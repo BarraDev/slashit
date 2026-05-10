@@ -26,11 +26,24 @@ SlashIt is a Tauri v2 desktop app for managing AI coding agents, task queues, te
 - **Jujutsu integration** -- Use `jj`-native workflows with Git interoperability.
 - **GitHub/Jira import** -- Bring external issues into the local board.
 - **PR management** -- Create and track pull requests from completed tasks.
+- **PR review assistant** -- Triage reviewer comments on a PR, let the agent propose Fix / Skip / Question for each, then apply approved fixes and post replies back to the PR.
 - **CLI tool** -- Control the running app from terminals and AI agents with `slashit`.
 - **System tray** -- Keep agents and terminals alive after closing the window.
 - **Auto-update** -- Check GitHub Releases for signed app updates.
 
 ## Screenshots
+
+### PR review assistant
+
+Triage every reviewer comment on a pull request, decide Fix / Skip / Question per item, edit the agent's reasoning and proposed change inline, then apply all approved fixes in one pass with optional auto-push and auto-reply on the PR.
+
+<p align="center">
+  <img src="docs/assets/screenshots/pr-comment-review.png" alt="SlashIt PR Comment Review modal: per-comment Fix/Skip/Question dropdown, editable reasoning and proposed change, footer toggles for auto-push, auto-reply, and only-new filter, plus Re-discuss / Re-analyze / Apply actions" width="900">
+</p>
+
+### Workspace overview (in progress)
+
+The screens below preview the broader workspace, parts of which are still being polished.
 
 <p align="center">
   <img src="docs/assets/screenshots/dashboard-kanban.jpg" alt="SlashIt dashboard with Kanban task queue, agent queue, worktrees, and JJ status" width="900">
