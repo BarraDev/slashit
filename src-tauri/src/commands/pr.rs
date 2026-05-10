@@ -687,6 +687,11 @@ pub async fn address_pr_review(
         }
     });
 
+    // Plans written before the lifecycle fields existed (and plans where the
+    // frontend hasn't backfilled yet) need fix_done / reply_posted derived from
+    // the prior last_apply so the apply loop respects what's already on disk.
+    let mut plan = plan;
+    plan.backfill_lifecycle_from_last_apply();
     let (result, updated_plan) = address_pr_review_inner(task, working_dir, plan, options, progress).await?;
     save_review_plan_on_task(&state, task_uuid, updated_plan).await;
     Ok(result)
@@ -1044,8 +1049,9 @@ pub async fn sync_pr_review_replies(
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
-    let plan = task.pr_review_plan.clone()
+    let mut plan = task.pr_review_plan.clone()
         .ok_or_else(|| "Task has no PR review plan to sync".to_string())?;
+    plan.backfill_lifecycle_from_last_apply();
 
     let (result, updated_plan) = sync_pr_review_replies_inner(task, plan).await?;
     save_review_plan_on_task(&state, task_uuid, updated_plan).await;

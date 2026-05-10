@@ -727,3 +727,76 @@ async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
     assert_eq!(result.fix_pending, 2);
     assert_eq!(result.already_done, 0);
 }
+
+#[test]
+fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies() {
+    use slashit_app_lib::domain::task::{PrReviewApplyResult, PrReviewPlan};
+
+    let (_task, mut plan) = create_test_two_fix_setup();
+    // Both items still have fix_done=false and reply_posted=false at this point.
+    assert!(!plan.items[0].fix_done);
+    assert!(!plan.items[1].fix_done);
+
+    // Stage a prior last_apply that fixed BOTH items but only managed to reply
+    // for one of them — the other's reply failed.
+    plan.last_apply = Some(PrReviewApplyResult {
+        applied_at: chrono::Utc::now(),
+        agent_summary: "prior round".to_string(),
+        fixed_ids: vec![301, 302],
+        skipped_ids: vec![],
+        pushed: true,
+        push_branch: Some("test-branch".to_string()),
+        replies_posted: 1,
+        reply_errors: vec!["comment 302: gh rate limit".to_string()],
+        dry_run: false,
+        failed_ids: vec![],
+        fix_errors: vec![],
+        push_error: None,
+    });
+
+    plan.backfill_lifecycle_from_last_apply();
+
+    // Item 0 (comment 301): fixed AND replied — both flags flip.
+    assert!(plan.items[0].fix_done, "fix_done should backfill from fixed_ids");
+    assert!(plan.items[0].reply_posted, "reply_posted should backfill when no reply error for this id");
+    // Item 1 (comment 302): fixed but the reply errored — only fix_done flips.
+    assert!(plan.items[1].fix_done);
+    assert!(!plan.items[1].reply_posted, "failed reply must keep reply_posted=false");
+
+    // Re-running backfill is a no-op (idempotent).
+    plan.backfill_lifecycle_from_last_apply();
+    assert!(plan.items[0].fix_done && plan.items[0].reply_posted);
+    assert!(plan.items[1].fix_done && !plan.items[1].reply_posted);
+
+    // Dry-run results are intentionally ignored.
+    let mut dry_plan = PrReviewPlan {
+        generated_at: chrono::Utc::now(),
+        pr_url: "x".to_string(),
+        review_decision: None,
+        comments: vec![],
+        items: plan.items.clone(),
+        raw_plan: String::new(),
+        last_apply: Some(PrReviewApplyResult {
+            applied_at: chrono::Utc::now(),
+            agent_summary: String::new(),
+            fixed_ids: vec![999],
+            skipped_ids: vec![],
+            pushed: false,
+            push_branch: None,
+            replies_posted: 0,
+            reply_errors: vec![],
+            dry_run: true,
+            failed_ids: vec![],
+            fix_errors: vec![],
+            push_error: None,
+        }),
+    };
+    // Reset to prove backfill leaves dry-run alone.
+    for it in dry_plan.items.iter_mut() {
+        it.fix_done = false;
+        it.reply_posted = false;
+    }
+    dry_plan.backfill_lifecycle_from_last_apply();
+    assert!(dry_plan.items.iter().all(|i| !i.fix_done && !i.reply_posted),
+        "dry-run last_apply must not flip lifecycle flags");
+}

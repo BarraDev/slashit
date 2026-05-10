@@ -124,6 +124,41 @@ pub struct PrReviewPlan {
     pub last_apply: Option<PrReviewApplyResult>,
 }
 
+impl PrReviewPlan {
+    /// Derive per-item `fix_done` and `reply_posted` from the persisted
+    /// `last_apply`. Used to upgrade plans that pre-date the lifecycle fields
+    /// so badges show immediately for items the user already addressed, and
+    /// so a re-apply on the same plan correctly skips items whose work landed
+    /// in a prior run.
+    ///
+    /// Only flips flags from `false` to `true` — never undoes user-visible
+    /// state. Dry-run results are ignored on purpose.
+    pub fn backfill_lifecycle_from_last_apply(&mut self) {
+        let Some(last) = self.last_apply.clone() else { return; };
+        if last.dry_run { return; }
+        // `reply_errors` come back as `"comment <id>: <msg>"`. Lift the ids out
+        // so we know which fixed items missed the reply step.
+        let failed_reply_ids: std::collections::HashSet<u64> = last.reply_errors.iter()
+            .filter_map(|s| {
+                let rest = s.strip_prefix("comment ")?;
+                let (id, _) = rest.split_once(':')?;
+                id.trim().parse::<u64>().ok()
+            })
+            .collect();
+        for item in self.items.iter_mut() {
+            let Some(cid) = item.comment_id else { continue; };
+            if last.fixed_ids.contains(&cid) {
+                if !item.fix_done {
+                    item.fix_done = true;
+                }
+                if !item.reply_posted && !failed_reply_ids.contains(&cid) {
+                    item.reply_posted = true;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PrReviewComment {
     pub id: Option<u64>,

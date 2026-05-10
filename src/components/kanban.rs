@@ -8,9 +8,18 @@ use crate::models::task::{
     PrReviewPlan,
 };
 use crate::components::{TaskCard, TaskEditModal, TaskEditMode, toast, TaskContextMenu, DiffModal};
-use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
+use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::HashSet;
+
+/// Per-item live status updated as `pr-review-progress` events arrive during
+/// an apply or dry-run. Reset whenever the user starts a fresh run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PrItemStatus {
+    Running,
+    Succeeded,
+    Failed(String),
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct ColumnData {
@@ -150,6 +159,56 @@ pub fn Kanban(
     let pr_review_auto_reply = RwSignal::new(true);
     let pr_review_dry_run = RwSignal::new(false);
     let pr_review_last_apply = RwSignal::new(None::<PrReviewApplyResult>);
+    // Per-item live status fed by `pr-review-progress` Tauri events keyed by
+    // `comment_id`. Reset on each apply/dry-run.
+    let pr_review_item_status =
+        RwSignal::new(std::collections::HashMap::<u64, PrItemStatus>::new());
+    // (current, total) for the overall apply counter shown on the button.
+    let pr_review_overall = RwSignal::new(None::<(usize, usize)>);
+
+    // Subscribe once at this component's scope so a new listener isn't created
+    // every time the modal opens (the modal is mounted via <Show> and would
+    // accumulate listeners otherwise).
+    {
+        let item_status = pr_review_item_status;
+        let overall = pr_review_overall;
+        let task_signal = pr_review_task;
+        crate::services::pr_service::subscribe_pr_review_progress(move |ev| {
+            // Only react to events from the currently-open task. The backend
+            // includes the task uuid so we can filter out stale events from
+            // earlier runs.
+            let current_task_id = task_signal.get_untracked()
+                .map(|t| t.id.to_string());
+            if current_task_id.as_deref() != Some(ev.task_id.as_str()) {
+                return;
+            }
+            match ev.kind.as_str() {
+                "item_started" => {
+                    if let (Some(cur), Some(tot)) = (ev.current, ev.total) {
+                        overall.set(Some((cur, tot)));
+                    }
+                    if let Some(id) = ev.comment_id {
+                        item_status.update(|m| { m.insert(id, PrItemStatus::Running); });
+                    }
+                }
+                "item_succeeded" => {
+                    if let Some(id) = ev.comment_id {
+                        item_status.update(|m| { m.insert(id, PrItemStatus::Succeeded); });
+                    }
+                }
+                "item_failed" => {
+                    if let Some(id) = ev.comment_id {
+                        let err = ev.message.unwrap_or_else(|| "failed".to_string());
+                        item_status.update(|m| { m.insert(id, PrItemStatus::Failed(err)); });
+                    }
+                }
+                "all_done" => {
+                    overall.set(None);
+                }
+                _ => {}
+            }
+        });
+    }
     let show_pr_candidates_modal = RwSignal::new(false);
     let pr_candidate_task = RwSignal::new(None::<Task>);
     let pr_candidates = RwSignal::new(Vec::<PrCandidate>::new());
@@ -471,6 +530,8 @@ pub fn Kanban(
                 auto_reply=pr_review_auto_reply
                 dry_run=pr_review_dry_run
                 last_apply=pr_review_last_apply
+                item_status=pr_review_item_status
+                overall_progress=pr_review_overall
                 set_tasks=set_tasks_signal
             />
 
@@ -739,6 +800,8 @@ fn PrReviewModal(
     auto_reply: RwSignal<bool>,
     dry_run: RwSignal<bool>,
     last_apply: RwSignal<Option<PrReviewApplyResult>>,
+    item_status: RwSignal<std::collections::HashMap<u64, PrItemStatus>>,
+    overall_progress: RwSignal<Option<(usize, usize)>>,
     set_tasks: WriteSignal<Vec<Task>>,
 ) -> impl IntoView {
     let show_raw_comments = RwSignal::new(false);
@@ -772,12 +835,35 @@ fn PrReviewModal(
         ts.map(|t| t > la.applied_at).unwrap_or(true)
     };
 
+    // True whenever any async PR-review operation is in flight. Used to lock
+    // the modal so the user can't mutate state mid-run. Memoized so per-item
+    // children can subscribe without re-computing on every signal tick.
+    let busy_memo = Memo::new(move |_| loading.get() || applying.get() || discussing.get());
+    let busy = move || busy_memo.get();
+
+    // Auto-scroll the modal's scrollable body to the top whenever a fresh
+    // apply/dry-run result lands, so the new result panel (rendered at the
+    // top of the items list) is immediately visible without manual scrolling.
+    let content_ref = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move |_| {
+        if last_apply.get().is_some() {
+            if let Some(el) = content_ref.get() {
+                el.set_scroll_top(0);
+            }
+        }
+    });
+
     let trigger_analyze = move |force: bool| {
         let Some(task_value) = task.get() else { return; };
+        if busy() { return; }
         if !force {
             let cached = task_value.pr_review_plan.clone()
                 .filter(|p| !p.comments.is_empty() || !p.items.is_empty());
-            if let Some(cached) = cached {
+            if let Some(mut cached) = cached {
+                // Surface badges immediately for items the previous run
+                // already addressed — old plans on disk pre-date the
+                // lifecycle fields and would otherwise look blank.
+                cached.backfill_lifecycle_from_last_apply();
                 last_apply.set(cached.last_apply.clone());
                 show_only_new.set(cached.last_apply.is_some());
                 plan.set(Some(cached));
@@ -790,7 +876,8 @@ fn PrReviewModal(
         loading.set(true);
         spawn_local(async move {
             match analyze_pr_comments(task_value.id.to_string()).await {
-                Ok(p) => {
+                Ok(mut p) => {
+                    p.backfill_lifecycle_from_last_apply();
                     show_only_new.set(p.last_apply.is_some());
                     plan.set(Some(p));
                     error.set(None);
@@ -820,6 +907,14 @@ fn PrReviewModal(
             auto_reply: auto_reply.get(),
             dry_run: dry_run.get(),
         };
+        // Clear the prior preview/report and any stale error so the user
+        // doesn't stare at the previous run's output while the new one runs.
+        last_apply.set(None);
+        error.set(None);
+        // Reset per-item status + overall counter so the previous run's
+        // checkmarks don't bleed into this one. Backend events will repopulate.
+        item_status.update(|m| m.clear());
+        overall_progress.set(None);
         applying.set(true);
         let task_id = task_value.id.to_string();
         spawn_local(async move {
@@ -828,16 +923,27 @@ fn PrReviewModal(
                     let pushed = result.pushed;
                     let replies = result.replies_posted;
                     let errs = result.reply_errors.len();
+                    let was_dry_run = result.dry_run;
                     last_apply.set(Some(result));
-                    let mut msg = String::from("Applied. ");
+                    let mut msg = if was_dry_run {
+                        String::from("Dry-run complete. ")
+                    } else {
+                        String::from("Applied. ")
+                    };
                     if pushed { msg.push_str("Pushed. "); }
                     if replies > 0 { msg.push_str(&format!("Posted {} replies. ", replies)); }
                     if errs > 0 { msg.push_str(&format!("{} reply errors.", errs)); }
                     toast::success(msg);
                     // Refresh task PR state so the card moves if reviewer reacts.
+                    // Also propagate the updated PR-review plan back into the modal so
+                    // the new fix_done / reply_posted flags drive the per-item badges
+                    // without needing the modal to be reopened.
                     let task_id_inner = task_id.clone();
                     spawn_local(async move {
                         if let Ok(Some(updated)) = refresh_task_pr_state(task_id_inner).await {
+                            if let Some(refreshed_plan) = updated.pr_review_plan.clone() {
+                                plan.set(Some(refreshed_plan));
+                            }
                             set_tasks.update(|tasks| {
                                 if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
                                     *t = updated;
@@ -846,7 +952,11 @@ fn PrReviewModal(
                         }
                     });
                 }
-                Err(e) => toast::error(format!("Failed to apply PR fixes: {}", e)),
+                Err(e) => {
+                    let msg = format!("Failed to apply PR fixes: {}", e);
+                    error.set(Some(msg.clone()));
+                    toast::error(msg);
+                }
             }
             applying.set(false);
         });
@@ -859,6 +969,7 @@ fn PrReviewModal(
             toast::error("Add a note to at least one Question item first".to_string());
             return;
         }
+        error.set(None);
         discussing.set(true);
         let task_id = task_value.id.to_string();
         spawn_local(async move {
@@ -868,9 +979,74 @@ fn PrReviewModal(
                     error.set(None);
                     toast::success("Agent re-evaluated the questions".to_string());
                 }
-                Err(e) => toast::error(format!("Failed to discuss: {}", e)),
+                Err(e) => {
+                    let msg = format!("Failed to discuss: {}", e);
+                    error.set(Some(msg.clone()));
+                    toast::error(msg);
+                }
             }
             discussing.set(false);
+        });
+    };
+
+    // Count of approved Fix items whose code edit is on disk but whose GitHub
+    // reply was never posted. Drives the "Sync replies" button visibility.
+    let deferred_reply_count = move || plan.get()
+        .map(|p| p.items.iter()
+            .filter(|i| i.approved
+                && matches!(i.decision, PrReviewDecisionKind::Fix)
+                && i.fix_done
+                && !i.reply_posted)
+            .count())
+        .unwrap_or(0);
+
+    let on_sync_replies = move |_| {
+        let Some(task_value) = task.get() else { return; };
+        if deferred_reply_count() == 0 {
+            toast::error("No deferred replies — every fixed item already has a reply".to_string());
+            return;
+        }
+        // Reuse the `applying` lock for the modal-busy treatment; sync is a
+        // short, gh-only catch-up but conceptually the same exclusive operation.
+        error.set(None);
+        applying.set(true);
+        let task_id = task_value.id.to_string();
+        spawn_local(async move {
+            match sync_pr_review_replies(task_id.clone()).await {
+                Ok(result) => {
+                    let mut parts: Vec<String> = Vec::new();
+                    if result.replied > 0 { parts.push(format!("Posted {} replies", result.replied)); }
+                    if result.already_done > 0 { parts.push(format!("{} already done", result.already_done)); }
+                    if result.fix_pending > 0 { parts.push(format!("{} still need a fix", result.fix_pending)); }
+                    if !result.errors.is_empty() { parts.push(format!("{} errors", result.errors.len())); }
+                    let msg = if parts.is_empty() { "Nothing to sync".to_string() } else { parts.join(", ") };
+                    if result.errors.is_empty() && result.replied > 0 {
+                        toast::success(msg);
+                    } else if !result.errors.is_empty() {
+                        let detail = result.errors.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+                        let final_msg = format!("{}: {}", msg, detail);
+                        error.set(Some(final_msg.clone()));
+                        toast::error(final_msg);
+                    } else {
+                        toast::success(msg);
+                    }
+                    // Refresh the plan from the task so badges flip green for newly-replied items.
+                    let task_id_inner = task_id.clone();
+                    spawn_local(async move {
+                        if let Ok(Some(updated)) = refresh_task_pr_state(task_id_inner).await {
+                            if let Some(refreshed_plan) = updated.pr_review_plan.clone() {
+                                plan.set(Some(refreshed_plan));
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    let msg = format!("Failed to sync replies: {}", e);
+                    error.set(Some(msg.clone()));
+                    toast::error(msg);
+                }
+            }
+            applying.set(false);
         });
     };
 
@@ -911,9 +1087,9 @@ fn PrReviewModal(
                             </p>
                         </div>
                         <button
-                            class="p-2 rounded-md hover:bg-white/10 text-white/60 transition-colors flex-shrink-0"
+                            class="p-2 rounded-md hover:bg-white/10 text-white/60 transition-colors flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
                             on:click=move |_| show.set(false)
-                            disabled=move || applying.get()
+                            disabled=move || busy()
                             aria-label="Close"
                         >
                             <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -922,7 +1098,21 @@ fn PrReviewModal(
                         </button>
                     </div>
 
-                    <div class="px-5 py-3 overflow-y-auto flex-1 space-y-4">
+                    // Indeterminate progress bar — visible whenever any async
+                    // PR-review operation is in flight (analyze / discuss /
+                    // apply / dry-run). The bar slides horizontally so the
+                    // user sees activity even when the agent is silent.
+                    <Show when=move || busy()>
+                        <div
+                            class="h-0.5 w-full bg-white/5 overflow-hidden"
+                            role="progressbar"
+                            aria-label="Agent working"
+                        >
+                            <div class="h-full w-1/3 bg-yellow-500/70 animate-pr-busy"></div>
+                        </div>
+                    </Show>
+
+                    <div node_ref=content_ref class="px-5 py-3 overflow-y-auto flex-1 space-y-4">
                         <Show
                             when=move || !loading.get()
                             fallback=|| view! {
@@ -938,33 +1128,93 @@ fn PrReviewModal(
                             }
                         >
                             {move || error.get().map(|msg| view! {
-                                <div class="px-3 py-2 rounded-md border border-red-500/30 bg-red-500/10 text-xs text-red-200">
-                                    {msg}
+                                <div class="px-3 py-2 rounded-md border border-red-500/30 bg-red-500/10 text-xs text-red-200 flex items-start gap-2">
+                                    <div class="flex-1 whitespace-pre-wrap break-words font-mono">{msg}</div>
+                                    <button
+                                        class="flex-shrink-0 -mr-1 p-1 rounded hover:bg-red-500/15 text-red-300/70 hover:text-red-200 transition-colors"
+                                        on:click=move |_| error.set(None)
+                                        aria-label="Dismiss error"
+                                        type="button"
+                                    >
+                                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                                        </svg>
+                                    </button>
                                 </div>
                             })}
 
                             {move || last_apply.get().map(|res| {
-                                let summary_class = if res.reply_errors.is_empty() {
+                                let any_failure = !res.fix_errors.is_empty()
+                                    || !res.reply_errors.is_empty()
+                                    || res.push_error.is_some();
+                                let summary_class = if res.dry_run {
+                                    "border-sky-500/30 bg-sky-500/10 text-sky-100"
+                                } else if !any_failure {
                                     "border-emerald-500/30 bg-emerald-500/10 text-emerald-100"
                                 } else {
                                     "border-amber-500/30 bg-amber-500/10 text-amber-100"
                                 };
+                                let header = if res.dry_run {
+                                    format!(
+                                        "Dry-run at {} — {} of {} item(s) previewed (no edits made)",
+                                        res.applied_at.format("%Y-%m-%d %H:%M"),
+                                        res.fixed_ids.len(),
+                                        res.fixed_ids.len() + res.failed_ids.len(),
+                                    )
+                                } else {
+                                    format!(
+                                        "Last apply at {}: fixed {}{}, pushed {}, replies {}",
+                                        res.applied_at.format("%Y-%m-%d %H:%M"),
+                                        res.fixed_ids.len(),
+                                        if res.failed_ids.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(" ({} failed)", res.failed_ids.len())
+                                        },
+                                        if res.pushed { "yes" } else if res.push_error.is_some() { "FAILED" } else { "skipped" },
+                                        res.replies_posted,
+                                    )
+                                };
+                                let summary_html = (!res.agent_summary.trim().is_empty())
+                                    .then(|| render_pr_comment_markdown(&res.agent_summary));
                                 view! {
-                                    <div class=format!("px-3 py-2 rounded-md border text-xs space-y-1 {}", summary_class)>
-                                        <div class="font-medium">
-                                            {format!(
-                                                "Last apply at {}: fixed {}, pushed {}, replies {}{}",
-                                                res.applied_at.format("%H:%M:%S"),
-                                                res.fixed_ids.len(),
-                                                if res.pushed { "yes" } else { "no" },
-                                                res.replies_posted,
-                                                if res.reply_errors.is_empty() { String::new() } else { format!(", {} errors", res.reply_errors.len()) },
-                                            )}
-                                        </div>
-                                        {(!res.reply_errors.is_empty()).then(|| view! {
-                                            <ul class="list-disc list-inside opacity-80">
-                                                {res.reply_errors.iter().take(5).map(|e| view! { <li>{e.clone()}</li> }).collect_view()}
-                                            </ul>
+                                    <div class=format!("px-3 py-2 rounded-md border text-xs space-y-2 {}", summary_class)>
+                                        <div class="font-medium">{header}</div>
+                                        {res.push_error.as_ref().map(|e| view! {
+                                            <div class="opacity-80"><span class="font-medium">"Push error: "</span>{e.clone()}</div>
+                                        })}
+                                        {(!res.fix_errors.is_empty()).then(|| {
+                                            let errs = res.fix_errors.clone();
+                                            view! {
+                                                <details>
+                                                    <summary class="cursor-pointer opacity-80">{format!("{} fix failure(s)", errs.len())}</summary>
+                                                    <ul class="list-disc list-inside opacity-80 mt-1">
+                                                        {errs.iter().take(20).map(|e| view! { <li class="font-mono">{e.clone()}</li> }).collect_view()}
+                                                    </ul>
+                                                </details>
+                                            }
+                                        })}
+                                        {(!res.reply_errors.is_empty()).then(|| {
+                                            let errs = res.reply_errors.clone();
+                                            view! {
+                                                <details>
+                                                    <summary class="cursor-pointer opacity-80">{format!("{} reply error(s)", errs.len())}</summary>
+                                                    <ul class="list-disc list-inside opacity-80 mt-1">
+                                                        {errs.iter().take(20).map(|e| view! { <li class="font-mono">{e.clone()}</li> }).collect_view()}
+                                                    </ul>
+                                                </details>
+                                            }
+                                        })}
+                                        {summary_html.map(|html| view! {
+                                            <details open=res.dry_run class="text-xs">
+                                                <summary class="cursor-pointer opacity-80 hover:opacity-100">
+                                                    {if res.dry_run { "Agent preview (what it would change)" } else { "Agent report" }}
+                                                </summary>
+                                                <div
+                                                    class="mt-2 max-h-72 overflow-y-auto rounded border border-white/10 bg-black/30 px-3 py-2 prose prose-sm prose-invert max-w-none leading-relaxed prose-pre:my-2 prose-pre:bg-black/50 prose-pre:text-xs prose-code:text-xs prose-code:before:hidden prose-code:after:hidden prose-p:my-1 prose-ul:my-1 prose-li:my-0"
+                                                    inner_html=html
+                                                ></div>
+                                            </details>
                                         })}
                                     </div>
                                 }
@@ -1042,7 +1292,7 @@ fn PrReviewModal(
                                 let visible_count = visible.len();
                                 let hidden = total.saturating_sub(visible_count);
                                 let items_view = visible.into_iter().map(|(idx, item)| {
-                                    render_review_item(idx, item, plan)
+                                    render_review_item(idx, item, plan, busy_memo, item_status)
                                 }).collect_view();
                                 view! {
                                     <div class="space-y-2">
@@ -1058,23 +1308,28 @@ fn PrReviewModal(
                         </Show>
                     </div>
 
-                    <div class="flex items-center justify-between gap-3 px-5 py-3 border-t border-white/10 bg-white/[0.02]">
+                    <div class=move || format!(
+                        "flex items-center justify-between gap-3 px-5 py-3 border-t border-white/10 bg-white/[0.02] {}",
+                        if busy() { "opacity-60" } else { "" },
+                    )>
                         <div class="flex items-center gap-4 text-xs text-white/70">
                             <label class="flex items-center gap-1.5 cursor-pointer">
                                 <input
                                     type="checkbox"
-                                    class="accent-yellow-500"
+                                    class="accent-yellow-500 disabled:cursor-not-allowed"
                                     prop:checked=move || auto_push.get()
                                     on:change=move |ev| auto_push.set(event_target_checked(&ev))
+                                    disabled=move || busy()
                                 />
                                 "Auto-push branch"
                             </label>
                             <label class="flex items-center gap-1.5 cursor-pointer">
                                 <input
                                     type="checkbox"
-                                    class="accent-yellow-500"
+                                    class="accent-yellow-500 disabled:cursor-not-allowed"
                                     prop:checked=move || auto_reply.get()
                                     on:change=move |ev| auto_reply.set(event_target_checked(&ev))
+                                    disabled=move || busy()
                                 />
                                 "Auto-reply on PR"
                             </label>
@@ -1084,10 +1339,10 @@ fn PrReviewModal(
                             >
                                 <input
                                     type="checkbox"
-                                    class="accent-yellow-500"
+                                    class="accent-yellow-500 disabled:cursor-not-allowed"
                                     prop:checked=move || show_only_new.get()
                                     on:change=move |ev| show_only_new.set(event_target_checked(&ev))
-                                    disabled=move || last_apply.get().is_none()
+                                    disabled=move || busy() || last_apply.get().is_none()
                                 />
                                 "Only new since last apply"
                             </label>
@@ -1097,9 +1352,10 @@ fn PrReviewModal(
                             >
                                 <input
                                     type="checkbox"
-                                    class="accent-yellow-500"
+                                    class="accent-yellow-500 disabled:cursor-not-allowed"
                                     prop:checked=move || dry_run.get()
                                     on:change=move |ev| dry_run.set(event_target_checked(&ev))
+                                    disabled=move || busy()
                                 />
                                 "Dry run (no edits)"
                             </label>
@@ -1117,6 +1373,16 @@ fn PrReviewModal(
                                     format!("Re-discuss {} questions", pending_discussion_count())
                                 }}
                             </button>
+                            <Show when=move || { deferred_reply_count() > 0 }>
+                                <button
+                                    class="px-3 py-1.5 rounded-lg text-xs text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 transition-colors disabled:opacity-40"
+                                    on:click=on_sync_replies
+                                    disabled=move || busy()
+                                    title="Post deferred replies on GitHub for items that were fixed but never replied to. No agent run, no push."
+                                >
+                                    {move || format!("Sync {} replies", deferred_reply_count())}
+                                </button>
+                            </Show>
                             <button
                                 class="px-3 py-1.5 rounded-lg text-xs text-white/70 hover:bg-white/10 transition-colors disabled:opacity-40"
                                 on:click=move |_| trigger_analyze(true)
@@ -1138,7 +1404,11 @@ fn PrReviewModal(
                                 disabled=move || loading.get() || applying.get() || discussing.get() || approved_fix_count() == 0
                             >
                                 {move || if applying.get() {
-                                    if dry_run.get() { "Planning...".to_string() } else { "Applying...".to_string() }
+                                    let label = if dry_run.get() { "Previewing" } else { "Applying" };
+                                    match overall_progress.get() {
+                                        Some((cur, tot)) => format!("{} fix {} of {}", label, cur, tot),
+                                        None => format!("{}...", label),
+                                    }
                                 } else if dry_run.get() {
                                     format!("Dry-run {} fixes", approved_fix_count())
                                 } else {
@@ -1153,10 +1423,35 @@ fn PrReviewModal(
     }
 }
 
+/// Render a PR-comment body (GitHub-flavored markdown from `gh api`) to HTML.
+/// Raw HTML in the input is dropped to keep the modal safe from injected
+/// `<script>`/`<img onerror>` payloads that could ride along in a reviewer
+/// comment. Output is consumed via Leptos `inner_html` and styled via the
+/// `prose prose-invert` Tailwind plugin.
+fn render_pr_comment_markdown(src: &str) -> String {
+    use pulldown_cmark::{html, Event, Options, Parser};
+
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_GFM);
+
+    let parser = Parser::new_ext(src, opts).filter(|ev| {
+        !matches!(ev, Event::Html(_) | Event::InlineHtml(_))
+    });
+
+    let mut out = String::with_capacity(src.len() + src.len() / 4);
+    html::push_html(&mut out, parser);
+    out
+}
+
 fn render_review_item(
     idx: usize,
     item: PrReviewItem,
     plan: RwSignal<Option<PrReviewPlan>>,
+    busy: Memo<bool>,
+    item_status: RwSignal<std::collections::HashMap<u64, PrItemStatus>>,
 ) -> impl IntoView {
     let comment_id = item.comment_id;
     let related = plan.get_untracked()
@@ -1231,9 +1526,10 @@ fn render_review_item(
             <div class="flex items-start gap-3">
                 <input
                     type="checkbox"
-                    class="mt-1 accent-yellow-500"
+                    class="mt-1 accent-yellow-500 disabled:cursor-not-allowed"
                     prop:checked=approved_init
                     on:change=toggle_approved
+                    disabled=move || busy.get()
                     title="Approve to include in apply"
                 />
                 <div class="flex-1 min-w-0 space-y-1">
@@ -1241,12 +1537,67 @@ fn render_review_item(
                         <span class="font-mono">{location}</span>
                         {(!author.is_empty()).then(|| view! { <span>"-"</span> <span>{author}</span> })}
                         {comment_id.map(|id| view! { <span class="opacity-60">{format!("(id {})", id)}</span> })}
+                        {
+                            // Live status from the in-flight run takes priority. Outside of a run,
+                            // fall back to the persisted lifecycle: fix_done + reply_posted determine
+                            // a composite badge so the user can see exactly which step is still
+                            // outstanding without re-running.
+                            let fix_done_init = item.fix_done;
+                            let reply_posted_init = item.reply_posted;
+                            let last_error_init = item.last_error.clone();
+                            move || {
+                                let live = comment_id.and_then(|id| item_status.get().get(&id).cloned());
+                                match live {
+                                    Some(PrItemStatus::Running) => view! {
+                                        <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-yellow-500/15 text-yellow-300 font-medium text-[10px]" title="Agent working on this item">
+                                            <svg class="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+                                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                                            </svg>
+                                            "Running"
+                                        </span>
+                                    }.into_any(),
+                                    Some(PrItemStatus::Failed(err)) => view! {
+                                        <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-red-500/15 text-red-300 font-medium text-[10px]" title=err>
+                                            "✕ Failed"
+                                        </span>
+                                    }.into_any(),
+                                    // Live "Succeeded" means the agent just finished a fix this run.
+                                    // Still show reply state alongside so the user knows whether the
+                                    // GitHub round-trip happened.
+                                    Some(PrItemStatus::Succeeded) | None => {
+                                        if fix_done_init && reply_posted_init {
+                                            view! {
+                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 font-medium text-[10px]" title="Fix applied and reply posted on the PR">
+                                                    "✓ Fixed · ✓ Replied"
+                                                </span>
+                                            }.into_any()
+                                        } else if fix_done_init {
+                                            view! {
+                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 font-medium text-[10px]" title="Fix is on disk but no reply was posted yet — use Sync replies">
+                                                    "✓ Fixed · ⚠ Reply pending"
+                                                </span>
+                                            }.into_any()
+                                        } else if let Some(err) = last_error_init.clone() {
+                                            view! {
+                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-red-500/15 text-red-300 font-medium text-[10px]" title=err>
+                                                    "✕ Failed (prior run)"
+                                                </span>
+                                            }.into_any()
+                                        } else {
+                                            view! { <span></span> }.into_any()
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     </div>
                     <div class="text-sm text-white/90 font-medium">{summary}</div>
                 </div>
                 <select
-                    class="text-xs bg-white/[0.05] border border-white/10 rounded px-2 py-1 text-white/80 flex-shrink-0"
+                    class="text-xs bg-white/[0.05] border border-white/10 rounded px-2 py-1 text-white/80 flex-shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
                     on:change=on_decision_change
+                    disabled=move || busy.get()
                 >
                     <option value="fix" selected=decision_value == "fix">"Fix"</option>
                     <option value="skip" selected=decision_value == "skip">"Skip"</option>
@@ -1254,21 +1605,28 @@ fn render_review_item(
                 </select>
             </div>
 
-            {original_body.map(|body| view! {
-                <details class="text-xs text-white/55">
-                    <summary class="cursor-pointer hover:text-white/80">"Original comment"</summary>
-                    <pre class="mt-1 whitespace-pre-wrap font-mono opacity-80">{body}</pre>
-                </details>
+            {original_body.map(|body| {
+                let html = render_pr_comment_markdown(&body);
+                view! {
+                    <details class="text-xs text-white/55">
+                        <summary class="cursor-pointer hover:text-white/80">"Original comment"</summary>
+                        <div
+                            class="mt-1 max-h-48 overflow-y-auto rounded border border-white/5 bg-black/20 px-3 py-2 prose prose-sm prose-invert max-w-none leading-relaxed prose-pre:my-2 prose-pre:bg-black/40 prose-pre:text-xs prose-code:text-xs prose-code:before:hidden prose-code:after:hidden prose-p:my-1 prose-ul:my-1 prose-li:my-0"
+                            inner_html=html
+                        ></div>
+                    </details>
+                }
             })}
 
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
                 <label class="block">
                     <span class="text-[10px] uppercase tracking-wide text-white/40">"Reply / reasoning"</span>
                     <textarea
-                        class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50"
+                        class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50 disabled:opacity-60 disabled:cursor-not-allowed"
                         rows="2"
                         on:input=on_reasoning_input
                         prop:value=reasoning
+                        disabled=move || busy.get()
                         placeholder="What you would tell the reviewer. Posted as the PR reply when auto-reply is on."
                     ></textarea>
                 </label>
@@ -1276,10 +1634,11 @@ fn render_review_item(
                 <label class="block">
                     <span class="text-[10px] uppercase tracking-wide text-white/40">"Proposed change"</span>
                     <textarea
-                        class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50"
+                        class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50 disabled:opacity-60 disabled:cursor-not-allowed"
                         rows="2"
                         on:input=on_change_input
                         prop:value=proposed
+                        disabled=move || busy.get()
                         placeholder="What the agent will change if approved."
                     ></textarea>
                 </label>
@@ -1291,12 +1650,16 @@ fn render_review_item(
                         "Your note for the agent (re-discuss)"
                     </span>
                     <textarea
-                        class="w-full mt-1 bg-amber-500/[0.04] border border-amber-500/30 rounded p-2 text-xs text-white/85 resize-y focus:outline-none focus:border-amber-400/60"
+                        class="w-full mt-1 bg-amber-500/[0.04] border border-amber-500/30 rounded p-2 text-xs text-white/85 resize-y focus:outline-none focus:border-amber-400/60 disabled:opacity-60 disabled:cursor-not-allowed"
                         rows="2"
                         on:input=on_user_note_input
                         prop:value=user_note
+                        disabled=move || busy.get()
                         placeholder="Tell the agent what to do (e.g. 'go ahead and fix it', or 'no, the issue is X — re-evaluate')."
                     ></textarea>
+                    <p class="mt-1 text-[10px] text-amber-300/70">
+                        "Notes on Question items are sent by the \"Re-discuss N questions\" button below — not by Apply or Dry-run."
+                    </p>
                 </label>
             })}
         </div>

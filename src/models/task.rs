@@ -115,6 +115,36 @@ pub struct PrReviewPlan {
     pub last_apply: Option<PrReviewApplyResult>,
 }
 
+impl PrReviewPlan {
+    /// Derive per-item `fix_done` / `reply_posted` from a persisted
+    /// `last_apply`. Mirrors the backend helper of the same name so the
+    /// frontend can backfill the cached plan on modal open without a round
+    /// trip — old plans created before lifecycle tracking surface their
+    /// badges immediately.
+    pub fn backfill_lifecycle_from_last_apply(&mut self) {
+        let Some(last) = self.last_apply.clone() else { return; };
+        if last.dry_run { return; }
+        let failed_reply_ids: std::collections::HashSet<u64> = last.reply_errors.iter()
+            .filter_map(|s| {
+                let rest = s.strip_prefix("comment ")?;
+                let (id, _) = rest.split_once(':')?;
+                id.trim().parse::<u64>().ok()
+            })
+            .collect();
+        for item in self.items.iter_mut() {
+            let Some(cid) = item.comment_id else { continue; };
+            if last.fixed_ids.contains(&cid) {
+                if !item.fix_done {
+                    item.fix_done = true;
+                }
+                if !item.reply_posted && !failed_reply_ids.contains(&cid) {
+                    item.reply_posted = true;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PrReviewComment {
     pub id: Option<u64>,

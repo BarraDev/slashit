@@ -5,6 +5,47 @@ use wasm_bindgen_futures::JsFuture;
 extern "C" {
     #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "core"], js_name = invoke)]
     fn raw_invoke(cmd: &str, args: JsValue) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_namespace = ["window", "__TAURI__", "event"], js_name = "listen")]
+    fn tauri_event_listen(event: &str, handler: &Closure<dyn Fn(JsValue)>) -> js_sys::Promise;
+}
+
+/// Progress event emitted by the backend `address_pr_review` per item / phase.
+/// Mirrors `commands::pr::PrReviewProgress` on the backend.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct PrReviewProgress {
+    pub task_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub current: Option<usize>,
+    #[serde(default)]
+    pub total: Option<usize>,
+    #[serde(default)]
+    pub comment_id: Option<u64>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// Subscribe to backend `pr-review-progress` Tauri events. Returns an opaque
+/// guard whose `Drop` is a no-op — the closure must be kept alive (it is
+/// `.forget()`ed inside) for the lifetime of the page. Calling repeatedly
+/// adds independent listeners; callers should subscribe once per modal open
+/// and ignore events whose `task_id` does not match.
+pub fn subscribe_pr_review_progress<F: Fn(PrReviewProgress) + 'static>(handler: F) {
+    let cb = Closure::wrap(Box::new(move |event: JsValue| {
+        // Tauri delivers `{ event, id, payload }` — pull `payload` and decode.
+        let payload = js_sys::Reflect::get(&event, &JsValue::from_str("payload"))
+            .unwrap_or(JsValue::NULL);
+        match serde_wasm_bindgen::from_value::<PrReviewProgress>(payload) {
+            Ok(ev) => handler(ev),
+            Err(e) => leptos::logging::warn!("[pr-review] bad progress payload: {:?}", e),
+        }
+    }) as Box<dyn Fn(JsValue)>);
+    let promise = tauri_event_listen("pr-review-progress", &cb);
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = JsFuture::from(promise).await;
+    });
+    cb.forget();
 }
 
 async fn invoke(cmd: &str, args: JsValue) -> Result<JsValue, String> {
@@ -127,6 +168,24 @@ pub async fn discuss_pr_review_questions(
         "plan": plan,
     })).unwrap();
     let response = invoke("discuss_pr_review_questions", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+/// Result of `sync_pr_review_replies` — mirrors `commands::pr::SyncPrRepliesResult`.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SyncPrRepliesResult {
+    pub replied: u32,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub already_done: u32,
+    #[serde(default)]
+    pub fix_pending: u32,
+}
+
+pub async fn sync_pr_review_replies(task_id: String) -> Result<SyncPrRepliesResult, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "taskId": task_id })).unwrap();
+    let response = invoke("sync_pr_review_replies", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
