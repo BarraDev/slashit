@@ -620,6 +620,12 @@ pub async fn discuss_pr_review_questions(
 pub struct AddressPrReviewOptions {
     pub auto_push: bool,
     pub auto_reply: bool,
+    /// When true, the agent runs read-only and describes what it would do, but
+    /// no edits, jj describe, push, or PR replies are performed. Result is
+    /// saved on the task with `pushed=false`, `replies_posted=0`, and
+    /// `agent_summary` containing the dry-run report.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[tauri::command]
@@ -644,39 +650,42 @@ pub async fn address_pr_review(
         return Err("No approved fix items to apply".to_string());
     }
     eprintln!(
-        "[pr-review] applying {} approved items (auto_push={}, auto_reply={})",
-        approved.len(), options.auto_push, options.auto_reply,
+        "[pr-review] applying {} approved items (auto_push={}, auto_reply={}, dry_run={})",
+        approved.len(), options.auto_push, options.auto_reply, options.dry_run,
     );
 
-    let prompt = build_review_fix_prompt(&task, &pr_url, &plan.comments, &approved);
-    let agent_summary = run_claude_pr_helper(prompt, working_dir.clone(), true).await?;
-
-    let _ = run_cmd("jj", &["describe", "-m", &format!("task: {} (PR review fixes)", task.title)], &working_dir).await;
-    let _ = run_cmd("jj", &["git", "export"], &working_dir).await;
+    let prompt = build_review_fix_prompt(&task, &pr_url, &plan.comments, &approved, options.dry_run);
+    let agent_summary = run_claude_pr_helper(prompt, working_dir.clone(), !options.dry_run).await?;
 
     let mut pushed = false;
     let mut push_branch_name: Option<String> = None;
-    if options.auto_push {
-        let branch = task.branch_name.clone();
-        match push_branch(&working_dir, branch.as_deref()).await {
-            Ok(b) => { pushed = true; push_branch_name = Some(b); }
-            Err(e) => return Err(format!("agent applied fixes but push failed: {}", e)),
-        }
-    }
-
     let mut replies_posted = 0u32;
     let mut reply_errors: Vec<String> = Vec::new();
-    if options.auto_reply {
-        let (repo, number) = parse_pr_url(&pr_url)?;
-        for item in &approved {
-            let body = build_reply_body(item);
-            match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
-                Ok(()) => replies_posted += 1,
-                Err(e) => {
-                    let label = item.comment_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| "<none>".to_string());
-                    reply_errors.push(format!("comment {}: {}", label, e));
+
+    if !options.dry_run {
+        let _ = run_cmd("jj", &["describe", "-m", &format!("task: {} (PR review fixes)", task.title)], &working_dir).await;
+        let _ = run_cmd("jj", &["git", "export"], &working_dir).await;
+
+        if options.auto_push {
+            let branch = task.branch_name.clone();
+            match push_branch(&working_dir, branch.as_deref()).await {
+                Ok(b) => { pushed = true; push_branch_name = Some(b); }
+                Err(e) => return Err(format!("agent applied fixes but push failed: {}", e)),
+            }
+        }
+
+        if options.auto_reply {
+            let (repo, number) = parse_pr_url(&pr_url)?;
+            for item in &approved {
+                let body = build_reply_body(item);
+                match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
+                    Ok(()) => replies_posted += 1,
+                    Err(e) => {
+                        let label = item.comment_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "<none>".to_string());
+                        reply_errors.push(format!("comment {}: {}", label, e));
+                    }
                 }
             }
         }
@@ -971,6 +980,7 @@ fn build_review_fix_prompt(
     pr_url: &str,
     comments: &[PrReviewComment],
     approved: &[&PrReviewItem],
+    dry_run: bool,
 ) -> String {
     let items_text = approved.iter().enumerate().map(|(i, item)| {
         let related = item.comment_id.and_then(|id| comments.iter().find(|c| c.id == Some(id)));
@@ -985,6 +995,35 @@ fn build_review_fix_prompt(
             reasoning = item.reasoning, change = item.proposed_change,
         )
     }).collect::<Vec<_>>().join("\n\n---\n\n");
+
+    if dry_run {
+        return format!(
+            r#"# Dry-run: Plan PR Review Fixes (DO NOT EDIT)
+
+Task: {title}
+PR: {pr_url}
+
+## Approved Items
+{items}
+
+## Instructions
+This is a DRY RUN. You have read-only tools (Read, Glob, Grep). Do NOT edit
+any files. For each approved item, verify the issue still exists in the
+current code and write a concrete plan describing exactly what you would
+change.
+
+Output format (plain text, one section per item):
+
+Item #N (location: <path:line>):
+- Verified: yes/no — <one-line evidence from the file>
+- Plan: <concrete edit you would make: which lines, what to replace with what>
+- Risk: <any concern, or "none">
+
+End with a one-line summary: "DRY RUN — N items verified, would edit M files."
+"#,
+            title = task.title, pr_url = pr_url, items = items_text,
+        );
+    }
 
     format!(
         r#"# Apply Approved PR Review Fixes

@@ -100,6 +100,8 @@ pub async fn analyze_pr_comments(task_id: String) -> Result<crate::models::task:
 pub struct AddressPrReviewOptions {
     pub auto_push: bool,
     pub auto_reply: bool,
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 pub async fn address_pr_review(

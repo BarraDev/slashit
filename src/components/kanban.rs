@@ -148,6 +148,7 @@ pub fn Kanban(
     let pr_review_error = RwSignal::new(None::<String>);
     let pr_review_auto_push = RwSignal::new(true);
     let pr_review_auto_reply = RwSignal::new(true);
+    let pr_review_dry_run = RwSignal::new(false);
     let pr_review_last_apply = RwSignal::new(None::<PrReviewApplyResult>);
     let show_pr_candidates_modal = RwSignal::new(false);
     let pr_candidate_task = RwSignal::new(None::<Task>);
@@ -468,6 +469,7 @@ pub fn Kanban(
                 error=pr_review_error
                 auto_push=pr_review_auto_push
                 auto_reply=pr_review_auto_reply
+                dry_run=pr_review_dry_run
                 last_apply=pr_review_last_apply
                 set_tasks=set_tasks_signal
             />
@@ -735,6 +737,7 @@ fn PrReviewModal(
     error: RwSignal<Option<String>>,
     auto_push: RwSignal<bool>,
     auto_reply: RwSignal<bool>,
+    dry_run: RwSignal<bool>,
     last_apply: RwSignal<Option<PrReviewApplyResult>>,
     set_tasks: WriteSignal<Vec<Task>>,
 ) -> impl IntoView {
@@ -815,6 +818,7 @@ fn PrReviewModal(
         let opts = AddressPrReviewOptions {
             auto_push: auto_push.get(),
             auto_reply: auto_reply.get(),
+            dry_run: dry_run.get(),
         };
         applying.set(true);
         let task_id = task_value.id.to_string();
@@ -1087,6 +1091,18 @@ fn PrReviewModal(
                                 />
                                 "Only new since last apply"
                             </label>
+                            <label
+                                class="flex items-center gap-1.5 cursor-pointer"
+                                title="Run the agent read-only: describe what it would change without editing, pushing, or replying"
+                            >
+                                <input
+                                    type="checkbox"
+                                    class="accent-yellow-500"
+                                    prop:checked=move || dry_run.get()
+                                    on:change=move |ev| dry_run.set(event_target_checked(&ev))
+                                />
+                                "Dry run (no edits)"
+                            </label>
                         </div>
                         <div class="flex items-center gap-2">
                             <button
@@ -1122,7 +1138,9 @@ fn PrReviewModal(
                                 disabled=move || loading.get() || applying.get() || discussing.get() || approved_fix_count() == 0
                             >
                                 {move || if applying.get() {
-                                    "Applying...".to_string()
+                                    if dry_run.get() { "Planning...".to_string() } else { "Applying...".to_string() }
+                                } else if dry_run.get() {
+                                    format!("Dry-run {} fixes", approved_fix_count())
                                 } else {
                                     format!("Apply {} fixes", approved_fix_count())
                                 }}
