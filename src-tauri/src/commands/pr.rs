@@ -619,10 +619,12 @@ pub async fn address_pr_review(
             let body = build_reply_body(item);
             match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
                 Ok(()) => replies_posted += 1,
-                Err(e) => reply_errors.push(match item.comment_id {
-                    Some(id) => format!("comment {}: {}", id, e),
-                    None => format!("comment <none>: {}", e),
-                }),
+                Err(e) => {
+                    let label = item.comment_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "<none>".to_string());
+                    reply_errors.push(format!("comment {}: {}", label, e));
+                }
             }
         }
     }

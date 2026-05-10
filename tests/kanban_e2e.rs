@@ -141,8 +141,6 @@ mod kanban_tests {
 /// Integration tests that can run without browser
 #[cfg(test)]
 mod integration_tests {
-    use uuid::Uuid;
-
     /// Test task reorder logic
     #[test]
     fn test_reorder_logic() {

@@ -740,6 +740,13 @@ fn PrReviewModal(
 ) -> impl IntoView {
     let show_raw_comments = RwSignal::new(false);
 
+    // Reactive count of items that are both Fix-decisioned and user-approved.
+    let approved_fix_count = move || plan.get()
+        .map(|p| p.items.iter()
+            .filter(|i| i.approved && matches!(i.decision, PrReviewDecisionKind::Fix))
+            .count())
+        .unwrap_or(0);
+
     let trigger_analyze = move |force: bool| {
         let Some(task_value) = task.get() else { return; };
         if !force {
@@ -773,10 +780,7 @@ fn PrReviewModal(
             toast::error("No plan loaded".to_string());
             return;
         };
-        let approved_count = current_plan.items.iter()
-            .filter(|i| i.approved && matches!(i.decision, PrReviewDecisionKind::Fix))
-            .count();
-        if approved_count == 0 {
+        if approved_fix_count() == 0 {
             toast::error("Approve at least one Fix item before applying".to_string());
             return;
         }
@@ -1026,11 +1030,12 @@ fn PrReviewModal(
                             <button
                                 class="px-4 py-1.5 rounded-lg text-sm bg-yellow-500 text-black font-medium hover:bg-yellow-400 transition-colors disabled:opacity-40 disabled:hover:bg-yellow-500"
                                 on:click=on_apply
-                                disabled=move || loading.get() || applying.get() || plan.get().map(|p| p.items.iter().filter(|i| i.approved && matches!(i.decision, PrReviewDecisionKind::Fix)).count() == 0).unwrap_or(true)
+                                disabled=move || loading.get() || applying.get() || approved_fix_count() == 0
                             >
-                                {move || if applying.get() { "Applying...".to_string() } else {
-                                    let n = plan.get().map(|p| p.items.iter().filter(|i| i.approved && matches!(i.decision, PrReviewDecisionKind::Fix)).count()).unwrap_or(0);
-                                    format!("Apply {} approved", n)
+                                {move || if applying.get() {
+                                    "Applying...".to_string()
+                                } else {
+                                    format!("Apply {} approved", approved_fix_count())
                                 }}
                             </button>
                         </div>
@@ -1050,39 +1055,38 @@ fn render_review_item(
     let related = plan.get_untracked()
         .and_then(|p| comment_id.and_then(|id| p.comments.into_iter().find(|c| c.id == Some(id))));
 
-    let update_item = move |f: Box<dyn Fn(&mut PrReviewItem)>| {
+    // Apply a mutation to the item at `idx` inside the (possibly absent) plan.
+    let update_item = move |mutate: &dyn Fn(&mut PrReviewItem)| {
         plan.update(|opt| {
-            if let Some(p) = opt.as_mut() {
-                if let Some(it) = p.items.get_mut(idx) {
-                    f(it);
-                }
+            if let Some(it) = opt.as_mut().and_then(|p| p.items.get_mut(idx)) {
+                mutate(it);
             }
         });
     };
 
     let toggle_approved = move |ev: leptos::ev::Event| {
         let v = event_target_checked(&ev);
-        update_item(Box::new(move |it| it.approved = v));
+        update_item(&|it| it.approved = v);
     };
     let on_decision_change = move |ev: leptos::ev::Event| {
-        let v = event_target_value(&ev);
-        let decision = match v.as_str() {
+        let decision = match event_target_value(&ev).as_str() {
             "fix" => PrReviewDecisionKind::Fix,
             "skip" => PrReviewDecisionKind::Skip,
             _ => PrReviewDecisionKind::Question,
         };
-        update_item(Box::new(move |it| {
+        let approved = matches!(decision, PrReviewDecisionKind::Fix);
+        update_item(&|it| {
             it.decision = decision.clone();
-            it.approved = matches!(it.decision, PrReviewDecisionKind::Fix);
-        }));
+            it.approved = approved;
+        });
     };
     let on_reasoning_input = move |ev: leptos::ev::Event| {
         let v = event_target_value(&ev);
-        update_item(Box::new(move |it| it.reasoning = v.clone()));
+        update_item(&|it| it.reasoning = v.clone());
     };
     let on_change_input = move |ev: leptos::ev::Event| {
         let v = event_target_value(&ev);
-        update_item(Box::new(move |it| it.proposed_change = v.clone()));
+        update_item(&|it| it.proposed_change = v.clone());
     };
 
     let location = related.as_ref().map(|c| match (&c.path, c.line) {
@@ -1093,12 +1097,11 @@ fn render_review_item(
     let original_body = related.as_ref().map(|c| c.body.clone());
     let author = related.as_ref().map(|c| c.author.clone()).unwrap_or_default();
 
-    let (decision_class, decision_label) = match item.decision {
-        PrReviewDecisionKind::Fix => ("border-emerald-500/30 bg-emerald-500/[0.04]", "Fix"),
-        PrReviewDecisionKind::Skip => ("border-white/10 bg-white/[0.02]", "Skip"),
-        PrReviewDecisionKind::Question => ("border-amber-500/30 bg-amber-500/[0.04]", "Question"),
+    let decision_class = match item.decision {
+        PrReviewDecisionKind::Fix => "border-emerald-500/30 bg-emerald-500/[0.04]",
+        PrReviewDecisionKind::Skip => "border-white/10 bg-white/[0.02]",
+        PrReviewDecisionKind::Question => "border-amber-500/30 bg-amber-500/[0.04]",
     };
-    let _ = decision_label;
 
     let summary = item.summary.clone();
     let reasoning = item.reasoning.clone();
