@@ -177,6 +177,14 @@ pub struct PrReviewApplyResult {
     pub replies_posted: u32,
     #[serde(default)]
     pub reply_errors: Vec<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub failed_ids: Vec<u64>,
+    #[serde(default)]
+    pub fix_errors: Vec<String>,
+    #[serde(default)]
+    pub push_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

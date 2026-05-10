@@ -188,6 +188,25 @@ pub struct PrReviewApplyResult {
     pub replies_posted: u32,
     #[serde(default)]
     pub reply_errors: Vec<String>,
+    /// True when this result came from a read-only dry run — no edits, push,
+    /// or replies actually happened. Lets the UI label the summary as a preview
+    /// instead of a real apply.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Items the agent attempted but failed (e.g. claude exited non-zero for
+    /// that item). Distinct from `skipped_ids` (user-marked skip/not approved).
+    #[serde(default)]
+    pub failed_ids: Vec<u64>,
+    /// One human-readable error per failed item, in the form
+    /// `"comment <id>: <error>"`. Surfaced in the modal alongside the agent
+    /// summary so the user knows which items need manual attention.
+    #[serde(default)]
+    pub fix_errors: Vec<String>,
+    /// Set when `auto_push=true` and the push failed AFTER at least one fix
+    /// was applied. The fixes are still on disk; this records why the branch
+    /// did not reach the remote.
+    #[serde(default)]
+    pub push_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
