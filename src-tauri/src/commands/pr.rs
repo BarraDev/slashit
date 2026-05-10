@@ -3,7 +3,6 @@ use crate::domain::task::{
     ExternalRef, PrCommentKind, PrReviewApplyResult, PrReviewComment, PrReviewDecision,
     PrReviewItem, PrReviewPlan,
 };
-use crate::agents::runner::{ClaudeRunConfig, ClaudeRunner};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -931,34 +930,94 @@ async fn post_pr_reply(
 
 async fn run_claude_pr_helper(prompt: String, working_dir: String, can_edit: bool) -> Result<String, String> {
     let allowed_tools = if can_edit {
-        vec![
-            "Read".to_string(), "Edit".to_string(), "Write".to_string(),
-            "Bash".to_string(), "Glob".to_string(), "Grep".to_string(),
-        ]
+        "Read,Edit,Write,Bash,Glob,Grep"
     } else {
-        vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()]
+        "Read,Glob,Grep"
     };
+    let session_id = Uuid::new_v4().to_string();
 
-    let runner = ClaudeRunner::start(ClaudeRunConfig {
-        prompt,
-        working_dir,
-        allowed_tools,
-        max_turns: Some(if can_edit { 30 } else { 12 }),
-        max_budget_usd: None,
-        session_id: Some(Uuid::new_v4().to_string()),
-        resume_session: None,
-        model: None,
-        system_prompt: None,
-        disable_mcp: true,
-        permission_mode: None,
-    }).await?;
+    eprintln!(
+        "[pr-review] spawning claude helper (can_edit={}, prompt_chars={})",
+        can_edit, prompt.len(),
+    );
 
-    let wait_result = runner.wait().await;
-    let output = runner.get_output().await;
-    let _ = runner.kill().await;
-    wait_result?;
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.arg("-p").arg(&prompt)
+        .arg("--output-format").arg("stream-json")
+        .arg("--verbose")
+        .arg("--allowedTools").arg(allowed_tools)
+        .arg("--dangerously-skip-permissions")
+        .arg("--max-turns").arg("30")
+        .arg("--session-id").arg(&session_id)
+        .arg("--strict-mcp-config")
+        .current_dir(&working_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
-    Ok(output)
+    let output = cmd.output().await
+        .map_err(|e| format!("Failed to spawn claude: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    eprintln!(
+        "[pr-review] claude exit={} stdout={}B stderr={}B",
+        output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+        stdout.len(), stderr.len(),
+    );
+
+    if !output.status.success() {
+        let tail = stderr.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
+        return Err(format!(
+            "claude exited {} — {}",
+            output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+            if tail.is_empty() { "no stderr" } else { &tail },
+        ));
+    }
+
+    let extracted = extract_text_from_stream_json(&stdout);
+    if extracted.trim().is_empty() {
+        let stderr_tail = stderr.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        eprintln!(
+            "[pr-review] claude helper produced empty extracted text (can_edit={}). Stderr tail:\n{}",
+            can_edit,
+            if stderr_tail.is_empty() { "(empty)" } else { &stderr_tail },
+        );
+    }
+    Ok(extracted)
+}
+
+/// Pull the final text/result from a Claude CLI `--output-format stream-json` blob.
+/// Prefers the terminal `result` event; falls back to concatenating text blocks
+/// from assistant messages.
+fn extract_text_from_stream_json(stdout: &str) -> String {
+    let mut result_text: Option<String> = None;
+    let mut assistant_text = String::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match msg_type {
+            "result" => {
+                if let Some(text) = json.get("result").and_then(|r| r.as_str()) {
+                    result_text = Some(text.to_string());
+                }
+            }
+            "assistant" => {
+                let Some(content) = json.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else { continue; };
+                for block in content {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            assistant_text.push_str(text);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    result_text.unwrap_or(assistant_text)
 }
 
 async fn create_pr_inner(

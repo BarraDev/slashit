@@ -54,6 +54,9 @@ pub struct ClaudeRunner {
     accumulated_output: Arc<RwLock<String>>,
     /// Set to the error text if the Result event has is_error: true
     result_error: Arc<RwLock<Option<String>>>,
+    /// Handle to the stdout reader task. `wait()` joins this before returning so
+    /// callers can read the full accumulated output without racing the reader.
+    reader_handle: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 impl ClaudeRunner {
@@ -104,6 +107,7 @@ impl ClaudeRunner {
 
         let child = cmd.spawn()
             .map_err(|e| format!("Failed to spawn claude: {}. Is claude CLI installed?", e))?;
+        eprintln!("[claude-runner] spawned pid={:?}", child.id());
 
         let (event_tx, _) = broadcast::channel(512);
 
@@ -113,9 +117,11 @@ impl ClaudeRunner {
             session_id: Arc::new(Mutex::new(config.session_id)),
             accumulated_output: Arc::new(RwLock::new(String::new())),
             result_error: Arc::new(RwLock::new(None)),
+            reader_handle: Mutex::new(None),
         };
 
-        runner.start_reader();
+        let handle = runner.start_reader();
+        *runner.reader_handle.lock().await = Some(handle);
 
         Ok(runner)
     }
@@ -158,6 +164,11 @@ impl ClaudeRunner {
             Some(handle) => handle.await.unwrap_or_default(),
             None => String::new(),
         };
+        // Wait for the stdout reader to drain before callers read accumulated_output.
+        // Without this, get_output() can race the reader and return partial/empty text.
+        if let Some(handle) = self.reader_handle.lock().await.take() {
+            let _ = handle.await;
+        }
 
         if !status.success() {
             let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string());
@@ -181,7 +192,7 @@ impl ClaudeRunner {
         Ok(true)
     }
 
-    fn start_reader(&self) {
+    fn start_reader(&self) -> tauri::async_runtime::JoinHandle<()> {
         let child = self.child.clone();
         let event_tx = self.event_tx.clone();
         let session_id = self.session_id.clone();
@@ -214,6 +225,17 @@ impl ClaudeRunner {
                                     ClaudeEvent::TextDelta { text } => {
                                         accumulated_output.write().await.push_str(text);
                                     }
+                                    ClaudeEvent::AssistantMessage { content } => {
+                                        if let Some(arr) = content.as_array() {
+                                            for block in arr {
+                                                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                                        accumulated_output.write().await.push_str(text);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     ClaudeEvent::Result { text, is_error, .. } => {
                                         let mut output = accumulated_output.write().await;
                                         if !output.is_empty() {
@@ -239,7 +261,7 @@ impl ClaudeRunner {
                     }
                 }
             }
-        });
+        })
     }
 }
 
