@@ -885,7 +885,7 @@ fn PrReviewModal(
                 }
             >
                 <div
-                    class="w-full max-w-4xl max-h-[90vh] bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl overflow-hidden flex flex-col"
+                    class="w-full max-w-6xl max-h-[90vh] bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl overflow-hidden flex flex-col"
                     on:click=move |e| e.stop_propagation()
                 >
                     <div class="flex items-start justify-between px-5 py-4 border-b border-white/10 gap-4">
@@ -1245,7 +1245,7 @@ fn render_review_item(
                     <div class="text-sm text-white/90 font-medium">{summary}</div>
                 </div>
                 <select
-                    class="text-xs bg-white/[0.05] border border-white/10 rounded px-2 py-1 text-white/80"
+                    class="text-xs bg-white/[0.05] border border-white/10 rounded px-2 py-1 text-white/80 flex-shrink-0"
                     on:change=on_decision_change
                 >
                     <option value="fix" selected=decision_value == "fix">"Fix"</option>
@@ -1261,27 +1261,29 @@ fn render_review_item(
                 </details>
             })}
 
-            <label class="block">
-                <span class="text-[10px] uppercase tracking-wide text-white/40">"Reply / reasoning"</span>
-                <textarea
-                    class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50"
-                    rows="2"
-                    on:input=on_reasoning_input
-                    prop:value=reasoning
-                    placeholder="What you would tell the reviewer. Posted as the PR reply when auto-reply is on."
-                ></textarea>
-            </label>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                <label class="block">
+                    <span class="text-[10px] uppercase tracking-wide text-white/40">"Reply / reasoning"</span>
+                    <textarea
+                        class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50"
+                        rows="2"
+                        on:input=on_reasoning_input
+                        prop:value=reasoning
+                        placeholder="What you would tell the reviewer. Posted as the PR reply when auto-reply is on."
+                    ></textarea>
+                </label>
 
-            <label class="block">
-                <span class="text-[10px] uppercase tracking-wide text-white/40">"Proposed change"</span>
-                <textarea
-                    class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50"
-                    rows="2"
-                    on:input=on_change_input
-                    prop:value=proposed
-                    placeholder="What the agent will change if approved."
-                ></textarea>
-            </label>
+                <label class="block">
+                    <span class="text-[10px] uppercase tracking-wide text-white/40">"Proposed change"</span>
+                    <textarea
+                        class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50"
+                        rows="2"
+                        on:input=on_change_input
+                        prop:value=proposed
+                        placeholder="What the agent will change if approved."
+                    ></textarea>
+                </label>
+            </div>
 
             {is_question.then(|| view! {
                 <label class="block">
