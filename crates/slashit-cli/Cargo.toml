@@ -1,0 +1,19 @@
+[package]
+name = "slashit"
+version = "0.1.0"
+edition = "2021"
+authors = ["Barradev Digital Services <admin@barradev.com>"]
+license = "Apache-2.0"
+description = "CLI tool for controlling the SlashIt AI agent workspace manager"
+repository = "https://github.com/BarraDev/slashit"
+
+[[bin]]
+name = "slashit"
+path = "src/main.rs"
+
+[dependencies]
+slashit-ipc = { path = "../slashit-ipc" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time"] }
+anyhow = "1"

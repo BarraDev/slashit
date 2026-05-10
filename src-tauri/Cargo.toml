@@ -1,0 +1,46 @@
+[package]
+name = "slashit-app"
+version = "0.1.0"
+description = "AI agent workspace manager - Tauri v2 desktop app with Kanban, terminals, and queue execution"
+authors = ["Barradev Digital Services <admin@barradev.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/BarraDev/slashit"
+edition = "2021"
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "slashit_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1"
+sysinfo = "0.32"
+directories = "5"
+toml = "0.8"
+walkdir = "2.5.0"
+portable-pty = "0.8"
+futures = "0.3"
+which = "8.0.0"
+dirs = "6.0.0"
+tauri-plugin-dialog = "2"
+slashit-ipc = { path = "../crates/slashit-ipc" }
+tauri-plugin-updater = "2"
+
+[dev-dependencies]
+tempfile = "3"
+mockall = "0.13"
+

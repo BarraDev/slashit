@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">SlashIt logo</title>
+  <desc id="desc">A minimalist forward slash mark inside a rounded square.</desc>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f1e5;
+      --mark: #102820;
+      --accent: #d85a2a;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #102820;
+        --mark: #f7f1e5;
+        --accent: #f0a35e;
+      }
+    }
+  </style>
+  <rect width="512" height="512" rx="112" fill="var(--bg)"/>
+  <path d="M315 77h83L197 435h-83L315 77Z" fill="var(--mark)"/>
+  <path d="M353 77h45L197 435h-45L353 77Z" fill="var(--accent)" opacity="0.9"/>
+</svg>

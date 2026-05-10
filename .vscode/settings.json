@@ -1,0 +1,6 @@
+{
+  "emmet.includeLanguages": {
+    "rust": "html"
+  },
+  "rust-analyzer.diagnostics.useRustcErrorCode": true
+}

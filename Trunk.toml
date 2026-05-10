@@ -1,0 +1,20 @@
+[build]
+target = "./index.html"
+
+[tools]
+tailwindcss = "4.1.10"
+
+[watch]
+ignore = [
+    "./src-tauri",
+    "./target",
+    "./dist",
+    "./Cargo.lock",
+    "./.git",
+    "./.jj",
+]
+
+[serve]
+port = 1420
+open = false
+ws_protocol = "ws"

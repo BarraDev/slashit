@@ -1,0 +1,33 @@
+/dist/
+/target
+
+# Test artifacts
+test-results/
+playwright-report/
+node_modules/
+nul
+
+# Auto Claude data directory
+.auto-claude/
+
+# Claude Code local settings (user-specific)
+.claude/
+.mcp.json
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Tauri signing keys
+.tauri-keys/
+
+# OS/editor files
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
