@@ -226,35 +226,35 @@ pub fn run() {
             // System tray
             {
                 use tauri::menu::{MenuBuilder, MenuItem};
-                use tauri::tray::TrayIconBuilder;
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-                let show_i = MenuItem::with_id(app, "show", "Show SlashIt", true, None::<&str>)?;
+                let toggle_i = MenuItem::with_id(app, "toggle", "Show/Hide SlashIt", true, None::<&str>)?;
                 let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-                let menu = MenuBuilder::new(app).items(&[&show_i, &quit_i]).build()?;
+                let menu = MenuBuilder::new(app).items(&[&toggle_i, &quit_i]).build()?;
                 let tray_icon = tauri::include_image!("icons/32x32.png");
 
-                TrayIconBuilder::new()
+                let tray = TrayIconBuilder::new()
                     .icon(tray_icon)
                     .menu(&menu)
-                    .show_menu_on_left_click(false)
                     .tooltip("SlashIt")
                     .on_menu_event(move |app, event| match event.id.as_ref() {
-                        "show" => show_window(app),
+                        "toggle" => toggle_window(app),
                         "quit" => request_quit(app),
                         _ => {}
                     })
                     .on_tray_icon_event(|tray, event| {
-                        use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-                        if let TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        } = event
-                        {
-                            toggle_window(tray.app_handle());
+                        if let TrayIconEvent::Click { button, button_state, .. } = event {
+                            match (button, button_state) {
+                                (MouseButton::Left, MouseButtonState::Up) => toggle_window(tray.app_handle()),
+                                _ => {}
+                            }
                         }
-                    })
-                    .build(app)?;
+                    });
+
+                #[cfg(not(target_os = "linux"))]
+                let tray = tray.show_menu_on_left_click(false);
+
+                let _tray = tray.build(app)?;
 
                 println!("SlashIt: System tray initialized");
             }
@@ -330,7 +330,14 @@ pub fn run() {
             check_worktree_exists,
             create_pr,
             bulk_create_prs,
+            sync_existing_pr,
+            find_pr_candidates,
+            get_pr_push_recovery,
+            recover_private_email_and_create_pr,
             get_pr_status,
+            analyze_pr_comments,
+            address_pr_comments,
+            refresh_task_pr_state,
             submit_stack,
             create_roadmap_feature,
             update_roadmap_feature,

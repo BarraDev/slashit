@@ -17,6 +17,9 @@ pub fn TaskContextMenu(
     on_edit: Callback<Task>,
     on_delete: Callback<Uuid>,
     on_move: Callback<(Task, TaskStatus)>,
+    on_pr_created: Callback<Task>,
+    on_analyze_pr_comments: Callback<Task>,
+    on_private_email_pr_error: Callback<Task>,
 ) -> impl IntoView {
     let (show_move_submenu, set_show_move_submenu) = signal(false);
     
@@ -229,12 +232,24 @@ pub fn TaskContextMenu(
                     let set_show = set_show;
                     let on_create_pr = move |_: leptos::ev::MouseEvent| {
                         if let Some(t) = task.get() {
+                            let mut task_after_create = t.clone();
                             let task_id = t.id.to_string();
                             set_show.set(false);
                             spawn_local(async move {
                                 match create_pr(task_id).await {
-                                    Ok(url) => toast::success(format!("PR created: {}", url)),
-                                    Err(e) => toast::error(format!("Failed to create PR: {}", e)),
+                                    Ok(url) => {
+                                        task_after_create.pr_url = Some(url.clone());
+                                        task_after_create.status = TaskStatus::PrCreated;
+                                        on_pr_created.run(task_after_create);
+                                        toast::success(format!("PR linked: {}", url));
+                                    }
+                                    Err(e) => {
+                                        if e.contains("GH007") || e.contains("private email address") {
+                                            on_private_email_pr_error.run(task_after_create);
+                                        } else {
+                                            toast::error(format!("Failed to find or create PR: {}", e));
+                                        }
+                                    }
                                 }
                             });
                         }
@@ -243,6 +258,7 @@ pub fn TaskContextMenu(
                         let can_create_pr = task.get().map(|t| {
                             matches!(t.status, TaskStatus::HumanReview | TaskStatus::Done)
                                 && t.pr_url.is_none()
+                                && !t.external_refs.iter().any(|r| r.is_pr())
                         }).unwrap_or(false);
 
                         can_create_pr.then(|| view! {
@@ -253,7 +269,35 @@ pub fn TaskContextMenu(
                                 <svg class="w-4 h-4 text-white/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
                                 </svg>
-                                "Create PR"
+                                "Find/Create PR"
+                            </button>
+                        })
+                    }
+                }
+
+                // Analyze PR comments before applying fixes
+                {
+                    let set_show = set_show;
+                    let on_analyze = move |_: leptos::ev::MouseEvent| {
+                        if let Some(t) = task.get() {
+                            set_show.set(false);
+                            on_analyze_pr_comments.run(t);
+                        }
+                    };
+                    move || {
+                        let has_pr = task.get().map(|t| {
+                            t.pr_url.is_some() || t.external_refs.iter().any(|r| r.is_pr())
+                        }).unwrap_or(false);
+
+                        has_pr.then(|| view! {
+                            <button
+                                class="w-full px-3 py-2 text-left text-sm text-white/80 hover:bg-white/10 flex items-center gap-2 transition-colors"
+                                on:click=on_analyze
+                            >
+                                <svg class="w-4 h-4 text-white/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5h6m-6 4h6m-6 4h4m5 8H6a2 2 0 01-2-2V5a2 2 0 012-2h7l5 5v11a2 2 0 01-2 2z" />
+                                </svg>
+                                "Review PR comments"
                             </button>
                         })
                     }

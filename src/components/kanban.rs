@@ -4,7 +4,7 @@ use leptos::callback::Callback;
 use wasm_bindgen::JsCast;
 use crate::models::{Task, TaskStatus};
 use crate::components::{TaskCard, TaskEditModal, TaskEditMode, toast, TaskContextMenu, DiffModal};
-use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat};
+use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_comments, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::HashSet;
 
@@ -20,7 +20,7 @@ struct ColumnData {
     empty_message: &'static str,
 }
 
-const COLUMNS: [ColumnData; 7] = [
+const COLUMNS: [ColumnData; 8] = [
     ColumnData {
         status: TaskStatus::Backlog,
         title: "Backlog",
@@ -82,9 +82,19 @@ const COLUMNS: [ColumnData; 7] = [
         empty_message: "Awaiting your review",
     },
     ColumnData {
+        status: TaskStatus::PrCreated,
+        title: "PR Open",
+        description: "Awaiting merge",
+        color_class: "border-cyan-400",
+        bg_class: "bg-cyan-400/5",
+        count_bg_class: "bg-cyan-400/20 text-cyan-200",
+        empty_icon: "",
+        empty_message: "No open PRs",
+    },
+    ColumnData {
         status: TaskStatus::Done,
         title: "Done",
-        description: "Completed",
+        description: "Merged / completed",
         color_class: "border-emerald-500",
         bg_class: "bg-emerald-500/5",
         count_bg_class: "bg-emerald-500/20 text-emerald-300",
@@ -122,6 +132,20 @@ pub fn Kanban(
     let diff_content = RwSignal::new(String::new());
     let diff_stat_content = RwSignal::new(String::new());
     let diff_title = RwSignal::new(String::new());
+    let show_pr_review_modal = RwSignal::new(false);
+    let pr_review_task = RwSignal::new(None::<Task>);
+    let pr_review_plan = RwSignal::new(String::new());
+    let pr_review_loading = RwSignal::new(false);
+    let pr_review_applying = RwSignal::new(false);
+    let pr_review_error = RwSignal::new(None::<String>);
+    let show_pr_candidates_modal = RwSignal::new(false);
+    let pr_candidate_task = RwSignal::new(None::<Task>);
+    let pr_candidates = RwSignal::new(Vec::<PrCandidate>::new());
+    let show_pr_recovery_modal = RwSignal::new(false);
+    let pr_recovery_task = RwSignal::new(None::<Task>);
+    let pr_recovery_plan = RwSignal::new(None::<PrPushRecoveryPlan>);
+    let pr_recovery_email = RwSignal::new(String::new());
+    let pr_recovery_loading = RwSignal::new(false);
 
     let project_id_modal = project_id.clone();
     
@@ -201,12 +225,91 @@ pub fn Kanban(
         }
     });
 
+    let on_pr_created = Callback::new({
+        move |updated_task: Task| {
+            set_tasks_signal.update(|tasks| {
+                if let Some(task) = tasks.iter_mut().find(|t| t.id == updated_task.id) {
+                    task.pr_url = updated_task.pr_url.clone();
+                    task.status = updated_task.status.clone();
+                    task.updated_at = updated_task.updated_at;
+                }
+            });
+        }
+    });
+
+    // Refresh PR state for any task with a linked PR on mount, so PrCreated
+    // tasks whose PR was merged externally get moved to Done.
+    {
+        let initial_pr_task_ids: Vec<String> = tasks_signal
+            .get_untracked()
+            .iter()
+            .filter(|t| t.pr_url.is_some() || t.external_refs.iter().any(|r| r.is_pr()))
+            .map(|t| t.id.to_string())
+            .collect();
+        for tid in initial_pr_task_ids {
+            spawn_local(async move {
+                if let Ok(Some(updated)) = refresh_task_pr_state(tid).await {
+                    set_tasks_signal.update(|tasks| {
+                        if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
+                            t.status = updated.status.clone();
+                            t.external_refs = updated.external_refs.clone();
+                            t.updated_at = updated.updated_at;
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    let on_analyze_pr_comments = Callback::new({
+        move |task: Task| {
+            pr_review_task.set(Some(task.clone()));
+            pr_review_plan.set(String::new());
+            pr_review_error.set(None);
+            pr_review_loading.set(true);
+            show_pr_review_modal.set(true);
+            spawn_local(async move {
+                match analyze_pr_comments(task.id.to_string()).await {
+                    Ok(plan) => {
+                        if plan.trim().is_empty() {
+                            pr_review_plan.set(String::new());
+                            pr_review_error.set(Some(
+                                "Triage helper returned an empty plan. Edit a plan manually below or try again.".to_string(),
+                            ));
+                        } else {
+                            pr_review_plan.set(plan);
+                            pr_review_error.set(None);
+                        }
+                    }
+                    Err(e) => {
+                        pr_review_plan.set(String::new());
+                        pr_review_error.set(Some(format!("Failed to analyze PR comments: {}", e)));
+                    }
+                }
+                pr_review_loading.set(false);
+            });
+        }
+    });
+
+    let on_private_email_pr_error = Callback::new({
+        move |task: Task| {
+            request_pr_push_recovery(
+                task,
+                show_pr_recovery_modal,
+                pr_recovery_task,
+                pr_recovery_plan,
+                pr_recovery_email,
+                pr_recovery_loading,
+            );
+        }
+    });
+
     // Calculate stats
     let task_stats = move || {
         let tasks = tasks_signal.get();
         let total = tasks.len();
         let in_progress = tasks.iter().filter(|t| t.status == TaskStatus::InProgress).count();
-        let done = tasks.iter().filter(|t| t.status == TaskStatus::Done || t.status == TaskStatus::PrCreated).count();
+        let done = tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
         (total, in_progress, done)
     };
 
@@ -281,6 +384,11 @@ pub fn Kanban(
                             diff_content=diff_content
                             diff_stat_content=diff_stat_content
                             diff_title=diff_title
+                            on_pr_created=on_pr_created
+                            on_analyze_pr_comments=on_analyze_pr_comments
+                            show_pr_candidates_modal=show_pr_candidates_modal
+                            pr_candidate_task=pr_candidate_task
+                            pr_candidates=pr_candidates
                         />
                     }
                 }).collect::<Vec<_>>()}
@@ -305,6 +413,9 @@ pub fn Kanban(
                 on_edit=on_context_edit
                 on_delete=on_task_delete
                 on_move=on_context_move
+                on_pr_created=on_pr_created
+                on_analyze_pr_comments=on_analyze_pr_comments
+                on_private_email_pr_error=on_private_email_pr_error
             />
 
             // Diff modal (shared across all task cards)
@@ -319,7 +430,377 @@ pub fn Kanban(
                     />
                 }
             }}
+
+            <PrReviewModal
+                show=show_pr_review_modal
+                task=pr_review_task
+                plan=pr_review_plan
+                loading=pr_review_loading
+                applying=pr_review_applying
+                error=pr_review_error
+            />
+
+            <PrCandidatesModal
+                show=show_pr_candidates_modal
+                task=pr_candidate_task
+                candidates=pr_candidates
+                on_pr_created=on_pr_created
+            />
+
+            <PrPushRecoveryModal
+                show=show_pr_recovery_modal
+                task=pr_recovery_task
+                plan=pr_recovery_plan
+                email=pr_recovery_email
+                loading=pr_recovery_loading
+                on_pr_created=on_pr_created
+            />
         </div>
+    }
+}
+
+fn request_pr_push_recovery(
+    task_value: Task,
+    show: RwSignal<bool>,
+    task: RwSignal<Option<Task>>,
+    plan: RwSignal<Option<PrPushRecoveryPlan>>,
+    email: RwSignal<String>,
+    loading: RwSignal<bool>,
+) {
+    task.set(Some(task_value.clone()));
+    plan.set(None);
+    email.set(String::new());
+    loading.set(true);
+    show.set(true);
+
+    spawn_local(async move {
+        match get_pr_push_recovery(task_value.id.to_string()).await {
+            Ok(recovery_plan) => {
+                email.set(recovery_plan.suggested_email.clone().unwrap_or_default());
+                plan.set(Some(recovery_plan));
+            }
+            Err(e) => {
+                show.set(false);
+                toast::error(format!("Could not prepare PR recovery: {}", e));
+            }
+        }
+        loading.set(false);
+    });
+}
+
+#[component]
+fn PrCandidatesModal(
+    show: RwSignal<bool>,
+    task: RwSignal<Option<Task>>,
+    candidates: RwSignal<Vec<PrCandidate>>,
+    on_pr_created: Callback<Task>,
+) -> impl IntoView {
+    view! {
+        <Show when=move || show.get()>
+            <div
+                class="fixed inset-0 z-[70] bg-black/60 flex items-center justify-center p-4"
+                on:click=move |_| show.set(false)
+            >
+                <div
+                    class="w-full max-w-2xl bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl overflow-hidden"
+                    on:click=move |e| e.stop_propagation()
+                >
+                    <div class="flex items-center justify-between px-5 py-4 border-b border-white/10">
+                        <div>
+                            <h2 class="text-lg font-semibold text-white/90">"Link Existing PR"</h2>
+                            <p class="text-xs text-white/40">"Choose the PR that belongs to this task."</p>
+                        </div>
+                        <button
+                            class="p-2 rounded-md hover:bg-white/10 text-white/60 transition-colors"
+                            on:click=move |_| show.set(false)
+                            aria-label="Close"
+                        >
+                            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </div>
+
+                    <div class="p-4 space-y-2 max-h-[60vh] overflow-y-auto">
+                        {move || candidates.get().into_iter().map(|candidate| {
+                            let candidate_for_click = candidate.clone();
+                            view! {
+                                <button
+                                    class="w-full text-left p-3 rounded-lg bg-white/[0.04] border border-white/10 hover:border-yellow-500/50 hover:bg-yellow-500/10 transition-colors"
+                                    on:click=move |_| {
+                                        let Some(task_value) = task.get() else {
+                                            return;
+                                        };
+                                        let pr_url = candidate_for_click.url.clone();
+                                        show.set(false);
+                                        spawn_local(async move {
+                                            match link_existing_pr(task_value.id.to_string(), pr_url.clone()).await {
+                                                Ok(Some(updated)) => {
+                                                    on_pr_created.run(updated);
+                                                    toast::success(format!("Linked PR: {}", pr_url));
+                                                }
+                                                Ok(None) => toast::error("Task not found while linking PR".to_string()),
+                                                Err(e) => toast::error(format!("Failed to link PR: {}", e)),
+                                            }
+                                        });
+                                    }
+                                >
+                                    <div class="flex items-center justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <div class="text-sm font-medium text-white/90 truncate">
+                                                {format!("#{} {}", candidate.number, candidate.title)}
+                                            </div>
+                                            <div class="text-xs text-white/45 truncate">
+                                                {format!("{} - {} - {}", candidate.state, candidate.head_ref_name, candidate.reason)}
+                                            </div>
+                                        </div>
+                                        <span class="text-xs text-yellow-300 flex-shrink-0">"Link"</span>
+                                    </div>
+                                </button>
+                            }
+                        }).collect_view()}
+                    </div>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
+fn PrPushRecoveryModal(
+    show: RwSignal<bool>,
+    task: RwSignal<Option<Task>>,
+    plan: RwSignal<Option<PrPushRecoveryPlan>>,
+    email: RwSignal<String>,
+    loading: RwSignal<bool>,
+    on_pr_created: Callback<Task>,
+) -> impl IntoView {
+    let on_confirm = move |_| {
+        let Some(task_value) = task.get() else {
+            return;
+        };
+        let author_email = email.get();
+        if author_email.trim().is_empty() || !author_email.contains('@') {
+            toast::error("Enter a valid GitHub noreply email".to_string());
+            return;
+        }
+
+        loading.set(true);
+        spawn_local(async move {
+            match recover_private_email_and_create_pr(task_value.id.to_string(), author_email).await {
+                Ok(url) => {
+                    let mut updated = task_value;
+                    updated.pr_url = Some(url.clone());
+                    updated.status = TaskStatus::PrCreated;
+                    on_pr_created.run(updated);
+                    show.set(false);
+                    toast::success(format!("PR linked: {}", url));
+                }
+                Err(e) => toast::error(format!("Failed to recover PR push: {}", e)),
+            }
+            loading.set(false);
+        });
+    };
+
+    view! {
+        <Show when=move || show.get()>
+            <div
+                class="fixed inset-0 z-[75] bg-black/60 flex items-center justify-center p-4"
+                on:click=move |_| {
+                    if !loading.get() {
+                        show.set(false);
+                    }
+                }
+            >
+                <div
+                    class="w-full max-w-xl bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl overflow-hidden"
+                    on:click=move |e| e.stop_propagation()
+                >
+                    <div class="flex items-center justify-between px-5 py-4 border-b border-white/10">
+                        <div class="min-w-0">
+                            <h2 class="text-lg font-semibold text-white/90">"Fix PR Push"</h2>
+                            <p class="text-xs text-white/40 truncate">
+                                {move || task.get().map(|t| t.title).unwrap_or_else(|| "GitHub rejected the branch push".to_string())}
+                            </p>
+                        </div>
+                        <button
+                            class="p-2 rounded-md hover:bg-white/10 text-white/60 transition-colors"
+                            on:click=move |_| show.set(false)
+                            disabled=move || loading.get()
+                            aria-label="Close"
+                        >
+                            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </div>
+
+                    <div class="p-5 space-y-4">
+                        <Show
+                            when=move || !loading.get() || plan.get().is_some()
+                            fallback=|| view! {
+                                <div class="py-10 text-center text-sm text-white/50">"Inspecting task branch..."</div>
+                            }
+                        >
+                            {move || plan.get().map(|p| view! {
+                                <div class="space-y-3">
+                                    <div class="rounded-lg border border-yellow-500/25 bg-yellow-500/10 p-3 text-sm text-yellow-100">
+                                        "GitHub rejected this push because the task commit author email is private. SlashIt can set the repo-local author email, rewrite only the task branch tip author, then retry without creating a duplicate PR."
+                                    </div>
+
+                                    <div class="grid grid-cols-[110px_1fr] gap-x-3 gap-y-2 text-xs">
+                                        <span class="text-white/40">"Branch"</span>
+                                        <span class="text-white/80 truncate">{p.branch_name.clone()}</span>
+                                        <span class="text-white/40">"Commit"</span>
+                                        <span class="text-white/80 truncate">{format!("{} {}", p.commit_sha.chars().take(12).collect::<String>(), p.commit_subject)}</span>
+                                        <span class="text-white/40">"Current author"</span>
+                                        <span class="text-white/80 truncate">{format!("{} <{}>", p.author_name, p.author_email)}</span>
+                                    </div>
+
+                                    <label class="block space-y-1">
+                                        <span class="text-xs font-medium text-white/60">"GitHub noreply email"</span>
+                                        <input
+                                            class="w-full px-3 py-2 bg-white/[0.04] border border-white/10 rounded-lg text-sm text-white/90 focus:outline-none focus:border-yellow-500/50"
+                                            prop:value=move || email.get()
+                                            on:input=move |ev| email.set(event_target_value(&ev))
+                                            placeholder="12345+user@users.noreply.github.com"
+                                        />
+                                    </label>
+                                </div>
+                            })}
+                        </Show>
+                    </div>
+
+                    <div class="flex justify-end gap-2 px-5 py-4 border-t border-white/10">
+                        <button
+                            class="px-3 py-2 text-sm rounded-lg text-white/70 hover:bg-white/10 transition-colors"
+                            on:click=move |_| show.set(false)
+                            disabled=move || loading.get()
+                        >
+                            "Cancel"
+                        </button>
+                        <button
+                            class="px-3 py-2 text-sm rounded-lg bg-yellow-500 text-black font-medium hover:bg-yellow-400 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                            on:click=on_confirm
+                            disabled=move || loading.get() || plan.get().is_none()
+                        >
+                            {move || if loading.get() { "Fixing..." } else { "Fix and Create PR" }}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
+fn PrReviewModal(
+    show: RwSignal<bool>,
+    task: RwSignal<Option<Task>>,
+    plan: RwSignal<String>,
+    loading: RwSignal<bool>,
+    applying: RwSignal<bool>,
+    error: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let on_apply = move |_| {
+        let Some(task_value) = task.get() else {
+            return;
+        };
+        let approved_plan = plan.get();
+        if approved_plan.trim().is_empty() {
+            toast::error("Nothing to apply yet".to_string());
+            return;
+        }
+
+        applying.set(true);
+        spawn_local(async move {
+            match address_pr_comments(task_value.id.to_string(), approved_plan).await {
+                Ok(summary) => {
+                    toast::success("PR review fixes applied".to_string());
+                    plan.set(summary);
+                }
+                Err(e) => toast::error(format!("Failed to apply PR fixes: {}", e)),
+            }
+            applying.set(false);
+        });
+    };
+
+    view! {
+        <Show when=move || show.get()>
+            <div
+                class="fixed inset-0 z-[70] bg-black/60 flex items-center justify-center p-4"
+                on:click=move |_| {
+                    if !applying.get() {
+                        show.set(false);
+                    }
+                }
+            >
+                <div
+                    class="w-full max-w-3xl max-h-[86vh] bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl overflow-hidden flex flex-col"
+                    on:click=move |e| e.stop_propagation()
+                >
+                    <div class="flex items-center justify-between px-5 py-4 border-b border-white/10">
+                        <div class="min-w-0">
+                            <h2 class="text-lg font-semibold text-white/90">"PR Comment Review"</h2>
+                            <p class="text-xs text-white/40 truncate">
+                                {move || task.get().map(|t| t.title).unwrap_or_else(|| "Review comments before applying fixes".to_string())}
+                            </p>
+                        </div>
+                        <button
+                            class="p-2 rounded-md hover:bg-white/10 text-white/60 transition-colors"
+                            on:click=move |_| show.set(false)
+                            disabled=move || applying.get()
+                            aria-label="Close"
+                        >
+                            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </div>
+
+                    <div class="p-5 overflow-y-auto space-y-3">
+                        <Show
+                            when=move || !loading.get()
+                            fallback=|| view! {
+                                <div class="py-12 text-center text-sm text-white/50">"Analyzing PR comments..."</div>
+                            }
+                        >
+                            {move || error.get().map(|msg| view! {
+                                <div class="px-3 py-2 rounded-md border border-red-500/30 bg-red-500/10 text-xs text-red-200">
+                                    {msg}
+                                </div>
+                            })}
+                            <textarea
+                                class="w-full min-h-[360px] bg-white/[0.04] border border-white/10 rounded-lg p-4 text-sm text-white/80 font-mono leading-relaxed resize-y focus:outline-none focus:border-yellow-500/50"
+                                prop:value=move || plan.get()
+                                on:input=move |ev| plan.set(event_target_value(&ev))
+                                placeholder="The agent's triage plan will appear here. Edit it before approving if needed."
+                            ></textarea>
+                            <p class="text-xs text-white/40">
+                                "Only the plan shown here is approved. Edit out anything you do not want the agent to change."
+                            </p>
+                        </Show>
+                    </div>
+
+                    <div class="flex items-center justify-end gap-2 px-5 py-4 border-t border-white/10">
+                        <button
+                            class="px-4 py-2 rounded-lg text-sm text-white/60 hover:bg-white/10 transition-colors disabled:opacity-40"
+                            on:click=move |_| show.set(false)
+                            disabled=move || applying.get()
+                        >
+                            "Cancel"
+                        </button>
+                        <button
+                            class="px-4 py-2 rounded-lg text-sm bg-yellow-500 text-black font-medium hover:bg-yellow-400 transition-colors disabled:opacity-40 disabled:hover:bg-yellow-500"
+                            on:click=on_apply
+                            disabled=move || loading.get() || applying.get() || plan.get().trim().is_empty()
+                        >
+                            {move || if applying.get() { "Applying..." } else { "Apply Approved Fixes" }}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </Show>
     }
 }
 
@@ -346,6 +827,11 @@ fn KanbanColumn(
     diff_content: RwSignal<String>,
     diff_stat_content: RwSignal<String>,
     diff_title: RwSignal<String>,
+    on_pr_created: Callback<Task>,
+    on_analyze_pr_comments: Callback<Task>,
+    show_pr_candidates_modal: RwSignal<bool>,
+    pr_candidate_task: RwSignal<Option<Task>>,
+    pr_candidates: RwSignal<Vec<PrCandidate>>,
 ) -> impl IntoView {
     let status_drop = status.clone();
     let status_tasks = status.clone();
@@ -372,14 +858,7 @@ fn KanbanColumn(
                 // Get tasks in the target column sorted by position
                 let mut column_tasks: Vec<&Task> = tasks_snapshot
                     .iter()
-                    .filter(|t| {
-                        let matches_status = if new_status == TaskStatus::Done {
-                            t.status == TaskStatus::Done || t.status == TaskStatus::PrCreated
-                        } else {
-                            t.status == new_status
-                        };
-                        matches_status && t.id.to_string() != task_id
-                    })
+                    .filter(|t| t.status == new_status && t.id.to_string() != task_id)
                     .collect();
                 column_tasks.sort_by_key(|t| t.position);
                 
@@ -398,22 +877,13 @@ fn KanbanColumn(
                 // Default to end of column
                 let column_count = tasks_snapshot
                     .iter()
-                    .filter(|t| {
-                        let matches_status = if new_status == TaskStatus::Done {
-                            t.status == TaskStatus::Done || t.status == TaskStatus::PrCreated
-                        } else {
-                            t.status == new_status
-                        };
-                        matches_status && t.id.to_string() != task_id
-                    })
+                    .filter(|t| t.status == new_status && t.id.to_string() != task_id)
                     .count();
                 column_count as i32
             };
             
             // Determine if this is a same-column reorder or cross-column move
-            let is_same_column = current_status == new_status || 
-                (new_status == TaskStatus::Done && current_status == TaskStatus::PrCreated) ||
-                (new_status == TaskStatus::PrCreated && current_status == TaskStatus::Done);
+            let is_same_column = current_status == new_status;
                 
             spawn_local(async move {
                 // Use reorder_task for both within-column and cross-column moves
@@ -480,17 +950,10 @@ fn KanbanColumn(
         let status_tasks = status_tasks.clone();
         move || {
             let mut tasks_list: Vec<Task> = tasks.get();
-            if status_tasks == TaskStatus::Done {
-                tasks_list = tasks_list.iter()
-                    .filter(|t| t.status == TaskStatus::Done || t.status == TaskStatus::PrCreated)
-                    .cloned()
-                    .collect();
-            } else {
-                tasks_list = tasks_list.iter()
-                    .filter(|t| t.status == status_tasks.clone())
-                    .cloned()
-                    .collect();
-            }
+            tasks_list = tasks_list.iter()
+                .filter(|t| t.status == status_tasks.clone())
+                .cloned()
+                .collect();
             // Sort by position
             tasks_list.sort_by_key(|t| t.position);
             tasks_list
@@ -548,11 +1011,7 @@ fn KanbanColumn(
 
     let task_count = move || {
         let tasks = tasks.get();
-        if status_count == TaskStatus::Done {
-            tasks.iter().filter(|t| t.status == TaskStatus::Done || t.status == TaskStatus::PrCreated).count()
-        } else {
-            tasks.iter().filter(|t| t.status == status_count.clone()).count()
-        }
+        tasks.iter().filter(|t| t.status == status_count.clone()).count()
     };
 
     let status_for_drag = status.clone();
@@ -676,6 +1135,11 @@ fn KanbanColumn(
                                                 diff_content=diff_content
                                                 diff_stat_content=diff_stat_content
                                                 diff_title=diff_title
+                                                on_pr_created=on_pr_created
+                                                on_analyze_pr_comments=on_analyze_pr_comments
+                                                show_pr_candidates_modal=show_pr_candidates_modal
+                                                pr_candidate_task=pr_candidate_task
+                                                pr_candidates=pr_candidates
                                             />
                                         }
                                     }).collect::<Vec<_>>()}
@@ -728,10 +1192,16 @@ fn KanbanTaskCard(
     diff_content: RwSignal<String>,
     diff_stat_content: RwSignal<String>,
     diff_title: RwSignal<String>,
+    on_pr_created: Callback<Task>,
+    on_analyze_pr_comments: Callback<Task>,
+    show_pr_candidates_modal: RwSignal<bool>,
+    pr_candidate_task: RwSignal<Option<Task>>,
+    pr_candidates: RwSignal<Vec<PrCandidate>>,
 ) -> impl IntoView {
     let task_for_click = task.clone();
     let task_for_context = task.clone();
     let task_for_menu_btn = task.clone();
+    let task_for_pr_review = task.clone();
     let task_id = task.id.to_string();
     let task_id_for_indicator = task.id.to_string();
     let task_uuid = task.id;
@@ -1002,7 +1472,7 @@ fn KanbanTaskCard(
                 {
                     let show_diff = matches!(
                         column_status,
-                        TaskStatus::AiReview | TaskStatus::HumanReview | TaskStatus::Done
+                        TaskStatus::AiReview | TaskStatus::HumanReview | TaskStatus::Done | TaskStatus::PrCreated
                     );
                     show_diff.then(|| {
                         let task_id = task.id.to_string();
@@ -1039,6 +1509,119 @@ fn KanbanTaskCard(
                                 >
                                     "Diff"
                                 </button>
+                            </div>
+                        }
+                    })
+                }
+                // Visible PR review action for tasks that already have a PR.
+                {
+                    let has_pr = task.pr_url.is_some() || task.external_refs.iter().any(|r| r.is_pr());
+                    let can_sync_pr = matches!(task.status, TaskStatus::HumanReview | TaskStatus::Done)
+                        && !has_pr;
+
+                    (has_pr || can_sync_pr).then(|| {
+                        let task_for_pr_review = task_for_pr_review.clone();
+                        let task_for_sync_pr = task.clone();
+                        view! {
+                            <div class="flex justify-end gap-1.5 px-2 pb-1.5 -mt-1">
+                                {can_sync_pr.then(|| {
+                                    let task_for_sync_pr = task_for_sync_pr.clone();
+                                    view! {
+                                        <button
+                                            class="px-2 py-0.5 text-[10px] rounded bg-green-500/10 text-green-300 hover:bg-green-500/20 transition-colors"
+                                            on:click=move |e: web_sys::MouseEvent| {
+                                                e.stop_propagation();
+                                                let task_id = task_for_sync_pr.id.to_string();
+                                                let branch_label = task_for_sync_pr.branch_name.clone()
+                                                    .unwrap_or_else(|| "no branch".to_string());
+                                                let issue_labels: Vec<String> = task_for_sync_pr.external_refs.iter()
+                                                    .filter_map(|r| match r {
+                                                        crate::models::ExternalRef::GithubIssue { number, .. } => Some(format!("#{}", number)),
+                                                        _ => None,
+                                                    })
+                                                    .collect();
+                                                let issue_label = if issue_labels.is_empty() {
+                                                    "no linked issue".to_string()
+                                                } else {
+                                                    issue_labels.join(", ")
+                                                };
+                                                toast::info(format!("Checking PR for branch `{}` / issue {}", branch_label, issue_label));
+                                                let task_for_modal = task_for_sync_pr.clone();
+                                                spawn_local(async move {
+                                                    match find_pr_candidates(task_id.clone()).await {
+                                                        Ok(candidates) if candidates.is_empty() => {
+                                                            toast::info(format!(
+                                                                "No PR candidates found for branch `{}` / issue {}",
+                                                                branch_label,
+                                                                issue_label
+                                                            ));
+                                                        }
+                                                        Ok(candidates) if candidates.len() == 1 => {
+                                                            let candidate = candidates[0].clone();
+                                                            match link_existing_pr(task_id, candidate.url.clone()).await {
+                                                                Ok(Some(updated)) => {
+                                                                    on_pr_created.run(updated);
+                                                                    toast::success(format!("Linked PR: {}", candidate.url));
+                                                                }
+                                                                Ok(None) => toast::error("Task not found while linking PR".to_string()),
+                                                                Err(e) => toast::error(format!("Failed to link PR: {}", e)),
+                                                            }
+                                                        }
+                                                        Ok(candidates) => {
+                                                            pr_candidate_task.set(Some(task_for_modal));
+                                                            pr_candidates.set(candidates);
+                                                            show_pr_candidates_modal.set(true);
+                                                        }
+                                                        Err(e) => toast::error(format!("Failed to find PR candidates: {}", e)),
+                                                    }
+                                                });
+                                            }
+                                            title="Find and link an existing pull request for this branch"
+                                        >
+                                            "Sync PR"
+                                        </button>
+                                    }
+                                })}
+                                {has_pr.then(|| {
+                                    let task_for_refresh = task_for_pr_review.clone();
+                                    view! {
+                                        <button
+                                            class="px-2 py-0.5 text-[10px] rounded bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 transition-colors"
+                                            on:click=move |e: web_sys::MouseEvent| {
+                                                e.stop_propagation();
+                                                let task_id = task_for_refresh.id.to_string();
+                                                spawn_local(async move {
+                                                    match refresh_task_pr_state(task_id).await {
+                                                        Ok(Some(updated)) => {
+                                                            let new_status = updated.status.clone();
+                                                            on_pr_created.run(updated);
+                                                            if matches!(new_status, TaskStatus::Done) {
+                                                                toast::success("PR merged — moved to Done".to_string());
+                                                            } else {
+                                                                toast::info("PR state refreshed".to_string());
+                                                            }
+                                                        }
+                                                        Ok(None) => {}
+                                                        Err(e) => toast::error(format!("Failed to refresh PR: {}", e)),
+                                                    }
+                                                });
+                                            }
+                                            title="Refresh PR state from GitHub"
+                                        >
+                                            "Refresh"
+                                        </button>
+                                        <button
+                                            class="px-2 py-0.5 text-[10px] rounded bg-yellow-500/10 text-yellow-300 hover:bg-yellow-500/20 transition-colors"
+                                            on:click=move |e: web_sys::MouseEvent| {
+                                                e.stop_propagation();
+                                                on_analyze_pr_comments.run(task_for_pr_review.clone());
+                                            }
+                                            title="Analyze PR comments before applying fixes"
+                                        >
+                                            "Review PR"
+                                        </button>
+                                    }
+                                })}
                             </div>
                         }
                     })

@@ -443,6 +443,7 @@ impl TaskExecutor {
                 model: task_model,
                 system_prompt: None,
                 permission_mode: None, // defaults to --dangerously-skip-permissions
+                disable_mcp: false,
             }).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -729,6 +730,7 @@ impl TaskExecutor {
                     model: None,
                     system_prompt: None,
                     permission_mode: None,
+                    disable_mcp: false,
                 }).await;
 
                 match runner {
@@ -855,6 +857,7 @@ impl TaskExecutor {
                     model: None,
                     system_prompt: None,
                     permission_mode: None,
+                    disable_mcp: false,
                 }).await {
                     Ok(r) => {
                         let _success = r.wait().await.unwrap_or(false);

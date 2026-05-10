@@ -17,6 +17,9 @@ pub struct ClaudeRunConfig {
     pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub permission_mode: Option<String>,
+    /// When true, pass --strict-mcp-config without any --mcp-config files,
+    /// effectively disabling all MCP servers (project + user) for this run.
+    pub disable_mcp: bool,
 }
 
 /// Events emitted by the Claude runner during execution.
@@ -89,6 +92,10 @@ impl ClaudeRunner {
         }
         if let Some(ref sys) = config.system_prompt {
             cmd.arg("--system-prompt").arg(sys);
+        }
+
+        if config.disable_mcp {
+            cmd.arg("--strict-mcp-config");
         }
 
         cmd.current_dir(&config.working_dir);

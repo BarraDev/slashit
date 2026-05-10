@@ -30,7 +30,7 @@ pub fn Insights(
     let backlog_count = move || tasks.get().iter().filter(|t| t.status == TaskStatus::Backlog).count();
     let queue_count = move || tasks.get().iter().filter(|t| t.status == TaskStatus::Queue).count();
     let in_progress_count = move || tasks.get().iter().filter(|t| t.status == TaskStatus::InProgress).count();
-    let done_count = move || tasks.get().iter().filter(|t| t.status == TaskStatus::Done || t.status == TaskStatus::PrCreated).count();
+    let done_count = move || tasks.get().iter().filter(|t| t.status == TaskStatus::Done).count();
     let error_count = move || tasks.get().iter().filter(|t| t.status == TaskStatus::Error).count();
 
     let completion_rate = move || {
