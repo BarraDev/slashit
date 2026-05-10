@@ -579,6 +579,19 @@ pub async fn discuss_pr_review_questions(
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
 
+    let merged = discuss_pr_review_questions_inner(task, working_dir, plan).await?;
+    save_review_plan_on_task(&state, task_uuid, merged.clone()).await;
+    Ok(merged)
+}
+
+/// Core logic of `discuss_pr_review_questions` extracted for testability. Owns
+/// no `AppState`; the caller resolves the task + working directory and persists
+/// the returned plan.
+pub async fn discuss_pr_review_questions_inner(
+    task: Task,
+    working_dir: String,
+    plan: PrReviewPlan,
+) -> Result<PrReviewPlan, String> {
     let pending: Vec<&PrReviewItem> = plan.items.iter()
         .filter(|i| matches!(i.decision, PrReviewDecision::Question) && !i.user_note.trim().is_empty())
         .collect();
@@ -612,7 +625,6 @@ pub async fn discuss_pr_review_questions(
         }
     }
 
-    save_review_plan_on_task(&state, task_uuid, merged.clone()).await;
     Ok(merged)
 }
 
@@ -628,13 +640,39 @@ pub struct AddressPrReviewOptions {
     pub dry_run: bool,
 }
 
+/// Progress event emitted during a per-item apply so the UI can update a
+/// status badge next to each item as the agent works through them.
+/// `kind` is one of: `item_started`, `item_succeeded`, `item_failed`,
+/// `push_started`, `push_done`, `push_failed`, `reply_started`,
+/// `reply_done`, `reply_failed`, `all_done`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PrReviewProgress {
+    pub task_id: String,
+    pub kind: String,
+    pub current: Option<usize>,
+    pub total: Option<usize>,
+    pub comment_id: Option<u64>,
+    pub message: Option<String>,
+}
+
+/// Callback the inner apply invokes for every progress event. Production code
+/// passes one that re-emits via Tauri; tests pass a collector that pushes into
+/// a Vec.
+pub type ProgressSink = std::sync::Arc<dyn Fn(PrReviewProgress) + Send + Sync>;
+
+pub fn no_progress() -> ProgressSink {
+    std::sync::Arc::new(|_| {})
+}
+
 #[tauri::command]
 pub async fn address_pr_review(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     plan: PrReviewPlan,
     options: AddressPrReviewOptions,
 ) -> Result<PrReviewApplyResult, String> {
+    use tauri::Emitter;
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     let working_dir = resolve_working_dir(&state, task_uuid).await?;
     let task = {
@@ -642,7 +680,14 @@ pub async fn address_pr_review(
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
 
-    let (result, updated_plan) = address_pr_review_inner(task, working_dir, plan, options).await?;
+    let app_handle = app.clone();
+    let progress: ProgressSink = std::sync::Arc::new(move |ev: PrReviewProgress| {
+        if let Err(e) = app_handle.emit("pr-review-progress", &ev) {
+            eprintln!("[pr-review] failed to emit progress event: {}", e);
+        }
+    });
+
+    let (result, updated_plan) = address_pr_review_inner(task, working_dir, plan, options, progress).await?;
     save_review_plan_on_task(&state, task_uuid, updated_plan).await;
     Ok(result)
 }
@@ -650,48 +695,150 @@ pub async fn address_pr_review(
 /// Core logic of `address_pr_review` extracted for testability. Owns no
 /// `AppState`; the caller is responsible for fetching the `Task` + working
 /// directory and persisting the returned plan.
+///
+/// Each approved Fix item is sent to claude in its own invocation, so a single
+/// max-turns blowout no longer wipes the whole batch. Failures are recorded
+/// per-item; subsequent items still run. Push and replies only happen if at
+/// least one item succeeded.
 pub async fn address_pr_review_inner(
     task: Task,
     working_dir: String,
     plan: PrReviewPlan,
     options: AddressPrReviewOptions,
+    progress: ProgressSink,
 ) -> Result<(PrReviewApplyResult, PrReviewPlan), String> {
     let pr_url = pr_url_for_task(&task)?;
+    let task_id_str = task.id.to_string();
 
-    let approved: Vec<&PrReviewItem> = plan.items.iter()
+    let approved: Vec<PrReviewItem> = plan.items.iter()
         .filter(|i| i.approved && matches!(i.decision, PrReviewDecision::Fix))
+        .cloned()
         .collect();
     if approved.is_empty() {
         return Err("No approved fix items to apply".to_string());
     }
+    let total = approved.len();
     eprintln!(
-        "[pr-review] applying {} approved items (auto_push={}, auto_reply={}, dry_run={})",
-        approved.len(), options.auto_push, options.auto_reply, options.dry_run,
+        "[pr-review] applying {} approved items per-item (auto_push={}, auto_reply={}, dry_run={})",
+        total, options.auto_push, options.auto_reply, options.dry_run,
     );
 
-    let prompt = build_review_fix_prompt(&task, &pr_url, &plan.comments, &approved, options.dry_run);
-    let agent_summary = run_claude_pr_helper(prompt, working_dir.clone(), !options.dry_run).await?;
+    let mut per_item_summaries: Vec<String> = Vec::with_capacity(total);
+    let mut fixed_ids: Vec<u64> = Vec::new();
+    let mut failed_ids: Vec<u64> = Vec::new();
+    let mut fix_errors: Vec<String> = Vec::new();
+
+    for (idx, item) in approved.iter().enumerate() {
+        let current = idx + 1;
+        progress(PrReviewProgress {
+            task_id: task_id_str.clone(),
+            kind: "item_started".to_string(),
+            current: Some(current),
+            total: Some(total),
+            comment_id: item.comment_id,
+            message: Some(item.summary.clone()),
+        });
+
+        let single = vec![item];
+        let prompt = build_review_fix_prompt(&task, &pr_url, &plan.comments, &single, options.dry_run);
+        let label = item.comment_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+
+        match run_claude_pr_helper(prompt, working_dir.clone(), !options.dry_run).await {
+            Ok(summary) => {
+                if let Some(id) = item.comment_id { fixed_ids.push(id); }
+                per_item_summaries.push(format!(
+                    "## Item {}/{} — comment {}: {}\n\n{}",
+                    current, total, label, item.summary, summary,
+                ));
+                progress(PrReviewProgress {
+                    task_id: task_id_str.clone(),
+                    kind: "item_succeeded".to_string(),
+                    current: Some(current),
+                    total: Some(total),
+                    comment_id: item.comment_id,
+                    message: None,
+                });
+            }
+            Err(e) => {
+                if let Some(id) = item.comment_id { failed_ids.push(id); }
+                fix_errors.push(format!("comment {}: {}", label, e));
+                per_item_summaries.push(format!(
+                    "## Item {}/{} — comment {}: {} — FAILED\n\n{}",
+                    current, total, label, item.summary, e,
+                ));
+                progress(PrReviewProgress {
+                    task_id: task_id_str.clone(),
+                    kind: "item_failed".to_string(),
+                    current: Some(current),
+                    total: Some(total),
+                    comment_id: item.comment_id,
+                    message: Some(e),
+                });
+            }
+        }
+    }
+
+    let agent_summary = per_item_summaries.join("\n\n---\n\n");
+    let any_succeeded = !fixed_ids.is_empty();
 
     let mut pushed = false;
     let mut push_branch_name: Option<String> = None;
+    let mut push_error: Option<String> = None;
     let mut replies_posted = 0u32;
     let mut reply_errors: Vec<String> = Vec::new();
 
-    if !options.dry_run {
-        let _ = run_cmd("jj", &["describe", "-m", &format!("task: {} (PR review fixes)", task.title)], &working_dir).await;
+    if !options.dry_run && any_succeeded {
+        let _ = run_cmd("jj", &["describe", "-m", &format!(
+            "task: {} (PR review fixes: {} of {})",
+            task.title, fixed_ids.len(), total,
+        )], &working_dir).await;
         let _ = run_cmd("jj", &["git", "export"], &working_dir).await;
 
         if options.auto_push {
+            progress(PrReviewProgress {
+                task_id: task_id_str.clone(),
+                kind: "push_started".to_string(),
+                current: None,
+                total: None,
+                comment_id: None,
+                message: None,
+            });
             let branch = task.branch_name.clone();
             match push_branch(&working_dir, branch.as_deref()).await {
-                Ok(b) => { pushed = true; push_branch_name = Some(b); }
-                Err(e) => return Err(format!("agent applied fixes but push failed: {}", e)),
+                Ok(b) => {
+                    pushed = true;
+                    push_branch_name = Some(b.clone());
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "push_done".to_string(),
+                        current: None,
+                        total: None,
+                        comment_id: None,
+                        message: Some(b),
+                    });
+                }
+                Err(e) => {
+                    push_error = Some(e.clone());
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "push_failed".to_string(),
+                        current: None,
+                        total: None,
+                        comment_id: None,
+                        message: Some(e),
+                    });
+                }
             }
         }
 
         if options.auto_reply {
             let (repo, number) = parse_pr_url(&pr_url)?;
-            for item in &approved {
+            for item in approved.iter().filter(|i| i.comment_id
+                .map(|id| fixed_ids.contains(&id))
+                .unwrap_or(false))
+            {
                 let body = build_reply_body(item);
                 match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
                     Ok(()) => replies_posted += 1,
@@ -706,7 +853,6 @@ pub async fn address_pr_review_inner(
         }
     }
 
-    let fixed_ids: Vec<u64> = approved.iter().filter_map(|i| i.comment_id).collect();
     let skipped_ids: Vec<u64> = plan.items.iter()
         .filter(|i| !i.approved || matches!(i.decision, PrReviewDecision::Skip))
         .filter_map(|i| i.comment_id)
@@ -721,10 +867,29 @@ pub async fn address_pr_review_inner(
         push_branch: push_branch_name,
         replies_posted,
         reply_errors,
+        dry_run: options.dry_run,
+        failed_ids,
+        fix_errors,
+        push_error,
     };
 
+    progress(PrReviewProgress {
+        task_id: task_id_str.clone(),
+        kind: "all_done".to_string(),
+        current: Some(total),
+        total: Some(total),
+        comment_id: None,
+        message: None,
+    });
+
+    // Only real applies advance the persisted `last_apply` timestamp on the
+    // task. Dry-runs are session-local previews: the caller still gets the
+    // `PrReviewApplyResult` to display in the modal, but the plan written
+    // back to disk keeps whatever real-apply state existed before.
     let mut updated_plan = plan;
-    updated_plan.last_apply = Some(result.clone());
+    if !options.dry_run {
+        updated_plan.last_apply = Some(result.clone());
+    }
 
     Ok((result, updated_plan))
 }
@@ -980,10 +1145,18 @@ before or after. Schema (one entry per item above, keyed by comment_id):
 
 {{"items":[{{"comment_id":<number-or-null>,"summary":"<short title>","decision":"fix"|"skip"|"question","reasoning":"<reply to the reviewer; will be posted on the PR>","proposed_change":"<concrete change you would make if Fix>"}}]}}
 
-If the user's note resolves the question (e.g. they say "go ahead and fix it"),
-return decision="fix" with a concrete proposed_change. If they confirm there's
-nothing to do, return "skip". If you still need more information from the user,
-return "question" with a clear follow-up in reasoning.
+Rules:
+- The user's note is an instruction, not a suggestion to negotiate. If they say
+  any variant of "go ahead", "fix it", "yes", "do it", "ok": return
+  decision="fix" with ONE concrete proposed_change. Do NOT offer multiple
+  options or ask which approach they prefer.
+- If they confirm there's nothing to do or say "skip"/"ignore": return "skip".
+- Only return "question" if the user's note itself raises a NEW ambiguity that
+  blocks a fix decision. In that case put ONE specific follow-up in reasoning.
+- proposed_change must be a single concrete edit, not a menu. If multiple
+  approaches are reasonable, pick the simplest one that matches the user's note
+  and the existing code style; mention the alternative in reasoning at most as
+  a one-line aside, never as a numbered list of options.
 "#,
         title = task.title, pr_url = pr_url, items = items_text,
     )
@@ -1136,19 +1309,43 @@ async fn run_claude_pr_helper(prompt: String, working_dir: String, can_edit: boo
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_label = output.status.code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".into());
     eprintln!(
         "[pr-review] claude exit={} stdout={}B stderr={}B",
-        output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
-        stdout.len(), stderr.len(),
+        exit_label, stdout.len(), stderr.len(),
     );
 
+    // Always persist stdout when it's substantial or when claude failed, so the
+    // 200 KB transcript that exposes the real error isn't lost. The path is
+    // surfaced in the error message and printed to stderr.
+    let log_path = if !output.status.success() || stdout.len() > 4096 {
+        write_pr_helper_log(&stdout, &stderr, can_edit).ok()
+    } else {
+        None
+    };
+
     if !output.status.success() {
-        let tail = stderr.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
-        return Err(format!(
-            "claude exited {} — {}",
-            output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
-            if tail.is_empty() { "no stderr" } else { &tail },
-        ));
+        let reason = extract_failure_reason(&stdout)
+            .or_else(|| {
+                let tail: Vec<&str> = stderr.lines().rev().take(5).collect();
+                if tail.is_empty() {
+                    None
+                } else {
+                    let mut joined: Vec<&str> = tail.into_iter().collect();
+                    joined.reverse();
+                    Some(joined.join(" | "))
+                }
+            })
+            .unwrap_or_else(|| {
+                "no error event in stream-json and no stderr — see log".to_string()
+            });
+        let log_hint = log_path
+            .as_ref()
+            .map(|p| format!(" (transcript: {})", p.display()))
+            .unwrap_or_default();
+        return Err(format!("claude exited {} — {}{}", exit_label, reason, log_hint));
     }
 
     let extracted = extract_text_from_stream_json(&stdout);
@@ -1161,6 +1358,75 @@ async fn run_claude_pr_helper(prompt: String, working_dir: String, can_edit: boo
         );
     }
     Ok(extracted)
+}
+
+/// Pull a human-readable failure reason out of the stream-json stdout. Prefers
+/// the terminal `result` event when its `is_error` flag is set (this is where
+/// the Claude CLI reports max-turns, sandbox denials, model errors, etc.).
+/// Falls back to the last `error` field on any event, or the last assistant
+/// text block before the truncation.
+fn extract_failure_reason(stdout: &str) -> Option<String> {
+    let mut last_error_text: Option<String> = None;
+    let mut last_assistant_text: Option<String> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if msg_type == "result" {
+            let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
+            let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+            let text = v.get("result").and_then(|r| r.as_str()).unwrap_or("").trim();
+            if is_error || subtype.contains("error") || subtype.contains("max_turns") {
+                let label = if subtype.is_empty() { "error".to_string() } else { format!("{}", subtype) };
+                let body = if text.is_empty() { "(empty result body)".to_string() } else { text.to_string() };
+                return Some(format!("{}: {}", label, truncate_one_line(&body, 400)));
+            }
+        }
+        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+            last_error_text = Some(err.to_string());
+        }
+        if msg_type == "assistant" {
+            if let Some(content) = v.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                for block in content {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            last_assistant_text = Some(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    last_error_text
+        .map(|e| format!("stream error: {}", truncate_one_line(&e, 400)))
+        .or_else(|| last_assistant_text.map(|t| format!("last assistant text: {}", truncate_one_line(&t, 400))))
+}
+
+fn truncate_one_line(s: &str, max: usize) -> String {
+    let oneline: String = s.split('\n').filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" / ");
+    if oneline.chars().count() <= max {
+        oneline
+    } else {
+        let truncated: String = oneline.chars().take(max).collect();
+        format!("{}…", truncated)
+    }
+}
+
+fn write_pr_helper_log(stdout: &str, stderr: &str, can_edit: bool) -> std::io::Result<std::path::PathBuf> {
+    let dir = directories::ProjectDirs::from("com", "barradev", "slashit-app")
+        .map(|d| d.data_dir().join("pr-helper-logs"))
+        .ok_or_else(|| std::io::Error::other("no ProjectDirs"))?;
+    std::fs::create_dir_all(&dir)?;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let path = dir.join(format!("{}-{}.log", ts, if can_edit { "apply" } else { "readonly" }));
+    let body = format!(
+        "=== STDOUT ({} bytes) ===\n{}\n=== STDERR ({} bytes) ===\n{}\n",
+        stdout.len(), stdout, stderr.len(), stderr,
+    );
+    std::fs::write(&path, body)?;
+    eprintln!("[pr-review] wrote claude transcript to {}", path.display());
+    Ok(path)
 }
 
 /// Pull the final text/result from a Claude CLI `--output-format stream-json` blob.
