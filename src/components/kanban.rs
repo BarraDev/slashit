@@ -1124,7 +1124,7 @@ fn PrReviewModal(
                                 {move || if applying.get() {
                                     "Applying...".to_string()
                                 } else {
-                                    format!("Apply {} approved", approved_fix_count())
+                                    format!("Apply {} fixes", approved_fix_count())
                                 }}
                             </button>
                         </div>

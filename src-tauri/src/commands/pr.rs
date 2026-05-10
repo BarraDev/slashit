@@ -1879,4 +1879,178 @@ mod tests {
         assert_eq!(Mergeability::from_gh("UNKNOWN"), Some(Mergeability::Unknown));
         assert_eq!(Mergeability::from_gh("other"), None);
     }
+
+    // ──────────────────────────────────────────────
+    // parse_review_items: JSON parsing, decision normalization, sort
+    // ──────────────────────────────────────────────
+
+    fn comment(id: u64) -> PrReviewComment {
+        PrReviewComment {
+            id: Some(id),
+            kind: crate::domain::task::PrCommentKind::Inline,
+            author: "reviewer".to_string(),
+            body: format!("comment {id}"),
+            path: None,
+            line: None,
+            url: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn parse_review_items_preserves_input_order() {
+        // Order from the agent (= order from the PR) must be preserved end-to-end.
+        let comments = vec![comment(1), comment(2), comment(3)];
+        let raw = r#"{"items":[
+            {"comment_id":1,"summary":"A","decision":"skip","reasoning":"","proposed_change":""},
+            {"comment_id":2,"summary":"B","decision":"fix","reasoning":"","proposed_change":""},
+            {"comment_id":3,"summary":"C","decision":"question","reasoning":"","proposed_change":""}
+        ]}"#;
+        let items = parse_review_items(raw, &comments);
+        let summaries: Vec<_> = items.iter().map(|i| i.summary.clone()).collect();
+        assert_eq!(summaries, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn parse_review_items_unknown_decision_falls_back_to_question() {
+        let comments = vec![comment(1)];
+        let raw = r#"{"items":[
+            {"comment_id":1,"summary":"X","decision":"maybe","reasoning":"","proposed_change":""}
+        ]}"#;
+        let items = parse_review_items(raw, &comments);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].decision, PrReviewDecision::Question);
+        assert!(!items[0].approved);
+    }
+
+    #[test]
+    fn parse_review_items_decision_is_case_insensitive() {
+        let comments = vec![comment(1), comment(2)];
+        let raw = r#"{"items":[
+            {"comment_id":1,"summary":"u","decision":"FIX","reasoning":"","proposed_change":""},
+            {"comment_id":2,"summary":"l","decision":"Skip","reasoning":"","proposed_change":""}
+        ]}"#;
+        let items = parse_review_items(raw, &comments);
+        assert_eq!(items.len(), 2);
+        // Sorted: Fix before Skip (no Question present).
+        assert_eq!(items[0].decision, PrReviewDecision::Fix);
+        assert_eq!(items[1].decision, PrReviewDecision::Skip);
+    }
+
+    #[test]
+    fn parse_review_items_filters_unknown_comment_id() {
+        // Item references comment_id=999 which is not in the comments slice.
+        let comments = vec![comment(1)];
+        let raw = r#"{"items":[
+            {"comment_id":999,"summary":"orphan","decision":"fix","reasoning":"","proposed_change":""}
+        ]}"#;
+        let items = parse_review_items(raw, &comments);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].comment_id, None);
+    }
+
+    #[test]
+    fn parse_review_items_fix_marks_approved() {
+        let comments = vec![comment(1), comment(2), comment(3)];
+        let raw = r#"{"items":[
+            {"comment_id":1,"summary":"a","decision":"fix","reasoning":"","proposed_change":""},
+            {"comment_id":2,"summary":"b","decision":"skip","reasoning":"","proposed_change":""},
+            {"comment_id":3,"summary":"c","decision":"question","reasoning":"","proposed_change":""}
+        ]}"#;
+        let items = parse_review_items(raw, &comments);
+        for item in &items {
+            let expected = matches!(item.decision, PrReviewDecision::Fix);
+            assert_eq!(item.approved, expected, "approved should mirror Fix decision");
+        }
+    }
+
+    #[test]
+    fn parse_review_items_extracts_json_from_surrounding_prose() {
+        // Agent sometimes prefixes with chatter; parser should locate the JSON
+        // between the first '{' and last '}'.
+        let comments = vec![comment(1)];
+        let raw = "Here is my analysis:\n```json\n{\"items\":[{\"comment_id\":1,\"summary\":\"x\",\"decision\":\"fix\",\"reasoning\":\"\",\"proposed_change\":\"\"}]}\n```\nDone.";
+        let items = parse_review_items(raw, &comments);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].summary, "x");
+    }
+
+    #[test]
+    fn parse_review_items_empty_input_returns_empty() {
+        assert!(parse_review_items("", &[]).is_empty());
+        assert!(parse_review_items("   \n\t", &[]).is_empty());
+    }
+
+    #[test]
+    fn parse_review_items_no_braces_returns_empty() {
+        assert!(parse_review_items("just prose, no json", &[]).is_empty());
+    }
+
+    #[test]
+    fn parse_review_items_malformed_json_returns_empty() {
+        let raw = r#"{"items": [not valid"#;
+        assert!(parse_review_items(raw, &[]).is_empty());
+    }
+
+    #[test]
+    fn parse_review_items_user_note_starts_empty() {
+        // user_note is filled by the user in the UI, never by the agent.
+        let comments = vec![comment(1)];
+        let raw = r#"{"items":[
+            {"comment_id":1,"summary":"x","decision":"question","reasoning":"","proposed_change":""}
+        ]}"#;
+        let items = parse_review_items(raw, &comments);
+        assert_eq!(items[0].user_note, "");
+    }
+
+    // ──────────────────────────────────────────────
+    // extract_text_from_stream_json: result/assistant precedence
+    // ──────────────────────────────────────────────
+
+    #[test]
+    fn extract_text_prefers_terminal_result_over_assistant() {
+        let stream = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"intermediate"}]}}
+{"type":"result","result":"final"}"#;
+        assert_eq!(extract_text_from_stream_json(stream), "final");
+    }
+
+    #[test]
+    fn extract_text_falls_back_to_assistant_when_no_result() {
+        let stream = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello "}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"world"}]}}"#;
+        assert_eq!(extract_text_from_stream_json(stream), "hello world");
+    }
+
+    #[test]
+    fn extract_text_concatenates_multiple_text_blocks_in_one_message() {
+        let stream = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}}"#;
+        assert_eq!(extract_text_from_stream_json(stream), "ab");
+    }
+
+    #[test]
+    fn extract_text_ignores_non_text_content_blocks() {
+        // tool_use blocks should not contribute to the captured text.
+        let stream = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{}},{"type":"text","text":"only this"}]}}"#;
+        assert_eq!(extract_text_from_stream_json(stream), "only this");
+    }
+
+    #[test]
+    fn extract_text_skips_blank_and_invalid_lines() {
+        let stream = "\n\nnot json\n{\"type\":\"result\",\"result\":\"ok\"}\n   \n";
+        assert_eq!(extract_text_from_stream_json(stream), "ok");
+    }
+
+    #[test]
+    fn extract_text_empty_stream_returns_empty() {
+        assert_eq!(extract_text_from_stream_json(""), "");
+    }
+
+    #[test]
+    fn extract_text_unknown_event_types_are_ignored() {
+        let stream = r#"{"type":"system","subtype":"init"}
+{"type":"user","message":{"content":[]}}
+{"type":"result","result":"done"}"#;
+        assert_eq!(extract_text_from_stream_json(stream), "done");
+    }
 }
