@@ -231,9 +231,10 @@ pub fn run() {
                 let show_i = MenuItem::with_id(app, "show", "Show SlashIt", true, None::<&str>)?;
                 let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
                 let menu = MenuBuilder::new(app).items(&[&show_i, &quit_i]).build()?;
+                let tray_icon = tauri::include_image!("icons/32x32.png");
 
                 TrayIconBuilder::new()
-                    .icon(app.default_window_icon().unwrap().clone())
+                    .icon(tray_icon)
                     .menu(&menu)
                     .show_menu_on_left_click(false)
                     .tooltip("SlashIt")

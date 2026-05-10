@@ -32,12 +32,17 @@ SlashIt is a Tauri v2 desktop app for managing AI coding agents, task queues, te
 
 ## Screenshots
 
-Screenshots are coming soon. The release-ready image set will live in `docs/screenshots/` and should include:
+<p align="center">
+  <img src="docs/assets/screenshots/dashboard-kanban.jpg" alt="SlashIt dashboard with Kanban task queue, agent queue, worktrees, and JJ status" width="900">
+</p>
 
-- Dashboard and project overview
-- Kanban queue with active tasks
-- Agent execution panel
-- Integrated terminal view
+<p align="center">
+  <img src="docs/assets/screenshots/agent-workspace.jpg" alt="SlashIt agent execution workspace with terminal logs, task phases, and session context" width="900">
+</p>
+
+<p align="center">
+  <img src="docs/assets/screenshots/worktrees-prs.jpg" alt="SlashIt worktrees page with JJ status, PR readiness, and diff preview" width="900">
+</p>
 
 ## Status and Roadmap
 
@@ -45,8 +50,7 @@ SlashIt is currently pre-1.0 software. The core app, CLI, IPC server, queue, ter
 
 Near-term roadmap:
 
-- Replace default Tauri platform icons with generated SlashIt icons.
-- Add first-run screenshots and installation walkthroughs.
+- Add installation walkthroughs and release notes polish.
 - Track follow-up issues for GUI binary naming, optional daemon mode, and workspace layout cleanup.
 - Continue hardening queue execution, agent recovery, and cross-platform packaging.
 
