@@ -96,8 +96,81 @@ pub struct Task {
     #[serde(default)]
     pub branch_name: Option<String>,
 
+    #[serde(default)]
+    pub pr_review_plan: Option<PrReviewPlan>,
+
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrReviewPlan {
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    pub pr_url: String,
+    pub review_decision: Option<String>,
+    pub comments: Vec<PrReviewComment>,
+    pub items: Vec<PrReviewItem>,
+    pub raw_plan: String,
+    #[serde(default)]
+    pub last_apply: Option<PrReviewApplyResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrReviewComment {
+    pub id: Option<u64>,
+    pub kind: PrCommentKind,
+    pub author: String,
+    pub body: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub line: Option<i64>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrCommentKind {
+    Inline,
+    Review,
+    Conversation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrReviewItem {
+    #[serde(default)]
+    pub comment_id: Option<u64>,
+    pub summary: String,
+    pub decision: PrReviewDecisionKind,
+    pub reasoning: String,
+    pub proposed_change: String,
+    #[serde(default)]
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrReviewDecisionKind {
+    Fix,
+    Skip,
+    Question,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrReviewApplyResult {
+    pub applied_at: chrono::DateTime<chrono::Utc>,
+    pub agent_summary: String,
+    pub fixed_ids: Vec<u64>,
+    pub skipped_ids: Vec<u64>,
+    #[serde(default)]
+    pub pushed: bool,
+    #[serde(default)]
+    pub push_branch: Option<String>,
+    #[serde(default)]
+    pub replies_posted: u32,
+    #[serde(default)]
+    pub reply_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -179,6 +179,7 @@ pub async fn create_task_from_issue(
         error_message: None,
         worktree_path: None,
         branch_name: None,
+        pr_review_plan: None,
         created_at: now,
         updated_at: now,
     };
@@ -271,8 +272,9 @@ pub async fn import_github_issues(
             human_review: None,
             stuck_since: None,
             error_message: None,
-        worktree_path: None,
-        branch_name: None,
+            worktree_path: None,
+            branch_name: None,
+            pr_review_plan: None,
             created_at: now,
             updated_at: now,
         };

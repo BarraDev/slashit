@@ -186,6 +186,7 @@ mod tests {
                 worktree_path: None,
                 branch_name: None,
                 position: 0,
+                pr_review_plan: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };

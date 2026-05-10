@@ -90,18 +90,29 @@ pub async fn link_existing_pr(task_id: String, pr_url: String) -> Result<Option<
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
-pub async fn analyze_pr_comments(task_id: String) -> Result<String, String> {
+pub async fn analyze_pr_comments(task_id: String) -> Result<crate::models::task::PrReviewPlan, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "taskId": task_id })).unwrap();
     let response = invoke("analyze_pr_comments", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
-pub async fn address_pr_comments(task_id: String, approved_plan: String) -> Result<String, String> {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AddressPrReviewOptions {
+    pub auto_push: bool,
+    pub auto_reply: bool,
+}
+
+pub async fn address_pr_review(
+    task_id: String,
+    plan: crate::models::task::PrReviewPlan,
+    options: AddressPrReviewOptions,
+) -> Result<crate::models::task::PrReviewApplyResult, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "taskId": task_id,
-        "approvedPlan": approved_plan,
+        "plan": plan,
+        "options": options,
     })).unwrap();
-    let response = invoke("address_pr_comments", args).await?;
+    let response = invoke("address_pr_review", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 

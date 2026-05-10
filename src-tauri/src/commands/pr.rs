@@ -1,5 +1,8 @@
 use crate::domain::{Task, TaskStatus};
-use crate::domain::task::ExternalRef;
+use crate::domain::task::{
+    ExternalRef, PrCommentKind, PrReviewApplyResult, PrReviewComment, PrReviewDecision,
+    PrReviewItem, PrReviewPlan,
+};
 use crate::agents::runner::{ClaudeRunConfig, ClaudeRunner};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -500,222 +503,419 @@ pub async fn recover_private_email_and_create_pr(
 pub async fn analyze_pr_comments(
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
-) -> Result<String, String> {
+) -> Result<PrReviewPlan, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     let working_dir = resolve_working_dir(&state, task_uuid).await?;
-
     let task = {
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
+    let pr_url = pr_url_for_task(&task)?;
 
-    let pr_url = task.pr_url.clone()
-        .or_else(|| task.external_refs.iter().find_map(|r| match r {
-            ExternalRef::GithubPr { url, .. } => Some(url.clone()),
-            _ => None,
-        }))
-        .ok_or("Task does not have a GitHub PR")?;
-
-    let comments = fetch_pr_comments(&pr_url).await?;
-    if comments.trim().is_empty() {
-        return Ok("No PR comments or requested changes found.".to_string());
+    eprintln!("[pr-review] analyze {} for task {}", pr_url, task_uuid);
+    let (review_decision, comments) = fetch_pr_review_data(&pr_url).await?;
+    eprintln!(
+        "[pr-review] {} comments fetched (decision={:?})",
+        comments.len(), review_decision,
+    );
+    if comments.is_empty() {
+        // Don't cache empty plans — reviewers can still leave comments later
+        // and the user shouldn't have to remember to hit Re-analyze.
+        return Ok(PrReviewPlan {
+            generated_at: chrono::Utc::now(),
+            pr_url,
+            review_decision,
+            comments,
+            items: Vec::new(),
+            raw_plan: String::new(),
+            last_apply: None,
+        });
     }
 
-    let prompt = build_pr_comment_analysis_prompt(&task, &pr_url, &comments);
-    let output = run_claude_pr_helper(prompt, working_dir, false).await?;
-    if output.trim().is_empty() {
+    let prompt = build_review_analysis_prompt(&task, &pr_url, &comments);
+    let raw_output = run_claude_pr_helper(prompt, working_dir, false).await?;
+    eprintln!(
+        "[pr-review] triage output: {} chars",
+        raw_output.len(),
+    );
+    if raw_output.trim().is_empty() {
         return Err(format!(
-            "Triage helper finished without producing a plan. \
-            The Claude CLI exited before writing a result \
-            (max-turns hit, MCP startup stall, or no transcript captured). \
-            PR: {} | comments fetched: {} chars. Try again or paste a manual plan.",
-            pr_url,
-            comments.len()
+            "Triage helper finished without producing output. \
+             The Claude CLI exited before writing a result \
+             (max-turns hit, MCP startup stall, or no transcript captured). \
+             PR: {} | comments: {}.",
+            pr_url, comments.len()
         ));
     }
-    Ok(output)
+    let items = parse_review_items(&raw_output, &comments);
+    eprintln!("[pr-review] parsed {} items", items.len());
+
+    let plan = PrReviewPlan {
+        generated_at: chrono::Utc::now(),
+        pr_url,
+        review_decision,
+        comments,
+        items,
+        raw_plan: raw_output,
+        last_apply: None,
+    };
+    save_review_plan_on_task(&state, task_uuid, plan.clone()).await;
+    Ok(plan)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AddressPrReviewOptions {
+    pub auto_push: bool,
+    pub auto_reply: bool,
 }
 
 #[tauri::command]
-pub async fn address_pr_comments(
+pub async fn address_pr_review(
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
-    approved_plan: String,
-) -> Result<String, String> {
-    if approved_plan.trim().is_empty() {
-        return Err("Approved plan is empty".to_string());
-    }
-
+    plan: PrReviewPlan,
+    options: AddressPrReviewOptions,
+) -> Result<PrReviewApplyResult, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     let working_dir = resolve_working_dir(&state, task_uuid).await?;
-
     let task = {
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
+    let pr_url = pr_url_for_task(&task)?;
 
-    let pr_url = task.pr_url.clone()
-        .or_else(|| task.external_refs.iter().find_map(|r| match r {
-            ExternalRef::GithubPr { url, .. } => Some(url.clone()),
-            _ => None,
-        }))
-        .ok_or("Task does not have a GitHub PR")?;
+    let approved: Vec<&PrReviewItem> = plan.items.iter()
+        .filter(|i| i.approved && matches!(i.decision, PrReviewDecision::Fix))
+        .collect();
+    if approved.is_empty() {
+        return Err("No approved fix items to apply".to_string());
+    }
+    eprintln!(
+        "[pr-review] applying {} approved items (auto_push={}, auto_reply={})",
+        approved.len(), options.auto_push, options.auto_reply,
+    );
 
-    let comments = fetch_pr_comments(&pr_url).await?;
-    let prompt = build_pr_comment_fix_prompt(&task, &pr_url, &comments, &approved_plan);
-    let output = run_claude_pr_helper(prompt, working_dir.clone(), true).await?;
+    let prompt = build_review_fix_prompt(&task, &pr_url, &plan.comments, &approved);
+    let agent_summary = run_claude_pr_helper(prompt, working_dir.clone(), true).await?;
 
     let _ = run_cmd("jj", &["describe", "-m", &format!("task: {} (PR review fixes)", task.title)], &working_dir).await;
     let _ = run_cmd("jj", &["git", "export"], &working_dir).await;
 
-    {
-        let mut tasks = state.task.tasks.write().await;
-        if let Some(task) = tasks.get_mut(&task_uuid) {
-            task.updated_at = chrono::Utc::now();
+    let mut pushed = false;
+    let mut push_branch_name: Option<String> = None;
+    if options.auto_push {
+        let branch = task.branch_name.clone();
+        match push_branch(&working_dir, branch.as_deref()).await {
+            Ok(b) => { pushed = true; push_branch_name = Some(b); }
+            Err(e) => return Err(format!("agent applied fixes but push failed: {}", e)),
         }
     }
-    let tasks_r = state.task.tasks.read().await;
-    if let Some(task) = tasks_r.get(&task_uuid) {
-        let project_id = task.project_id;
-        let project_tasks: Vec<Task> = tasks_r.values()
-            .filter(|t| t.project_id == project_id)
-            .cloned()
-            .collect();
-        let _ = state.storage.save_project_tasks(project_id, &project_tasks);
+
+    let mut replies_posted = 0u32;
+    let mut reply_errors: Vec<String> = Vec::new();
+    if options.auto_reply {
+        let (repo, number) = parse_pr_url(&pr_url)?;
+        for item in &approved {
+            let body = build_reply_body(item);
+            match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
+                Ok(()) => replies_posted += 1,
+                Err(e) => reply_errors.push(match item.comment_id {
+                    Some(id) => format!("comment {}: {}", id, e),
+                    None => format!("comment <none>: {}", e),
+                }),
+            }
+        }
     }
 
-    Ok(output)
+    let fixed_ids: Vec<u64> = approved.iter().filter_map(|i| i.comment_id).collect();
+    let skipped_ids: Vec<u64> = plan.items.iter()
+        .filter(|i| !i.approved || matches!(i.decision, PrReviewDecision::Skip))
+        .filter_map(|i| i.comment_id)
+        .collect();
+
+    let result = PrReviewApplyResult {
+        applied_at: chrono::Utc::now(),
+        agent_summary,
+        fixed_ids,
+        skipped_ids,
+        pushed,
+        push_branch: push_branch_name,
+        replies_posted,
+        reply_errors,
+    };
+
+    let mut updated_plan = plan;
+    updated_plan.last_apply = Some(result.clone());
+    save_review_plan_on_task(&state, task_uuid, updated_plan).await;
+
+    Ok(result)
 }
 
-async fn fetch_pr_comments(pr_url: &str) -> Result<String, String> {
+fn pr_url_for_task(task: &Task) -> Result<String, String> {
+    task.pr_url.clone()
+        .or_else(|| task.external_refs.iter().find_map(|r| match r {
+            ExternalRef::GithubPr { url, .. } => Some(url.clone()),
+            _ => None,
+        }))
+        .ok_or_else(|| "Task does not have a GitHub PR".to_string())
+}
+
+async fn save_review_plan_on_task(state: &crate::AppState, task_id: Uuid, plan: PrReviewPlan) {
+    let project_id = {
+        let mut tasks = state.task.tasks.write().await;
+        let Some(t) = tasks.get_mut(&task_id) else { return; };
+        t.pr_review_plan = Some(plan);
+        t.updated_at = chrono::Utc::now();
+        t.project_id
+    };
+    let tasks_r = state.task.tasks.read().await;
+    let project_tasks: Vec<Task> = tasks_r.values()
+        .filter(|t| t.project_id == project_id)
+        .cloned()
+        .collect();
+    let _ = state.storage.save_project_tasks(project_id, &project_tasks);
+}
+
+async fn fetch_pr_review_data(
+    pr_url: &str,
+) -> Result<(Option<String>, Vec<PrReviewComment>), String> {
     let (repo, number) = parse_pr_url(pr_url)?;
+    let mut comments: Vec<PrReviewComment> = Vec::new();
+    let mut review_decision: Option<String> = None;
 
     let review_json = run_cmd_no_cwd(
         "gh",
-        &[
-            "pr", "view", &number,
-            "--repo", &repo,
-            "--json", "reviews,comments,reviewDecision",
-        ],
+        &["pr", "view", &number, "--repo", &repo, "--json", "reviews,comments,reviewDecision"],
     ).await?;
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&review_json) {
+        review_decision = json.get("reviewDecision").and_then(|v| v.as_str()).map(String::from);
+        if let Some(reviews) = json.get("reviews").and_then(|v| v.as_array()) {
+            for review in reviews {
+                let body = review.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if body.is_empty() && state != "CHANGES_REQUESTED" {
+                    continue;
+                }
+                let id = review.get("id")
+                    .or_else(|| review.get("databaseId"))
+                    .and_then(|v| v.as_u64());
+                let author = review.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                let url = review.get("url").and_then(|v| v.as_str()).map(String::from);
+                let display_body = if body.is_empty() { format!("[{}]", state) } else { body };
+                comments.push(PrReviewComment {
+                    id, kind: PrCommentKind::Review, author, body: display_body,
+                    path: None, line: None, url,
+                });
+            }
+        }
+        if let Some(conv) = json.get("comments").and_then(|v| v.as_array()) {
+            for c in conv {
+                let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                if body.is_empty() { continue; }
+                let id = c.get("id").or_else(|| c.get("databaseId")).and_then(|v| v.as_u64());
+                let author = c.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                let url = c.get("url").and_then(|v| v.as_str()).map(String::from);
+                comments.push(PrReviewComment {
+                    id, kind: PrCommentKind::Conversation, author, body,
+                    path: None, line: None, url,
+                });
+            }
+        }
+    }
 
     let inline_json = run_cmd_no_cwd(
         "gh",
-        &[
-            "api",
-            &format!("repos/{}/pulls/{}/comments", repo, number),
-        ],
-    ).await.unwrap_or_else(|e| {
-        serde_json::json!([{ "body": format!("Could not fetch inline comments: {}", e) }]).to_string()
-    });
-
-    let mut sections = Vec::new();
-    sections.push(format!("PR: {}", pr_url));
-
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&review_json) {
-        if let Some(decision) = json.get("reviewDecision").and_then(|v| v.as_str()) {
-            sections.push(format!("Review decision: {}", decision));
-        }
-
-        if let Some(reviews) = json.get("reviews").and_then(|v| v.as_array()) {
-            for review in reviews {
-                let state = review.get("state").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
-                let author = review.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let body = review.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
-                if !body.is_empty() || state == "CHANGES_REQUESTED" {
-                    sections.push(format!("Review by {} [{}]\n{}", author, state, body));
-                }
-            }
-        }
-
-        if let Some(comments) = json.get("comments").and_then(|v| v.as_array()) {
-            for comment in comments {
-                let author = comment.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let body = comment.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
-                if !body.is_empty() {
-                    sections.push(format!("Conversation comment by {}\n{}", author, body));
-                }
-            }
+        &["api", &format!("repos/{}/pulls/{}/comments", repo, number)],
+    ).await.unwrap_or_default();
+    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&inline_json) {
+        for c in arr {
+            let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            if body.is_empty() { continue; }
+            let id = c.get("id").and_then(|v| v.as_u64());
+            let author = c.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            let path = c.get("path").and_then(|v| v.as_str()).map(String::from);
+            let line = c.get("line").or_else(|| c.get("original_line")).and_then(|v| v.as_i64());
+            let url = c.get("html_url").and_then(|v| v.as_str()).map(String::from);
+            comments.push(PrReviewComment {
+                id, kind: PrCommentKind::Inline, author, body, path, line, url,
+            });
         }
     }
 
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&inline_json) {
-        if let Some(comments) = json.as_array() {
-            for comment in comments {
-                let author = comment.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let path = comment.get("path").and_then(|v| v.as_str()).unwrap_or("unknown file");
-                let line = comment.get("line")
-                    .or_else(|| comment.get("original_line"))
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "?".to_string());
-                let body = comment.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
-                if !body.is_empty() {
-                    sections.push(format!("Inline comment by {} at {}:{}\n{}", author, path, line, body));
-                }
-            }
-        }
-    }
-
-    Ok(sections.join("\n\n---\n\n"))
+    Ok((review_decision, comments))
 }
 
-fn build_pr_comment_analysis_prompt(task: &Task, pr_url: &str, comments: &str) -> String {
+fn build_review_analysis_prompt(task: &Task, pr_url: &str, comments: &[PrReviewComment]) -> String {
+    let comments_text = comments.iter().enumerate().map(|(i, c)| {
+        let loc = match (&c.path, c.line) {
+            (Some(p), Some(l)) => format!("{}:{}", p, l),
+            (Some(p), None) => p.clone(),
+            _ => "PR-level".to_string(),
+        };
+        let id_str = c.id.map(|id| id.to_string()).unwrap_or_else(|| "null".to_string());
+        let kind = match c.kind {
+            PrCommentKind::Inline => "inline",
+            PrCommentKind::Review => "review",
+            PrCommentKind::Conversation => "conversation",
+        };
+        format!(
+            "Comment #{i} (id={id}, kind={kind}, author={author}, location={loc}):\n{body}",
+            i = i, id = id_str, kind = kind, author = c.author, loc = loc, body = c.body,
+        )
+    }).collect::<Vec<_>>().join("\n\n---\n\n");
+
     format!(
         r#"# PR Review Triage
 
-Task: {}
-PR: {}
+Task: {title}
+PR: {pr_url}
 
-## PR Comments
-{}
+## Comments
+{comments}
 
 ## Instructions
-Analyze the review comments without editing files.
+For each comment above, decide whether the request should be applied. Read the
+relevant source files (Read/Glob/Grep only) to verify the issue exists. Do not
+edit files.
 
-For each requested change, decide whether it should be fixed. Separate real issues from optional suggestions, misunderstandings, duplicates, and risky requests.
+Return a STRICT JSON object on a single line. No markdown fences. No prose
+before or after the JSON. Schema:
 
-Return a concise plan using exactly these headings:
+{{"items":[{{"comment_id":<number-or-null>,"summary":"<short title>","decision":"fix"|"skip"|"question","reasoning":"<why; will be shown to the reviewer as your reply>","proposed_change":"<concrete change you would make>"}}]}}
 
-## Should Fix
-- [ ] file or area: recommended fix and why
-
-## Should Not Fix
-- comment/request: why it should be skipped or discussed
-
-## Questions For User
-- any decision that needs human confirmation
-
-## Proposed Command
-One short sentence describing what you will change if the user confirms."#,
-        task.title, pr_url, comments
+Use the exact `id` from each comment's header for `comment_id`. Use null only
+when the comment had id=null. Make `reasoning` reply-friendly: the user can
+post it back to the reviewer verbatim. If the comment is a duplicate of another
+one, prefer "skip" with a reasoning that points to the canonical one.
+"#,
+        title = task.title, pr_url = pr_url, comments = comments_text,
     )
 }
 
-fn build_pr_comment_fix_prompt(task: &Task, pr_url: &str, comments: &str, approved_plan: &str) -> String {
+fn parse_review_items(output: &str, comments: &[PrReviewComment]) -> Vec<PrReviewItem> {
+    let Some(start) = output.find('{') else { return Vec::new(); };
+    let Some(end) = output.rfind('}') else { return Vec::new(); };
+    if end <= start { return Vec::new(); }
+    let candidate = &output[start..=end];
+
+    #[derive(serde::Deserialize)]
+    struct Raw { items: Vec<RawItem> }
+    #[derive(serde::Deserialize)]
+    struct RawItem {
+        #[serde(default)] comment_id: Option<u64>,
+        #[serde(default)] summary: String,
+        #[serde(default)] decision: String,
+        #[serde(default)] reasoning: String,
+        #[serde(default)] proposed_change: String,
+    }
+
+    let raw: Raw = match serde_json::from_str(candidate) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    raw.items.into_iter().map(|i| {
+        let decision = match i.decision.to_lowercase().as_str() {
+            "fix" => PrReviewDecision::Fix,
+            "skip" => PrReviewDecision::Skip,
+            _ => PrReviewDecision::Question,
+        };
+        let approved = matches!(decision, PrReviewDecision::Fix);
+        let comment_id = i.comment_id.filter(|id| comments.iter().any(|c| c.id == Some(*id)));
+        PrReviewItem {
+            comment_id,
+            summary: i.summary,
+            decision,
+            reasoning: i.reasoning,
+            proposed_change: i.proposed_change,
+            approved,
+        }
+    }).collect()
+}
+
+fn build_review_fix_prompt(
+    task: &Task,
+    pr_url: &str,
+    comments: &[PrReviewComment],
+    approved: &[&PrReviewItem],
+) -> String {
+    let items_text = approved.iter().enumerate().map(|(i, item)| {
+        let related = item.comment_id.and_then(|id| comments.iter().find(|c| c.id == Some(id)));
+        let loc = related.map(|c| match (&c.path, c.line) {
+            (Some(p), Some(l)) => format!("{}:{}", p, l),
+            (Some(p), None) => p.clone(),
+            _ => "PR-level".to_string(),
+        }).unwrap_or_else(|| "PR-level".to_string());
+        format!(
+            "Item #{i} (location: {loc}):\nSummary: {summary}\nReasoning: {reasoning}\nProposed change: {change}",
+            i = i, loc = loc, summary = item.summary,
+            reasoning = item.reasoning, change = item.proposed_change,
+        )
+    }).collect::<Vec<_>>().join("\n\n---\n\n");
+
     format!(
         r#"# Apply Approved PR Review Fixes
 
-Task: {}
-PR: {}
+Task: {title}
+PR: {pr_url}
 
-## Approved Plan From User
-{}
-
-## Original PR Comments
-{}
+## Approved Items (apply ALL of these — nothing else)
+{items}
 
 ## Instructions
-Only implement the items explicitly approved in the plan above.
-Do not implement items listed as "Should Not Fix" or unresolved questions.
-Before editing each area, verify that the issue exists in the current code.
-Keep the change focused and minimal.
+Implement only the approved items above. Verify each issue exists in the current
+code before editing. Keep changes focused and minimal. Do not refactor unrelated
+code.
 
-After edits, summarize:
-- FIXED: what changed
-- SKIPPED: anything from the approved plan that no longer applied and why"#,
-        task.title, pr_url, approved_plan, comments
+After completing all edits, write a short final summary listing:
+- FIXED: which items you implemented, citing the item number.
+- SKIPPED: any approved item that no longer applied and why.
+"#,
+        title = task.title, pr_url = pr_url, items = items_text,
     )
+}
+
+fn build_reply_body(item: &PrReviewItem) -> String {
+    let status = match item.decision {
+        PrReviewDecision::Fix => "Fixed",
+        PrReviewDecision::Skip => "Skipped",
+        PrReviewDecision::Question => "Needs discussion",
+    };
+    let mut body = format!("[SlashIt agent — {}]\n\n", status);
+    if !item.summary.is_empty() {
+        body.push_str(&item.summary);
+        body.push_str("\n\n");
+    }
+    if !item.reasoning.is_empty() {
+        body.push_str(&item.reasoning);
+        body.push_str("\n\n");
+    }
+    if matches!(item.decision, PrReviewDecision::Fix) && !item.proposed_change.is_empty() {
+        body.push_str("Change: ");
+        body.push_str(&item.proposed_change);
+    }
+    body.trim().to_string()
+}
+
+async fn post_pr_reply(
+    repo: &str,
+    number: &str,
+    pr_url: &str,
+    comment_id: Option<u64>,
+    body: &str,
+) -> Result<(), String> {
+    if let Some(id) = comment_id {
+        let endpoint = format!("repos/{}/pulls/{}/comments/{}/replies", repo, number, id);
+        let body_arg = format!("body={}", body);
+        if run_cmd_no_cwd("gh", &["api", "-X", "POST", &endpoint, "-f", &body_arg]).await.is_ok() {
+            return Ok(());
+        }
+        // Inline reply failed (e.g. comment was on a Review, not an inline thread).
+        // Fall through to a global PR comment so the reply is not lost.
+    }
+    run_cmd_no_cwd("gh", &["pr", "comment", pr_url, "--body", body])
+        .await
+        .map(|_| ())
 }
 
 async fn run_claude_pr_helper(prompt: String, working_dir: String, can_edit: bool) -> Result<String, String> {

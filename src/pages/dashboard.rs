@@ -146,8 +146,9 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
                     view! {
                         <>
                             <div class="flex-1 min-h-0">
-                            <Kanban 
-                                tasks=tasks.get() 
+                            <Kanban
+                                tasks=tasks
+                                set_tasks=set_tasks
                                 project_id=project_id_kanban
                                 selected_tasks=Signal::from(selected_tasks)
                                 set_selected_tasks=set_selected_tasks

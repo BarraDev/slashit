@@ -3,8 +3,12 @@ use leptos::task::spawn_local;
 use leptos::callback::Callback;
 use wasm_bindgen::JsCast;
 use crate::models::{Task, TaskStatus};
+use crate::models::task::{
+    PrCommentKind, PrReviewApplyResult, PrReviewComment, PrReviewDecisionKind, PrReviewItem,
+    PrReviewPlan,
+};
 use crate::components::{TaskCard, TaskEditModal, TaskEditMode, toast, TaskContextMenu, DiffModal};
-use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_comments, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, PrCandidate, PrPushRecoveryPlan};
+use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::HashSet;
 
@@ -105,7 +109,8 @@ const COLUMNS: [ColumnData; 8] = [
 
 #[component]
 pub fn Kanban(
-    tasks: Vec<Task>,
+    tasks: ReadSignal<Vec<Task>>,
+    set_tasks: WriteSignal<Vec<Task>>,
     #[prop(default = String::new())] project_id: String,
     #[prop(into)] selected_tasks: Signal<Vec<Uuid>>,
     set_selected_tasks: WriteSignal<Vec<Uuid>>,
@@ -113,7 +118,10 @@ pub fn Kanban(
     // Use the provided selection state
     let selected_tasks_signal = selected_tasks;
     let set_selected_tasks_writer = set_selected_tasks;
-    let (tasks_signal, set_tasks_signal) = signal(tasks);
+    // Use parent-owned task signals so this component is not recreated when the
+    // parent's task list updates (which would destroy modal/menu state).
+    let tasks_signal = tasks;
+    let set_tasks_signal = set_tasks;
     let (dragged_task, set_dragged_task) = signal(None::<(String, TaskStatus)>);
     let (drag_over_column, set_drag_over_column) = signal(None::<TaskStatus>);
     // Track which position within a column we're hovering over (task_id we're above, or None for end)
@@ -134,10 +142,13 @@ pub fn Kanban(
     let diff_title = RwSignal::new(String::new());
     let show_pr_review_modal = RwSignal::new(false);
     let pr_review_task = RwSignal::new(None::<Task>);
-    let pr_review_plan = RwSignal::new(String::new());
+    let pr_review_plan = RwSignal::new(None::<PrReviewPlan>);
     let pr_review_loading = RwSignal::new(false);
     let pr_review_applying = RwSignal::new(false);
     let pr_review_error = RwSignal::new(None::<String>);
+    let pr_review_auto_push = RwSignal::new(true);
+    let pr_review_auto_reply = RwSignal::new(true);
+    let pr_review_last_apply = RwSignal::new(None::<PrReviewApplyResult>);
     let show_pr_candidates_modal = RwSignal::new(false);
     let pr_candidate_task = RwSignal::new(None::<Task>);
     let pr_candidates = RwSignal::new(Vec::<PrCandidate>::new());
@@ -249,13 +260,24 @@ pub fn Kanban(
         for tid in initial_pr_task_ids {
             spawn_local(async move {
                 if let Ok(Some(updated)) = refresh_task_pr_state(tid).await {
-                    set_tasks_signal.update(|tasks| {
-                        if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
-                            t.status = updated.status.clone();
-                            t.external_refs = updated.external_refs.clone();
-                            t.updated_at = updated.updated_at;
-                        }
+                    // Only propagate if status or refs actually changed — a no-op
+                    // update would still trigger reactive re-renders and could
+                    // tear down open modals/menus.
+                    let snapshot = tasks_signal.get_untracked();
+                    let needs_update = snapshot.iter().any(|t| {
+                        t.id == updated.id
+                            && (t.status != updated.status
+                                || t.external_refs != updated.external_refs)
                     });
+                    if needs_update {
+                        set_tasks_signal.update(|tasks| {
+                            if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
+                                t.status = updated.status.clone();
+                                t.external_refs = updated.external_refs.clone();
+                                t.updated_at = updated.updated_at;
+                            }
+                        });
+                    }
                 }
             });
         }
@@ -264,25 +286,31 @@ pub fn Kanban(
     let on_analyze_pr_comments = Callback::new({
         move |task: Task| {
             pr_review_task.set(Some(task.clone()));
-            pr_review_plan.set(String::new());
             pr_review_error.set(None);
+            pr_review_last_apply.set(task.pr_review_plan.as_ref().and_then(|p| p.last_apply.clone()));
+            // Reuse cached plan only when it actually has content. An empty
+            // cache (from a prior empty-fetch or older app version) would block
+            // the backend call and the user could never refresh by reopening.
+            let has_useful_cache = task.pr_review_plan.as_ref()
+                .map(|p| !p.comments.is_empty() || !p.items.is_empty())
+                .unwrap_or(false);
+            if has_useful_cache {
+                pr_review_plan.set(task.pr_review_plan.clone());
+                pr_review_loading.set(false);
+                show_pr_review_modal.set(true);
+                return;
+            }
+            pr_review_plan.set(None);
             pr_review_loading.set(true);
             show_pr_review_modal.set(true);
             spawn_local(async move {
                 match analyze_pr_comments(task.id.to_string()).await {
                     Ok(plan) => {
-                        if plan.trim().is_empty() {
-                            pr_review_plan.set(String::new());
-                            pr_review_error.set(Some(
-                                "Triage helper returned an empty plan. Edit a plan manually below or try again.".to_string(),
-                            ));
-                        } else {
-                            pr_review_plan.set(plan);
-                            pr_review_error.set(None);
-                        }
+                        pr_review_plan.set(Some(plan));
+                        pr_review_error.set(None);
                     }
                     Err(e) => {
-                        pr_review_plan.set(String::new());
+                        pr_review_plan.set(None);
                         pr_review_error.set(Some(format!("Failed to analyze PR comments: {}", e)));
                     }
                 }
@@ -438,6 +466,10 @@ pub fn Kanban(
                 loading=pr_review_loading
                 applying=pr_review_applying
                 error=pr_review_error
+                auto_push=pr_review_auto_push
+                auto_reply=pr_review_auto_reply
+                last_apply=pr_review_last_apply
+                set_tasks=set_tasks_signal
             />
 
             <PrCandidatesModal
@@ -697,27 +729,87 @@ fn PrPushRecoveryModal(
 fn PrReviewModal(
     show: RwSignal<bool>,
     task: RwSignal<Option<Task>>,
-    plan: RwSignal<String>,
+    plan: RwSignal<Option<PrReviewPlan>>,
     loading: RwSignal<bool>,
     applying: RwSignal<bool>,
     error: RwSignal<Option<String>>,
+    auto_push: RwSignal<bool>,
+    auto_reply: RwSignal<bool>,
+    last_apply: RwSignal<Option<PrReviewApplyResult>>,
+    set_tasks: WriteSignal<Vec<Task>>,
 ) -> impl IntoView {
+    let show_raw_comments = RwSignal::new(false);
+
+    let trigger_analyze = move |force: bool| {
+        let Some(task_value) = task.get() else { return; };
+        if !force {
+            let cached = task_value.pr_review_plan.clone()
+                .filter(|p| !p.comments.is_empty() || !p.items.is_empty());
+            if let Some(cached) = cached {
+                last_apply.set(cached.last_apply.clone());
+                plan.set(Some(cached));
+                error.set(None);
+                return;
+            }
+        }
+        plan.set(None);
+        error.set(None);
+        loading.set(true);
+        spawn_local(async move {
+            match analyze_pr_comments(task_value.id.to_string()).await {
+                Ok(p) => { plan.set(Some(p)); error.set(None); }
+                Err(e) => {
+                    plan.set(None);
+                    error.set(Some(format!("Failed to analyze PR comments: {}", e)));
+                }
+            }
+            loading.set(false);
+        });
+    };
+
     let on_apply = move |_| {
-        let Some(task_value) = task.get() else {
+        let Some(task_value) = task.get() else { return; };
+        let Some(current_plan) = plan.get() else {
+            toast::error("No plan loaded".to_string());
             return;
         };
-        let approved_plan = plan.get();
-        if approved_plan.trim().is_empty() {
-            toast::error("Nothing to apply yet".to_string());
+        let approved_count = current_plan.items.iter()
+            .filter(|i| i.approved && matches!(i.decision, PrReviewDecisionKind::Fix))
+            .count();
+        if approved_count == 0 {
+            toast::error("Approve at least one Fix item before applying".to_string());
             return;
         }
 
+        let opts = AddressPrReviewOptions {
+            auto_push: auto_push.get(),
+            auto_reply: auto_reply.get(),
+        };
         applying.set(true);
+        let task_id = task_value.id.to_string();
         spawn_local(async move {
-            match address_pr_comments(task_value.id.to_string(), approved_plan).await {
-                Ok(summary) => {
-                    toast::success("PR review fixes applied".to_string());
-                    plan.set(summary);
+            match address_pr_review(task_id.clone(), current_plan, opts).await {
+                Ok(result) => {
+                    let pushed = result.pushed;
+                    let replies = result.replies_posted;
+                    let errs = result.reply_errors.len();
+                    last_apply.set(Some(result));
+                    let mut msg = String::from("Applied. ");
+                    if pushed { msg.push_str("Pushed. "); }
+                    if replies > 0 { msg.push_str(&format!("Posted {} replies. ", replies)); }
+                    if errs > 0 { msg.push_str(&format!("{} reply errors.", errs)); }
+                    toast::success(msg);
+                    // Refresh task PR state so the card moves if reviewer reacts.
+                    let task_id_inner = task_id.clone();
+                    spawn_local(async move {
+                        if let Ok(Some(updated)) = refresh_task_pr_state(task_id_inner).await {
+                            set_tasks.update(|tasks| {
+                                if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
+                                    *t = updated;
+                                }
+                            });
+                        }
+                    });
                 }
                 Err(e) => toast::error(format!("Failed to apply PR fixes: {}", e)),
             }
@@ -730,24 +822,39 @@ fn PrReviewModal(
             <div
                 class="fixed inset-0 z-[70] bg-black/60 flex items-center justify-center p-4"
                 on:click=move |_| {
-                    if !applying.get() {
+                    if !loading.get() && !applying.get() {
                         show.set(false);
                     }
                 }
             >
                 <div
-                    class="w-full max-w-3xl max-h-[86vh] bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl overflow-hidden flex flex-col"
+                    class="w-full max-w-4xl max-h-[90vh] bg-[#0B0B0F] border border-white/10 rounded-xl shadow-2xl overflow-hidden flex flex-col"
                     on:click=move |e| e.stop_propagation()
                 >
-                    <div class="flex items-center justify-between px-5 py-4 border-b border-white/10">
-                        <div class="min-w-0">
-                            <h2 class="text-lg font-semibold text-white/90">"PR Comment Review"</h2>
-                            <p class="text-xs text-white/40 truncate">
+                    <div class="flex items-start justify-between px-5 py-4 border-b border-white/10 gap-4">
+                        <div class="min-w-0 flex-1">
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <h2 class="text-lg font-semibold text-white/90">"PR Comment Review"</h2>
+                                {move || plan.get().and_then(|p| p.review_decision).map(|d| {
+                                    let (bg, fg, label) = match d.as_str() {
+                                        "APPROVED" => ("bg-emerald-500/15", "text-emerald-300", "Approved"),
+                                        "CHANGES_REQUESTED" => ("bg-amber-500/15", "text-amber-300", "Changes requested"),
+                                        "REVIEW_REQUIRED" => ("bg-blue-500/15", "text-blue-300", "Review required"),
+                                        _ => ("bg-white/10", "text-white/60", "Commented"),
+                                    };
+                                    view! {
+                                        <span class=format!("text-[10px] px-2 py-0.5 rounded-full font-medium {} {}", bg, fg)>
+                                            {label}
+                                        </span>
+                                    }
+                                })}
+                            </div>
+                            <p class="text-xs text-white/40 truncate mt-0.5">
                                 {move || task.get().map(|t| t.title).unwrap_or_else(|| "Review comments before applying fixes".to_string())}
                             </p>
                         </div>
                         <button
-                            class="p-2 rounded-md hover:bg-white/10 text-white/60 transition-colors"
+                            class="p-2 rounded-md hover:bg-white/10 text-white/60 transition-colors flex-shrink-0"
                             on:click=move |_| show.set(false)
                             disabled=move || applying.get()
                             aria-label="Close"
@@ -758,11 +865,19 @@ fn PrReviewModal(
                         </button>
                     </div>
 
-                    <div class="p-5 overflow-y-auto space-y-3">
+                    <div class="px-5 py-3 overflow-y-auto flex-1 space-y-4">
                         <Show
                             when=move || !loading.get()
                             fallback=|| view! {
-                                <div class="py-12 text-center text-sm text-white/50">"Analyzing PR comments..."</div>
+                                <div class="py-12 text-center text-sm text-white/50">
+                                    <div class="inline-flex items-center gap-2">
+                                        <svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+                                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                                        </svg>
+                                        "Analyzing PR comments..."
+                                    </div>
+                                </div>
                             }
                         >
                             {move || error.get().map(|msg| view! {
@@ -770,37 +885,288 @@ fn PrReviewModal(
                                     {msg}
                                 </div>
                             })}
-                            <textarea
-                                class="w-full min-h-[360px] bg-white/[0.04] border border-white/10 rounded-lg p-4 text-sm text-white/80 font-mono leading-relaxed resize-y focus:outline-none focus:border-yellow-500/50"
-                                prop:value=move || plan.get()
-                                on:input=move |ev| plan.set(event_target_value(&ev))
-                                placeholder="The agent's triage plan will appear here. Edit it before approving if needed."
-                            ></textarea>
-                            <p class="text-xs text-white/40">
-                                "Only the plan shown here is approved. Edit out anything you do not want the agent to change."
-                            </p>
+
+                            {move || last_apply.get().map(|res| {
+                                let summary_class = if res.reply_errors.is_empty() {
+                                    "border-emerald-500/30 bg-emerald-500/10 text-emerald-100"
+                                } else {
+                                    "border-amber-500/30 bg-amber-500/10 text-amber-100"
+                                };
+                                view! {
+                                    <div class=format!("px-3 py-2 rounded-md border text-xs space-y-1 {}", summary_class)>
+                                        <div class="font-medium">
+                                            {format!(
+                                                "Last apply at {}: fixed {}, pushed {}, replies {}{}",
+                                                res.applied_at.format("%H:%M:%S"),
+                                                res.fixed_ids.len(),
+                                                if res.pushed { "yes" } else { "no" },
+                                                res.replies_posted,
+                                                if res.reply_errors.is_empty() { String::new() } else { format!(", {} errors", res.reply_errors.len()) },
+                                            )}
+                                        </div>
+                                        {(!res.reply_errors.is_empty()).then(|| view! {
+                                            <ul class="list-disc list-inside opacity-80">
+                                                {res.reply_errors.iter().take(5).map(|e| view! { <li>{e.clone()}</li> }).collect_view()}
+                                            </ul>
+                                        })}
+                                    </div>
+                                }
+                            })}
+
+                            // Raw comments collapsible
+                            {move || plan.get().map(|p| {
+                                let count = p.comments.len();
+                                view! {
+                                    <div class="rounded-md border border-white/10">
+                                        <button
+                                            class="w-full text-left px-3 py-2 text-xs text-white/70 hover:bg-white/5 flex items-center justify-between"
+                                            on:click=move |_| show_raw_comments.update(|v| *v = !*v)
+                                        >
+                                            <span>{format!("PR comments ({})", count)}</span>
+                                            <span class="text-white/40">
+                                                {move || if show_raw_comments.get() { "Hide" } else { "Show" }}
+                                            </span>
+                                        </button>
+                                        <Show when=move || show_raw_comments.get()>
+                                            <div class="border-t border-white/10 max-h-60 overflow-y-auto p-3 space-y-2 text-xs">
+                                                {p.comments.iter().map(|c| {
+                                                    let kind = match c.kind {
+                                                        PrCommentKind::Inline => "inline",
+                                                        PrCommentKind::Review => "review",
+                                                        PrCommentKind::Conversation => "conversation",
+                                                    };
+                                                    let loc = match (&c.path, c.line) {
+                                                        (Some(p), Some(l)) => format!("{}:{}", p, l),
+                                                        (Some(p), None) => p.clone(),
+                                                        _ => "PR-level".to_string(),
+                                                    };
+                                                    view! {
+                                                        <div class="rounded bg-white/[0.03] p-2">
+                                                            <div class="text-white/50 font-mono">
+                                                                {format!("[{}] {} - {}", kind, c.author, loc)}
+                                                            </div>
+                                                            <div class="text-white/80 whitespace-pre-wrap mt-1">{c.body.clone()}</div>
+                                                        </div>
+                                                    }
+                                                }).collect_view()}
+                                            </div>
+                                        </Show>
+                                    </div>
+                                }
+                            })}
+
+                            // Items list
+                            {move || plan.get().map(|p| {
+                                if p.comments.is_empty() {
+                                    return view! {
+                                        <div class="rounded-md border border-white/10 bg-white/[0.03] p-4 text-sm text-white/60">
+                                            <div class="font-medium text-white/80 mb-1">"No reviewer comments yet"</div>
+                                            <p>{format!(
+                                                "{} did not receive any review comments, conversation comments, or inline comments. Click Re-analyze once a reviewer leaves feedback.",
+                                                p.pr_url,
+                                            )}</p>
+                                        </div>
+                                    }.into_any();
+                                }
+                                if p.items.is_empty() {
+                                    return view! {
+                                        <div class="rounded-md border border-amber-500/20 bg-amber-500/[0.04] p-4 text-sm text-white/70">
+                                            <div class="font-medium text-amber-200 mb-1">"Triage returned no structured items"</div>
+                                            <p class="text-white/60">"The agent could not produce a JSON plan. Raw output below — Re-analyze, or paste a manual decision into the items list above."</p>
+                                            <pre class="mt-2 text-xs whitespace-pre-wrap font-mono text-white/50 max-h-60 overflow-y-auto">{p.raw_plan.clone()}</pre>
+                                        </div>
+                                    }.into_any();
+                                }
+                                let items_view = p.items.iter().enumerate().map(|(idx, item)| {
+                                    let item = item.clone();
+                                    render_review_item(idx, item, plan)
+                                }).collect_view();
+                                view! { <div class="space-y-2">{items_view}</div> }.into_any()
+                            })}
                         </Show>
                     </div>
 
-                    <div class="flex items-center justify-end gap-2 px-5 py-4 border-t border-white/10">
-                        <button
-                            class="px-4 py-2 rounded-lg text-sm text-white/60 hover:bg-white/10 transition-colors disabled:opacity-40"
-                            on:click=move |_| show.set(false)
-                            disabled=move || applying.get()
-                        >
-                            "Cancel"
-                        </button>
-                        <button
-                            class="px-4 py-2 rounded-lg text-sm bg-yellow-500 text-black font-medium hover:bg-yellow-400 transition-colors disabled:opacity-40 disabled:hover:bg-yellow-500"
-                            on:click=on_apply
-                            disabled=move || loading.get() || applying.get() || plan.get().trim().is_empty()
-                        >
-                            {move || if applying.get() { "Applying..." } else { "Apply Approved Fixes" }}
-                        </button>
+                    <div class="flex items-center justify-between gap-3 px-5 py-3 border-t border-white/10 bg-white/[0.02]">
+                        <div class="flex items-center gap-4 text-xs text-white/70">
+                            <label class="flex items-center gap-1.5 cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    class="accent-yellow-500"
+                                    prop:checked=move || auto_push.get()
+                                    on:change=move |ev| auto_push.set(event_target_checked(&ev))
+                                />
+                                "Auto-push branch"
+                            </label>
+                            <label class="flex items-center gap-1.5 cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    class="accent-yellow-500"
+                                    prop:checked=move || auto_reply.get()
+                                    on:change=move |ev| auto_reply.set(event_target_checked(&ev))
+                                />
+                                "Auto-reply on PR"
+                            </label>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <button
+                                class="px-3 py-1.5 rounded-lg text-xs text-white/70 hover:bg-white/10 transition-colors disabled:opacity-40"
+                                on:click=move |_| trigger_analyze(true)
+                                disabled=move || loading.get() || applying.get()
+                                title="Run the triage agent again, ignoring the cached plan"
+                            >
+                                "Re-analyze"
+                            </button>
+                            <button
+                                class="px-3 py-1.5 rounded-lg text-xs text-white/60 hover:bg-white/10 transition-colors disabled:opacity-40"
+                                on:click=move |_| show.set(false)
+                                disabled=move || applying.get()
+                            >
+                                "Close"
+                            </button>
+                            <button
+                                class="px-4 py-1.5 rounded-lg text-sm bg-yellow-500 text-black font-medium hover:bg-yellow-400 transition-colors disabled:opacity-40 disabled:hover:bg-yellow-500"
+                                on:click=on_apply
+                                disabled=move || loading.get() || applying.get() || plan.get().map(|p| p.items.iter().filter(|i| i.approved && matches!(i.decision, PrReviewDecisionKind::Fix)).count() == 0).unwrap_or(true)
+                            >
+                                {move || if applying.get() { "Applying...".to_string() } else {
+                                    let n = plan.get().map(|p| p.items.iter().filter(|i| i.approved && matches!(i.decision, PrReviewDecisionKind::Fix)).count()).unwrap_or(0);
+                                    format!("Apply {} approved", n)
+                                }}
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
         </Show>
+    }
+}
+
+fn render_review_item(
+    idx: usize,
+    item: PrReviewItem,
+    plan: RwSignal<Option<PrReviewPlan>>,
+) -> impl IntoView {
+    let comment_id = item.comment_id;
+    let related = plan.get_untracked()
+        .and_then(|p| comment_id.and_then(|id| p.comments.into_iter().find(|c| c.id == Some(id))));
+
+    let update_item = move |f: Box<dyn Fn(&mut PrReviewItem)>| {
+        plan.update(|opt| {
+            if let Some(p) = opt.as_mut() {
+                if let Some(it) = p.items.get_mut(idx) {
+                    f(it);
+                }
+            }
+        });
+    };
+
+    let toggle_approved = move |ev: leptos::ev::Event| {
+        let v = event_target_checked(&ev);
+        update_item(Box::new(move |it| it.approved = v));
+    };
+    let on_decision_change = move |ev: leptos::ev::Event| {
+        let v = event_target_value(&ev);
+        let decision = match v.as_str() {
+            "fix" => PrReviewDecisionKind::Fix,
+            "skip" => PrReviewDecisionKind::Skip,
+            _ => PrReviewDecisionKind::Question,
+        };
+        update_item(Box::new(move |it| {
+            it.decision = decision.clone();
+            it.approved = matches!(it.decision, PrReviewDecisionKind::Fix);
+        }));
+    };
+    let on_reasoning_input = move |ev: leptos::ev::Event| {
+        let v = event_target_value(&ev);
+        update_item(Box::new(move |it| it.reasoning = v.clone()));
+    };
+    let on_change_input = move |ev: leptos::ev::Event| {
+        let v = event_target_value(&ev);
+        update_item(Box::new(move |it| it.proposed_change = v.clone()));
+    };
+
+    let location = related.as_ref().map(|c| match (&c.path, c.line) {
+        (Some(p), Some(l)) => format!("{}:{}", p, l),
+        (Some(p), None) => p.clone(),
+        _ => "PR-level".to_string(),
+    }).unwrap_or_else(|| "PR-level".to_string());
+    let original_body = related.as_ref().map(|c| c.body.clone());
+    let author = related.as_ref().map(|c| c.author.clone()).unwrap_or_default();
+
+    let (decision_class, decision_label) = match item.decision {
+        PrReviewDecisionKind::Fix => ("border-emerald-500/30 bg-emerald-500/[0.04]", "Fix"),
+        PrReviewDecisionKind::Skip => ("border-white/10 bg-white/[0.02]", "Skip"),
+        PrReviewDecisionKind::Question => ("border-amber-500/30 bg-amber-500/[0.04]", "Question"),
+    };
+    let _ = decision_label;
+
+    let summary = item.summary.clone();
+    let reasoning = item.reasoning.clone();
+    let proposed = item.proposed_change.clone();
+    let approved_init = item.approved;
+    let decision_value = match item.decision {
+        PrReviewDecisionKind::Fix => "fix",
+        PrReviewDecisionKind::Skip => "skip",
+        PrReviewDecisionKind::Question => "question",
+    };
+
+    view! {
+        <div class=format!("rounded-lg border {} p-3 space-y-2", decision_class)>
+            <div class="flex items-start gap-3">
+                <input
+                    type="checkbox"
+                    class="mt-1 accent-yellow-500"
+                    prop:checked=approved_init
+                    on:change=toggle_approved
+                    title="Approve to include in apply"
+                />
+                <div class="flex-1 min-w-0 space-y-1">
+                    <div class="flex items-center gap-2 flex-wrap text-xs text-white/45">
+                        <span class="font-mono">{location}</span>
+                        {(!author.is_empty()).then(|| view! { <span>"-"</span> <span>{author}</span> })}
+                        {comment_id.map(|id| view! { <span class="opacity-60">{format!("(id {})", id)}</span> })}
+                    </div>
+                    <div class="text-sm text-white/90 font-medium">{summary}</div>
+                </div>
+                <select
+                    class="text-xs bg-white/[0.05] border border-white/10 rounded px-2 py-1 text-white/80"
+                    on:change=on_decision_change
+                >
+                    <option value="fix" selected=decision_value == "fix">"Fix"</option>
+                    <option value="skip" selected=decision_value == "skip">"Skip"</option>
+                    <option value="question" selected=decision_value == "question">"Question"</option>
+                </select>
+            </div>
+
+            {original_body.map(|body| view! {
+                <details class="text-xs text-white/55">
+                    <summary class="cursor-pointer hover:text-white/80">"Original comment"</summary>
+                    <pre class="mt-1 whitespace-pre-wrap font-mono opacity-80">{body}</pre>
+                </details>
+            })}
+
+            <label class="block">
+                <span class="text-[10px] uppercase tracking-wide text-white/40">"Reply / reasoning"</span>
+                <textarea
+                    class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50"
+                    rows="2"
+                    on:input=on_reasoning_input
+                    prop:value=reasoning
+                    placeholder="What you would tell the reviewer. Posted as the PR reply when auto-reply is on."
+                ></textarea>
+            </label>
+
+            <label class="block">
+                <span class="text-[10px] uppercase tracking-wide text-white/40">"Proposed change"</span>
+                <textarea
+                    class="w-full mt-1 bg-white/[0.04] border border-white/10 rounded p-2 text-xs text-white/85 font-mono resize-y focus:outline-none focus:border-yellow-500/50"
+                    rows="2"
+                    on:input=on_change_input
+                    prop:value=proposed
+                    placeholder="What the agent will change if approved."
+                ></textarea>
+            </label>
+        </div>
     }
 }
 

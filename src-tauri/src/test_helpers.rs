@@ -41,6 +41,7 @@ pub fn create_test_task(title: &str) -> Task {
         worktree_path: None,
         branch_name: None,
         position: 0,
+        pr_review_plan: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

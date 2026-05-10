@@ -101,8 +101,85 @@ pub struct Task {
     #[serde(default)]
     pub branch_name: Option<String>,
 
+    /// Last triage of PR review comments. Cached so reopening the modal does
+    /// not re-run the LLM, and so post-apply state survives reloads.
+    #[serde(default)]
+    pub pr_review_plan: Option<PrReviewPlan>,
+
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrReviewPlan {
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    pub pr_url: String,
+    pub review_decision: Option<String>,
+    pub comments: Vec<PrReviewComment>,
+    pub items: Vec<PrReviewItem>,
+    /// Raw model output, preserved for fallback display when JSON parsing fails.
+    pub raw_plan: String,
+    /// Result of the last apply, if any.
+    #[serde(default)]
+    pub last_apply: Option<PrReviewApplyResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrReviewComment {
+    pub id: Option<u64>,
+    pub kind: PrCommentKind,
+    pub author: String,
+    pub body: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub line: Option<i64>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrCommentKind {
+    Inline,
+    Review,
+    Conversation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrReviewItem {
+    #[serde(default)]
+    pub comment_id: Option<u64>,
+    pub summary: String,
+    pub decision: PrReviewDecision,
+    pub reasoning: String,
+    pub proposed_change: String,
+    #[serde(default)]
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrReviewDecision {
+    Fix,
+    Skip,
+    Question,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrReviewApplyResult {
+    pub applied_at: chrono::DateTime<chrono::Utc>,
+    pub agent_summary: String,
+    pub fixed_ids: Vec<u64>,
+    pub skipped_ids: Vec<u64>,
+    #[serde(default)]
+    pub pushed: bool,
+    #[serde(default)]
+    pub push_branch: Option<String>,
+    #[serde(default)]
+    pub replies_posted: u32,
+    #[serde(default)]
+    pub reply_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

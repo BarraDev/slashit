@@ -148,6 +148,7 @@ async fn handle_create_task(
         error_message: None,
         worktree_path: None,
         branch_name: None,
+        pr_review_plan: None,
         created_at: now,
         updated_at: now,
     };
