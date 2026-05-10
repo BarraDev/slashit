@@ -727,21 +727,30 @@ async fn fetch_pr_review_data(
 
     let inline_json = run_cmd_no_cwd(
         "gh",
-        &["api", &format!("repos/{}/pulls/{}/comments", repo, number)],
-    ).await.unwrap_or_default();
-    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&inline_json) {
-        for c in arr {
-            let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            if body.is_empty() { continue; }
-            let id = c.get("id").and_then(|v| v.as_u64());
-            let author = c.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-            let path = c.get("path").and_then(|v| v.as_str()).map(String::from);
-            let line = c.get("line").or_else(|| c.get("original_line")).and_then(|v| v.as_i64());
-            let url = c.get("html_url").and_then(|v| v.as_str()).map(String::from);
-            comments.push(PrReviewComment {
-                id, kind: PrCommentKind::Inline, author, body, path, line, url,
-            });
+        &["api", "--paginate", &format!("repos/{}/pulls/{}/comments?per_page=100", repo, number)],
+    ).await.unwrap_or_else(|e| {
+        eprintln!("[pr-review] inline comments fetch failed: {}", e);
+        String::new()
+    });
+    match serde_json::from_str::<Vec<serde_json::Value>>(&inline_json) {
+        Ok(arr) => {
+            for c in arr {
+                let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                if body.is_empty() { continue; }
+                let id = c.get("id").and_then(|v| v.as_u64());
+                let author = c.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                let path = c.get("path").and_then(|v| v.as_str()).map(String::from);
+                let line = c.get("line").or_else(|| c.get("original_line")).and_then(|v| v.as_i64());
+                let url = c.get("html_url").and_then(|v| v.as_str()).map(String::from);
+                comments.push(PrReviewComment {
+                    id, kind: PrCommentKind::Inline, author, body, path, line, url,
+                });
+            }
         }
+        Err(e) if !inline_json.is_empty() => {
+            eprintln!("[pr-review] inline comments parse failed: {}", e);
+        }
+        Err(_) => {}
     }
 
     Ok((review_decision, comments))
