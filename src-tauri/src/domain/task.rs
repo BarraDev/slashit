@@ -164,6 +164,24 @@ pub struct PrReviewItem {
     /// `discuss_pr_review_questions` round. Cleared once the round completes.
     #[serde(default)]
     pub user_note: String,
+    /// True once the agent successfully edited code for this item. Survives
+    /// across modal reopens. A re-run with `fix_done=true` skips the agent.
+    #[serde(default)]
+    pub fix_done: bool,
+    /// True once a reply (inline or fallback PR comment) was posted on GitHub
+    /// for this item. Decoupled from `fix_done` so a successful fix with a
+    /// failed reply leaves the item visibly pending in the "Sync replies" path.
+    #[serde(default)]
+    pub reply_posted: bool,
+    /// Agent's per-item report from the run that set `fix_done=true`. Reused
+    /// as the body of a deferred reply when the agent does not need to run
+    /// again (already fixed, only the reply is missing).
+    #[serde(default)]
+    pub last_agent_summary: Option<String>,
+    /// Last per-item error message, surfaced as the failed-badge tooltip and
+    /// kept across reopens so the user remembers which items still need work.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

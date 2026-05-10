@@ -114,6 +114,10 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             proposed_change: "Delete the variable.".to_string(),
             approved: true,
             user_note: String::new(),
+            fix_done: false,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
         },
         PrReviewItem {
             comment_id: Some(102),
@@ -123,6 +127,10 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             proposed_change: String::new(),
             approved: false,
             user_note: String::new(),
+            fix_done: false,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
         },
     ];
 

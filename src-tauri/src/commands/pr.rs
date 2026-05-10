@@ -710,26 +710,44 @@ pub async fn address_pr_review_inner(
     let pr_url = pr_url_for_task(&task)?;
     let task_id_str = task.id.to_string();
 
-    let approved: Vec<PrReviewItem> = plan.items.iter()
-        .filter(|i| i.approved && matches!(i.decision, PrReviewDecision::Fix))
-        .cloned()
+    let approved_indices: Vec<usize> = plan.items.iter().enumerate()
+        .filter(|(_, i)| i.approved && matches!(i.decision, PrReviewDecision::Fix))
+        .map(|(idx, _)| idx)
         .collect();
-    if approved.is_empty() {
+    if approved_indices.is_empty() {
         return Err("No approved fix items to apply".to_string());
     }
-    let total = approved.len();
+    let total = approved_indices.len();
     eprintln!(
         "[pr-review] applying {} approved items per-item (auto_push={}, auto_reply={}, dry_run={})",
         total, options.auto_push, options.auto_reply, options.dry_run,
     );
 
+    let (reply_repo, reply_number) = if options.dry_run {
+        (String::new(), String::new())
+    } else {
+        parse_pr_url(&pr_url)?
+    };
+
+    // We mutate the plan in place to record per-item lifecycle. `updated_plan`
+    // is what we hand back to the caller; the in-loop snapshot of an item is
+    // cloned so we don't hold a borrow across the async agent call.
+    let mut updated_plan = plan;
+
     let mut per_item_summaries: Vec<String> = Vec::with_capacity(total);
     let mut fixed_ids: Vec<u64> = Vec::new();
     let mut failed_ids: Vec<u64> = Vec::new();
     let mut fix_errors: Vec<String> = Vec::new();
+    let mut replies_posted = 0u32;
+    let mut reply_errors: Vec<String> = Vec::new();
 
-    for (idx, item) in approved.iter().enumerate() {
-        let current = idx + 1;
+    for (loop_idx, &orig_idx) in approved_indices.iter().enumerate() {
+        let item = updated_plan.items[orig_idx].clone();
+        let current = loop_idx + 1;
+        let label = item.comment_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+
         progress(PrReviewProgress {
             task_id: task_id_str.clone(),
             kind: "item_started".to_string(),
@@ -739,57 +757,177 @@ pub async fn address_pr_review_inner(
             message: Some(item.summary.clone()),
         });
 
-        let single = vec![item];
-        let prompt = build_review_fix_prompt(&task, &pr_url, &plan.comments, &single, options.dry_run);
-        let label = item.comment_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "<none>".to_string());
-
-        match run_claude_pr_helper(prompt, working_dir.clone(), !options.dry_run).await {
-            Ok(summary) => {
-                if let Some(id) = item.comment_id { fixed_ids.push(id); }
-                per_item_summaries.push(format!(
-                    "## Item {}/{} — comment {}: {}\n\n{}",
-                    current, total, label, item.summary, summary,
-                ));
-                progress(PrReviewProgress {
-                    task_id: task_id_str.clone(),
-                    kind: "item_succeeded".to_string(),
-                    current: Some(current),
-                    total: Some(total),
-                    comment_id: item.comment_id,
-                    message: None,
-                });
+        // --- Dry-run path: agent only, never touch plan state -----------------
+        if options.dry_run {
+            let single = vec![&item];
+            let prompt = build_review_fix_prompt(&task, &pr_url, &updated_plan.comments, &single, true);
+            match run_claude_pr_helper(prompt, working_dir.clone(), false).await {
+                Ok(summary) => {
+                    if let Some(id) = item.comment_id { fixed_ids.push(id); }
+                    per_item_summaries.push(format!(
+                        "## Item {}/{} — comment {}: {}\n\n{}",
+                        current, total, label, item.summary, summary,
+                    ));
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "item_succeeded".to_string(),
+                        current: Some(current),
+                        total: Some(total),
+                        comment_id: item.comment_id,
+                        message: None,
+                    });
+                }
+                Err(e) => {
+                    if let Some(id) = item.comment_id { failed_ids.push(id); }
+                    fix_errors.push(format!("comment {}: {}", label, e));
+                    per_item_summaries.push(format!(
+                        "## Item {}/{} — comment {}: {} — FAILED\n\n{}",
+                        current, total, label, item.summary, e,
+                    ));
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "item_failed".to_string(),
+                        current: Some(current),
+                        total: Some(total),
+                        comment_id: item.comment_id,
+                        message: Some(e),
+                    });
+                }
             }
-            Err(e) => {
-                if let Some(id) = item.comment_id { failed_ids.push(id); }
-                fix_errors.push(format!("comment {}: {}", label, e));
-                per_item_summaries.push(format!(
-                    "## Item {}/{} — comment {}: {} — FAILED\n\n{}",
-                    current, total, label, item.summary, e,
-                ));
-                progress(PrReviewProgress {
-                    task_id: task_id_str.clone(),
-                    kind: "item_failed".to_string(),
-                    current: Some(current),
-                    total: Some(total),
-                    comment_id: item.comment_id,
-                    message: Some(e),
-                });
+            continue;
+        }
+
+        // --- Already fully done — skip silently ------------------------------
+        if item.fix_done && item.reply_posted {
+            per_item_summaries.push(format!(
+                "## Item {}/{} — comment {}: {} — already addressed (skipped)\n",
+                current, total, label, item.summary,
+            ));
+            progress(PrReviewProgress {
+                task_id: task_id_str.clone(),
+                kind: "item_skipped".to_string(),
+                current: Some(current),
+                total: Some(total),
+                comment_id: item.comment_id,
+                message: Some("already fixed and replied".to_string()),
+            });
+            continue;
+        }
+
+        // --- Run agent only if the fix isn't already on disk -----------------
+        let mut agent_summary_for_reply: Option<String> = item.last_agent_summary.clone();
+
+        if !item.fix_done {
+            let single = vec![&item];
+            let prompt = build_review_fix_prompt(&task, &pr_url, &updated_plan.comments, &single, false);
+            match run_claude_pr_helper(prompt, working_dir.clone(), true).await {
+                Ok(summary) => {
+                    if let Some(id) = item.comment_id { fixed_ids.push(id); }
+                    agent_summary_for_reply = Some(summary.clone());
+                    {
+                        let p = &mut updated_plan.items[orig_idx];
+                        p.fix_done = true;
+                        p.last_agent_summary = Some(summary.clone());
+                        p.last_error = None;
+                    }
+                    per_item_summaries.push(format!(
+                        "## Item {}/{} — comment {}: {}\n\n{}",
+                        current, total, label, item.summary, summary,
+                    ));
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "item_succeeded".to_string(),
+                        current: Some(current),
+                        total: Some(total),
+                        comment_id: item.comment_id,
+                        message: None,
+                    });
+                }
+                Err(e) => {
+                    if let Some(id) = item.comment_id { failed_ids.push(id); }
+                    fix_errors.push(format!("comment {}: {}", label, e));
+                    updated_plan.items[orig_idx].last_error = Some(e.clone());
+                    per_item_summaries.push(format!(
+                        "## Item {}/{} — comment {}: {} — FAILED\n\n{}",
+                        current, total, label, item.summary, e,
+                    ));
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "item_failed".to_string(),
+                        current: Some(current),
+                        total: Some(total),
+                        comment_id: item.comment_id,
+                        message: Some(e),
+                    });
+                    // Don't even attempt reply for an item whose fix just failed.
+                    continue;
+                }
+            }
+        } else {
+            // Fix was completed in a prior run; we're only here because the
+            // reply is missing. Don't re-run the agent.
+            per_item_summaries.push(format!(
+                "## Item {}/{} — comment {}: {} — fix already on disk, posting deferred reply\n",
+                current, total, label, item.summary,
+            ));
+            progress(PrReviewProgress {
+                task_id: task_id_str.clone(),
+                kind: "item_succeeded".to_string(),
+                current: Some(current),
+                total: Some(total),
+                comment_id: item.comment_id,
+                message: Some("reusing prior fix".to_string()),
+            });
+        }
+
+        // --- Reply step (only if enabled and not yet posted) -----------------
+        if options.auto_reply && !item.reply_posted {
+            let item_for_body = &updated_plan.items[orig_idx];
+            let body = build_reply_body(item_for_body, agent_summary_for_reply.as_deref());
+            progress(PrReviewProgress {
+                task_id: task_id_str.clone(),
+                kind: "reply_started".to_string(),
+                current: Some(current),
+                total: Some(total),
+                comment_id: item.comment_id,
+                message: None,
+            });
+            match post_pr_reply(&reply_repo, &reply_number, &pr_url, item.comment_id, &body).await {
+                Ok(()) => {
+                    replies_posted += 1;
+                    updated_plan.items[orig_idx].reply_posted = true;
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "reply_done".to_string(),
+                        current: Some(current),
+                        total: Some(total),
+                        comment_id: item.comment_id,
+                        message: None,
+                    });
+                }
+                Err(e) => {
+                    reply_errors.push(format!("comment {}: {}", label, e));
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "reply_failed".to_string(),
+                        current: Some(current),
+                        total: Some(total),
+                        comment_id: item.comment_id,
+                        message: Some(e),
+                    });
+                }
             }
         }
     }
 
     let agent_summary = per_item_summaries.join("\n\n---\n\n");
-    let any_succeeded = !fixed_ids.is_empty();
+    let any_new_fix = !fixed_ids.is_empty();
 
     let mut pushed = false;
     let mut push_branch_name: Option<String> = None;
     let mut push_error: Option<String> = None;
-    let mut replies_posted = 0u32;
-    let mut reply_errors: Vec<String> = Vec::new();
 
-    if !options.dry_run && any_succeeded {
+    if !options.dry_run && any_new_fix {
         let _ = run_cmd("jj", &["describe", "-m", &format!(
             "task: {} (PR review fixes: {} of {})",
             task.title, fixed_ids.len(), total,
@@ -832,28 +970,9 @@ pub async fn address_pr_review_inner(
                 }
             }
         }
-
-        if options.auto_reply {
-            let (repo, number) = parse_pr_url(&pr_url)?;
-            for item in approved.iter().filter(|i| i.comment_id
-                .map(|id| fixed_ids.contains(&id))
-                .unwrap_or(false))
-            {
-                let body = build_reply_body(item);
-                match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
-                    Ok(()) => replies_posted += 1,
-                    Err(e) => {
-                        let label = item.comment_id
-                            .map(|id| id.to_string())
-                            .unwrap_or_else(|| "<none>".to_string());
-                        reply_errors.push(format!("comment {}: {}", label, e));
-                    }
-                }
-            }
-        }
     }
 
-    let skipped_ids: Vec<u64> = plan.items.iter()
+    let skipped_ids: Vec<u64> = updated_plan.items.iter()
         .filter(|i| !i.approved || matches!(i.decision, PrReviewDecision::Skip))
         .filter_map(|i| i.comment_id)
         .collect();
@@ -886,12 +1005,101 @@ pub async fn address_pr_review_inner(
     // task. Dry-runs are session-local previews: the caller still gets the
     // `PrReviewApplyResult` to display in the modal, but the plan written
     // back to disk keeps whatever real-apply state existed before.
-    let mut updated_plan = plan;
     if !options.dry_run {
         updated_plan.last_apply = Some(result.clone());
     }
 
     Ok((result, updated_plan))
+}
+
+/// Result of `sync_pr_review_replies` — how many GitHub replies were posted
+/// in this catch-up pass and any per-item errors.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SyncPrRepliesResult {
+    pub replied: u32,
+    pub errors: Vec<String>,
+    /// Number of items that already had `reply_posted=true` and were left
+    /// untouched. Useful for the UI's confirmation toast.
+    pub already_done: u32,
+    /// Number of approved Fix items still missing a fix on disk
+    /// (`fix_done=false`). These are NOT replied to — the user must run Apply
+    /// for them. Carried back so the UI can warn instead of silently dropping.
+    pub fix_pending: u32,
+}
+
+/// Catch-up reply pass: post replies for items where `fix_done=true` but
+/// `reply_posted=false`, without invoking the agent and without pushing.
+///
+/// This is the recovery path for partial runs: when the agent fixed something
+/// but the GitHub reply step failed (rate limit, transient API error, the user
+/// closed the modal mid-run, etc.), the user can click "Sync replies" to walk
+/// the plan and post only the deferred replies.
+#[tauri::command]
+pub async fn sync_pr_review_replies(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<SyncPrRepliesResult, String> {
+    let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let task = {
+        let tasks = state.task.tasks.read().await;
+        tasks.get(&task_uuid).cloned().ok_or("Task not found")?
+    };
+    let plan = task.pr_review_plan.clone()
+        .ok_or_else(|| "Task has no PR review plan to sync".to_string())?;
+
+    let (result, updated_plan) = sync_pr_review_replies_inner(task, plan).await?;
+    save_review_plan_on_task(&state, task_uuid, updated_plan).await;
+    Ok(result)
+}
+
+/// Core logic of `sync_pr_review_replies` extracted for testability. Walks
+/// the plan's approved Fix items, posts a reply for each one with
+/// `fix_done=true && reply_posted=false`, and returns the updated plan with
+/// `reply_posted` flipped on whatever succeeded.
+pub async fn sync_pr_review_replies_inner(
+    task: Task,
+    plan: PrReviewPlan,
+) -> Result<(SyncPrRepliesResult, PrReviewPlan), String> {
+    let pr_url = pr_url_for_task(&task)?;
+    let (repo, number) = parse_pr_url(&pr_url)?;
+    let mut updated_plan = plan;
+
+    let mut replied = 0u32;
+    let mut errors: Vec<String> = Vec::new();
+    let mut already_done = 0u32;
+    let mut fix_pending = 0u32;
+
+    let approved_indices: Vec<usize> = updated_plan.items.iter().enumerate()
+        .filter(|(_, i)| i.approved && matches!(i.decision, PrReviewDecision::Fix))
+        .map(|(idx, _)| idx)
+        .collect();
+
+    for orig_idx in approved_indices {
+        let item = updated_plan.items[orig_idx].clone();
+        if item.reply_posted {
+            already_done += 1;
+            continue;
+        }
+        if !item.fix_done {
+            fix_pending += 1;
+            continue;
+        }
+        let label = item.comment_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        let body = build_reply_body(&item, item.last_agent_summary.as_deref());
+        match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
+            Ok(()) => {
+                replied += 1;
+                updated_plan.items[orig_idx].reply_posted = true;
+            }
+            Err(e) => {
+                errors.push(format!("comment {}: {}", label, e));
+            }
+        }
+    }
+
+    Ok((SyncPrRepliesResult { replied, errors, already_done, fix_pending }, updated_plan))
 }
 
 fn pr_url_for_task(task: &Task) -> Result<String, String> {
@@ -1096,6 +1304,10 @@ fn parse_review_items(output: &str, comments: &[PrReviewComment]) -> Vec<PrRevie
             proposed_change: i.proposed_change,
             approved,
             user_note: String::new(),
+            fix_done: false,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
         }
     }).collect()
 }
@@ -1234,7 +1446,7 @@ After completing all edits, write a short final summary listing:
     )
 }
 
-fn build_reply_body(item: &PrReviewItem) -> String {
+fn build_reply_body(item: &PrReviewItem, agent_summary: Option<&str>) -> String {
     let status = match item.decision {
         PrReviewDecision::Fix => "Fixed",
         PrReviewDecision::Skip => "Skipped",
@@ -1252,6 +1464,11 @@ fn build_reply_body(item: &PrReviewItem) -> String {
     if matches!(item.decision, PrReviewDecision::Fix) && !item.proposed_change.is_empty() {
         body.push_str("Change: ");
         body.push_str(&item.proposed_change);
+        body.push_str("\n\n");
+    }
+    if let Some(summary) = agent_summary.map(str::trim).filter(|s| !s.is_empty()) {
+        body.push_str("Agent notes:\n");
+        body.push_str(summary);
     }
     body.trim().to_string()
 }

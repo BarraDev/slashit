@@ -299,6 +299,10 @@ fn create_test_discuss_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
             proposed_change: String::new(),
             approved: false,
             user_note: "yes, please add retry with backoff".to_string(),
+            fix_done: false,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
         },
         PrReviewItem {
             comment_id: Some(202),
@@ -308,6 +312,10 @@ fn create_test_discuss_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
             proposed_change: String::new(),
             approved: false,
             user_note: "what timeout should we use?".to_string(),
+            fix_done: false,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
         },
         PrReviewItem {
             comment_id: Some(203),
@@ -317,6 +325,10 @@ fn create_test_discuss_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
             proposed_change: String::new(),
             approved: false,
             user_note: String::new(),
+            fix_done: false,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
         },
     ];
 
@@ -476,6 +488,10 @@ fn create_test_two_fix_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
             proposed_change: "change a".to_string(),
             approved: true,
             user_note: String::new(),
+            fix_done: false,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
         },
         PrReviewItem {
             comment_id: Some(302),
@@ -485,6 +501,10 @@ fn create_test_two_fix_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
             proposed_change: "change b".to_string(),
             approved: true,
             user_note: String::new(),
+            fix_done: false,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
         },
     ];
 
@@ -560,4 +580,150 @@ async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
     assert_eq!(events[2].comment_id, Some(302));
     assert_eq!(events[2].current, Some(2));
     assert_eq!(events[2].total, Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pending() {
+    // Round 1: apply both items normally — both get fix_done + reply_posted.
+    // Round 2: re-apply the SAME plan. Items should be detected as already
+    // addressed; claude must not be invoked again and gh should not be called.
+    let _guard = PATH_LOCK.lock().unwrap();
+    let env = MockEnv::setup("fixed");
+    let (task, plan) = create_test_two_fix_setup();
+
+    let opts = AddressPrReviewOptions {
+        auto_push: false,
+        auto_reply: true,
+        dry_run: false,
+    };
+
+    // Round 1
+    let (round1, plan_after_round1) =
+        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts.clone(), no_progress())
+            .await
+            .expect("round 1 succeeds");
+    assert_eq!(round1.fixed_ids, vec![301, 302]);
+    assert_eq!(round1.replies_posted, 2);
+    // Both items must be marked fix_done + reply_posted on the persisted plan.
+    for it in plan_after_round1.items.iter().filter(|i| i.approved) {
+        assert!(it.fix_done, "fix_done must be true after a successful round");
+        assert!(it.reply_posted, "reply_posted must be true after a successful reply");
+        assert!(it.last_agent_summary.is_some(), "summary must be cached on success");
+    }
+    let claude_calls_round1 = env.claude_invocations();
+    let gh_calls_round1 = env.gh_invocations();
+    assert_eq!(claude_calls_round1, 2, "round 1 should invoke claude per item");
+    assert_eq!(gh_calls_round1, 2, "round 1 should reply per item");
+
+    // Round 2 — same task, the now-stamped plan
+    let (round2, plan_after_round2) =
+        address_pr_review_inner(task, env.working_dir_str(), plan_after_round1, opts, no_progress())
+            .await
+            .expect("round 2 succeeds");
+    assert_eq!(env.claude_invocations(), claude_calls_round1,
+        "round 2 must not call claude — both items already fix_done");
+    assert_eq!(env.gh_invocations(), gh_calls_round1,
+        "round 2 must not call gh — both items already reply_posted");
+    assert!(round2.fixed_ids.is_empty(), "no new fixes this round");
+    assert_eq!(round2.replies_posted, 0);
+    assert!(
+        round2.agent_summary.contains("already addressed"),
+        "summary should call out skipped items, got: {}",
+        round2.agent_summary,
+    );
+    for it in plan_after_round2.items.iter().filter(|i| i.approved) {
+        assert!(it.fix_done);
+        assert!(it.reply_posted);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rerunning_apply_with_only_replies_pending_skips_claude() {
+    // Manually stage a plan where item 1 has fix_done=true but reply_posted=false
+    // (the broken state we want to recover from). Re-applying should NOT call
+    // claude — only post the missing reply.
+    let _guard = PATH_LOCK.lock().unwrap();
+    let env = MockEnv::setup("not used");
+    let (task, mut plan) = create_test_two_fix_setup();
+
+    // Both approved, but only item index 0 has its fix on disk and is missing a reply.
+    plan.items[0].fix_done = true;
+    plan.items[0].last_agent_summary = Some("prior round did the edit".to_string());
+    plan.items[0].reply_posted = false;
+    // Drop item 2 from approval so we focus on the reply-only path for item 1.
+    plan.items[1].approved = false;
+
+    let opts = AddressPrReviewOptions {
+        auto_push: false,
+        auto_reply: true,
+        dry_run: false,
+    };
+
+    let (result, updated_plan) =
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress())
+            .await
+            .expect("recovery apply succeeds");
+
+    assert_eq!(env.claude_invocations(), 0,
+        "agent must not be invoked when the only pending step is a reply");
+    assert_eq!(env.gh_invocations(), 1, "exactly one gh call for the deferred reply");
+    assert!(result.fixed_ids.is_empty(), "no new fixes this round");
+    assert_eq!(result.replies_posted, 1);
+    assert!(updated_plan.items[0].reply_posted);
+    assert!(
+        result.agent_summary.contains("fix already on disk"),
+        "summary should note the reused fix, got: {}",
+        result.agent_summary,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
+    use slashit_app_lib::commands::pr::sync_pr_review_replies_inner;
+
+    let _guard = PATH_LOCK.lock().unwrap();
+    let env = MockEnv::setup("not used");
+    let (task, mut plan) = create_test_two_fix_setup();
+
+    // Item 0: fix done, reply missing — should be replied to.
+    plan.items[0].fix_done = true;
+    plan.items[0].reply_posted = false;
+    plan.items[0].last_agent_summary = Some("edit already shipped".to_string());
+    // Item 1: fix done, reply already posted — should be left alone.
+    plan.items[1].fix_done = true;
+    plan.items[1].reply_posted = true;
+
+    let _ = env.working_dir_str(); // unused but keeps the mock PATH active
+
+    let (result, updated_plan) =
+        sync_pr_review_replies_inner(task, plan).await
+            .expect("sync succeeds");
+
+    assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
+    assert_eq!(env.gh_invocations(), 1, "sync should reply exactly once (only item 0)");
+    assert_eq!(result.replied, 1);
+    assert_eq!(result.already_done, 1, "item 1 was already done");
+    assert_eq!(result.fix_pending, 0);
+    assert!(result.errors.is_empty());
+    assert!(updated_plan.items[0].reply_posted, "deferred reply flipped to posted");
+    assert!(updated_plan.items[1].reply_posted, "untouched item stays posted");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
+    use slashit_app_lib::commands::pr::sync_pr_review_replies_inner;
+
+    let _guard = PATH_LOCK.lock().unwrap();
+    let env = MockEnv::setup("not used");
+    let (task, plan) = create_test_two_fix_setup();
+    // Both items: approved=Fix, fix_done=false (defaults). Sync should classify
+    // them as fix_pending without touching gh.
+
+    let (result, _plan) =
+        sync_pr_review_replies_inner(task, plan).await
+            .expect("sync succeeds");
+    assert_eq!(env.gh_invocations(), 0, "no replies posted when nothing is fix_done");
+    assert_eq!(result.replied, 0);
+    assert_eq!(result.fix_pending, 2);
+    assert_eq!(result.already_done, 0);
 }

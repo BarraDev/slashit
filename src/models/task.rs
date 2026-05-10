@@ -153,6 +153,14 @@ pub struct PrReviewItem {
     pub approved: bool,
     #[serde(default)]
     pub user_note: String,
+    #[serde(default)]
+    pub fix_done: bool,
+    #[serde(default)]
+    pub reply_posted: bool,
+    #[serde(default)]
+    pub last_agent_summary: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
