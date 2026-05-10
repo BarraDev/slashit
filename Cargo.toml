@@ -21,6 +21,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde", "js"] }
 thiserror = "2"
 vte = "0.13"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "KeyboardEvent", "FocusEvent", "WheelEvent", "MouseEvent", "DragEvent", "DataTransfer", "ResizeObserver", "ResizeObserverEntry", "DomRect", "DomRectReadOnly", "Storage", "EventTarget"] }
 
 [dev-dependencies]
