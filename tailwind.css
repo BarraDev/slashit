@@ -177,3 +177,13 @@
   animation: none;
   opacity: 0.5;
 }
+
+/* Indeterminate progress bar used by the PR review modal during agent runs. */
+@keyframes pr-busy {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
+.animate-pr-busy {
+  animation: pr-busy 1.6s ease-in-out infinite;
+}

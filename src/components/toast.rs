@@ -57,13 +57,20 @@ pub fn show_toast(message: String, variant: ToastVariant, duration_ms: Option<u6
         }
 
         toasts.set(current);
-        
-        // Auto-dismiss after duration (default 4 seconds)
-        let duration = duration_ms.unwrap_or(4000);
-        leptos::task::spawn_local(async move {
-            gloo_timers::future::TimeoutFuture::new(duration as u32).await;
-            remove_toast(id);
-        });
+
+        // Auto-dismiss after duration (default 4s). `Some(0)` means "sticky":
+        // the toast stays until the user clicks its close button. Used for
+        // error toasts that the user must actually read.
+        match duration_ms {
+            Some(0) => {}
+            other => {
+                let duration = other.unwrap_or(4000);
+                leptos::task::spawn_local(async move {
+                    gloo_timers::future::TimeoutFuture::new(duration as u32).await;
+                    remove_toast(id);
+                });
+            }
+        }
     });
 }
 
@@ -142,7 +149,9 @@ pub fn success(message: String) {
 }
 
 pub fn error(message: String) {
-    show_toast(message, ToastVariant::Error, None);
+    // Errors stay until the user dismisses them so a glance away doesn't drop
+    // a real failure on the floor.
+    show_toast(message, ToastVariant::Error, Some(0));
 }
 
 pub fn info(message: String) {
