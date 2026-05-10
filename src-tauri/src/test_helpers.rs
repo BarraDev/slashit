@@ -68,6 +68,77 @@ pub fn create_test_task_full(
     task
 }
 
+/// Build a Task + PrReviewPlan pair suitable for exercising
+/// `address_pr_review_inner`. Default plan has 2 items: one Fix (approved,
+/// inline comment) and one Skip.
+pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan) {
+    use crate::domain::task::{
+        PrReviewComment, PrReviewDecision, PrReviewItem, PrReviewPlan, PrCommentKind,
+    };
+
+    let mut task = create_test_task("Fix login bug");
+    task.pr_url = Some("https://github.com/test-org/test-repo/pull/42".to_string());
+    task.branch_name = Some("test-branch".to_string());
+
+    let comments = vec![
+        PrReviewComment {
+            id: Some(101),
+            kind: PrCommentKind::Inline,
+            author: "reviewer".to_string(),
+            body: "This variable is unused.".to_string(),
+            path: Some("src/lib.rs".to_string()),
+            line: Some(42),
+            url: None,
+            created_at: None,
+            updated_at: None,
+        },
+        PrReviewComment {
+            id: Some(102),
+            kind: PrCommentKind::Inline,
+            author: "reviewer".to_string(),
+            body: "Nit: rename for clarity.".to_string(),
+            path: Some("src/lib.rs".to_string()),
+            line: Some(60),
+            url: None,
+            created_at: None,
+            updated_at: None,
+        },
+    ];
+
+    let items = vec![
+        PrReviewItem {
+            comment_id: Some(101),
+            summary: "Remove unused variable".to_string(),
+            decision: PrReviewDecision::Fix,
+            reasoning: "Confirmed unused.".to_string(),
+            proposed_change: "Delete the variable.".to_string(),
+            approved: true,
+            user_note: String::new(),
+        },
+        PrReviewItem {
+            comment_id: Some(102),
+            summary: "Rename suggestion (skipped)".to_string(),
+            decision: PrReviewDecision::Skip,
+            reasoning: "Out of scope for this PR.".to_string(),
+            proposed_change: String::new(),
+            approved: false,
+            user_note: String::new(),
+        },
+    ];
+
+    let plan = PrReviewPlan {
+        generated_at: Utc::now(),
+        pr_url: task.pr_url.clone().unwrap(),
+        review_decision: None,
+        comments,
+        items,
+        raw_plan: String::new(),
+        last_apply: None,
+    };
+
+    (task, plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

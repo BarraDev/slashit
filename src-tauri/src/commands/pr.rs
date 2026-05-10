@@ -641,6 +641,21 @@ pub async fn address_pr_review(
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
+
+    let (result, updated_plan) = address_pr_review_inner(task, working_dir, plan, options).await?;
+    save_review_plan_on_task(&state, task_uuid, updated_plan).await;
+    Ok(result)
+}
+
+/// Core logic of `address_pr_review` extracted for testability. Owns no
+/// `AppState`; the caller is responsible for fetching the `Task` + working
+/// directory and persisting the returned plan.
+pub async fn address_pr_review_inner(
+    task: Task,
+    working_dir: String,
+    plan: PrReviewPlan,
+    options: AddressPrReviewOptions,
+) -> Result<(PrReviewApplyResult, PrReviewPlan), String> {
     let pr_url = pr_url_for_task(&task)?;
 
     let approved: Vec<&PrReviewItem> = plan.items.iter()
@@ -710,9 +725,8 @@ pub async fn address_pr_review(
 
     let mut updated_plan = plan;
     updated_plan.last_apply = Some(result.clone());
-    save_review_plan_on_task(&state, task_uuid, updated_plan).await;
 
-    Ok(result)
+    Ok((result, updated_plan))
 }
 
 fn pr_url_for_task(task: &Task) -> Result<String, String> {

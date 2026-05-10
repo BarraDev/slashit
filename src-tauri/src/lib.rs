@@ -1,8 +1,7 @@
-mod domain;
-mod commands;
+pub mod domain;
+pub mod commands;
 
-#[cfg(test)]
-mod test_helpers;
+pub mod test_helpers;
 mod acp;
 mod jj;
 mod agents;
