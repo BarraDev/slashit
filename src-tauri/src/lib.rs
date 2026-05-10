@@ -337,6 +337,7 @@ pub fn run() {
             get_pr_status,
             analyze_pr_comments,
             address_pr_review,
+            discuss_pr_review_questions,
             refresh_task_pr_state,
             submit_stack,
             create_roadmap_feature,

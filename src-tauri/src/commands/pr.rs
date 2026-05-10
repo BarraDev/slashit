@@ -562,6 +562,60 @@ pub async fn analyze_pr_comments(
     Ok(plan)
 }
 
+/// Re-discuss any items currently flagged Question that have a non-empty
+/// `user_note`. The agent receives only those items (with the user's note as
+/// guidance) and returns updated decision/reasoning/proposed_change for each.
+/// Other items are left untouched. Returns the merged plan.
+#[tauri::command]
+pub async fn discuss_pr_review_questions(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+    plan: PrReviewPlan,
+) -> Result<PrReviewPlan, String> {
+    let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let working_dir = resolve_working_dir(&state, task_uuid).await?;
+    let task = {
+        let tasks = state.task.tasks.read().await;
+        tasks.get(&task_uuid).cloned().ok_or("Task not found")?
+    };
+
+    let pending: Vec<&PrReviewItem> = plan.items.iter()
+        .filter(|i| matches!(i.decision, PrReviewDecision::Question) && !i.user_note.trim().is_empty())
+        .collect();
+    if pending.is_empty() {
+        return Err("No Question items with notes to discuss".to_string());
+    }
+    eprintln!("[pr-review] discussing {} question items", pending.len());
+
+    let prompt = build_discuss_prompt(&task, &plan.pr_url, &plan.comments, &pending);
+    let raw_output = run_claude_pr_helper(prompt, working_dir, false).await?;
+    eprintln!("[pr-review] discuss output: {} chars", raw_output.len());
+    if raw_output.trim().is_empty() {
+        return Err("Discuss helper finished without producing output.".to_string());
+    }
+
+    let updates = parse_review_items(&raw_output, &plan.comments);
+    if updates.is_empty() {
+        return Err("Discuss helper output did not parse as JSON items.".to_string());
+    }
+
+    let mut merged = plan;
+    for update in updates {
+        let Some(target_id) = update.comment_id else { continue; };
+        if let Some(existing) = merged.items.iter_mut().find(|i| i.comment_id == Some(target_id)) {
+            existing.decision = update.decision;
+            existing.reasoning = update.reasoning;
+            existing.proposed_change = update.proposed_change;
+            existing.approved = update.approved;
+            existing.summary = update.summary;
+            existing.user_note.clear();
+        }
+    }
+
+    save_review_plan_on_task(&state, task_uuid, merged.clone()).await;
+    Ok(merged)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AddressPrReviewOptions {
     pub auto_push: bool,
@@ -677,6 +731,12 @@ async fn save_review_plan_on_task(state: &crate::AppState, task_id: Uuid, plan: 
     let _ = state.storage.save_project_tasks(project_id, &project_tasks);
 }
 
+fn parse_gh_ts(v: Option<&serde_json::Value>) -> Option<chrono::DateTime<chrono::Utc>> {
+    v.and_then(|x| x.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
 async fn fetch_pr_review_data(
     pr_url: &str,
 ) -> Result<(Option<String>, Vec<PrReviewComment>), String> {
@@ -686,7 +746,7 @@ async fn fetch_pr_review_data(
 
     let review_json = run_cmd_no_cwd(
         "gh",
-        &["pr", "view", &number, "--repo", &repo, "--json", "reviews,comments,reviewDecision"],
+        &["pr", "view", &number, "--repo", &repo, "--json", "reviews,comments,reviewDecision,createdAt,updatedAt"],
     ).await?;
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&review_json) {
         review_decision = json.get("reviewDecision").and_then(|v| v.as_str()).map(String::from);
@@ -703,9 +763,11 @@ async fn fetch_pr_review_data(
                 let author = review.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
                 let url = review.get("url").and_then(|v| v.as_str()).map(String::from);
                 let display_body = if body.is_empty() { format!("[{}]", state) } else { body };
+                let created_at = parse_gh_ts(review.get("submittedAt").or_else(|| review.get("createdAt")));
                 comments.push(PrReviewComment {
                     id, kind: PrCommentKind::Review, author, body: display_body,
                     path: None, line: None, url,
+                    created_at, updated_at: created_at,
                 });
             }
         }
@@ -716,9 +778,12 @@ async fn fetch_pr_review_data(
                 let id = c.get("id").or_else(|| c.get("databaseId")).and_then(|v| v.as_u64());
                 let author = c.pointer("/author/login").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
                 let url = c.get("url").and_then(|v| v.as_str()).map(String::from);
+                let created_at = parse_gh_ts(c.get("createdAt"));
+                let updated_at = parse_gh_ts(c.get("updatedAt")).or(created_at);
                 comments.push(PrReviewComment {
                     id, kind: PrCommentKind::Conversation, author, body,
                     path: None, line: None, url,
+                    created_at, updated_at,
                 });
             }
         }
@@ -741,8 +806,11 @@ async fn fetch_pr_review_data(
                 let path = c.get("path").and_then(|v| v.as_str()).map(String::from);
                 let line = c.get("line").or_else(|| c.get("original_line")).and_then(|v| v.as_i64());
                 let url = c.get("html_url").and_then(|v| v.as_str()).map(String::from);
+                let created_at = parse_gh_ts(c.get("created_at"));
+                let updated_at = parse_gh_ts(c.get("updated_at")).or(created_at);
                 comments.push(PrReviewComment {
                     id, kind: PrCommentKind::Inline, author, body, path, line, url,
+                    created_at, updated_at,
                 });
             }
         }
@@ -839,8 +907,63 @@ fn parse_review_items(output: &str, comments: &[PrReviewComment]) -> Vec<PrRevie
             reasoning: i.reasoning,
             proposed_change: i.proposed_change,
             approved,
+            user_note: String::new(),
         }
     }).collect()
+}
+
+fn build_discuss_prompt(
+    task: &Task,
+    pr_url: &str,
+    comments: &[PrReviewComment],
+    pending: &[&PrReviewItem],
+) -> String {
+    let items_text = pending.iter().enumerate().map(|(i, item)| {
+        let related = item.comment_id.and_then(|id| comments.iter().find(|c| c.id == Some(id)));
+        let loc = related.map(|c| match (&c.path, c.line) {
+            (Some(p), Some(l)) => format!("{}:{}", p, l),
+            (Some(p), None) => p.clone(),
+            _ => "PR-level".to_string(),
+        }).unwrap_or_else(|| "PR-level".to_string());
+        let original = related.map(|c| c.body.as_str()).unwrap_or("(comment body unavailable)");
+        let id_str = item.comment_id.map(|id| id.to_string()).unwrap_or_else(|| "null".to_string());
+        format!(
+            "Item #{i} (comment_id={id}, location: {loc}):\n\
+             Original reviewer comment:\n{original}\n\n\
+             Your prior reasoning: {prior}\n\
+             User's note for you: {note}",
+            i = i, id = id_str, loc = loc, original = original,
+            prior = item.reasoning, note = item.user_note,
+        )
+    }).collect::<Vec<_>>().join("\n\n---\n\n");
+
+    format!(
+        r#"# PR Review Discussion
+
+Task: {title}
+PR: {pr_url}
+
+You previously triaged the comments below as "Question" because you weren't
+sure. The user has now added a note for each, telling you what they want done
+or asking a follow-up. Re-evaluate each item with the user's note as guidance.
+Read source files (Read/Glob/Grep only) if you need to verify. Do not edit.
+
+## Items to re-evaluate
+{items}
+
+## Output
+Return a STRICT JSON object on a single line. No markdown fences. No prose
+before or after. Schema (one entry per item above, keyed by comment_id):
+
+{{"items":[{{"comment_id":<number-or-null>,"summary":"<short title>","decision":"fix"|"skip"|"question","reasoning":"<reply to the reviewer; will be posted on the PR>","proposed_change":"<concrete change you would make if Fix>"}}]}}
+
+If the user's note resolves the question (e.g. they say "go ahead and fix it"),
+return decision="fix" with a concrete proposed_change. If they confirm there's
+nothing to do, return "skip". If you still need more information from the user,
+return "question" with a clear follow-up in reasoning.
+"#,
+        title = task.title, pr_url = pr_url, items = items_text,
+    )
 }
 
 fn build_review_fix_prompt(

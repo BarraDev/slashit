@@ -116,6 +116,18 @@ pub async fn address_pr_review(
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
+pub async fn discuss_pr_review_questions(
+    task_id: String,
+    plan: crate::models::task::PrReviewPlan,
+) -> Result<crate::models::task::PrReviewPlan, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({
+        "taskId": task_id,
+        "plan": plan,
+    })).unwrap();
+    let response = invoke("discuss_pr_review_questions", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
 pub async fn refresh_task_pr_state(task_id: String) -> Result<Option<crate::models::Task>, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "taskId": task_id })).unwrap();
     let response = invoke("refresh_task_pr_state", args).await?;

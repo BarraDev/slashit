@@ -8,7 +8,7 @@ use crate::models::task::{
     PrReviewPlan,
 };
 use crate::components::{TaskCard, TaskEditModal, TaskEditMode, toast, TaskContextMenu, DiffModal};
-use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
+use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::HashSet;
 
@@ -739,6 +739,9 @@ fn PrReviewModal(
     set_tasks: WriteSignal<Vec<Task>>,
 ) -> impl IntoView {
     let show_raw_comments = RwSignal::new(false);
+    // Default true once an apply has happened — focus on what's new since.
+    let show_only_new = RwSignal::new(false);
+    let discussing = RwSignal::new(false);
 
     // Reactive count of items that are both Fix-decisioned and user-approved.
     let approved_fix_count = move || plan.get()
@@ -747,6 +750,25 @@ fn PrReviewModal(
             .count())
         .unwrap_or(0);
 
+    // Question items the user has annotated, ready to send back to the agent.
+    let pending_discussion_count = move || plan.get()
+        .map(|p| p.items.iter()
+            .filter(|i| matches!(i.decision, PrReviewDecisionKind::Question)
+                && !i.user_note.trim().is_empty())
+            .count())
+        .unwrap_or(0);
+
+    // Filter: when "only new" is on and we have a previous apply, hide items
+    // whose related comment hasn't been updated since the last apply.
+    let item_visible = move |it: &PrReviewItem, p: &PrReviewPlan| -> bool {
+        if !show_only_new.get() { return true; }
+        let Some(la) = last_apply.get() else { return true; };
+        let Some(cid) = it.comment_id else { return true; };
+        let Some(comment) = p.comments.iter().find(|c| c.id == Some(cid)) else { return true; };
+        let ts = comment.updated_at.or(comment.created_at);
+        ts.map(|t| t > la.applied_at).unwrap_or(true)
+    };
+
     let trigger_analyze = move |force: bool| {
         let Some(task_value) = task.get() else { return; };
         if !force {
@@ -754,6 +776,7 @@ fn PrReviewModal(
                 .filter(|p| !p.comments.is_empty() || !p.items.is_empty());
             if let Some(cached) = cached {
                 last_apply.set(cached.last_apply.clone());
+                show_only_new.set(cached.last_apply.is_some());
                 plan.set(Some(cached));
                 error.set(None);
                 return;
@@ -764,7 +787,11 @@ fn PrReviewModal(
         loading.set(true);
         spawn_local(async move {
             match analyze_pr_comments(task_value.id.to_string()).await {
-                Ok(p) => { plan.set(Some(p)); error.set(None); }
+                Ok(p) => {
+                    show_only_new.set(p.last_apply.is_some());
+                    plan.set(Some(p));
+                    error.set(None);
+                }
                 Err(e) => {
                     plan.set(None);
                     error.set(Some(format!("Failed to analyze PR comments: {}", e)));
@@ -821,12 +848,34 @@ fn PrReviewModal(
         });
     };
 
+    let on_discuss = move |_| {
+        let Some(task_value) = task.get() else { return; };
+        let Some(current_plan) = plan.get() else { return; };
+        if pending_discussion_count() == 0 {
+            toast::error("Add a note to at least one Question item first".to_string());
+            return;
+        }
+        discussing.set(true);
+        let task_id = task_value.id.to_string();
+        spawn_local(async move {
+            match discuss_pr_review_questions(task_id, current_plan).await {
+                Ok(updated) => {
+                    plan.set(Some(updated));
+                    error.set(None);
+                    toast::success("Agent re-evaluated the questions".to_string());
+                }
+                Err(e) => toast::error(format!("Failed to discuss: {}", e)),
+            }
+            discussing.set(false);
+        });
+    };
+
     view! {
         <Show when=move || show.get()>
             <div
                 class="fixed inset-0 z-[70] bg-black/60 flex items-center justify-center p-4"
                 on:click=move |_| {
-                    if !loading.get() && !applying.get() {
+                    if !loading.get() && !applying.get() && !discussing.get() {
                         show.set(false);
                     }
                 }
@@ -981,11 +1030,26 @@ fn PrReviewModal(
                                         </div>
                                     }.into_any();
                                 }
-                                let items_view = p.items.iter().enumerate().map(|(idx, item)| {
-                                    let item = item.clone();
+                                let total = p.items.len();
+                                let visible: Vec<(usize, PrReviewItem)> = p.items.iter().enumerate()
+                                    .filter(|(_, it)| item_visible(it, &p))
+                                    .map(|(idx, it)| (idx, it.clone()))
+                                    .collect();
+                                let visible_count = visible.len();
+                                let hidden = total.saturating_sub(visible_count);
+                                let items_view = visible.into_iter().map(|(idx, item)| {
                                     render_review_item(idx, item, plan)
                                 }).collect_view();
-                                view! { <div class="space-y-2">{items_view}</div> }.into_any()
+                                view! {
+                                    <div class="space-y-2">
+                                        {(hidden > 0).then(|| view! {
+                                            <div class="text-[11px] text-white/45 px-1">
+                                                {format!("{} hidden (already addressed before last apply)", hidden)}
+                                            </div>
+                                        })}
+                                        {items_view}
+                                    </div>
+                                }.into_any()
                             })}
                         </Show>
                     </div>
@@ -1010,12 +1074,37 @@ fn PrReviewModal(
                                 />
                                 "Auto-reply on PR"
                             </label>
+                            <label
+                                class="flex items-center gap-1.5 cursor-pointer"
+                                title="Hide items whose comment hasn't changed since the last apply"
+                            >
+                                <input
+                                    type="checkbox"
+                                    class="accent-yellow-500"
+                                    prop:checked=move || show_only_new.get()
+                                    on:change=move |ev| show_only_new.set(event_target_checked(&ev))
+                                    disabled=move || last_apply.get().is_none()
+                                />
+                                "Only new since last apply"
+                            </label>
                         </div>
                         <div class="flex items-center gap-2">
                             <button
                                 class="px-3 py-1.5 rounded-lg text-xs text-white/70 hover:bg-white/10 transition-colors disabled:opacity-40"
+                                on:click=on_discuss
+                                disabled=move || loading.get() || applying.get() || discussing.get() || pending_discussion_count() == 0
+                                title="Send Question items with notes back to the agent"
+                            >
+                                {move || if discussing.get() {
+                                    "Re-discussing...".to_string()
+                                } else {
+                                    format!("Re-discuss {} questions", pending_discussion_count())
+                                }}
+                            </button>
+                            <button
+                                class="px-3 py-1.5 rounded-lg text-xs text-white/70 hover:bg-white/10 transition-colors disabled:opacity-40"
                                 on:click=move |_| trigger_analyze(true)
-                                disabled=move || loading.get() || applying.get()
+                                disabled=move || loading.get() || applying.get() || discussing.get()
                                 title="Run the triage agent again, ignoring the cached plan"
                             >
                                 "Re-analyze"
@@ -1023,14 +1112,14 @@ fn PrReviewModal(
                             <button
                                 class="px-3 py-1.5 rounded-lg text-xs text-white/60 hover:bg-white/10 transition-colors disabled:opacity-40"
                                 on:click=move |_| show.set(false)
-                                disabled=move || applying.get()
+                                disabled=move || applying.get() || discussing.get()
                             >
                                 "Close"
                             </button>
                             <button
                                 class="px-4 py-1.5 rounded-lg text-sm bg-yellow-500 text-black font-medium hover:bg-yellow-400 transition-colors disabled:opacity-40 disabled:hover:bg-yellow-500"
                                 on:click=on_apply
-                                disabled=move || loading.get() || applying.get() || approved_fix_count() == 0
+                                disabled=move || loading.get() || applying.get() || discussing.get() || approved_fix_count() == 0
                             >
                                 {move || if applying.get() {
                                     "Applying...".to_string()
@@ -1088,6 +1177,10 @@ fn render_review_item(
         let v = event_target_value(&ev);
         update_item(&|it| it.proposed_change = v.clone());
     };
+    let on_user_note_input = move |ev: leptos::ev::Event| {
+        let v = event_target_value(&ev);
+        update_item(&|it| it.user_note = v.clone());
+    };
 
     let location = related.as_ref().map(|c| match (&c.path, c.line) {
         (Some(p), Some(l)) => format!("{}:{}", p, l),
@@ -1106,7 +1199,9 @@ fn render_review_item(
     let summary = item.summary.clone();
     let reasoning = item.reasoning.clone();
     let proposed = item.proposed_change.clone();
+    let user_note = item.user_note.clone();
     let approved_init = item.approved;
+    let is_question = matches!(item.decision, PrReviewDecisionKind::Question);
     let decision_value = match item.decision {
         PrReviewDecisionKind::Fix => "fix",
         PrReviewDecisionKind::Skip => "skip",
@@ -1169,6 +1264,21 @@ fn render_review_item(
                     placeholder="What the agent will change if approved."
                 ></textarea>
             </label>
+
+            {is_question.then(|| view! {
+                <label class="block">
+                    <span class="text-[10px] uppercase tracking-wide text-amber-300/80">
+                        "Your note for the agent (re-discuss)"
+                    </span>
+                    <textarea
+                        class="w-full mt-1 bg-amber-500/[0.04] border border-amber-500/30 rounded p-2 text-xs text-white/85 resize-y focus:outline-none focus:border-amber-400/60"
+                        rows="2"
+                        on:input=on_user_note_input
+                        prop:value=user_note
+                        placeholder="Tell the agent what to do (e.g. 'go ahead and fix it', or 'no, the issue is X — re-evaluate')."
+                    ></textarea>
+                </label>
+            })}
         </div>
     }
 }

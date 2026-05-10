@@ -136,6 +136,10 @@ pub struct PrReviewComment {
     pub line: Option<i64>,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,6 +160,10 @@ pub struct PrReviewItem {
     pub proposed_change: String,
     #[serde(default)]
     pub approved: bool,
+    /// User-provided note for a Question item, fed to the agent on the next
+    /// `discuss_pr_review_questions` round. Cleared once the round completes.
+    #[serde(default)]
+    pub user_note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
