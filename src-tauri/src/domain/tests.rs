@@ -65,6 +65,7 @@ mod project_tests {
             id: Uuid::new_v4(),
             name: "Test Project".to_string(),
             repository_id: None,
+            scope: crate::domain::ProjectScope::Standalone,
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
@@ -93,34 +94,14 @@ mod project_tests {
 #[cfg(test)]
 mod workspace_tests {
     use super::*;
-    use uuid::Uuid;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn test_workspace_creation() {
-        let workspace = Workspace {
-            id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
-            name: "main".to_string(),
-            path: "/path/to/workspace".to_string(),
-            base_revision: None,
-            current_change_id: None,
-            created_at: chrono::Utc::now(),
-        };
-        
-        assert_eq!(workspace.name, "main");
-    }
-
-    #[test]
-    fn test_workspace_status_creation() {
-        let status = WorkspaceStatus {
-            workspace_id: Uuid::new_v4(),
-            current_change_id: Some("abc123".to_string()),
-            pending_changes: true,
-            conflicted: false,
-        };
-        
-        assert!(status.pending_changes);
-        assert!(!status.conflicted);
+        let root = WorkspaceRoot::from_trusted(PathBuf::from("/home/u/Repo/ps"));
+        let workspace = Workspace::new("ps".to_string(), root);
+        assert_eq!(workspace.name, "ps");
+        assert_eq!(workspace.root_path.as_path(), Path::new("/home/u/Repo/ps"));
     }
 }
 

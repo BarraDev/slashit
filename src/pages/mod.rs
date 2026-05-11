@@ -11,6 +11,7 @@ pub mod insights;
 pub mod changelog;
 pub mod mcp;
 pub mod worktrees;
+pub mod workspaces;
 pub mod github_issues;
 pub mod github_prs;
 
@@ -25,5 +26,6 @@ pub use insights::*;
 pub use changelog::*;
 pub use mcp::*;
 pub use worktrees::*;
+pub use workspaces::*;
 pub use github_issues::*;
 pub use github_prs::*;

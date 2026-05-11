@@ -553,6 +553,7 @@ baz = 123
             id: project_id,
             name: "Test Project".to_string(),
             repository_id: None,
+            scope: crate::domain::ProjectScope::Standalone,
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
