@@ -239,35 +239,21 @@ mod retry_logic_tests {
     /// Expected timeout per spawn attempt (milliseconds)
     const EXPECTED_SPAWN_TIMEOUT_MS: u32 = 5000;
 
-    #[test]
-    fn test_retry_parameters_are_reasonable() {
-        // Verify retry count is reasonable (not too few, not too many)
-        assert!(
-            EXPECTED_MAX_RETRIES >= 2 && EXPECTED_MAX_RETRIES <= 5,
-            "Retry count should be between 2 and 5, got {}",
-            EXPECTED_MAX_RETRIES
-        );
-    }
-
-    #[test]
-    fn test_base_delay_is_reasonable() {
-        // Base delay should be short enough for good UX but long enough to be meaningful
-        assert!(
-            EXPECTED_BASE_DELAY_MS >= 100 && EXPECTED_BASE_DELAY_MS <= 1000,
-            "Base delay should be between 100ms and 1000ms, got {}ms",
-            EXPECTED_BASE_DELAY_MS
-        );
-    }
-
-    #[test]
-    fn test_spawn_timeout_is_reasonable() {
-        // Timeout should be long enough for slow systems but not too long
-        assert!(
-            EXPECTED_SPAWN_TIMEOUT_MS >= 3000 && EXPECTED_SPAWN_TIMEOUT_MS <= 10000,
-            "Spawn timeout should be between 3s and 10s, got {}ms",
-            EXPECTED_SPAWN_TIMEOUT_MS
-        );
-    }
+    // Compile-time bounds checks on PTY retry tuning. If these constants drift
+    // outside the expected range, the crate fails to build with the message
+    // baked into the const assert — no runtime test needed.
+    const _RETRY_COUNT_OK: () = assert!(
+        EXPECTED_MAX_RETRIES >= 2 && EXPECTED_MAX_RETRIES <= 5,
+        "Retry count should be between 2 and 5"
+    );
+    const _BASE_DELAY_OK: () = assert!(
+        EXPECTED_BASE_DELAY_MS >= 100 && EXPECTED_BASE_DELAY_MS <= 1000,
+        "Base delay should be between 100ms and 1000ms"
+    );
+    const _SPAWN_TIMEOUT_OK: () = assert!(
+        EXPECTED_SPAWN_TIMEOUT_MS >= 3000 && EXPECTED_SPAWN_TIMEOUT_MS <= 10000,
+        "Spawn timeout should be between 3s and 10s"
+    );
 
     #[test]
     fn test_total_max_wait_time() {
@@ -276,7 +262,7 @@ mod retry_logic_tests {
         // Attempt 2: 200ms delay
         // Attempt 3: 400ms delay
         // Plus timeouts: 3 * 5000ms = 15000ms
-        let total_delay = 0 + EXPECTED_BASE_DELAY_MS + (EXPECTED_BASE_DELAY_MS * 2);
+        let total_delay = EXPECTED_BASE_DELAY_MS + (EXPECTED_BASE_DELAY_MS * 2);
         let total_timeout = EXPECTED_MAX_RETRIES * EXPECTED_SPAWN_TIMEOUT_MS;
         let max_wait_time = total_delay + total_timeout;
         

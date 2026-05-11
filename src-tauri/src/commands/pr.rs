@@ -511,6 +511,13 @@ pub async fn analyze_pr_comments(
     };
     let pr_url = pr_url_for_task(&task)?;
 
+    // Preserve apply history across a re-analyze: same PR URL means the user
+    // is refreshing comments, not switching contexts, so `last_apply` and the
+    // per-item lifecycle flags should carry over for items whose `comment_id`
+    // survives the re-fetch.
+    let prior_plan = task.pr_review_plan.clone()
+        .filter(|p| p.pr_url == pr_url);
+
     eprintln!("[pr-review] analyze {} for task {}", pr_url, task_uuid);
     let (review_decision, comments) = fetch_pr_review_data(&pr_url).await?;
     eprintln!(
@@ -527,7 +534,7 @@ pub async fn analyze_pr_comments(
             comments,
             items: Vec::new(),
             raw_plan: String::new(),
-            last_apply: None,
+            last_apply: prior_plan.and_then(|p| p.last_apply),
         });
     }
 
@@ -546,8 +553,22 @@ pub async fn analyze_pr_comments(
             pr_url, comments.len()
         ));
     }
-    let items = parse_review_items(&raw_output, &comments);
+    let mut items = parse_review_items(&raw_output, &comments);
     eprintln!("[pr-review] parsed {} items", items.len());
+
+    // Carry over lifecycle flags from the prior plan for items whose
+    // `comment_id` matches — the fix already landed on disk and the reply is
+    // already on the PR, so the freshly-triaged item should reflect that.
+    if let Some(prev) = prior_plan.as_ref() {
+        for item in items.iter_mut() {
+            let Some(cid) = item.comment_id else { continue; };
+            let Some(prev_item) = prev.items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
+            if prev_item.fix_done { item.fix_done = true; }
+            if prev_item.reply_posted { item.reply_posted = true; }
+            if item.last_error.is_none() { item.last_error = prev_item.last_error.clone(); }
+            if item.last_agent_summary.is_none() { item.last_agent_summary = prev_item.last_agent_summary.clone(); }
+        }
+    }
 
     let plan = PrReviewPlan {
         generated_at: chrono::Utc::now(),
@@ -556,7 +577,7 @@ pub async fn analyze_pr_comments(
         comments,
         items,
         raw_plan: raw_output,
-        last_apply: None,
+        last_apply: prior_plan.and_then(|p| p.last_apply),
     };
     save_review_plan_on_task(&state, task_uuid, plan.clone()).await;
     Ok(plan)
@@ -820,19 +841,20 @@ pub async fn address_pr_review_inner(
         }
 
         // --- Run agent only if the fix isn't already on disk -----------------
-        let mut agent_summary_for_reply: Option<String> = item.last_agent_summary.clone();
-
         if !item.fix_done {
             let single = vec![&item];
             let prompt = build_review_fix_prompt(&task, &pr_url, &updated_plan.comments, &single, false);
             match run_claude_pr_helper(prompt, working_dir.clone(), true).await {
                 Ok(summary) => {
                     if let Some(id) = item.comment_id { fixed_ids.push(id); }
-                    agent_summary_for_reply = Some(summary.clone());
+                    let reply_text = extract_pr_reply(&summary);
                     {
                         let p = &mut updated_plan.items[orig_idx];
                         p.fix_done = true;
                         p.last_agent_summary = Some(summary.clone());
+                        if reply_text.is_some() {
+                            p.pr_reply_text = reply_text;
+                        }
                         p.last_error = None;
                     }
                     per_item_summaries.push(format!(
@@ -888,7 +910,7 @@ pub async fn address_pr_review_inner(
         // --- Reply step (only if enabled and not yet posted) -----------------
         if options.auto_reply && !item.reply_posted {
             let item_for_body = &updated_plan.items[orig_idx];
-            let body = build_reply_body(item_for_body, agent_summary_for_reply.as_deref());
+            let body = build_reply_body(item_for_body);
             progress(PrReviewProgress {
                 task_id: task_id_str.clone(),
                 kind: "reply_started".to_string(),
@@ -898,9 +920,12 @@ pub async fn address_pr_review_inner(
                 message: None,
             });
             match post_pr_reply(&reply_repo, &reply_number, &pr_url, item.comment_id, &body).await {
-                Ok(()) => {
+                Ok(reply_id) => {
                     replies_posted += 1;
                     updated_plan.items[orig_idx].reply_posted = true;
+                    if reply_id.is_some() {
+                        updated_plan.items[orig_idx].reply_comment_id = reply_id;
+                    }
                     progress(PrReviewProgress {
                         task_id: task_id_str.clone(),
                         kind: "reply_done".to_string(),
@@ -1017,15 +1042,26 @@ pub async fn address_pr_review_inner(
     Ok((result, updated_plan))
 }
 
-/// Result of `sync_pr_review_replies` — how many GitHub replies were posted
-/// in this catch-up pass and any per-item errors.
+/// Result of `sync_pr_review_replies` — counts the three operations Sync can
+/// perform on each item: post a missing reply, discover the GitHub ID of a
+/// reply we already posted but never tracked, and rewrite the body of a
+/// tracked reply with the current `build_reply_body` output.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyncPrRepliesResult {
+    /// Items where we created a new reply on GitHub.
     pub replied: u32,
+    /// Items whose `reply_comment_id` we filled in by querying the PR thread
+    /// (via `in_reply_to_id` matching). These also get patched in the same
+    /// pass, so they're counted in `rewritten` as well.
+    pub discovered: u32,
+    /// Items whose existing GitHub reply was overwritten with the current body
+    /// (legacy `[SlashIt agent —]` format → first-person, signature-free).
+    pub rewritten: u32,
+    /// Items with `reply_posted=true` whose reply we couldn't locate on GitHub
+    /// (e.g. PR-level fallback comment with no `in_reply_to_id`). Reported so
+    /// the user knows which ones still need manual cleanup.
+    pub unmatched: u32,
     pub errors: Vec<String>,
-    /// Number of items that already had `reply_posted=true` and were left
-    /// untouched. Useful for the UI's confirmation toast.
-    pub already_done: u32,
     /// Number of approved Fix items still missing a fix on disk
     /// (`fix_done=false`). These are NOT replied to — the user must run Apply
     /// for them. Carried back so the UI can warn instead of silently dropping.
@@ -1072,7 +1108,6 @@ pub async fn sync_pr_review_replies_inner(
 
     let mut replied = 0u32;
     let mut errors: Vec<String> = Vec::new();
-    let mut already_done = 0u32;
     let mut fix_pending = 0u32;
 
     let approved_indices: Vec<usize> = updated_plan.items.iter().enumerate()
@@ -1080,32 +1115,87 @@ pub async fn sync_pr_review_replies_inner(
         .map(|(idx, _)| idx)
         .collect();
 
+    let mut discovered = 0u32;
+    let mut rewritten = 0u32;
+    let mut unmatched = 0u32;
+
     for orig_idx in approved_indices {
         let item = updated_plan.items[orig_idx].clone();
-        if item.reply_posted {
-            already_done += 1;
-            continue;
-        }
         if !item.fix_done {
             fix_pending += 1;
+            continue;
+        }
+        // Up-to-date items are left alone: a reply we posted in the current
+        // signature-free format has `pr_reply_text=Some(_)`. Anything else is
+        // either missing (Case A) or legacy (Case B/C → discover + rewrite).
+        if item.reply_posted && item.pr_reply_text.is_some() {
             continue;
         }
         let label = item.comment_id
             .map(|id| id.to_string())
             .unwrap_or_else(|| "<none>".to_string());
-        let body = build_reply_body(&item, item.last_agent_summary.as_deref());
-        match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
+        let body = build_reply_body(&item);
+
+        // Case A: no reply on GitHub yet — POST a new one.
+        if !item.reply_posted {
+            match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
+                Ok(reply_id) => {
+                    replied += 1;
+                    updated_plan.items[orig_idx].reply_posted = true;
+                    if reply_id.is_some() {
+                        updated_plan.items[orig_idx].reply_comment_id = reply_id;
+                    }
+                    updated_plan.items[orig_idx].pr_reply_text = Some(body);
+                }
+                Err(e) => errors.push(format!("comment {}: {}", label, e)),
+            }
+            continue;
+        }
+
+        // Case B: reply exists but we don't have its GitHub id — try to find it
+        // by walking the PR's inline comments and matching `in_reply_to_id` to
+        // our original comment. No text heuristics. If we still can't find it,
+        // the reply was likely a PR-level fallback comment — count as unmatched.
+        if updated_plan.items[orig_idx].reply_comment_id.is_none() {
+            let Some(original_id) = item.comment_id else {
+                unmatched += 1;
+                continue;
+            };
+            match discover_reply_comment_id(&repo, &number, original_id).await {
+                Ok(Some(found_id)) => {
+                    updated_plan.items[orig_idx].reply_comment_id = Some(found_id);
+                    discovered += 1;
+                }
+                Ok(None) => {
+                    unmatched += 1;
+                    continue;
+                }
+                Err(e) => {
+                    errors.push(format!("comment {} (discover): {}", label, e));
+                    continue;
+                }
+            }
+        }
+
+        // Case C: we now have a reply_comment_id — PATCH the body. Idempotent:
+        // if GitHub already holds the current body, nothing changes server-side.
+        let Some(reply_id) = updated_plan.items[orig_idx].reply_comment_id else {
+            unmatched += 1;
+            continue;
+        };
+        match patch_pr_inline_reply(&repo, reply_id, &body).await {
             Ok(()) => {
-                replied += 1;
-                updated_plan.items[orig_idx].reply_posted = true;
+                rewritten += 1;
+                updated_plan.items[orig_idx].pr_reply_text = Some(body);
             }
-            Err(e) => {
-                errors.push(format!("comment {}: {}", label, e));
-            }
+            Err(e) => errors.push(format!("comment {} (rewrite): {}", label, e)),
         }
     }
 
-    Ok((SyncPrRepliesResult { replied, errors, already_done, fix_pending }, updated_plan))
+    Ok((
+        SyncPrRepliesResult { replied, discovered, rewritten, unmatched, errors, fix_pending },
+        updated_plan,
+    ))
 }
 
 fn pr_url_for_task(task: &Task) -> Result<String, String> {
@@ -1314,6 +1404,8 @@ fn parse_review_items(output: &str, comments: &[PrReviewComment]) -> Vec<PrRevie
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
         }
     }).collect()
 }
@@ -1447,57 +1539,121 @@ code.
 After completing all edits, write a short final summary listing:
 - FIXED: which items you implemented, citing the item number.
 - SKIPPED: any approved item that no longer applied and why.
+
+Then, on a NEW line, emit a `<pr_reply>` block. Its content is the message we
+will post on the PR as a reply to the original review comment. Write in first
+person as the PR author (the human), casual but professional, 1–3 sentences,
+describing what you actually changed (or "skipped — <reason>" if you couldn't
+apply it). Do NOT include a signature, salutation, sign-off, labels like
+"Summary:" or "Change:", or any agent/tool attribution. Just the message.
+
+Example format:
+
+<pr_reply>
+Switched to Promise.allSettled so the card still renders if only one of the
+fetches fails — added an i18n string for the partial-failure state too.
+</pr_reply>
 "#,
         title = task.title, pr_url = pr_url, items = items_text,
     )
 }
 
-fn build_reply_body(item: &PrReviewItem, agent_summary: Option<&str>) -> String {
-    let status = match item.decision {
-        PrReviewDecision::Fix => "Fixed",
-        PrReviewDecision::Skip => "Skipped",
-        PrReviewDecision::Question => "Needs discussion",
-    };
-    let mut body = format!("[SlashIt agent — {}]\n\n", status);
-    if !item.summary.is_empty() {
-        body.push_str(&item.summary);
-        body.push_str("\n\n");
-    }
-    if !item.reasoning.is_empty() {
-        body.push_str(&item.reasoning);
-        body.push_str("\n\n");
-    }
-    if matches!(item.decision, PrReviewDecision::Fix) && !item.proposed_change.is_empty() {
-        body.push_str("Change: ");
-        body.push_str(&item.proposed_change);
-        body.push_str("\n\n");
-    }
-    if let Some(summary) = agent_summary.map(str::trim).filter(|s| !s.is_empty()) {
-        body.push_str("Agent notes:\n");
-        body.push_str(summary);
-    }
-    body.trim().to_string()
+/// Extracts the content between `<pr_reply>` and `</pr_reply>` tags from the
+/// agent's free-form output. Returns `None` if the block is missing or empty
+/// so the caller can fall back to the triage `reasoning`.
+fn extract_pr_reply(agent_output: &str) -> Option<String> {
+    let start = agent_output.find("<pr_reply>")? + "<pr_reply>".len();
+    let rest = &agent_output[start..];
+    let end = rest.find("</pr_reply>")?;
+    let inner = rest[..end].trim();
+    (!inner.is_empty()).then(|| inner.to_string())
 }
 
+/// Builds the body we post on GitHub as the reply to the original review
+/// comment. Prefers the agent's `<pr_reply>` text (first-person, written for
+/// the reviewer). Falls back to the triage `reasoning`, which the analysis
+/// prompt already asks to be reply-friendly. No signature, no labels, no
+/// "Agent notes:" — the human is the apparent author.
+fn build_reply_body(item: &PrReviewItem) -> String {
+    if let Some(text) = item.pr_reply_text.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return text.to_string();
+    }
+    let reasoning = item.reasoning.trim();
+    if !reasoning.is_empty() {
+        return reasoning.to_string();
+    }
+    item.summary.trim().to_string()
+}
+
+/// Posts a reply on the PR. Returns the GitHub comment ID of the created
+/// reply so the caller can persist it on the item for future PATCH-edit.
+/// Returns `Ok(None)` only for the legacy `gh pr comment` fallback path where
+/// gh's CLI doesn't surface a JSON id.
 async fn post_pr_reply(
     repo: &str,
     number: &str,
     pr_url: &str,
     comment_id: Option<u64>,
     body: &str,
-) -> Result<(), String> {
+) -> Result<Option<u64>, String> {
     if let Some(id) = comment_id {
         let endpoint = format!("repos/{}/pulls/{}/comments/{}/replies", repo, number, id);
         let body_arg = format!("body={}", body);
-        if run_cmd_no_cwd("gh", &["api", "-X", "POST", &endpoint, "-f", &body_arg]).await.is_ok() {
-            return Ok(());
+        if let Ok(out) = run_cmd_no_cwd(
+            "gh",
+            &["api", "-X", "POST", &endpoint, "-f", &body_arg, "--jq", ".id"],
+        ).await {
+            let parsed = out.trim().parse::<u64>().ok();
+            return Ok(parsed);
         }
         // Inline reply failed (e.g. comment was on a Review, not an inline thread).
         // Fall through to a global PR comment so the reply is not lost.
     }
     run_cmd_no_cwd("gh", &["pr", "comment", pr_url, "--body", body])
         .await
+        .map(|_| None)
+}
+
+/// Walks the PR's inline review comments and returns the id of the reply
+/// whose `in_reply_to_id` matches `original_comment_id`. Picks the most
+/// recently created when there are multiple. Returns `Ok(None)` when no
+/// inline reply exists for that comment — the original reply may have been a
+/// PR-level fallback (no `in_reply_to_id`) or it was deleted.
+async fn discover_reply_comment_id(
+    repo: &str,
+    number: &str,
+    original_comment_id: u64,
+) -> Result<Option<u64>, String> {
+    let endpoint = format!("repos/{}/pulls/{}/comments?per_page=100", repo, number);
+    let raw = run_cmd_no_cwd("gh", &["api", "--paginate", &endpoint]).await
+        .map_err(|e| format!("gh api list failed: {}", e))?;
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&raw)
+        .map_err(|e| format!("gh api returned non-JSON: {}", e))?;
+
+    let mut best: Option<(u64, chrono::DateTime<chrono::Utc>)> = None;
+    for c in arr {
+        let in_reply_to = c.get("in_reply_to_id").and_then(|v| v.as_u64());
+        if in_reply_to != Some(original_comment_id) { continue; }
+        let Some(id) = c.get("id").and_then(|v| v.as_u64()) else { continue; };
+        let created = parse_gh_ts(c.get("created_at"))
+            .unwrap_or_else(chrono::Utc::now);
+        if best.as_ref().is_none_or(|(_, t)| created > *t) {
+            best = Some((id, created));
+        }
+    }
+    Ok(best.map(|(id, _)| id))
+}
+
+/// PATCHes the body of an existing inline PR review comment via the GitHub
+/// API. Used by Sync replies to rewrite legacy `[SlashIt agent —]`-style
+/// replies with the current first-person, signature-free body.
+async fn patch_pr_inline_reply(repo: &str, comment_id: u64, body: &str) -> Result<(), String> {
+    let endpoint = format!("repos/{}/pulls/comments/{}", repo, comment_id);
+    let body_arg = format!("body={}", body);
+    run_cmd_no_cwd("gh", &["api", "-X", "PATCH", &endpoint, "-f", &body_arg])
+        .await
         .map(|_| ())
+        .map_err(|e| format!("gh PATCH failed: {}", e))
 }
 
 async fn run_claude_pr_helper(prompt: String, working_dir: String, can_edit: bool) -> Result<String, String> {
