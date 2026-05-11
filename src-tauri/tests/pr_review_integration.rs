@@ -14,7 +14,8 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::LazyLock;
+use tokio::sync::Mutex;
 
 use slashit_app_lib::commands::pr::{
     address_pr_review_inner, discuss_pr_review_questions_inner, no_progress,
@@ -26,7 +27,9 @@ use slashit_app_lib::domain::task::{
 use slashit_app_lib::test_helpers::{create_test_pr_review_setup, create_test_task};
 
 // PATH is process-global; serialize tests that mutate it.
-static PATH_LOCK: Mutex<()> = Mutex::new(());
+// `tokio::sync::Mutex` is await-safe so clippy doesn't flag the guard being
+// held across the async work inside each test.
+static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 struct MockEnv {
     _tmp: tempfile::TempDir,
@@ -128,7 +131,7 @@ fn write_executable(path: &Path, body: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn dry_run_invokes_claude_only_no_gh_no_push() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("DRY RUN — 1 item verified, would edit 1 file.");
     let (task, plan) = create_test_pr_review_setup();
 
@@ -188,7 +191,7 @@ async fn dry_run_invokes_claude_only_no_gh_no_push() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("FIXED: item #0\nDONE");
     let (task, plan) = create_test_pr_review_setup();
 
@@ -303,6 +306,8 @@ fn create_test_discuss_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
         },
         PrReviewItem {
             comment_id: Some(202),
@@ -316,6 +321,8 @@ fn create_test_discuss_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
         },
         PrReviewItem {
             comment_id: Some(203),
@@ -329,6 +336,8 @@ fn create_test_discuss_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
         },
     ];
 
@@ -347,7 +356,7 @@ fn create_test_discuss_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn discuss_round_merges_updates_without_reordering_or_touching_skip() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = PATH_LOCK.lock().await;
     // Agent converts 201 → Fix, keeps 202 as Question with fresh reasoning,
     // and (correctly) does not return an entry for the Skip item 203.
     let claude_json = r#"{"items":[{"comment_id":201,"summary":"Add retry with backoff","decision":"fix","reasoning":"User confirmed; will wrap call in retry.","proposed_change":"Wrap http_call in retry_with_backoff(3)."},{"comment_id":202,"summary":"Timeout value","decision":"question","reasoning":"Which timeout (ms) do you want — 5000 or 10000?","proposed_change":""}]}"#;
@@ -409,7 +418,7 @@ async fn discuss_round_merges_updates_without_reordering_or_touching_skip() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn discuss_without_pending_questions_errors_before_calling_claude() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("unused");
     // Default 2-item plan has 1 Fix + 1 Skip — no Question items with notes.
     let (task, plan) = create_test_pr_review_setup();
@@ -424,7 +433,7 @@ async fn discuss_without_pending_questions_errors_before_calling_claude() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_approved_set_returns_error_and_does_not_call_claude() {
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("unused");
     let (task, mut plan) = create_test_pr_review_setup();
     // Demote the only Fix item so nothing is approved.
@@ -492,6 +501,8 @@ fn create_test_two_fix_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
         },
         PrReviewItem {
             comment_id: Some(302),
@@ -505,6 +516,8 @@ fn create_test_two_fix_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
         },
     ];
 
@@ -524,7 +537,7 @@ fn create_test_two_fix_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) 
 #[tokio::test(flavor = "multi_thread")]
 async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
     use std::sync::Mutex as StdMutex;
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("OK fixed");
     let (task, plan) = create_test_two_fix_setup();
 
@@ -587,7 +600,7 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
     // Round 1: apply both items normally — both get fix_done + reply_posted.
     // Round 2: re-apply the SAME plan. Items should be detected as already
     // addressed; claude must not be invoked again and gh should not be called.
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("fixed");
     let (task, plan) = create_test_two_fix_setup();
 
@@ -642,7 +655,7 @@ async fn rerunning_apply_with_only_replies_pending_skips_claude() {
     // Manually stage a plan where item 1 has fix_done=true but reply_posted=false
     // (the broken state we want to recover from). Re-applying should NOT call
     // claude — only post the missing reply.
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
     let (task, mut plan) = create_test_two_fix_setup();
 
@@ -681,7 +694,7 @@ async fn rerunning_apply_with_only_replies_pending_skips_claude() {
 async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
     use slashit_app_lib::commands::pr::sync_pr_review_replies_inner;
 
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
     let (task, mut plan) = create_test_two_fix_setup();
 
@@ -689,9 +702,11 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
     plan.items[0].fix_done = true;
     plan.items[0].reply_posted = false;
     plan.items[0].last_agent_summary = Some("edit already shipped".to_string());
-    // Item 1: fix done, reply already posted — should be left alone.
+    // Item 1: fix done, reply posted in the current format (pr_reply_text set)
+    // — should be skipped: no rewrite needed.
     plan.items[1].fix_done = true;
     plan.items[1].reply_posted = true;
+    plan.items[1].pr_reply_text = Some("already replied with the new format".to_string());
 
     let _ = env.working_dir_str(); // unused but keeps the mock PATH active
 
@@ -702,7 +717,9 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
     assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
     assert_eq!(env.gh_invocations(), 1, "sync should reply exactly once (only item 0)");
     assert_eq!(result.replied, 1);
-    assert_eq!(result.already_done, 1, "item 1 was already done");
+    assert_eq!(result.discovered, 0);
+    assert_eq!(result.rewritten, 0);
+    assert_eq!(result.unmatched, 0);
     assert_eq!(result.fix_pending, 0);
     assert!(result.errors.is_empty());
     assert!(updated_plan.items[0].reply_posted, "deferred reply flipped to posted");
@@ -713,7 +730,7 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
 async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
     use slashit_app_lib::commands::pr::sync_pr_review_replies_inner;
 
-    let _guard = PATH_LOCK.lock().unwrap();
+    let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
     let (task, plan) = create_test_two_fix_setup();
     // Both items: approved=Fix, fix_done=false (defaults). Sync should classify
@@ -725,7 +742,8 @@ async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
     assert_eq!(env.gh_invocations(), 0, "no replies posted when nothing is fix_done");
     assert_eq!(result.replied, 0);
     assert_eq!(result.fix_pending, 2);
-    assert_eq!(result.already_done, 0);
+    assert_eq!(result.discovered, 0);
+    assert_eq!(result.rewritten, 0);
 }
 
 #[test]

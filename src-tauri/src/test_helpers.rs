@@ -118,6 +118,8 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
+        pr_reply_text: None,
+        reply_comment_id: None,
         },
         PrReviewItem {
             comment_id: Some(102),
@@ -131,6 +133,8 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
+        pr_reply_text: None,
+        reply_comment_id: None,
         },
     ];
 

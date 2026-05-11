@@ -191,6 +191,10 @@ pub struct PrReviewItem {
     pub last_agent_summary: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub pr_reply_text: Option<String>,
+    #[serde(default)]
+    pub reply_comment_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

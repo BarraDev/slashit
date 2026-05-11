@@ -217,6 +217,14 @@ pub struct PrReviewItem {
     /// kept across reopens so the user remembers which items still need work.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// First-person reply text produced by the agent during the fix step.
+    /// Used verbatim as the PR reply body — no signature, no labels.
+    #[serde(default)]
+    pub pr_reply_text: Option<String>,
+    /// GitHub comment ID of the reply we posted. Persisted so a future Sync
+    /// can PATCH the existing comment instead of duplicating it.
+    #[serde(default)]
+    pub reply_comment_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
