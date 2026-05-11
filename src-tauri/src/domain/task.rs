@@ -57,7 +57,7 @@ pub struct Task {
     pub model: String,
     pub planning_mode: bool,
     pub dependencies: Vec<Uuid>,
-    pub workspace_id: Option<Uuid>,
+    pub worktree_id: Option<Uuid>,
     pub jj_change_id: Option<String>,
 
     pub category: TaskCategory,

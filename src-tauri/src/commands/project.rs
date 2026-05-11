@@ -80,6 +80,7 @@ pub async fn create_project(
         id,
         name,
         repository_id,
+        scope: crate::domain::ProjectScope::Standalone,
         agent_type,
         agent_config,
         created_at: now,

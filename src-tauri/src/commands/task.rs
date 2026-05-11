@@ -97,7 +97,7 @@ pub async fn create_task(
         model: params.model,
         planning_mode: params.planning_mode,
         dependencies,
-        workspace_id: None,
+        worktree_id: None,
         jj_change_id: None,
         category: params.category.unwrap_or_default(),
         priority: params.priority.unwrap_or_default(),

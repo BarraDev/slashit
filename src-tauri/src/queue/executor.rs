@@ -37,6 +37,7 @@ pub struct TaskExecutor {
     logs: Arc<RwLock<HashMap<Uuid, Vec<AgentLogEntry>>>>,
     projects: Arc<RwLock<HashMap<Uuid, crate::domain::Project>>>,
     repositories: Arc<RwLock<HashMap<Uuid, crate::domain::Repository>>>,
+    workspace_registry: Arc<RwLock<crate::config::WorkspaceRegistry>>,
     storage: crate::config::Storage,
     worktree_manager: Arc<WorktreeManager>,
     app_handle: tauri::AppHandle,
@@ -50,6 +51,7 @@ pub struct TaskExecutorConfig {
     pub logs: Arc<RwLock<HashMap<Uuid, Vec<AgentLogEntry>>>>,
     pub projects: Arc<RwLock<HashMap<Uuid, crate::domain::Project>>>,
     pub repositories: Arc<RwLock<HashMap<Uuid, crate::domain::Repository>>>,
+    pub workspace_registry: Arc<RwLock<crate::config::WorkspaceRegistry>>,
     pub storage: crate::config::Storage,
     pub worktree_manager: Arc<WorktreeManager>,
     pub app_handle: tauri::AppHandle,
@@ -66,6 +68,7 @@ impl TaskExecutor {
             logs: config.logs,
             projects: config.projects,
             repositories: config.repositories,
+            workspace_registry: config.workspace_registry,
             storage: config.storage,
             worktree_manager: config.worktree_manager,
             app_handle: config.app_handle,
@@ -397,6 +400,12 @@ impl TaskExecutor {
         // Update phase
         self.update_task_phase(task_id, TaskPhase::Coding, 5).await;
 
+        // If the project is attached to a workspace, run Claude from the
+        // workspace root and expose the task's working dir via --add-dir so
+        // the agent inherits the workspace's instruction files.
+        let (claude_cwd, claude_add_dirs) =
+            Self::resolve_workspace_launch(&self.tasks, &self.projects, &self.workspace_registry, task_id, &working_dir).await;
+
         let tasks = self.tasks.clone();
         let executions = self.executions.clone();
         let running_handles = self.running_handles.clone();
@@ -412,7 +421,7 @@ impl TaskExecutor {
             // Create execution record
             let execution = AgentExecution {
                 id: execution_id,
-                workspace_id: Uuid::nil(),
+                worktree_id: None,
                 task_id: Some(task_id),
                 agent_type: "claude-code".to_string(),
                 status: AgentStatus::Starting,
@@ -431,7 +440,7 @@ impl TaskExecutor {
             // Start Claude runner
             let runner = match ClaudeRunner::start(ClaudeRunConfig {
                 prompt,
-                working_dir: working_dir.clone(),
+                working_dir: claude_cwd.clone(),
                 allowed_tools: vec![
                     "Read".to_string(), "Edit".to_string(), "Write".to_string(),
                     "Bash".to_string(), "Glob".to_string(), "Grep".to_string(),
@@ -444,6 +453,7 @@ impl TaskExecutor {
                 system_prompt: None,
                 permission_mode: None, // defaults to --dangerously-skip-permissions
                 disable_mcp: false,
+                additional_dirs: claude_add_dirs.clone(),
             }).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -731,6 +741,7 @@ impl TaskExecutor {
                     system_prompt: None,
                     permission_mode: None,
                     disable_mcp: false,
+            additional_dirs: Vec::new(),
                 }).await;
 
                 match runner {
@@ -858,6 +869,7 @@ impl TaskExecutor {
                     system_prompt: None,
                     permission_mode: None,
                     disable_mcp: false,
+            additional_dirs: Vec::new(),
                 }).await {
                     Ok(r) => {
                         let _success = r.wait().await.unwrap_or(false);
@@ -960,6 +972,45 @@ impl TaskExecutor {
     }
 
     // --- Helpers ---
+
+    /// Resolve agent launch context.
+    ///
+    /// If the task's project is attached to a workspace, return
+    /// `(workspace_root, [task_working_dir])` so Claude runs from the
+    /// workspace cwd with the task tree exposed via `--add-dir`. Otherwise
+    /// return `(task_working_dir, [])` to preserve today's behavior.
+    async fn resolve_workspace_launch(
+        tasks: &Tasks,
+        projects: &Arc<RwLock<HashMap<Uuid, crate::domain::Project>>>,
+        workspace_registry: &Arc<RwLock<crate::config::WorkspaceRegistry>>,
+        task_id: Uuid,
+        task_working_dir: &str,
+    ) -> (String, Vec<std::path::PathBuf>) {
+        let project_id = {
+            let tasks_r = tasks.read().await;
+            tasks_r.get(&task_id).map(|t| t.project_id)
+        };
+        let Some(project_id) = project_id else {
+            return (task_working_dir.to_string(), Vec::new());
+        };
+
+        let workspace_id = {
+            let projects_r = projects.read().await;
+            projects_r.get(&project_id).and_then(|p| p.scope.workspace_id())
+        };
+        let Some(workspace_id) = workspace_id else {
+            return (task_working_dir.to_string(), Vec::new());
+        };
+
+        let registry_r = workspace_registry.read().await;
+        match registry_r.get(&workspace_id) {
+            Some(ws) => (
+                ws.root_path.as_path().to_string_lossy().to_string(),
+                vec![std::path::PathBuf::from(task_working_dir)],
+            ),
+            None => (task_working_dir.to_string(), Vec::new()),
+        }
+    }
 
     async fn resolve_working_dir_for_task(
         tasks: &Tasks,

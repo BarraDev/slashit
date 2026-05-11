@@ -1,34 +1,11 @@
-use super::workspace::WorkspaceManager;
 use anyhow::{Context, Result};
 use std::path::Path;
 
-pub struct JjManager {
-    workspace_manager: WorkspaceManager,
-}
+pub struct JjManager;
 
 impl JjManager {
     pub fn new() -> Self {
-        Self {
-            workspace_manager: WorkspaceManager::new(),
-        }
-    }
-
-    pub fn create_workspace(
-        &self,
-        project_path: &Path,
-        name: &str,
-        base_revision: Option<&str>,
-    ) -> Result<String> {
-        self.workspace_manager
-            .create(project_path, name, base_revision)
-    }
-
-    pub fn list_workspaces(&self, project_path: &Path) -> Result<Vec<String>> {
-        self.workspace_manager.list(project_path)
-    }
-
-    pub fn remove_workspace(&self, project_path: &Path, name: &str) -> Result<()> {
-        self.workspace_manager.remove(project_path, name)
+        Self
     }
 
     pub fn get_status(&self, workspace_path: &Path) -> Result<JjStatus> {

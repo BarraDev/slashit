@@ -137,6 +137,7 @@ pub fn App() -> impl IntoView {
                         "changelog" => view! { <Changelog project_id=selected_project.get() /> }.into_any(),
                         "mcp" => view! { <McpOverview /> }.into_any(),
                         "worktrees" => view! { <Worktrees project_id=selected_project.get() on_navigate=on_navigate /> }.into_any(),
+                        "workspaces" => view! { <Workspaces /> }.into_any(),
                         "github_issues" => view! { <GithubIssues project_id=selected_project.get() /> }.into_any(),
                         "github_prs" => view! { <GithubPrs project_id=selected_project.get() /> }.into_any(),
                         _ => view! { <Dashboard project_id=selected_project.get() /> }.into_any(),

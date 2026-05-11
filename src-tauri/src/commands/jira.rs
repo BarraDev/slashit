@@ -117,7 +117,7 @@ pub async fn import_jira_issues(
             model: "default".to_string(),
             planning_mode: false,
             dependencies: Vec::new(),
-            workspace_id: None,
+            worktree_id: None,
             jj_change_id: None,
             category,
             priority,

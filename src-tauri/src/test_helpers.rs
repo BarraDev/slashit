@@ -16,7 +16,7 @@ pub fn create_test_task(title: &str) -> Task {
         model: "test-model".to_string(),
         planning_mode: false,
         dependencies: Vec::new(),
-        workspace_id: None,
+        worktree_id: None,
         jj_change_id: None,
         category: TaskCategory::Feature,
         priority: TaskPriority::Medium,
