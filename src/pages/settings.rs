@@ -73,6 +73,14 @@ pub fn Settings() -> impl IntoView {
 
     let (git_colocation, set_git_colocation) = signal(true);
 
+    let (diff_collapsed, set_diff_collapsed) = signal({
+        web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .and_then(|s| s.get_item("slashit_diff_default_collapsed").ok().flatten())
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    });
+
     view! {
         <div class="space-y-6">
             <div class="mb-6">
@@ -122,7 +130,34 @@ pub fn Settings() -> impl IntoView {
                                     <div class="space-y-6">
                                         <div>
                                             <h2 class="text-lg font-semibold text-white/90 mb-4">"General Settings"</h2>
-                                            <p class="text-sm text-white/50">"Theme and appearance settings are available in the Theme tab."</p>
+                                            <p class="text-sm text-white/50 mb-4">"Theme and appearance settings are available in the Theme tab."</p>
+
+                                            <div class="flex items-center justify-between p-4 rounded-xl bg-white/5 border border-white/10">
+                                                <div>
+                                                    <p class="font-medium text-white/90">"Collapse diff files by default"</p>
+                                                    <p class="text-sm text-white/40 mt-1">"When opening a diff, show file headers only. You can still toggle each file or use Expand all."</p>
+                                                </div>
+                                                <label class="relative inline-flex items-center cursor-pointer">
+                                                    <input
+                                                        type="checkbox"
+                                                        prop:checked=diff_collapsed
+                                                        on:change=move |ev| {
+                                                            let v = event_target_checked(&ev);
+                                                            set_diff_collapsed.set(v);
+                                                            if let Some(window) = web_sys::window() {
+                                                                if let Ok(Some(storage)) = window.local_storage() {
+                                                                    let _ = storage.set_item(
+                                                                        "slashit_diff_default_collapsed",
+                                                                        if v { "true" } else { "false" },
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        class="sr-only peer"
+                                                    />
+                                                    <div class="w-11 h-6 bg-white/10 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-blue-500/50 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
+                                                </label>
+                                            </div>
                                         </div>
                                     </div>
                                 }.into_any(),
