@@ -1128,3 +1128,181 @@ impl TaskExecutor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{AgentConfig, AgentType, Project, Repository, TaskPhase};
+    use crate::test_helpers::create_test_task;
+
+    fn make_project(id: Uuid, repository_id: Option<Uuid>) -> Project {
+        Project {
+            id,
+            name: "Test Project".to_string(),
+            repository_id,
+            agent_type: AgentType::ClaudeCode,
+            agent_config: AgentConfig {
+                agent_type: AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn make_repository(id: Uuid, local_path: &str) -> Repository {
+        Repository {
+            id,
+            local_path: local_path.to_string(),
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_working_dir_for_task_returns_repo_path_when_chain_exists() {
+        let repo_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        let mut task = create_test_task("Task");
+        task.project_id = project_id;
+        let task_id = task.id;
+
+        let tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            make_project(project_id, Some(repo_id)),
+        )])));
+        let repositories = Arc::new(RwLock::new(HashMap::from([(
+            repo_id,
+            make_repository(repo_id, "/tmp/repo"),
+        )])));
+
+        let result =
+            TaskExecutor::resolve_working_dir_for_task(&tasks, &projects, &repositories, task_id)
+                .await;
+
+        assert_eq!(result.unwrap(), "/tmp/repo");
+    }
+
+    #[tokio::test]
+    async fn resolve_working_dir_for_task_errors_when_task_missing() {
+        let tasks = Arc::new(RwLock::new(HashMap::new()));
+        let projects = Arc::new(RwLock::new(HashMap::new()));
+        let repositories = Arc::new(RwLock::new(HashMap::new()));
+        let missing_task_id = Uuid::new_v4();
+
+        let result = TaskExecutor::resolve_working_dir_for_task(
+            &tasks,
+            &projects,
+            &repositories,
+            missing_task_id,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(err.contains("Task"));
+        assert!(err.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_working_dir_for_task_errors_when_project_missing() {
+        let missing_project_id = Uuid::new_v4();
+        let mut task = create_test_task("Task");
+        task.project_id = missing_project_id;
+        let task_id = task.id;
+
+        let tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        let projects = Arc::new(RwLock::new(HashMap::new()));
+        let repositories = Arc::new(RwLock::new(HashMap::new()));
+
+        let result =
+            TaskExecutor::resolve_working_dir_for_task(&tasks, &projects, &repositories, task_id)
+                .await;
+
+        let err = result.unwrap_err();
+        assert!(err.contains("Project"));
+        assert!(err.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn resolve_working_dir_for_task_errors_when_project_has_no_repository() {
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task("Task");
+        task.project_id = project_id;
+        let task_id = task.id;
+
+        let tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            make_project(project_id, None),
+        )])));
+        let repositories = Arc::new(RwLock::new(HashMap::new()));
+
+        let result =
+            TaskExecutor::resolve_working_dir_for_task(&tasks, &projects, &repositories, task_id)
+                .await;
+
+        let err = result.unwrap_err();
+        assert!(err.contains("has no repository linked"));
+    }
+
+    #[tokio::test]
+    async fn resolve_working_dir_for_task_errors_when_repository_missing() {
+        let repo_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        let mut task = create_test_task("Task");
+        task.project_id = project_id;
+        let task_id = task.id;
+
+        let tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            make_project(project_id, Some(repo_id)),
+        )])));
+        let repositories = Arc::new(RwLock::new(HashMap::new()));
+
+        let result =
+            TaskExecutor::resolve_working_dir_for_task(&tasks, &projects, &repositories, task_id)
+                .await;
+
+        let err = result.unwrap_err();
+        assert!(err.contains("Repository"));
+        assert!(err.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn update_task_phase_static_updates_phase_and_progress_for_existing_task() {
+        let mut task = create_test_task("Task");
+        task.status = TaskStatus::InProgress;
+        task.phase = TaskPhase::Planning;
+        task.phase_progress = 10;
+        let task_id = task.id;
+        let before = task.updated_at;
+
+        let tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+
+        TaskExecutor::update_task_phase_static(&tasks, task_id, TaskPhase::QaReview, 85).await;
+
+        let tasks_r = tasks.read().await;
+        let updated = tasks_r.get(&task_id).unwrap();
+        assert_eq!(updated.phase, TaskPhase::QaReview);
+        assert_eq!(updated.phase_progress, 85);
+        assert!(updated.updated_at >= before);
+    }
+
+    #[tokio::test]
+    async fn update_task_phase_static_noops_for_missing_task() {
+        let tasks = Arc::new(RwLock::new(HashMap::new()));
+
+        TaskExecutor::update_task_phase_static(&tasks, Uuid::new_v4(), TaskPhase::Coding, 40).await;
+
+        assert_eq!(tasks.read().await.len(), 0);
+    }
+}
