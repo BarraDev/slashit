@@ -242,11 +242,13 @@ pub fn run() {
                         _ => {}
                     })
                     .on_tray_icon_event(|tray, event| {
-                        if let TrayIconEvent::Click { button, button_state, .. } = event {
-                            match (button, button_state) {
-                                (MouseButton::Left, MouseButtonState::Up) => toggle_window(tray.app_handle()),
-                                _ => {}
-                            }
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            toggle_window(tray.app_handle());
                         }
                     });
 

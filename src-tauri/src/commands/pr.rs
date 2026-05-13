@@ -1601,7 +1601,7 @@ fn extract_failure_reason(stdout: &str) -> Option<String> {
             let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
             let text = v.get("result").and_then(|r| r.as_str()).unwrap_or("").trim();
             if is_error || subtype.contains("error") || subtype.contains("max_turns") {
-                let label = if subtype.is_empty() { "error".to_string() } else { format!("{}", subtype) };
+                let label = if subtype.is_empty() { "error".to_string() } else { subtype.to_string() };
                 let body = if text.is_empty() { "(empty result body)".to_string() } else { text.to_string() };
                 return Some(format!("{}: {}", label, truncate_one_line(&body, 400)));
             }
