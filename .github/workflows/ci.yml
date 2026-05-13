@@ -10,7 +10,7 @@ jobs:
   check:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -35,7 +35,7 @@ jobs:
         run: cargo test -p slashit-app -p slashit-ipc
 
       - name: Install trunk
-        uses: jetli/trunk-action@v0.5.0
+        uses: jetli/trunk-action@v0.5.1
         with:
           version: latest
 
