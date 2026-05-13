@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>AI agent workspace management for people who run more than one thread of work at a time.</strong>
+  <strong>Mission control for AI coding agents — from "here's a task" to "the PR is merged" without leaving the window.</strong>
 </p>
 
 <p align="center">
@@ -15,21 +15,38 @@
   <a href="https://github.com/BarraDev/slashit/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/BarraDev/slashit"></a>
 </p>
 
-SlashIt is a Tauri v2 desktop app for managing AI coding agents, task queues, terminals, and version-control workspaces from one place. It is built entirely in Rust with a Leptos/WASM frontend and a native Tauri backend.
+Delegating code to an AI agent works fine for one task. Doing it for five tasks across three repos, each in its own branch, with reviewer comments coming in on yesterday's PR, is where it falls apart.
 
-## Features
+SlashIt is a desktop app that turns that into a workflow you can actually run. Stage tasks on a Kanban board, hand each one to an agent in its own isolated workspace, and queue several to run in parallel. Keep a terminal — or several — open next to each one for when you want to take over. When the agent comes back with a draft, review the diff, open a PR, and — when reviewers leave comments — triage them one by one, let the agent propose Fix / Skip / Question per comment, apply the approved fixes, and reply back on the PR without ever opening GitHub.
 
-- **Kanban board** -- Organize work across Backlog, Queue, In Progress, Review, and Done.
-- **AI agent execution** -- Run Claude Code agents against tasks with workspace isolation.
-- **Queue system** -- Execute multiple tasks with configurable concurrency limits.
-- **Integrated terminals** -- Keep PTY-backed terminals next to each task and workspace.
-- **Jujutsu integration** -- Use `jj`-native workflows with Git interoperability.
-- **GitHub/Jira import** -- Bring external issues into the local board.
-- **PR management** -- Create and track pull requests from completed tasks.
-- **PR review assistant** -- Triage reviewer comments on a PR, let the agent propose Fix / Skip / Question for each, then apply approved fixes and post replies back to the PR.
-- **CLI tool** -- Control the running app from terminals and AI agents with `slashit`.
-- **System tray** -- Keep agents and terminals alive after closing the window.
-- **Auto-update** -- Check GitHub Releases for signed app updates.
+It's built for people who've already outgrown a single terminal tab and a stack of disposable branches.
+
+## What you can do with it
+
+**Plan and dispatch work**
+- Kanban board across Backlog, Queue, In Progress, Review, and Done — per project, fully local.
+- Pull issues in from GitHub or Jira instead of retyping them.
+- Drop a card into the queue and an agent picks it up; configurable concurrency keeps things sane.
+
+**Run many things at once**
+- Every task gets its own isolated workspace — a real Git worktree (or a `jj` workspace, if you use Jujutsu) — so parallel agents never trample each other and you can keep reviewing one change while another keeps cooking.
+- Each workspace has its own set of PTY-backed terminals — split them, group them by task, drop into one when you need to take over.
+- A persistent session model is the long-term goal: close the window, the agents and terminals keep running in the background, reattach later and pick up exactly where you left off (think `tmux`, but for whole AI workflows).
+
+**Group projects into a meta-workspace** *(in progress)*
+- Bundle several related projects together and let an agent work across all of them at once — useful when a single change spans, say, a backend repo, a frontend repo, and a shared library.
+- The agent runs from the meta-workspace as its working root, with memory and instructions defined once, and treats the bundled projects as context it can reason about together.
+- AI-tooling artifacts (agent memory, prompts, scratch notes) live inside the meta-workspace instead of being scattered as `.claude/`, `.codex/`, etc. across every project repo — your project trees stay clean.
+- Tasks still execute in their own isolated workspaces under the hood; the meta-workspace adds grouping and shared context, not shared mutable state.
+
+**Close the loop on PRs**
+- Open pull requests directly from a finished task.
+- The PR review assistant pulls every reviewer comment, asks the agent for a per-comment recommendation, lets you edit the reasoning and the proposed change, then applies approved fixes in one pass and posts replies back on the PR.
+
+**Stay in flow**
+- Works with whatever version-control setup you already have — plain Git is fine, and [Jujutsu](https://github.com/jj-vcs/jj) (`jj`) gets first-class treatment for stacked changes if you use it.
+- A `slashit` CLI controls the running app from any terminal — handy for shell scripts and for other agents to talk to.
+- System tray keeps agents and terminals alive when the window closes; signed auto-updates ship from GitHub Releases.
 
 ## Screenshots
 
@@ -67,35 +84,9 @@ Near-term roadmap:
 - Track follow-up issues for GUI binary naming, optional daemon mode, and workspace layout cleanup.
 - Continue hardening queue execution, agent recovery, and cross-platform packaging.
 
-## Architecture
+## Built with
 
-SlashIt is built entirely in Rust:
-
-- **Frontend**: Leptos 0.8 (CSR, compiled to WASM)
-- **Backend**: Tauri v2 with tokio async runtime
-- **CLI**: Standalone binary communicating via Unix domain socket
-- **IPC**: JSON-lines protocol over `$XDG_RUNTIME_DIR/slashit.sock`
-
-```
-slashit-app/
-├── src/                    # Frontend (Leptos/WASM)
-│   ├── components/         # UI components
-│   ├── pages/              # Page views
-│   ├── services/           # Tauri IPC service layer
-│   └── models/             # Frontend models
-├── src-tauri/              # Backend (Tauri v2)
-│   └── src/
-│       ├── commands/       # Tauri command handlers
-│       ├── domain/         # Domain models
-│       ├── agents/         # Agent execution engine
-│       ├── queue/          # Task queue and executor
-│       ├── pty/            # PTY terminal management
-│       ├── ipc/            # Unix socket IPC server
-│       └── config/         # Persistent storage
-└── crates/
-    ├── slashit-ipc/        # Shared IPC protocol types
-    └── slashit-cli/        # CLI binary
-```
+Rust end to end — a [Leptos](https://leptos.dev/) 0.8 frontend compiled to WASM, a [Tauri](https://tauri.app/) v2 backend on the tokio runtime, and a standalone CLI that talks to the running app over a Unix domain socket (JSON-lines on `$XDG_RUNTIME_DIR/slashit.sock`). Module-level layout is documented in [`AGENTS.md`](AGENTS.md).
 
 ## Installation
 
