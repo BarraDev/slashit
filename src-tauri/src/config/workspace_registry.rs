@@ -1,9 +1,16 @@
 //! Workspace registry — OS-level index of all SlashIt meta-workspaces.
 //!
-//! Stored as TOML at `<config_dir>/slashit/workspaces.toml`. Each entry holds
-//! the workspace id, display name, and root path on disk. Per-workspace state
-//! (open worktrees, last agent, UI state) lives in `<root_path>/.slashit/`.
+//! Stored as TOML at the path [`AppPaths::workspaces_file`] resolves to. Each
+//! entry holds the workspace id, display name, and root path on disk.
+//!
+//! Registering a workspace deliberately creates *nothing* inside the user's
+//! folder. An earlier version created an empty `.slashit/` directory in every
+//! registered root and never wrote to it; where a workspace's state lives is
+//! now the user's decision, expressed as `StateLocation` and acted on by
+//! [`crate::config::migration::StateMigrator`].
 
+use super::migration::StateMigrator;
+use super::paths::{AppPaths, IN_PROJECT_DIR};
 use crate::domain::Workspace;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -11,9 +18,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-
-const WORKSPACES_FILE: &str = "workspaces.toml";
-const PER_WORKSPACE_DIR: &str = ".slashit";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RegistryFile {
@@ -54,7 +58,6 @@ impl WorkspaceRegistry {
     }
 
     pub fn upsert(&mut self, workspace: Workspace) -> io::Result<()> {
-        Self::ensure_per_workspace_dir(workspace.root_path.as_path())?;
         // Stage the change in a clone, persist, and only commit to self on success.
         // This keeps the in-memory map consistent with disk even if the write fails.
         let mut next = self.workspaces.clone();
@@ -90,11 +93,23 @@ impl WorkspaceRegistry {
     }
 
     fn config_path() -> io::Result<PathBuf> {
-        let proj_dirs = directories::ProjectDirs::from("com", "barradev", "slashit-app")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no project dirs"))?;
-        let dir = proj_dirs.config_dir().to_path_buf();
-        fs::create_dir_all(&dir)?;
-        Ok(dir.join(WORKSPACES_FILE))
+        Ok(AppPaths::new()?.workspaces_file())
+    }
+
+    /// Delete the empty `.slashit/` directories left behind by earlier versions.
+    ///
+    /// Only provably-empty directories are removed, so a workspace that has
+    /// genuinely opted into in-project state is never disturbed. Returns how
+    /// many were cleaned up.
+    pub fn clean_legacy_state_dirs(&self) -> usize {
+        self.workspaces
+            .values()
+            .filter(|w| {
+                StateMigrator::remove_empty_legacy_dir(
+                    &w.root_path.as_path().join(IN_PROJECT_DIR),
+                )
+            })
+            .count()
     }
 
     fn persist_map(path: &Path, map: &HashMap<Uuid, Workspace>) -> io::Result<()> {
@@ -110,8 +125,4 @@ impl WorkspaceRegistry {
         fs::rename(&tmp, path)
     }
 
-    fn ensure_per_workspace_dir(root: &Path) -> io::Result<()> {
-        let dir = root.join(PER_WORKSPACE_DIR);
-        fs::create_dir_all(dir)
-    }
 }
