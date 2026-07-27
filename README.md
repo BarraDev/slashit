@@ -157,6 +157,31 @@ Configuration is stored in your system config directory:
 - macOS: `~/Library/Application Support/com.barradev.slashit-app/`
 - Windows: `%APPDATA%\com.barradev.slashit-app\`
 
+### Your project stays clean
+
+SlashIt writes nothing inside your repository unless you ask it to. Boards,
+worktrees, terminal history and logs all live outside the project by default.
+
+Per project, under **Settings → Storage**, you can choose where the board is
+kept:
+
+| Choice | Where | Use it when |
+|---|---|---|
+| Outside the project *(default)* | `<data_dir>/projects/<key>/` | You want the repository untouched |
+| Inside the project | `<repo>/.slashit/` | You want the board committed and shared with your team |
+| Detect automatically | whichever already exists | Upgrading, or moving between machines |
+
+Switching between them previews the move first — how many files, how large, and
+any conflicts — and nothing is moved until you confirm. Your API keys, terminal
+scrollback and logs are never part of that choice; they always stay outside the
+project.
+
+Worktrees are created under `<data_dir>/worktrees/`, not as siblings of your
+repository. If you use [worktrunk](https://github.com/max-sixty/worktrunk),
+SlashIt defers to your `wt` configuration and hooks instead.
+
+Full details in [`docs/architecture/state-locations.md`](docs/architecture/state-locations.md).
+
 ## Development
 
 Useful local checks:

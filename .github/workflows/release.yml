@@ -25,7 +25,7 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -33,7 +33,7 @@ jobs:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Install trunk
-        uses: jetli/trunk-action@v0.5.0
+        uses: jetli/trunk-action@v0.5.1
         with:
           version: latest
 
@@ -57,6 +57,9 @@ jobs:
           releaseName: 'SlashIt v__VERSION__'
           releaseBody: 'See the assets to download this version and install.'
           releaseDraft: true
-          prerelease: false
+          # A tag containing a hyphen is a prerelease by semver
+          # (v0.1.0-rc.1). Hard-coding false would publish an RC as
+          # the latest stable release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           args: ${{ matrix.args }}
           includeUpdaterJson: true
