@@ -1,97 +1,111 @@
 # Headless daemon mode
 
-**Status: designed, not implemented.** The `daemon_mode` feature flag exists
-and is off. This document is the plan and the honest state of the blockers, so
-the work can be picked up without re-deriving it.
+**Status: implemented.** `slashitd` runs the queue executor and the IPC server
+with no window. It is not a second implementation of SlashIt — it calls the
+same state builder, constructs the same executor, and serves the same command
+set as the desktop app.
 
-## What exists today
+## Running it
 
-Close-to-tray keeps the app alive with its window hidden: agents and terminals
-continue running and the IPC socket stays up. What does not exist is a mode
-with **no GUI process at all** — an IPC server plus queue executor suitable for
-a systemd user unit.
-
-## Why it is not a rewrite
-
-The Tauri coupling is much shallower than the backend's size suggests. Of 82
-backend files, 11 contain a Tauri reference and 4 of those are false positives
-(Windows shell-detection strings, doc comments).
-
-Already Tauri-free: `domain/`, `config/`, `worktree/`, `jj/`, `acp/`,
-`session/`, `queue/manager.rs`, `queue/prompt.rs`, `queue/workflow.rs`,
-`pty/manager.rs`, `pty/store.rs`.
-
-The concentration is in `queue/executor.rs`, and every reference there is one
-of three things: the `tauri::AppHandle` field, `tauri::async_runtime::spawn`,
-or `.emit(...)`. There is no `.state()`, no window access, no `Manager` use.
-That is the whole problem: **the executor needs to emit events, not to be a
-GUI**.
-
-## Design
-
-### 1. An event sink
-
-Replace direct `app.emit()` calls with a sink the executor holds:
-
-```rust
-pub type EventSink = Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+```bash
+slashitd                          # run in the foreground
+slashitd --verbose                # log every event, including agent output
+slashitd --feature daemon_mode=true   # override a flag for this run
 ```
 
-The GUI passes a sink that forwards to `AppHandle::emit`. The daemon passes one
-that logs and discards, or later, one that fans out to connected IPC clients.
+`slashit ping` reports which kind of instance answered; `slashit daemon status`
+answers specifically whether a daemon is running.
 
-This is not a new idea in this codebase — `commands/pr.rs` already does exactly
-this with `ProgressSink` and a `no_progress()` null sink. Generalising that
-pattern is the bulk of the work: 35 raw `emit` call sites across 5 files,
-5 distinct event names, of which 29 are in the executor.
+A systemd user unit is the expected deployment:
 
-### 2. Lift startup out of `run()`
+```ini
+# ~/.config/systemd/user/slashit.service
+[Unit]
+Description=SlashIt headless daemon
+After=network.target
 
-`lib.rs::run()` mixes state construction with `tauri::Builder`. The first ~140
-lines — resolve paths, build `Storage`, load config, hydrate repositories,
-projects and tasks — are GUI-independent and belong in a
-`fn build_state() -> AppState` both entrypoints call.
+[Service]
+ExecStart=%h/.local/bin/slashitd
+Restart=on-failure
+# The socket lives in $XDG_RUNTIME_DIR, which systemd already provides.
 
-### 3. A daemon entrypoint
+[Install]
+WantedBy=default.target
+```
 
-A `slashitd` binary, or `slashit-ui --headless`, that builds state, starts the
-IPC server and the executor with a discarding sink, writes
-`AppPaths::pid_file()`, and waits for a signal.
+## What is shared, and what differs
 
-### 4. CLI and unit
+Of the whole backend, exactly three things depend on having a window. Each is
+behind an abstraction, and everything else is common code:
 
-`slashit daemon start|stop|status`, plus a
-`~/.config/systemd/user/slashit.service` template.
+| Concern | GUI | Daemon |
+|---|---|---|
+| Events | `TauriEventSink` -> webview | `LoggingEventSink` -> stderr |
+| Window and quit | `GuiControl` | `DaemonControl` |
+| Entry point | `lib.rs::run()` | `bin/slashitd.rs` |
 
-## Blockers that must be fixed first
+Everything else — `AppState`, hydration, migrations, the queue executor, the
+IPC command handlers, worktree management, agent execution — is one
+implementation used by both.
 
-Both are real, both are cheap, and both cause a crash rather than a missing
-feature:
+### The event sink
 
-1. **`blocking_write()` / `blocking_lock()` during startup.** `lib.rs` uses
-   them to hydrate state. Tokio panics if these are called from inside a
-   runtime thread, so they work today only because `run()` executes before the
-   runtime starts. A `#[tokio::main]` daemon calling the same code panics
-   immediately. Fix: make `build_state()` async, or hydrate before entering the
-   runtime.
+`queue/executor.rs` used to hold a `tauri::AppHandle` purely to call `.emit()`
+29 times. It now holds an `Arc<dyn EventSink>` (`src/events.rs`) and contains
+no Tauri reference at all. Three sinks exist: the Tauri one, a logging one for
+the daemon, and a discarding one for tests.
 
-2. **Socket ownership.** Fixed in the commit that hardened IPC — the server now
-   refuses to start if a live instance already owns the socket. Without that, a
-   daemon started next to a running GUI silently stole its socket. Worth
-   re-checking when the daemon lands, because it becomes routine rather than
-   accidental for both to be running.
+This generalises a pattern the codebase already had: `commands/pr.rs` threads a
+`ProgressSink` through the review-apply flow so tests can observe progress
+without a window.
+
+### Instance control
+
+`InstanceControl` (`src/instance.rs`) covers showing the window and requesting
+a quit. The daemon's `show_window` returns an error rather than silently
+succeeding, so `slashit show` against a daemon says there is no window instead
+of reporting a success that never happened.
+
+## The blockers that had to be fixed first
+
+Both were real, both caused a crash rather than a missing feature:
+
+1. **Blocking lock acquisition during startup.** `lib.rs` hydrated state with
+   `blocking_write()` / `blocking_read()` on tokio locks. That worked only
+   because `run()` executes before the runtime starts; the same code inside a
+   `#[tokio::main]` daemon panics immediately. Hydration is now
+   `app_core::build_state()`, which is async, and the GUI reaches it through
+   `tauri::async_runtime::block_on` before the event loop starts.
+
+2. **`request_quit` had the same latent bug.** It read `pty.sessions` with
+   `blocking_lock()` and `agent.executions` with `blocking_read()`. That was
+   safe only because its sole caller was the tray menu, which runs on the
+   event-loop thread. Routing an IPC `Quit` through it would have panicked on a
+   runtime worker. It is now async and spawned.
+
+3. **Endpoint ownership.** The transport layer refuses to bind an endpoint a
+   live instance already holds — a connect-first check on Unix, and
+   `first_pipe_instance` on Windows. This matters more now than it did when
+   only the GUI could bind: a daemon started next to a running app is routine
+   rather than accidental.
+
+## Shutdown
+
+`SIGTERM` or `SIGINT` (or an IPC `Quit`) stops accepting connections, then
+waits up to 30 seconds for running agents to finish. Tasks still running when
+the grace period expires are left as they are and returned to the queue by the
+next start's migration, and the daemon says so rather than exiting silently.
+
+The PID file at `AppPaths::pid_file()` is informational only. Endpoint
+ownership is the authoritative single-instance mechanism, because a PID file
+goes stale on a hard kill and acting on a stale one would let a second daemon
+start and steal the first one's clients.
 
 ## Deliberately out of scope
 
 Dropping the `tauri` crate from the daemon build behind a `gui` Cargo feature
-is a *separate, much larger* job: 21 files carry `tauri::State`, there are 139
-`#[tauri::command]` functions, and `pty/mod.rs` re-exports the Tauri command
-module unconditionally. The MVP keeps `tauri` linked and simply never calls
-`Builder::run`. That costs a webkit2gtk link dependency on the daemon and buys
-a tractable change.
-
-## Estimate
-
-Medium — roughly two to three focused days, dominated by mechanically
-rewriting the emit sites behind the sink and by splitting `run()`. The
-`gui`-feature version is a large job and should not be on the MVP path.
+is a separate, much larger job: 21 files carry `tauri::State` and there are
+~139 `#[tauri::command]` functions. The daemon keeps `tauri` linked and simply
+never calls `Builder::run`. That costs a webkit2gtk link dependency on the
+daemon and buys a tractable change. The command *logic* is already shared: IPC
+handlers call the same state the Tauri commands do.

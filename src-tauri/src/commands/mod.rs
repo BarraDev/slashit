@@ -23,6 +23,7 @@ pub mod workflow;
 pub mod jira;
 pub mod features;
 pub mod state_location;
+pub mod updater;
 
 pub use repository::*;
 pub use project::*;
@@ -47,4 +48,8 @@ pub use executor::*;
 pub use tray::*;
 pub use features::*;
 pub use state_location::*;
+// Only the commands: the module's types are reached through
+// `commands::updater::` so that `UpdaterState` cannot be confused with the
+// plugin type of the same name.
+pub use updater::{updater_check, updater_download_and_install, updater_restart, updater_status};
 // workflow commands not yet wired up

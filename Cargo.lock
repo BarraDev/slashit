@@ -4853,7 +4853,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "slashit-app-ui"
+name = "slashit-frontend"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -4881,8 +4881,14 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "libc",
+ "rand 0.8.5",
  "serde",
  "serde_json",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.2",
  "uuid",
 ]
 
@@ -4893,6 +4899,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "clap",
  "directories",
  "dirs",
  "futures",

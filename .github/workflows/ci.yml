@@ -19,6 +19,7 @@ on:
 jobs:
   check:
     runs-on: ubuntu-22.04
+    name: Lint, test and build (ubuntu-22.04)
     steps:
       - uses: actions/checkout@v6.0.2
 
@@ -51,3 +52,34 @@ jobs:
 
       - name: Build frontend
         run: trunk build
+
+  # Windows and macOS were previously first compiled at tag time, inside the
+  # release build. That is the worst possible place to discover a
+  # `#[cfg(unix)]` that should have been `#[cfg(not(windows))]`: the tag is
+  # already pushed and the fix needs a new one. The IPC layer now carries three
+  # transports (Unix socket, named pipe, TCP) selected by cfg, so the class of
+  # break this catches is not hypothetical -- it has already happened once.
+  #
+  # `cargo check`, not `clippy -D warnings` and not `tauri build`: this gate
+  # exists to answer "does it still compile off Linux", cheaply enough to run
+  # on every pull request. Lint policy and bundling stay on the Linux job and
+  # the release workflow respectively. The repository is public, so these
+  # runners cost nothing.
+  cross-compile:
+    name: Compile check (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check (backend + CLI + IPC)
+        run: cargo check -p slashit-ui -p slashit -p slashit-ipc

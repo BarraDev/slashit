@@ -236,16 +236,20 @@ impl AppPaths {
         let dirs = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
             .ok_or_else(|| io::Error::other("could not determine OS project directories"))?;
 
-        let runtime_dir = dirs
-            .runtime_dir()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| std::env::temp_dir().join("slashit"));
-
         let paths = Self {
             config_dir: dirs.config_dir().to_path_buf(),
             data_dir: dirs.data_dir().to_path_buf(),
             cache_dir: dirs.cache_dir().to_path_buf(),
-            runtime_dir,
+            // Deliberately not `dirs.runtime_dir()`. That returns `None` on
+            // macOS and Windows, so its fallback — a fixed `<tmp>/slashit` —
+            // was the *normal* path there rather than an edge case, and it was
+            // wrong twice over. The socket is bound by `slashit_ipc`, which
+            // resolves this directory its own way, so `socket_path()` and
+            // `pid_file()` described a directory nothing had ever listened in;
+            // and an unqualified name in world-writable `/tmp` can be
+            // pre-created by another local user. One resolver, in the crate
+            // that does the binding, is the only way the two cannot drift.
+            runtime_dir: slashit_ipc::endpoint::runtime_dir(),
         };
         paths.ensure_base_dirs()?;
         Ok(paths)
@@ -291,6 +295,9 @@ impl AppPaths {
 
     /// Runtime files: daemon socket and PID file. Never inside a project, and
     /// never inside `data_dir` — these must not survive a reboot.
+    ///
+    /// Resolved by [`slashit_ipc::endpoint::runtime_dir`], which is also what
+    /// the IPC server binds against, so the two cannot disagree.
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
     }
@@ -313,6 +320,16 @@ impl AppPaths {
 
     pub fn feature_flags_file(&self) -> PathBuf {
         self.config_dir.join("features.toml")
+    }
+
+    /// IPC listener configuration: which transports are enabled and, for TCP,
+    /// where to bind. Separate from `config.toml` so the CLI can read it
+    /// without loading the whole desktop configuration model.
+    ///
+    /// Configuration, not runtime state: it is written by the user and must
+    /// survive a reboot, unlike the socket and PID file it describes.
+    pub fn ipc_config_file(&self) -> PathBuf {
+        self.config_dir.join("ipc.toml")
     }
 
     // --- Runtime -----------------------------------------------------------
@@ -498,6 +515,92 @@ mod tests {
         )
     }
 
+    /// Serialises the tests that swap `XDG_RUNTIME_DIR`.
+    ///
+    /// Both resolvers read that variable at call time, so two of these running
+    /// in parallel would compare answers taken under different environments.
+    static RUNTIME_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Evaluate `f` with `XDG_RUNTIME_DIR` set to `value`, then restore it.
+    ///
+    /// Assertions belong to the caller, not to `f`: a panic inside the closure
+    /// would skip the restore and leak the override into every later test.
+    fn with_xdg_runtime_dir<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = RUNTIME_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("XDG_RUNTIME_DIR").ok();
+        // SAFETY: the guard above makes this the only thread touching the
+        // variable, and it is restored before the guard drops.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", value) };
+
+        let out = f();
+
+        match previous {
+            // SAFETY: as above.
+            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        }
+        out
+    }
+
+    #[test]
+    fn runtime_dir_is_the_one_the_ipc_crate_resolves() {
+        // `socket_path()` and `pid_file()` are diagnostics about a socket this
+        // process does not bind: `slashit_ipc` does. Deriving the directory
+        // twice let them describe a path nothing ever listened in.
+        let tmp = TempDir::new().unwrap();
+        let xdg = tmp.path().join("xdg-runtime");
+        std::fs::create_dir_all(&xdg).unwrap();
+
+        let (ours, theirs) = with_xdg_runtime_dir(&xdg.to_string_lossy(), || {
+            (
+                AppPaths::new().unwrap().runtime_dir().to_path_buf(),
+                slashit_ipc::endpoint::runtime_dir(),
+            )
+        });
+        assert_eq!(ours, theirs, "with XDG_RUNTIME_DIR set");
+
+        // An unset variable is the shape macOS and Windows always have, so this
+        // branch is the normal one on two of three platforms.
+        let (ours, theirs) = with_xdg_runtime_dir("", || {
+            (
+                AppPaths::new().unwrap().runtime_dir().to_path_buf(),
+                slashit_ipc::endpoint::runtime_dir(),
+            )
+        });
+        assert_eq!(ours, theirs, "with XDG_RUNTIME_DIR absent");
+    }
+
+    #[test]
+    fn the_runtime_temp_fallback_is_qualified_per_user() {
+        // The temp directory is world-writable and shared between accounts, so
+        // a fixed name there can be pre-created by another local user, who then
+        // owns the directory our socket is bound in.
+        let dir =
+            with_xdg_runtime_dir("", || AppPaths::new().unwrap().runtime_dir().to_path_buf());
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("slashit-") && name.len() > "slashit-".len(),
+            "temp fallback must be qualified per user, got {name}"
+        );
+    }
+
+    #[test]
+    fn the_application_identity_matches_the_ipc_crate() {
+        // Both crates derive per-user runtime paths from this name. Renaming it
+        // on one side alone splits the runtime directory in two.
+        assert_eq!(APPLICATION, slashit_ipc::APPLICATION);
+    }
+
+    #[test]
+    fn ipc_configuration_is_configuration_not_runtime_state() {
+        // It is written by the user and must survive a reboot, unlike the
+        // socket and PID file it describes.
+        let tmp = TempDir::new().unwrap();
+        let p = paths_in(&tmp);
+        assert!(p.ipc_config_file().starts_with(p.config_dir()));
+        assert!(!p.ipc_config_file().starts_with(p.runtime_dir()));
+    }
+
     #[test]
     fn project_key_is_stable_across_calls() {
         let tmp = TempDir::new().unwrap();
@@ -679,6 +782,7 @@ mod tests {
             p.credentials_file(),
             p.workspaces_file(),
             p.feature_flags_file(),
+            p.ipc_config_file(),
             p.socket_path(),
             p.pid_file(),
             p.logs_dir(),

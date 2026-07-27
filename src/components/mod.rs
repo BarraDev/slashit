@@ -32,6 +32,7 @@ pub mod custom_select;
 pub mod project_rail;
 pub mod quit_dialog;
 pub mod diff_viewer;
+pub mod update_banner;
 
 pub use app_layout::*;
 pub use sidebar::*;
@@ -66,3 +67,4 @@ pub use project_rail::*;
 pub use quit_dialog::*;
 pub use diff_viewer::*;
 pub use storage_settings::*;
+pub use update_banner::*;

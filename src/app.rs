@@ -1,4 +1,4 @@
-use crate::components::{AppLayout, QuitDialog};
+use crate::components::{provide_updater_context, AppLayout, QuitDialog, UpdateBanner};
 use crate::pages::*;
 use crate::services::get_project;
 use leptos::prelude::*;
@@ -68,7 +68,12 @@ pub fn App() -> impl IntoView {
     
     // Provide selected project as context for child components
     provide_context(selected_project);
-    
+
+    // Updater state is provided once, here, so the notice and the Settings
+    // Updates tab read the same signals instead of running competing checks
+    // and disagreeing about the result.
+    let _ = provide_updater_context();
+
     // Validate persisted project exists on startup
     Effect::new(move |prev: Option<bool>| {
         // Only run once on mount
@@ -115,6 +120,9 @@ pub fn App() -> impl IntoView {
 
     view! {
         <QuitDialog />
+        // Floats over the layout rather than sitting above it: AppLayout's root
+        // is `h-screen`, so a preceding sibling would push the app off-screen.
+        <UpdateBanner />
         <AppLayout
             current_page=current_page
             on_navigate=on_navigate
