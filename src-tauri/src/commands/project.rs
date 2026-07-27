@@ -9,19 +9,29 @@ type Projects = Arc<RwLock<HashMap<Uuid, Project>>>;
 
 /// Helper function to persist projects to config file after mutation
 pub(crate) fn persist_projects(storage: &Storage, projects: &HashMap<Uuid, Project>) {
-    // Load current config
+    if let Err(e) = try_persist_projects(storage, projects) {
+        eprintln!("Warning: Failed to persist projects: {}", e);
+    }
+}
+
+/// Persist projects, reporting failure to the caller.
+///
+/// Most callers are content to log and continue, but a caller that has already
+/// moved files on disk cannot: losing the write there would leave the project
+/// pointing at the directory the data just left, and the user would open an
+/// empty board with no indication that anything went wrong.
+pub(crate) fn try_persist_projects(
+    storage: &Storage,
+    projects: &HashMap<Uuid, Project>,
+) -> anyhow::Result<()> {
     let mut config = storage.load_config().unwrap_or_default();
-    
-    // Update projects in config (convert Uuid keys to String keys)
+
     config.projects = projects
         .iter()
         .map(|(id, project)| (id.to_string(), project.clone()))
         .collect();
-    
-    // Save config
-    if let Err(e) = storage.save_config(&config) {
-        eprintln!("Warning: Failed to persist projects: {}", e);
-    }
+
+    storage.save_config(&config)
 }
 
 #[derive(Clone)]
