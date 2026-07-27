@@ -3,6 +3,7 @@
 //! This module handles persistent storage of application configuration,
 //! projects, repositories, and tasks.
 
+pub mod features;
 pub mod migration;
 pub mod paths;
 pub mod queue;

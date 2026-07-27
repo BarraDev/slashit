@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -17,20 +17,55 @@ pub struct IpcContext {
     pub app_handle: tauri::AppHandle,
 }
 
+/// Create the socket directory with owner-only permissions.
+///
+/// The directory is the real access control. Permissions on the socket file
+/// itself can only be applied *after* `bind()` returns, which leaves a window
+/// in which the socket exists at its final path with the process umask; a
+/// 0700 parent closes that window because nobody else can traverse into it.
+fn prepare_socket_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Decide whether an existing socket file may be replaced.
+///
+/// A socket left behind by a crash must be cleared, but one belonging to a
+/// live instance must not: removing it and binding again silently steals every
+/// subsequent CLI connection from the running app. Connecting is the only
+/// reliable liveness test — a bound socket accepts, an orphaned inode refuses.
+async fn claim_socket(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    match tokio::net::UnixStream::connect(path).await {
+        Ok(_) => Err(format!(
+            "another SlashIt instance is already listening on {}",
+            path.display()
+        )
+        .into()),
+        Err(_) => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+    }
+}
+
 pub async fn run(ctx: IpcContext) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = slashit_ipc::socket_path();
 
-    // Remove stale socket file
-    std::fs::remove_file(&path).ok();
-
-    // Ensure parent directory exists
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        prepare_socket_dir(parent)?;
     }
+
+    claim_socket(&path).await?;
 
     let listener = UnixListener::bind(&path)?;
 
-    // Set socket permissions to 0o600 (owner-only read/write)
+    // Belt and braces: the 0700 directory already prevents access, but a
+    // 0600 socket keeps the guarantee if the directory is ever relaxed.
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
@@ -64,14 +99,23 @@ async fn handle_connection(
     ctx: &IpcContext,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
-    let mut buf_reader = BufReader::new(reader);
+    // Cap the read. A client that connects and never sends a newline would
+    // otherwise make the server buffer without bound.
+    let mut buf_reader = BufReader::new(reader.take(slashit_ipc::MAX_REQUEST_BYTES));
     let mut line = String::new();
 
-    buf_reader.read_line(&mut line).await?;
+    let read = buf_reader.read_line(&mut line).await?;
 
-    let response = match serde_json::from_str::<slashit_ipc::IpcRequest>(&line) {
-        Ok(request) => super::handlers::dispatch(request, ctx).await,
-        Err(e) => slashit_ipc::IpcResponse::error(format!("Invalid request: {}", e)),
+    let response = if read as u64 >= slashit_ipc::MAX_REQUEST_BYTES {
+        slashit_ipc::IpcResponse::error(format!(
+            "Request exceeds the {} byte limit",
+            slashit_ipc::MAX_REQUEST_BYTES
+        ))
+    } else {
+        match serde_json::from_str::<slashit_ipc::IpcRequest>(&line) {
+            Ok(request) => super::handlers::dispatch(request, ctx).await,
+            Err(e) => slashit_ipc::IpcResponse::error(format!("Invalid request: {}", e)),
+        }
     };
 
     let mut json = serde_json::to_string(&response)?;
