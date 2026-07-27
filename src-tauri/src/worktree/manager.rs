@@ -82,6 +82,15 @@ impl WorktreeManager {
         Some(parent.join(format!("{repo_name}.{branch}")))
     }
 
+    /// Find a worktree for `branch` that already exists on disk.
+    ///
+    /// Used at startup to re-point a task whose recorded worktree path no
+    /// longer resolves, before the reference is discarded as stale.
+    pub fn adopt_existing(&self, repo_path: &str, branch: &str) -> Option<String> {
+        self.adoptable_path(repo_path, branch)
+            .map(|p| p.to_string_lossy().to_string())
+    }
+
     /// An existing worktree for this branch that SlashIt should reuse.
     ///
     /// Checked before creating anything, so an upgrade never abandons a

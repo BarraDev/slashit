@@ -14,6 +14,7 @@ fn event_target_checked(ev: &leptos::ev::Event) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SettingsTab {
     General,
+    Storage,
     Jujutsu,
     Theme,
 }
@@ -22,6 +23,7 @@ impl SettingsTab {
     fn title(&self) -> &'static str {
         match self {
             SettingsTab::General => "General",
+            SettingsTab::Storage => "Storage",
             SettingsTab::Jujutsu => "Jujutsu",
             SettingsTab::Theme => "Theme",
         }
@@ -30,6 +32,8 @@ impl SettingsTab {
     fn icon(&self) -> &'static str {
         match self {
             SettingsTab::General => "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z",
+            // Database / stacked-discs outline.
+            SettingsTab::Storage => "M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4",
             SettingsTab::Jujutsu => "M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15",
             SettingsTab::Theme => "M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z",
         }
@@ -37,7 +41,13 @@ impl SettingsTab {
 }
 
 #[component]
-pub fn Settings() -> impl IntoView {
+pub fn Settings(
+    /// The project whose storage is being configured. Empty when no project is
+    /// selected, which the Storage tab renders as an explanatory empty state
+    /// rather than a control that silently does nothing.
+    #[prop(default = String::new())]
+    project_id: String,
+) -> impl IntoView {
     let (active_tab, set_active_tab) = signal(SettingsTab::General);
 
     let (theme_id, set_theme_id) = signal("default".to_string());
@@ -94,6 +104,7 @@ pub fn Settings() -> impl IntoView {
                         <div class="p-2 space-y-1">
                             {[
                                 SettingsTab::General,
+                                SettingsTab::Storage,
                                 SettingsTab::Jujutsu,
                                 SettingsTab::Theme,
                             ].into_iter().map(|tab| {
@@ -160,6 +171,10 @@ pub fn Settings() -> impl IntoView {
                                             </div>
                                         </div>
                                     </div>
+                                }.into_any(),
+
+                                SettingsTab::Storage => view! {
+                                    <crate::components::StorageSettings project_id=project_id.clone() />
                                 }.into_any(),
 
                                 SettingsTab::Jujutsu => view! {
