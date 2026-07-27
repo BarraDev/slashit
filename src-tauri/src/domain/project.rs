@@ -1,3 +1,4 @@
+use crate::config::paths::StateLocation;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -30,6 +31,16 @@ pub struct Project {
     pub repository_id: Option<Uuid>,
     #[serde(default)]
     pub scope: ProjectScope,
+    /// Where this project's shareable state (its board) is kept.
+    ///
+    /// Projects stored before this field existed deserialize as
+    /// [`StateLocation::Auto`] rather than the type's own `External` default:
+    /// an existing install may already have a populated `.slashit/`, and
+    /// silently switching it to external storage would look like data loss.
+    /// `Auto` keeps such a project reading from where its state actually is,
+    /// while a project with no `.slashit/` resolves to external.
+    #[serde(default = "StateLocation::auto")]
+    pub state_location: StateLocation,
     pub agent_type: AgentType,
     pub agent_config: AgentConfig,
     pub created_at: chrono::DateTime<chrono::Utc>,

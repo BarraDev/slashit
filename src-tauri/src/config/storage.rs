@@ -1,14 +1,21 @@
-use crate::domain::{Project, AgentConfig, Task, Repository};
+use crate::config::paths::{AppPaths, ProjectKey};
 use crate::domain::task::ExternalRef;
+use crate::domain::{AgentConfig, Project, Repository, Task};
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
-const APP_NAME: &str = "slashit-app";
+/// Task file name inside a project's own state directory.
+const TASKS_FILE: &str = "tasks.toml";
+
+/// Pre-`AppPaths` task location: one `<project-uuid>.toml` per project, all of
+/// them under a single global directory. Still read, and still written for
+/// projects that cannot be routed to a state directory of their own.
+const LEGACY_TASKS_DIR: &str = "tasks";
 
 /// Structure for storing tasks per project in TOML files
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -28,7 +35,16 @@ pub struct AppConfig {
     #[serde(default)]
     pub jj_config: JjConfig,
     #[serde(default)]
+    pub worktree: WorktreeConfig,
+    #[serde(default)]
     pub ui_preferences: UiPreferences,
+}
+
+/// How SlashIt places the worktrees it creates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorktreeConfig {
+    #[serde(default)]
+    pub placement: crate::config::paths::WorktreePlacement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +107,7 @@ impl Default for AppConfig {
                 user_email: None,
                 default_branch: "main".to_string(),
             },
+            worktree: WorktreeConfig::default(),
             ui_preferences: UiPreferences {
                 theme: "dark".to_string(),
                 sidebar_width: 300,
@@ -137,28 +154,48 @@ fn migrate_task_refs(task: &mut Task) {
 
 #[derive(Clone)]
 pub struct Storage {
-    config_dir: PathBuf,
+    paths: Arc<AppPaths>,
     config_file: PathBuf,
+    /// Project id to the directory holding that project's shareable state.
+    ///
+    /// Routing depends only on config content — a project's repository path
+    /// and its `state_location`. Rebuilding the table wherever config enters or
+    /// leaves the process is therefore sufficient to keep it correct, and there
+    /// is no second invalidation path that could be forgotten. A project absent
+    /// from the table (no repository attached, or config not loaded yet) falls
+    /// back to the legacy global location rather than guessing.
+    routes: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
 }
 
 impl Storage {
     pub fn new() -> Result<Self> {
-        let proj_dirs = ProjectDirs::from("com", "barradev", APP_NAME)
-            .context("Failed to get project directories")?;
+        let paths = AppPaths::new().context("Failed to resolve application directories")?;
+        Ok(Self::with_paths(paths))
+    }
 
-        let config_dir = proj_dirs.config_dir().to_path_buf();
-        let config_file = config_dir.join("config.toml");
-
-        fs::create_dir_all(&config_dir)
-            .context("Failed to create config directory")?;
-
-        Ok(Self {
-            config_dir,
+    /// Build against explicit roots. Used by tests to stay inside a tempdir.
+    pub fn with_paths(paths: AppPaths) -> Self {
+        let config_file = paths.config_file();
+        Self {
+            paths: Arc::new(paths),
             config_file,
-        })
+            routes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// The resolved application directories. The single source of truth for
+    /// every path; no caller may derive a state path independently.
+    pub fn paths(&self) -> &AppPaths {
+        &self.paths
     }
 
     pub fn load_config(&self) -> Result<AppConfig> {
+        let config = self.read_config()?;
+        self.refresh_routes(&config);
+        Ok(config)
+    }
+
+    fn read_config(&self) -> Result<AppConfig> {
         if self.config_file.exists() {
             let contents = fs::read_to_string(&self.config_file)
                 .context("Failed to read config file")?;
@@ -234,17 +271,122 @@ impl Storage {
         }
     }
 
+    /// Persist global config.
+    ///
+    /// This file carries `AgentConfig::api_key`, so it is written atomically
+    /// and locked to owner-only permissions. It is also the reason config is
+    /// never relocatable into a project directory — see `config::paths`.
     pub fn save_config(&self, config: &AppConfig) -> Result<()> {
         let contents = toml::to_string_pretty(config)
             .context("Failed to serialize config")?;
-        fs::write(&self.config_file, contents)
+        write_private_atomic(&self.config_file, contents.as_bytes())
             .context("Failed to write config file")?;
+        self.refresh_routes(config);
         Ok(())
     }
 
-    pub fn config_dir(&self) -> &PathBuf {
-        &self.config_dir
+    // --- Project state routing --------------------------------------------
+
+    /// Recompute the project to state-directory table from `config`.
+    fn refresh_routes(&self, config: &AppConfig) {
+        let mut next = HashMap::with_capacity(config.projects.len());
+        for (id_str, project) in &config.projects {
+            let Ok(id) = Uuid::parse_str(id_str) else {
+                continue;
+            };
+            if let Some(dir) = self.state_dir_for(config, project) {
+                next.insert(id, dir);
+            }
+        }
+        // A poisoned lock means another thread panicked mid-update. The table
+        // is derived data, so recovering it and carrying on is strictly better
+        // than propagating the panic into every subsequent save.
+        match self.routes.write() {
+            Ok(mut routes) => *routes = next,
+            Err(poisoned) => *poisoned.into_inner() = next,
+        }
     }
+
+    /// Where one project's shareable state belongs, or `None` when the project
+    /// has no repository path to key off.
+    fn state_dir_for(&self, config: &AppConfig, project: &Project) -> Option<PathBuf> {
+        let repository_id = project.repository_id?;
+        let repository = config.repositories.get(&repository_id.to_string())?;
+        let root = Path::new(&repository.local_path);
+        let key = ProjectKey::for_path(root).key;
+        Some(
+            self.paths
+                .project_state_dir(&key, root, project.state_location),
+        )
+    }
+
+    /// The routed state directory for a project, if it has one.
+    fn routed_state_dir(&self, project_id: Uuid) -> Option<PathBuf> {
+        let routes = match self.routes.read() {
+            Ok(routes) => routes,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        routes.get(&project_id).cloned()
+    }
+
+    fn legacy_tasks_dir(&self) -> PathBuf {
+        self.paths.config_dir().join(LEGACY_TASKS_DIR)
+    }
+
+    fn legacy_tasks_path(&self, project_id: Uuid) -> PathBuf {
+        self.legacy_tasks_dir().join(format!("{project_id}.toml"))
+    }
+
+    /// Where this project's tasks are written.
+    ///
+    /// Routed projects get `tasks.toml` inside their own state directory.
+    /// Unroutable ones keep the legacy `<uuid>.toml` name under the shared
+    /// directory, because a shared directory plus a shared file name would
+    /// make every unroutable project overwrite the same file.
+    fn tasks_path(&self, project_id: Uuid) -> PathBuf {
+        match self.routed_state_dir(project_id) {
+            Some(dir) => dir.join(TASKS_FILE),
+            None => self.legacy_tasks_path(project_id),
+        }
+    }
+}
+
+/// Write a file atomically with owner-only permissions.
+///
+/// The temp file is created in the destination directory so the rename stays
+/// on one filesystem, and permissions are set on the temp file *before* the
+/// rename so the secret is never briefly world-readable at its final path.
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes)?;
+    set_owner_only(&tmp)?;
+    fs::rename(&tmp, path)
+}
+
+/// Write a file atomically, leaving permissions at the platform default.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only(_path: &Path) -> std::io::Result<()> {
+    // Windows inherits the parent ACL, which is already user-scoped under
+    // %APPDATA%. There is no portable mode bit to set here.
+    Ok(())
 }
 
 impl Default for Storage {
@@ -254,47 +396,80 @@ impl Default for Storage {
 }
 
 impl Storage {
-    /// Get the directory for storing task files
-    pub fn tasks_dir(&self) -> PathBuf {
-        self.config_dir.join("tasks")
+    /// Read and parse one tasks file, applying reference migration.
+    ///
+    /// A parse failure is reported and skipped rather than propagated: one
+    /// corrupt project file must not stop the other projects from loading.
+    fn read_tasks_file(path: &Path) -> Option<Vec<Task>> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(e) => {
+                eprintln!("Warning: Failed to read tasks file {path:?}: {e}");
+                return None;
+            }
+        };
+        match toml::from_str::<ProjectTasksFile>(&contents) {
+            Ok(file) => {
+                let mut tasks = file.tasks;
+                for task in &mut tasks {
+                    migrate_task_refs(task);
+                }
+                Some(tasks)
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to parse tasks file {path:?}: {e}");
+                None
+            }
+        }
     }
 
-    /// Get the path to a project's tasks file
-    fn project_tasks_path(&self, project_id: Uuid) -> PathBuf {
-        self.tasks_dir().join(format!("{}.toml", project_id))
-    }
-
-    /// Load all tasks from all project files
+    /// Load every task across every project.
+    ///
+    /// Reads each routed project's own state directory, then sweeps the legacy
+    /// global directory for projects that have not been routed or not yet
+    /// migrated. The legacy sweep is what keeps an upgrade non-destructive:
+    /// tasks stay visible until the project that owns them is saved once.
     pub fn load_all_tasks(&self) -> Result<Vec<Task>> {
-        let tasks_dir = self.tasks_dir();
-        if !tasks_dir.exists() {
-            return Ok(Vec::new());
+        let mut all_tasks = Vec::new();
+        let mut seen_files = std::collections::HashSet::new();
+
+        let routes = {
+            let guard = match self.routes.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.clone()
+        };
+
+        for (project_id, dir) in &routes {
+            let path = dir.join(TASKS_FILE);
+            if path.is_file() {
+                seen_files.insert(path.clone());
+                if let Some(tasks) = Self::read_tasks_file(&path) {
+                    all_tasks.extend(tasks);
+                }
+                continue;
+            }
+            // Not migrated yet: this project's tasks are still in the legacy
+            // file. Read them from there so nothing disappears on upgrade.
+            let legacy = self.legacy_tasks_path(*project_id);
+            if legacy.is_file() {
+                seen_files.insert(legacy.clone());
+                if let Some(tasks) = Self::read_tasks_file(&legacy) {
+                    all_tasks.extend(tasks);
+                }
+            }
         }
 
-        let mut all_tasks = Vec::new();
-        
-        for entry in fs::read_dir(&tasks_dir).context("Failed to read tasks directory")? {
-            let entry = entry?;
-            let path = entry.path();
-            
-            if path.extension().is_some_and(|ext| ext == "toml") {
-                match fs::read_to_string(&path) {
-                    Ok(contents) => {
-                        match toml::from_str::<ProjectTasksFile>(&contents) {
-                            Ok(tasks_file) => {
-                                let mut tasks = tasks_file.tasks;
-                                for task in &mut tasks {
-                                    migrate_task_refs(task);
-                                }
-                                all_tasks.extend(tasks);
-                            }
-                            Err(e) => {
-                                eprintln!("Warning: Failed to parse tasks file {:?}: {}", path, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to read tasks file {:?}: {}", path, e);
+        let legacy_dir = self.legacy_tasks_dir();
+        if legacy_dir.is_dir() {
+            for entry in fs::read_dir(&legacy_dir).context("Failed to read tasks directory")? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|ext| ext == "toml")
+                    && !seen_files.contains(&path)
+                {
+                    if let Some(tasks) = Self::read_tasks_file(&path) {
+                        all_tasks.extend(tasks);
                     }
                 }
             }
@@ -303,56 +478,58 @@ impl Storage {
         Ok(all_tasks)
     }
 
-    /// Load tasks for a specific project
+    /// Load tasks for a specific project, falling back to the legacy location.
     pub fn load_project_tasks(&self, project_id: Uuid) -> Result<Vec<Task>> {
-        let path = self.project_tasks_path(project_id);
-        
-        if !path.exists() {
-            return Ok(Vec::new());
+        let path = self.tasks_path(project_id);
+        if path.is_file() {
+            return Ok(Self::read_tasks_file(&path).unwrap_or_default());
         }
 
-        let contents = fs::read_to_string(&path)
-            .context("Failed to read project tasks file")?;
-        
-        let tasks_file: ProjectTasksFile = toml::from_str(&contents)
-            .context("Failed to parse project tasks file")?;
-
-        let mut tasks = tasks_file.tasks;
-        for task in &mut tasks {
-            migrate_task_refs(task);
+        let legacy = self.legacy_tasks_path(project_id);
+        if legacy != path && legacy.is_file() {
+            return Ok(Self::read_tasks_file(&legacy).unwrap_or_default());
         }
-        Ok(tasks)
+
+        Ok(Vec::new())
     }
 
-    /// Save tasks for a specific project
+    /// Save tasks for a specific project.
+    ///
+    /// Writes to the project's current state directory and then retires the
+    /// legacy file, so the move happens exactly once and only after the new
+    /// copy is safely on disk.
     pub fn save_project_tasks(&self, project_id: Uuid, tasks: &[Task]) -> Result<()> {
-        let tasks_dir = self.tasks_dir();
-        fs::create_dir_all(&tasks_dir)
-            .context("Failed to create tasks directory")?;
+        let path = self.tasks_path(project_id);
 
-        let path = self.project_tasks_path(project_id);
-        
         let tasks_file = ProjectTasksFile {
             version: 1,
             tasks: tasks.to_vec(),
         };
+        let contents = toml::to_string_pretty(&tasks_file).context("Failed to serialize tasks")?;
+        write_atomic(&path, contents.as_bytes()).context("Failed to write tasks file")?;
 
-        let contents = toml::to_string_pretty(&tasks_file)
-            .context("Failed to serialize tasks")?;
-        
-        fs::write(&path, contents)
-            .context("Failed to write tasks file")?;
+        let legacy = self.legacy_tasks_path(project_id);
+        if legacy != path && legacy.is_file() {
+            if let Err(e) = fs::remove_file(&legacy) {
+                eprintln!("Warning: Failed to remove legacy tasks file {legacy:?}: {e}");
+            }
+        }
 
         Ok(())
     }
 
-    /// Delete tasks file for a project
+    /// Delete a project's tasks from wherever they live.
     pub fn delete_project_tasks(&self, project_id: Uuid) -> Result<()> {
-        let path = self.project_tasks_path(project_id);
+        let path = self.tasks_path(project_id);
         if path.exists() {
-            fs::remove_file(&path)
-                .context("Failed to delete project tasks file")?;
+            fs::remove_file(&path).context("Failed to delete project tasks file")?;
         }
+
+        let legacy = self.legacy_tasks_path(project_id);
+        if legacy != path && legacy.exists() {
+            fs::remove_file(&legacy).context("Failed to delete legacy project tasks file")?;
+        }
+
         Ok(())
     }
 }
@@ -365,14 +542,19 @@ mod tests {
     /// Create a test storage instance with a temporary directory
     fn create_test_storage() -> (Storage, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config_dir = temp_dir.path().to_path_buf();
-        let config_file = config_dir.join("config.toml");
-        
-        let storage = Storage {
-            config_dir,
-            config_file,
-        };
-        
+        let root = temp_dir.path();
+        // `AppPaths::new()` creates these in production; `with_roots` does not,
+        // so the fixture stands in for that setup.
+        fs::create_dir_all(root.join("config")).expect("Failed to create config dir");
+        fs::create_dir_all(root.join("data")).expect("Failed to create data dir");
+
+        let storage = Storage::with_paths(AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        ));
+
         (storage, temp_dir)
     }
 
@@ -554,6 +736,7 @@ baz = 123
             name: "Test Project".to_string(),
             repository_id: None,
             scope: crate::domain::ProjectScope::Standalone,
+            state_location: crate::config::paths::StateLocation::External,
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
@@ -695,8 +878,8 @@ user_name = "Test"
         // Save tasks
         storage.save_project_tasks(project_id, &tasks).expect("Should save");
         
-        // Verify file exists
-        let path = storage.tasks_dir().join(format!("{}.toml", project_id));
+        // An unroutable project (no config loaded) keeps the legacy filename.
+        let path = storage.legacy_tasks_path(project_id);
         assert!(path.exists());
         
         // Delete tasks

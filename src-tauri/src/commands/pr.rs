@@ -1793,9 +1793,7 @@ fn truncate_one_line(s: &str, max: usize) -> String {
 }
 
 fn write_pr_helper_log(stdout: &str, stderr: &str, can_edit: bool) -> std::io::Result<std::path::PathBuf> {
-    let dir = directories::ProjectDirs::from("com", "barradev", "slashit-app")
-        .map(|d| d.data_dir().join("pr-helper-logs"))
-        .ok_or_else(|| std::io::Error::other("no ProjectDirs"))?;
+    let dir = crate::config::paths::AppPaths::new()?.pr_helper_logs_dir();
     std::fs::create_dir_all(&dir)?;
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let path = dir.join(format!("{}-{}.log", ts, if can_edit { "apply" } else { "readonly" }));

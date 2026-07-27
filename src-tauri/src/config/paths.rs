@@ -66,6 +66,15 @@ pub enum StateLocation {
 }
 
 impl StateLocation {
+    /// `Auto`, as a function so it can be a `#[serde(default = ...)]`.
+    ///
+    /// Used by `Project::state_location` so that projects written before the
+    /// field existed adopt whatever state directory they already have instead
+    /// of jumping to the `External` default.
+    pub fn auto() -> Self {
+        Self::Auto
+    }
+
     /// Resolve `Auto` against the filesystem. `External` and `InProject` are
     /// returned unchanged.
     pub fn resolve(self, project_root: &Path) -> ResolvedLocation {
@@ -84,10 +93,33 @@ impl StateLocation {
 }
 
 /// A [`StateLocation`] with `Auto` already resolved to a concrete choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializable because the settings UI shows the user where their state
+/// *actually* is, which for `Auto` is only knowable after resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResolvedLocation {
     External,
     InProject,
+}
+
+/// Who decides where a SlashIt-managed worktree is created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreePlacement {
+    /// Delegate to worktrunk (`wt`) when it is installed, otherwise behave as
+    /// [`Self::Managed`].
+    ///
+    /// This is the default because `wt` is the user's own tool: it runs their
+    /// configured hooks and honours their `worktree-path` template. `wt switch`
+    /// has no target-path flag, so delegating means SlashIt cannot dictate the
+    /// location — which is the point. Nothing lands inside the project either
+    /// way.
+    #[default]
+    Auto,
+    /// Always place worktrees under SlashIt's own external root, using plain
+    /// `git worktree add` with an explicit path.
+    Managed,
 }
 
 /// True when `dir` looks like a state directory SlashIt owns.

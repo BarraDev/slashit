@@ -66,6 +66,7 @@ mod project_tests {
             name: "Test Project".to_string(),
             repository_id: None,
             scope: crate::domain::ProjectScope::Standalone,
+            state_location: crate::config::paths::StateLocation::External,
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
