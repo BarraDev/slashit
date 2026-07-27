@@ -443,19 +443,30 @@ impl Storage {
 
         for (project_id, dir) in &routes {
             let path = dir.join(TASKS_FILE);
-            if path.is_file() {
-                seen_files.insert(path.clone());
-                if let Some(tasks) = Self::read_tasks_file(&path) {
-                    all_tasks.extend(tasks);
-                }
-                continue;
-            }
-            // Not migrated yet: this project's tasks are still in the legacy
-            // file. Read them from there so nothing disappears on upgrade.
             let legacy = self.legacy_tasks_path(*project_id);
-            if legacy.is_file() {
-                seen_files.insert(legacy.clone());
-                if let Some(tasks) = Self::read_tasks_file(&legacy) {
+
+            // Claim both locations for this project before reading either.
+            //
+            // Marking only the file we read would let the legacy sweep below
+            // pick up a stale copy that survived — a crash between writing the
+            // new file and deleting the old one leaves both on disk. That copy
+            // is older and is appended last, so it would overwrite the current
+            // board when the caller collects tasks by id.
+            seen_files.insert(path.clone());
+            seen_files.insert(legacy.clone());
+
+            let source = if path.is_file() {
+                Some(path)
+            } else if legacy.is_file() {
+                // Not migrated yet: read from where the tasks still are, so
+                // nothing disappears on upgrade.
+                Some(legacy)
+            } else {
+                None
+            };
+
+            if let Some(source) = source {
+                if let Some(tasks) = Self::read_tasks_file(&source) {
                     all_tasks.extend(tasks);
                 }
             }
@@ -914,6 +925,166 @@ user_name = "Test"
         let all_tasks = storage.load_all_tasks().expect("Should load all");
 
         assert_eq!(all_tasks.len(), 3);
+    }
+
+    // ==================== State routing / migration Tests ====================
+
+    /// Build a config whose single project routes to `state_dir`, and load it
+    /// so the routing table is populated.
+    fn route_project_to(
+        storage: &Storage,
+        project_id: Uuid,
+        repo_path: &std::path::Path,
+    ) -> AppConfig {
+        use crate::domain::{AgentConfig, AgentType, Project, Repository};
+
+        let repository_id = Uuid::new_v4();
+        let mut config = AppConfig::default();
+        config.repositories.insert(
+            repository_id.to_string(),
+            Repository {
+                id: repository_id,
+                local_path: repo_path.to_string_lossy().to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        config.projects.insert(
+            project_id.to_string(),
+            Project {
+                id: project_id,
+                name: "Routed".to_string(),
+                repository_id: Some(repository_id),
+                scope: crate::domain::ProjectScope::Standalone,
+                state_location: crate::config::paths::StateLocation::External,
+                agent_type: AgentType::ClaudeCode,
+                agent_config: AgentConfig {
+                    agent_type: AgentType::ClaudeCode,
+                    command: "claude".to_string(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    model: None,
+                    api_key: None,
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        );
+
+        storage.save_config(&config).expect("Should save config");
+        config
+    }
+
+    #[test]
+    fn routed_project_writes_into_its_own_state_dir() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        let project_id = Uuid::new_v4();
+        route_project_to(&storage, project_id, &repo);
+
+        let task = crate::test_helpers::create_test_task("Routed task");
+        storage
+            .save_project_tasks(project_id, &[task])
+            .expect("Should save");
+
+        // Outside the repository, and not in the legacy global directory.
+        let written = storage.tasks_path(project_id);
+        assert!(written.is_file());
+        assert!(!written.starts_with(&repo));
+        assert!(!storage.legacy_tasks_path(project_id).exists());
+        assert_eq!(storage.load_project_tasks(project_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tasks_left_in_the_legacy_location_are_still_loaded() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        // Write a task the old way: routed project, but only the legacy file.
+        let project_id = Uuid::new_v4();
+        let task = crate::test_helpers::create_test_task("Pre-upgrade task");
+        storage
+            .save_project_tasks(project_id, &[task])
+            .expect("Should save");
+        assert!(storage.legacy_tasks_path(project_id).is_file());
+
+        // Now the project gains a route, as it would on upgrade.
+        route_project_to(&storage, project_id, &repo);
+
+        assert_eq!(storage.load_all_tasks().unwrap().len(), 1);
+        assert_eq!(storage.load_project_tasks(project_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_surviving_legacy_file_does_not_resurrect_an_old_board() {
+        // A crash between writing the new file and deleting the old one leaves
+        // both on disk. The stale copy must not be loaded: it is older, and
+        // being appended last it would overwrite the current board when the
+        // caller collects tasks by id.
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        let project_id = Uuid::new_v4();
+        route_project_to(&storage, project_id, &repo);
+
+        let current = crate::test_helpers::create_test_task("Current");
+        storage
+            .save_project_tasks(project_id, &[current])
+            .expect("Should save");
+
+        // Re-create the legacy file behind the code's back.
+        let legacy = storage.legacy_tasks_path(project_id);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let stale = ProjectTasksFile {
+            version: 1,
+            tasks: vec![
+                crate::test_helpers::create_test_task("Stale one"),
+                crate::test_helpers::create_test_task("Stale two"),
+            ],
+        };
+        fs::write(&legacy, toml::to_string_pretty(&stale).unwrap()).unwrap();
+
+        let loaded = storage.load_all_tasks().expect("Should load");
+        assert_eq!(loaded.len(), 1, "stale legacy copy must be ignored");
+        assert_eq!(loaded[0].title, "Current");
+    }
+
+    #[test]
+    fn unroutable_projects_keep_separate_legacy_files() {
+        // Without a route there is no per-project directory, so the per-uuid
+        // filename is what stops two projects sharing one tasks.toml.
+        let (storage, _temp) = create_test_storage();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        storage
+            .save_project_tasks(a, &[crate::test_helpers::create_test_task("A")])
+            .unwrap();
+        storage
+            .save_project_tasks(b, &[crate::test_helpers::create_test_task("B")])
+            .unwrap();
+
+        assert_ne!(storage.tasks_path(a), storage.tasks_path(b));
+        assert_eq!(storage.load_all_tasks().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn config_file_is_not_world_readable() {
+        // config.toml carries AgentConfig::api_key.
+        let (storage, _temp) = create_test_storage();
+        storage.save_config(&AppConfig::default()).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&storage.config_file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "config.toml must not be group/world readable");
+        }
     }
 
     // ==================== parse_github_url Tests ====================
