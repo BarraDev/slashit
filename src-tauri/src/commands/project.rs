@@ -81,6 +81,9 @@ pub async fn create_project(
         name,
         repository_id,
         scope: crate::domain::ProjectScope::Standalone,
+        // New projects keep the repository pristine. Storing the board inside
+        // the project is a deliberate opt-in, never the default.
+        state_location: crate::config::paths::StateLocation::External,
         agent_type,
         agent_config,
         created_at: now,

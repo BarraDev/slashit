@@ -5,7 +5,7 @@ pub mod test_helpers;
 mod acp;
 mod jj;
 mod agents;
-mod config;
+pub mod config;
 mod session;
 mod queue;
 mod pty;
@@ -37,13 +37,27 @@ pub struct AppState {
     pub appearance: commands::appearance::AppearanceState,
     pub pty: PtyState,
     pub storage: Storage,
+    /// The one resolved set of application directories. Commands must read
+    /// paths from here rather than deriving their own.
+    pub paths: Arc<config::paths::AppPaths>,
     pub worktree_manager: Arc<worktree::WorktreeManager>,
     pub executor: Arc<tokio::sync::OnceCell<Arc<queue::TaskExecutor>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let storage = Storage::new().expect("Failed to initialize storage");
+    let paths = Arc::new(
+        config::paths::AppPaths::new().expect("Failed to resolve application directories"),
+    );
+    let storage = Storage::with_paths((*paths).clone());
+
+    // Config must be read before the worktree manager is built: it carries the
+    // worktree placement policy, and it populates Storage's project routing
+    // table, which every later task load depends on.
+    let loaded_config = storage.load_config().unwrap_or_else(|e| {
+        eprintln!("Warning: Failed to load config from disk: {}", e);
+        config::storage::AppConfig::default()
+    });
 
     let task_state = commands::task::TaskState::new();
     let queue_state = commands::queue::QueueState::new(task_state.tasks.clone());
@@ -65,17 +79,16 @@ pub fn run() {
         appearance: commands::appearance::AppearanceState::new(),
         pty: PtyState::new(),
         storage,
-        worktree_manager: Arc::new(worktree::WorktreeManager::new()),
+        worktree_manager: Arc::new(worktree::WorktreeManager::new(
+            paths.clone(),
+            loaded_config.worktree.placement,
+        )),
+        paths,
         executor: Arc::new(tokio::sync::OnceCell::new()),
     };
 
-    // Load persisted config from disk (synchronous at startup)
-    // Load repositories FIRST, then projects (which reference repository_id), then tasks (which reference project_id)
-    let loaded_config = app_state.storage.load_config().unwrap_or_else(|e| {
-        eprintln!("Warning: Failed to load config from disk: {}", e);
-        config::storage::AppConfig::default()
-    });
-    
+    // Repositories load FIRST, then projects (which reference repository_id),
+    // then tasks (which reference project_id).
     // Insert loaded repositories into repository state
     {
         let repositories_map = app_state.repository.repositories.clone();
