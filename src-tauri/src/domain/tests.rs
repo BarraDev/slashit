@@ -1,5 +1,5 @@
 //! Domain model tests
-//! Run with: cargo test -p slashit-app
+//! Run with: cargo test -p slashit-ui
 
 use super::*;
 

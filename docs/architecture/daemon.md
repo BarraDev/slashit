@@ -54,7 +54,7 @@ projects and tasks — are GUI-independent and belong in a
 
 ### 3. A daemon entrypoint
 
-A `slashitd` binary, or `slashit-app --headless`, that builds state, starts the
+A `slashitd` binary, or `slashit-ui --headless`, that builds state, starts the
 IPC server and the executor with a discarding sink, writes
 `AppPaths::pid_file()`, and waits for a signal.
 

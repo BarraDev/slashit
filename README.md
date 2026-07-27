@@ -81,12 +81,13 @@ SlashIt is currently pre-1.0 software. The core app, CLI, IPC server, queue, ter
 Near-term roadmap:
 
 - Add installation walkthroughs and release notes polish.
-- Track follow-up issues for GUI binary naming, optional daemon mode, and workspace layout cleanup.
+- Headless daemon mode, so agents and terminals survive without a window — designed in [`docs/architecture/daemon.md`](docs/architecture/daemon.md), not yet implemented.
+- Workspace layout cleanup (the root crate is both a package and a workspace).
 - Continue hardening queue execution, agent recovery, and cross-platform packaging.
 
 ## Built with
 
-Rust end to end — a [Leptos](https://leptos.dev/) 0.8 frontend compiled to WASM, a [Tauri](https://tauri.app/) v2 backend on the tokio runtime, and a standalone CLI that talks to the running app over a Unix domain socket (JSON-lines on `$XDG_RUNTIME_DIR/slashit.sock`). Module-level layout is documented in [`AGENTS.md`](AGENTS.md).
+Rust end to end — a [Leptos](https://leptos.dev/) 0.8 frontend compiled to WASM, a [Tauri](https://tauri.app/) v2 backend on the tokio runtime, and a standalone CLI that talks to the running app over a Unix domain socket (JSON-lines on `$XDG_RUNTIME_DIR/slashit-app/slashit.sock`). Module-level layout is documented in [`AGENTS.md`](AGENTS.md).
 
 ## Installation
 
@@ -188,8 +189,8 @@ Useful local checks:
 
 ```bash
 cargo fmt --check
-cargo clippy -p slashit-app -p slashit -p slashit-ipc -- -D warnings
-cargo test -p slashit-app -p slashit-ipc
+cargo clippy -p slashit-ui -p slashit -p slashit-ipc -- -D warnings
+cargo test -p slashit-ui -p slashit-ipc
 trunk build
 ```
 

@@ -17,14 +17,14 @@ use std::path::Path;
 use std::sync::LazyLock;
 use tokio::sync::Mutex;
 
-use slashit_app_lib::commands::pr::{
+use slashit_ui_lib::commands::pr::{
     address_pr_review_inner, discuss_pr_review_questions_inner, no_progress,
     AddressPrReviewOptions, PrReviewProgress, ProgressSink,
 };
-use slashit_app_lib::domain::task::{
+use slashit_ui_lib::domain::task::{
     PrCommentKind, PrReviewComment, PrReviewDecision, PrReviewItem, PrReviewPlan,
 };
-use slashit_app_lib::test_helpers::{create_test_pr_review_setup, create_test_task};
+use slashit_ui_lib::test_helpers::{create_test_pr_review_setup, create_test_task};
 
 // PATH is process-global; serialize tests that mutate it.
 // `tokio::sync::Mutex` is await-safe so clippy doesn't flag the guard being
@@ -252,7 +252,7 @@ async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
 
 /// Build a plan with three items keyed to comment ids 201/202/203:
 /// two Question items (with notes) plus a Skip item that must survive untouched.
-fn create_test_discuss_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) {
+fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
     let mut task = create_test_task("Discuss PR review questions");
     task.pr_url = Some("https://github.com/test-org/test-repo/pull/42".to_string());
     task.branch_name = Some("test-branch".to_string());
@@ -456,8 +456,8 @@ async fn empty_approved_set_returns_error_and_does_not_call_claude() {
 }
 
 /// Build a 2-Fix-item plan exercising the per-item iteration.
-fn create_test_two_fix_setup() -> (slashit_app_lib::domain::Task, PrReviewPlan) {
-    use slashit_app_lib::test_helpers::create_test_task;
+fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
+    use slashit_ui_lib::test_helpers::create_test_task;
 
     let mut task = create_test_task("Two fixes");
     task.pr_url = Some("https://github.com/test-org/test-repo/pull/42".to_string());
@@ -692,7 +692,7 @@ async fn rerunning_apply_with_only_replies_pending_skips_claude() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
-    use slashit_app_lib::commands::pr::sync_pr_review_replies_inner;
+    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
 
     let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
@@ -728,7 +728,7 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
-    use slashit_app_lib::commands::pr::sync_pr_review_replies_inner;
+    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
 
     let _guard = PATH_LOCK.lock().await;
     let env = MockEnv::setup("not used");
@@ -748,7 +748,7 @@ async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
 
 #[test]
 fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies() {
-    use slashit_app_lib::domain::task::{PrReviewApplyResult, PrReviewPlan};
+    use slashit_ui_lib::domain::task::{PrReviewApplyResult, PrReviewPlan};
 
     let (_task, mut plan) = create_test_two_fix_setup();
     // Both items still have fix_done=false and reply_posted=false at this point.
