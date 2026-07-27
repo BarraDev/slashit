@@ -163,7 +163,17 @@ pub async fn apply_state_migration(
             project.state_location = target;
             project.updated_at = chrono::Utc::now();
         }
-        crate::commands::project::persist_projects(&state.storage, &projects);
+        // The files have already moved, so a failure to record where they went
+        // must be reported rather than logged. Swallowing it would leave the
+        // project reading from the directory the data just left, and the user
+        // would open an empty board with nothing to explain it.
+        crate::commands::project::try_persist_projects(&state.storage, &projects).map_err(|e| {
+            format!(
+                "State was moved to {} but the setting could not be saved: {e}. \
+                 Re-select the location in Settings to finish.",
+                to.display()
+            )
+        })?;
     }
 
     // Saving config rebuilt the routing table, so subsequent task reads and
