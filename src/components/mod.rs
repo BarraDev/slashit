@@ -43,6 +43,8 @@ pub use workspace_panel::*;
 pub use agent_panel::*;
 pub use log_viewer::*;
 pub use jj_status::*;
+pub mod storage_settings;
+
 pub use badge::*;
 pub use progress_bar::*;
 pub use phase_badge::*;
@@ -63,3 +65,4 @@ pub use custom_select::*;
 pub use project_rail::*;
 pub use quit_dialog::*;
 pub use diff_viewer::*;
+pub use storage_settings::*;

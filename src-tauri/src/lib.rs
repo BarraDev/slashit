@@ -165,16 +165,54 @@ pub fn run() {
             tasks.insert(task.id, task);
         }
 
-        // Verify worktree paths still exist on disk (mark stale ones)
+        // Verify worktree paths still exist on disk.
+        //
+        // A path that no longer resolves is not automatically stale: upgrading
+        // moves managed worktrees to a new root, so try to adopt the worktree
+        // at its current location before discarding the reference. Clearing
+        // first would strand the branch and any uncommitted work in it.
+        let repo_for_project: std::collections::HashMap<uuid::Uuid, String> = {
+            let projects = app_state.project.projects.blocking_read();
+            let repositories = app_state.repository.repositories.blocking_read();
+            projects
+                .iter()
+                .filter_map(|(id, project)| {
+                    let repo = repositories.get(&project.repository_id?)?;
+                    Some((*id, repo.local_path.clone()))
+                })
+                .collect()
+        };
+
         for task in tasks.values_mut() {
-            if let Some(wt_path) = task.worktree_path.as_ref() {
-                if !std::path::Path::new(wt_path).exists() {
-                    // Worktree dir was deleted externally — clear the reference
+            let Some(wt_path) = task.worktree_path.as_ref() else {
+                continue;
+            };
+            if std::path::Path::new(wt_path).exists() {
+                continue;
+            }
+
+            let adopted = task
+                .branch_name
+                .as_ref()
+                .zip(repo_for_project.get(&task.project_id))
+                .and_then(|(branch, repo)| {
+                    app_state.worktree_manager.adopt_existing(repo, branch)
+                });
+
+            match adopted {
+                Some(path) => {
+                    println!(
+                        "SlashIt: Adopted relocated worktree for task '{}' at {}",
+                        task.title, path
+                    );
+                    task.worktree_path = Some(path);
+                }
+                None => {
                     println!("SlashIt: Worktree dir missing for task '{}', clearing reference", task.title);
                     task.worktree_path = None;
-                    migrated_projects.insert(task.project_id);
                 }
             }
+            migrated_projects.insert(task.project_id);
         }
 
         println!("SlashIt: Loaded {} tasks from disk", tasks.len());
@@ -278,6 +316,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             greet,
+            get_state_location,
+            set_state_location,
+            plan_state_migration,
+            apply_state_migration,
+            clean_legacy_state_dirs,
             create_repository,
             list_repositories,
             get_repository,

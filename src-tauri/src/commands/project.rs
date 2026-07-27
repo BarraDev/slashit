@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 type Projects = Arc<RwLock<HashMap<Uuid, Project>>>;
 
 /// Helper function to persist projects to config file after mutation
-fn persist_projects(storage: &Storage, projects: &HashMap<Uuid, Project>) {
+pub(crate) fn persist_projects(storage: &Storage, projects: &HashMap<Uuid, Project>) {
     // Load current config
     let mut config = storage.load_config().unwrap_or_default();
     
