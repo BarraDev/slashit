@@ -818,12 +818,9 @@ pub fn reorder_task_logic(
 ) -> Option<Task> {
     // Get the task and its current/new status
     let (project_id, old_status, target_status) = {
-        if let Some(task) = tasks.get(&task_id) {
-            let target = new_status.clone().unwrap_or(task.status.clone());
-            (task.project_id, task.status.clone(), target)
-        } else {
-            return None;
-        }
+        let task = tasks.get(&task_id)?;
+        let target = new_status.clone().unwrap_or(task.status.clone());
+        (task.project_id, task.status.clone(), target)
     };
 
     // Collect task IDs in the target column, sorted by position
