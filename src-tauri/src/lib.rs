@@ -10,6 +10,10 @@ mod session;
 mod queue;
 mod pty;
 mod worktree;
+// Unix-domain-socket IPC. Gated because the whole module is built on
+// UnixListener and mode bits; without this the Windows build fails to
+// compile rather than merely lacking the feature.
+#[cfg(unix)]
 mod ipc;
 
 use commands::*;
@@ -40,6 +44,8 @@ pub struct AppState {
     /// The one resolved set of application directories. Commands must read
     /// paths from here rather than deriving their own.
     pub paths: Arc<config::paths::AppPaths>,
+    /// Runtime feature flags, so unfinished work can ship dark.
+    pub features: Arc<tokio::sync::RwLock<config::features::FeatureFlags>>,
     pub worktree_manager: Arc<worktree::WorktreeManager>,
     pub executor: Arc<tokio::sync::OnceCell<Arc<queue::TaskExecutor>>>,
 }
@@ -82,6 +88,9 @@ pub fn run() {
         worktree_manager: Arc::new(worktree::WorktreeManager::new(
             paths.clone(),
             loaded_config.worktree.placement,
+        )),
+        features: Arc::new(tokio::sync::RwLock::new(
+            config::features::FeatureFlags::load(&paths),
         )),
         paths,
         executor: Arc::new(tokio::sync::OnceCell::new()),
@@ -258,6 +267,8 @@ pub fn run() {
             println!("SlashIt: Task executor started");
 
             // IPC Unix socket server
+            #[cfg(unix)]
+            {
             let ipc_ctx = ipc::IpcContext {
                 tasks: state.task.tasks.clone(),
                 projects: state.project.projects.clone(),
@@ -273,6 +284,7 @@ pub fn run() {
                 }
             });
             println!("SlashIt: IPC server starting");
+            }
 
             // System tray
             {
@@ -321,6 +333,8 @@ pub fn run() {
             plan_state_migration,
             apply_state_migration,
             clean_legacy_state_dirs,
+            get_feature_flags,
+            set_feature_flag,
             create_repository,
             list_repositories,
             get_repository,
