@@ -10,10 +10,18 @@ pub async fn get_feature_flags(
     Ok(state.features.read().await.clone())
 }
 
-/// Toggle one flag by name and persist the whole set.
+/// Toggle one flag by name, persist it, and re-resolve what is in force.
 ///
 /// An unrecognised name is an error rather than a silent no-op, so a typo in
 /// the UI or a stale caller is visible immediately.
+///
+/// The persisted file is loaded, edited and saved on its own rather than
+/// writing back the in-memory set. `AppState.features` is the *resolved* set,
+/// which may carry environment overrides; saving that would silently bake a
+/// temporary override into the user's configuration. After the write, the
+/// resolved set is rebuilt so behaviour follows the new configuration without
+/// a restart — and so a flag the environment is pinning stays pinned rather
+/// than appearing to accept the toggle.
 #[tauri::command]
 pub async fn set_feature_flag(
     state: tauri::State<'_, crate::AppState>,
@@ -126,4 +134,18 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(*features.read().await, FeatureFlags::default());
     }
+}
+
+/// Every flag with the value in force and the layer that decided it.
+///
+/// [`get_feature_flags`] returns what is persisted, which is only one of the
+/// four layers; a user whose flag is being overridden by the environment needs
+/// to be told that rather than shown a toggle that appears to disagree with the
+/// application's behaviour. Same shape as the `slashit features` IPC reply, so
+/// both surfaces report the same thing.
+#[tauri::command]
+pub async fn describe_feature_flags(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Vec<slashit_ipc::FeatureFlagInfo>, String> {
+    Ok(state.features.read().await.diagnostics())
 }

@@ -5,6 +5,56 @@ use crate::domain::{Task, TaskStatus, TaskCategory, TaskPriority, TaskComplexity
 pub use uuid::Uuid;
 use chrono::Utc;
 
+/// The IPC server, reachable from the integration tests.
+///
+/// `tests/ipc_integration.rs` is a separate crate, so it can only name items
+/// that are public *and* reachable from the crate root. Re-exporting here means
+/// the tests keep working whatever `lib.rs` decides about the visibility of the
+/// `ipc` module itself.
+pub use crate::ipc::{serve, IpcContext, IpcServer};
+
+/// An [`IpcContext`] with empty state, rooted at explicit directories.
+///
+/// Everything the IPC server does — framing, protocol versioning,
+/// authentication, authorization — is worth testing without a window, a webview
+/// or the developer's real configuration. So the event sink discards, the
+/// instance control is inert, and every path lands in whatever tempdir the
+/// caller passed.
+pub fn ipc_test_context(paths: std::sync::Arc<crate::config::paths::AppPaths>) -> IpcContext {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, RwLock};
+
+    let tasks = Arc::new(RwLock::new(HashMap::new()));
+
+    // Built field by field rather than through `PtyState::new`, which resolves
+    // the real OS directories and rewrites the developer's live terminal
+    // session file as a side effect.
+    let pty = crate::pty::PtyState {
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        scrollback: crate::pty::store::ScrollbackManager::new(),
+        store: Arc::new(
+            crate::pty::store::SessionStore::with_paths(&paths)
+                .expect("a session store under a tempdir should always be creatable"),
+        ),
+    };
+
+    IpcContext {
+        tasks: tasks.clone(),
+        projects: Arc::new(RwLock::new(HashMap::new())),
+        executions: Arc::new(RwLock::new(HashMap::new())),
+        pty,
+        queue_manager: Arc::new(RwLock::new(crate::queue::QueueManager::with_config(tasks))),
+        storage: crate::config::Storage::with_paths((*paths).clone()),
+        events: crate::events::null_sink(),
+        control: Arc::new(crate::instance::InertControl),
+        features: Arc::new(RwLock::new(
+            crate::config::features::FeatureFlags::default(),
+        )),
+        paths,
+    }
+}
+
 /// Create a test task with default values
 pub fn create_test_task(title: &str) -> Task {
     Task {

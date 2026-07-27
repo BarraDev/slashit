@@ -1,5 +1,5 @@
 {
-  "name": "slashit-app-e2e",
+  "name": "slashit-e2e",
   "version": "0.1.0",
   "private": true,
   "scripts": {

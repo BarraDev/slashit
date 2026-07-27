@@ -5,7 +5,7 @@ use crate::queue::QueueManager;
 use crate::worktree::{WorktreeManager, WorktreeInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::Emitter;
+use crate::events::{EventSink, SharedEventSink};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -27,6 +27,23 @@ pub enum AgentEvent {
 }
 
 type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
+
+/// Emit an `AgentEvent` through any sink.
+///
+/// The executor produces exactly one event name, so the conversion lives here
+/// rather than forcing every call site to name it.
+trait AgentEmit {
+    fn agent_event(&self, event: AgentEvent);
+}
+
+impl<T: EventSink + ?Sized> AgentEmit for T {
+    fn agent_event(&self, event: AgentEvent) {
+        match serde_json::to_value(&event) {
+            Ok(value) => self.emit_json("agent-event", value),
+            Err(e) => eprintln!("[executor] dropping agent event: {e}"),
+        }
+    }
+}
 
 pub struct TaskExecutor {
     tasks: Tasks,
@@ -58,7 +75,7 @@ pub struct TaskExecutor {
     workspace_registry: Arc<RwLock<crate::config::WorkspaceRegistry>>,
     storage: crate::config::Storage,
     worktree_manager: Arc<WorktreeManager>,
-    app_handle: tauri::AppHandle,
+    events: SharedEventSink,
     pr_check_counter: std::sync::atomic::AtomicU32,
 }
 
@@ -72,7 +89,7 @@ pub struct TaskExecutorConfig {
     pub workspace_registry: Arc<RwLock<crate::config::WorkspaceRegistry>>,
     pub storage: crate::config::Storage,
     pub worktree_manager: Arc<WorktreeManager>,
-    pub app_handle: tauri::AppHandle,
+    pub events: SharedEventSink,
 }
 
 impl TaskExecutor {
@@ -91,7 +108,7 @@ impl TaskExecutor {
             workspace_registry: config.workspace_registry,
             storage: config.storage,
             worktree_manager: config.worktree_manager,
-            app_handle: config.app_handle,
+            events: config.events,
             pr_check_counter: std::sync::atomic::AtomicU32::new(0),
         }
     }
@@ -99,7 +116,7 @@ impl TaskExecutor {
     /// Start the polling loop.
     pub fn start_polling(self: &Arc<Self>) {
         let executor = Arc::clone(self);
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 executor.check_and_execute().await;
                 tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -107,12 +124,22 @@ impl TaskExecutor {
         });
     }
 
+    /// How many tasks are executing or under review right now.
+    ///
+    /// A shutting-down daemon uses this to wait for real work rather than
+    /// killing agents mid-run: an aborted task is left marked `in_progress`
+    /// with no process behind it, and although startup requeues those, the
+    /// work the agent had already done is discarded.
+    pub async fn running_task_count(&self) -> usize {
+        self.running_handles.read().await.len() + self.reviewing_handles.read().await.len()
+    }
+
     async fn check_and_execute(&self) {
         // Auto-promote tasks from Queue → InProgress when capacity is available
         let manager = self.queue_manager.read().await;
         if manager.config().auto_promote {
             while let Some(task_id) = manager.promote_next_task().await {
-                let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                self.events.agent_event(AgentEvent::Log {
                     task_id: task_id.to_string(),
                     level: LogLevel::Info,
                     message: "Auto-promoted from queue".to_string(),
@@ -236,7 +263,7 @@ impl TaskExecutor {
 
                             if state == "MERGED" {
                                 Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
-                                let _ = self.app_handle.emit("agent-event", AgentEvent::Completed {
+                                self.events.agent_event(AgentEvent::Completed {
                                     task_id: task_id.to_string(),
                                     success: true,
                                     message: Some("PR merged — task complete".to_string()),
@@ -458,7 +485,7 @@ impl TaskExecutor {
         ).await {
             Ok(dir) => dir,
             Err(e) => {
-                let _ = self.app_handle.emit("agent-event", AgentEvent::Error {
+                self.events.agent_event(AgentEvent::Error {
                     task_id: task_id.to_string(),
                     message: format!("Cannot resolve working directory: {}", e),
                 });
@@ -506,8 +533,8 @@ impl TaskExecutor {
         };
 
         // Helper closure to handle worktree success
-        let handle_worktree_ok = |info: &WorktreeInfo, app: &tauri::AppHandle, msg: &str| {
-            let _ = app.emit("agent-event", AgentEvent::Log {
+        let handle_worktree_ok = |info: &WorktreeInfo, app: &SharedEventSink, msg: &str| {
+            app.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Info,
                 message: format!("{}: {}", msg, info.path),
@@ -519,7 +546,7 @@ impl TaskExecutor {
             // Reattach to existing branch
             match self.worktree_manager.reattach(&repo_path, &branch_name).await {
                 Ok(info) => {
-                    handle_worktree_ok(&info, &self.app_handle, "Reattached worktree");
+                    handle_worktree_ok(&info, &self.events, "Reattached worktree");
                     {
                         let mut tasks_w = self.tasks.write().await;
                         if let Some(t) = tasks_w.get_mut(&task_id) {
@@ -531,7 +558,7 @@ impl TaskExecutor {
                     (info.path.clone(), Some(info.path))
                 }
                 Err(e) => {
-                    let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                    self.events.agent_event(AgentEvent::Log {
                         task_id: task_id.to_string(),
                         level: LogLevel::Warn,
                         message: format!("Worktree reattach failed ({}), using repo dir", e),
@@ -543,7 +570,7 @@ impl TaskExecutor {
             // Stacked branch based on parent dependency
             match self.worktree_manager.create_stacked_branch(&repo_path, &branch_name, parent_branch).await {
                 Ok(info) => {
-                    handle_worktree_ok(&info, &self.app_handle, "Created stacked worktree");
+                    handle_worktree_ok(&info, &self.events, "Created stacked worktree");
                     {
                         let mut tasks_w = self.tasks.write().await;
                         if let Some(t) = tasks_w.get_mut(&task_id) {
@@ -556,14 +583,14 @@ impl TaskExecutor {
                 }
                 Err(e) => {
                     // Fallback to normal create if stacking fails
-                    let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                    self.events.agent_event(AgentEvent::Log {
                         task_id: task_id.to_string(),
                         level: LogLevel::Warn,
                         message: format!("Stacked branch failed ({}), falling back to normal create", e),
                     });
                     match self.worktree_manager.create(&repo_path, &branch_name).await {
                         Ok(info) => {
-                            handle_worktree_ok(&info, &self.app_handle, "Created worktree (fallback)");
+                            handle_worktree_ok(&info, &self.events, "Created worktree (fallback)");
                             {
                                 let mut tasks_w = self.tasks.write().await;
                                 if let Some(t) = tasks_w.get_mut(&task_id) {
@@ -575,7 +602,7 @@ impl TaskExecutor {
                             (info.path.clone(), Some(info.path))
                         }
                         Err(e2) => {
-                            let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                            self.events.agent_event(AgentEvent::Log {
                                 task_id: task_id.to_string(),
                                 level: LogLevel::Warn,
                                 message: format!("Worktree creation failed ({}), using repo dir", e2),
@@ -589,7 +616,7 @@ impl TaskExecutor {
             // Normal new branch
             match self.worktree_manager.create(&repo_path, &branch_name).await {
                 Ok(info) => {
-                    handle_worktree_ok(&info, &self.app_handle, "Created worktree");
+                    handle_worktree_ok(&info, &self.events, "Created worktree");
                     {
                         let mut tasks_w = self.tasks.write().await;
                         if let Some(t) = tasks_w.get_mut(&task_id) {
@@ -601,7 +628,7 @@ impl TaskExecutor {
                     (info.path.clone(), Some(info.path))
                 }
                 Err(e) => {
-                    let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                    self.events.agent_event(AgentEvent::Log {
                         task_id: task_id.to_string(),
                         level: LogLevel::Warn,
                         message: format!("Worktree creation failed ({}), using repo dir", e),
@@ -639,7 +666,7 @@ impl TaskExecutor {
         let executions = self.executions.clone();
         let running_handles = self.running_handles.clone();
         let logs = self.logs.clone();
-        let app_handle = self.app_handle.clone();
+        let events = self.events.clone();
         let storage = self.storage.clone();
         let working_dir_for_commit = working_dir.clone();
 
@@ -660,7 +687,7 @@ impl TaskExecutor {
             executions.write().await.insert(execution_id, execution);
             logs.write().await.insert(execution_id, Vec::new());
 
-            let _ = app_handle.emit("agent-event", AgentEvent::Log {
+            events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Info,
                 message: format!("Starting Claude agent in {}", working_dir),
@@ -687,7 +714,7 @@ impl TaskExecutor {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!("Failed to start claude: {}", e);
-                    let _ = app_handle.emit("agent-event", AgentEvent::Error {
+                    events.agent_event(AgentEvent::Error {
                         task_id: task_id.to_string(),
                         message: msg.clone(),
                     });
@@ -701,7 +728,7 @@ impl TaskExecutor {
                 exec.status = AgentStatus::Running;
             }
 
-            let _ = app_handle.emit("agent-event", AgentEvent::PhaseChange {
+            events.agent_event(AgentEvent::PhaseChange {
                 task_id: task_id.to_string(),
                 phase: TaskPhase::Coding,
                 progress: 10,
@@ -709,7 +736,7 @@ impl TaskExecutor {
 
             // Subscribe to events and forward to frontend
             let mut event_rx = runner.subscribe();
-            let app_handle_events = app_handle.clone();
+            let events_stream = events.clone();
             let task_id_str = task_id.to_string();
             let logs_events = logs.clone();
             let execution_id_events = execution_id;
@@ -719,14 +746,14 @@ impl TaskExecutor {
                 while let Ok(event) = event_rx.recv().await {
                     match &event {
                         ClaudeEvent::TextDelta { text } => {
-                            let _ = app_handle_events.emit("agent-event", AgentEvent::Log {
+                            events_stream.agent_event(AgentEvent::Log {
                                 task_id: task_id_str.clone(),
                                 level: LogLevel::Info,
                                 message: text.clone(),
                             });
                         }
                         ClaudeEvent::ToolUse { tool, .. } => {
-                            let _ = app_handle_events.emit("agent-event", AgentEvent::ToolUse {
+                            events_stream.agent_event(AgentEvent::ToolUse {
                                 task_id: task_id_str.clone(),
                                 tool: tool.clone(),
                             });
@@ -759,7 +786,7 @@ impl TaskExecutor {
                                 .push(entry);
                         }
                         ClaudeEvent::Error { message } => {
-                            let _ = app_handle_events.emit("agent-event", AgentEvent::Error {
+                            events_stream.agent_event(AgentEvent::Error {
                                 task_id: task_id_str.clone(),
                                 message: message.clone(),
                             });
@@ -773,7 +800,7 @@ impl TaskExecutor {
             match runner.wait().await {
                 Ok(_) => {
                     // Commit changes in the worktree/working dir
-                    Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &app_handle).await;
+                    Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await;
 
                     // Move to AiReview for automated review before human review
                     Self::update_task_phase_static(&tasks, task_id, TaskPhase::QaReview, 80).await;
@@ -785,7 +812,7 @@ impl TaskExecutor {
                             t.updated_at = chrono::Utc::now();
                         }
                     }
-                    let _ = app_handle.emit("agent-event", AgentEvent::Completed {
+                    events.agent_event(AgentEvent::Completed {
                         task_id: task_id.to_string(),
                         success: true,
                         message: Some("Agent completed — moving to AI review".to_string()),
@@ -805,7 +832,7 @@ impl TaskExecutor {
                     } else {
                         err_msg.clone()
                     };
-                    let _ = app_handle.emit("agent-event", AgentEvent::Error {
+                    events.agent_event(AgentEvent::Error {
                         task_id: task_id.to_string(),
                         message: full_msg.clone(),
                     });
@@ -875,7 +902,7 @@ impl TaskExecutor {
             ).await {
                 Ok(dir) => dir,
                 Err(e) => {
-                    let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                    self.events.agent_event(AgentEvent::Log {
                         task_id: task_id.to_string(),
                         level: LogLevel::Warn,
                         message: format!("Cannot resolve working dir for review: {}", e),
@@ -894,7 +921,7 @@ impl TaskExecutor {
 
         let tasks = self.tasks.clone();
         let reviewing_handles = self.reviewing_handles.clone();
-        let app_handle = self.app_handle.clone();
+        let events = self.events.clone();
         let storage = self.storage.clone();
         let queue_manager = self.queue_manager.clone();
 
@@ -904,7 +931,7 @@ impl TaskExecutor {
         let handle = tokio::spawn(async move {
             let task_id_str = task_id.to_string();
 
-            let _ = app_handle.emit("agent-event", AgentEvent::Log {
+            events.agent_event(AgentEvent::Log {
                 task_id: task_id_str.clone(),
                 level: LogLevel::Info,
                 message: "Starting AI review...".to_string(),
@@ -914,7 +941,7 @@ impl TaskExecutor {
             let diff = match Self::get_diff(&working_dir).await {
                 Some(d) => d,
                 None => {
-                    let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                    events.agent_event(AgentEvent::Log {
                         task_id: task_id_str.clone(),
                         level: LogLevel::Warn,
                         message: "Could not get diff (jj/git), skipping AI review".to_string(),
@@ -932,7 +959,7 @@ impl TaskExecutor {
             };
 
             if diff.trim().is_empty() {
-                let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
                     message: "No changes detected, skipping review".to_string(),
@@ -1003,7 +1030,7 @@ impl TaskExecutor {
                 {
                     Ok(output) if output.status.success() => {}
                     _ => {
-                        let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                        events.agent_event(AgentEvent::Log {
                             task_id: task_id_str.clone(),
                             level: LogLevel::Warn,
                             message: "CodeRabbit enabled but CLI not found. Install it or disable in Queue Settings.".to_string(),
@@ -1012,7 +1039,7 @@ impl TaskExecutor {
                     }
                 }
 
-                let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
                     message: "Running CodeRabbit review...".to_string(),
@@ -1052,7 +1079,7 @@ impl TaskExecutor {
                 && !coderabbit_result.starts_with("CodeRabbit warning:");
 
             if has_claude_issues || has_coderabbit_issues {
-                let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
                     message: "Issues found — validating and fixing...".to_string(),
@@ -1120,7 +1147,7 @@ impl TaskExecutor {
                         true
                     }
                     Err(e) => {
-                        let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                        events.agent_event(AgentEvent::Log {
                             task_id: task_id_str.clone(),
                             level: LogLevel::Error,
                             message: format!("Fix agent failed to start: {}", e),
@@ -1144,7 +1171,7 @@ impl TaskExecutor {
                 Self::transition_to_human_review(&tasks, &storage, task_id, Some(signoff)).await;
             } else {
                 // All clear — no issues
-                let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
                     message: "AI review passed — moving to human review".to_string(),
@@ -1281,7 +1308,7 @@ impl TaskExecutor {
         tasks: &Tasks,
         task_id: Uuid,
         working_dir: &str,
-        app_handle: &tauri::AppHandle,
+        events: &SharedEventSink,
     ) {
         let title = {
             let tasks_r = tasks.read().await;
@@ -1302,7 +1329,7 @@ impl TaskExecutor {
                     .current_dir(working_dir)
                     .output()
                     .await;
-                let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
                     message: "Committed via jj".to_string(),
@@ -1331,14 +1358,14 @@ impl TaskExecutor {
                 .await
             {
                 Ok(output) if output.status.success() => {
-                    let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                    events.agent_event(AgentEvent::Log {
                         task_id: task_id_str,
                         level: LogLevel::Info,
                         message: "Committed via git".to_string(),
                     });
                 }
                 _ => {
-                    let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                    events.agent_event(AgentEvent::Log {
                         task_id: task_id_str,
                         level: LogLevel::Warn,
                         message: "Git commit skipped (no changes or error)".to_string(),
@@ -1350,7 +1377,7 @@ impl TaskExecutor {
 
     async fn update_task_phase(&self, task_id: Uuid, phase: TaskPhase, progress: u8) {
         Self::update_task_phase_static(&self.tasks, task_id, phase.clone(), progress).await;
-        let _ = self.app_handle.emit("agent-event", AgentEvent::PhaseChange {
+        self.events.agent_event(AgentEvent::PhaseChange {
             task_id: task_id.to_string(),
             phase,
             progress,

@@ -1,5 +1,8 @@
 [package]
-name = "slashit-app-ui"
+# The Leptos/WASM frontend. Not `slashit-ui` — that name belongs to the Tauri
+# crate in src-tauri/, and two packages sharing a name in one workspace is a
+# hard Cargo error that would also make `cargo -p slashit-ui` ambiguous in CI.
+name = "slashit-frontend"
 version = "0.1.0"
 edition = "2021"
 authors = ["Barradev Digital Services <admin@barradev.com>"]

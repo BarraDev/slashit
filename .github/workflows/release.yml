@@ -6,7 +6,73 @@ on:
       - 'v*'
 
 jobs:
+  # Everything a tag can get wrong is decided here, in seconds, before four
+  # platform builds start. Two of these checks used to fail late or not at all:
+  #
+  # - A non-numeric prerelease (v0.1.0-rc.1) passes semver and passes Linux and
+  #   macOS, then kills the Windows job at MSI bundling time -- after the full
+  #   release compile -- with no artifact. See docs/releasing.md.
+  # - tauri-action substitutes __VERSION__ from tauri.conf.json, not from the
+  #   git ref, so a tag and an app version that disagree produced a release
+  #   named after the app version while the pushed tag said something else.
+  #   Nothing failed; the two just silently diverged.
+  preflight:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Validate the release version
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          fail() { echo "::error::$*"; exit 1; }
+
+          version="$(jq -er '.version' src-tauri/tauri.conf.json)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tauri.conf.json version: $version"
+          echo "pushed tag:              $TAG"
+
+          # 1. The tag names the release; tauri.conf.json defines what gets
+          #    built. If they disagree the release is mislabelled, so refuse
+          #    rather than pick a winner.
+          if [ "$TAG" != "v$version" ]; then
+            fail "Tag $TAG does not match the app version $version in src-tauri/tauri.conf.json (expected tag v$version). Bump every version listed in docs/releasing.md, then retag."
+          fi
+
+          # 2. Every workspace manifest ships in the same release; a stale one
+          #    means `slashit --version` disagrees with the installer.
+          for manifest in Cargo.toml src-tauri/Cargo.toml crates/slashit-ipc/Cargo.toml crates/slashit-cli/Cargo.toml; do
+            crate_version="$(grep -m1 '^version = ' "$manifest" | cut -d'"' -f2)"
+            if [ "$crate_version" != "$version" ]; then
+              fail "$manifest is at $crate_version but the release version is $version. See docs/releasing.md."
+            fi
+          done
+
+          # 3. WiX, which builds the MSI, accepts a narrower grammar than
+          #    semver: numeric major.minor.patch, an optional prerelease that
+          #    must be numeric-only, and no build metadata. tauri-bundler maps
+          #    0.1.0-1 to the WiX version 0.1.0.1 and hard-errors on
+          #    0.1.0-rc.1. bundle.targets is "all" and MSI is attempted before
+          #    NSIS, so a rejected version costs the whole Windows job.
+          if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-([0-9]+))?$ ]]; then
+            fail "Version $version cannot be packaged as an MSI. Use major.minor.patch with an optional numeric prerelease (0.1.0-1), not a named one (0.1.0-rc.1), and no build metadata. See docs/releasing.md."
+          fi
+          [ "${BASH_REMATCH[1]}" -le 255 ]   || fail "MSI: major version must be <= 255 (got ${BASH_REMATCH[1]})."
+          [ "${BASH_REMATCH[2]}" -le 255 ]   || fail "MSI: minor version must be <= 255 (got ${BASH_REMATCH[2]})."
+          [ "${BASH_REMATCH[3]}" -le 65535 ] || fail "MSI: patch version must be <= 65535 (got ${BASH_REMATCH[3]})."
+          if [ -n "${BASH_REMATCH[5]}" ]; then
+            [ "${BASH_REMATCH[5]}" -le 65535 ] || fail "MSI: prerelease number must be <= 65535 (got ${BASH_REMATCH[5]})."
+          fi
+
+          echo "Version $version is releasable."
+
   release:
+    needs: preflight
     permissions:
       contents: write
     strategy:
@@ -56,16 +122,72 @@ jobs:
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2 (resolved from moving major tag v0)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # These sign the updater manifest and its artifacts so a running app
+          # can verify an update it downloads. They are NOT OS code signing:
+          # the installers carry no Authenticode certificate and are not
+          # notarized by Apple. See docs/releasing.md.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: v__VERSION__
-          releaseName: 'SlashIt v__VERSION__'
-          releaseBody: 'See the assets to download this version and install.'
+          # Taken from the git ref rather than tauri-action's __VERSION__
+          # placeholder, which resolves from tauri.conf.json and can therefore
+          # name a release something other than the tag that triggered it. The
+          # preflight job has already proven the two agree, so this is the same
+          # string by construction -- it just cannot drift again.
+          tagName: ${{ github.ref_name }}
+          releaseName: 'SlashIt ${{ github.ref_name }}'
+          releaseBody: |
+            See CHANGELOG.md for what changed, and the assets below to install.
+
+            Installers are not yet OS code-signed: Windows SmartScreen and
+            macOS Gatekeeper will warn on first run.
+          # Drafts are deliberate. Nothing in this workflow verifies that the
+          # artifacts install and launch, so a human checks them and presses
+          # Publish. Note that a draft is invisible to the updater endpoint --
+          # see the summary printed by the next job.
           releaseDraft: true
-          # A tag containing a hyphen is a prerelease by semver
-          # (v0.1.0-rc.1). Hard-coding false would publish an RC as
-          # the latest stable release.
+          # A tag containing a hyphen is a prerelease by semver (v0.1.0-1).
+          # Hard-coding false would publish a release candidate as the latest
+          # stable release.
           prerelease: ${{ contains(github.ref_name, '-') }}
           args: ${{ matrix.args }}
           includeUpdaterJson: true
+
+  # The release is a draft at this point, so the run is not done -- it is
+  # waiting on a person. Saying so on the run page beats it being true only in
+  # a document nobody opens at the moment it matters.
+  next-steps:
+    needs: [preflight, release]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Explain what still has to happen by hand
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          IS_PRERELEASE: ${{ contains(github.ref_name, '-') }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## SlashIt ${GITHUB_REF_NAME} built"
+            echo
+            echo "The GitHub release is a **draft**. It is not visible to users and"
+            echo "not visible to the auto-updater until someone publishes it."
+            echo
+            echo "1. Download one artifact per platform and confirm it installs and launches."
+            echo "2. Publish the draft release."
+            echo
+            echo "### Auto-update"
+            echo
+            echo "The updater endpoint is \`releases/latest/download/latest.json\`."
+            echo "GitHub's \`latest\` excludes drafts **and** prereleases, so:"
+            echo
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              echo "- \`$VERSION\` is a prerelease. Publishing it will **not** make it"
+              echo "  reachable by the updater, by design: existing installs must not be"
+              echo "  auto-upgraded onto a release candidate."
+            else
+              echo "- \`$VERSION\` is a stable release. Auto-update starts working the"
+              echo "  moment the draft is published, and not before."
+            fi
+            echo
+            echo "See docs/releasing.md."
+          } >> "$GITHUB_STEP_SUMMARY"

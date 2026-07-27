@@ -1,4 +1,7 @@
-use slashit_ipc::{AppStatus, ProjectSummary, QueueStatusInfo, TaskSummary, TerminalSummary};
+use slashit_ipc::{
+    AppStatus, FeatureFlagInfo, InstanceInfo, ProjectSummary, QueueStatusInfo, TaskSummary,
+    TerminalSummary,
+};
 
 pub fn print_status(data: &serde_json::Value) {
     if let Ok(status) = serde_json::from_value::<AppStatus>(data.clone()) {
@@ -106,18 +109,70 @@ pub fn print_terminals(data: &serde_json::Value) {
     }
 }
 
+pub fn print_instance(data: &serde_json::Value) {
+    if let Ok(info) = serde_json::from_value::<InstanceInfo>(data.clone()) {
+        println!("SlashIt Instance");
+        println!("{}", "-".repeat(30));
+        println!("  Mode:      {}", info.mode);
+        println!("  Version:   {}", info.version);
+        println!("  Protocol:  {}", info.protocol_version);
+        println!("  PID:       {}", info.pid);
+        println!("  Endpoint:  {}", info.endpoint);
+    } else {
+        print_raw(data);
+    }
+}
+
+/// The resolved flags, with the layer that decided each one.
+///
+/// The source column is the point of the command: a flag whose value comes from
+/// the environment looks identical to one from the config file until you are
+/// told otherwise, and that is exactly the situation people spend an afternoon
+/// on.
+pub fn print_features(data: &serde_json::Value) {
+    if let Ok(flags) = serde_json::from_value::<Vec<FeatureFlagInfo>>(data.clone()) {
+        if flags.is_empty() {
+            println!("No feature flags.");
+            return;
+        }
+        println!(
+            "{:<20} {:<8} {:<10} DESCRIPTION",
+            "NAME", "VALUE", "SOURCE"
+        );
+        println!("{}", "-".repeat(96));
+        for f in &flags {
+            println!(
+                "{:<20} {:<8} {:<10} {}",
+                truncate(&f.name, 18),
+                if f.value { "on" } else { "off" },
+                truncate(&f.source, 8),
+                truncate(&f.description, 54),
+            );
+        }
+        println!("\n{} flag(s)", flags.len());
+    } else {
+        print_raw(data);
+    }
+}
+
 fn print_raw(data: &serde_json::Value) {
     if let Ok(s) = serde_json::to_string_pretty(data) {
         println!("{}", s);
     }
 }
 
+/// Shorten a value to fit a fixed-width column.
+///
+/// Counted in characters rather than bytes. A task title carrying an accent or
+/// an em dash would otherwise be sliced through the middle of a UTF-8 sequence
+/// and panic, which is a poor way for a status command to fail.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max {
-        format!("{}...", &s[..max.saturating_sub(3)])
-    } else {
-        s.to_string()
+    if s.chars().count() <= max {
+        return s.to_string();
     }
+    let mut out: String = s.chars().take(max.saturating_sub(3)).collect();
+    out.push_str("...");
+    out
 }
 
 fn short_id(id: &str) -> String {

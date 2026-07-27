@@ -169,9 +169,29 @@ branch and any uncommitted work in it.
 |---|---|---|---|
 | config | `~/.config/slashit-app` | `~/Library/Application Support/com.barradev.slashit-app` | `%APPDATA%\barradev\slashit-app\config` |
 | data | `~/.local/share/slashit-app` | same as config | `%APPDATA%\barradev\slashit-app\data` |
-| runtime | `$XDG_RUNTIME_DIR/slashit-app` | temp dir | temp dir |
+| runtime | `$XDG_RUNTIME_DIR/slashit-app` | `<tmp>/slashit-<uid>` | `<tmp>\slashit-<username>` |
+
+Config, data and cache come from the `directories` crate. Runtime does not:
+`AppPaths` defers to `slashit_ipc::endpoint::runtime_dir()`.
+
+That is not a stylistic preference. `ProjectDirs::runtime_dir()` returns
+`None` off Linux, so its fallback — a fixed `<tmp>/slashit` — was the *normal*
+path on macOS and Windows rather than an edge case, and it was wrong twice
+over. It named a different directory than the one the IPC crate actually binds
+in, so `socket_path()` and `pid_file()` described a directory nothing had ever
+listened in; and an unqualified name in a world-writable temp directory can be
+pre-created by another local user before SlashIt gets there. One resolver, in
+the crate that does the binding, is the only arrangement in which the socket
+and the PID file cannot drift apart.
+
+The qualifier differs by platform because the thing it has to disambiguate
+does: a uid where the runtime directory is a filesystem path, the username on
+Windows, where named pipes live in a machine-global namespace. On Windows the
+control channel *is* a named pipe (`\\.\pipe\slashit-<username>`) rather than
+a file, so the runtime directory there holds only the PID file.
 
 The application identifier `("com", "barradev", "slashit-app")` is frozen.
 Changing its third component would orphan every existing user's projects and
-tasks. It is independent of the binary name, so renaming an executable is safe;
-renaming this is not.
+tasks. It is independent of every Rust package and binary name in the
+workspace — `slashit-ui`, `slashit-frontend`, `slashit`, `slashit-ipc`,
+`slashitd` — so renaming any of those is safe; renaming this is not.
