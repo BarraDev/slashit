@@ -4853,38 +4853,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "slashit-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "directories",
- "dirs",
- "futures",
- "hex",
- "mockall",
- "portable-pty",
- "serde",
- "serde_json",
- "sha2",
- "slashit-ipc",
- "sysinfo",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tauri-plugin-updater",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml 0.8.2",
- "uuid",
- "walkdir",
- "which",
-]
-
-[[package]]
 name = "slashit-app-ui"
 version = "0.1.0"
 dependencies = [
@@ -4916,6 +4884,38 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "slashit-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "directories",
+ "dirs",
+ "futures",
+ "hex",
+ "mockall",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "sha2",
+ "slashit-ipc",
+ "sysinfo",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tauri-plugin-updater",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.2",
+ "uuid",
+ "walkdir",
+ "which",
 ]
 
 [[package]]
