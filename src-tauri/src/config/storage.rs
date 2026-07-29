@@ -316,7 +316,7 @@ impl Storage {
         let key = ProjectKey::for_path(root).key;
         Some(
             self.paths
-                .project_state_dir(&key, root, project.state_location),
+                .project_state_dir(&key, project.id, root, project.state_location),
         )
     }
 
@@ -996,6 +996,81 @@ user_name = "Test"
         assert!(!written.starts_with(&repo));
         assert!(!storage.legacy_tasks_path(project_id).exists());
         assert_eq!(storage.load_project_tasks(project_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn routed_projects_sharing_a_repository_keep_separate_task_state() {
+        use crate::domain::{AgentConfig, AgentType, Project, Repository};
+
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        let repository_id = Uuid::new_v4();
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+        let project = |id, name: &str| Project {
+            id,
+            name: name.to_string(),
+            repository_id: Some(repository_id),
+            scope: crate::domain::ProjectScope::Standalone,
+            state_location: crate::config::paths::StateLocation::External,
+            agent_type: AgentType::ClaudeCode,
+            agent_config: AgentConfig {
+                agent_type: AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let mut config = AppConfig::default();
+        config.repositories.insert(
+            repository_id.to_string(),
+            Repository {
+                id: repository_id,
+                local_path: repo.to_string_lossy().to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        config
+            .projects
+            .insert(project_a.to_string(), project(project_a, "A"));
+        config
+            .projects
+            .insert(project_b.to_string(), project(project_b, "B"));
+        storage.save_config(&config).unwrap();
+
+        let mut task_a = crate::test_helpers::create_test_task("A task");
+        task_a.project_id = project_a;
+        let mut task_b = crate::test_helpers::create_test_task("B task");
+        task_b.project_id = project_b;
+
+        storage.save_project_tasks(project_a, &[task_a]).unwrap();
+        storage.save_project_tasks(project_b, &[task_b]).unwrap();
+
+        assert_ne!(storage.tasks_path(project_a), storage.tasks_path(project_b));
+        assert_eq!(
+            storage.load_project_tasks(project_a).unwrap()[0].title,
+            "A task"
+        );
+        assert_eq!(
+            storage.load_project_tasks(project_b).unwrap()[0].title,
+            "B task"
+        );
+
+        storage.delete_project_tasks(project_b).unwrap();
+        assert_eq!(
+            storage.load_project_tasks(project_a).unwrap()[0].title,
+            "A task"
+        );
+        assert!(storage.load_project_tasks(project_b).unwrap().is_empty());
     }
 
     #[test]

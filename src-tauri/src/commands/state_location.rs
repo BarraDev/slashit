@@ -73,11 +73,15 @@ fn info_for(
         resolved: project.state_location.resolve(root),
         project_root: root.display().to_string(),
         current_dir: paths
-            .project_state_dir(&key, root, project.state_location)
+            .project_state_dir(&key, project.id, root, project.state_location)
             .display()
             .to_string(),
-        external_dir: paths.external_project_state(&key).display().to_string(),
-        in_project_dir: crate::config::paths::AppPaths::in_project_state(root)
+        external_dir: paths
+            .project_state_dir(&key, project.id, root, StateLocation::External)
+            .display()
+            .to_string(),
+        in_project_dir: paths
+            .project_state_dir(&key, project.id, root, StateLocation::InProject)
             .display()
             .to_string(),
         can_choose: true,
@@ -128,8 +132,10 @@ pub async fn plan_state_migration(
     let key = ProjectKey::for_path(&root).key;
     let from = state
         .paths
-        .project_state_dir(&key, &root, project.state_location);
-    let to = state.paths.project_state_dir(&key, &root, target);
+        .project_state_dir(&key, project.id, &root, project.state_location);
+    let to = state
+        .paths
+        .project_state_dir(&key, project.id, &root, target);
 
     StateMigrator::plan(&from, &to).map_err(|e| e.to_string())
 }
@@ -151,8 +157,10 @@ pub async fn apply_state_migration(
     let key = ProjectKey::for_path(&root).key;
     let from = state
         .paths
-        .project_state_dir(&key, &root, project.state_location);
-    let to = state.paths.project_state_dir(&key, &root, target);
+        .project_state_dir(&key, project.id, &root, project.state_location);
+    let to = state
+        .paths
+        .project_state_dir(&key, project.id, &root, target);
 
     let report = StateMigrator::migrate(&from, &to, policy.unwrap_or_default())
         .map_err(|e| e.to_string())?;

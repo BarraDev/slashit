@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use uuid::Uuid;
 
 /// Application identifiers used to derive OS directories.
 ///
@@ -352,16 +353,22 @@ impl AppPaths {
     }
 
     /// Resolve where a project's shareable state lives right now.
+    ///
+    /// The repository-derived key groups state by checkout, while the project
+    /// id keeps independent boards for multiple projects attached to that same
+    /// checkout from overwriting or deleting each other.
     pub fn project_state_dir(
         &self,
         key: &ProjectKey,
+        project_id: Uuid,
         project_root: &Path,
         location: StateLocation,
     ) -> PathBuf {
-        match location.resolve(project_root) {
+        let root = match location.resolve(project_root) {
             ResolvedLocation::External => self.external_project_state(key),
             ResolvedLocation::InProject => Self::in_project_state(project_root),
-        }
+        };
+        root.join(project_id.to_string())
     }
 
     // --- Worktrees ---------------------------------------------------------
@@ -639,6 +646,25 @@ mod tests {
             StateLocation::InProject.resolve(&project),
             ResolvedLocation::InProject
         );
+    }
+
+    #[test]
+    fn project_state_dirs_do_not_collide_for_one_repository() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        let repository = tmp.path().join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        let key = ProjectKey::for_path(&repository).key;
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+
+        for location in [StateLocation::External, StateLocation::InProject] {
+            let a = paths.project_state_dir(&key, project_a, &repository, location);
+            let b = paths.project_state_dir(&key, project_b, &repository, location);
+            assert_ne!(a, b);
+            assert_eq!(a.file_name().unwrap(), project_a.to_string().as_str());
+            assert_eq!(b.file_name().unwrap(), project_b.to_string().as_str());
+        }
     }
 
     #[test]

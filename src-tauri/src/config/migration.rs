@@ -462,14 +462,26 @@ fn merge_into(src: &Path, dst: &Path, warnings: &mut Vec<String>) -> Result<()> 
     let entries = fs::read_dir(src)
         .map_err(|e| MigrationError::io(format!("reading {}", src.display()), e))?;
     for entry in entries.flatten() {
-        let target = dst.join(entry.file_name());
-        if target.exists() {
-            continue;
-        }
         let from = entry.path();
+        let target = dst.join(entry.file_name());
+        let source_type = entry
+            .file_type()
+            .map_err(|e| MigrationError::io(format!("stat {}", from.display()), e))?;
+
+        match fs::symlink_metadata(&target) {
+            Ok(target_meta) => {
+                if source_type.is_dir() && target_meta.file_type().is_dir() {
+                    merge_into(&from, &target, warnings)?;
+                }
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(MigrationError::io(format!("stat {}", target.display()), e)),
+        }
+
         if fs::rename(&from, &target).is_err() {
             // Cross-device or non-empty: fall back to a copy.
-            let copied = if from.is_dir() {
+            let copied = if source_type.is_dir() {
                 copy_tree(&from, &target).is_ok()
             } else {
                 fs::copy(&from, &target).is_ok()
@@ -755,6 +767,23 @@ mod tests {
         let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
         assert!(matches!(report.outcome, MigrationOutcome::Migrated { .. }));
         assert_eq!(fs::read_to_string(to.join("notes.md")).unwrap(), "keep me\n");
+        assert!(to.join("tasks/a.toml").is_file());
+    }
+
+    #[test]
+    fn nested_non_conflicting_destination_entries_are_preserved() {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        seed(&from);
+        write(&to.join("tasks/keep-me.toml"), "keep me\n");
+
+        let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
+        assert!(matches!(report.outcome, MigrationOutcome::Migrated { .. }));
+        assert_eq!(
+            fs::read_to_string(to.join("tasks/keep-me.toml")).unwrap(),
+            "keep me\n"
+        );
         assert!(to.join("tasks/a.toml").is_file());
     }
 
