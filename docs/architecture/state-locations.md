@@ -47,12 +47,17 @@ of which is true of a directory inside a git repository.
 
 Per project, in Settings → Storage:
 
-- **Outside the project** (default) — `<data_dir>/projects/<project-key>/`.
+- **Outside the project** (default) —
+  `<data_dir>/projects/<project-key>/<project-id>/`.
   Your repository is untouched.
-- **Inside the project** — `<repo>/.slashit/`. Opt in when you want the board
-  committed and shared with your team.
+- **Inside the project** — `<repo>/.slashit/<project-id>/`. Opt in when you
+  want the board committed and shared with your team.
 - **Detect automatically** — use `.slashit/` if it already exists and has
   content, otherwise stay outside.
+
+The repository-derived key groups state by checkout. The project UUID below
+that root keeps separate SlashIt projects attached to one repository from
+sharing, overwriting, or deleting the same board file.
 
 Projects saved before this setting existed load as *Detect automatically*
 rather than the type's own `External` default. An existing install may already
