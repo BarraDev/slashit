@@ -157,7 +157,7 @@ impl PrReviewPlan {
                 if !item.fix_done {
                     item.fix_done = true;
                 }
-                if last.auto_reply && !item.reply_posted && !failed_reply_ids.contains(&cid) {
+                if last.auto_reply == Some(true) && !item.reply_posted && !failed_reply_ids.contains(&cid) {
                     item.reply_posted = true;
                 }
             }
@@ -274,13 +274,21 @@ pub struct PrReviewApplyResult {
     /// did not reach the remote.
     #[serde(default)]
     pub push_error: Option<String>,
-    /// Whether this apply ran with `auto_reply=true`. Needed to distinguish
-    /// "reply attempted and succeeded" from "reply intentionally never
-    /// attempted" when backfilling `reply_posted` from `fixed_ids` — without
-    /// it, an apply with replies disabled would be misread as having posted
-    /// replies for every fixed item.
+    /// Whether this apply ran with `auto_reply=true` — `Some(true)`/`Some(false)`
+    /// for any apply recorded since this field existed, `None` for a result
+    /// persisted before it did. Needed to distinguish "reply attempted and
+    /// succeeded" from "reply intentionally never attempted" when backfilling
+    /// `reply_posted` from `fixed_ids` — collapsing the missing-historical-value
+    /// case to `false` would make backfill treat "we don't actually know" the
+    /// same as "definitely not attempted", when in fact a genuinely old apply
+    /// may well have posted replies. `replies_posted > 0` cannot resolve that
+    /// ambiguity either: with multiple fixed items it does not say *which*
+    /// item's reply succeeded, so backfill must not use it to flip any
+    /// individual item's `reply_posted`. The unknown case is left alone here;
+    /// `Sync` is the path that may resolve it, using concrete per-comment
+    /// evidence (`in_reply_to_id`) rather than a guess.
     #[serde(default)]
-    pub auto_reply: bool,
+    pub auto_reply: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

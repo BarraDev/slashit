@@ -727,6 +727,51 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sync_pr_review_replies_discovers_and_rewrites_a_legacy_reply() {
+    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
+
+    let _guard = PATH_LOCK.lock().await;
+    let env = MockEnv::setup("not used");
+    // Override the default mock `gh` (which always returns `{}`) with one
+    // that answers the two calls this path actually makes: the paginated
+    // comment listing `discover_reply_comment_id` parses as a JSON array,
+    // and the `-X PATCH` rewrite. Anything else falls back to `{}`, matching
+    // `MockEnv`'s own default.
+    let gh_script = format!(
+        "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\ncase \"$*\" in\n  *'-X PATCH'*) printf '%s\\n' '{{}}' ;;\n  *'pulls/42/comments?per_page=100'*) printf '%s\\n' '[{{\"id\":9001,\"in_reply_to_id\":301,\"created_at\":\"2024-01-01T00:00:00Z\"}}]' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\n",
+        log = env.gh_log,
+    );
+    write_executable(&env.bin_dir.join("gh"), &gh_script);
+
+    let (task, mut plan) = create_test_two_fix_setup();
+    // Item 0 (comment 301): fixed, a reply was posted before `reply_comment_id`
+    // was tracked (legacy `[SlashIt agent —]`-style reply) — no id, no
+    // `pr_reply_text`. Must be discovered via `in_reply_to_id`, then rewritten.
+    plan.items[0].fix_done = true;
+    plan.items[0].reply_posted = true;
+    plan.items[0].reply_comment_id = None;
+    plan.items[0].pr_reply_text = None;
+    // Item 1: leave fix_pending so it doesn't add noise to the gh call count.
+
+    let (result, updated_plan) =
+        sync_pr_review_replies_inner(task, plan).await
+            .expect("sync succeeds");
+
+    assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
+    assert_eq!(result.discovered, 1, "the legacy reply's id should be discovered via in_reply_to_id");
+    assert_eq!(result.rewritten, 1, "the discovered reply should be rewritten to the current body");
+    assert_eq!(result.replied, 0);
+    assert_eq!(result.unmatched, 0);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    assert_eq!(
+        updated_plan.items[0].reply_comment_id,
+        Some(9001),
+        "discovered id must be persisted so a future sync can PATCH directly"
+    );
+    assert!(updated_plan.items[0].pr_reply_text.is_some(), "rewrite records the body it wrote");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
     use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
 
@@ -770,7 +815,7 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
         failed_ids: vec![],
         fix_errors: vec![],
         push_error: None,
-        auto_reply: true,
+        auto_reply: Some(true),
     });
 
     plan.backfill_lifecycle_from_last_apply();
@@ -808,7 +853,7 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
             failed_ids: vec![],
             fix_errors: vec![],
             push_error: None,
-            auto_reply: true,
+            auto_reply: Some(true),
         }),
     };
     // Reset to prove backfill leaves dry-run alone.
@@ -845,7 +890,7 @@ fn backfill_lifecycle_from_last_apply_never_attempted_reply_leaves_reply_posted_
         failed_ids: vec![],
         fix_errors: vec![],
         push_error: None,
-        auto_reply: false,
+        auto_reply: Some(false),
     });
 
     plan.backfill_lifecycle_from_last_apply();
@@ -858,4 +903,42 @@ fn backfill_lifecycle_from_last_apply_never_attempted_reply_leaves_reply_posted_
         "reply_posted must stay false when auto_reply=false, even though the fix succeeded");
     assert!(!plan.items[1].reply_posted,
         "reply_posted must stay false when auto_reply=false, even though the fix succeeded");
+}
+
+#[test]
+fn backfill_lifecycle_from_last_apply_does_not_guess_for_a_legacy_result_missing_auto_reply() {
+    use slashit_ui_lib::domain::task::PrReviewApplyResult;
+
+    // A `PrReviewApplyResult` persisted before the `auto_reply` field existed:
+    // the JSON simply has no such key. `#[serde(default)]` must deserialize
+    // this as `None` (unknown), not `Some(false)`.
+    let legacy_json = r#"{
+        "applied_at": "2024-01-01T00:00:00Z",
+        "agent_summary": "an apply from before auto_reply was tracked",
+        "fixed_ids": [301, 302],
+        "skipped_ids": [],
+        "replies_posted": 1
+    }"#;
+    let legacy: PrReviewApplyResult =
+        serde_json::from_str(legacy_json).expect("legacy result without auto_reply must still parse");
+    assert_eq!(legacy.auto_reply, None, "a missing field must deserialize as unknown, not false");
+
+    let (_task, mut plan) = create_test_two_fix_setup();
+    assert!(!plan.items[0].fix_done);
+    assert!(!plan.items[1].fix_done);
+    plan.last_apply = Some(legacy);
+
+    plan.backfill_lifecycle_from_last_apply();
+
+    // fix_done still backfills — that evidence (fixed_ids) is unambiguous.
+    assert!(plan.items[0].fix_done);
+    assert!(plan.items[1].fix_done);
+    // `replies_posted: 1` proves *a* reply landed, but not which of the two
+    // fixed items it belongs to. With `auto_reply` unknown, backfill must not
+    // guess by flipping either one — that is Sync's job, using per-comment
+    // evidence instead of an aggregate count.
+    assert!(!plan.items[0].reply_posted,
+        "an ambiguous legacy result must not mark either item as replied");
+    assert!(!plan.items[1].reply_posted,
+        "an ambiguous legacy result must not mark either item as replied");
 }

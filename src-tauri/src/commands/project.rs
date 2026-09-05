@@ -111,13 +111,28 @@ pub async fn create_project(
         updated_at: now,
     };
 
-    let mut projects = state.project.projects.write().await;
-    projects.insert(id, project.clone());
+    create_project_committed(&state.project.projects, &state.storage, project).await
+}
 
-    // Persist to disk, surfacing a failure instead of silently succeeding.
-    try_persist_projects(&state.storage, &projects)
+/// Core of [`create_project`], taking the raw map and storage so tests can
+/// call it without a `tauri::State`.
+///
+/// Inserts into a cloned map, persists the clone, and only replaces the
+/// shared map on success — a failed persist never leaves memory holding a
+/// project the caller was told did not get created.
+async fn create_project_committed(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    storage: &Storage,
+    project: Project,
+) -> Result<Project, String> {
+    let mut projects_w = projects.write().await;
+    let mut proposed = projects_w.clone();
+    proposed.insert(project.id, project.clone());
+
+    try_persist_projects(storage, &proposed)
         .map_err(|e| format!("Failed to persist project: {e}"))?;
 
+    *projects_w = proposed;
     Ok(project)
 }
 
@@ -145,16 +160,30 @@ pub async fn delete_project(
     id: String,
 ) -> Result<bool, String> {
     let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-    let mut projects = state.project.projects.write().await;
-    let removed = projects.remove(&id).is_some();
+    delete_project_committed(&state.project.projects, &state.storage, id).await
+}
 
-    // Persist to disk, surfacing a failure instead of silently succeeding.
+/// Core of [`delete_project`]; see [`create_project_committed`] for why the
+/// map is cloned first. The task files are only deleted once the persisted
+/// map no longer references the project — a failed persist must leave both
+/// memory and the on-disk task files untouched.
+async fn delete_project_committed(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    storage: &Storage,
+    id: Uuid,
+) -> Result<bool, String> {
+    let mut projects_w = projects.write().await;
+    let mut proposed = projects_w.clone();
+    let removed = proposed.remove(&id).is_some();
+
     if removed {
-        try_persist_projects(&state.storage, &projects)
+        try_persist_projects(storage, &proposed)
             .map_err(|e| format!("Failed to persist project deletion: {e}"))?;
 
+        *projects_w = proposed;
+
         // Also delete associated tasks file
-        if let Err(e) = state.storage.delete_project_tasks(id) {
+        if let Err(e) = storage.delete_project_tasks(id) {
             eprintln!("Warning: Failed to delete project tasks: {}", e);
         }
     }
@@ -171,9 +200,24 @@ pub async fn update_project(
     agent_type: Option<AgentType>,
 ) -> Result<Option<Project>, String> {
     let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-    let mut projects = state.project.projects.write().await;
+    update_project_committed(&state.project.projects, &state.storage, id, name, repository_id, agent_type).await
+}
 
-    if let Some(project) = projects.get_mut(&id) {
+/// Core of [`update_project`]; see [`create_project_committed`] for why the
+/// map is cloned first. A failed persist never leaves memory holding an
+/// update the caller was told did not apply.
+async fn update_project_committed(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    storage: &Storage,
+    id: Uuid,
+    name: Option<String>,
+    repository_id: Option<String>,
+    agent_type: Option<AgentType>,
+) -> Result<Option<Project>, String> {
+    let mut projects_w = projects.write().await;
+    let mut proposed = projects_w.clone();
+
+    if let Some(project) = proposed.get_mut(&id) {
         if let Some(name) = name {
             project.name = name;
         }
@@ -185,13 +229,13 @@ pub async fn update_project(
             project.agent_config = get_default_agent_config(&agent_type);
         }
         project.updated_at = chrono::Utc::now();
-        let result = Some(project.clone());
+        let result = project.clone();
 
-        // Persist to disk, surfacing a failure instead of silently succeeding.
-        try_persist_projects(&state.storage, &projects)
+        try_persist_projects(storage, &proposed)
             .map_err(|e| format!("Failed to persist project update: {e}"))?;
 
-        Ok(result)
+        *projects_w = proposed;
+        Ok(Some(result))
     } else {
         Ok(None)
     }
@@ -286,6 +330,10 @@ mod tests {
     fn try_persist_projects_propagates_read_failure_without_destroying_config() {
         use std::os::unix::fs::PermissionsExt;
 
+        if unsafe { libc_geteuid() } == 0 {
+            return; // root ignores permission bits, so chmod 0o000 would not force a read failure
+        }
+
         let (storage, _temp) = create_test_storage();
 
         // Seed a real config with data that must survive a failed persist.
@@ -311,5 +359,88 @@ mod tests {
         assert!(result.is_err(), "a read failure must not be treated as success");
         let on_disk = std::fs::read(&config_path).unwrap();
         assert_eq!(on_disk, original_bytes, "config on disk must be untouched by a failed persist");
+    }
+
+    /// Make `config.toml` exist but unreadable, so `try_persist_projects`
+    /// fails deep inside its own `load_config()` call — the same forcing
+    /// technique the read-failure test above uses, reused here to prove the
+    /// *committed helpers* leave memory untouched on that failure, not just
+    /// that the persistence function itself reports it.
+    #[cfg(unix)]
+    fn make_storage_with_unreadable_config() -> (Storage, TempDir) {
+        use std::os::unix::fs::PermissionsExt;
+        let (storage, temp) = create_test_storage();
+        storage.save_config(&AppConfig::default()).expect("seed config");
+        std::fs::set_permissions(storage.paths().config_file(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        (storage, temp)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_project_leaves_memory_unchanged_when_persistence_fails() {
+        if unsafe { libc_geteuid() } == 0 {
+            return;
+        }
+        let (storage, _temp) = make_storage_with_unreadable_config();
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
+        let new_project = make_test_project(Uuid::new_v4());
+
+        let result = create_project_committed(&projects, &storage, new_project.clone()).await;
+
+        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
+        assert!(
+            projects.read().await.is_empty(),
+            "memory must not contain a project disk never recorded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_project_leaves_memory_and_task_files_unchanged_when_persistence_fails() {
+        if unsafe { libc_geteuid() } == 0 {
+            return;
+        }
+        let (storage, _temp) = make_storage_with_unreadable_config();
+        let existing = make_test_project(Uuid::new_v4());
+        let id = existing.id;
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+
+        let result = delete_project_committed(&projects, &storage, id).await;
+
+        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
+        assert!(
+            projects.read().await.contains_key(&id),
+            "memory must still contain the project a failed deletion could not persist"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_project_leaves_memory_unchanged_when_persistence_fails() {
+        if unsafe { libc_geteuid() } == 0 {
+            return;
+        }
+        let (storage, _temp) = make_storage_with_unreadable_config();
+        let existing = make_test_project(Uuid::new_v4());
+        let id = existing.id;
+        let original_name = existing.name.clone();
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+
+        let result = update_project_committed(
+            &projects, &storage, id, Some("New Name".to_string()), None, None,
+        ).await;
+
+        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
+        assert_eq!(
+            projects.read().await.get(&id).unwrap().name,
+            original_name,
+            "memory must not contain an update disk never recorded"
+        );
+    }
+
+    #[cfg(unix)]
+    extern "C" {
+        #[link_name = "geteuid"]
+        fn libc_geteuid() -> u32;
     }
 }

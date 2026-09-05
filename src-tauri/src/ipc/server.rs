@@ -29,11 +29,10 @@ pub struct IpcContext {
 /// temp-dir fallback) is never chmod'd on trust alone; it goes through
 /// [`ensure_safe_runtime_dir`] first, the same as a freshly created one.
 fn prepare_socket_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::create_dir(dir) {
-        Ok(()) => {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        }
+    use std::os::unix::fs::DirBuilderExt;
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }

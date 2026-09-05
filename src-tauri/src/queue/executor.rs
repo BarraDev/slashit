@@ -190,7 +190,12 @@ impl TaskExecutor {
                                             t.overall_progress = 100;
                                             t.phase = TaskPhase::Complete;
                                             t.updated_at = chrono::Utc::now();
-                                            if let Some(wt_path) = t.worktree_path.take() {
+                                            // Not cleared here: `worktree_path` is the only
+                                            // persisted record of this directory. It is
+                                            // cleared (and re-persisted) only once removal
+                                            // below actually succeeds, so a crash or a
+                                            // failed removal leaves it in place for retry.
+                                            if let Some(wt_path) = t.worktree_path.clone() {
                                                 let branch = t.branch_name.clone().unwrap_or_default();
                                                 pending_worktree_removal = Some((wt_path, branch));
                                             }
@@ -212,8 +217,34 @@ impl TaskExecutor {
                                 ).await {
                                     Ok(repo_path) => {
                                         let wt_mgr = self.worktree_manager.clone();
+                                        let tasks = self.tasks.clone();
+                                        let storage = self.storage.clone();
+                                        let app_handle = self.app_handle.clone();
+                                        let wt_path_done = wt_path.clone();
                                         tokio::spawn(async move {
-                                            let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
+                                            match wt_mgr.remove(&wt_path, &branch, &repo_path).await {
+                                                Ok(()) => {
+                                                    {
+                                                        let mut tasks_w = tasks.write().await;
+                                                        if let Some(t) = tasks_w.get_mut(&task_id) {
+                                                            if t.worktree_path.as_deref() == Some(wt_path_done.as_str()) {
+                                                                t.worktree_path = None;
+                                                            }
+                                                        }
+                                                    }
+                                                    Self::persist_task_static(&tasks, &storage, task_id).await;
+                                                }
+                                                Err(e) => {
+                                                    let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                                                        task_id: task_id.to_string(),
+                                                        level: LogLevel::Warn,
+                                                        message: format!(
+                                                            "Failed to remove worktree {}: {}. It stays recorded on the task for a future retry.",
+                                                            wt_path_done, e
+                                                        ),
+                                                    });
+                                                }
+                                            }
                                         });
                                     }
                                     Err(e) => {

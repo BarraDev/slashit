@@ -31,6 +31,86 @@ async fn resolve_repo_path(
     Ok(repo.local_path.clone())
 }
 
+/// Resource handles [`cleanup_worktree`] needs, grouped so the function
+/// itself only takes the values that vary per call.
+struct WorktreeCleanupCtx<'a> {
+    worktree_manager: &'a crate::worktree::WorktreeManager,
+    projects: &'a Arc<RwLock<HashMap<Uuid, Project>>>,
+    repositories: &'a Arc<RwLock<HashMap<Uuid, Repository>>>,
+    tasks: &'a Tasks,
+    storage: &'a Storage,
+}
+
+/// Core of [`spawn_worktree_cleanup`], split out so tests can `.await` it
+/// directly instead of going through `tauri::async_runtime::spawn`.
+///
+/// `worktree_path` is the only persisted record of this directory. Every
+/// call site used to clear it — followed immediately by a synchronous
+/// persist — before the detached removal here even ran, so a crash or a
+/// failed `git worktree remove` orphaned the directory with nothing left
+/// pointing back to it. A `resolve_repo_path` or `WorktreeManager::remove`
+/// failure is logged with the task id and path instead, and leaves
+/// `worktree_path` untouched so the directory stays recoverable.
+async fn cleanup_worktree(ctx: WorktreeCleanupCtx<'_>, task_id: Uuid, project_id: Uuid, wt_path: &str, branch: &str) {
+    let repo_path = match resolve_repo_path(ctx.projects, ctx.repositories, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "Warning: worktree cleanup for task {task_id} could not resolve a repository path ({e}); {wt_path} is left on disk and worktree_path is retained for retry."
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = ctx.worktree_manager.remove(wt_path, branch, &repo_path).await {
+        eprintln!(
+            "Warning: failed to remove worktree {wt_path} for task {task_id}: {e}. worktree_path is retained for retry."
+        );
+        return;
+    }
+
+    let mut tasks_w = ctx.tasks.write().await;
+    if let Some(task) = tasks_w.get_mut(&task_id) {
+        if task.worktree_path.as_deref() == Some(wt_path) {
+            task.worktree_path = None;
+        }
+    }
+    persist_project_tasks(ctx.storage, &tasks_w, project_id);
+}
+
+/// Remove a task's worktree in the background; see [`cleanup_worktree`] for
+/// the retain-on-failure invariant this preserves.
+fn spawn_worktree_cleanup(
+    state: &crate::AppState,
+    task_id: Uuid,
+    project_id: Uuid,
+    wt_path: String,
+    branch: String,
+) {
+    let wt_mgr = state.worktree_manager.clone();
+    let projects = state.project.projects.clone();
+    let repositories = state.repository.repositories.clone();
+    let tasks = state.task.tasks.clone();
+    let storage = state.storage.clone();
+
+    tauri::async_runtime::spawn(async move {
+        cleanup_worktree(
+            WorktreeCleanupCtx {
+                worktree_manager: &wt_mgr,
+                projects: &projects,
+                repositories: &repositories,
+                tasks: &tasks,
+                storage: &storage,
+            },
+            task_id,
+            project_id,
+            &wt_path,
+            &branch,
+        )
+        .await;
+    });
+}
+
 pub type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
 
 /// Helper function to persist tasks for a project after mutation
@@ -193,39 +273,21 @@ pub async fn update_task_status(
             task.phase_progress = 0;
             task.overall_progress = 0;
             task.error_message = None;
-            // Cleanup worktree dir but keep branch for potential re-use
-            if let Some(wt_path) = &task.worktree_path {
-                let wt_path = wt_path.clone();
+            // Cleanup worktree dir but keep branch for potential re-use.
+            // `worktree_path` is left in place until removal succeeds.
+            if let Some(wt_path) = task.worktree_path.clone() {
                 let branch = task.branch_name.clone().unwrap_or_default();
-                let wt_mgr = state.worktree_manager.clone();
-                let projects = state.project.projects.clone();
-                let repositories = state.repository.repositories.clone();
-                let project_id = task.project_id;
-                tauri::async_runtime::spawn(async move {
-                    if let Ok(repo_path) = resolve_repo_path(&projects, &repositories, project_id).await {
-                        let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
-                    }
-                });
+                spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
             }
-            task.worktree_path = None;
         }
 
-        // Cleanup worktree when moving to Done (keep branch for PR)
+        // Cleanup worktree when moving to Done (keep branch for PR).
+        // `worktree_path` is left in place until removal succeeds.
         if matches!(status, TaskStatus::Done) {
-            if let Some(wt_path) = &task.worktree_path {
-                let wt_path = wt_path.clone();
+            if let Some(wt_path) = task.worktree_path.clone() {
                 let branch = task.branch_name.clone().unwrap_or_default();
-                let wt_mgr = state.worktree_manager.clone();
-                let projects = state.project.projects.clone();
-                let repositories = state.repository.repositories.clone();
-                let project_id = task.project_id;
-                tauri::async_runtime::spawn(async move {
-                    if let Ok(repo_path) = resolve_repo_path(&projects, &repositories, project_id).await {
-                        let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
-                    }
-                });
+                spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
             }
-            task.worktree_path = None;
             // Keep branch_name for PR creation
         }
 
@@ -603,20 +665,14 @@ pub async fn delete_task(
     // Get project_id before removal for persistence
     let project_id = tasks.get(&task_id).map(|t| t.project_id);
 
-    // Cleanup worktree and branch before removing
+    // Cleanup worktree and branch before removing. The task record itself is
+    // about to be deleted, so a failure here has no persisted task left to
+    // retain the path on — the failure is logged so the orphaned directory
+    // is at least discoverable, per `spawn_worktree_cleanup`'s own logging.
     if let Some(task) = tasks.get(&task_id) {
-        if let Some(wt_path) = &task.worktree_path {
-            let wt_path = wt_path.clone();
+        if let Some(wt_path) = task.worktree_path.clone() {
             let branch = task.branch_name.clone().unwrap_or_default();
-            let wt_mgr = state.worktree_manager.clone();
-            let projects = state.project.projects.clone();
-            let repositories = state.repository.repositories.clone();
-            let project_id = task.project_id;
-            tauri::async_runtime::spawn(async move {
-                if let Ok(repo_path) = resolve_repo_path(&projects, &repositories, project_id).await {
-                    let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
-                }
-            });
+            spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
         }
     }
 
@@ -687,39 +743,21 @@ pub async fn reorder_task(
                 task.phase_progress = 0;
                 task.overall_progress = 0;
                 task.error_message = None;
-                // Cleanup worktree dir but keep branch for potential re-use
-                if let Some(wt_path) = &task.worktree_path {
-                    let wt_path = wt_path.clone();
+                // Cleanup worktree dir but keep branch for potential re-use.
+                // `worktree_path` is left in place until removal succeeds.
+                if let Some(wt_path) = task.worktree_path.clone() {
                     let branch = task.branch_name.clone().unwrap_or_default();
-                    let wt_mgr = state.worktree_manager.clone();
-                    let projects = state.project.projects.clone();
-                    let repositories = state.repository.repositories.clone();
-                    let project_id = task.project_id;
-                    tauri::async_runtime::spawn(async move {
-                        if let Ok(repo_path) = resolve_repo_path(&projects, &repositories, project_id).await {
-                            let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
-                        }
-                    });
+                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
                 }
-                task.worktree_path = None;
             }
 
-            // Cleanup worktree when moving to Done (keep branch for PR)
+            // Cleanup worktree when moving to Done (keep branch for PR).
+            // `worktree_path` is left in place until removal succeeds.
             if matches!(target_status, TaskStatus::Done) {
-                if let Some(wt_path) = &task.worktree_path {
-                    let wt_path = wt_path.clone();
+                if let Some(wt_path) = task.worktree_path.clone() {
                     let branch = task.branch_name.clone().unwrap_or_default();
-                    let wt_mgr = state.worktree_manager.clone();
-                    let projects = state.project.projects.clone();
-                    let repositories = state.repository.repositories.clone();
-                    let project_id = task.project_id;
-                    tauri::async_runtime::spawn(async move {
-                        if let Ok(repo_path) = resolve_repo_path(&projects, &repositories, project_id).await {
-                            let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
-                        }
-                    });
+                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
                 }
-                task.worktree_path = None;
                 // Keep branch_name for PR creation
             }
         }
@@ -910,6 +948,221 @@ mod tests {
     /// Helper to create a HashMap of tasks for testing
     fn create_test_tasks_map(tasks: Vec<Task>) -> HashMap<Uuid, Task> {
         tasks.into_iter().map(|t| (t.id, t)).collect()
+    }
+
+    fn test_worktree_manager() -> crate::worktree::WorktreeManager {
+        let root = std::env::temp_dir().join(format!("slashit-task-wt-test-{}", Uuid::new_v4()));
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        ));
+        // `Managed` forces the git-native path regardless of whether `wt`
+        // happens to be installed on the machine running this test.
+        crate::worktree::WorktreeManager::new(paths, crate::config::paths::WorktreePlacement::Managed)
+    }
+
+    fn test_storage() -> (Storage, tempfile::TempDir) {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let storage = Storage::with_paths(crate::config::paths::AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        ));
+        (storage, temp)
+    }
+
+    fn create_temp_git_repo() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .output()
+                .expect("git command failed to spawn")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        tmp
+    }
+
+    fn test_project(id: Uuid, repository_id: Option<Uuid>) -> Project {
+        Project {
+            id,
+            name: "test-project".to_string(),
+            repository_id,
+            scope: crate::domain::ProjectScope::Standalone,
+            state_location: crate::config::paths::StateLocation::External,
+            agent_type: crate::domain::AgentType::ClaudeCode,
+            agent_config: crate::domain::AgentConfig {
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn test_repository(id: Uuid, local_path: String) -> Repository {
+        Repository {
+            id,
+            local_path,
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_worktree_clears_worktree_path_only_after_successful_removal() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let wt_mgr = test_worktree_manager();
+        let info = wt_mgr
+            .create(&repo_path, "cleanup-success")
+            .await
+            .expect("create failed");
+
+        let project_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            test_project(project_id, Some(repo_id)),
+        )])));
+        let repositories = Arc::new(RwLock::new(HashMap::from([(
+            repo_id,
+            test_repository(repo_id, repo_path),
+        )])));
+
+        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
+        task.worktree_path = Some(info.path.clone());
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
+        let (storage, _tmp) = test_storage();
+
+        cleanup_worktree(
+            WorktreeCleanupCtx {
+                worktree_manager: &wt_mgr,
+                projects: &projects,
+                repositories: &repositories,
+                tasks: &tasks,
+                storage: &storage,
+            },
+            task_id,
+            project_id,
+            &info.path,
+            "cleanup-success",
+        )
+        .await;
+
+        let tasks_r = tasks.read().await;
+        assert_eq!(
+            tasks_r.get(&task_id).unwrap().worktree_path, None,
+            "worktree_path must be cleared once removal actually succeeded"
+        );
+        assert!(
+            !std::path::Path::new(&info.path).exists(),
+            "the worktree directory itself must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_worktree_retains_worktree_path_when_repo_path_cannot_be_resolved() {
+        let wt_mgr = test_worktree_manager();
+        // `project_id` deliberately has no entry in `projects` below, so
+        // `resolve_repo_path` fails before any git command ever runs.
+        let project_id = Uuid::new_v4();
+        let projects = Arc::new(RwLock::new(HashMap::new()));
+        let repositories = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
+        task.worktree_path = Some("/tmp/does-not-matter".to_string());
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
+        let (storage, _tmp) = test_storage();
+
+        cleanup_worktree(
+            WorktreeCleanupCtx {
+                worktree_manager: &wt_mgr,
+                projects: &projects,
+                repositories: &repositories,
+                tasks: &tasks,
+                storage: &storage,
+            },
+            task_id,
+            project_id,
+            "/tmp/does-not-matter",
+            "some-branch",
+        )
+        .await;
+
+        let tasks_r = tasks.read().await;
+        assert_eq!(
+            tasks_r.get(&task_id).unwrap().worktree_path.as_deref(),
+            Some("/tmp/does-not-matter"),
+            "an unresolved repo path must leave worktree_path untouched, not clear it"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_worktree_retains_worktree_path_when_removal_fails() {
+        let wt_mgr = test_worktree_manager();
+        let project_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        // A repo path that does not exist on disk makes every git invocation
+        // in `remove_with_git` fail to spawn (its `current_dir` is invalid),
+        // giving a real, deterministic removal failure to test against.
+        let bogus_repo_path = "/definitely/does/not/exist/slashit-test-xyz".to_string();
+
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            test_project(project_id, Some(repo_id)),
+        )])));
+        let repositories = Arc::new(RwLock::new(HashMap::from([(
+            repo_id,
+            test_repository(repo_id, bogus_repo_path),
+        )])));
+
+        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
+        task.worktree_path = Some("/tmp/some-worktree-path".to_string());
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
+        let (storage, _tmp) = test_storage();
+
+        cleanup_worktree(
+            WorktreeCleanupCtx {
+                worktree_manager: &wt_mgr,
+                projects: &projects,
+                repositories: &repositories,
+                tasks: &tasks,
+                storage: &storage,
+            },
+            task_id,
+            project_id,
+            "/tmp/some-worktree-path",
+            "some-branch",
+        )
+        .await;
+
+        let tasks_r = tasks.read().await;
+        assert_eq!(
+            tasks_r.get(&task_id).unwrap().worktree_path.as_deref(),
+            Some("/tmp/some-worktree-path"),
+            "a failed removal must leave worktree_path in place for retry"
+        );
     }
 
     #[test]

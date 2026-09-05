@@ -559,8 +559,11 @@ pub async fn analyze_pr_comments(
     // Carry over lifecycle flags from the prior plan for items whose
     // `comment_id` matches — the fix already landed on disk and the reply is
     // already on the PR, so the freshly-triaged item should reflect that.
+    // Skipped for a comment GitHub reports as edited after that apply: the
+    // carried state describes the *old* text, not the one just re-triaged.
     if let Some(prev) = prior_plan.as_ref() {
-        carry_forward_reanalysis_lifecycle(&mut items, &prev.items);
+        let applied_at = prev.last_apply.as_ref().map(|a| a.applied_at);
+        carry_forward_reanalysis_lifecycle(&mut items, &prev.items, &comments, applied_at);
     }
 
     let plan = PrReviewPlan {
@@ -582,10 +585,35 @@ pub async fn analyze_pr_comments(
 /// `pr_reply_text`/`reply_comment_id`/etc. as `None`/`false`, so anything
 /// already recorded against a matching prior item must be carried forward or
 /// it is silently lost on re-analyze.
-fn carry_forward_reanalysis_lifecycle(items: &mut [PrReviewItem], prior_items: &[PrReviewItem]) {
+///
+/// GitHub keeps a review comment's id stable across an edit, so matching on
+/// `comment_id` alone cannot tell an unchanged comment apart from one the
+/// reviewer materially edited after `applied_at`. Carrying `fix_done`/
+/// `reply_posted` forward for the latter would make `address_pr_review_inner`
+/// skip a comment that now says something different, believing it already
+/// addressed. `comments` (the freshly-fetched set for this analysis) is
+/// checked for each matched id and the merge is skipped when its
+/// `updated_at` is newer than the apply the prior lifecycle came from.
+fn carry_forward_reanalysis_lifecycle(
+    items: &mut [PrReviewItem],
+    prior_items: &[PrReviewItem],
+    comments: &[PrReviewComment],
+    applied_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
     for item in items.iter_mut() {
         let Some(cid) = item.comment_id else { continue; };
         let Some(prev_item) = prior_items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
+
+        let edited_since_last_apply = applied_at.is_some_and(|applied_at| {
+            comments.iter()
+                .find(|c| c.id == Some(cid))
+                .and_then(|c| c.updated_at)
+                .is_some_and(|updated_at| updated_at > applied_at)
+        });
+        if edited_since_last_apply {
+            continue;
+        }
+
         if prev_item.fix_done { item.fix_done = true; }
         if prev_item.reply_posted { item.reply_posted = true; }
         if item.last_error.is_none() { item.last_error = prev_item.last_error.clone(); }
@@ -1032,7 +1060,10 @@ pub async fn address_pr_review_inner(
         failed_ids,
         fix_errors,
         push_error,
-        auto_reply: options.auto_reply,
+        // A freshly-run apply always knows whether replies were requested —
+        // only a result persisted before this field existed deserializes to
+        // `None` (see `PrReviewApplyResult::auto_reply`).
+        auto_reply: Some(options.auto_reply),
     };
 
     progress(PrReviewProgress {
@@ -2754,7 +2785,7 @@ mod tests {
         };
         let mut items = vec![fresh_item(42)];
 
-        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item]);
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[comment(42)], None);
 
         assert!(items[0].fix_done, "fix_done should carry forward");
         assert!(items[0].reply_posted, "reply_posted should carry forward");
@@ -2791,7 +2822,7 @@ mod tests {
         fresh.reply_comment_id = Some(2);
         let mut items = vec![fresh];
 
-        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item]);
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[comment(7)], None);
 
         assert_eq!(items[0].pr_reply_text.as_deref(), Some("fresh text"));
         assert_eq!(items[0].reply_comment_id, Some(2));
@@ -2802,9 +2833,62 @@ mod tests {
         let prev_item = PrReviewItem { pr_reply_text: Some("for a different comment".to_string()), ..fresh_item(1) };
         let mut items = vec![fresh_item(2)];
 
-        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item]);
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[comment(1), comment(2)], None);
 
         assert_eq!(items[0].pr_reply_text, None, "unrelated comment_id must not merge");
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_resets_a_comment_edited_after_the_last_apply() {
+        let applied_at = "2024-06-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let prev_item = PrReviewItem {
+            fix_done: true,
+            reply_posted: true,
+            pr_reply_text: Some("addressed the original wording".to_string()),
+            reply_comment_id: Some(555),
+            ..fresh_item(42)
+        };
+        let mut items = vec![fresh_item(42)];
+
+        // The reviewer edited comment 42 after the apply that produced
+        // `prev_item`'s lifecycle — GitHub kept the same comment id.
+        let edited_comment = PrReviewComment {
+            updated_at: Some("2024-06-02T00:00:00Z".parse().unwrap()),
+            ..comment(42)
+        };
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[edited_comment], Some(applied_at));
+
+        assert!(!items[0].fix_done, "an edited comment must be treated as needing fresh processing");
+        assert!(!items[0].reply_posted, "stale reply state must not suppress handling of the edited comment");
+        assert_eq!(items[0].pr_reply_text, None, "stale reply text must not carry forward for an edited comment");
+        assert_eq!(items[0].reply_comment_id, None);
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_keeps_state_for_a_comment_unchanged_since_the_last_apply() {
+        let applied_at = "2024-06-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let prev_item = PrReviewItem {
+            fix_done: true,
+            reply_posted: true,
+            pr_reply_text: Some("addressed the original wording".to_string()),
+            reply_comment_id: Some(555),
+            ..fresh_item(42)
+        };
+        let mut items = vec![fresh_item(42)];
+
+        // Same comment id, updated_at at or before the apply: not edited.
+        let unchanged_comment = PrReviewComment {
+            updated_at: Some(applied_at),
+            ..comment(42)
+        };
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[unchanged_comment], Some(applied_at));
+
+        assert!(items[0].fix_done, "an unchanged comment may retain its lifecycle");
+        assert!(items[0].reply_posted);
+        assert_eq!(items[0].pr_reply_text.as_deref(), Some("addressed the original wording"));
+        assert_eq!(items[0].reply_comment_id, Some(555));
     }
 
     // ──────────────────────────────────────────────

@@ -80,13 +80,29 @@ pub async fn create_repository(
         created_at: chrono::Utc::now(),
     };
 
-    let mut repositories = state.repository.repositories.write().await;
-    repositories.insert(id, repository.clone());
+    create_repository_committed(&state.repository.repositories, &state.storage, repository).await
+}
 
-    // Persist to disk, surfacing a failure instead of silently succeeding.
-    try_persist_repositories(&state.storage, &repositories)
+/// Core of [`create_repository`], taking the raw map and storage so tests
+/// can call it without a `tauri::State`.
+///
+/// Inserts into a cloned map, persists the clone, and only replaces the
+/// shared map on success — a failed persist never leaves memory holding a
+/// repository disk never recorded (which a later successful persist could
+/// otherwise write).
+async fn create_repository_committed(
+    repositories: &RwLock<HashMap<Uuid, Repository>>,
+    storage: &Storage,
+    repository: Repository,
+) -> Result<Repository, String> {
+    let mut repositories_w = repositories.write().await;
+    let mut proposed = repositories_w.clone();
+    proposed.insert(repository.id, repository.clone());
+
+    try_persist_repositories(storage, &proposed)
         .map_err(|e| format!("Failed to persist repository: {e}"))?;
 
+    *repositories_w = proposed;
     Ok(repository)
 }
 
@@ -165,6 +181,10 @@ mod tests {
     fn try_persist_repositories_propagates_read_failure_without_destroying_config() {
         use std::os::unix::fs::PermissionsExt;
 
+        if unsafe { libc_geteuid() } == 0 {
+            return; // root ignores permission bits, so chmod 0o000 would not force a read failure
+        }
+
         let (storage, _temp) = create_test_storage();
 
         // Seed a real config with data that must survive a failed persist.
@@ -190,5 +210,35 @@ mod tests {
         assert!(result.is_err(), "a read failure must not be treated as success");
         let on_disk = std::fs::read(&config_path).unwrap();
         assert_eq!(on_disk, original_bytes, "config on disk must be untouched by a failed persist");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_repository_leaves_memory_unchanged_when_persistence_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc_geteuid() } == 0 {
+            return;
+        }
+
+        let (storage, _temp) = create_test_storage();
+        storage.save_config(&AppConfig::default()).expect("seed config");
+        std::fs::set_permissions(storage.paths().config_file(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let new_repo = make_test_repository(Uuid::new_v4());
+
+        let result = create_repository_committed(&repositories, &storage, new_repo).await;
+
+        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
+        assert!(
+            repositories.read().await.is_empty(),
+            "memory must not contain a repository disk never recorded"
+        );
+    }
+
+    #[cfg(unix)]
+    extern "C" {
+        #[link_name = "geteuid"]
+        fn libc_geteuid() -> u32;
     }
 }
