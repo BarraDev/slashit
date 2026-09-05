@@ -1584,7 +1584,7 @@ fn render_review_item(
                                         let u = url_for_click.clone();
                                         leptos::task::spawn_local(async move {
                                             if let Err(e) = crate::services::open_url_external(u).await {
-                                                eprintln!("open_url failed: {}", e);
+                                                toast::error(format!("Could not open link: {}", e));
                                             }
                                         });
                                     }

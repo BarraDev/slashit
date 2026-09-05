@@ -152,4 +152,53 @@ mod tests {
         assert!(flags.daemon_mode);
         assert!(flags.extra.contains_key("from_a_newer_build"));
     }
+
+    #[test]
+    fn unknown_table_and_scalar_values_survive_a_save_and_reload_roundtrip() {
+        // `unknown_keys_survive_a_roundtrip` above only exercises `load_from`
+        // against a hand-written file. This drives the actual `save` path
+        // too — the one a real downgrade-then-upgrade cycle goes through —
+        // with both an unknown table value and an unknown scalar value, since
+        // TOML's own syntax rules (scalars before table headers at the same
+        // level) make table-valued entries the riskier case to get wrong.
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        );
+
+        let mut flags = FeatureFlags::default();
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "nested".to_string(),
+            toml::Value::String("value".to_string()),
+        );
+        table.insert("count".to_string(), toml::Value::Integer(3));
+        flags
+            .extra
+            .insert("future_table_flag".to_string(), toml::Value::Table(table));
+        flags
+            .extra
+            .insert("future_scalar_flag".to_string(), toml::Value::Boolean(true));
+
+        flags.save(&paths).unwrap();
+        let reloaded = FeatureFlags::load(&paths);
+
+        assert_eq!(
+            reloaded.extra.get("future_table_flag"),
+            flags.extra.get("future_table_flag"),
+            "an unknown table-valued key must survive a save/reload cycle unchanged"
+        );
+        assert_eq!(
+            reloaded.extra.get("future_scalar_flag"),
+            flags.extra.get("future_scalar_flag"),
+            "an unknown scalar-valued key must survive a save/reload cycle unchanged"
+        );
+        assert_eq!(
+            reloaded, flags,
+            "a full save/reload roundtrip must not lose or alter any unknown key"
+        );
+    }
 }

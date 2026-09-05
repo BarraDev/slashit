@@ -1027,10 +1027,16 @@ impl TaskExecutor {
 
     /// Resolve agent launch context.
     ///
-    /// If the task's project is attached to a workspace, return
-    /// `(workspace_root, [task_working_dir])` so Claude runs from the
-    /// workspace cwd with the task tree exposed via `--add-dir`. Otherwise
-    /// return `(task_working_dir, [])` to preserve today's behavior.
+    /// If the task's project is attached to a workspace *and that
+    /// workspace's root still exists on disk*, return `(workspace_root,
+    /// [task_working_dir])` so Claude runs from the workspace cwd with the
+    /// task tree exposed via `--add-dir`. Otherwise return
+    /// `(task_working_dir, [])` — the same fallback used when there is no
+    /// workspace at all. A registered root that has been unmounted, renamed,
+    /// or deleted must not fail the task: the task's own worktree is
+    /// unaffected by the workspace root disappearing, so launching from it
+    /// directly is strictly safer than erroring out from underneath a task
+    /// whose own working directory is still perfectly valid.
     async fn resolve_workspace_launch(
         tasks: &Tasks,
         projects: &Arc<RwLock<HashMap<Uuid, crate::domain::Project>>>,
@@ -1054,13 +1060,17 @@ impl TaskExecutor {
             return (task_working_dir.to_string(), Vec::new());
         };
 
-        let registry_r = workspace_registry.read().await;
-        match registry_r.get(&workspace_id) {
-            Some(ws) => (
-                ws.root_path.as_path().to_string_lossy().to_string(),
+        let root_path = {
+            let registry_r = workspace_registry.read().await;
+            registry_r.get(&workspace_id).map(|ws| ws.root_path.as_path().to_path_buf())
+        };
+
+        match root_path {
+            Some(root) if root.is_dir() => (
+                root.to_string_lossy().to_string(),
                 vec![std::path::PathBuf::from(task_working_dir)],
             ),
-            None => (task_working_dir.to_string(), Vec::new()),
+            _ => (task_working_dir.to_string(), Vec::new()),
         }
     }
 
@@ -1229,5 +1239,119 @@ impl TaskExecutor {
                 .collect();
             let _ = storage.save_project_tasks(project_id, &project_tasks);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::WorkspaceRegistry;
+    use crate::domain::{AgentConfig, AgentType, Project, ProjectScope, Workspace, WorkspaceRoot};
+    use crate::test_helpers::create_test_task_full;
+
+    fn test_project(id: Uuid, scope: ProjectScope) -> Project {
+        Project {
+            id,
+            name: "test-project".to_string(),
+            repository_id: None,
+            scope,
+            state_location: crate::config::paths::StateLocation::External,
+            agent_type: AgentType::ClaudeCode,
+            agent_config: AgentConfig {
+                agent_type: AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn test_registry() -> (WorkspaceRegistry, tempfile::TempDir) {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let registry = WorkspaceRegistry::load_from(temp.path().join("workspaces.toml"))
+            .expect("a missing registry file should still load empty");
+        (registry, temp)
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_launch_uses_the_workspace_root_when_it_exists() {
+        let workspace_root = tempfile::TempDir::new().expect("workspace root tempdir");
+        let workspace = Workspace::new(
+            "ws".to_string(),
+            WorkspaceRoot::try_new(workspace_root.path()).expect("real dir must validate"),
+        );
+        let workspace_id = workspace.id;
+
+        let (mut registry, _reg_temp) = test_registry();
+        registry.upsert(workspace).expect("upsert should succeed");
+
+        let project_id = Uuid::new_v4();
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            test_project(project_id, ProjectScope::InWorkspace { workspace_id }),
+        )])));
+
+        let task = create_test_task_full("t", project_id, TaskStatus::InProgress, 0);
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+
+        let (root, extra_dirs) = TaskExecutor::resolve_workspace_launch(
+            &tasks,
+            &projects,
+            &Arc::new(RwLock::new(registry)),
+            task_id,
+            "/tmp/task-working-dir",
+        )
+        .await;
+
+        assert_eq!(root, workspace_root.path().canonicalize().unwrap().to_string_lossy());
+        assert_eq!(extra_dirs, vec![std::path::PathBuf::from("/tmp/task-working-dir")]);
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_launch_falls_back_to_task_dir_when_the_registered_root_is_missing() {
+        // The registry holds a root that no longer exists on disk — e.g. an
+        // unmounted drive, a rename, or a deleted folder — which
+        // `WorkspaceRoot::from_trusted` allows (registry loads never
+        // re-validate). The task's own worktree is unaffected and must still
+        // be usable.
+        let vanished = tempfile::TempDir::new().expect("tempdir").path().join("gone");
+        let workspace = Workspace::new("ws".to_string(), WorkspaceRoot::from_trusted(vanished));
+        let workspace_id = workspace.id;
+
+        let (mut registry, _reg_temp) = test_registry();
+        registry.upsert(workspace).expect("upsert should succeed even for a missing root");
+
+        let project_id = Uuid::new_v4();
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            test_project(project_id, ProjectScope::InWorkspace { workspace_id }),
+        )])));
+
+        let task = create_test_task_full("t", project_id, TaskStatus::InProgress, 0);
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+
+        let (root, extra_dirs) = TaskExecutor::resolve_workspace_launch(
+            &tasks,
+            &projects,
+            &Arc::new(RwLock::new(registry)),
+            task_id,
+            "/tmp/task-working-dir",
+        )
+        .await;
+
+        assert_eq!(
+            root, "/tmp/task-working-dir",
+            "a missing workspace root must fall back to the task's own working directory"
+        );
+        assert!(
+            extra_dirs.is_empty(),
+            "the fallback must match the no-workspace shape exactly (no --add-dir entries)"
+        );
     }
 }

@@ -8,13 +8,6 @@ use tokio::sync::RwLock;
 
 type Projects = Arc<RwLock<HashMap<Uuid, Project>>>;
 
-/// Helper function to persist projects to config file after mutation
-pub(crate) fn persist_projects(storage: &Storage, projects: &HashMap<Uuid, Project>) {
-    if let Err(e) = try_persist_projects(storage, projects) {
-        eprintln!("Warning: Failed to persist projects: {}", e);
-    }
-}
-
 /// Persist projects, reporting failure to the caller.
 ///
 /// Most callers are content to log and continue, but a caller that has already

@@ -48,6 +48,9 @@ pub struct AppState {
     pub features: Arc<tokio::sync::RwLock<config::features::FeatureFlags>>,
     pub worktree_manager: Arc<worktree::WorktreeManager>,
     pub executor: Arc<tokio::sync::OnceCell<Arc<queue::TaskExecutor>>>,
+    /// Per-project guard serializing `apply_state_migration` and
+    /// `set_state_location` for the same project. See its doc comment.
+    pub state_location_locks: Arc<commands::state_location::StateLocationLocks>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -94,6 +97,7 @@ pub fn run() {
         )),
         paths,
         executor: Arc::new(tokio::sync::OnceCell::new()),
+        state_location_locks: Arc::new(commands::state_location::StateLocationLocks::new()),
     };
 
     // Repositories load FIRST, then projects (which reference repository_id),

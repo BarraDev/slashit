@@ -7,12 +7,50 @@
 //! — see [`crate::config::paths`] for the classification.
 
 use crate::config::migration::{ConflictPolicy, MigrationPlan, MigrationReport, StateMigrator};
-use crate::config::paths::{ProjectKey, ResolvedLocation, StateLocation};
-use crate::domain::Project;
+use crate::config::paths::{AppPaths, ProjectKey, ResolvedLocation, StateLocation};
+use crate::config::Storage;
+use crate::domain::{Project, Repository};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
+
+/// Serializes `apply_state_migration` and `set_state_location` per project.
+///
+/// Keyed by project id, not by migration destination — the destination-keyed
+/// filesystem lock inside [`StateMigrator`] only ever protects one direction
+/// of one move; it does nothing to stop `set_state_location` (which touches
+/// no files) from racing a concurrent migration for the same project. Every
+/// entry point in this module that reads-then-writes a project's state
+/// location acquires this guard first, so the two commands can never
+/// interleave their read-decide-write sequence for one project.
+///
+/// Entries are never evicted: one idle `Arc<Mutex<()>>` per project that has
+/// ever changed its state location is a handful of bytes, bounded by the
+/// number of projects that exist, and not worth cleanup complexity.
+#[derive(Default)]
+pub struct StateLocationLocks {
+    per_project: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+}
+
+impl StateLocationLocks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    async fn acquire(&self, project_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        let handle = {
+            let mut per_project = self.per_project.lock().await;
+            per_project
+                .entry(project_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        handle.lock_owned().await
+    }
+}
 
 /// Everything the settings UI needs to describe a project's storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,15 +68,26 @@ pub struct StateLocationInfo {
     /// False when the project has no repository, so there is no path to key
     /// storage off and the choice cannot be offered.
     pub can_choose: bool,
+    /// RFC3339 timestamp of the project record this info was read from.
+    ///
+    /// Callers that later ask to change the location (in particular
+    /// `set_state_location`, which trusts its caller rather than inspecting
+    /// disk) pass this back as `known_updated_at` so a decision based on a
+    /// stale read can be rejected instead of silently overwriting a newer one.
+    pub updated_at: String,
 }
 
 /// Resolve the project and its repository root, or explain why we cannot.
-async fn project_root(
-    state: &tauri::State<'_, crate::AppState>,
+///
+/// Takes raw locks rather than `tauri::State` so it is reusable from the
+/// `*_committed` helpers below, which tests drive without a full `AppState`.
+async fn resolve_project_root(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    repositories: &RwLock<HashMap<Uuid, Repository>>,
     project_id: Uuid,
 ) -> Result<(Project, PathBuf), String> {
     let project = {
-        let projects = state.project.projects.read().await;
+        let projects = projects.read().await;
         projects
             .get(&project_id)
             .cloned()
@@ -50,7 +99,7 @@ async fn project_root(
         .ok_or_else(|| "This project has no repository, so it has no folder to store state in.".to_string())?;
 
     let root = {
-        let repositories = state.repository.repositories.read().await;
+        let repositories = repositories.read().await;
         repositories
             .get(&repository_id)
             .map(|r| PathBuf::from(&r.local_path))
@@ -58,6 +107,18 @@ async fn project_root(
     };
 
     Ok((project, root))
+}
+
+async fn project_root(
+    state: &tauri::State<'_, crate::AppState>,
+    project_id: Uuid,
+) -> Result<(Project, PathBuf), String> {
+    resolve_project_root(
+        &state.project.projects,
+        &state.repository.repositories,
+        project_id,
+    )
+    .await
 }
 
 fn info_for(
@@ -86,6 +147,7 @@ fn info_for(
             .display()
             .to_string(),
         can_choose: true,
+        updated_at: project.updated_at.to_rfc3339(),
     }
 }
 
@@ -115,6 +177,7 @@ pub async fn get_state_location(
                 external_dir: String::new(),
                 in_project_dir: String::new(),
                 can_choose: false,
+                updated_at: project.updated_at.to_rfc3339(),
             })
         }
     }
@@ -169,6 +232,73 @@ fn record_migrated_location(
     }
 }
 
+/// Bundles the resource handles [`apply_state_migration_committed`] and
+/// [`set_state_location_committed`] need, so passing them through stays under
+/// clippy's argument-count lint without smuggling anything through global
+/// state — mirrors `WorktreeCleanupCtx` in `commands::task`.
+struct StateLocationCtx<'a> {
+    locks: &'a StateLocationLocks,
+    projects: &'a RwLock<HashMap<Uuid, Project>>,
+    repositories: &'a RwLock<HashMap<Uuid, Repository>>,
+    paths: &'a AppPaths,
+    storage: &'a Storage,
+}
+
+/// Core of [`apply_state_migration`], taking raw locks/paths/storage so tests
+/// can drive it without a `tauri::State`.
+///
+/// The per-project guard is acquired before anything else, then the project's
+/// current location is re-read under it — so a transition already recorded by
+/// a concurrent call (`apply_state_migration` or `set_state_location`, for
+/// the same project) is never migrated from a source directory that is no
+/// longer current. The proposed map is persisted before it replaces the
+/// shared one, so a persistence failure never leaves memory believing a
+/// setting was saved that disk does not have.
+async fn apply_state_migration_committed(
+    ctx: StateLocationCtx<'_>,
+    id: Uuid,
+    target: StateLocation,
+    policy: Option<ConflictPolicy>,
+) -> Result<MigrationReport, String> {
+    let _guard = ctx.locks.acquire(id).await;
+
+    let (project, root) = resolve_project_root(ctx.projects, ctx.repositories, id).await?;
+
+    let key = ProjectKey::for_path(&root).key;
+    let from = ctx.paths.project_state_dir(&key, project.id, &root, project.state_location);
+    let to = ctx.paths.project_state_dir(&key, project.id, &root, target);
+
+    let report = StateMigrator::migrate(&from, &to, policy.unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+
+    {
+        let mut projects_w = ctx.projects.write().await;
+        let mut proposed = projects_w.clone();
+        record_migrated_location(&mut proposed, id, target, &to)?;
+
+        // The files have already moved, so a failure to record where they
+        // went must be reported rather than logged. Swallowing it would leave
+        // the project reading from the directory the data just left, and the
+        // user would open an empty board with nothing to explain it. Memory
+        // is left holding the pre-migration map — consistent with what disk
+        // still has — rather than a location the persisted config disagrees
+        // with.
+        crate::commands::project::try_persist_projects(ctx.storage, &proposed).map_err(|e| {
+            format!(
+                "State was moved to {} but the setting could not be saved: {e}. \
+                 The move is safely on disk; re-select the location in Settings to finish.",
+                to.display()
+            )
+        })?;
+
+        *projects_w = proposed;
+    }
+
+    // Saving config rebuilt the routing table, so subsequent task reads and
+    // writes already resolve to the new directory.
+    Ok(report)
+}
+
 /// Move the project's state and persist the new preference.
 ///
 /// The preference is written only after the move succeeds. Recording it first
@@ -181,38 +311,64 @@ pub async fn apply_state_migration(
     policy: Option<ConflictPolicy>,
 ) -> Result<MigrationReport, String> {
     let id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
-    let (project, root) = project_root(&state, id).await?;
+    apply_state_migration_committed(
+        StateLocationCtx {
+            locks: &state.state_location_locks,
+            projects: &state.project.projects,
+            repositories: &state.repository.repositories,
+            paths: &state.paths,
+            storage: &state.storage,
+        },
+        id,
+        target,
+        policy,
+    )
+    .await
+}
 
-    let key = ProjectKey::for_path(&root).key;
-    let from = state
-        .paths
-        .project_state_dir(&key, project.id, &root, project.state_location);
-    let to = state
-        .paths
-        .project_state_dir(&key, project.id, &root, target);
+/// Core of [`set_state_location`], taking raw locks/storage so tests can
+/// drive it without a `tauri::State`.
+///
+/// Shares [`StateLocationLocks`] with [`apply_state_migration_committed`] so
+/// the two can never interleave for one project, and rejects a request whose
+/// `known_updated_at` no longer matches the authoritative record — the
+/// caller observed the project before a newer decision (a migration or
+/// another `set_state_location`) was recorded, and applying it now would
+/// silently un-record that newer decision.
+async fn set_state_location_committed(
+    locks: &StateLocationLocks,
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    storage: &Storage,
+    id: Uuid,
+    location: StateLocation,
+    known_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), String> {
+    let _guard = locks.acquire(id).await;
 
-    let report = StateMigrator::migrate(&from, &to, policy.unwrap_or_default())
-        .map_err(|e| e.to_string())?;
+    let mut projects_w = projects.write().await;
+    let mut proposed = projects_w.clone();
+    let project = proposed
+        .get_mut(&id)
+        .ok_or_else(|| format!("Project {id} not found"))?;
 
-    {
-        let mut projects = state.project.projects.write().await;
-        record_migrated_location(&mut projects, id, target, &to)?;
-        // The files have already moved, so a failure to record where they went
-        // must be reported rather than logged. Swallowing it would leave the
-        // project reading from the directory the data just left, and the user
-        // would open an empty board with nothing to explain it.
-        crate::commands::project::try_persist_projects(&state.storage, &projects).map_err(|e| {
-            format!(
-                "State was moved to {} but the setting could not be saved: {e}. \
-                 Re-select the location in Settings to finish.",
-                to.display()
-            )
-        })?;
+    if let Some(expected) = known_updated_at {
+        if project.updated_at != expected {
+            return Err(
+                "This project's storage location changed since it was last loaded here. \
+                 Reload the storage settings and try again."
+                    .to_string(),
+            );
+        }
     }
 
-    // Saving config rebuilt the routing table, so subsequent task reads and
-    // writes already resolve to the new directory.
-    Ok(report)
+    project.state_location = location;
+    project.updated_at = chrono::Utc::now();
+
+    crate::commands::project::try_persist_projects(storage, &proposed)
+        .map_err(|e| format!("Failed to save the storage location: {e}"))?;
+
+    *projects_w = proposed;
+    Ok(())
 }
 
 /// Set the preference without moving anything.
@@ -220,23 +376,35 @@ pub async fn apply_state_migration(
 /// Offered separately because a user who has already moved their files by hand
 /// needs a way to tell SlashIt where they are, and forcing a migration through
 /// would then be wrong.
+///
+/// `known_updated_at` is the `updated_at` from the last [`StateLocationInfo`]
+/// the caller read (RFC3339); pass `None` to skip the staleness check.
 #[tauri::command]
 pub async fn set_state_location(
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     location: StateLocation,
+    known_updated_at: Option<String>,
 ) -> Result<StateLocationInfo, String> {
     let id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
 
-    {
-        let mut projects = state.project.projects.write().await;
-        let project = projects
-            .get_mut(&id)
-            .ok_or_else(|| format!("Project {id} not found"))?;
-        project.state_location = location;
-        project.updated_at = chrono::Utc::now();
-        crate::commands::project::persist_projects(&state.storage, &projects);
-    }
+    let known_updated_at = known_updated_at
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| format!("Invalid known_updated_at timestamp: {e}"))
+        })
+        .transpose()?;
+
+    set_state_location_committed(
+        &state.state_location_locks,
+        &state.project.projects,
+        &state.storage,
+        id,
+        location,
+        known_updated_at,
+    )
+    .await?;
 
     get_state_location(state, project_id).await
 }
@@ -324,5 +492,191 @@ mod tests {
             "a vanished project must never be reported as a successful move"
         );
         assert!(result.unwrap_err().contains("no longer exists"));
+    }
+
+    #[tokio::test]
+    async fn state_location_locks_serialize_the_same_project() {
+        let locks = StateLocationLocks::new();
+        let id = Uuid::new_v4();
+
+        let guard = locks.acquire(id).await;
+
+        let inner = {
+            let per_project = locks.per_project.lock().await;
+            per_project.get(&id).unwrap().clone()
+        };
+        assert!(
+            inner.try_lock().is_err(),
+            "a held per-project guard must block a concurrent holder for the same project"
+        );
+
+        drop(guard);
+        assert!(
+            inner.try_lock().is_ok(),
+            "the project's guard must release once the holder drops it"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_location_locks_do_not_serialize_different_projects() {
+        let locks = StateLocationLocks::new();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        let _guard_a = locks.acquire(a).await;
+
+        let guard_b = tokio::time::timeout(std::time::Duration::from_millis(500), locks.acquire(b)).await;
+        assert!(
+            guard_b.is_ok(),
+            "a different project must be acquirable without waiting on an unrelated project's guard"
+        );
+    }
+
+    fn test_repository(id: Uuid, local_path: &Path) -> Repository {
+        Repository {
+            id,
+            local_path: local_path.display().to_string(),
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn create_test_storage() -> (Storage, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+        let root = temp_dir.path();
+        std::fs::create_dir_all(root.join("config")).expect("Failed to create config dir");
+        std::fs::create_dir_all(root.join("data")).expect("Failed to create data dir");
+
+        let storage = Storage::with_paths(AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        ));
+
+        (storage, temp_dir)
+    }
+
+    /// Reproduces the exact race from the module docs: request A completes a
+    /// real migration and records the new location; request B, built from an
+    /// observation taken before A ran, must not be able to overwrite it.
+    #[tokio::test]
+    async fn a_stale_set_state_location_cannot_undo_a_completed_migration() {
+        let (storage, _storage_temp) = create_test_storage();
+        let repo_temp = tempfile::TempDir::new().expect("repo temp dir");
+        let repo_root = repo_temp.path().to_path_buf();
+
+        let project_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+
+        let mut project = test_project(project_id);
+        project.repository_id = Some(repository_id);
+        let original_updated_at = project.updated_at;
+
+        let projects = RwLock::new(HashMap::from([(project_id, project)]));
+        let repositories = RwLock::new(HashMap::from([(
+            repository_id,
+            test_repository(repository_id, &repo_root),
+        )]));
+        let locks = StateLocationLocks::new();
+        let paths = storage.paths();
+
+        // Seed the external state dir with a file, so the migration actually
+        // has data to move.
+        let key = ProjectKey::for_path(&repo_root).key;
+        let external_dir =
+            paths.project_state_dir(&key, project_id, &repo_root, StateLocation::External);
+        std::fs::create_dir_all(&external_dir).unwrap();
+        std::fs::write(external_dir.join("board.json"), b"{}").unwrap();
+
+        // A: a real migration to InProject.
+        apply_state_migration_committed(
+            StateLocationCtx {
+                locks: &locks,
+                projects: &projects,
+                repositories: &repositories,
+                paths,
+                storage: &storage,
+            },
+            project_id,
+            StateLocation::InProject,
+            None,
+        )
+        .await
+        .expect("migration should succeed");
+
+        assert_eq!(
+            projects.read().await.get(&project_id).unwrap().state_location,
+            StateLocation::InProject,
+            "the migration must be recorded"
+        );
+
+        // B: a stale `set_state_location`, built from the project's state
+        // *before* A ran.
+        let result = set_state_location_committed(
+            &locks,
+            &projects,
+            &storage,
+            project_id,
+            StateLocation::External,
+            Some(original_updated_at),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a request based on a stale observation must not overwrite a newer decision"
+        );
+        assert_eq!(
+            projects.read().await.get(&project_id).unwrap().state_location,
+            StateLocation::InProject,
+            "the winning transition's location must survive a stale overwrite attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_state_location_committed_succeeds_when_known_updated_at_matches() {
+        let (storage, _temp) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let project = test_project(project_id);
+        let current = project.updated_at;
+        let projects = RwLock::new(HashMap::from([(project_id, project)]));
+        let locks = StateLocationLocks::new();
+
+        set_state_location_committed(
+            &locks,
+            &projects,
+            &storage,
+            project_id,
+            StateLocation::InProject,
+            Some(current),
+        )
+        .await
+        .expect("a known_updated_at matching the authoritative record must be accepted");
+
+        assert_eq!(
+            projects.read().await.get(&project_id).unwrap().state_location,
+            StateLocation::InProject
+        );
+    }
+
+    #[tokio::test]
+    async fn set_state_location_committed_skips_the_staleness_check_when_not_provided() {
+        let (storage, _temp) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let projects = RwLock::new(HashMap::from([(project_id, test_project(project_id))]));
+        let locks = StateLocationLocks::new();
+
+        set_state_location_committed(
+            &locks, &projects, &storage, project_id, StateLocation::InProject, None,
+        )
+        .await
+        .expect("omitting known_updated_at must not be treated as stale");
+
+        assert_eq!(
+            projects.read().await.get(&project_id).unwrap().state_location,
+            StateLocation::InProject
+        );
     }
 }
