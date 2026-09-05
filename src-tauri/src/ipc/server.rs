@@ -103,6 +103,23 @@ pub struct IpcContext {
     pub paths: Arc<crate::config::paths::AppPaths>,
 }
 
+/// The current process's effective user id.
+///
+/// Shared by every ownership check that needs it, all of which are
+/// `#[cfg(unix)]` tests exercising permission-sensitive paths — hence the same
+/// gate here, or the function is dead code on every other build. No `libc`
+/// dependency in this crate; declaring the one symbol needed avoids pulling
+/// one in just for this.
+#[cfg(all(test, unix))]
+pub(crate) fn current_uid() -> u32 {
+    extern "C" {
+        #[link_name = "geteuid"]
+        fn libc_geteuid() -> u32;
+    }
+    // Safety: geteuid takes no arguments and always succeeds.
+    unsafe { libc_geteuid() }
+}
+
 /// What the transport established about one connection.
 ///
 /// Passed to the handlers rather than re-derived, so `Ping` can report which
