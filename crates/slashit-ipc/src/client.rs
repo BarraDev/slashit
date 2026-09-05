@@ -15,6 +15,15 @@ use crate::framing::{read_frame, write_json_frame, Frame};
 use crate::protocol::{IpcEnvelope, IpcRequest, IpcResponse, MAX_REQUEST_BYTES};
 use crate::transport;
 
+/// How long to wait for the instance to answer a request it has already
+/// accepted. Every current request handler is expected to return in well
+/// under a second — agent spawning happens on the queue executor's own
+/// background polling loop, decoupled from the request/response cycle, so a
+/// handler that runs long here is a bug, not routine slow work. This mirrors
+/// the server's own `REQUEST_TIMEOUT`, keeping both ends of the protocol
+/// symmetric.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Everything that can go wrong on the client side.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -22,6 +31,8 @@ pub enum ClientError {
     NotRunning(String),
     #[error("{0}")]
     Connect(String),
+    #[error("SlashIt accepted the connection on {0} but did not answer in time")]
+    NoResponse(Endpoint),
     #[error("SlashIt closed the connection without answering — it may have crashed")]
     EmptyResponse,
     #[error("SlashIt sent a response larger than the {MAX_REQUEST_BYTES} byte limit")]
@@ -96,7 +107,10 @@ pub async fn send(
     // newline. The response arrives on the read half, which stays open.
     writer.shutdown().await?;
 
-    match read_frame(reader, MAX_REQUEST_BYTES).await? {
+    let frame = tokio::time::timeout(RESPONSE_TIMEOUT, read_frame(reader, MAX_REQUEST_BYTES))
+        .await
+        .map_err(|_| ClientError::NoResponse(options.endpoint.clone()))??;
+    match frame {
         Frame::Line(line) => {
             serde_json::from_str(&line).map_err(|e| ClientError::Decode(e.to_string()))
         }
@@ -186,6 +200,13 @@ mod tests {
         );
     }
 
+    // `Endpoint::Unix` is OS-authenticated, so `send` reaches
+    // `transport::connect` unconditionally. On a non-Unix target that returns
+    // `ErrorKind::Unsupported`, which `describe_connect_failure` maps to
+    // `ClientError::Connect` rather than `NotRunning` — a real answer for that
+    // platform, just not the one this test expects for a genuinely-absent
+    // endpoint.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_missing_local_endpoint_reports_not_running() {
         let options = ClientOptions {

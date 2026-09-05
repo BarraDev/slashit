@@ -100,9 +100,10 @@ impl Credentials {
 
     /// Write credentials with owner-only permissions.
     ///
-    /// The temporary file is created inside the destination directory and
-    /// tightened *before* the rename, so the token never exists at its final
-    /// path with looser permissions.
+    /// The temporary file is created inside the destination directory, at
+    /// `0600` from the moment it is created, and tightened again *before* the
+    /// rename in case it already existed — so the token never exists at its
+    /// final path, or at the temporary path, with looser permissions.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -111,7 +112,7 @@ impl Credentials {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, text)?;
+        write_owner_only(&tmp, text.as_bytes())?;
         restrict_to_owner(&tmp)?;
         std::fs::rename(&tmp, path)
     }
@@ -136,6 +137,30 @@ impl Credentials {
 fn restrict_to_owner(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Create (or truncate) `path` and write `contents`, `0600` from the instant
+/// the file is created.
+///
+/// On Unix, setting the mode at `open()` time — rather than `write` then
+/// `chmod` after — means the file never exists on disk at a looser,
+/// umask-controlled mode, not even for the instant between the two calls.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, contents: &[u8]) -> io::Result<()> {
+    std::fs::write(path, contents)
 }
 
 #[cfg(not(unix))]

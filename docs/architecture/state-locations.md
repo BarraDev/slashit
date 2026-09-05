@@ -171,6 +171,14 @@ branch and any uncommitted work in it.
 | data | `~/.local/share/slashit-app` | same as config | `%APPDATA%\barradev\slashit-app\data` |
 | runtime | `$XDG_RUNTIME_DIR/slashit-app` | `<tmp>/slashit-<uid>` | `<tmp>\slashit-<username>` |
 
+The `$XDG_RUNTIME_DIR` check itself is not Linux-only — the resolver checks it
+on every platform and only falls back to the qualified temp path when it is
+unset or empty. The table lists the fallback for macOS and Windows because
+that is what an unmodified install actually has; if something in your
+environment sets `XDG_RUNTIME_DIR` there too (a Nix shell, a container
+toolchain, dotfiles sourced from a Linux setup), the runtime directory and PID
+file follow that instead.
+
 Config, data and cache come from the `directories` crate. Runtime does not:
 `AppPaths` defers to `slashit_ipc::endpoint::runtime_dir()`.
 

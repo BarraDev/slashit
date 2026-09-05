@@ -59,13 +59,21 @@ impl NamedPipeListenerTransport {
     }
 
     pub async fn accept(&mut self) -> io::Result<Accepted> {
-        self.pending.connect().await?;
-
-        // Hand the connected instance to the caller and put a fresh one in
-        // place before returning, so the next client is never refused.
+        // Create the replacement *before* connecting `self.pending`, not
+        // after. If replacement creation failed after a successful connect,
+        // `self.pending` would be left connected but never handed to a
+        // caller; the next `accept()`'s own `connect()` call on that same
+        // instance then returns `ERROR_PIPE_CONNECTED` immediately without
+        // ever delivering that client, and repeated failures here can run out
+        // the accept loop's retry budget. Creating first means a failure
+        // leaves `self.pending` exactly as it was, a clean state to retry
+        // `accept()` again — and the next client is still never refused.
         let next = ServerOptions::new()
             .reject_remote_clients(true)
             .create(&self.name)?;
+
+        self.pending.connect().await?;
+
         let connected = std::mem::replace(&mut self.pending, next);
 
         Ok(Accepted {
