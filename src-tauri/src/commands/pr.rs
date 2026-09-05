@@ -560,14 +560,7 @@ pub async fn analyze_pr_comments(
     // `comment_id` matches — the fix already landed on disk and the reply is
     // already on the PR, so the freshly-triaged item should reflect that.
     if let Some(prev) = prior_plan.as_ref() {
-        for item in items.iter_mut() {
-            let Some(cid) = item.comment_id else { continue; };
-            let Some(prev_item) = prev.items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
-            if prev_item.fix_done { item.fix_done = true; }
-            if prev_item.reply_posted { item.reply_posted = true; }
-            if item.last_error.is_none() { item.last_error = prev_item.last_error.clone(); }
-            if item.last_agent_summary.is_none() { item.last_agent_summary = prev_item.last_agent_summary.clone(); }
-        }
+        carry_forward_reanalysis_lifecycle(&mut items, &prev.items);
     }
 
     let plan = PrReviewPlan {
@@ -581,6 +574,25 @@ pub async fn analyze_pr_comments(
     };
     save_review_plan_on_task(&state, task_uuid, plan.clone()).await;
     Ok(plan)
+}
+
+/// Merge lifecycle state from a prior plan's items into freshly re-parsed
+/// items sharing the same `comment_id`, in place. Extracted from
+/// `analyze_pr_comments` for unit testing: a fresh re-parse always starts
+/// `pr_reply_text`/`reply_comment_id`/etc. as `None`/`false`, so anything
+/// already recorded against a matching prior item must be carried forward or
+/// it is silently lost on re-analyze.
+fn carry_forward_reanalysis_lifecycle(items: &mut [PrReviewItem], prior_items: &[PrReviewItem]) {
+    for item in items.iter_mut() {
+        let Some(cid) = item.comment_id else { continue; };
+        let Some(prev_item) = prior_items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
+        if prev_item.fix_done { item.fix_done = true; }
+        if prev_item.reply_posted { item.reply_posted = true; }
+        if item.last_error.is_none() { item.last_error = prev_item.last_error.clone(); }
+        if item.last_agent_summary.is_none() { item.last_agent_summary = prev_item.last_agent_summary.clone(); }
+        if item.pr_reply_text.is_none() { item.pr_reply_text = prev_item.pr_reply_text.clone(); }
+        if item.reply_comment_id.is_none() { item.reply_comment_id = prev_item.reply_comment_id; }
+    }
 }
 
 /// Re-discuss any items currently flagged Question that have a non-empty
@@ -1020,6 +1032,7 @@ pub async fn address_pr_review_inner(
         failed_ids,
         fix_errors,
         push_error,
+        auto_reply: options.auto_reply,
     };
 
     progress(PrReviewProgress {
@@ -2698,6 +2711,100 @@ mod tests {
         ]}"#;
         let items = parse_review_items(raw, &comments);
         assert_eq!(items[0].user_note, "");
+    }
+
+    // ──────────────────────────────────────────────
+    // carry_forward_reanalysis_lifecycle: re-analyze must not drop reply
+    // metadata for items matched by comment_id against the prior plan.
+    // ──────────────────────────────────────────────
+
+    /// A freshly re-parsed item as `parse_review_items` would produce it:
+    /// only `comment_id`/`summary`/`decision` are populated by the agent,
+    /// every lifecycle field starts at its zero value.
+    fn fresh_item(cid: u64) -> PrReviewItem {
+        PrReviewItem {
+            comment_id: Some(cid),
+            summary: "re-parsed summary".to_string(),
+            decision: PrReviewDecision::Fix,
+            reasoning: String::new(),
+            proposed_change: String::new(),
+            approved: true,
+            user_note: String::new(),
+            fix_done: false,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
+        }
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_preserves_reply_text_and_id() {
+        // Previous plan: item was fixed and replied to, with the reply text
+        // and GitHub comment id recorded.
+        let prev_item = PrReviewItem {
+            fix_done: true,
+            reply_posted: true,
+            pr_reply_text: Some("Thanks, fixed in the latest commit.".to_string()),
+            reply_comment_id: Some(9999),
+            last_agent_summary: Some("agent report".to_string()),
+            last_error: None,
+            ..fresh_item(42)
+        };
+        let mut items = vec![fresh_item(42)];
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item]);
+
+        assert!(items[0].fix_done, "fix_done should carry forward");
+        assert!(items[0].reply_posted, "reply_posted should carry forward");
+        assert_eq!(
+            items[0].pr_reply_text.as_deref(),
+            Some("Thanks, fixed in the latest commit."),
+            "pr_reply_text must survive re-analysis so the already-synced skip check \
+             (reply_posted && pr_reply_text.is_some()) doesn't misfire and overwrite \
+             an existing GitHub reply",
+        );
+        assert_eq!(
+            items[0].reply_comment_id,
+            Some(9999),
+            "reply_comment_id must survive re-analysis so Sync can PATCH instead of duplicate",
+        );
+        assert_eq!(items[0].last_agent_summary.as_deref(), Some("agent report"));
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_does_not_overwrite_freshly_parsed_values() {
+        // If the fresh re-parse already carries its own reply text/id (should
+        // never happen in practice — the agent doesn't fill these — but the
+        // merge must still be non-destructive), the prior plan's values must
+        // not clobber them.
+        let prev_item = PrReviewItem {
+            pr_reply_text: Some("stale text".to_string()),
+            reply_comment_id: Some(1),
+            fix_done: true,
+            reply_posted: true,
+            ..fresh_item(7)
+        };
+        let mut fresh = fresh_item(7);
+        fresh.pr_reply_text = Some("fresh text".to_string());
+        fresh.reply_comment_id = Some(2);
+        let mut items = vec![fresh];
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item]);
+
+        assert_eq!(items[0].pr_reply_text.as_deref(), Some("fresh text"));
+        assert_eq!(items[0].reply_comment_id, Some(2));
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_ignores_unmatched_comment_ids() {
+        let prev_item = PrReviewItem { pr_reply_text: Some("for a different comment".to_string()), ..fresh_item(1) };
+        let mut items = vec![fresh_item(2)];
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item]);
+
+        assert_eq!(items[0].pr_reply_text, None, "unrelated comment_id must not merge");
     }
 
     // ──────────────────────────────────────────────

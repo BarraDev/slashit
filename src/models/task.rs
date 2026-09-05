@@ -137,7 +137,7 @@ impl PrReviewPlan {
                 if !item.fix_done {
                     item.fix_done = true;
                 }
-                if !item.reply_posted && !failed_reply_ids.contains(&cid) {
+                if last.auto_reply && !item.reply_posted && !failed_reply_ids.contains(&cid) {
                     item.reply_posted = true;
                 }
             }
@@ -227,6 +227,12 @@ pub struct PrReviewApplyResult {
     pub fix_errors: Vec<String>,
     #[serde(default)]
     pub push_error: Option<String>,
+    /// Whether this apply ran with `auto_reply=true`. Mirrors the backend
+    /// field so `backfill_lifecycle_from_last_apply` can tell "reply
+    /// attempted and succeeded" apart from "reply intentionally never
+    /// attempted".
+    #[serde(default)]
+    pub auto_reply: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

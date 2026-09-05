@@ -172,6 +172,7 @@ impl TaskExecutor {
                             let state = json.get("state").and_then(|s| s.as_str()).unwrap_or("");
 
                             // Update the ExternalRef state
+                            let mut pending_worktree_removal: Option<(String, String)> = None;
                             {
                                 let mut tasks_w = self.tasks.write().await;
                                 if let Some(t) = tasks_w.get_mut(&task_id) {
@@ -191,16 +192,36 @@ impl TaskExecutor {
                                             t.updated_at = chrono::Utc::now();
                                             if let Some(wt_path) = t.worktree_path.take() {
                                                 let branch = t.branch_name.clone().unwrap_or_default();
-                                                let wt_mgr = self.worktree_manager.clone();
-                                                tokio::spawn(async move {
-                                                    let _ = wt_mgr.remove(&wt_path, &branch).await;
-                                                });
+                                                pending_worktree_removal = Some((wt_path, branch));
                                             }
                                         }
                                         "CLOSED" => {
                                             t.error_message = Some("PR was closed without merge".to_string());
                                         }
                                         _ => {} // OPEN — update state only
+                                    }
+                                }
+                            }
+
+                            // Resolved after `tasks_w` is dropped above, since
+                            // `resolve_working_dir_for_task` takes its own
+                            // read lock on `self.tasks`.
+                            if let Some((wt_path, branch)) = pending_worktree_removal {
+                                match Self::resolve_working_dir_for_task(
+                                    &self.tasks, &self.projects, &self.repositories, task_id,
+                                ).await {
+                                    Ok(repo_path) => {
+                                        let wt_mgr = self.worktree_manager.clone();
+                                        tokio::spawn(async move {
+                                            let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                                            task_id: task_id.to_string(),
+                                            level: LogLevel::Warn,
+                                            message: format!("Cannot resolve repo path to clean up worktree: {}", e),
+                                        });
                                     }
                                 }
                             }
@@ -391,7 +412,7 @@ impl TaskExecutor {
                     } else {
                         Some(t.model.clone())
                     };
-                    (build_task_prompt(t, None), model)
+                    (build_task_prompt(t, Some(working_dir.as_str())), model)
                 },
                 None => return,
             }

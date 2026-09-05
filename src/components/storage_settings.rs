@@ -274,7 +274,7 @@ pub fn StorageSettings(project_id: String) -> impl IntoView {
                                                 on:click=move |_| apply_source(target, Some(ConflictPolicy::PreferSource))
                                                 class="px-4 py-2 rounded-lg bg-blue-500 text-white hover:bg-blue-400 disabled:opacity-50"
                                             >
-                                                "Keep this project's copy"
+                                                "Keep the source copy"
                                             </button>
                                         </>
                                     }.into_any()

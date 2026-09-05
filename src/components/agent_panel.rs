@@ -5,21 +5,21 @@ use crate::services::{start_agent, stop_agent, get_agent_status};
 use crate::components::icons::*;
 
 #[component]
-pub fn AgentPanel(#[prop(into)] workspace_id: String) -> impl IntoView {
+pub fn AgentPanel(#[prop(into)] worktree_id: String) -> impl IntoView {
     let (execution, set_execution) = signal(None::<AgentExecution>);
     let (status, set_status) = signal(None::<AgentStatus>);
     let (logs, set_logs) = signal(Vec::<String>::new());
 
-    let workspace_id_clone = workspace_id.clone();
+    let worktree_id_clone = worktree_id.clone();
     let is_running = move || status.get().map(|s| s == AgentStatus::Running).unwrap_or(false);
 
     let start = move || {
-        let workspace_id = workspace_id_clone.clone();
+        let worktree_id = worktree_id_clone.clone();
         let set_execution = set_execution;
         let set_status = set_status;
 
         spawn_local(async move {
-            match start_agent(workspace_id, None).await {
+            match start_agent(worktree_id, None).await {
                 Ok(exec) => {
                     set_status.set(Some(exec.status.clone()));
                     set_execution.set(Some(exec));
@@ -76,7 +76,7 @@ pub fn AgentPanel(#[prop(into)] workspace_id: String) -> impl IntoView {
                         ) />
                         <div>
                             <h3 class="font-semibold text-white/90">"Agent Terminal"</h3>
-                            <p class="text-xs text-white/40">{workspace_id.clone()}</p>
+                            <p class="text-xs text-white/40">{worktree_id.clone()}</p>
                         </div>
                     </div>
 

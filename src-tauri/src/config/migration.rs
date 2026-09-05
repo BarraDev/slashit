@@ -51,11 +51,14 @@
 //! project. Since we copy anyway, the only rename is staging → destination
 //! *within one parent directory*, which is always the same filesystem.
 
-use super::paths::{is_valid_in_project_dir, STATE_MARKER};
+use super::paths::{is_valid_in_project_dir, sanitize_component, STATE_MARKER};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What to do when source and destination both hold data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -110,7 +113,7 @@ pub enum MigrationOutcome {
 }
 
 /// What [`StateMigrator::recover`] did about one leftover `.slashit-migrating-*`
-/// pid it found beside a destination.
+/// transaction it found beside a destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryOutcome {
     /// An incomplete scratch copy with no retired counterpart was deleted;
@@ -128,9 +131,9 @@ pub enum RecoveryOutcome {
     /// The destination was missing entirely and no scratch copy remained to
     /// re-install; the retired copy was restored as the destination.
     RestoredFromRetired,
-    /// Both a scratch and a retired copy exist for a pid whose destination is
-    /// also already present. Left untouched — completing or discarding
-    /// either would be a guess, not a recovery.
+    /// Both a scratch and a retired copy exist for a transaction whose
+    /// destination is also already present. Left untouched — completing or
+    /// discarding either would be a guess, not a recovery.
     LeftForManualReview,
 }
 
@@ -226,6 +229,14 @@ impl Drop for MigrationLock {
 }
 
 /// Suffix used for staging directories. Recognised by [`StateMigrator::recover`].
+///
+/// Followed by a destination tag and a transaction id (see
+/// [`destination_tag`] and [`next_transaction_id`]): `{STAGING_PREFIX}{tag}-{txn}`
+/// for a scratch copy, `{STAGING_PREFIX}old-{tag}-{txn}` for a retired one. The
+/// tag scopes both forms to one exact destination, so two destinations that
+/// happen to share a parent directory (siblings under the same project key,
+/// for instance) can never collide, and recovering one destination can never
+/// touch state left behind by a migration to a different one.
 const STAGING_PREFIX: &str = ".slashit-migrating-";
 const LOCK_SUFFIX: &str = ".slashit-migrate.lock";
 
@@ -370,8 +381,17 @@ impl StateMigrator {
         fs::create_dir_all(parent)
             .map_err(|e| MigrationError::io(format!("creating {}", parent.display()), e))?;
 
-        let staging = parent.join(format!("{STAGING_PREFIX}{}", std::process::id()));
-        // A staging dir from a previous crashed run is always disposable.
+        // Scoped to this exact destination and this exact call, so a second
+        // migration running concurrently for a sibling destination under the
+        // same parent — or a retry of this same destination after a crash —
+        // can never collide on the same staging/retired names.
+        let dest_tag = destination_tag(to);
+        let txn = next_transaction_id();
+
+        let staging = parent.join(format!("{STAGING_PREFIX}{dest_tag}-{txn}"));
+        // A staging dir from a previous crashed run is always disposable —
+        // recovery above already handled anything worth keeping for this
+        // destination, before this fresh transaction id even existed.
         if staging.exists() {
             let _ = fs::remove_dir_all(&staging);
         }
@@ -402,7 +422,7 @@ impl StateMigrator {
                 let _ = fs::remove_dir_all(&staging);
                 return Err(e);
             }
-            let retired = parent.join(format!("{STAGING_PREFIX}old-{}", std::process::id()));
+            let retired = parent.join(format!("{STAGING_PREFIX}old-{dest_tag}-{txn}"));
             let _ = fs::remove_dir_all(&retired);
             fs::rename(to, &retired)
                 .map_err(|e| MigrationError::io(format!("retiring {}", to.display()), e))?;
@@ -457,13 +477,18 @@ impl StateMigrator {
     /// method so it can be run proactively (for example, once at startup for
     /// every known destination) without waiting for a retry.
     ///
-    /// Every leftover carries a pid: a scratch copy at
-    /// `{STAGING_PREFIX}{pid}`, and — only if the crash happened after the
-    /// destination was retired but before staging replaced it — a retired
-    /// copy of the pre-migration destination at `{STAGING_PREFIX}old-{pid}`.
-    /// Those two are paired up by pid rather than treated as interchangeable
-    /// disposable junk, because the retired copy is the *only* surviving
-    /// copy of destination-only data during that narrow window:
+    /// Only leftovers tagged for this exact `to` are ever considered (see
+    /// [`destination_tag`]) — a sibling destination sharing the same parent
+    /// directory has its own tag, so its leftovers are never touched here.
+    /// Within that scope, every leftover also carries a transaction id (see
+    /// [`next_transaction_id`]): a scratch copy at
+    /// `{STAGING_PREFIX}{tag}-{txn}`, and — only if the crash happened after
+    /// the destination was retired but before staging replaced it — a retired
+    /// copy of the pre-migration destination at
+    /// `{STAGING_PREFIX}old-{tag}-{txn}`. Those two are paired up by
+    /// transaction id rather than treated as interchangeable disposable junk,
+    /// because the retired copy is the *only* surviving copy of
+    /// destination-only data during that narrow window:
     ///
     /// - scratch only: the swap never started; the scratch copy is pure
     ///   working state and is deleted.
@@ -487,15 +512,21 @@ impl StateMigrator {
             return Vec::new();
         };
 
-        let old_prefix = format!("{STAGING_PREFIX}old-");
+        // Scoped to this exact destination: a sibling destination sharing
+        // `parent` has its own, different tag, so its leftovers never match
+        // either prefix below and are left completely untouched — recovering
+        // one destination can never act on state stranded by another.
+        let tag = destination_tag(to);
+        let old_prefix = format!("{STAGING_PREFIX}old-{tag}-");
+        let scratch_prefix = format!("{STAGING_PREFIX}{tag}-");
         let mut scratch = std::collections::BTreeMap::new();
         let mut retired = std::collections::BTreeMap::new();
         for entry in dir.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(pid) = name.strip_prefix(&old_prefix) {
-                retired.insert(pid.to_string(), entry.path());
-            } else if let Some(pid) = name.strip_prefix(STAGING_PREFIX) {
-                scratch.insert(pid.to_string(), entry.path());
+            if let Some(txn) = name.strip_prefix(&old_prefix) {
+                retired.insert(txn.to_string(), entry.path());
+            } else if let Some(txn) = name.strip_prefix(&scratch_prefix) {
+                scratch.insert(txn.to_string(), entry.path());
             }
         }
 
@@ -512,12 +543,12 @@ impl StateMigrator {
             let _ = fs::remove_file(&lock);
         }
 
-        let mut pids: Vec<String> = scratch.keys().chain(retired.keys()).cloned().collect();
-        pids.sort();
-        pids.dedup();
+        let mut txns: Vec<String> = scratch.keys().chain(retired.keys()).cloned().collect();
+        txns.sort();
+        txns.dedup();
 
-        pids.into_iter()
-            .map(|pid| resolve_one(to, scratch.get(&pid), retired.get(&pid)))
+        txns.into_iter()
+            .map(|txn| resolve_one(to, scratch.get(&txn), retired.get(&txn)))
             .collect()
     }
 
@@ -542,6 +573,48 @@ fn lock_path_for(to: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "state".into());
     parent.join(format!("{name}{LOCK_SUFFIX}"))
+}
+
+/// Discriminator for `to`'s staging/retired directory names, scoping them to
+/// this exact destination among any siblings sharing its parent.
+///
+/// `to.file_name()` is already unique among those siblings — no two distinct
+/// paths in one parent can share a name — so using it directly would already
+/// prevent cross-destination collisions. But sanitising it for filesystem
+/// safety can only ever *introduce* a collision between two different names
+/// that sanitise to the same string, never remove one, so — exactly like
+/// [`super::paths::worktree_dir_name`] does for branch names — a short hash of
+/// the original is appended whenever sanitising actually changed it.
+fn destination_tag(to: &Path) -> String {
+    let name = to
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "dest".to_string());
+    let sanitized = sanitize_component(&name, "dest");
+    if sanitized == name {
+        return sanitized;
+    }
+    let digest = Sha256::digest(name.as_bytes());
+    format!("{sanitized}-{}", hex::encode(&digest[..3]))
+}
+
+/// A discriminator for one [`StateMigrator::migrate`] call, unique enough that
+/// two calls racing for the same destination's staging slot never collide.
+///
+/// Deliberately not just `std::process::id()`: two migrations to *different*
+/// destinations can run concurrently in the same process (and therefore share
+/// a pid), and a pid can in principle be reused across process restarts. The
+/// nanosecond timestamp and an atomic counter are the actual uniqueness
+/// guarantees; the pid is included only to make a leftover directory easier to
+/// trace back to the process that created it.
+fn next_transaction_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos:x}-{n}", std::process::id())
 }
 
 fn ensure_state_dir(dir: &Path) -> Result<()> {
@@ -602,7 +675,7 @@ fn archive(dir: &Path, warnings: &mut Vec<String>) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Decide and act on the fate of one pid's leftovers, per
+/// Decide and act on the fate of one transaction's leftovers, per
 /// [`StateMigrator::recover`]'s documented cases.
 fn resolve_one(to: &Path, scratch: Option<&PathBuf>, retired: Option<&PathBuf>) -> RecoveryOutcome {
     match (scratch, retired) {
@@ -630,7 +703,7 @@ fn resolve_one(to: &Path, scratch: Option<&PathBuf>, retired: Option<&PathBuf>) 
                 RecoveryOutcome::LeftForManualReview
             }
         }
-        (None, None) => unreachable!("resolve_one called for a pid with no leftovers"),
+        (None, None) => unreachable!("resolve_one called for a transaction with no leftovers"),
     }
 }
 
@@ -853,6 +926,22 @@ mod tests {
         write(&dir.join("roadmap.toml"), "features = []\n");
     }
 
+    /// Build a scratch/retired directory name for `to`, the way
+    /// [`StateMigrator::migrate`] and [`StateMigrator::recover`] do, so tests
+    /// can plant leftovers under a fake, easy-to-read transaction id instead
+    /// of duplicating the real (pid + nanosecond) generator.
+    fn scratch_dir_for(to: &Path, txn: &str) -> PathBuf {
+        to.parent()
+            .unwrap()
+            .join(format!("{STAGING_PREFIX}{}-{txn}", destination_tag(to)))
+    }
+
+    fn retired_dir_for(to: &Path, txn: &str) -> PathBuf {
+        to.parent()
+            .unwrap()
+            .join(format!("{STAGING_PREFIX}old-{}-{txn}", destination_tag(to)))
+    }
+
     #[test]
     fn migrates_and_removes_source() {
         let tmp = TempDir::new().unwrap();
@@ -1028,7 +1117,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let parent = tmp.path();
         let to = parent.join("state");
-        let junk = parent.join(format!("{STAGING_PREFIX}4242"));
+        let junk = scratch_dir_for(&to, "4242");
         fs::create_dir_all(junk.join("tasks")).unwrap();
         fs::write(junk.join("tasks/x.toml"), "x").unwrap();
         let keep = parent.join("real-state");
@@ -1048,7 +1137,7 @@ mod tests {
         let from = tmp.path().join("from");
         let to = tmp.path().join("dest/state");
         seed(&from);
-        let staging = to.parent().unwrap().join(format!("{STAGING_PREFIX}999"));
+        let staging = scratch_dir_for(&to, "999");
         copy_tree(&from, &staging).unwrap();
 
         assert!(from.join("tasks/a.toml").is_file());
@@ -1071,12 +1160,9 @@ mod tests {
         let to = tmp.path().join("dest/state");
         fs::create_dir_all(to.parent().unwrap()).unwrap();
 
-        let scratch = to.parent().unwrap().join(format!("{STAGING_PREFIX}777"));
+        let scratch = scratch_dir_for(&to, "777");
         write(&scratch.join("roadmap.toml"), "new\n");
-        let retired = to
-            .parent()
-            .unwrap()
-            .join(format!("{STAGING_PREFIX}old-777"));
+        let retired = retired_dir_for(&to, "777");
         write(&retired.join("roadmap.toml"), "old\n");
 
         let outcomes = StateMigrator::recover(&to);
@@ -1107,12 +1193,9 @@ mod tests {
         seed(&from);
 
         fs::create_dir_all(to.parent().unwrap()).unwrap();
-        let scratch = to.parent().unwrap().join(format!("{STAGING_PREFIX}9001"));
+        let scratch = scratch_dir_for(&to, "9001");
         write(&scratch.join("recovered.toml"), "from the interrupted swap\n");
-        let retired = to
-            .parent()
-            .unwrap()
-            .join(format!("{STAGING_PREFIX}old-9001"));
+        let retired = retired_dir_for(&to, "9001");
         fs::create_dir_all(&retired).unwrap();
 
         assert!(!to.exists(), "destination is missing, as after the crash");
@@ -1142,15 +1225,93 @@ mod tests {
     }
 
     #[test]
+    fn two_destinations_sharing_a_parent_get_independent_staging_names() {
+        // Two sibling projects under one project key, migrating at the same
+        // time (same process, so the same pid) must never compute the same
+        // staging directory name for each other.
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("data/projects/repo-abc12345");
+        let to_a = parent.join("11111111-1111-1111-1111-111111111111");
+        let to_b = parent.join("22222222-2222-2222-2222-222222222222");
+        let from_a = tmp.path().join("from-a");
+        let from_b = tmp.path().join("from-b");
+        seed(&from_a);
+        seed(&from_b);
+
+        let report_a = StateMigrator::migrate(&from_a, &to_a, ConflictPolicy::Abort).unwrap();
+        let report_b = StateMigrator::migrate(&from_b, &to_b, ConflictPolicy::Abort).unwrap();
+
+        assert!(matches!(report_a.outcome, MigrationOutcome::Migrated { .. }));
+        assert!(matches!(report_b.outcome, MigrationOutcome::Migrated { .. }));
+        assert!(to_a.join("tasks/a.toml").is_file());
+        assert!(to_b.join("tasks/a.toml").is_file());
+        assert_ne!(
+            destination_tag(&to_a),
+            destination_tag(&to_b),
+            "distinct destinations must never share a tag"
+        );
+
+        // Nothing left behind for either destination once both succeed.
+        let leftovers: Vec<_> = fs::read_dir(&parent)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(STAGING_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "no scratch or retired dirs should survive success");
+    }
+
+    #[test]
+    fn recovery_for_one_destination_ignores_a_stranded_swap_belonging_to_a_sibling() {
+        // Destination B has a fully-stranded swap (scratch + retired, B
+        // itself missing) sitting right beside destination A, which shares
+        // the same parent directory. Recovering A must not touch, complete,
+        // or otherwise notice B's leftovers.
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("data/projects/repo-abc12345");
+        fs::create_dir_all(&parent).unwrap();
+        let to_a = parent.join("aaaaaaaa-0000-0000-0000-000000000000");
+        let to_b = parent.join("bbbbbbbb-0000-0000-0000-000000000000");
+
+        write(&to_a.join("roadmap.toml"), "a is already installed\n");
+
+        let b_scratch = scratch_dir_for(&to_b, "42");
+        write(&b_scratch.join("roadmap.toml"), "b candidate\n");
+        let b_retired = retired_dir_for(&to_b, "42");
+        fs::create_dir_all(&b_retired).unwrap();
+        assert!(!to_b.exists(), "b's destination is missing, as after a crash");
+
+        let outcomes = StateMigrator::recover(&to_a);
+
+        assert!(
+            outcomes.is_empty(),
+            "recovering a's destination must find nothing of its own to resolve"
+        );
+        assert!(b_scratch.exists(), "b's stranded scratch must survive untouched");
+        assert!(b_retired.exists(), "b's stranded retired copy must survive untouched");
+        assert!(!to_b.exists(), "b's destination must not be silently installed by a's recovery");
+        assert_eq!(
+            fs::read_to_string(to_a.join("roadmap.toml")).unwrap(),
+            "a is already installed\n",
+            "a's own state must be untouched"
+        );
+
+        // Recovering B afterward still works normally — this destination's
+        // own recovery path isn't broken by A's parent-sharing presence.
+        let b_outcomes = StateMigrator::recover(&to_b);
+        assert_eq!(b_outcomes, vec![RecoveryOutcome::CompletedSwap]);
+        assert_eq!(
+            fs::read_to_string(to_b.join("roadmap.toml")).unwrap(),
+            "b candidate\n"
+        );
+    }
+
+    #[test]
     fn recovery_removes_a_stale_retired_copy_once_the_swap_already_succeeded() {
         let tmp = TempDir::new().unwrap();
         let to = tmp.path().join("dest/state");
         write(&to.join("roadmap.toml"), "installed\n");
 
-        let retired = to
-            .parent()
-            .unwrap()
-            .join(format!("{STAGING_PREFIX}old-555"));
+        let retired = retired_dir_for(&to, "555");
         write(&retired.join("roadmap.toml"), "stale\n");
 
         let outcomes = StateMigrator::recover(&to);
@@ -1169,10 +1330,7 @@ mod tests {
         // deleted.
         let tmp = TempDir::new().unwrap();
         let to = tmp.path().join("dest/state");
-        let retired = tmp
-            .path()
-            .join("dest")
-            .join(format!("{STAGING_PREFIX}old-321"));
+        let retired = retired_dir_for(&to, "321");
         write(&retired.join("roadmap.toml"), "only copy left\n");
 
         let outcomes = StateMigrator::recover(&to);
@@ -1190,12 +1348,9 @@ mod tests {
         let to = tmp.path().join("dest/state");
         write(&to.join("roadmap.toml"), "already here\n");
 
-        let scratch = to.parent().unwrap().join(format!("{STAGING_PREFIX}111"));
+        let scratch = scratch_dir_for(&to, "111");
         write(&scratch.join("roadmap.toml"), "candidate\n");
-        let retired = to
-            .parent()
-            .unwrap()
-            .join(format!("{STAGING_PREFIX}old-111"));
+        let retired = retired_dir_for(&to, "111");
         write(&retired.join("roadmap.toml"), "candidate-old\n");
 
         let outcomes = StateMigrator::recover(&to);

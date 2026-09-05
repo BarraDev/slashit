@@ -351,18 +351,33 @@ impl Storage {
     }
 }
 
+/// Per-process, monotonically increasing counter used to make temp file names
+/// for atomic writes unique across concurrent callers.
+static ATOMIC_WRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A sibling of `path` with a name no other in-flight atomic write can be
+/// using: the process id rules out collisions across processes, and the
+/// counter rules them out between concurrent writers inside this one. Kept in
+/// the same directory as `path` so the final rename stays on one filesystem.
+pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    let counter = ATOMIC_WRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_file_name(format!("{file_name}.{}-{counter}.tmp", std::process::id()))
+}
+
 /// Write a file atomically with owner-only permissions.
 ///
-/// The temp file is created in the destination directory so the rename stays
-/// on one filesystem, and permissions are set on the temp file *before* the
-/// rename so the secret is never briefly world-readable at its final path.
+/// The temp file is created in the destination directory, under a name unique
+/// to this call (see [`unique_temp_path`]) so concurrent writers never race on
+/// the same temp path, and is opened already restricted to owner-only
+/// permissions so the secret it carries is never briefly world-readable, at
+/// the temporary path or the final one.
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
-    set_owner_only(&tmp)?;
+    let tmp = unique_temp_path(path);
+    create_owner_only_file(&tmp, bytes)?;
     fs::rename(&tmp, path)
 }
 
@@ -371,22 +386,34 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
+    let tmp = unique_temp_path(path);
     fs::write(&tmp, bytes)?;
     fs::rename(&tmp, path)
 }
 
+/// Create `path` containing `bytes`, restricted to owner-only permissions
+/// from the moment it exists. On Unix this opens the file with mode `0600`
+/// set at creation time rather than writing at the platform default and
+/// tightening permissions afterward, which would leave a window where the
+/// file is briefly world-readable.
 #[cfg(unix)]
-fn set_owner_only(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+fn create_owner_only_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
 }
 
 #[cfg(not(unix))]
-fn set_owner_only(_path: &Path) -> std::io::Result<()> {
+fn create_owner_only_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // Windows inherits the parent ACL, which is already user-scoped under
     // %APPDATA%. There is no portable mode bit to set here.
-    Ok(())
+    fs::write(path, bytes)
 }
 
 impl Default for Storage {
@@ -1160,6 +1187,80 @@ user_name = "Test"
             let mode = fs::metadata(&storage.config_file).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "config.toml must not be group/world readable");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_temp_file_is_owner_only_from_creation() {
+        // The temp file itself (not just the final path) must never be
+        // briefly world-readable, since save_config carries api_key.
+        let (storage, _temp) = create_test_storage();
+        storage.save_config(&AppConfig::default()).unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_path(&storage.config_file);
+        create_owner_only_file(&tmp, b"secret").unwrap();
+        let mode = fs::metadata(&tmp).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "temp file must be owner-only at creation");
+        fs::remove_file(&tmp).unwrap();
+    }
+
+    // ==================== Atomic write temp-name uniqueness Tests ====================
+
+    #[test]
+    fn unique_temp_path_never_collides_across_calls() {
+        let path = Path::new("/tmp/example-dir/config.toml");
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let tmp = unique_temp_path(path);
+            assert!(seen.insert(tmp.clone()), "temp path collided: {tmp:?}");
+            assert_eq!(tmp.parent(), path.parent(), "temp file must stay a sibling of the destination");
+        }
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_to_same_destination_do_not_corrupt() {
+        // Two writers targeting the same destination used to share one fixed
+        // temp name and race on it. With per-call unique temp names, each
+        // writer's rename is independent, so the final file must be exactly
+        // one writer's complete payload — never a truncated or interleaved
+        // mix of two — and no stray temp files should be left behind.
+        use std::sync::Barrier;
+        use std::thread;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let path = Arc::new(temp_dir.path().join("shared.toml"));
+
+        let writer_count = 8usize;
+        let barrier = Arc::new(Barrier::new(writer_count));
+
+        let handles: Vec<_> = (0..writer_count)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                let path = Arc::clone(&path);
+                thread::spawn(move || {
+                    let payload = format!("writer-{i}-").repeat(2048);
+                    barrier.wait();
+                    write_atomic(&path, payload.as_bytes()).expect("write should succeed");
+                    payload
+                })
+            })
+            .collect();
+
+        let payloads: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let final_contents = fs::read_to_string(&*path).expect("final file should be readable");
+        assert!(
+            payloads.iter().any(|p| p == &final_contents),
+            "final file must be exactly one writer's complete payload, not a mix"
+        );
+
+        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path() != *path)
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected leftover temp files: {leftovers:?}");
     }
 
     // ==================== parse_github_url Tests ====================

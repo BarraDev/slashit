@@ -10,6 +10,7 @@ use crate::config::migration::{ConflictPolicy, MigrationPlan, MigrationReport, S
 use crate::config::paths::{ProjectKey, ResolvedLocation, StateLocation};
 use crate::domain::Project;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -140,6 +141,34 @@ pub async fn plan_state_migration(
     StateMigrator::plan(&from, &to).map_err(|e| e.to_string())
 }
 
+/// Record `target` as project `id`'s new state location, or explain why not.
+///
+/// Split out from [`apply_state_migration`] so the race it guards against —
+/// the project disappearing (e.g. deleted from another window) between the
+/// migration finishing on disk and this point — is unit-testable without a
+/// full `AppState`. The files have already moved by the time this runs, so
+/// silently doing nothing for a vanished project would let the caller believe
+/// the move fully succeeded when nothing was left to record it on.
+fn record_migrated_location(
+    projects: &mut HashMap<Uuid, Project>,
+    id: Uuid,
+    target: StateLocation,
+    to: &Path,
+) -> Result<(), String> {
+    match projects.get_mut(&id) {
+        Some(project) => {
+            project.state_location = target;
+            project.updated_at = chrono::Utc::now();
+            Ok(())
+        }
+        None => Err(format!(
+            "State was moved to {} but project {id} no longer exists, so the new \
+             location could not be recorded on it.",
+            to.display()
+        )),
+    }
+}
+
 /// Move the project's state and persist the new preference.
 ///
 /// The preference is written only after the move succeeds. Recording it first
@@ -167,10 +196,7 @@ pub async fn apply_state_migration(
 
     {
         let mut projects = state.project.projects.write().await;
-        if let Some(project) = projects.get_mut(&id) {
-            project.state_location = target;
-            project.updated_at = chrono::Utc::now();
-        }
+        record_migrated_location(&mut projects, id, target, &to)?;
         // The files have already moved, so a failure to record where they went
         // must be reported rather than logged. Swallowing it would leave the
         // project reading from the directory the data just left, and the user
@@ -240,4 +266,63 @@ pub async fn clean_legacy_state_dirs(
         }
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{AgentConfig, AgentType, ProjectScope};
+
+    fn test_project(id: Uuid) -> Project {
+        Project {
+            id,
+            name: "Test Project".to_string(),
+            repository_id: None,
+            scope: ProjectScope::Standalone,
+            state_location: StateLocation::External,
+            agent_type: AgentType::ClaudeCode,
+            agent_config: AgentConfig {
+                agent_type: AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn records_the_new_location_when_the_project_still_exists() {
+        let id = Uuid::new_v4();
+        let mut projects = HashMap::new();
+        projects.insert(id, test_project(id));
+
+        record_migrated_location(&mut projects, id, StateLocation::InProject, Path::new("/tmp/to"))
+            .expect("project exists, this must succeed");
+
+        assert_eq!(projects[&id].state_location, StateLocation::InProject);
+    }
+
+    #[test]
+    fn errors_instead_of_silently_succeeding_when_the_project_vanished() {
+        // Reproduces the race: the filesystem migration already completed
+        // (the caller always calls this only after `StateMigrator::migrate`
+        // returns `Ok`), but the project record is gone by the time the
+        // result needs to be recorded — e.g. deleted from another window
+        // while the migration was in flight.
+        let id = Uuid::new_v4();
+        let mut projects: HashMap<Uuid, Project> = HashMap::new();
+
+        let result =
+            record_migrated_location(&mut projects, id, StateLocation::InProject, Path::new("/tmp/to"));
+
+        assert!(
+            result.is_err(),
+            "a vanished project must never be reported as a successful move"
+        );
+        assert!(result.unwrap_err().contains("no longer exists"));
+    }
 }
