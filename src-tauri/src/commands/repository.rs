@@ -181,7 +181,7 @@ mod tests {
     fn try_persist_repositories_propagates_read_failure_without_destroying_config() {
         use std::os::unix::fs::PermissionsExt;
 
-        if unsafe { libc_geteuid() } == 0 {
+        if crate::ipc::server::current_uid() == 0 {
             return; // root ignores permission bits, so chmod 0o000 would not force a read failure
         }
 
@@ -216,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn create_repository_leaves_memory_unchanged_when_persistence_fails() {
         use std::os::unix::fs::PermissionsExt;
-        if unsafe { libc_geteuid() } == 0 {
+        if crate::ipc::server::current_uid() == 0 {
             return;
         }
 
@@ -234,11 +234,5 @@ mod tests {
             repositories.read().await.is_empty(),
             "memory must not contain a repository disk never recorded"
         );
-    }
-
-    #[cfg(unix)]
-    extern "C" {
-        #[link_name = "geteuid"]
-        fn libc_geteuid() -> u32;
     }
 }

@@ -111,6 +111,40 @@ fn spawn_worktree_cleanup(
     });
 }
 
+/// How a status transition affects a task's execution state and worktree.
+///
+/// `update_task_status` and `reorder_task` used to check these as two
+/// independent `if`s. An Error-to-Done transition matches both conditions
+/// (`old_status == Error` from the first, `new_status == Done` from the
+/// second), so with `worktree_path` no longer cleared inside the first
+/// branch, both would fire and spawn cleanup twice for the same path.
+/// Classifying the transition into one variant makes that overlap
+/// structurally impossible instead of relying on `if`/`else if` ordering at
+/// every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTransitionEffect {
+    /// Moving out of an error state or back to an early column: reset
+    /// phase/progress/error, and clean up any worktree.
+    ResetAndCleanUp,
+    /// Moving to `Done`: clean up the worktree, keep everything else
+    /// (including `branch_name`, for PR creation) untouched.
+    CleanUpOnly,
+    /// No cleanup-relevant effect.
+    None,
+}
+
+fn classify_status_transition(old_status: &TaskStatus, new_status: &TaskStatus) -> StatusTransitionEffect {
+    if *old_status == TaskStatus::Error
+        || matches!(new_status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
+    {
+        StatusTransitionEffect::ResetAndCleanUp
+    } else if matches!(new_status, TaskStatus::Done) {
+        StatusTransitionEffect::CleanUpOnly
+    } else {
+        StatusTransitionEffect::None
+    }
+}
+
 pub type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
 
 /// Helper function to persist tasks for a project after mutation
@@ -265,30 +299,27 @@ pub async fn update_task_status(
         task.status = status.clone();
         task.updated_at = chrono::Utc::now();
 
-        // Reset execution state when moving out of Error or back to early columns
-        if old_status == TaskStatus::Error
-            || matches!(status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
-        {
-            task.phase = TaskPhase::Idle;
-            task.phase_progress = 0;
-            task.overall_progress = 0;
-            task.error_message = None;
-            // Cleanup worktree dir but keep branch for potential re-use.
-            // `worktree_path` is left in place until removal succeeds.
-            if let Some(wt_path) = task.worktree_path.clone() {
-                let branch = task.branch_name.clone().unwrap_or_default();
-                spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+        // Reset execution state when moving out of Error or back to early
+        // columns; clean up the worktree exactly once either way.
+        match classify_status_transition(&old_status, &status) {
+            StatusTransitionEffect::ResetAndCleanUp => {
+                task.phase = TaskPhase::Idle;
+                task.phase_progress = 0;
+                task.overall_progress = 0;
+                task.error_message = None;
+                if let Some(wt_path) = task.worktree_path.clone() {
+                    let branch = task.branch_name.clone().unwrap_or_default();
+                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+                }
             }
-        }
-
-        // Cleanup worktree when moving to Done (keep branch for PR).
-        // `worktree_path` is left in place until removal succeeds.
-        if matches!(status, TaskStatus::Done) {
-            if let Some(wt_path) = task.worktree_path.clone() {
-                let branch = task.branch_name.clone().unwrap_or_default();
-                spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+            StatusTransitionEffect::CleanUpOnly => {
+                // Keep branch_name for PR creation.
+                if let Some(wt_path) = task.worktree_path.clone() {
+                    let branch = task.branch_name.clone().unwrap_or_default();
+                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+                }
             }
-            // Keep branch_name for PR creation
+            StatusTransitionEffect::None => {}
         }
 
         let updated_task = task.clone();
@@ -735,30 +766,27 @@ pub async fn reorder_task(
         if old_status != target_status {
             task.status = target_status.clone();
 
-            // Reset execution state when moving out of Error or to early columns
-            if old_status == TaskStatus::Error
-                || matches!(target_status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
-            {
-                task.phase = TaskPhase::Idle;
-                task.phase_progress = 0;
-                task.overall_progress = 0;
-                task.error_message = None;
-                // Cleanup worktree dir but keep branch for potential re-use.
-                // `worktree_path` is left in place until removal succeeds.
-                if let Some(wt_path) = task.worktree_path.clone() {
-                    let branch = task.branch_name.clone().unwrap_or_default();
-                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+            // Reset execution state when moving out of Error or to early
+            // columns; clean up the worktree exactly once either way.
+            match classify_status_transition(&old_status, &target_status) {
+                StatusTransitionEffect::ResetAndCleanUp => {
+                    task.phase = TaskPhase::Idle;
+                    task.phase_progress = 0;
+                    task.overall_progress = 0;
+                    task.error_message = None;
+                    if let Some(wt_path) = task.worktree_path.clone() {
+                        let branch = task.branch_name.clone().unwrap_or_default();
+                        spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+                    }
                 }
-            }
-
-            // Cleanup worktree when moving to Done (keep branch for PR).
-            // `worktree_path` is left in place until removal succeeds.
-            if matches!(target_status, TaskStatus::Done) {
-                if let Some(wt_path) = task.worktree_path.clone() {
-                    let branch = task.branch_name.clone().unwrap_or_default();
-                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+                StatusTransitionEffect::CleanUpOnly => {
+                    // Keep branch_name for PR creation.
+                    if let Some(wt_path) = task.worktree_path.clone() {
+                        let branch = task.branch_name.clone().unwrap_or_default();
+                        spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+                    }
                 }
-                // Keep branch_name for PR creation
+                StatusTransitionEffect::None => {}
             }
         }
         task.updated_at = chrono::Utc::now();
@@ -1163,6 +1191,53 @@ mod tests {
             Some("/tmp/some-worktree-path"),
             "a failed removal must leave worktree_path in place for retry"
         );
+    }
+
+    #[test]
+    fn classify_status_transition_never_matches_both_effects_for_error_to_done() {
+        // The one transition where the naive two-`if` version overlapped:
+        // old_status == Error (matches the reset condition) and
+        // new_status == Done (matches the cleanup-only condition). Exactly
+        // one variant must come back, or callers spawn cleanup twice.
+        assert_eq!(
+            classify_status_transition(&TaskStatus::Error, &TaskStatus::Done),
+            StatusTransitionEffect::ResetAndCleanUp,
+            "an Error-to-Done transition must classify as exactly one effect"
+        );
+    }
+
+    #[test]
+    fn classify_status_transition_covers_every_status_pair_with_exactly_one_effect() {
+        // Exhaustive over every (old, new) pair: whichever effect comes back,
+        // it must be the *only* one that would have matched under the
+        // original two independent `if` conditions, for every status this
+        // enum has today — not just the one overlapping case above.
+        let all = [
+            TaskStatus::Backlog, TaskStatus::Queue, TaskStatus::InProgress, TaskStatus::AiReview,
+            TaskStatus::HumanReview, TaskStatus::Done, TaskStatus::PrCreated, TaskStatus::Error,
+        ];
+        for old in &all {
+            for new in &all {
+                let reset_matches = *old == TaskStatus::Error
+                    || matches!(new, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress);
+                let cleanup_only_matches = matches!(new, TaskStatus::Done);
+                let effect = classify_status_transition(old, new);
+                match effect {
+                    StatusTransitionEffect::ResetAndCleanUp => assert!(
+                        reset_matches,
+                        "{old:?} -> {new:?} classified ResetAndCleanUp but the reset condition doesn't hold"
+                    ),
+                    StatusTransitionEffect::CleanUpOnly => assert!(
+                        !reset_matches && cleanup_only_matches,
+                        "{old:?} -> {new:?} classified CleanUpOnly but reset also matches (would double-spawn)"
+                    ),
+                    StatusTransitionEffect::None => assert!(
+                        !reset_matches && !cleanup_only_matches,
+                        "{old:?} -> {new:?} classified None but one of the effects should apply"
+                    ),
+                }
+            }
+        }
     }
 
     #[test]
