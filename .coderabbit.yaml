@@ -1,0 +1,83 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+inheritance: true
+
+reviews:
+  profile: assertive
+
+  request_changes_workflow: false
+
+  high_level_summary: false
+  changed_files_summary: false
+
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+
+  enable_prompt_for_ai_agents: false
+
+  collapse_walkthrough: true
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 0
+    base_branches:
+      - ".*"
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+
+    title:
+      mode: warning
+      requirements: >-
+        The title must be concise and describe the primary user-visible,
+        architectural, or correctness change without claiming work that is not
+        present in the pull request.
+
+    description:
+      mode: warning
+
+    issue_assessment:
+      mode: "off"
+
+    custom_checks:
+      - name: Persistent state integrity
+        mode: warning
+        instructions: >-
+          Fail this check when changed code that mutates persisted application
+          state can report success after persistence failed, can publish
+          unpersisted state to shared memory after reporting failure, or can let
+          a stale read-modify-write overwrite a newer authoritative state.
+          Require concrete evidence in changed code and ignore read-only paths.
+
+      - name: Recoverable resource lifecycle
+        mode: warning
+        instructions: >-
+          Fail this check when changes to worktree, task, migration, or cleanup
+          lifecycle code can clear or destroy the last persisted reference to an
+          existing resource before cleanup is confirmed successful, or when a
+          failed cleanup leaves no explicit recovery or retry path. Do not flag
+          harmless idempotent cleanup.
+
+      - name: Platform boundary safety
+        mode: warning
+        instructions: >-
+          Fail this check when changed code uses Unix-specific or
+          Windows-specific APIs, modules, types, or tests on unsupported targets
+          without appropriate compile-time gating or an equivalent platform
+          implementation, or when the changed build path creates an evident
+          cross-platform compile failure. Do not require feature parity when
+          platform-specific behavior is intentionally and correctly gated.
