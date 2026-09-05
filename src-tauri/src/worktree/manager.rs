@@ -225,7 +225,7 @@ impl WorktreeManager {
             }
 
             // Now create a worktree for this branch
-            if self.wt_available {
+            if self.delegates_to_wt() {
                 let output = tokio::process::Command::new("wt")
                     .args(["switch", branch, "--no-cd", "-y", "--no-verify"])
                     .current_dir(repo_path)
@@ -239,7 +239,7 @@ impl WorktreeManager {
 
             // Fallback: create worktree manually
             self.create_with_git(repo_path, branch).await
-        } else if self.wt_available {
+        } else if self.delegates_to_wt() {
             // Fallback: use wt with --base flag
             let output = tokio::process::Command::new("wt")
                 .args(["switch", "-c", branch, "--base", after_branch, "--no-cd", "-y", "--no-verify"])
@@ -255,13 +255,18 @@ impl WorktreeManager {
 
             self.find_worktree_path(repo_path, branch).await
         } else {
-            // Git-only fallback: create branch from parent, then worktree
+            // Git-only fallback: create the branch from its parent, then
+            // attach a worktree to it. Attach, not `-b` (`create_with_git`
+            // always passes `-b`): the branch already exists from the line
+            // above, so creating it again would fail.
             let _ = tokio::process::Command::new("git")
                 .args(["branch", branch, after_branch])
                 .current_dir(repo_path)
                 .output()
                 .await;
-            self.create_with_git(repo_path, branch).await
+            let worktree_path = self.managed_path(repo_path, branch);
+            self.git_worktree_add(repo_path, &worktree_path, branch, false)
+                .await
         }
     }
 
@@ -523,6 +528,21 @@ mod tests {
     }
 
     #[test]
+    fn delegates_to_wt_respects_managed_placement_regardless_of_wt_availability() {
+        let mut mgr = test_manager();
+        mgr.wt_available = true;
+
+        mgr.placement = WorktreePlacement::Auto;
+        assert!(mgr.delegates_to_wt(), "Auto with wt installed should delegate");
+
+        mgr.placement = WorktreePlacement::Managed;
+        assert!(
+            !mgr.delegates_to_wt(),
+            "Managed must take placement back even when wt is installed"
+        );
+    }
+
+    #[test]
     fn managed_worktrees_live_outside_the_repository() {
         let mgr = test_manager();
         let repo = "/home/someone/code/my-app";
@@ -741,6 +761,30 @@ branch refs/heads/fix
         assert!(Path::new(&info.path).exists(), "worktree dir should exist");
         assert_eq!(info.branch, "test-branch");
         assert!(mgr.exists(&info.path));
+    }
+
+    #[tokio::test]
+    async fn integration_create_stacked_branch_falls_back_to_git_when_placement_is_managed() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        // `wt_available` is forced true without an actual `wt` binary on
+        // PATH: under `Managed` placement this must never be consulted, so
+        // if the fix regresses to checking `wt_available` directly, this
+        // test fails by trying (and failing) to run a nonexistent `wt`.
+        let mgr = WorktreeManager {
+            wt_available: true,
+            gs_available: false,
+            paths: test_paths(),
+            placement: WorktreePlacement::Managed,
+        };
+
+        let info = mgr
+            .create_stacked_branch(repo_path, "stacked-branch", "main")
+            .await
+            .expect("create_stacked_branch should fall back to git, not delegate to wt");
+        assert!(Path::new(&info.path).exists(), "worktree dir should exist");
+        assert_eq!(info.branch, "stacked-branch");
     }
 
     #[tokio::test]
