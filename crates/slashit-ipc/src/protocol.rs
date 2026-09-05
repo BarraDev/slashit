@@ -80,8 +80,8 @@ impl IpcRequest {
     /// Whether this command can change state.
     ///
     /// Used for authorization and for the audit log. `CreateTask`,
-    /// `MoveTask` and `EnqueueTask` are the ones that ultimately reach the
-    /// queue executor, which spawns an agent — see
+    /// `MoveTask`, `EnqueueTask` and `EditTask` are the ones that ultimately
+    /// reach the queue executor, which spawns an agent — see
     /// `docs/architecture/ipc-security.md`.
     pub fn is_mutating(&self) -> bool {
         !matches!(
@@ -99,13 +99,20 @@ impl IpcRequest {
     /// Whether this command can cause code to run in a checkout.
     ///
     /// Moving a task into `in_progress` reaches the queue executor, which
-    /// creates a worktree and spawns the configured agent with the task
-    /// description as its prompt. These verbs are the code-execution surface
-    /// and are denied to any non-local peer.
+    /// creates a worktree and spawns the configured agent with the task's
+    /// live title and description as its prompt — read at execution time, not
+    /// snapshotted at `CreateTask`/`MoveTask`/`EnqueueTask` time. `EditTask`
+    /// can rewrite that title and description on a task already queued or
+    /// in progress, so it reaches the same primitive one step later and must
+    /// be denied to any non-local peer exactly like the verbs that start it.
+    /// These verbs are the code-execution surface.
     pub fn spawns_agent(&self) -> bool {
         matches!(
             self,
-            Self::CreateTask { .. } | Self::MoveTask { .. } | Self::EnqueueTask { .. }
+            Self::CreateTask { .. }
+                | Self::MoveTask { .. }
+                | Self::EnqueueTask { .. }
+                | Self::EditTask { .. }
         )
     }
 
@@ -329,9 +336,22 @@ mod tests {
             task_id: String::new(),
         }
         .spawns_agent());
+        assert!(IpcRequest::EditTask {
+            task_id: String::new(),
+            title: None,
+            description: None,
+            priority: None,
+        }
+        .spawns_agent());
 
         assert!(!IpcRequest::Status.spawns_agent());
         assert!(!IpcRequest::ListProjects.spawns_agent());
+        assert!(!IpcRequest::DeleteTask {
+            task_id: String::new(),
+        }
+        .spawns_agent());
+        assert!(!IpcRequest::Show.spawns_agent());
+        assert!(!IpcRequest::Quit.spawns_agent());
     }
 
     #[test]

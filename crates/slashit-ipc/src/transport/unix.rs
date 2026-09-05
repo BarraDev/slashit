@@ -19,6 +19,7 @@ use crate::endpoint::Endpoint;
 pub struct UnixListenerTransport {
     listener: UnixListener,
     path: PathBuf,
+    ino: u64,
 }
 
 impl UnixListenerTransport {
@@ -27,14 +28,22 @@ impl UnixListenerTransport {
             prepare_socket_dir(parent)?;
         }
 
+        // Held only across the reclaim-then-bind sequence below, which is a
+        // check-then-act with no atomicity of its own. See
+        // `acquire_claim_lock`; the `File` is never read, only kept alive so
+        // its `flock` is held until this scope ends.
+        let _guard = acquire_claim_lock(&path.with_extension("lock"))?;
+
         claim_socket(path).await?;
 
         let listener = UnixListener::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let ino = std::fs::metadata(path)?.ino();
 
         Ok(Self {
             listener,
             path: path.to_path_buf(),
+            ino,
         })
     }
 
@@ -58,13 +67,61 @@ impl UnixListenerTransport {
 
 impl Drop for UnixListenerTransport {
     /// Remove the socket so the next start does not have to decide whether a
-    /// leftover file is stale.
+    /// leftover file is stale — but only if it is still *this* socket.
+    /// `ClaimLock` serializes two processes racing to bind at startup, but it
+    /// cannot protect a socket that was already bound before either process
+    /// started shutting down: without the inode check, a process that loses a
+    /// race and later exits could unlink the *newer* process's live socket
+    /// (whose bind it never even contended with) out from under it, since a
+    /// path match alone doesn't say which process's file it still is.
     ///
     /// Best-effort: a failure here is not worth failing shutdown over, and
-    /// `claim_socket` handles the leftover on the next start anyway.
+    /// `claim_socket` handles a leftover on the next start anyway.
     fn drop(&mut self) {
+        match std::fs::metadata(&self.path) {
+            Ok(meta) if meta.ino() != self.ino => return,
+            _ => {}
+        }
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Serializes the stale-socket-reclaim-then-bind sequence across processes.
+///
+/// `claim_socket` followed by `UnixListener::bind` is a check-then-act
+/// sequence with no atomicity of its own: two processes started together can
+/// both observe the same stale socket, and the second to run `remove_file`
+/// can delete the first's freshly bound (live) socket instead of the stale
+/// one it actually saw, leaving the first holding a listener nothing can
+/// reach. `flock` is released automatically when the returned file's
+/// descriptor closes — including on a crash — so, unlike a lockfile
+/// existence check, holding this lock never itself needs a staleness rule.
+/// The caller only needs to keep the returned `File` alive for as long as the
+/// lock must be held; its contents are never read or written.
+fn acquire_claim_lock(lock_path: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    flock_exclusive(&file)?;
+    Ok(file)
+}
+
+fn flock_exclusive(file: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // No `libc` dependency in this crate; declaring the one symbol needed
+    // avoids pulling one in just for this.
+    extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    // Safety: `file`'s fd is open and valid for the duration of this call.
+    let ret = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Create the socket directory with owner-only permissions.
@@ -212,6 +269,32 @@ mod tests {
             listener.is_ok(),
             "a stale socket must be reclaimed, got {:?}",
             listener.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_does_not_remove_a_socket_that_is_no_longer_its_own() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("slashit.sock");
+
+        let listener = UnixListenerTransport::bind(&path).await.unwrap();
+
+        // Simulate what a racing second process leaves behind: this path now
+        // holds a different socket (a different inode) than the one this
+        // instance bound, as if another process had reclaimed and rebound it
+        // between this instance's bind and its eventual drop.
+        std::fs::remove_file(&path).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(
+            path.exists(),
+            "precondition: a different socket now occupies the path"
+        );
+
+        drop(listener);
+
+        assert!(
+            path.exists(),
+            "Drop must not remove a socket it did not itself bind"
         );
     }
 

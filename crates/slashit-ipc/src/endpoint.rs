@@ -23,7 +23,15 @@ use std::path::PathBuf;
 /// macOS and Windows have no `XDG_RUNTIME_DIR`, so the qualified temp fallback
 /// is the normal path there, not an edge case.
 pub fn runtime_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+    runtime_dir_from(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
+}
+
+/// Pure core of [`runtime_dir`], taking the `XDG_RUNTIME_DIR` value as an
+/// explicit argument rather than reading the process environment directly, so
+/// it is testable without mutating global state shared with every other test
+/// in this crate's test binary.
+fn runtime_dir_from(xdg_runtime_dir: Option<&str>) -> PathBuf {
+    if let Some(dir) = xdg_runtime_dir {
         if !dir.is_empty() {
             return PathBuf::from(dir).join(crate::APPLICATION);
         }
@@ -255,23 +263,16 @@ mod tests {
     #[test]
     fn the_temp_fallback_is_qualified_per_user() {
         // Guards the squatting hazard: a fixed name in world-writable /tmp can
-        // be pre-created by another local user.
-        let previous = std::env::var("XDG_RUNTIME_DIR").ok();
-        // SAFETY: single-threaded test; restored below.
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "") };
-
-        let dir = runtime_dir();
+        // be pre-created by another local user. Goes through the pure helper
+        // with an explicit empty value rather than mutating the real process
+        // environment, which `cargo test` would otherwise share, unsynchronized,
+        // with every other test in this binary.
+        let dir = runtime_dir_from(Some(""));
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
             name.starts_with("slashit-") && name.len() > "slashit-".len(),
             "temp fallback must be user-qualified, got {name}"
         );
-
-        match previous {
-            // SAFETY: single-threaded test.
-            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
-            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
-        }
     }
 
     #[test]
