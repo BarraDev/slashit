@@ -387,7 +387,7 @@ impl TaskExecutor {
             Ok(path) => path,
             Err(e) => {
                 Self::warn_cleanup_once(
-                    &self.app_handle,
+                    &self.events,
                     &self.cleanup_last_warning,
                     task_id,
                     format!("Cannot resolve repo path to clean up worktree: {}", e),
@@ -401,7 +401,7 @@ impl TaskExecutor {
         let wt_mgr = self.worktree_manager.clone();
         let tasks = self.tasks.clone();
         let storage = self.storage.clone();
-        let app_handle = self.app_handle.clone();
+        let events = self.events.clone();
         let in_flight = self.cleanup_in_flight.clone();
         let last_warning = self.cleanup_last_warning.clone();
         let wt_path_done = wt_path.clone();
@@ -414,7 +414,7 @@ impl TaskExecutor {
             {
                 Err(e) => {
                     Self::warn_cleanup_once(
-                        &app_handle,
+                        &events,
                         &last_warning,
                         task_id,
                         format!(
@@ -441,7 +441,7 @@ impl TaskExecutor {
     /// event, never an attempt. A different message always gets through, so a
     /// failure that changes character is still visible.
     async fn warn_cleanup_once(
-        app_handle: &tauri::AppHandle,
+        events: &SharedEventSink,
         last_warning: &RwLock<HashMap<Uuid, String>>,
         task_id: Uuid,
         message: String,
@@ -450,14 +450,11 @@ impl TaskExecutor {
             return;
         }
 
-        let _ = app_handle.emit(
-            "agent-event",
-            AgentEvent::Log {
-                task_id: task_id.to_string(),
-                level: LogLevel::Warn,
-                message,
-            },
-        );
+        events.agent_event(AgentEvent::Log {
+            task_id: task_id.to_string(),
+            level: LogLevel::Warn,
+            message,
+        });
     }
 
     /// Record `message` as this task's latest cleanup warning, returning
