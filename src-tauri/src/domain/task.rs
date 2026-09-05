@@ -57,6 +57,12 @@ pub struct Task {
     pub model: String,
     pub planning_mode: bool,
     pub dependencies: Vec<Uuid>,
+    /// Per-task git worktree. Renamed from `workspace_id`. Without the alias
+    /// a pre-rename record still deserializes (unknown fields are ignored),
+    /// but silently drops the reference — `worktree_id` defaults to `None`
+    /// since the old `workspace_id` key is never read. The alias makes the
+    /// legacy key populate this field instead of being discarded.
+    #[serde(alias = "workspace_id", default)]
     pub worktree_id: Option<Uuid>,
     pub jj_change_id: Option<String>,
 
@@ -151,7 +157,7 @@ impl PrReviewPlan {
                 if !item.fix_done {
                     item.fix_done = true;
                 }
-                if !item.reply_posted && !failed_reply_ids.contains(&cid) {
+                if last.auto_reply && !item.reply_posted && !failed_reply_ids.contains(&cid) {
                     item.reply_posted = true;
                 }
             }
@@ -268,6 +274,13 @@ pub struct PrReviewApplyResult {
     /// did not reach the remote.
     #[serde(default)]
     pub push_error: Option<String>,
+    /// Whether this apply ran with `auto_reply=true`. Needed to distinguish
+    /// "reply attempted and succeeded" from "reply intentionally never
+    /// attempted" when backfilling `reply_posted` from `fixed_ids` — without
+    /// it, an apply with replies disabled would be misread as having posted
+    /// replies for every fixed item.
+    #[serde(default)]
+    pub auto_reply: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -390,8 +403,61 @@ pub struct HumanReview {
     pub spec_hash: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    /// A pre-rename persisted task record: `workspace_id` (the old field
+    /// name), no `worktree_id` at all. Loaded by `Storage::load_project_tasks`
+    /// / `load_all_tasks` from an on-disk `tasks.toml` written before the
+    /// `worktree_id` rename shipped.
+    const LEGACY_TASK_TOML: &str = r#"
+        id = "11111111-1111-1111-1111-111111111111"
+        project_id = "22222222-2222-2222-2222-222222222222"
+        title = "Legacy task"
+        status = "backlog"
+        model = "test-model"
+        planning_mode = false
+        dependencies = []
+        workspace_id = "33333333-3333-3333-3333-333333333333"
+        category = "feature"
+        priority = "medium"
+        complexity = "moderate"
+        impact = "medium"
+        security_severity = "none"
+        phase = "planning"
+        phase_progress = 0
+        overall_progress = 0
+        subtasks = []
+        sequence_number = 0
+        created_at = "2024-01-01T00:00:00Z"
+        updated_at = "2024-01-01T00:00:00Z"
+    "#;
 
+    #[test]
+    fn task_deserializes_legacy_workspace_id_into_worktree_id() {
+        let task: Task = toml::from_str(LEGACY_TASK_TOML)
+            .expect("legacy `workspace_id` record must still deserialize via the alias");
+        assert_eq!(
+            task.worktree_id,
+            Some(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap()),
+            "worktree_id should be populated from the legacy `workspace_id` key",
+        );
+    }
 
+    #[test]
+    fn task_deserializes_without_workspace_id_or_worktree_id() {
+        // Belt-and-suspenders: a record with neither key present (the normal
+        // case for any task that never had a worktree) must still load, with
+        // worktree_id defaulting to None.
+        let toml_str = LEGACY_TASK_TOML.replace(
+            "workspace_id = \"33333333-3333-3333-3333-333333333333\"\n",
+            "",
+        );
+        let task: Task = toml::from_str(&toml_str)
+            .expect("record with no worktree reference at all must still deserialize");
+        assert_eq!(task.worktree_id, None);
+    }
+}
 
 

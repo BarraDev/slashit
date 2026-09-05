@@ -32,17 +32,35 @@ pub struct WorkspaceRegistry {
 
 impl WorkspaceRegistry {
     pub fn load() -> io::Result<Self> {
-        let config_path = Self::config_path()?;
+        Self::load_from(Self::config_path()?)
+    }
+
+    /// Load from an explicit path, split out from `load()` so tests can point
+    /// it at a tempdir instead of the real OS config directory.
+    fn load_from(config_path: PathBuf) -> io::Result<Self> {
         let workspaces = if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
             match toml::from_str::<RegistryFile>(&content) {
                 Ok(parsed) => parsed.workspaces.into_iter().map(|w| (w.id, w)).collect(),
                 Err(e) => {
                     // A bad file should not block startup. Quarantine and start empty
-                    // so the user can recreate workspaces and SlashIt remains usable.
+                    // so the user can recreate workspaces and SlashIt remains usable —
+                    // but only once the corrupt file is actually safely backed up. If
+                    // the rename itself fails (permissions, cross-device, ...), the
+                    // corrupt file would be left in place, unbacked-up, while an empty
+                    // *writable* registry proceeded — the next save would then
+                    // silently overwrite that unbacked-up file with a near-empty one.
+                    // Fail closed instead, the same as the unreadable-file case above.
                     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
                     let quarantine = config_path.with_extension(format!("toml.corrupt-{ts}"));
-                    let _ = fs::rename(&config_path, &quarantine);
+                    if let Err(rename_err) = fs::rename(&config_path, &quarantine) {
+                        eprintln!(
+                            "[workspace-registry] failed to parse {}: {e}. Quarantine to {} also failed: {rename_err}. Leaving the corrupt file in place.",
+                            config_path.display(),
+                            quarantine.display()
+                        );
+                        return Err(rename_err);
+                    }
                     eprintln!(
                         "[workspace-registry] failed to parse {}: {e}. Quarantined to {}.",
                         config_path.display(),
@@ -119,10 +137,78 @@ impl WorkspaceRegistry {
         let toml_text = toml::to_string_pretty(&file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         // Write to a sibling temp file then atomically rename so a crash or
-        // partial write cannot leave the registry truncated.
-        let tmp = path.with_extension("toml.tmp");
+        // partial write cannot leave the registry truncated. The temp name is
+        // unique per call (shared with `storage::write_atomic`) so concurrent
+        // writers never race on the same temp path.
+        let tmp = crate::config::storage::unique_temp_path(path);
         fs::write(&tmp, toml_text)?;
         fs::rename(&tmp, path)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn missing_registry_file_loads_empty() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("workspaces.toml");
+
+        let registry = WorkspaceRegistry::load_from(path).expect("should load a default registry");
+
+        assert!(registry.all().next().is_none());
+    }
+
+    #[test]
+    fn corrupt_file_is_quarantined_and_registry_starts_empty() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("workspaces.toml");
+        fs::write(&path, "this is not valid toml {{{").expect("write corrupt file");
+
+        let registry =
+            WorkspaceRegistry::load_from(path.clone()).expect("a quarantinable file should still load");
+
+        assert!(registry.all().next().is_none());
+        assert!(!path.exists(), "corrupt file should have been moved aside");
+
+        let quarantined: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt-"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine backup should exist");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_rename_failure_returns_err_instead_of_empty_registry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("workspaces.toml");
+        fs::write(&path, "this is not valid toml {{{").expect("write corrupt file");
+
+        // Remove write permission on the parent directory so the quarantine
+        // rename cannot happen: renaming requires write access to the
+        // directory holding both the source and destination names.
+        let original_perms = fs::metadata(temp.path()).unwrap().permissions();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = WorkspaceRegistry::load_from(path.clone());
+
+        // Restore so the tempdir can be cleaned up regardless of the outcome.
+        fs::set_permissions(temp.path(), original_perms).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a failed quarantine rename must fail load() rather than silently starting empty"
+        );
+        assert!(
+            path.exists(),
+            "the corrupt file must be left in place when it could not be quarantined"
+        );
+    }
 }

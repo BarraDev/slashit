@@ -160,7 +160,7 @@ Configuration is stored in your system config directory:
 
 ### Your project stays clean
 
-SlashIt writes nothing inside your repository unless you ask it to. Boards,
+SlashIt writes nothing inside your working tree unless you ask it to. Boards,
 worktrees, terminal history and logs all live outside the project by default.
 
 Per project, under **Settings → Storage**, you can choose where the board is
@@ -170,7 +170,7 @@ kept:
 |---|---|---|
 | Outside the project *(default)* | `<data_dir>/projects/<key>/` | You want the repository untouched |
 | Inside the project | `<repo>/.slashit/` | You want the board committed and shared with your team |
-| Detect automatically | whichever already exists | Upgrading, or moving between machines |
+| Detect automatically | `.slashit/` if it already exists and has content, otherwise outside | Upgrading, or moving between machines |
 
 Switching between them previews the move first — how many files, how large, and
 any conflicts — and nothing is moved until you confirm. Your API keys, terminal

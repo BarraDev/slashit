@@ -1,6 +1,6 @@
 use crate::domain::{
     Task, TaskStatus, TaskCategory, TaskPriority, TaskComplexity,
-    TaskImpact, SecuritySeverity, TaskPhase, Subtask
+    TaskImpact, SecuritySeverity, TaskPhase, Subtask, Project, Repository,
 };
 use crate::domain::task::ExternalRef;
 use crate::config::Storage;
@@ -8,6 +8,28 @@ use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Resolve a project's repository local path.
+///
+/// Used to give worktree cleanup (spawned after a task's status changes) the
+/// `repo_path` that `WorktreeManager::remove` needs to run its git commands
+/// in the right directory. Takes the project/repository maps directly so it
+/// can be called from inside a `tauri::async_runtime::spawn`ed closure that
+/// only cloned those two `Arc`s, not the whole `AppState`.
+async fn resolve_repo_path(
+    projects: &Arc<RwLock<HashMap<Uuid, Project>>>,
+    repositories: &Arc<RwLock<HashMap<Uuid, Repository>>>,
+    project_id: Uuid,
+) -> Result<String, String> {
+    let projects_r = projects.read().await;
+    let project = projects_r.get(&project_id).ok_or("Project not found")?;
+    let repo_id = project.repository_id.ok_or("No repository linked")?;
+    drop(projects_r);
+
+    let repos = repositories.read().await;
+    let repo = repos.get(&repo_id).ok_or("Repository not found")?;
+    Ok(repo.local_path.clone())
+}
 
 pub type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
 
@@ -176,8 +198,13 @@ pub async fn update_task_status(
                 let wt_path = wt_path.clone();
                 let branch = task.branch_name.clone().unwrap_or_default();
                 let wt_mgr = state.worktree_manager.clone();
+                let projects = state.project.projects.clone();
+                let repositories = state.repository.repositories.clone();
+                let project_id = task.project_id;
                 tauri::async_runtime::spawn(async move {
-                    let _ = wt_mgr.remove(&wt_path, &branch).await;
+                    if let Ok(repo_path) = resolve_repo_path(&projects, &repositories, project_id).await {
+                        let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
+                    }
                 });
             }
             task.worktree_path = None;
@@ -189,8 +216,13 @@ pub async fn update_task_status(
                 let wt_path = wt_path.clone();
                 let branch = task.branch_name.clone().unwrap_or_default();
                 let wt_mgr = state.worktree_manager.clone();
+                let projects = state.project.projects.clone();
+                let repositories = state.repository.repositories.clone();
+                let project_id = task.project_id;
                 tauri::async_runtime::spawn(async move {
-                    let _ = wt_mgr.remove(&wt_path, &branch).await;
+                    if let Ok(repo_path) = resolve_repo_path(&projects, &repositories, project_id).await {
+                        let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
+                    }
                 });
             }
             task.worktree_path = None;
@@ -199,10 +231,10 @@ pub async fn update_task_status(
 
         let updated_task = task.clone();
         let project_id = task.project_id;
-        
+
         // Persist to disk
         persist_project_tasks(&state.storage, &tasks, project_id);
-        
+
         Ok(Some(updated_task))
     } else {
         Ok(None)
@@ -577,8 +609,13 @@ pub async fn delete_task(
             let wt_path = wt_path.clone();
             let branch = task.branch_name.clone().unwrap_or_default();
             let wt_mgr = state.worktree_manager.clone();
+            let projects = state.project.projects.clone();
+            let repositories = state.repository.repositories.clone();
+            let project_id = task.project_id;
             tauri::async_runtime::spawn(async move {
-                let _ = wt_mgr.remove(&wt_path, &branch).await;
+                if let Ok(repo_path) = resolve_repo_path(&projects, &repositories, project_id).await {
+                    let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
+                }
             });
         }
     }
@@ -655,8 +692,13 @@ pub async fn reorder_task(
                     let wt_path = wt_path.clone();
                     let branch = task.branch_name.clone().unwrap_or_default();
                     let wt_mgr = state.worktree_manager.clone();
+                    let projects = state.project.projects.clone();
+                    let repositories = state.repository.repositories.clone();
+                    let project_id = task.project_id;
                     tauri::async_runtime::spawn(async move {
-                        let _ = wt_mgr.remove(&wt_path, &branch).await;
+                        if let Ok(repo_path) = resolve_repo_path(&projects, &repositories, project_id).await {
+                            let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
+                        }
                     });
                 }
                 task.worktree_path = None;
@@ -668,8 +710,13 @@ pub async fn reorder_task(
                     let wt_path = wt_path.clone();
                     let branch = task.branch_name.clone().unwrap_or_default();
                     let wt_mgr = state.worktree_manager.clone();
+                    let projects = state.project.projects.clone();
+                    let repositories = state.repository.repositories.clone();
+                    let project_id = task.project_id;
                     tauri::async_runtime::spawn(async move {
-                        let _ = wt_mgr.remove(&wt_path, &branch).await;
+                        if let Ok(repo_path) = resolve_repo_path(&projects, &repositories, project_id).await {
+                            let _ = wt_mgr.remove(&wt_path, &branch, &repo_path).await;
+                        }
                     });
                 }
                 task.worktree_path = None;

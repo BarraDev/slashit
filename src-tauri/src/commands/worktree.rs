@@ -67,16 +67,28 @@ pub async fn cleanup_worktree(
 ) -> Result<(), String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
-    let (wt_path, branch) = {
+    let (wt_path, branch, project_id) = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_id).ok_or("Task not found")?;
         (
             task.worktree_path.clone().ok_or("No worktree for this task")?,
             task.branch_name.clone().unwrap_or_default(),
+            task.project_id,
         )
     };
 
-    state.worktree_manager.remove(&wt_path, &branch).await?;
+    let repo_path = {
+        let projects = state.project.projects.read().await;
+        let project = projects.get(&project_id).ok_or("Project not found")?;
+        let repo_id = project.repository_id.ok_or("No repository linked")?;
+        drop(projects);
+
+        let repos = state.repository.repositories.read().await;
+        let repo = repos.get(&repo_id).ok_or("Repository not found")?;
+        repo.local_path.clone()
+    };
+
+    state.worktree_manager.remove(&wt_path, &branch, &repo_path).await?;
 
     // Clear task fields
     {

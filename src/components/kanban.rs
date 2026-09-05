@@ -1061,6 +1061,11 @@ fn PrReviewModal(
                             if let Some(refreshed_plan) = updated.pr_review_plan.clone() {
                                 plan.set(Some(refreshed_plan));
                             }
+                            set_tasks.update(|tasks| {
+                                if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
+                                    *t = updated;
+                                }
+                            });
                         }
                     });
                 }

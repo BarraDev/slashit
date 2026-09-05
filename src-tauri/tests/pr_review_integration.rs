@@ -770,6 +770,7 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
         failed_ids: vec![],
         fix_errors: vec![],
         push_error: None,
+        auto_reply: true,
     });
 
     plan.backfill_lifecycle_from_last_apply();
@@ -807,6 +808,7 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
             failed_ids: vec![],
             fix_errors: vec![],
             push_error: None,
+            auto_reply: true,
         }),
     };
     // Reset to prove backfill leaves dry-run alone.
@@ -817,4 +819,43 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
     dry_plan.backfill_lifecycle_from_last_apply();
     assert!(dry_plan.items.iter().all(|i| !i.fix_done && !i.reply_posted),
         "dry-run last_apply must not flip lifecycle flags");
+}
+
+#[test]
+fn backfill_lifecycle_from_last_apply_never_attempted_reply_leaves_reply_posted_false() {
+    use slashit_ui_lib::domain::task::PrReviewApplyResult;
+
+    let (_task, mut plan) = create_test_two_fix_setup();
+    assert!(!plan.items[0].fix_done);
+    assert!(!plan.items[1].fix_done);
+
+    // Both items were successfully fixed, but the apply ran with
+    // auto_reply=false: no reply was ever attempted for either one, so
+    // `reply_errors` is empty (nothing failed — nothing was tried).
+    plan.last_apply = Some(PrReviewApplyResult {
+        applied_at: chrono::Utc::now(),
+        agent_summary: "fix-only round".to_string(),
+        fixed_ids: vec![301, 302],
+        skipped_ids: vec![],
+        pushed: false,
+        push_branch: None,
+        replies_posted: 0,
+        reply_errors: vec![],
+        dry_run: false,
+        failed_ids: vec![],
+        fix_errors: vec![],
+        push_error: None,
+        auto_reply: false,
+    });
+
+    plan.backfill_lifecycle_from_last_apply();
+
+    // fix_done still backfills from fixed_ids regardless of auto_reply...
+    assert!(plan.items[0].fix_done, "fix_done should backfill from fixed_ids");
+    assert!(plan.items[1].fix_done, "fix_done should backfill from fixed_ids");
+    // ...but reply_posted must NOT be inferred when no reply was attempted.
+    assert!(!plan.items[0].reply_posted,
+        "reply_posted must stay false when auto_reply=false, even though the fix succeeded");
+    assert!(!plan.items[1].reply_posted,
+        "reply_posted must stay false when auto_reply=false, even though the fix succeeded");
 }

@@ -82,25 +82,78 @@ impl WorktreeManager {
         Some(parent.join(format!("{repo_name}.{branch}")))
     }
 
-    /// Find a worktree for `branch` that already exists on disk.
+    /// Find a worktree for `branch` that already exists on disk and that git
+    /// itself confirms is registered for that exact branch.
     ///
     /// Used at startup to re-point a task whose recorded worktree path no
     /// longer resolves, before the reference is discarded as stale.
-    pub fn adopt_existing(&self, repo_path: &str, branch: &str) -> Option<String> {
-        self.adoptable_path(repo_path, branch)
+    ///
+    /// `porcelain` is the output of `git worktree list --porcelain` for
+    /// `repo_path`. A caller adopting many branches from the same repo in a
+    /// loop (e.g. one task per branch at startup) should fetch it once via
+    /// [`Self::worktree_list_porcelain`] and reuse it, rather than shelling
+    /// out per task.
+    pub fn adopt_existing(&self, repo_path: &str, branch: &str, porcelain: &str) -> Option<String> {
+        self.adoptable_path(repo_path, branch, porcelain)
             .map(|p| p.to_string_lossy().to_string())
+    }
+
+    /// Run `git worktree list --porcelain` for `repo_path`, synchronously.
+    ///
+    /// Exists for callers outside an async context (startup adoption runs
+    /// before the Tauri/Tokio runtime is driving anything) that still need
+    /// to verify a candidate worktree path against git's own bookkeeping.
+    /// Returns an empty listing on failure, which [`Self::worktree_for_branch`]
+    /// treats as "nothing registered" rather than panicking or adopting
+    /// blind.
+    pub fn worktree_list_porcelain(repo_path: &str) -> String {
+        std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(repo_path)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
     }
 
     /// An existing worktree for this branch that SlashIt should reuse.
     ///
     /// Checked before creating anything, so an upgrade never abandons a
     /// worktree the user still has work in.
-    fn adoptable_path(&self, repo_path: &str, branch: &str) -> Option<PathBuf> {
+    ///
+    /// A directory existing at the deterministic managed/legacy path is not
+    /// enough on its own — it could be stale, pruned, or unrelated debris
+    /// left behind on disk. The path is only trusted once `porcelain`
+    /// confirms git itself has that exact path registered for `branch`.
+    fn adoptable_path(&self, repo_path: &str, branch: &str, porcelain: &str) -> Option<PathBuf> {
+        let registered = PathBuf::from(Self::worktree_for_branch(porcelain, branch)?);
+        if !registered.is_dir() {
+            return None;
+        }
+
         let managed = self.managed_path(repo_path, branch);
-        if managed.is_dir() {
+        if registered == managed {
             return Some(managed);
         }
-        Self::legacy_path(repo_path, branch).filter(|p| p.is_dir())
+
+        if Self::legacy_path(repo_path, branch).as_deref() == Some(registered.as_path()) {
+            return Some(registered);
+        }
+
+        None
+    }
+
+    /// Async counterpart of [`Self::adoptable_path`] for callers already
+    /// running on the Tokio runtime: fetches the porcelain listing itself
+    /// rather than requiring the caller to supply one.
+    async fn adoptable_path_live(&self, repo_path: &str, branch: &str) -> Option<PathBuf> {
+        let output = tokio::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .ok()?;
+        let porcelain = String::from_utf8_lossy(&output.stdout);
+        self.adoptable_path(repo_path, branch, &porcelain)
     }
 
     /// Generate a branch name from a task UUID (first 8 chars).
@@ -110,7 +163,7 @@ impl WorktreeManager {
 
     /// Create a worktree for a task. Returns the worktree path and branch name.
     pub async fn create(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
-        if let Some(existing) = self.adoptable_path(repo_path, branch) {
+        if let Some(existing) = self.adoptable_path_live(repo_path, branch).await {
             return Ok(WorktreeInfo {
                 path: existing.to_string_lossy().to_string(),
                 branch: branch.to_string(),
@@ -126,7 +179,7 @@ impl WorktreeManager {
     /// Reattach to an existing branch (no -c flag). Used when re-queuing a task
     /// that already has a branch from a previous execution.
     pub async fn reattach(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
-        if let Some(existing) = self.adoptable_path(repo_path, branch) {
+        if let Some(existing) = self.adoptable_path_live(repo_path, branch).await {
             return Ok(WorktreeInfo {
                 path: existing.to_string_lossy().to_string(),
                 branch: branch.to_string(),
@@ -271,11 +324,11 @@ impl WorktreeManager {
     }
 
     /// Remove a worktree for a task.
-    pub async fn remove(&self, worktree_path: &str, branch: &str) -> Result<(), String> {
-        if self.wt_available {
+    pub async fn remove(&self, worktree_path: &str, branch: &str, repo_path: &str) -> Result<(), String> {
+        if self.delegates_to_wt() {
             self.remove_with_wt(worktree_path).await
         } else {
-            self.remove_with_git(worktree_path, branch).await
+            self.remove_with_git(worktree_path, branch, repo_path).await
         }
     }
 
@@ -396,10 +449,11 @@ impl WorktreeManager {
             .await
     }
 
-    async fn remove_with_git(&self, worktree_path: &str, branch: &str) -> Result<(), String> {
+    async fn remove_with_git(&self, worktree_path: &str, branch: &str, repo_path: &str) -> Result<(), String> {
         // Try normal remove first
         let output = tokio::process::Command::new("git")
             .args(["worktree", "remove", worktree_path])
+            .current_dir(repo_path)
             .output()
             .await
             .map_err(|e| format!("Failed to remove worktree: {}", e))?;
@@ -408,6 +462,7 @@ impl WorktreeManager {
             // Fallback to force if normal remove fails (e.g., uncommitted changes)
             let force_output = tokio::process::Command::new("git")
                 .args(["worktree", "remove", "--force", worktree_path])
+                .current_dir(repo_path)
                 .output()
                 .await
                 .map_err(|e| format!("Failed to force-remove worktree: {}", e))?;
@@ -416,6 +471,7 @@ impl WorktreeManager {
                 // Last resort: prune
                 let _ = tokio::process::Command::new("git")
                     .args(["worktree", "prune"])
+                    .current_dir(repo_path)
                     .output()
                     .await;
             }
@@ -424,6 +480,7 @@ impl WorktreeManager {
         // Delete the branch
         let _ = tokio::process::Command::new("git")
             .args(["branch", "-D", branch])
+            .current_dir(repo_path)
             .output()
             .await;
 
@@ -448,8 +505,11 @@ impl WorktreeManager {
         }
 
         // Not registered with git: fall back to the paths we would have used,
-        // newest scheme first.
-        if let Some(path) = self.adoptable_path(repo_path, branch) {
+        // newest scheme first. (`worktree_for_branch` already checked this
+        // same listing above and found no match, so `adoptable_path`'s own
+        // git-registration check can only agree — kept for symmetry with
+        // `create`/`reattach` and in case that matching logic ever diverges.)
+        if let Some(path) = self.adoptable_path(repo_path, branch, &stdout) {
             return Ok(WorktreeInfo {
                 path: path.to_string_lossy().to_string(),
                 branch: branch.to_string(),
@@ -622,6 +682,121 @@ branch refs/heads/fix
         );
     }
 
+    // -------------------------------------------------------
+    // adoptable_path: a directory existing on disk is not enough — it must
+    // also be confirmed by git's own worktree list for this exact branch.
+    // -------------------------------------------------------
+
+    #[test]
+    fn adoptable_path_rejects_a_directory_that_exists_but_is_not_a_registered_worktree() {
+        let mgr = test_manager();
+        let repo = "/home/someone/code/my-app";
+        let branch = "task-stale0001";
+        let managed = mgr.managed_path(repo, branch);
+        std::fs::create_dir_all(&managed).expect("failed to create candidate dir");
+
+        // Git knows nothing about this branch at all -- e.g. the worktree
+        // was pruned, or the directory is unrelated debris that happens to
+        // sit at the deterministic path.
+        let porcelain = "\
+worktree /home/someone/code/my-app
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+";
+
+        assert!(
+            mgr.adoptable_path(repo, branch, porcelain).is_none(),
+            "a directory that exists on disk but isn't registered with git must not be adopted"
+        );
+
+        let _ = std::fs::remove_dir_all(managed.parent().unwrap());
+    }
+
+    #[test]
+    fn adoptable_path_accepts_a_directory_git_confirms_is_registered_for_the_branch() {
+        let mgr = test_manager();
+        let repo = "/home/someone/code/my-app";
+        let branch = "task-abcd1234";
+        let managed = mgr.managed_path(repo, branch);
+        std::fs::create_dir_all(&managed).expect("failed to create candidate dir");
+
+        let porcelain = format!(
+            "worktree {}\nHEAD 2222222222222222222222222222222222222222\nbranch refs/heads/{}\n",
+            managed.display(),
+            branch
+        );
+
+        let result = mgr.adoptable_path(repo, branch, &porcelain);
+        assert_eq!(result.as_deref(), Some(managed.as_path()));
+
+        let _ = std::fs::remove_dir_all(managed.parent().unwrap());
+    }
+
+    #[test]
+    fn adoptable_path_rejects_a_registration_for_a_different_branch() {
+        let mgr = test_manager();
+        let repo = "/home/someone/code/my-app";
+        let branch = "task-abcd1234";
+        let managed = mgr.managed_path(repo, branch);
+        std::fs::create_dir_all(&managed).expect("failed to create candidate dir");
+
+        // Git has a worktree registered at our exact candidate path, but for
+        // a different branch -- adopting it would hand this task someone
+        // else's branch.
+        let porcelain = format!(
+            "worktree {}\nHEAD 3333333333333333333333333333333333333333\nbranch refs/heads/some-other-branch\n",
+            managed.display()
+        );
+
+        assert!(mgr.adoptable_path(repo, branch, &porcelain).is_none());
+
+        let _ = std::fs::remove_dir_all(managed.parent().unwrap());
+    }
+
+    #[test]
+    fn adoptable_path_rejects_branch_registered_at_an_unrelated_path() {
+        let mgr = test_manager();
+        let repo = "/home/someone/code/my-app";
+        let branch = "task-abcd1234";
+        let managed = mgr.managed_path(repo, branch);
+        std::fs::create_dir_all(&managed).expect("failed to create candidate dir");
+
+        // Git confirms `branch` is registered, but at some other worktree
+        // entirely (e.g. the user's primary checkout) -- not at either
+        // deterministic path SlashIt would place it at, so it must not be
+        // adopted even though our own candidate directory also exists.
+        let porcelain = format!(
+            "worktree /home/someone/code/my-app\nHEAD 4444444444444444444444444444444444444444\nbranch refs/heads/{}\n",
+            branch
+        );
+
+        assert!(mgr.adoptable_path(repo, branch, &porcelain).is_none());
+
+        let _ = std::fs::remove_dir_all(managed.parent().unwrap());
+    }
+
+    #[test]
+    fn adopt_existing_returns_the_string_path_when_git_confirms_registration() {
+        let mgr = test_manager();
+        let repo = "/home/someone/code/my-app";
+        let branch = "task-abcd1234";
+        let managed = mgr.managed_path(repo, branch);
+        std::fs::create_dir_all(&managed).expect("failed to create candidate dir");
+
+        let porcelain = format!(
+            "worktree {}\nHEAD 5555555555555555555555555555555555555555\nbranch refs/heads/{}\n",
+            managed.display(),
+            branch
+        );
+
+        assert_eq!(
+            mgr.adopt_existing(repo, branch, &porcelain),
+            Some(managed.to_string_lossy().to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(managed.parent().unwrap());
+    }
+
     #[test]
     fn branch_for_task_format() {
         let id = Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();
@@ -763,6 +938,24 @@ branch refs/heads/fix
         assert!(mgr.exists(&info.path));
     }
 
+    #[test]
+    fn worktree_list_porcelain_returns_git_output_for_a_real_repo() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        let porcelain = WorktreeManager::worktree_list_porcelain(repo_path);
+        assert!(
+            porcelain.contains("branch refs/heads/main"),
+            "expected the main branch in the listing, got: {porcelain}"
+        );
+    }
+
+    #[test]
+    fn worktree_list_porcelain_returns_empty_string_when_git_fails() {
+        let porcelain = WorktreeManager::worktree_list_porcelain("/tmp/slashit_not_a_repo_at_all");
+        assert_eq!(porcelain, "");
+    }
+
     #[tokio::test]
     async fn integration_create_stacked_branch_falls_back_to_git_when_placement_is_managed() {
         let tmp = create_temp_git_repo();
@@ -788,6 +981,39 @@ branch refs/heads/fix
     }
 
     #[tokio::test]
+    async fn integration_remove_falls_back_to_git_when_placement_is_managed() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        // Mirrors `integration_create_stacked_branch_falls_back_to_git_when_placement_is_managed`:
+        // `wt_available` is forced true without an actual `wt` binary on
+        // PATH. `remove()` must gate on `delegates_to_wt()` (false here,
+        // since placement is `Managed`), not raw `wt_available`. If the gate
+        // regresses to checking `wt_available` directly, this test fails by
+        // trying (and failing) to run a nonexistent `wt remove`.
+        let mgr = WorktreeManager {
+            wt_available: true,
+            gs_available: false,
+            paths: test_paths(),
+            placement: WorktreePlacement::Managed,
+        };
+
+        let info = mgr
+            .create(repo_path, "managed-remove")
+            .await
+            .expect("create failed");
+        assert!(Path::new(&info.path).exists());
+
+        let result = mgr.remove(&info.path, "managed-remove", repo_path).await;
+        assert!(
+            result.is_ok(),
+            "remove should use the git-managed path, not remove_with_wt: {:?}",
+            result.err()
+        );
+        assert!(!Path::new(&info.path).exists(), "worktree directory should be removed");
+    }
+
+    #[tokio::test]
     async fn integration_exists_nonexistent() {
         let mgr = test_manager();
         assert!(!mgr.exists("/tmp/slashit_does_not_exist_999"));
@@ -803,15 +1029,11 @@ branch refs/heads/fix
         let info = mgr.create(repo_path, "remove-me").await.expect("create failed");
         assert!(Path::new(&info.path).exists());
 
-        // NOTE: remove_with_git() does not set current_dir on the git commands,
-        // so `git worktree remove` and `git branch -D` run from the process CWD.
-        // This means removal only succeeds when CWD is inside a git repo.
-        // We set CWD to the repo so the underlying git commands can find it.
-        // This documents a known limitation in the current implementation.
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(repo_path).unwrap();
-
-        let result = mgr.remove(&info.path, "remove-me").await;
+        // `remove_with_git` now takes `repo_path` explicitly and sets
+        // `.current_dir` on every git invocation, so this no longer needs to
+        // mutate the process-wide CWD (which was also unsound under
+        // parallel test execution).
+        let result = mgr.remove(&info.path, "remove-me", repo_path).await;
         assert!(result.is_ok(), "remove should succeed: {:?}", result.err());
         assert!(
             !Path::new(&info.path).exists(),
@@ -829,15 +1051,55 @@ branch refs/heads/fix
             !branches.contains("remove-me"),
             "branch should be deleted after remove"
         );
+    }
+
+    #[tokio::test]
+    async fn integration_remove_worktree_uses_repo_path_not_process_cwd() {
+        // Two unrelated repos: the process CWD is pointed at one (which has
+        // no relationship to the worktree being removed) while the
+        // worktree's own repo path is passed explicitly to `remove`. If
+        // `remove_with_git` ever regresses to relying on the process CWD
+        // instead of `.current_dir(repo_path)`, the git invocations run
+        // against the wrong repository and this test fails.
+        let target_repo = create_temp_git_repo();
+        let target_repo_path = target_repo.path().to_str().unwrap().to_string();
+        let unrelated_repo = create_temp_git_repo();
+
+        let mgr = test_manager();
+        let info = mgr
+            .create(&target_repo_path, "cwd-independent")
+            .await
+            .expect("create failed");
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(unrelated_repo.path()).unwrap();
+
+        let result = mgr.remove(&info.path, "cwd-independent", &target_repo_path).await;
 
         std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(result.is_ok(), "remove should succeed: {:?}", result.err());
+        assert!(
+            !Path::new(&info.path).exists(),
+            "worktree directory should be removed from the target repo"
+        );
+
+        let branch_check = std::process::Command::new("git")
+            .args(["branch", "--list", "cwd-independent"])
+            .current_dir(&target_repo_path)
+            .output()
+            .expect("git branch list failed");
+        assert!(
+            !String::from_utf8_lossy(&branch_check.stdout).contains("cwd-independent"),
+            "branch should be deleted from the target repo"
+        );
     }
 
     #[tokio::test]
     async fn integration_remove_nonexistent_does_not_panic() {
         let mgr = test_manager();
         // Removing a non-existent worktree should not panic (may return Err, that is fine).
-        let _ = mgr.remove("/tmp/slashit_no_such_wt", "no-branch").await;
+        let _ = mgr.remove("/tmp/slashit_no_such_wt", "no-branch", "/tmp").await;
     }
 
     #[tokio::test]

@@ -192,6 +192,12 @@ pub fn run() {
                 .collect()
         };
 
+        // Cache `git worktree list --porcelain` per repository so tasks that
+        // share a repo shell out to git at most once during this loop,
+        // rather than once per task.
+        let mut porcelain_cache: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
         for task in tasks.values_mut() {
             let Some(wt_path) = task.worktree_path.as_ref() else {
                 continue;
@@ -205,7 +211,10 @@ pub fn run() {
                 .as_ref()
                 .zip(repo_for_project.get(&task.project_id))
                 .and_then(|(branch, repo)| {
-                    app_state.worktree_manager.adopt_existing(repo, branch)
+                    let porcelain = porcelain_cache
+                        .entry(repo.clone())
+                        .or_insert_with(|| worktree::WorktreeManager::worktree_list_porcelain(repo));
+                    app_state.worktree_manager.adopt_existing(repo, branch, porcelain)
                 });
 
             match adopted {

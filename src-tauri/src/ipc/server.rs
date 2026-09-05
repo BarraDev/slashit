@@ -23,10 +23,69 @@ pub struct IpcContext {
 /// itself can only be applied *after* `bind()` returns, which leaves a window
 /// in which the socket exists at its final path with the process umask; a
 /// 0700 parent closes that window because nobody else can traverse into it.
+///
+/// Only creates when nothing exists yet at `dir` — an already-existing entry
+/// (from `$XDG_RUNTIME_DIR/slashit-app`, or a leftover in the world-writable
+/// temp-dir fallback) is never chmod'd on trust alone; it goes through
+/// [`ensure_safe_runtime_dir`] first, the same as a freshly created one.
 fn prepare_socket_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    match std::fs::create_dir(dir) {
+        Ok(()) => {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    ensure_safe_runtime_dir(dir)
+}
+
+/// Refuse to trust a pre-existing runtime directory just because something is
+/// there. `create_dir`-then-chmod only covers a directory this process just
+/// made; a directory that already existed could be a symlink planted to
+/// redirect the chmod (and the eventual socket) somewhere else, a leftover
+/// owned by a different user, or one left in an over-permissive mode by an
+/// older SlashIt version. This is the single authoritative check for both the
+/// `$XDG_RUNTIME_DIR` and temp-dir-fallback cases — both funnel through
+/// [`prepare_socket_dir`], so the invariant only needs to live once.
+fn ensure_safe_runtime_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Error;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(Error::other(format!(
+            "refusing to use {}: it is a symlink, not a real directory",
+            dir.display()
+        )));
+    }
+    if !meta.is_dir() {
+        return Err(Error::other(format!(
+            "refusing to use {}: not a directory",
+            dir.display()
+        )));
+    }
+    if meta.uid() != current_uid() {
+        return Err(Error::other(format!(
+            "refusing to use {}: not owned by the current user",
+            dir.display()
+        )));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn current_uid() -> u32 {
+    // No `libc` dependency in this crate; declaring the one symbol needed
+    // avoids pulling one in just for this.
+    extern "C" {
+        #[link_name = "geteuid"]
+        fn libc_geteuid() -> u32;
+    }
+    // Safety: geteuid takes no arguments and always succeeds.
+    unsafe { libc_geteuid() }
 }
 
 /// Decide whether an existing socket file may be replaced.
@@ -124,4 +183,62 @@ async fn handle_connection(
     writer.flush().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+
+    #[test]
+    fn prepare_socket_dir_creates_a_fresh_directory_at_0700() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("runtime");
+
+        prepare_socket_dir(&dir).unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn prepare_socket_dir_accepts_and_tightens_an_existing_owned_directory() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("runtime");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        prepare_socket_dir(&dir).unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "an over-permissive but owned directory is tightened, not rejected");
+    }
+
+    #[test]
+    fn prepare_socket_dir_refuses_a_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("elsewhere");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("runtime");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = prepare_socket_dir(&link).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn prepare_socket_dir_refuses_a_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("runtime");
+        std::fs::write(&path, b"not a directory").unwrap();
+
+        let err = prepare_socket_dir(&path).unwrap_err();
+        assert!(err.to_string().contains("not a directory"));
+    }
+
+    // Rejecting a directory owned by a different uid is exercised by
+    // `ensure_safe_runtime_dir`'s `meta.uid() != current_uid()` check, but a
+    // unit test cannot fabricate a directory owned by another user without
+    // root — that branch is verified by code inspection only.
 }
