@@ -1084,17 +1084,30 @@ mod tests {
 
     #[test]
     fn the_process_environment_is_read_when_asked() {
-        // The only test that touches the real environment; everything else
-        // injects a map, because `set_var` races with any concurrent reader.
+        // The only test in this module that touches the real environment;
+        // everything else injects a map, because `set_var` races with any
+        // concurrent reader. `cargo test` runs this binary's tests as
+        // parallel threads of one process, so this acquires the same lock
+        // `crate::config::paths`'s own environment-mutating tests use — a
+        // lock scoped to just this variable would not protect against that
+        // other module's unlocked-from-here mutations of a *different*
+        // variable, since concurrent `setenv`/`getenv` are undefined behavior
+        // in the platform C library regardless of which variable each side
+        // touches.
+        let _guard = crate::config::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let key = env_var_for("daemon_mode");
         let previous = std::env::var(&key).ok();
-        // SAFETY: single-threaded test; restored below.
+        // SAFETY: the guard above makes this the only thread touching the
+        // environment; restored below before it drops.
         unsafe { std::env::set_var(&key, "yes") };
 
         let resolved = FeatureResolver::new().with_process_env().resolve();
 
         match previous {
-            // SAFETY: single-threaded test.
+            // SAFETY: as above.
             Some(v) => unsafe { std::env::set_var(&key, v) },
             None => unsafe { std::env::remove_var(&key) },
         }

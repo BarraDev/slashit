@@ -98,7 +98,16 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     // stack is re-resolved rather than the top layer being poked into the
     // already-resolved set. Nothing is written back: an override is for this
     // run, not a change to the operator's configuration.
-    if !options.feature_overrides.is_empty() {
+    //
+    // `feature_diagnostics` keeps the full resolution — including which flags
+    // the CLI decided — for `handle_features` below. `state.features` alone
+    // cannot answer that later: it is a plain `FeatureFlags`, so a value the
+    // CLI chose is indistinguishable from one the config file happened to
+    // already hold, and `FeatureFlags::diagnostics()` would re-attribute it to
+    // whichever of `config`/`env` matches instead.
+    let feature_diagnostics = if options.feature_overrides.is_empty() {
+        None
+    } else {
         let persisted = crate::config::features::FeatureFlags::load(&state.paths);
         let resolved = crate::config::features::FeatureResolver::new()
             .with_config(persisted)
@@ -107,7 +116,8 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .resolve_and_report();
 
-        for flag in resolved.to_flag_info() {
+        let info = resolved.to_flag_info();
+        for flag in &info {
             if flag.source == "cli" {
                 println!(
                     "slashitd: feature `{}` = {} (command line)",
@@ -118,7 +128,10 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
 
         let mut flags = state.features.write().await;
         resolved.apply_to(&mut flags);
-    }
+        drop(flags);
+
+        Some(info)
+    };
 
     let _pid_file = PidFile::write(state.paths.pid_file())?;
 
@@ -137,12 +150,13 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
         },
     ));
     let _ = state.executor.set(executor.clone());
-    executor.start_polling();
-    println!("slashitd: queue executor started");
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    executor.start_polling(Some(shutdown_tx.subscribe()));
+    println!("slashitd: queue executor started");
+
     let control = Arc::new(DaemonControl {
-        shutdown: shutdown_tx,
+        shutdown: shutdown_tx.clone(),
     });
 
     let ipc_config = slashit_ipc::IpcConfig::load(&state.paths.ipc_config_file());
@@ -157,6 +171,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
         events: events.clone(),
         control: control.clone(),
         features: state.features.clone(),
+        feature_diagnostics,
         paths: state.paths.clone(),
     });
 
@@ -192,7 +207,10 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     };
 
     // Stop accepting new work before waiting on what is running, so the
-    // in-flight set cannot grow while we drain it.
+    // in-flight set cannot grow while we drain it. Sent unconditionally
+    // because only the IPC `Quit` path already set this — a signal or a
+    // failed IPC server must stop promotion too.
+    let _ = shutdown_tx.send(true);
     server.abort();
 
     shutdown(&executor).await;
