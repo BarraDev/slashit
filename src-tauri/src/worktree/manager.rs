@@ -468,7 +468,10 @@ impl WorktreeManager {
                 .map_err(|e| format!("Failed to force-remove worktree: {}", e))?;
 
             if !force_output.status.success() {
-                // Last resort: prune
+                // Last resort: prune stale git metadata for worktrees whose
+                // directory is already gone. It cannot remove a directory
+                // that is still present, so it can never turn this into a
+                // false success below.
                 let _ = tokio::process::Command::new("git")
                     .args(["worktree", "prune"])
                     .current_dir(repo_path)
@@ -477,7 +480,22 @@ impl WorktreeManager {
             }
         }
 
-        // Delete the branch
+        // Every attempt above can fail with a non-zero exit — which is not a
+        // Rust `Err` — without the directory actually being gone. The only
+        // trustworthy signal that removal worked is checking for the
+        // directory itself; reporting success otherwise would let a caller
+        // clear `worktree_path` for a worktree that is still on disk, losing
+        // the only handle back to it.
+        if self.exists(worktree_path) {
+            return Err(format!(
+                "worktree at {} still exists after worktree remove, --force, and prune all ran",
+                worktree_path
+            ));
+        }
+
+        // Only safe to delete the branch once the worktree checked out on it
+        // is confirmed gone: deleting it first would make a retry unable to
+        // recreate the worktree at all.
         let _ = tokio::process::Command::new("git")
             .args(["branch", "-D", branch])
             .current_dir(repo_path)
@@ -1055,15 +1073,26 @@ branch refs/heads/main
 
     #[tokio::test]
     async fn integration_remove_worktree_uses_repo_path_not_process_cwd() {
-        // Two unrelated repos: the process CWD is pointed at one (which has
-        // no relationship to the worktree being removed) while the
-        // worktree's own repo path is passed explicitly to `remove`. If
-        // `remove_with_git` ever regresses to relying on the process CWD
-        // instead of `.current_dir(repo_path)`, the git invocations run
-        // against the wrong repository and this test fails.
+        // Two unrelated repos, neither of which is the process's own ambient
+        // CWD (wherever `cargo test` happens to run from — this crate's own
+        // checkout, never one of these temp repos). `remove_with_git` sets
+        // `.current_dir(repo_path)` on every git invocation, so passing
+        // `target_repo_path` explicitly must succeed regardless of that
+        // ambient CWD. Proving this does not require mutating the
+        // process-wide CWD via `std::env::set_current_dir`, which would be
+        // unsound here: it is process-global, not per-thread, and other
+        // `#[tokio::test]` functions can be running concurrently in the same
+        // process.
         let target_repo = create_temp_git_repo();
         let target_repo_path = target_repo.path().to_str().unwrap().to_string();
         let unrelated_repo = create_temp_git_repo();
+
+        assert_ne!(
+            std::env::current_dir().unwrap(),
+            target_repo.path(),
+            "the test's own CWD must not coincidentally be the target repo, or this test would \
+             not actually exercise CWD independence"
+        );
 
         let mgr = test_manager();
         let info = mgr
@@ -1071,12 +1100,7 @@ branch refs/heads/main
             .await
             .expect("create failed");
 
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(unrelated_repo.path()).unwrap();
-
         let result = mgr.remove(&info.path, "cwd-independent", &target_repo_path).await;
-
-        std::env::set_current_dir(original_dir).unwrap();
 
         assert!(result.is_ok(), "remove should succeed: {:?}", result.err());
         assert!(
@@ -1092,6 +1116,63 @@ branch refs/heads/main
         assert!(
             !String::from_utf8_lossy(&branch_check.stdout).contains("cwd-independent"),
             "branch should be deleted from the target repo"
+        );
+
+        // The unrelated repo must never have been touched by any of this.
+        let unrelated_branch_check = std::process::Command::new("git")
+            .args(["branch", "--list", "cwd-independent"])
+            .current_dir(unrelated_repo.path())
+            .output()
+            .expect("git branch list failed");
+        assert!(
+            String::from_utf8_lossy(&unrelated_branch_check.stdout).trim().is_empty(),
+            "the unrelated repo must never see a branch created/removed in the target repo"
+        );
+    }
+
+    /// Deterministic reproduction of the false-success bug: `git worktree
+    /// remove`, `--force`, and `prune` all fail to actually delete the
+    /// directory (a permission-blocked, non-empty subdirectory defeats the
+    /// recursive delete each of them relies on), so `remove_with_git` must
+    /// report `Err` — never silently `Ok(())` for a worktree still on disk.
+    #[tokio::test]
+    async fn remove_with_git_reports_err_when_the_directory_survives_every_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::ipc::server::current_uid() == 0 {
+            return; // root ignores the permission bits this test relies on
+        }
+
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        let mgr = test_manager();
+        let info = mgr
+            .create(repo_path, "undeletable")
+            .await
+            .expect("create failed");
+
+        let blocked = Path::new(&info.path).join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("file.txt"), b"content").unwrap();
+        // No read/write/execute: git cannot list or unlink this directory's
+        // contents, so the directory itself can never become empty and no
+        // fallback (normal remove, --force, prune) can fully delete it.
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = mgr.remove(&info.path, "undeletable", repo_path).await;
+
+        // Restore permissions so the temp dir can be cleaned up on drop.
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "removal that cannot actually delete the directory must report Err"
+        );
+        assert!(
+            Path::new(&info.path).exists(),
+            "the worktree directory must still be there when removal is reported as failed, so \
+             a caller retains worktree_path for a future retry"
         );
     }
 
@@ -1178,23 +1259,18 @@ branch refs/heads/main
             .output()
             .expect("git branch failed");
 
-        // Create a stacked branch on top of the base.
-        // In the git-only fallback path, this does `git branch stacked-branch base-branch`
-        // then `create_with_git` which does `git worktree add <path> -b stacked-branch`.
-        // Since `git branch` already created it, `create_with_git` will fail with `-b`.
-        // This tests the actual code path -- the branch is created first, then worktree add
-        // with -b fails. This is a known limitation of the git-only fallback.
-        // We just verify the call doesn't panic.
-        let result = mgr
+        // Create a stacked branch on top of the base. In the git-only
+        // fallback path this runs `git branch stacked-branch base-branch`
+        // then attaches a worktree to the already-created branch without
+        // `-b` (`git_worktree_add(..., create_branch: false)`), so it must
+        // succeed.
+        let stacked = mgr
             .create_stacked_branch(repo_path, "stacked-branch", "base-branch")
-            .await;
-        // The git-only path creates the branch first then tries -b again, which fails.
-        // This documents the current behavior.
-        if let Ok(stacked) = &result {
-            assert!(Path::new(&stacked.path).exists());
-            assert_eq!(stacked.branch, "stacked-branch");
-        }
-        // If it errors, that's the expected git-only fallback limitation
+            .await
+            .expect("git-only stacked branch creation from a non-main base must succeed");
+
+        assert!(Path::new(&stacked.path).exists());
+        assert_eq!(stacked.branch, "stacked-branch");
     }
 
     #[tokio::test]

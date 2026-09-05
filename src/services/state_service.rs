@@ -68,13 +68,19 @@ pub async fn apply_state_migration(
 }
 
 /// Record the preference without moving any files.
+///
+/// `known_updated_at` should be the `updated_at` from the last
+/// [`StateLocationInfo`] read for this project, so a decision based on a
+/// stale read is rejected by the backend instead of silently applied.
 pub async fn set_state_location(
     project_id: String,
     location: StateLocation,
+    known_updated_at: Option<String>,
 ) -> Result<StateLocationInfo, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "projectId": project_id,
         "location": location,
+        "knownUpdatedAt": known_updated_at,
     }))
     .map_err(|e| e.to_string())?;
     let response = invoke("set_state_location", args).await?;

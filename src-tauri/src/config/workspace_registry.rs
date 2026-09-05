@@ -58,7 +58,11 @@ impl WorkspaceRegistry {
 
     /// Load from an explicit path, split out from `load()` so tests can point
     /// it at a tempdir instead of the real OS config directory.
-    fn load_from(config_path: PathBuf) -> io::Result<Self> {
+    ///
+    /// `pub(crate)` rather than private so other modules' tests (e.g. the
+    /// queue executor's workspace-root fallback tests) can build a real
+    /// registry backed by a tempdir instead of the OS config directory.
+    pub(crate) fn load_from(config_path: PathBuf) -> io::Result<Self> {
         let workspaces = if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
             match toml::from_str::<RegistryFile>(&content) {
@@ -230,6 +234,10 @@ mod tests {
     #[test]
     fn quarantine_rename_failure_returns_err_instead_of_empty_registry() {
         use std::os::unix::fs::PermissionsExt;
+
+        if crate::ipc::server::current_uid() == 0 {
+            return; // root ignores permission bits, so the rename would still succeed
+        }
 
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("workspaces.toml");

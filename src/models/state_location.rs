@@ -77,6 +77,9 @@ pub struct StateLocationInfo {
     pub external_dir: String,
     pub in_project_dir: String,
     pub can_choose: bool,
+    /// RFC3339 timestamp; pass back as `known_updated_at` to `set_state_location`
+    /// so a decision based on a stale read is rejected rather than applied.
+    pub updated_at: String,
 }
 
 /// A read-only preview of a proposed migration.

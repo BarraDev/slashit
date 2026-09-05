@@ -61,7 +61,9 @@ pub fn StorageSettings(project_id: String) -> impl IntoView {
                 Ok(plan) => {
                     if plan.source_file_count == 0 && !plan.destination_exists {
                         // Nothing to move: just record the preference.
-                        match state_service::set_state_location(pid, target).await {
+                        let known_updated_at = info.get_untracked().map(|i| i.updated_at.clone());
+                        match state_service::set_state_location(pid, target, known_updated_at).await
+                        {
                             Ok(updated) => {
                                 info.set(Some(updated));
                                 toast::success("Storage location updated".to_string());

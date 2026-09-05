@@ -842,8 +842,17 @@ pub async fn remove_external_ref(
     }
 }
 
-/// Core update_task_status logic extracted for testability
-/// Applies status transition rules without Tauri state or persistence
+/// Core update_task_status logic extracted for testability.
+///
+/// Applies status transition rules without Tauri state, worktree removal, or
+/// persistence. Classification is delegated to [`classify_status_transition`]
+/// — the same function `update_task_status`/`reorder_task` use — so this
+/// helper cannot drift into teaching a different contract than production.
+///
+/// Deliberately does **not** clear `worktree_path`: production only clears it
+/// once [`cleanup_worktree`]'s actual removal succeeds, and this helper never
+/// runs any removal. Clearing it here would model a cleanup that never
+/// happened, exactly the bug this file's worktree-lifecycle fix closed.
 #[cfg(test)]
 pub fn update_task_status_logic(
     tasks: &mut HashMap<Uuid, Task>,
@@ -855,20 +864,11 @@ pub fn update_task_status_logic(
         task.status = status.clone();
         task.updated_at = chrono::Utc::now();
 
-        // Reset execution state when moving out of Error or back to early columns
-        if old_status == TaskStatus::Error
-            || matches!(status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
-        {
+        if let StatusTransitionEffect::ResetAndCleanUp = classify_status_transition(&old_status, &status) {
             task.phase = TaskPhase::Idle;
             task.phase_progress = 0;
             task.overall_progress = 0;
             task.error_message = None;
-            task.worktree_path = None;
-        }
-
-        // Cleanup worktree when moving to Done (keep branch for PR)
-        if matches!(status, TaskStatus::Done) {
-            task.worktree_path = None;
         }
 
         Some(task.clone())
@@ -1595,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn test_status_any_to_done_clears_worktree_path() {
+    fn test_status_any_to_done_retains_worktree_path_until_cleanup_succeeds() {
         let project_id = Uuid::new_v4();
         let mut task = create_test_task_full("Task 1", project_id, TaskStatus::InProgress, 0);
         task.worktree_path = Some("/tmp/wt-test".to_string());
@@ -1608,9 +1608,12 @@ mod tests {
         assert!(result.is_some());
         let updated = result.unwrap();
         assert_eq!(updated.status, TaskStatus::Done);
-        // worktree_path cleared (both by the early-column reset and Done cleanup)
-        assert!(updated.worktree_path.is_none());
-        // branch_name kept for PR creation (Done cleanup does not clear it)
+        // This helper never runs worktree removal, so it must not model
+        // removal as already successful — production only clears
+        // `worktree_path` once `cleanup_worktree`'s actual removal succeeds.
+        assert_eq!(updated.worktree_path, Some("/tmp/wt-test".to_string()));
+        // branch_name kept for PR creation either way.
+        assert_eq!(updated.branch_name, Some("feature-branch".to_string()));
     }
 
     #[test]
