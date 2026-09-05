@@ -61,11 +61,46 @@ pub struct UpdaterState {
     pending: Arc<Mutex<Option<Update>>>,
     /// When the last *successful* check completed.
     last_check: Arc<Mutex<Option<DateTime<Utc>>>>,
+    /// Held for the whole download-and-install span via [`InstallGuard`], so
+    /// a second concurrent invocation is refused rather than starting its own
+    /// `download_and_install` against the same target executable. The
+    /// frontend already guards its own "Download and install" button, but
+    /// that is UI state, not a backend invariant — the command is callable
+    /// regardless, and a stalled install followed by a retry is an ordinary
+    /// sequence.
+    installing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl UpdaterState {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// Releases [`UpdaterState::installing`] on every exit path, including the
+/// several early `?`/`return Err` points in
+/// [`updater_download_and_install`] before the download even starts — a
+/// manual release at each of those call sites would only need one to be
+/// missed for a refusal to become permanent.
+struct InstallGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl InstallGuard {
+    /// `None` if another install is already in flight.
+    fn try_acquire(flag: &Arc<std::sync::atomic::AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .ok()
+        .map(|_| Self(flag.clone()))
+    }
+}
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -539,6 +574,13 @@ pub async fn updater_download_and_install(
         return Err(refusal);
     }
 
+    let _install_guard = InstallGuard::try_acquire(&state.updater.installing).ok_or_else(|| {
+        err(
+            UpdaterErrorKind::Install,
+            "An update is already being installed. Wait for it to finish.",
+        )
+    })?;
+
     // Before a single byte moves. On an unpackaged Linux build the plugin's
     // fallback rewrites whatever `current_exe()` resolves to, which in a
     // development tree is the developer's own build output.
@@ -625,6 +667,23 @@ pub fn updater_restart(app: AppHandle) {
 mod tests {
     use super::*;
     use tauri_plugin_updater::Error as PluginError;
+
+    #[test]
+    fn a_second_install_is_refused_while_the_first_holds_the_guard() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let first = InstallGuard::try_acquire(&flag).expect("first acquire must succeed");
+        assert!(
+            InstallGuard::try_acquire(&flag).is_none(),
+            "a second acquire must be refused while the first guard is held"
+        );
+
+        drop(first);
+        assert!(
+            InstallGuard::try_acquire(&flag).is_some(),
+            "dropping the guard must release the flag for the next caller"
+        );
+    }
 
     fn probe(os: &'static str, install: InstallKind) -> InstallProbe {
         InstallProbe {
