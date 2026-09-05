@@ -25,12 +25,25 @@ struct IdArgs<'a> {
 #[derive(Serialize)]
 struct Empty;
 
+/// A rejected Tauri invocation carries the backend's `String` error as a
+/// `JsValue`. `{:?}`-formatting it renders `JsValue("…")` verbatim — this
+/// unwraps to the actual message so callers (toasts, etc.) show the real
+/// error text instead of its debug wrapper.
+fn js_error_to_string(value: JsValue) -> String {
+    value.as_string().unwrap_or_else(|| {
+        js_sys::JSON::stringify(&value)
+            .ok()
+            .and_then(|s| s.as_string())
+            .unwrap_or_else(|| "Tauri command failed".to_string())
+    })
+}
+
 pub async fn create_workspace(name: &str, root_path: &str) -> Result<Workspace, String> {
     let args = serde_wasm_bindgen::to_value(&CreateArgs { name, root_path })
         .map_err(|e| e.to_string())?;
     let result = JsFuture::from(invoke("create_workspace", args))
         .await
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(js_error_to_string)?;
     serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())
 }
 
@@ -38,7 +51,7 @@ pub async fn list_workspaces() -> Result<Vec<Workspace>, String> {
     let args = serde_wasm_bindgen::to_value(&Empty).map_err(|e| e.to_string())?;
     let result = JsFuture::from(invoke("list_workspaces", args))
         .await
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(js_error_to_string)?;
     serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())
 }
 
@@ -47,7 +60,7 @@ pub async fn get_workspace(workspace_id: &str) -> Result<Workspace, String> {
         .map_err(|e| e.to_string())?;
     let result = JsFuture::from(invoke("get_workspace", args))
         .await
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(js_error_to_string)?;
     serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())
 }
 
@@ -56,6 +69,6 @@ pub async fn delete_workspace(workspace_id: &str) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
     let result = JsFuture::from(invoke("delete_workspace", args))
         .await
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(js_error_to_string)?;
     serde_wasm_bindgen::from_value(result).map_err(|e| e.to_string())
 }

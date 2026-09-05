@@ -87,10 +87,14 @@ pub async fn delete_workspace(
     // would leave that project's `scope` referencing a workspace id nothing
     // can resolve anymore. Reject the deletion instead of guessing at a
     // cascade — the caller can re-scope or delete those projects first.
-    let referencing = {
-        let projects = state.project.projects.read().await;
-        projects_referencing(&projects, workspace_id)
-    };
+    // Held across the registry mutation below: releasing it right after the
+    // check would leave a window where a project can attach to this
+    // workspace before the removal lands, recreating the dangling reference
+    // this check exists to prevent. No other path in this module acquires
+    // both locks, so holding this order (projects, then registry) here
+    // cannot deadlock against anything else.
+    let projects = state.project.projects.read().await;
+    let referencing = projects_referencing(&projects, workspace_id);
     if !referencing.is_empty() {
         return Err(format!(
             "Cannot delete workspace: {} project(s) still reference it: {}",

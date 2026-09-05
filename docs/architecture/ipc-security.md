@@ -40,7 +40,7 @@ connection from the running app.
 Twelve commands. Most are read-only, but two are not, and together they are a
 full local code-execution primitive:
 
-```
+```text
 CreateTask { project_id, title, description, ... }
 MoveTask   { task_id, status: "in_progress" }
 ```

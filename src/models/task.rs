@@ -137,7 +137,7 @@ impl PrReviewPlan {
                 if !item.fix_done {
                     item.fix_done = true;
                 }
-                if last.auto_reply && !item.reply_posted && !failed_reply_ids.contains(&cid) {
+                if last.auto_reply == Some(true) && !item.reply_posted && !failed_reply_ids.contains(&cid) {
                     item.reply_posted = true;
                 }
             }
@@ -227,12 +227,14 @@ pub struct PrReviewApplyResult {
     pub fix_errors: Vec<String>,
     #[serde(default)]
     pub push_error: Option<String>,
-    /// Whether this apply ran with `auto_reply=true`. Mirrors the backend
-    /// field so `backfill_lifecycle_from_last_apply` can tell "reply
-    /// attempted and succeeded" apart from "reply intentionally never
-    /// attempted".
+    /// Whether this apply ran with `auto_reply=true` — `None` for a result
+    /// persisted before this field existed. Mirrors the backend field
+    /// exactly, including the tri-state: backfill must not treat a missing
+    /// historical value as `false`, and must not use `replies_posted` to
+    /// guess which individual item it belongs to. See the backend
+    /// `PrReviewApplyResult::auto_reply` doc for the full reasoning.
     #[serde(default)]
-    pub auto_reply: bool,
+    pub auto_reply: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

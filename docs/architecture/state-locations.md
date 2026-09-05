@@ -72,7 +72,7 @@ the bug.
 
 External state is keyed by
 
-```
+```text
 <sanitised-directory-name>-<first 8 hex of sha256(absolute path)>
 ```
 
@@ -130,7 +130,7 @@ the next save, after the new copy is on disk.
 
 SlashIt-managed worktrees live at
 
-```
+```text
 <data_dir>/worktrees/<project-key>/<branch>
 ```
 

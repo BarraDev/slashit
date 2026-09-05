@@ -230,13 +230,18 @@ impl Drop for MigrationLock {
 
 /// Suffix used for staging directories. Recognised by [`StateMigrator::recover`].
 ///
-/// Followed by a destination tag and a transaction id (see
-/// [`destination_tag`] and [`next_transaction_id`]): `{STAGING_PREFIX}{tag}-{txn}`
-/// for a scratch copy, `{STAGING_PREFIX}old-{tag}-{txn}` for a retired one. The
-/// tag scopes both forms to one exact destination, so two destinations that
-/// happen to share a parent directory (siblings under the same project key,
-/// for instance) can never collide, and recovering one destination can never
-/// touch state left behind by a migration to a different one.
+/// Followed by a role marker, a destination tag, and a transaction id (see
+/// [`destination_tag`] and [`next_transaction_id`]): `{STAGING_PREFIX}new-{tag}-{txn}`
+/// for a scratch copy, `{STAGING_PREFIX}old-{tag}-{txn}` for a retired one. Both
+/// forms carry their own fixed-length role marker (`new-` / `old-`) ahead of the
+/// tag, so one can never be mistaken for the other regardless of what the tag
+/// itself contains — unlike a bare `{tag}-` scratch prefix, which could alias
+/// the `old-{tag}-` prefix of a sibling destination literally named `old-{tag}`.
+/// The tag itself scopes both forms to one exact destination, so two
+/// destinations that happen to share a parent directory (siblings under the
+/// same project key, for instance) can never collide, and recovering one
+/// destination can never touch state left behind by a migration to a
+/// different one.
 const STAGING_PREFIX: &str = ".slashit-migrating-";
 const LOCK_SUFFIX: &str = ".slashit-migrate.lock";
 
@@ -388,7 +393,7 @@ impl StateMigrator {
         let dest_tag = destination_tag(to);
         let txn = next_transaction_id();
 
-        let staging = parent.join(format!("{STAGING_PREFIX}{dest_tag}-{txn}"));
+        let staging = parent.join(format!("{STAGING_PREFIX}new-{dest_tag}-{txn}"));
         // A staging dir from a previous crashed run is always disposable —
         // recovery above already handled anything worth keeping for this
         // destination, before this fresh transaction id even existed.
@@ -482,7 +487,7 @@ impl StateMigrator {
     /// directory has its own tag, so its leftovers are never touched here.
     /// Within that scope, every leftover also carries a transaction id (see
     /// [`next_transaction_id`]): a scratch copy at
-    /// `{STAGING_PREFIX}{tag}-{txn}`, and — only if the crash happened after
+    /// `{STAGING_PREFIX}new-{tag}-{txn}`, and — only if the crash happened after
     /// the destination was retired but before staging replaced it — a retired
     /// copy of the pre-migration destination at
     /// `{STAGING_PREFIX}old-{tag}-{txn}`. Those two are paired up by
@@ -515,10 +520,14 @@ impl StateMigrator {
         // Scoped to this exact destination: a sibling destination sharing
         // `parent` has its own, different tag, so its leftovers never match
         // either prefix below and are left completely untouched — recovering
-        // one destination can never act on state stranded by another.
+        // one destination can never act on state stranded by another. The
+        // `new-`/`old-` role markers are fixed-length and precede the tag in
+        // both prefixes, so — unlike a bare `{tag}-` scratch prefix — neither
+        // prefix can ever equal the other's for any tag value, including a
+        // destination literally named `old-<tag>` or `new-<tag>`.
         let tag = destination_tag(to);
         let old_prefix = format!("{STAGING_PREFIX}old-{tag}-");
-        let scratch_prefix = format!("{STAGING_PREFIX}{tag}-");
+        let scratch_prefix = format!("{STAGING_PREFIX}new-{tag}-");
         let mut scratch = std::collections::BTreeMap::new();
         let mut retired = std::collections::BTreeMap::new();
         for entry in dir.flatten() {
@@ -933,7 +942,7 @@ mod tests {
     fn scratch_dir_for(to: &Path, txn: &str) -> PathBuf {
         to.parent()
             .unwrap()
-            .join(format!("{STAGING_PREFIX}{}-{txn}", destination_tag(to)))
+            .join(format!("{STAGING_PREFIX}new-{}-{txn}", destination_tag(to)))
     }
 
     fn retired_dir_for(to: &Path, txn: &str) -> PathBuf {
@@ -1302,6 +1311,54 @@ mod tests {
         assert_eq!(
             fs::read_to_string(to_b.join("roadmap.toml")).unwrap(),
             "b candidate\n"
+        );
+    }
+
+    #[test]
+    fn a_destination_named_old_dash_something_cannot_alias_a_sibling_retired_copy() {
+        // Destination "x"'s retired-copy prefix is literally
+        // `{STAGING_PREFIX}old-x-`. Before the `new-`/`old-` role markers were
+        // both required, destination "old-x"'s *scratch* prefix was the bare
+        // `{STAGING_PREFIX}old-x-` too — the exact same string — so the two
+        // destinations' leftovers were not just confusable, they occupied the
+        // identical path. Proves that no longer holds.
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("data/projects/repo-abc12345");
+        fs::create_dir_all(&parent).unwrap();
+        let to_x = parent.join("x");
+        let to_old_x = parent.join("old-x");
+
+        // A crash stranded x's retired (pre-migration) copy with x itself
+        // missing — the state a completed-swap recovery would restore.
+        let x_retired = retired_dir_for(&to_x, "7");
+        write(&x_retired.join("roadmap.toml"), "x's pre-migration data\n");
+        assert!(!to_x.exists());
+
+        // The two prefixes must be structurally distinct strings, not just
+        // coincidentally non-colliding for these particular tags.
+        assert_ne!(
+            x_retired,
+            scratch_dir_for(&to_old_x, "7"),
+            "x's retired path must never equal old-x's scratch path for any shared transaction id"
+        );
+
+        // Recovering "old-x" must see none of this — it has no leftovers of
+        // its own — even though its scratch prefix used to coincide with x's
+        // retired prefix.
+        assert!(
+            StateMigrator::recover(&to_old_x).is_empty(),
+            "old-x must not mistake x's retired copy for a scratch candidate of its own"
+        );
+        assert!(x_retired.exists(), "x's retired copy must survive old-x's recovery untouched");
+        assert!(!to_old_x.exists(), "old-x must not be silently installed by this");
+
+        // Recovering "x" still works normally: its own retired copy is
+        // restored as the destination.
+        let x_outcomes = StateMigrator::recover(&to_x);
+        assert_eq!(x_outcomes, vec![RecoveryOutcome::RestoredFromRetired]);
+        assert_eq!(
+            fs::read_to_string(to_x.join("roadmap.toml")).unwrap(),
+            "x's pre-migration data\n"
         );
     }
 

@@ -30,6 +30,27 @@ pub struct WorkspaceRegistry {
     config_path: PathBuf,
 }
 
+/// A `toml.corrupt-<timestamp>` path guaranteed not to already exist.
+///
+/// The timestamp has one-second resolution, so a second corruption handled
+/// within the same second — plausible in a crash-loop, and easy to hit in
+/// tests — would otherwise make `fs::rename` silently replace the first
+/// backup instead of preserving both.
+fn unique_quarantine_path(config_path: &Path, ts: &str) -> PathBuf {
+    let base = config_path.with_extension(format!("toml.corrupt-{ts}"));
+    if !base.exists() {
+        return base;
+    }
+    let mut n: u32 = 1;
+    loop {
+        let candidate = config_path.with_extension(format!("toml.corrupt-{ts}-{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 impl WorkspaceRegistry {
     pub fn load() -> io::Result<Self> {
         Self::load_from(Self::config_path()?)
@@ -52,7 +73,7 @@ impl WorkspaceRegistry {
                     // silently overwrite that unbacked-up file with a near-empty one.
                     // Fail closed instead, the same as the unreadable-file case above.
                     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-                    let quarantine = config_path.with_extension(format!("toml.corrupt-{ts}"));
+                    let quarantine = unique_quarantine_path(&config_path, &ts.to_string());
                     if let Err(rename_err) = fs::rename(&config_path, &quarantine) {
                         eprintln!(
                             "[workspace-registry] failed to parse {}: {e}. Quarantine to {} also failed: {rename_err}. Leaving the corrupt file in place.",
@@ -180,6 +201,29 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains("corrupt-"))
             .collect();
         assert_eq!(quarantined.len(), 1, "exactly one quarantine backup should exist");
+    }
+
+    #[test]
+    fn a_second_corruption_in_the_same_second_does_not_replace_the_first_backup() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("workspaces.toml");
+        let ts = "20260101-000000";
+
+        // Simulate a quarantine backup already sitting at the exact path a
+        // naive `toml.corrupt-<timestamp>` scheme would compute for a second
+        // corruption handled within the same second.
+        let first_backup = path.with_extension(format!("toml.corrupt-{ts}"));
+        fs::write(&first_backup, "first crash's corrupt content\n").unwrap();
+
+        let second = unique_quarantine_path(&path, ts);
+
+        assert_ne!(second, first_backup, "a colliding timestamp must not reuse the existing backup's path");
+        fs::write(&second, "second crash's corrupt content\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(&first_backup).unwrap(),
+            "first crash's corrupt content\n",
+            "the first backup must survive a second corruption untouched"
+        );
     }
 
     #[cfg(unix)]
