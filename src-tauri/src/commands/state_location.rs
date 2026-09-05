@@ -326,6 +326,22 @@ pub async fn apply_state_migration(
     .await
 }
 
+/// Parse the caller-supplied `known_updated_at` into the timestamp
+/// [`set_state_location_committed`] compares against the authoritative
+/// record.
+///
+/// A pure, side-effect-free step deliberately kept separate from
+/// [`set_state_location`] so an empty or malformed value is rejected before
+/// the per-project lock is even acquired, let alone before anything is
+/// persisted.
+fn parse_known_updated_at(raw: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| {
+            format!("A known_updated_at timestamp is required to change the storage location: {e}")
+        })
+}
+
 /// Core of [`set_state_location`], taking raw locks/storage so tests can
 /// drive it without a `tauri::State`.
 ///
@@ -334,14 +350,17 @@ pub async fn apply_state_migration(
 /// `known_updated_at` no longer matches the authoritative record — the
 /// caller observed the project before a newer decision (a migration or
 /// another `set_state_location`) was recorded, and applying it now would
-/// silently un-record that newer decision.
+/// silently un-record that newer decision. Unlike an earlier version of this
+/// function, the check is not optional: there is no argument shape that
+/// skips it, so a caller cannot accidentally (or otherwise) bypass staleness
+/// protection by omitting the timestamp.
 async fn set_state_location_committed(
     locks: &StateLocationLocks,
     projects: &RwLock<HashMap<Uuid, Project>>,
     storage: &Storage,
     id: Uuid,
     location: StateLocation,
-    known_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    known_updated_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     let _guard = locks.acquire(id).await;
 
@@ -351,14 +370,12 @@ async fn set_state_location_committed(
         .get_mut(&id)
         .ok_or_else(|| format!("Project {id} not found"))?;
 
-    if let Some(expected) = known_updated_at {
-        if project.updated_at != expected {
-            return Err(
-                "This project's storage location changed since it was last loaded here. \
-                 Reload the storage settings and try again."
-                    .to_string(),
-            );
-        }
+    if project.updated_at != known_updated_at {
+        return Err(
+            "This project's storage location changed since it was last loaded here. \
+             Reload the storage settings and try again."
+                .to_string(),
+        );
     }
 
     project.state_location = location;
@@ -377,24 +394,20 @@ async fn set_state_location_committed(
 /// needs a way to tell SlashIt where they are, and forcing a migration through
 /// would then be wrong.
 ///
-/// `known_updated_at` is the `updated_at` from the last [`StateLocationInfo`]
-/// the caller read (RFC3339); pass `None` to skip the staleness check.
+/// `known_updated_at` is required and must be the `updated_at` from the last
+/// [`StateLocationInfo`] the caller read (RFC3339) — this command shares its
+/// per-project lock with [`apply_state_migration`], and a caller that skipped
+/// the staleness check could otherwise silently undo a migration that
+/// completed after it last read the project's state.
 #[tauri::command]
 pub async fn set_state_location(
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     location: StateLocation,
-    known_updated_at: Option<String>,
+    known_updated_at: String,
 ) -> Result<StateLocationInfo, String> {
     let id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
-
-    let known_updated_at = known_updated_at
-        .map(|s| {
-            chrono::DateTime::parse_from_rfc3339(&s)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| format!("Invalid known_updated_at timestamp: {e}"))
-        })
-        .transpose()?;
+    let known_updated_at = parse_known_updated_at(&known_updated_at)?;
 
     set_state_location_committed(
         &state.state_location_locks,
@@ -620,7 +633,7 @@ mod tests {
             &storage,
             project_id,
             StateLocation::External,
-            Some(original_updated_at),
+            original_updated_at,
         )
         .await;
 
@@ -632,6 +645,20 @@ mod tests {
             projects.read().await.get(&project_id).unwrap().state_location,
             StateLocation::InProject,
             "the winning transition's location must survive a stale overwrite attempt"
+        );
+
+        // Persistence must be untouched too, not just memory: reload the
+        // config from disk independently of the in-memory map and confirm
+        // it still reflects the migration, not the stale rejected write.
+        let persisted = storage.load_config().expect("config must still load");
+        let persisted_project = persisted
+            .projects
+            .get(&project_id.to_string())
+            .expect("project must still be present on disk");
+        assert_eq!(
+            persisted_project.state_location,
+            StateLocation::InProject,
+            "a rejected stale write must not reach disk"
         );
     }
 
@@ -650,7 +677,7 @@ mod tests {
             &storage,
             project_id,
             StateLocation::InProject,
-            Some(current),
+            current,
         )
         .await
         .expect("a known_updated_at matching the authoritative record must be accepted");
@@ -661,22 +688,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn set_state_location_committed_skips_the_staleness_check_when_not_provided() {
-        let (storage, _temp) = create_test_storage();
-        let project_id = Uuid::new_v4();
-        let projects = RwLock::new(HashMap::from([(project_id, test_project(project_id))]));
-        let locks = StateLocationLocks::new();
-
-        set_state_location_committed(
-            &locks, &projects, &storage, project_id, StateLocation::InProject, None,
-        )
-        .await
-        .expect("omitting known_updated_at must not be treated as stale");
-
-        assert_eq!(
-            projects.read().await.get(&project_id).unwrap().state_location,
-            StateLocation::InProject
+    #[test]
+    fn parse_known_updated_at_rejects_an_empty_or_malformed_value() {
+        assert!(
+            parse_known_updated_at("").is_err(),
+            "an empty timestamp must be rejected rather than silently skipping the staleness check"
         );
+        assert!(parse_known_updated_at("not-a-timestamp").is_err());
+    }
+
+    #[test]
+    fn parse_known_updated_at_accepts_a_valid_rfc3339_timestamp() {
+        let now = chrono::Utc::now();
+        let parsed =
+            parse_known_updated_at(&now.to_rfc3339()).expect("a valid RFC3339 value must parse");
+        // RFC3339 formatting truncates to the same precision it round-trips.
+        assert_eq!(parsed.to_rfc3339(), now.to_rfc3339());
     }
 }
