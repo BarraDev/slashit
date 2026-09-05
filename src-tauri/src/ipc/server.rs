@@ -98,6 +98,18 @@ pub struct IpcContext {
     /// and the toggle in the app can never disagree.
     pub features: Arc<RwLock<crate::config::features::FeatureFlags>>,
 
+    /// A CLI-aware diagnostics snapshot, frozen at daemon startup.
+    ///
+    /// `features` above is a plain `FeatureFlags` — resolved once, but with no
+    /// memory of which layer decided each value. The daemon has no live
+    /// `SetFeature`-style request that changes flags after startup, so a
+    /// snapshot taken once, from the full resolution that still knows about
+    /// the CLI layer, stays correct for the daemon's whole lifetime. The
+    /// desktop GUI has no CLI layer and *can* change `features` live (the
+    /// settings toggle), so it leaves this `None` and `handle_features` falls
+    /// back to deriving diagnostics from the live value instead.
+    pub feature_diagnostics: Option<Vec<slashit_ipc::FeatureFlagInfo>>,
+
     /// The resolved application directories. The credentials file lives here,
     /// which is where the TCP bearer token is minted and read.
     pub paths: Arc<crate::config::paths::AppPaths>,

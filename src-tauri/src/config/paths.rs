@@ -500,6 +500,18 @@ fn path_bytes(path: &Path) -> Vec<u8> {
     }
 }
 
+/// Serializes any test in this crate's unit-test binary that mutates a real
+/// process environment variable a resolver reads — `XDG_RUNTIME_DIR` here, and
+/// feature-flag environment variables in [`crate::config::features`]. Scoped
+/// to the whole process environment rather than to one variable, because
+/// concurrent `setenv`, and `setenv` concurrent with `getenv`, are undefined
+/// behavior in the platform C library regardless of which variable each side
+/// touches — `cargo test` runs every test in this binary as parallel threads
+/// of one process, so a lock scoped to a single variable in a single module
+/// does not protect a different variable mutated, unlocked, in another.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,18 +527,14 @@ mod tests {
         )
     }
 
-    /// Serialises the tests that swap `XDG_RUNTIME_DIR`.
-    ///
-    /// Both resolvers read that variable at call time, so two of these running
-    /// in parallel would compare answers taken under different environments.
-    static RUNTIME_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Evaluate `f` with `XDG_RUNTIME_DIR` set to `value`, then restore it.
     ///
     /// Assertions belong to the caller, not to `f`: a panic inside the closure
     /// would skip the restore and leak the override into every later test.
+    /// Held under [`super::ENV_LOCK`], shared with every other test in this
+    /// binary that mutates real process environment variables.
     fn with_xdg_runtime_dir<T>(value: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = RUNTIME_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("XDG_RUNTIME_DIR").ok();
         // SAFETY: the guard above makes this the only thread touching the
         // variable, and it is restored before the guard drops.

@@ -379,10 +379,16 @@ fn handle_quit() -> Dispatch {
 
 /// Every feature flag with the value in force and the layer that decided it.
 ///
-/// Resolved through the same code the settings UI calls, so `slashit features`
-/// and the toggle in the app cannot disagree about which layer won.
+/// A daemon started with `--feature` overrides serves its startup snapshot,
+/// which is the only place the CLI layer is still visible — see
+/// [`IpcContext::feature_diagnostics`]. Otherwise this resolves live through
+/// the same code the settings UI calls, so `slashit features` and the toggle
+/// in the app cannot disagree about which layer won.
 async fn handle_features(ctx: &IpcContext) -> IpcResponse {
-    let flags = ctx.features.read().await.diagnostics();
+    let flags = match &ctx.feature_diagnostics {
+        Some(cached) => cached.clone(),
+        None => ctx.features.read().await.diagnostics(),
+    };
     IpcResponse::success(serde_json::to_value(flags).unwrap_or_default())
 }
 

@@ -135,7 +135,7 @@ pub fn run() {
                 },
             ));
             let _ = state.executor.set(executor.clone());
-            executor.start_polling();
+            executor.start_polling(None);
             println!("SlashIt: Task executor started");
 
             // The control channel. The same server the daemon runs; only the
@@ -151,6 +151,7 @@ pub fn run() {
                     events: events.clone(),
                     control: control.clone(),
                     features: state.features.clone(),
+                    feature_diagnostics: None,
                     paths: state.paths.clone(),
                 });
                 let ipc_config = slashit_ipc::IpcConfig::load(&state.paths.ipc_config_file());

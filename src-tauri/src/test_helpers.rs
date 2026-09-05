@@ -51,6 +51,7 @@ pub fn ipc_test_context(paths: std::sync::Arc<crate::config::paths::AppPaths>) -
         features: Arc::new(RwLock::new(
             crate::config::features::FeatureFlags::default(),
         )),
+        feature_diagnostics: None,
         paths,
     }
 }

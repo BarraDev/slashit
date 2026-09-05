@@ -114,12 +114,35 @@ impl TaskExecutor {
     }
 
     /// Start the polling loop.
-    pub fn start_polling(self: &Arc<Self>) {
+    ///
+    /// `shutdown`, when given, lets a caller stop new-task promotion
+    /// cooperatively: the loop checks it before every pass and stops after
+    /// the current pass finishes, rather than being killed via
+    /// `JoinHandle::abort` at an arbitrary `.await` point (worktree creation
+    /// shells out to `git`/`jj`, and none of those child processes are
+    /// spawned with `kill_on_drop`, so an abort mid-spawn could orphan one).
+    /// The daemon needs this so its shutdown drain can hold its stated
+    /// invariant that the in-flight set cannot grow while it waits. The
+    /// desktop GUI has no such handshake and passes `None`; the loop then
+    /// simply runs for the life of the process, as it always has.
+    pub fn start_polling(self: &Arc<Self>, shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
         let executor = Arc::clone(self);
         tokio::spawn(async move {
+            let mut shutdown = shutdown;
             loop {
+                if matches!(&shutdown, Some(rx) if *rx.borrow()) {
+                    return;
+                }
                 executor.check_and_execute().await;
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                match shutdown.as_mut() {
+                    Some(rx) => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {}
+                            _ = rx.changed() => {}
+                        }
+                    }
+                    None => tokio::time::sleep(tokio::time::Duration::from_secs(3)).await,
+                }
             }
         });
     }
@@ -157,6 +180,13 @@ impl TaskExecutor {
                 .collect()
         };
 
+        // A panic inside a spawned task's future skips its own cleanup code
+        // entirely (unwinding runs no further statements in that task), so it
+        // cannot be relied on to remove its own entry. Pruning finished
+        // handles here — reachable on every poll tick — is the backstop that
+        // catches that case regardless of which future code path forgets to
+        // clean up after itself.
+        self.running_handles.write().await.retain(|_, h| !h.is_finished());
         let running = self.running_handles.read().await.len();
         let limit = {
             let mgr = self.queue_manager.read().await;
@@ -716,6 +746,10 @@ impl TaskExecutor {
                         message: msg.clone(),
                     });
                     Self::set_task_error_static(&tasks, &storage, task_id, &msg).await;
+                    // This early return skips the removal after `runner.wait()`
+                    // below, so it must remove itself here or this slot never
+                    // frees up.
+                    running_handles.write().await.remove(&task_id);
                     return;
                 }
             };
