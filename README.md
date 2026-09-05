@@ -169,7 +169,7 @@ kept:
 | Choice | Where | Use it when |
 |---|---|---|
 | Outside the project *(default)* | `<data_dir>/projects/<project-key>/<project-id>/` | You want the repository untouched |
-| Inside the project | `<repo>/.slashit/` | You want the board committed and shared with your team |
+| Inside the project | `<repo>/.slashit/<project-id>/` | You want the board committed and shared with your team |
 | Detect automatically | `.slashit/` if it already exists and has content, otherwise outside | Upgrading, or moving between machines |
 
 Switching between them previews the move first — how many files, how large, and

@@ -330,7 +330,7 @@ mod tests {
     fn try_persist_projects_propagates_read_failure_without_destroying_config() {
         use std::os::unix::fs::PermissionsExt;
 
-        if unsafe { libc_geteuid() } == 0 {
+        if crate::ipc::server::current_uid() == 0 {
             return; // root ignores permission bits, so chmod 0o000 would not force a read failure
         }
 
@@ -378,7 +378,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn create_project_leaves_memory_unchanged_when_persistence_fails() {
-        if unsafe { libc_geteuid() } == 0 {
+        if crate::ipc::server::current_uid() == 0 {
             return;
         }
         let (storage, _temp) = make_storage_with_unreadable_config();
@@ -397,7 +397,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn delete_project_leaves_memory_and_task_files_unchanged_when_persistence_fails() {
-        if unsafe { libc_geteuid() } == 0 {
+        if crate::ipc::server::current_uid() == 0 {
             return;
         }
         let (storage, _temp) = make_storage_with_unreadable_config();
@@ -417,7 +417,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn update_project_leaves_memory_unchanged_when_persistence_fails() {
-        if unsafe { libc_geteuid() } == 0 {
+        if crate::ipc::server::current_uid() == 0 {
             return;
         }
         let (storage, _temp) = make_storage_with_unreadable_config();
@@ -436,11 +436,5 @@ mod tests {
             original_name,
             "memory must not contain an update disk never recorded"
         );
-    }
-
-    #[cfg(unix)]
-    extern "C" {
-        #[link_name = "geteuid"]
-        fn libc_geteuid() -> u32;
     }
 }

@@ -76,7 +76,7 @@ fn ensure_safe_runtime_dir(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     // No `libc` dependency in this crate; declaring the one symbol needed
     // avoids pulling one in just for this.
     extern "C" {

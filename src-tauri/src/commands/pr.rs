@@ -604,11 +604,21 @@ fn carry_forward_reanalysis_lifecycle(
         let Some(cid) = item.comment_id else { continue; };
         let Some(prev_item) = prior_items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
 
+        // GitHub's `updated_at` has whole-second precision; `applied_at`
+        // (from `chrono::Utc::now()`) almost never does. Comparing them
+        // as-is could read a same-second edit right after the apply as
+        // "not edited" purely from sub-second truncation. Both are rounded
+        // down to the second and compared non-strictly, so a same-second
+        // timestamp is treated as a possible edit rather than assumed safe —
+        // reprocessing an unchanged comment is cheap; silently skipping an
+        // edited one is the failure mode this check exists to prevent.
         let edited_since_last_apply = applied_at.is_some_and(|applied_at| {
+            use chrono::SubsecRound;
+            let applied_at = applied_at.trunc_subsecs(0);
             comments.iter()
                 .find(|c| c.id == Some(cid))
                 .and_then(|c| c.updated_at)
-                .is_some_and(|updated_at| updated_at > applied_at)
+                .is_some_and(|updated_at| updated_at.trunc_subsecs(0) >= applied_at)
         });
         if edited_since_last_apply {
             continue;
@@ -2877,9 +2887,13 @@ mod tests {
         };
         let mut items = vec![fresh_item(42)];
 
-        // Same comment id, updated_at at or before the apply: not edited.
+        // Same comment id, updated_at clearly before the apply: not edited.
+        // A same-second `updated_at` is deliberately NOT used here — that
+        // case is ambiguous (GitHub's whole-second precision vs.
+        // `applied_at`'s sub-second precision) and is treated as a possible
+        // edit by the covering test below, not as proof of "unchanged".
         let unchanged_comment = PrReviewComment {
-            updated_at: Some(applied_at),
+            updated_at: Some(applied_at - chrono::Duration::seconds(1)),
             ..comment(42)
         };
 
@@ -2889,6 +2903,34 @@ mod tests {
         assert!(items[0].reply_posted);
         assert_eq!(items[0].pr_reply_text.as_deref(), Some("addressed the original wording"));
         assert_eq!(items[0].reply_comment_id, Some(555));
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_treats_a_same_second_update_as_a_possible_edit() {
+        // `applied_at` almost never lands exactly on a whole second (it comes
+        // from `chrono::Utc::now()`), while GitHub's `updated_at` always does.
+        // A comment updated in the same second as the apply must not be
+        // waved through as "unchanged" just because naive truncation makes
+        // `updated_at < applied_at` look true.
+        let applied_at = "2024-06-01T00:00:00.900Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let prev_item = PrReviewItem {
+            fix_done: true,
+            reply_posted: true,
+            pr_reply_text: Some("addressed the original wording".to_string()),
+            reply_comment_id: Some(555),
+            ..fresh_item(42)
+        };
+        let mut items = vec![fresh_item(42)];
+
+        let same_second_comment = PrReviewComment {
+            updated_at: Some("2024-06-01T00:00:00Z".parse().unwrap()),
+            ..comment(42)
+        };
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[same_second_comment], Some(applied_at));
+
+        assert!(!items[0].fix_done, "a same-second update must be treated as a possible edit, not assumed safe");
+        assert!(!items[0].reply_posted);
     }
 
     // ──────────────────────────────────────────────
