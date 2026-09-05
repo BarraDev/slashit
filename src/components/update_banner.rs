@@ -101,6 +101,11 @@ pub struct UpdaterContext {
     /// the value it captured to tell "slow" from "stuck".
     pub progress_tick: RwSignal<u32>,
     pub stalled: RwSignal<bool>,
+    /// Bumped by every `start_install` call. A watchdog captures the value at
+    /// the moment it is spawned and only acts if it still matches when its
+    /// timer fires — otherwise a failed attempt's watchdog can outlive it and
+    /// wrongly mark a later retry stalled before that retry's own timeout.
+    pub install_generation: RwSignal<u32>,
 }
 
 impl UpdaterContext {
@@ -136,6 +141,22 @@ impl UpdaterContext {
         self.status.get().map(|s| s.current_version)
     }
 
+    /// Whether an available update at `version` should still be surfaced,
+    /// given a session "Later" or a persisted "Skip this version". Shared by
+    /// the floating notice and Settings > Updates so the two can never
+    /// disagree about whether the user has already dealt with a version —
+    /// each previously checked this on its own, and only the notice actually
+    /// did.
+    pub fn update_is_visible(&self, version: &str) -> bool {
+        if self.dismissed_version.get().as_deref() == Some(version) {
+            return false;
+        }
+        if get_skipped_version().as_deref() == Some(version) {
+            return false;
+        }
+        true
+    }
+
     fn record_failure(&self, failure: UpdaterFailure) {
         // A new failure un-dismisses the notice: the user acknowledged the
         // previous problem, not this one.
@@ -161,6 +182,7 @@ pub fn provide_updater_context() -> UpdaterContext {
         check_user_initiated: RwSignal::new(false),
         progress_tick: RwSignal::new(0),
         stalled: RwSignal::new(false),
+        install_generation: RwSignal::new(0),
     };
     provide_context(ctx);
 
@@ -309,7 +331,9 @@ pub fn start_install(ctx: UpdaterContext) {
         downloaded: 0,
         total: None,
     });
-    watch_for_stall(ctx);
+    let generation = ctx.install_generation.get_untracked().wrapping_add(1);
+    ctx.install_generation.set(generation);
+    watch_for_stall(ctx, generation);
 
     spawn_local(async move {
         match updater_download_and_install().await {
@@ -329,11 +353,20 @@ pub fn start_install(ctx: UpdaterContext) {
 /// Nothing here can cancel the backend. The watchdog exists so a transfer that
 /// stops reporting cannot pin the UI in a state with no exit: after the timeout
 /// the user gets a way out that says plainly the work may still be running.
-fn watch_for_stall(ctx: UpdaterContext) {
+///
+/// `generation` is the value `install_generation` held when this watchdog was
+/// spawned. A failed attempt leaves this loop running; if the user retries
+/// before the timeout fires, `install_generation` moves on and this check
+/// stops the stale watchdog from marking the new attempt stalled before its
+/// own timeout has actually elapsed.
+fn watch_for_stall(ctx: UpdaterContext, generation: u32) {
     spawn_local(async move {
         loop {
             let before = ctx.progress_tick.get_untracked();
             TimeoutFuture::new(STALL_TIMEOUT_MS).await;
+            if ctx.install_generation.get_untracked() != generation {
+                return;
+            }
             if !matches!(
                 ctx.activity.get_untracked(),
                 UpdaterActivity::Downloading { .. } | UpdaterActivity::Installing
@@ -669,10 +702,7 @@ fn available_card(ctx: UpdaterContext) -> AnyView {
     let Some(update) = ctx.available.get() else {
         return ().into_any();
     };
-    if ctx.dismissed_version.get().as_deref() == Some(update.version.as_str()) {
-        return ().into_any();
-    }
-    if get_skipped_version().as_deref() == Some(update.version.as_str()) {
+    if !ctx.update_is_visible(&update.version) {
         return ().into_any();
     }
 

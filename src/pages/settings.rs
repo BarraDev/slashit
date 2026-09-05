@@ -537,6 +537,9 @@ fn UpdatesTab() -> impl IntoView {
                         let Some(update) = ctx.available.get() else {
                             return ().into_any();
                         };
+                        if !ctx.update_is_visible(&update.version) {
+                            return ().into_any();
+                        }
                         let blocked = ctx.blocked_reason();
                         let body = update.body.clone().unwrap_or_default();
                         view! {
