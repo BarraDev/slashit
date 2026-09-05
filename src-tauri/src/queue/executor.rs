@@ -34,6 +34,11 @@ pub struct TaskExecutor {
     executions: Arc<RwLock<HashMap<Uuid, AgentExecution>>>,
     running_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
     reviewing_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
+    /// Task ids with a worktree-cleanup attempt currently in flight, so a
+    /// merged-PR transition and the periodic retry pass can never schedule
+    /// two removals for the same task at once. See
+    /// [`spawn_worktree_cleanup`](Self::spawn_worktree_cleanup).
+    cleanup_in_flight: Arc<RwLock<std::collections::HashSet<Uuid>>>,
     logs: Arc<RwLock<HashMap<Uuid, Vec<AgentLogEntry>>>>,
     projects: Arc<RwLock<HashMap<Uuid, crate::domain::Project>>>,
     repositories: Arc<RwLock<HashMap<Uuid, crate::domain::Repository>>>,
@@ -65,6 +70,7 @@ impl TaskExecutor {
             executions: config.executions,
             running_handles: Arc::new(RwLock::new(HashMap::new())),
             reviewing_handles: Arc::new(RwLock::new(HashMap::new())),
+            cleanup_in_flight: Arc::new(RwLock::new(std::collections::HashSet::new())),
             logs: config.logs,
             projects: config.projects,
             repositories: config.repositories,
@@ -208,53 +214,10 @@ impl TaskExecutor {
                                 }
                             }
 
-                            // Resolved after `tasks_w` is dropped above, since
-                            // `resolve_working_dir_for_task` takes its own
-                            // read lock on `self.tasks`.
+                            // Spawned after `tasks_w` is dropped above, since
+                            // `spawn_worktree_cleanup` takes its own locks.
                             if let Some((wt_path, branch)) = pending_worktree_removal {
-                                match Self::resolve_working_dir_for_task(
-                                    &self.tasks, &self.projects, &self.repositories, task_id,
-                                ).await {
-                                    Ok(repo_path) => {
-                                        let wt_mgr = self.worktree_manager.clone();
-                                        let tasks = self.tasks.clone();
-                                        let storage = self.storage.clone();
-                                        let app_handle = self.app_handle.clone();
-                                        let wt_path_done = wt_path.clone();
-                                        tokio::spawn(async move {
-                                            match wt_mgr.remove(&wt_path, &branch, &repo_path).await {
-                                                Ok(()) => {
-                                                    {
-                                                        let mut tasks_w = tasks.write().await;
-                                                        if let Some(t) = tasks_w.get_mut(&task_id) {
-                                                            if t.worktree_path.as_deref() == Some(wt_path_done.as_str()) {
-                                                                t.worktree_path = None;
-                                                            }
-                                                        }
-                                                    }
-                                                    Self::persist_task_static(&tasks, &storage, task_id).await;
-                                                }
-                                                Err(e) => {
-                                                    let _ = app_handle.emit("agent-event", AgentEvent::Log {
-                                                        task_id: task_id.to_string(),
-                                                        level: LogLevel::Warn,
-                                                        message: format!(
-                                                            "Failed to remove worktree {}: {}. It stays recorded on the task for a future retry.",
-                                                            wt_path_done, e
-                                                        ),
-                                                    });
-                                                }
-                                            }
-                                        });
-                                    }
-                                    Err(e) => {
-                                        let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
-                                            task_id: task_id.to_string(),
-                                            level: LogLevel::Warn,
-                                            message: format!("Cannot resolve repo path to clean up worktree: {}", e),
-                                        });
-                                    }
-                                }
+                                self.spawn_worktree_cleanup(task_id, wt_path, branch).await;
                             }
 
                             if state == "MERGED" {
@@ -271,7 +234,154 @@ impl TaskExecutor {
                     }
                 }
             }
+
+            // Retry worktree cleanup for tasks whose earlier attempt failed.
+            //
+            // The loop above only polls a `GithubPr` ref while it is not yet
+            // in a terminal state, so once a task reaches `Done` its ref is
+            // excluded from every future `gh pr view` here — correctly, that
+            // call must not run again for an already-merged PR. But it also
+            // means the merged-transition cleanup spawned above is the last
+            // time that code path ever looks at the task, so a failed
+            // removal would otherwise sit on `worktree_path` forever with no
+            // automatic path back. This pass, running on the same ~30s
+            // cadence, is that path: any `Done` task still holding a
+            // `worktree_path` gets another attempt, guarded so a task
+            // already being retried is never scheduled twice.
+            let cleanup_retries = {
+                let tasks = self.tasks.read().await;
+                let in_flight = self.cleanup_in_flight.read().await;
+                Self::tasks_eligible_for_cleanup_retry(&tasks, &in_flight)
+            };
+            for (task_id, wt_path, branch) in cleanup_retries {
+                self.spawn_worktree_cleanup(task_id, wt_path, branch).await;
+            }
         }
+    }
+
+    /// Tasks whose worktree cleanup should be (re)tried on this maintenance
+    /// pass: already `Done` and still holding a `worktree_path` because a
+    /// previous removal attempt failed, and not already being retried by an
+    /// in-flight attempt.
+    fn tasks_eligible_for_cleanup_retry(
+        tasks: &HashMap<Uuid, Task>,
+        in_flight: &std::collections::HashSet<Uuid>,
+    ) -> Vec<(Uuid, String, String)> {
+        tasks
+            .values()
+            .filter(|t| t.status == TaskStatus::Done)
+            .filter(|t| !in_flight.contains(&t.id))
+            .filter_map(|t| {
+                let wt_path = t.worktree_path.clone()?;
+                Some((t.id, wt_path, t.branch_name.clone().unwrap_or_default()))
+            })
+            .collect()
+    }
+
+    /// Reserve `task_id`'s cleanup slot, or refuse if one is already held.
+    ///
+    /// A `HashSet` rather than tracking `JoinHandle`s: nothing needs to
+    /// cancel a cleanup attempt, only prevent two of them running for the
+    /// same task at once, and `HashSet::insert`'s own return value makes the
+    /// check-and-reserve atomic under a single write lock.
+    async fn try_reserve_cleanup(
+        in_flight: &RwLock<std::collections::HashSet<Uuid>>,
+        task_id: Uuid,
+    ) -> bool {
+        in_flight.write().await.insert(task_id)
+    }
+
+    async fn release_cleanup(in_flight: &RwLock<std::collections::HashSet<Uuid>>, task_id: Uuid) {
+        in_flight.write().await.remove(&task_id);
+    }
+
+    /// Attempt the actual removal and, only on success, clear and persist
+    /// `worktree_path`.
+    ///
+    /// Takes no `AppHandle`, so it is unit-testable without a running Tauri
+    /// app; [`spawn_worktree_cleanup`](Self::spawn_worktree_cleanup) wraps it
+    /// with the in-flight guard and user-visible failure logging.
+    async fn attempt_worktree_cleanup(
+        wt_mgr: &WorktreeManager,
+        tasks: &Tasks,
+        storage: &crate::config::Storage,
+        task_id: Uuid,
+        wt_path: &str,
+        branch: &str,
+        repo_path: &str,
+    ) -> Result<(), String> {
+        wt_mgr.remove(wt_path, branch, repo_path).await?;
+        {
+            let mut tasks_w = tasks.write().await;
+            if let Some(t) = tasks_w.get_mut(&task_id) {
+                if t.worktree_path.as_deref() == Some(wt_path) {
+                    t.worktree_path = None;
+                }
+            }
+        }
+        Self::persist_task_static(tasks, storage, task_id).await;
+        Ok(())
+    }
+
+    /// Remove `task_id`'s worktree in the background, guarded so a second
+    /// call for the same task while one is already running is a no-op.
+    ///
+    /// Used both right after a PR is observed merged and by the periodic
+    /// retry pass in [`check_and_execute`](Self::check_and_execute) for a
+    /// task whose earlier attempt failed — `worktree_path` stays set on
+    /// failure, so the next maintenance pass finds it eligible again.
+    async fn spawn_worktree_cleanup(&self, task_id: Uuid, wt_path: String, branch: String) {
+        if !Self::try_reserve_cleanup(&self.cleanup_in_flight, task_id).await {
+            return; // already retrying this task's worktree
+        }
+
+        let repo_path = match Self::resolve_working_dir_for_task(
+            &self.tasks,
+            &self.projects,
+            &self.repositories,
+            task_id,
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(e) => {
+                let _ = self.app_handle.emit(
+                    "agent-event",
+                    AgentEvent::Log {
+                        task_id: task_id.to_string(),
+                        level: LogLevel::Warn,
+                        message: format!("Cannot resolve repo path to clean up worktree: {}", e),
+                    },
+                );
+                Self::release_cleanup(&self.cleanup_in_flight, task_id).await;
+                return;
+            }
+        };
+
+        let wt_mgr = self.worktree_manager.clone();
+        let tasks = self.tasks.clone();
+        let storage = self.storage.clone();
+        let app_handle = self.app_handle.clone();
+        let in_flight = self.cleanup_in_flight.clone();
+        let wt_path_done = wt_path.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = Self::attempt_worktree_cleanup(
+                &wt_mgr, &tasks, &storage, task_id, &wt_path, &branch, &repo_path,
+            )
+            .await
+            {
+                let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "Failed to remove worktree {}: {}. It stays recorded on the task and will be retried automatically on a later maintenance pass.",
+                        wt_path_done, e
+                    ),
+                });
+            }
+            Self::release_cleanup(&in_flight, task_id).await;
+        });
     }
 
     async fn spawn_task_execution(&self, task_id: Uuid) {
@@ -1352,6 +1462,175 @@ mod tests {
         assert!(
             extra_dirs.is_empty(),
             "the fallback must match the no-workspace shape exactly (no --add-dir entries)"
+        );
+    }
+
+    fn test_storage() -> (crate::config::Storage, tempfile::TempDir) {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let storage =
+            crate::config::Storage::with_paths(crate::config::paths::AppPaths::with_roots(
+                root.join("config"),
+                root.join("data"),
+                root.join("cache"),
+                root.join("runtime"),
+            ));
+        (storage, temp)
+    }
+
+    #[tokio::test]
+    async fn try_reserve_cleanup_prevents_a_second_concurrent_attempt_for_the_same_task() {
+        let in_flight: RwLock<std::collections::HashSet<Uuid>> =
+            RwLock::new(std::collections::HashSet::new());
+        let task_id = Uuid::new_v4();
+
+        assert!(
+            TaskExecutor::try_reserve_cleanup(&in_flight, task_id).await,
+            "the first reservation for a task must succeed"
+        );
+        assert!(
+            !TaskExecutor::try_reserve_cleanup(&in_flight, task_id).await,
+            "a second reservation while the first is still held must be refused"
+        );
+
+        TaskExecutor::release_cleanup(&in_flight, task_id).await;
+
+        assert!(
+            TaskExecutor::try_reserve_cleanup(&in_flight, task_id).await,
+            "releasing the guard must allow a later attempt to reserve it again"
+        );
+    }
+
+    #[test]
+    fn tasks_eligible_for_cleanup_retry_finds_only_done_tasks_with_a_retained_worktree_path() {
+        let mut tasks = HashMap::new();
+
+        let eligible = create_test_task_full(
+            "merged, cleanup failed",
+            Uuid::new_v4(),
+            TaskStatus::Done,
+            0,
+        );
+        let eligible_id = eligible.id;
+        let mut eligible = eligible;
+        eligible.worktree_path = Some("/tmp/eligible".to_string());
+        eligible.branch_name = Some("eligible-branch".to_string());
+        tasks.insert(eligible_id, eligible);
+
+        let mut already_clean =
+            create_test_task_full("merged, already clean", Uuid::new_v4(), TaskStatus::Done, 0);
+        already_clean.worktree_path = None;
+        tasks.insert(already_clean.id, already_clean);
+
+        let mut still_running = create_test_task_full(
+            "not complete yet",
+            Uuid::new_v4(),
+            TaskStatus::InProgress,
+            0,
+        );
+        still_running.worktree_path = Some("/tmp/still-running".to_string());
+        tasks.insert(still_running.id, still_running);
+
+        let mut already_retrying = create_test_task_full(
+            "merged, retry in flight",
+            Uuid::new_v4(),
+            TaskStatus::Done,
+            0,
+        );
+        already_retrying.worktree_path = Some("/tmp/already-retrying".to_string());
+        let already_retrying_id = already_retrying.id;
+        tasks.insert(already_retrying_id, already_retrying);
+
+        let in_flight = std::collections::HashSet::from([already_retrying_id]);
+
+        let result = TaskExecutor::tasks_eligible_for_cleanup_retry(&tasks, &in_flight);
+
+        assert_eq!(
+            result,
+            vec![(eligible_id, "/tmp/eligible".to_string(), "eligible-branch".to_string())],
+            "only the Done task with a retained worktree_path and no in-flight attempt must be eligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn attempt_worktree_cleanup_preserves_the_path_on_failure_and_clears_it_once_it_succeeds()
+    {
+        let (storage, _storage_temp) = test_storage();
+        let repo_temp = tempfile::TempDir::new().expect("repo temp dir");
+        let blocking_dir = tempfile::TempDir::new().expect("worktree temp dir");
+        let wt_path = blocking_dir.path().to_str().unwrap().to_string();
+
+        let wt_mgr = WorktreeManager::new(
+            Arc::new(crate::config::paths::AppPaths::with_roots(
+                repo_temp.path().join("config"),
+                repo_temp.path().join("data"),
+                repo_temp.path().join("cache"),
+                repo_temp.path().join("runtime"),
+            )),
+            crate::config::paths::WorktreePlacement::Managed,
+        );
+
+        let mut task = create_test_task_full("merge cleanup", Uuid::new_v4(), TaskStatus::Done, 0);
+        task.worktree_path = Some(wt_path.clone());
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+
+        // `repo_temp` is not a git repository and `wt_path` was never
+        // registered as a worktree, so every fallback inside `remove` fails
+        // at the git level — but the directory genuinely still exists, so
+        // this is a real (not faked) removal failure.
+        let first = TaskExecutor::attempt_worktree_cleanup(
+            &wt_mgr,
+            &tasks,
+            &storage,
+            task_id,
+            &wt_path,
+            "some-branch",
+            repo_temp.path().to_str().unwrap(),
+        )
+        .await;
+
+        assert!(
+            first.is_err(),
+            "removal must fail while the directory still exists"
+        );
+        assert_eq!(
+            tasks
+                .read()
+                .await
+                .get(&task_id)
+                .unwrap()
+                .worktree_path
+                .as_deref(),
+            Some(wt_path.as_str()),
+            "a failed attempt must leave worktree_path in place for a later retry"
+        );
+
+        // Simulate whatever was blocking removal having been resolved by
+        // the time the next maintenance pass retries.
+        std::fs::remove_dir_all(&wt_path).unwrap();
+
+        let second = TaskExecutor::attempt_worktree_cleanup(
+            &wt_mgr,
+            &tasks,
+            &storage,
+            task_id,
+            &wt_path,
+            "some-branch",
+            repo_temp.path().to_str().unwrap(),
+        )
+        .await;
+
+        assert!(
+            second.is_ok(),
+            "removal must succeed once the directory is actually gone"
+        );
+        assert_eq!(
+            tasks.read().await.get(&task_id).unwrap().worktree_path,
+            None,
+            "a successful retry must clear worktree_path"
         );
     }
 }

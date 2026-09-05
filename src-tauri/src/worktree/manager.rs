@@ -1135,6 +1135,11 @@ branch refs/heads/main
     /// directory (a permission-blocked, non-empty subdirectory defeats the
     /// recursive delete each of them relies on), so `remove_with_git` must
     /// report `Err` — never silently `Ok(())` for a worktree still on disk.
+    ///
+    /// Unix-only: relies on `std::os::unix::fs::PermissionsExt` and the
+    /// `ipc` module's `current_uid()`, neither of which exist when compiling
+    /// for Windows (`ipc` itself is `#[cfg(unix)]`-gated in `lib.rs`).
+    #[cfg(unix)]
     #[tokio::test]
     async fn remove_with_git_reports_err_when_the_directory_survives_every_fallback() {
         use std::os::unix::fs::PermissionsExt;

@@ -60,8 +60,18 @@ pub fn StorageSettings(project_id: String) -> impl IntoView {
             match state_service::plan_state_migration(pid.clone(), target).await {
                 Ok(plan) => {
                     if plan.source_file_count == 0 && !plan.destination_exists {
-                        // Nothing to move: just record the preference.
-                        let known_updated_at = info.get_untracked().map(|i| i.updated_at.clone());
+                        // Nothing to move: just record the preference. The
+                        // command requires the timestamp this project's info
+                        // was last read at, so a decision based on a stale
+                        // read is rejected rather than silently applied.
+                        let Some(known_updated_at) = info.get_untracked().map(|i| i.updated_at) else {
+                            toast::error(
+                                "Storage settings have not finished loading. Try again."
+                                    .to_string(),
+                            );
+                            busy.set(false);
+                            return;
+                        };
                         match state_service::set_state_location(pid, target, known_updated_at).await
                         {
                             Ok(updated) => {
