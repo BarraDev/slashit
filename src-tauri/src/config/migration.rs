@@ -2,20 +2,48 @@
 //!
 //! Changing [`StateLocation`] must move data, not just repoint a setting —
 //! otherwise a user who flips the toggle silently loses their board. The
-//! ordering below is chosen so that an interruption at *any* point leaves the
-//! source intact:
+//! ordering below is chosen so that an interruption at *any* point leaves at
+//! least one full, recoverable copy of both the source and the pre-migration
+//! destination on disk:
 //!
-//! 1. plan and detect conflicts (read-only);
-//! 2. take an exclusive lock so nothing else writes during the move;
-//! 3. copy into a staging directory beside the destination;
-//! 4. verify the copy against the source, file by file;
-//! 5. atomically rename staging into place;
-//! 6. only then delete the source and update the registry.
+//! 1. take an exclusive lock so nothing else writes during the move;
+//! 2. resolve any leftover state a previous, interrupted [`StateMigrator::migrate`]
+//!    call left beside this exact destination (see [`StateMigrator::recover`]).
+//!    This runs *before* planning, so retrying a migration after a crash can
+//!    never silently start fresh and ignore data stranded in a retired copy;
+//! 3. plan and detect conflicts *under the lock, after recovery* — this is the
+//!    authoritative plan, not the read-only preview [`StateMigrator::plan`]
+//!    returns to the UI before the lock is held. A conflict that appears
+//!    between the preview and this point — including one recovery itself just
+//!    surfaced by reinstating a destination the preview never saw — is caught
+//!    here and handled by the same policy as any other conflict; it can never
+//!    silently fall through as source-wins;
+//! 4. copy the source into a staging directory beside the destination;
+//! 5. verify the copy against the source, file by file. This check only
+//!    covers the source's data; it says nothing yet about any destination-only
+//!    data carried over in the next step;
+//! 6. if the destination already holds non-conflicting data, *copy* (never
+//!    move) it into staging too, so the destination itself is untouched by
+//!    this step. A collision or copy failure here aborts the whole migration
+//!    rather than downgrading to a warning — there is no separate
+//!    post-copy verification of this step, so its safety comes from that
+//!    fail-closed error handling, not from a checksum;
+//! 7. retire the destination (rename aside) and atomically rename staging
+//!    into its place;
+//! 8. only after that swap has succeeded, delete the source and the retired
+//!    destination.
 //!
-//! Steps 3–4 are disposable: staging directories are always safe to delete,
-//! because the source is untouched until step 5 has already succeeded. That is
-//! what makes the operation recoverable after a crash — [`StateMigrator::sweep_staging`]
-//! removes leftovers on startup with no risk of losing data.
+//! Steps 4–6 build a scratch copy in staging while leaving both the source
+//! and the destination fully intact, so an interruption before step 7 leaves
+//! nothing to recover: staging is pure scratch and can always be deleted.
+//! An interruption *during* step 7 — after the destination has been retired
+//! but before staging has replaced it — is the one window where the retired
+//! copy is briefly the only surviving copy of pre-migration destination data.
+//! [`StateMigrator::recover`] resolves that window deterministically by
+//! pairing each staging directory with its retired counterpart instead of
+//! treating every `.slashit-migrating-*` directory as equally disposable —
+//! and step 2 above calls it automatically, so nothing else needs to invoke
+//! it for this invariant to hold.
 //!
 //! The copy-then-rename shape also gives cross-filesystem support for free.
 //! `fs::rename` cannot move between mounts (`EXDEV`), and external state
@@ -73,10 +101,37 @@ impl MigrationPlan {
 pub enum MigrationOutcome {
     /// Source and destination are the same place, or there was no state at all.
     NothingToDo,
-    /// State was copied, verified and the source removed.
+    /// State was copied (the source portion checked file-by-file against the
+    /// source; any destination-only carry-over instead relies on the copy
+    /// call itself failing closed) and the source removed.
     Migrated { files: usize, bytes: u64 },
     /// Destination already held the state and the policy kept it.
     KeptDestination { archived_source: Option<PathBuf> },
+}
+
+/// What [`StateMigrator::recover`] did about one leftover `.slashit-migrating-*`
+/// pid it found beside a destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    /// An incomplete scratch copy with no retired counterpart was deleted;
+    /// the swap never started, so nothing but scratch work was touched.
+    RemovedIncompleteScratch,
+    /// The destination already reflects a completed swap; the stale retired
+    /// copy was deleted.
+    RemovedStaleRetired,
+    /// A swap whose scratch copy had already finished copying (the source
+    /// portion checked against the source; any destination-only carry-over
+    /// present only if its copy succeeded, since a failure would have
+    /// aborted before retiring `to`), but crashed before installing it, was
+    /// completed here.
+    CompletedSwap,
+    /// The destination was missing entirely and no scratch copy remained to
+    /// re-install; the retired copy was restored as the destination.
+    RestoredFromRetired,
+    /// Both a scratch and a retired copy exist for a pid whose destination is
+    /// also already present. Left untouched — completing or discarding
+    /// either would be a guess, not a recovery.
+    LeftForManualReview,
 }
 
 /// Result plus any non-fatal notes worth surfacing.
@@ -170,7 +225,7 @@ impl Drop for MigrationLock {
     }
 }
 
-/// Suffix used for staging directories. Recognised by [`StateMigrator::sweep_staging`].
+/// Suffix used for staging directories. Recognised by [`StateMigrator::recover`].
 const STAGING_PREFIX: &str = ".slashit-migrating-";
 const LOCK_SUFFIX: &str = ".slashit-migrate.lock";
 
@@ -182,11 +237,28 @@ impl StateMigrator {
         let source = scan(from)?;
         let dest = scan(to)?;
 
+        // A conflict is any relative path that exists on both sides and
+        // isn't a directory on both sides. Two directories at the same path
+        // are not a conflict — they get merged by recursing, and any real
+        // collision inside them shows up as its own entry. A directory
+        // colliding with a file (in either direction) is a conflict even
+        // though neither side's *file* list contains the directory's path
+        // itself, which is exactly the case a flat file-list comparison
+        // would silently miss.
         let conflicts: Vec<String> = source
-            .files
+            .entries
             .iter()
-            .filter(|(rel, _)| dest.files.iter().any(|(d, _)| d == rel))
-            .map(|(rel, _)| rel.clone())
+            .filter_map(|(rel, source_is_dir)| {
+                dest.entries.iter().find(|(d, _)| d == rel).and_then(
+                    |(_, dest_is_dir)| {
+                        if *source_is_dir && *dest_is_dir {
+                            None
+                        } else {
+                            Some(rel.clone())
+                        }
+                    },
+                )
+            })
             .take(50)
             .collect();
 
@@ -207,11 +279,15 @@ impl StateMigrator {
 
     /// Execute a migration. Idempotent: running it again after success is a
     /// no-op because the source no longer exists.
+    ///
+    /// The lock is acquired *before* the authoritative plan is computed, so
+    /// nothing below this point ever acts on a plan that could be stale by
+    /// the time it's used. [`StateMigrator::plan`] remains available on its
+    /// own as an unlocked, read-only preview for the UI.
     pub fn migrate(from: &Path, to: &Path, policy: ConflictPolicy) -> Result<MigrationReport> {
         let mut warnings = Vec::new();
-        let plan = Self::plan(from, to)?;
 
-        if plan.from == plan.to {
+        if from == to {
             return Ok(MigrationReport {
                 outcome: MigrationOutcome::NothingToDo,
                 from: from.into(),
@@ -219,6 +295,29 @@ impl StateMigrator {
                 warnings,
             });
         }
+
+        // Lock is placed beside the destination so two processes migrating the
+        // same project in opposite directions still contend on one file.
+        let lock_path = lock_path_for(to);
+        let _lock = MigrationLock::acquire(lock_path)?;
+
+        // Resolve any leftover `.slashit-migrating-*` state for this exact
+        // destination before planning anything. A previous `migrate` call
+        // that crashed between retiring `to` and installing staging in its
+        // place can leave the only safe copy of pre-crash destination data
+        // sitting in a retired directory that nothing else will ever look
+        // at; recovering it here — under the lock, before `plan` — means a
+        // retry can never silently start a fresh migration that ignores it.
+        for outcome in Self::recover(to) {
+            warnings.push(format!("resolved an interrupted previous migration: {outcome:?}"));
+        }
+
+        // Authoritative: computed under the lock and after recovery, so a
+        // conflict that only appeared after an earlier UI preview — or after
+        // recovery just reinstated a destination the preview never saw — is
+        // caught here and handled by `policy` like any other conflict, never
+        // silently ignored.
+        let plan = Self::plan(from, to)?;
 
         // Nothing at the source: either already migrated, or never existed.
         if !plan.source_exists || plan.source_file_count == 0 {
@@ -234,11 +333,6 @@ impl StateMigrator {
                 warnings,
             });
         }
-
-        // Lock is placed beside the destination so two processes migrating the
-        // same project in opposite directions still contend on one file.
-        let lock_path = lock_path_for(to);
-        let _lock = MigrationLock::acquire(lock_path)?;
 
         if plan.requires_resolution {
             match policy {
@@ -298,11 +392,16 @@ impl StateMigrator {
             }
         };
 
-        // Merge case: destination exists but had no conflicting files, or the
-        // policy said source wins. Move its surviving entries into staging so
-        // the final rename is still a single atomic step.
+        // Merge case: destination exists but had no conflicting entries under
+        // the authoritative plan above. Copy (never move) its surviving
+        // entries into staging, so `to` itself stays untouched — and fully
+        // recoverable — until the swap below has succeeded. A failure here
+        // aborts the migration with both `from` and `to` still intact.
         if to.exists() {
-            merge_into(to, &staging, &mut warnings)?;
+            if let Err(e) = merge_into(to, &staging) {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(e);
+            }
             let retired = parent.join(format!("{STAGING_PREFIX}old-{}", std::process::id()));
             let _ = fs::remove_dir_all(&retired);
             fs::rename(to, &retired)
@@ -330,8 +429,10 @@ impl StateMigrator {
 
         write_marker(to, &mut warnings);
 
-        // The destination is now complete and verified. Only now is the source
-        // expendable.
+        // The destination is now complete: the source portion was checked
+        // file-by-file above, and any destination-only carry-over is present
+        // because `merge_into` returned `Ok` rather than a fail-closed error.
+        // Only now is the source expendable.
         if let Err(e) = fs::remove_dir_all(from) {
             warnings.push(format!(
                 "state was migrated successfully, but the old directory {} could not be removed: {e}",
@@ -347,33 +448,77 @@ impl StateMigrator {
         })
     }
 
-    /// Remove staging leftovers under `parent`. Safe by construction: staging
-    /// directories only ever exist while a source directory is still intact.
-    pub fn sweep_staging(parent: &Path) -> usize {
-        let Ok(entries) = fs::read_dir(parent) else {
-            return 0;
+    /// Resolve any leftover `.slashit-migrating-*` state for the destination
+    /// `to`, left behind by a crash during a previous [`Self::migrate`] call.
+    ///
+    /// [`Self::migrate`] calls this itself, under its lock and before it
+    /// plans, so a caller never needs to invoke it separately for the
+    /// crash-recovery invariant to hold. It is also exposed here as a public
+    /// method so it can be run proactively (for example, once at startup for
+    /// every known destination) without waiting for a retry.
+    ///
+    /// Every leftover carries a pid: a scratch copy at
+    /// `{STAGING_PREFIX}{pid}`, and — only if the crash happened after the
+    /// destination was retired but before staging replaced it — a retired
+    /// copy of the pre-migration destination at `{STAGING_PREFIX}old-{pid}`.
+    /// Those two are paired up by pid rather than treated as interchangeable
+    /// disposable junk, because the retired copy is the *only* surviving
+    /// copy of destination-only data during that narrow window:
+    ///
+    /// - scratch only: the swap never started; the scratch copy is pure
+    ///   working state and is deleted.
+    /// - scratch and retired, destination missing: crashed mid-swap after
+    ///   both copy steps had already succeeded. The scratch copy is exactly
+    ///   what would have been installed, so the swap is completed here.
+    /// - scratch and retired, destination present: another run must have
+    ///   already finished (or something wrote a fresh destination since).
+    ///   Ambiguous — left untouched rather than guessed at.
+    /// - retired only, destination present: the swap already succeeded and
+    ///   the final cleanup step just didn't run; the retired copy is stale
+    ///   and is deleted.
+    /// - retired only, destination missing: the swap never completed and
+    ///   nothing else survived it. The retired copy is restored as the
+    ///   destination rather than deleted.
+    pub fn recover(to: &Path) -> Vec<RecoveryOutcome> {
+        let Some(parent) = to.parent() else {
+            return Vec::new();
         };
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with(STAGING_PREFIX) {
-                if fs::remove_dir_all(entry.path()).is_ok() {
-                    removed += 1;
-                }
-            } else if name.ends_with(LOCK_SUFFIX) {
-                // Locks are per-process; a leftover one means a crash.
-                let stale = entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .map(|t| t.elapsed().unwrap_or_default().as_secs() > 300)
-                    .unwrap_or(true);
-                if stale && fs::remove_file(entry.path()).is_ok() {
-                    removed += 1;
-                }
+        let Ok(dir) = fs::read_dir(parent) else {
+            return Vec::new();
+        };
+
+        let old_prefix = format!("{STAGING_PREFIX}old-");
+        let mut scratch = std::collections::BTreeMap::new();
+        let mut retired = std::collections::BTreeMap::new();
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(pid) = name.strip_prefix(&old_prefix) {
+                retired.insert(pid.to_string(), entry.path());
+            } else if let Some(pid) = name.strip_prefix(STAGING_PREFIX) {
+                scratch.insert(pid.to_string(), entry.path());
             }
         }
-        removed
+
+        // A lock left behind by a crashed process is otherwise only cleaned
+        // up lazily, the next time something tries to acquire it (see
+        // `MigrationLock::acquire`). Clear a stale one eagerly too, so a
+        // destination nobody is actively migrating doesn't sit locked.
+        let lock = lock_path_for(to);
+        let stale_lock = fs::metadata(&lock)
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default().as_secs() > 300)
+            .unwrap_or(false);
+        if stale_lock {
+            let _ = fs::remove_file(&lock);
+        }
+
+        let mut pids: Vec<String> = scratch.keys().chain(retired.keys()).cloned().collect();
+        pids.sort();
+        pids.dedup();
+
+        pids.into_iter()
+            .map(|pid| resolve_one(to, scratch.get(&pid), retired.get(&pid)))
+            .collect()
     }
 
     /// Remove a legacy `.slashit/` directory that is empty, leaving anything
@@ -457,38 +602,78 @@ fn archive(dir: &Path, warnings: &mut Vec<String>) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Move entries from `src` into `dst`, skipping any that already exist there.
-fn merge_into(src: &Path, dst: &Path, warnings: &mut Vec<String>) -> Result<()> {
-    let entries = fs::read_dir(src)
-        .map_err(|e| MigrationError::io(format!("reading {}", src.display()), e))?;
+/// Decide and act on the fate of one pid's leftovers, per
+/// [`StateMigrator::recover`]'s documented cases.
+fn resolve_one(to: &Path, scratch: Option<&PathBuf>, retired: Option<&PathBuf>) -> RecoveryOutcome {
+    match (scratch, retired) {
+        (Some(scratch), None) => {
+            let _ = fs::remove_dir_all(scratch);
+            RecoveryOutcome::RemovedIncompleteScratch
+        }
+        (None, Some(retired)) => {
+            if to.exists() {
+                let _ = fs::remove_dir_all(retired);
+                RecoveryOutcome::RemovedStaleRetired
+            } else if fs::rename(retired, to).is_ok() {
+                RecoveryOutcome::RestoredFromRetired
+            } else {
+                RecoveryOutcome::LeftForManualReview
+            }
+        }
+        (Some(scratch), Some(retired)) => {
+            if to.exists() {
+                RecoveryOutcome::LeftForManualReview
+            } else if fs::rename(scratch, to).is_ok() {
+                let _ = fs::remove_dir_all(retired);
+                RecoveryOutcome::CompletedSwap
+            } else {
+                RecoveryOutcome::LeftForManualReview
+            }
+        }
+        (None, None) => unreachable!("resolve_one called for a pid with no leftovers"),
+    }
+}
+
+/// Copy destination-only entries from `dst_original` into `staging`, leaving
+/// `dst_original` completely untouched.
+///
+/// This must be a copy, never a move: `dst_original` (the pre-migration
+/// destination) has to remain fully recoverable at its original path until
+/// the caller has successfully swapped `staging` into place. A collision that
+/// isn't a directory on both sides, or a copy that fails partway, aborts the
+/// whole migration instead of silently dropping the destination's data —
+/// `plan()` should already have surfaced any such collision as a conflict
+/// before this runs, so reaching one here means the filesystem changed under
+/// us and the safe response is to fail closed, not guess.
+fn merge_into(dst_original: &Path, staging: &Path) -> Result<()> {
+    let entries = fs::read_dir(dst_original)
+        .map_err(|e| MigrationError::io(format!("reading {}", dst_original.display()), e))?;
     for entry in entries.flatten() {
         let from = entry.path();
-        let target = dst.join(entry.file_name());
-        let source_type = entry
-            .file_type()
+        let target = staging.join(entry.file_name());
+        let meta = entry
+            .metadata()
             .map_err(|e| MigrationError::io(format!("stat {}", from.display()), e))?;
 
         match fs::symlink_metadata(&target) {
             Ok(target_meta) => {
-                if source_type.is_dir() && target_meta.file_type().is_dir() {
-                    merge_into(&from, &target, warnings)?;
+                if meta.is_dir() && !meta.is_symlink() && target_meta.file_type().is_dir() {
+                    merge_into(&from, &target)?;
+                    continue;
                 }
-                continue;
+                return Err(MigrationError::Conflict(format!(
+                    "{} collides with already-migrated source content",
+                    from.display()
+                )));
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(MigrationError::io(format!("stat {}", target.display()), e)),
         }
 
-        if fs::rename(&from, &target).is_err() {
-            // Cross-device or non-empty: fall back to a copy.
-            let copied = if source_type.is_dir() {
-                copy_tree(&from, &target).is_ok()
-            } else {
-                fs::copy(&from, &target).is_ok()
-            };
-            if !copied {
-                warnings.push(format!("could not carry over {}", from.display()));
-            }
+        if meta.is_dir() && !meta.is_symlink() {
+            copy_tree(&from, &target)?;
+        } else {
+            copy_entry(&from, &target, &meta)?;
         }
     }
     Ok(())
@@ -497,6 +682,10 @@ fn merge_into(src: &Path, dst: &Path, warnings: &mut Vec<String>) -> Result<()> 
 struct Scan {
     exists: bool,
     files: Vec<(String, u64)>,
+    /// Every filesystem node under the root, both directories and leaves, as
+    /// (relative path, is_dir). Used by [`StateMigrator::plan`] to detect
+    /// type collisions that a leaf-only file list would miss.
+    entries: Vec<(String, bool)>,
     bytes: u64,
 }
 
@@ -507,45 +696,85 @@ struct Scan {
 /// pull in unrelated data.
 fn scan(root: &Path) -> Result<Scan> {
     let mut files = Vec::new();
+    let mut entries = Vec::new();
     let mut bytes = 0u64;
     if !root.exists() {
         return Ok(Scan {
             exists: false,
             files,
+            entries,
             bytes,
         });
     }
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
+        let read = match fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) => return Err(MigrationError::io(format!("reading {}", dir.display()), e)),
         };
-        for entry in entries.flatten() {
+        for entry in read.flatten() {
             let path = entry.path();
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
             };
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
             if meta.is_dir() && !meta.is_symlink() {
+                entries.push((rel, true));
                 stack.push(path);
             } else {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
                 bytes += meta.len();
+                entries.push((rel.clone(), false));
                 files.push((rel, meta.len()));
             }
         }
     }
     files.sort();
+    entries.sort();
     Ok(Scan {
         exists: true,
         files,
+        entries,
         bytes,
     })
+}
+
+/// Copy one non-directory entry (regular file or symlink), preserving Unix
+/// permission bits. Fails closed: a symlink that can't be recreated is an
+/// error here, not a silently-dropped entry, so callers that need "never
+/// destroy data" semantics (like [`merge_into`]) can rely on `?` alone.
+fn copy_entry(from: &Path, to: &Path, meta: &fs::Metadata) -> Result<()> {
+    if meta.is_symlink() {
+        #[cfg(unix)]
+        {
+            let target = fs::read_link(from)
+                .map_err(|e| MigrationError::io(format!("readlink {}", from.display()), e))?;
+            std::os::unix::fs::symlink(target, to).map_err(|e| {
+                MigrationError::io(format!("symlinking {}", to.display()), e)
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::copy(from, to).map_err(|e| {
+                MigrationError::io(format!("copying {} -> {}", from.display(), to.display()), e)
+            })?;
+        }
+    } else {
+        fs::copy(from, to).map_err(|e| {
+            MigrationError::io(format!("copying {} -> {}", from.display(), to.display()), e)
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            let _ = fs::set_permissions(to, fs::Permissions::from_mode(mode));
+        }
+    }
+    Ok(())
 }
 
 /// Recursive copy that preserves Unix permission bits.
@@ -565,27 +794,8 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 
         if meta.is_dir() && !meta.is_symlink() {
             copy_tree(&from, &to)?;
-        } else if meta.is_symlink() {
-            #[cfg(unix)]
-            {
-                let target = fs::read_link(&from)
-                    .map_err(|e| MigrationError::io(format!("readlink {}", from.display()), e))?;
-                let _ = std::os::unix::fs::symlink(target, &to);
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = fs::copy(&from, &to);
-            }
         } else {
-            fs::copy(&from, &to).map_err(|e| {
-                MigrationError::io(format!("copying {} -> {}", from.display(), to.display()), e)
-            })?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = meta.permissions().mode();
-                let _ = fs::set_permissions(&to, fs::Permissions::from_mode(mode));
-            }
+            copy_entry(&from, &to, &meta)?;
         }
     }
 
@@ -814,18 +1024,20 @@ mod tests {
     }
 
     #[test]
-    fn staging_leftovers_are_swept() {
+    fn incomplete_scratch_with_no_retired_counterpart_is_removed() {
         let tmp = TempDir::new().unwrap();
         let parent = tmp.path();
+        let to = parent.join("state");
         let junk = parent.join(format!("{STAGING_PREFIX}4242"));
         fs::create_dir_all(junk.join("tasks")).unwrap();
         fs::write(junk.join("tasks/x.toml"), "x").unwrap();
         let keep = parent.join("real-state");
         fs::create_dir_all(&keep).unwrap();
 
-        assert_eq!(StateMigrator::sweep_staging(parent), 1);
+        let outcomes = StateMigrator::recover(&to);
+        assert_eq!(outcomes, vec![RecoveryOutcome::RemovedIncompleteScratch]);
         assert!(!junk.exists());
-        assert!(keep.exists(), "sweep must not touch real directories");
+        assert!(keep.exists(), "recovery must not touch unrelated directories");
     }
 
     #[test]
@@ -842,12 +1054,158 @@ mod tests {
         assert!(from.join("tasks/a.toml").is_file());
         assert!(!to.exists());
 
-        // Recovery sweeps staging, then the retry succeeds cleanly.
-        StateMigrator::sweep_staging(to.parent().unwrap());
+        // Recovery removes the orphaned scratch copy, then the retry
+        // succeeds cleanly.
+        StateMigrator::recover(&to);
         assert!(!staging.exists());
 
         let r = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
         assert!(matches!(r.outcome, MigrationOutcome::Migrated { files: 3, .. }));
+    }
+
+    #[test]
+    fn recovery_completes_a_swap_interrupted_between_retire_and_install() {
+        // Both copy steps already succeeded and `to` was retired, but the
+        // process died before staging could be renamed into place.
+        let tmp = TempDir::new().unwrap();
+        let to = tmp.path().join("dest/state");
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+
+        let scratch = to.parent().unwrap().join(format!("{STAGING_PREFIX}777"));
+        write(&scratch.join("roadmap.toml"), "new\n");
+        let retired = to
+            .parent()
+            .unwrap()
+            .join(format!("{STAGING_PREFIX}old-777"));
+        write(&retired.join("roadmap.toml"), "old\n");
+
+        let outcomes = StateMigrator::recover(&to);
+        assert_eq!(outcomes, vec![RecoveryOutcome::CompletedSwap]);
+        assert!(!scratch.exists());
+        assert!(!retired.exists());
+        assert_eq!(
+            fs::read_to_string(to.join("roadmap.toml")).unwrap(),
+            "new\n",
+            "the already-fully-copied scratch content must be what gets installed"
+        );
+    }
+
+    #[test]
+    fn retrying_a_migration_recovers_a_stranded_swap_before_starting_a_new_one() {
+        // Reproduces a full crash-and-retry cycle end to end through
+        // `migrate` itself, not just through `recover`: a previous call to
+        // `migrate(&from, &to, ..)` fully copied and merged its candidate
+        // into staging and retired the original `to`, then the process died
+        // before installing staging as the new `to`. `from` (the configured
+        // source) is still there, `to` is still missing, and the caller
+        // retries the exact same migration. The stranded swap must be
+        // installed first, not silently ignored by a fresh migration that
+        // only ever looks at `from` and an empty `to`.
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("dest/state");
+        seed(&from);
+
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        let scratch = to.parent().unwrap().join(format!("{STAGING_PREFIX}9001"));
+        write(&scratch.join("recovered.toml"), "from the interrupted swap\n");
+        let retired = to
+            .parent()
+            .unwrap()
+            .join(format!("{STAGING_PREFIX}old-9001"));
+        fs::create_dir_all(&retired).unwrap();
+
+        assert!(!to.exists(), "destination is missing, as after the crash");
+
+        let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
+
+        assert!(matches!(report.outcome, MigrationOutcome::Migrated { .. }));
+        assert_eq!(
+            fs::read_to_string(to.join("recovered.toml")).unwrap(),
+            "from the interrupted swap\n",
+            "a stranded swap must be installed before the retried migration runs"
+        );
+        assert!(
+            to.join("tasks/a.toml").is_file(),
+            "the retried migration's own data must still land on top of the recovered state"
+        );
+        assert!(!from.exists(), "source removed only after everything landed");
+        assert!(!scratch.exists());
+        assert!(!retired.exists());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("resolved an interrupted previous migration")),
+            "recovery must be visible in the report, not silent"
+        );
+    }
+
+    #[test]
+    fn recovery_removes_a_stale_retired_copy_once_the_swap_already_succeeded() {
+        let tmp = TempDir::new().unwrap();
+        let to = tmp.path().join("dest/state");
+        write(&to.join("roadmap.toml"), "installed\n");
+
+        let retired = to
+            .parent()
+            .unwrap()
+            .join(format!("{STAGING_PREFIX}old-555"));
+        write(&retired.join("roadmap.toml"), "stale\n");
+
+        let outcomes = StateMigrator::recover(&to);
+        assert_eq!(outcomes, vec![RecoveryOutcome::RemovedStaleRetired]);
+        assert!(!retired.exists());
+        assert_eq!(
+            fs::read_to_string(to.join("roadmap.toml")).unwrap(),
+            "installed\n"
+        );
+    }
+
+    #[test]
+    fn recovery_restores_the_destination_from_a_retired_copy_when_nothing_else_survived() {
+        // `to` is missing entirely and no scratch copy remains: the retired
+        // copy is the only safe data left, so it must be restored, not
+        // deleted.
+        let tmp = TempDir::new().unwrap();
+        let to = tmp.path().join("dest/state");
+        let retired = tmp
+            .path()
+            .join("dest")
+            .join(format!("{STAGING_PREFIX}old-321"));
+        write(&retired.join("roadmap.toml"), "only copy left\n");
+
+        let outcomes = StateMigrator::recover(&to);
+        assert_eq!(outcomes, vec![RecoveryOutcome::RestoredFromRetired]);
+        assert!(!retired.exists());
+        assert_eq!(
+            fs::read_to_string(to.join("roadmap.toml")).unwrap(),
+            "only copy left\n"
+        );
+    }
+
+    #[test]
+    fn recovery_leaves_an_ambiguous_scratch_and_retired_pair_alone_when_destination_exists() {
+        let tmp = TempDir::new().unwrap();
+        let to = tmp.path().join("dest/state");
+        write(&to.join("roadmap.toml"), "already here\n");
+
+        let scratch = to.parent().unwrap().join(format!("{STAGING_PREFIX}111"));
+        write(&scratch.join("roadmap.toml"), "candidate\n");
+        let retired = to
+            .parent()
+            .unwrap()
+            .join(format!("{STAGING_PREFIX}old-111"));
+        write(&retired.join("roadmap.toml"), "candidate-old\n");
+
+        let outcomes = StateMigrator::recover(&to);
+        assert_eq!(outcomes, vec![RecoveryOutcome::LeftForManualReview]);
+        assert!(scratch.exists(), "nothing should be deleted when ambiguous");
+        assert!(retired.exists(), "nothing should be deleted when ambiguous");
+        assert_eq!(
+            fs::read_to_string(to.join("roadmap.toml")).unwrap(),
+            "already here\n"
+        );
     }
 
     #[test]
@@ -983,5 +1341,133 @@ mod tests {
         assert!(fs::symlink_metadata(to.join("deep/a/b/c/link.toml"))
             .unwrap()
             .is_symlink());
+    }
+
+    #[test]
+    fn type_mismatch_between_source_and_destination_is_a_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        // Source has a plain file named "notes"; destination has a directory
+        // of the same name. A flat leaf-file comparison would never see
+        // these collide, since the destination's only *file* entries are
+        // nested inside "notes/", not "notes" itself.
+        write(&from.join("notes"), "a note\n");
+        write(&to.join("notes/inner.toml"), "nested\n");
+
+        let plan = StateMigrator::plan(&from, &to).unwrap();
+        assert!(plan.requires_resolution);
+        assert_eq!(plan.conflicts, vec!["notes".to_string()]);
+
+        let err = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap_err();
+        assert!(matches!(err, MigrationError::Conflict(_)));
+        assert_eq!(fs::read_to_string(from.join("notes")).unwrap(), "a note\n");
+        assert!(to.join("notes/inner.toml").is_file());
+    }
+
+    #[test]
+    fn conflict_appearing_after_preview_is_caught_by_revalidation() {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        seed(&from);
+
+        let preview = StateMigrator::plan(&from, &to).unwrap();
+        assert!(
+            !preview.requires_resolution,
+            "no conflict exists yet at preview time"
+        );
+
+        // Simulate another writer landing on the destination in the window
+        // between the UI showing this preview and the user confirming it.
+        write(&to.join("tasks/a.toml"), "raced in\n");
+
+        let err = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap_err();
+        assert!(
+            matches!(err, MigrationError::Conflict(_)),
+            "a stale preview must never let a new conflict through as source-wins"
+        );
+        assert_eq!(fs::read_to_string(from.join("tasks/a.toml")).unwrap(), "id = 1\n");
+        assert_eq!(fs::read_to_string(to.join("tasks/a.toml")).unwrap(), "raced in\n");
+    }
+
+    #[test]
+    fn merge_into_copies_destination_only_entries_without_touching_the_original() {
+        let tmp = TempDir::new().unwrap();
+        let to = tmp.path().join("to");
+        let staging = tmp.path().join("staging");
+        write(&to.join("keep.toml"), "keep me\n");
+        fs::create_dir_all(&staging).unwrap();
+
+        merge_into(&to, &staging).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(to.join("keep.toml")).unwrap(),
+            "keep me\n",
+            "the original destination must survive untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(staging.join("keep.toml")).unwrap(),
+            "keep me\n"
+        );
+    }
+
+    #[test]
+    fn successful_merge_leaves_no_staging_or_retired_leftovers() {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        seed(&from);
+        write(&to.join("notes.md"), "keep me\n");
+
+        StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
+
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(STAGING_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "no scratch or retired dirs should survive success");
+        assert_eq!(fs::read_to_string(to.join("notes.md")).unwrap(), "keep me\n");
+        assert!(to.join("tasks/a.toml").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_carry_over_copy_failure_aborts_the_migration() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc_geteuid() } == 0 {
+            return; // root ignores permission bits
+        }
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("from");
+        let to = tmp.path().join("to");
+        seed(&from);
+        let unreadable = to.join("secret.toml");
+        write(&unreadable, "keep out\n");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort);
+
+        // Restore before asserting so the tempdir can always be cleaned up.
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a failed destination carry-over must abort the migration, not warn and continue"
+        );
+        assert!(from.join("tasks/a.toml").is_file(), "source intact");
+        assert!(
+            to.join("secret.toml").is_file(),
+            "destination-only file was never moved out of `to`"
+        );
+        assert_eq!(fs::read_to_string(&unreadable).unwrap(), "keep out\n");
+
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(STAGING_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "staging must be cleaned up after failure");
     }
 }

@@ -95,15 +95,32 @@ Changing the setting never moves files as a side effect. Selecting an option
 builds a plan — real file counts, byte totals and any conflicting paths — and
 only an explicit confirmation runs it.
 
-The migration itself is: plan, lock, copy to a staging directory, verify,
-atomically rename into place, and **only then** delete the source. It is
-therefore safe across filesystems, idempotent, and recoverable if interrupted:
-at no point does the only copy of your board not exist.
+The migration itself is: lock, recover any leftover state from a previous,
+interrupted migration to this exact destination, re-plan under the lock (the
+plan shown for confirmation is only a preview — a conflict that appears after
+it, including one recovery itself just surfaced, is caught here, not silently
+resolved in the source's favor), copy the source to a staging directory,
+verify the copied source file-by-file, copy in any non-conflicting
+destination-only data, retire the destination, atomically rename staging into
+its place, and **only then** delete the source and the retired destination.
+It is therefore safe across filesystems and idempotent. An interruption
+before the retire-and-swap step leaves the source and destination fully
+untouched — staging is pure scratch. An interruption during that step is the
+one window where the retired destination is briefly the only surviving copy
+of its data; `StateMigrator::recover` resolves that window deterministically
+instead of treating every in-progress directory as equally disposable, and
+`migrate` calls it itself, under the lock and before planning, so retrying a
+migration after a crash can never silently start over and ignore what was
+stranded. The file-by-file check only covers the copied source; carrying over
+destination-only data has no separate verification pass, so its safety comes
+from that copy failing closed on any error, not from a checksum.
 
 If both locations hold data, the default is to refuse and list the conflicts.
 Guessing which copy of a kanban board is the good one is not a decision this
 code is entitled to make. When you choose, the copy that loses is archived
-beside itself, never deleted.
+beside itself, never deleted. Any copy failure while carrying destination-only
+data into staging aborts the whole migration rather than dropping data
+silently.
 
 Task files migrate lazily. Reads fall back to the old location and startup
 sweeps it, so an upgrade shows every task it showed before; the move happens on
