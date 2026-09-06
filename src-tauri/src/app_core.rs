@@ -178,42 +178,48 @@ pub async fn build_state_with_paths(
         // first would strand the branch and any uncommitted work in it.
         // Cache `git worktree list --porcelain` per repository so tasks that
         // share a repo shell out to git at most once during this loop, rather
-        // than once per task.
-        let mut porcelain_cache: HashMap<String, String> = HashMap::new();
+        // than once per task. A failed lookup is cached too: retrying per task
+        // would not make git work, and every task in that repo must reach the
+        // same "could not verify" conclusion anyway.
+        let mut porcelain_cache: HashMap<String, Option<String>> = HashMap::new();
 
         for task in tasks.values_mut() {
-            let Some(wt_path) = task.worktree_path.as_ref() else {
+            let Some(wt_path) = task.worktree_path.clone() else {
                 continue;
             };
-            if std::path::Path::new(wt_path).exists() {
+            if std::path::Path::new(&wt_path).exists() {
                 continue;
             }
 
-            // `adopt_existing` only matches this app's own managed/legacy
-            // path conventions; `adopt_any_registered` is the fallback for a
-            // worktree git still has registered for this branch at any other
-            // path (for example, one `wt` placed under its own convention
-            // when `WorktreePlacement::Auto`, the default, delegates to it).
-            // Falling through to it here — rather than clearing the
-            // reference — is what keeps this loop from stranding a live
-            // worktree just because it does not sit at a path SlashIt itself
-            // would have chosen.
-            let adopted = task
-                .branch_name
-                .as_ref()
-                .zip(repo_for_project.get(&task.project_id))
-                .and_then(|(branch, repo)| {
+            let recovery = match (
+                task.branch_name.as_ref(),
+                repo_for_project.get(&task.project_id),
+            ) {
+                (Some(branch), Some(repo)) => {
                     let porcelain = porcelain_cache
                         .entry(repo.clone())
                         .or_insert_with(|| worktree::WorktreeManager::worktree_list_porcelain(repo));
                     app_state
                         .worktree_manager
-                        .adopt_existing(repo, branch, porcelain)
-                        .or_else(|| worktree::WorktreeManager::adopt_any_registered(branch, porcelain))
-                });
+                        .classify_missing_worktree(repo, branch, porcelain.as_deref())
+                }
+                // No branch was ever recorded, so there is nothing to look a
+                // worktree up by and nothing that could ever recreate it. No
+                // amount of git working would change that answer, so this is
+                // genuine absence rather than a failed check.
+                (None, _) => worktree::WorktreeRecovery::ConfirmedAbsent,
+                // A branch is recorded but the project resolves to no
+                // repository. That is not proof the worktree is gone: this
+                // table is rebuilt from config on every start, and a config
+                // that fails to deserialize cleanly is recovered with no
+                // projects and no repositories at all. Clearing here would
+                // spend every task's reference on a lookup that never
+                // happened.
+                (Some(_), None) => worktree::WorktreeRecovery::Unverified,
+            };
 
-            match adopted {
-                Some(path) => {
+            match recovery {
+                worktree::WorktreeRecovery::Adopt(path) => {
                     println!(
                         "SlashIt: Adopted relocated worktree for task '{}' at {path}",
                         task.title
@@ -221,13 +227,31 @@ pub async fn build_state_with_paths(
                     task.worktree_path = Some(path);
                     report.adopted_worktrees += 1;
                 }
-                None => {
+                worktree::WorktreeRecovery::ConfirmedAbsent => {
                     println!(
                         "SlashIt: Worktree dir missing for task '{}', clearing reference",
                         task.title
                     );
                     task.worktree_path = None;
                     report.cleared_worktrees += 1;
+                }
+                // Git could not be consulted, so nothing here proves the
+                // worktree is gone. `worktree_path` is the only persisted
+                // record of it, and clearing it is not recoverable from here:
+                // this loop skips a task that has none, and the executor's
+                // cleanup-retry pass filters on one too, so no later start
+                // would reconsider it. A transient git failure must not be
+                // allowed to spend it. Left untouched, and deliberately not
+                // counted as migrated: nothing changed, so there is nothing to
+                // persist and the next start verifies again.
+                worktree::WorktreeRecovery::Unverified => {
+                    eprintln!(
+                        "Warning: worktree dir missing for task '{}' at {}, but its absence could \
+                         not be confirmed (git worktree list failed, or the project resolved to no \
+                         repository); keeping the reference for the next start",
+                        task.title, wt_path
+                    );
+                    continue;
                 }
             }
             migrated_projects.insert(task.project_id);
@@ -711,6 +735,98 @@ mod tests {
             hydrated.worktree_path.as_deref(),
             Some(unconventional_worktree.to_string_lossy().as_ref()),
             "worktree_path must be repointed at the git-confirmed location, not cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_keeps_a_worktree_reference_it_could_not_verify() {
+        // Regression guard for issue #6, asserted at the loop level rather
+        // than on `classify_missing_worktree` alone.
+        //
+        // This guarantee was originally written against the reconciliation
+        // loop while it still lived in `lib.rs`; extracting the loop into
+        // `build_state_with_paths` moved it out from under every test that
+        // covered it, because all of the issue-#6 tests target
+        // `WorktreeManager` methods directly. A resolution that collapsed
+        // `Option<String>` back to a plain `String` here would restore the
+        // exact defect and still pass the entire suite. This test is what
+        // makes that impossible.
+        //
+        // The task records a branch, but its project resolves to no
+        // repository -- so git is never consulted and absence is never
+        // established. `worktree_path` is the only persisted record of the
+        // worktree, and nothing later reconsiders a task that has none, so a
+        // lookup that never happened must not be allowed to spend it.
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+
+        let project = domain::Project {
+            id: uuid::Uuid::new_v4(),
+            name: "orphaned-project".to_string(),
+            // No repository: exactly what a partially-recovered config yields.
+            repository_id: None,
+            scope: domain::ProjectScope::Standalone,
+            state_location: config::paths::StateLocation::External,
+            agent_type: domain::AgentType::ClaudeCode,
+            agent_config: domain::AgentConfig {
+                agent_type: domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let recorded_path = tmp
+            .path()
+            .join("worktree-that-is-not-on-disk")
+            .to_string_lossy()
+            .to_string();
+
+        let mut task = crate::test_helpers::create_test_task("A task mid-flight");
+        task.project_id = project.id;
+        task.status = domain::TaskStatus::InProgress;
+        task.branch_name = Some("task-abcd1234".to_string());
+        task.worktree_path = Some(recorded_path.clone());
+
+        let storage = Storage::with_paths((*paths).clone());
+        let mut cfg = config::storage::AppConfig {
+            projects: HashMap::new(),
+            repositories: HashMap::new(),
+            agent_configs: HashMap::new(),
+            jj_config: Default::default(),
+            worktree: Default::default(),
+            ui_preferences: Default::default(),
+        };
+        cfg.projects.insert(project.id.to_string(), project.clone());
+        storage.save_config(&cfg).expect("save config");
+        storage
+            .save_project_tasks(project.id, &[task.clone()])
+            .expect("save tasks");
+
+        let (state, report) = build_state_with_paths(paths)
+            .await
+            .expect("hydration must succeed");
+
+        assert_eq!(
+            report.cleared_worktrees, 0,
+            "an unverifiable absence is not proof of absence and must clear nothing"
+        );
+        assert_eq!(
+            report.adopted_worktrees, 0,
+            "nothing was adopted either -- git was never consulted"
+        );
+
+        let tasks = state.task.tasks.read().await;
+        let hydrated = tasks.get(&task.id).expect("task must still exist");
+        assert_eq!(
+            hydrated.worktree_path.as_deref(),
+            Some(recorded_path.as_str()),
+            "worktree_path is the only record of the worktree; a lookup that never \
+             happened must not be allowed to spend it"
         );
     }
 }

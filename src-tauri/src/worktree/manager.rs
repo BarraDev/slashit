@@ -175,7 +175,20 @@ impl WorktreeManager {
             return WorktreeRecovery::Unverified;
         };
 
-        match self.adopt_existing(repo_path, branch, porcelain) {
+        // `adopt_existing` only matches this app's own managed/legacy path
+        // conventions. `adopt_any_registered` is the fallback for a worktree
+        // git still has registered for this branch at some other path — for
+        // example one `wt` placed under its own convention, which happens
+        // whenever `WorktreePlacement::Auto` (the default) delegates to it.
+        // Git's confirmation is already the trust boundary, so a worktree it
+        // vouches for is exactly as real as one sitting where SlashIt would
+        // itself have put it. Only once BOTH miss has git positively said
+        // there is nothing to adopt — which is what `ConfirmedAbsent` means,
+        // and the only basis on which a reference may be discarded.
+        match self
+            .adopt_existing(repo_path, branch, porcelain)
+            .or_else(|| Self::adopt_any_registered(branch, porcelain))
+        {
             Some(path) => WorktreeRecovery::Adopt(path),
             None => WorktreeRecovery::ConfirmedAbsent,
         }
