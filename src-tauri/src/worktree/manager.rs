@@ -208,6 +208,25 @@ impl WorktreeManager {
         None
     }
 
+    /// Any worktree git currently has registered for `branch`, regardless of
+    /// whether its path matches this app's managed or legacy conventions.
+    ///
+    /// Startup reconciliation uses this as a fallback after
+    /// [`Self::adopt_existing`]: git-confirmation is already the trust
+    /// boundary — see that method's doc comment — and a worktree placed by
+    /// an external tool such as `wt` under [`WorktreePlacement::Auto`] (the
+    /// default) never matches either convention, but is exactly as real as
+    /// one that does. Reusing a worktree when *creating* one, by contrast,
+    /// only makes sense at a path the app would itself create at, which is
+    /// why [`Self::adopt_existing`] stays scoped to those two conventions
+    /// and this method is not used there.
+    pub fn adopt_any_registered(branch: &str, porcelain: &str) -> Option<String> {
+        let registered = PathBuf::from(Self::worktree_for_branch(porcelain, branch)?);
+        registered
+            .is_dir()
+            .then(|| registered.to_string_lossy().to_string())
+    }
+
     /// Async counterpart of [`Self::adoptable_path`] for callers already
     /// running on the Tokio runtime: fetches the porcelain listing itself
     /// rather than requiring the caller to supply one.
@@ -1028,6 +1047,63 @@ branch refs/heads/main
         );
 
         let _ = std::fs::remove_dir_all(managed.parent().unwrap());
+    }
+
+    #[test]
+    fn adopt_any_registered_accepts_a_path_adopt_existing_would_reject() {
+        // The exact scenario `adoptable_path_rejects_branch_registered_at_an_unrelated_path`
+        // above proves `adopt_existing` refuses: git confirms `branch` is
+        // registered, but not at either of SlashIt's own conventions (for
+        // example, a worktree `wt` itself placed under its own naming
+        // scheme). `adopt_any_registered` is the startup-reconciliation
+        // fallback that treats git's confirmation alone as sufficient,
+        // rather than stranding a live worktree just because of where it
+        // happens to sit.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let branch = "task-abcd1234";
+        let registered_at = tmp.path().join("wherever-wt-put-it");
+        std::fs::create_dir_all(&registered_at).expect("failed to create candidate dir");
+
+        let porcelain = format!(
+            "worktree {}\nHEAD 6666666666666666666666666666666666666666\nbranch refs/heads/{}\n",
+            registered_at.display(),
+            branch
+        );
+
+        assert_eq!(
+            WorktreeManager::adopt_any_registered(branch, &porcelain),
+            Some(registered_at.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn adopt_any_registered_still_requires_git_confirmation_for_the_exact_branch() {
+        let branch = "task-abcd1234";
+
+        // Nothing registered for this branch at all.
+        assert!(WorktreeManager::adopt_any_registered(branch, "").is_none());
+
+        // Registered, but for a different branch.
+        let porcelain = "\
+worktree /home/someone/code/my-app
+HEAD 7777777777777777777777777777777777777777
+branch refs/heads/some-other-branch
+";
+        assert!(WorktreeManager::adopt_any_registered(branch, porcelain).is_none());
+    }
+
+    #[test]
+    fn adopt_any_registered_rejects_a_registration_whose_directory_is_gone() {
+        // Git can still list a registration for a worktree whose directory
+        // was already removed by hand; `is_dir()` is what keeps that from
+        // being adopted as if it were live.
+        let branch = "task-abcd1234";
+        let porcelain = format!(
+            "worktree /nonexistent/definitely-not-here-{}\nHEAD 8888888888888888888888888888888888888888\nbranch refs/heads/{}\n",
+            Uuid::new_v4(),
+            branch
+        );
+        assert!(WorktreeManager::adopt_any_registered(branch, &porcelain).is_none());
     }
 
     #[test]

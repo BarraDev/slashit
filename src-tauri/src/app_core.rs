@@ -173,6 +173,15 @@ pub async fn build_state_with_paths(
                 continue;
             }
 
+            // `adopt_existing` only matches this app's own managed/legacy
+            // path conventions; `adopt_any_registered` is the fallback for a
+            // worktree git still has registered for this branch at any other
+            // path (for example, one `wt` placed under its own convention
+            // when `WorktreePlacement::Auto`, the default, delegates to it).
+            // Falling through to it here — rather than clearing the
+            // reference — is what keeps this loop from stranding a live
+            // worktree just because it does not sit at a path SlashIt itself
+            // would have chosen.
             let adopted = task
                 .branch_name
                 .as_ref()
@@ -181,7 +190,10 @@ pub async fn build_state_with_paths(
                     let porcelain = porcelain_cache
                         .entry(repo.clone())
                         .or_insert_with(|| worktree::WorktreeManager::worktree_list_porcelain(repo));
-                    app_state.worktree_manager.adopt_existing(repo, branch, porcelain)
+                    app_state
+                        .worktree_manager
+                        .adopt_existing(repo, branch, porcelain)
+                        .or_else(|| worktree::WorktreeManager::adopt_any_registered(branch, porcelain))
                 });
 
             match adopted {
@@ -417,6 +429,119 @@ mod tests {
         assert!(
             !migrate_task(&mut task),
             "a second pass must find nothing to do"
+        );
+    }
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git must be installed to run this test");
+        assert!(status.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    #[tokio::test]
+    async fn startup_adopts_a_worktree_registered_at_a_non_conventional_path() {
+        // Regression guard: a worktree git still has registered for a task's
+        // branch, but at a path that matches neither of SlashIt's own
+        // managed/legacy conventions (e.g. one `wt` placed under its own
+        // naming scheme), must be adopted at startup rather than having its
+        // reference cleared -- clearing would strand the worktree with no
+        // way for the app to find it again.
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_dir, &["config", "user.name", "Test"]);
+        std::fs::write(repo_dir.join("README.md"), "hello").unwrap();
+        run_git(&repo_dir, &["add", "."]);
+        run_git(&repo_dir, &["commit", "-q", "-m", "initial"]);
+
+        let branch = "task-abcd1234";
+        let unconventional_worktree = tmp.path().join("wherever-wt-put-it");
+        run_git(
+            &repo_dir,
+            &[
+                "worktree",
+                "add",
+                unconventional_worktree.to_str().unwrap(),
+                "-b",
+                branch,
+            ],
+        );
+
+        let repository = domain::Repository {
+            id: uuid::Uuid::new_v4(),
+            local_path: repo_dir.to_string_lossy().to_string(),
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        let project = domain::Project {
+            id: uuid::Uuid::new_v4(),
+            name: "test-project".to_string(),
+            repository_id: Some(repository.id),
+            scope: domain::ProjectScope::Standalone,
+            state_location: config::paths::StateLocation::External,
+            agent_type: domain::AgentType::ClaudeCode,
+            agent_config: domain::AgentConfig {
+                agent_type: domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let mut task = crate::test_helpers::create_test_task("A task");
+        task.project_id = project.id;
+        task.status = domain::TaskStatus::InProgress;
+        task.branch_name = Some(branch.to_string());
+        // Recorded location no longer exists -- the trigger for adoption.
+        task.worktree_path = Some(
+            tmp.path()
+                .join("stale-recorded-path")
+                .to_string_lossy()
+                .to_string(),
+        );
+
+        let storage = Storage::with_paths((*paths).clone());
+        let mut cfg = config::storage::AppConfig {
+            projects: HashMap::new(),
+            repositories: HashMap::new(),
+            agent_configs: HashMap::new(),
+            jj_config: Default::default(),
+            worktree: Default::default(),
+            ui_preferences: Default::default(),
+        };
+        cfg.repositories
+            .insert(repository.id.to_string(), repository);
+        cfg.projects.insert(project.id.to_string(), project.clone());
+        storage.save_config(&cfg).expect("save config");
+        storage
+            .save_project_tasks(project.id, &[task.clone()])
+            .expect("save tasks");
+
+        let (state, report) = build_state_with_paths(paths)
+            .await
+            .expect("hydration must succeed");
+
+        assert_eq!(report.adopted_worktrees, 1, "expected one adoption");
+        assert_eq!(report.cleared_worktrees, 0, "must not clear a live worktree");
+
+        let tasks = state.task.tasks.read().await;
+        let hydrated = tasks.get(&task.id).expect("task must still exist");
+        assert_eq!(
+            hydrated.worktree_path.as_deref(),
+            Some(unconventional_worktree.to_string_lossy().as_ref()),
+            "worktree_path must be repointed at the git-confirmed location, not cleared"
         );
     }
 }
