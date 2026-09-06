@@ -392,7 +392,7 @@ impl WorktreeManager {
     /// Remove a worktree for a task.
     pub async fn remove(&self, worktree_path: &str, branch: &str, repo_path: &str) -> Result<(), String> {
         if self.delegates_to_wt() {
-            self.remove_with_wt(worktree_path).await
+            self.remove_with_wt(worktree_path, branch, repo_path).await
         } else {
             self.remove_with_git(worktree_path, branch, repo_path).await
         }
@@ -491,7 +491,37 @@ impl WorktreeManager {
         self.find_worktree_path(repo_path, branch).await
     }
 
-    async fn remove_with_wt(&self, worktree_path: &str) -> Result<(), String> {
+    async fn remove_with_wt(
+        &self,
+        worktree_path: &str,
+        branch: &str,
+        repo_path: &str,
+    ) -> Result<(), String> {
+        if !self.exists(worktree_path) {
+            // `wt` is spawned with `current_dir(worktree_path)`, so a missing
+            // directory fails at spawn with `NotFound` before `wt` ever runs.
+            // That is anti-convergent rather than merely unhelpful: a first
+            // attempt that did remove the directory guarantees every later
+            // attempt fails. A cleanup that removed the worktree but could not
+            // save the board retains `worktree_path` on purpose, so the ~30s
+            // retry pass would then retry that task forever -- and this is the
+            // default backend whenever `wt` is installed, because
+            // `WorktreePlacement::Auto` is the default.
+            //
+            // Handing this case to git rather than just returning `Ok(())` is
+            // what makes it converge to a *usable* state. `wt` leaves the
+            // registration behind when the directory disappears underneath it,
+            // and a prunable registration is not inert: `wt switch <branch>`
+            // then refuses with "Worktree directory missing", and
+            // `wt switch -c <branch>` refuses because the branch still exists,
+            // so the task could never get a worktree again. Nothing else in
+            // SlashIt runs `git worktree prune`. `remove_with_git` prunes the
+            // stale record and applies the same ownership rule it uses
+            // everywhere else, deleting the branch only when git actually had a
+            // registration to remove.
+            return self.remove_with_git(worktree_path, branch, repo_path).await;
+        }
+
         let output = tokio::process::Command::new("wt")
             .args(["remove", "-y", "--no-verify"])
             .current_dir(worktree_path)
@@ -502,6 +532,20 @@ impl WorktreeManager {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("wt remove failed: {}", stderr));
+        }
+
+        // A zero exit is not proof of removal. `wt remove` reports the removal
+        // as happening in the background, and it exits zero even when the
+        // directory survives -- an unwritable parent is enough to reproduce
+        // it. The only trustworthy signal is the directory itself, which is
+        // exactly why `remove_with_git` decides on `exists()` rather than on
+        // git's exit status. Without this check the caller would durably clear
+        // `worktree_path`, discarding the only handle back to a worktree that
+        // still holds the user's work.
+        if self.exists(worktree_path) {
+            return Err(format!(
+                "wt remove reported success but {worktree_path} is still on disk"
+            ));
         }
 
         Ok(())
@@ -697,6 +741,83 @@ mod tests {
         // wt_available and gs_available are booleans; just assert type.
         let _ = mgr.wt_available;
         let _ = mgr.gs_available;
+    }
+
+    #[tokio::test]
+    async fn remove_converges_on_an_absent_directory_under_worktrunk_delegation() {
+        // The retry pass PR #1 adds only terminates if a second removal of an
+        // already-absent worktree succeeds. `remove_with_git` gets that from
+        // its `exists()` gate; `remove_with_wt` spawns with
+        // `current_dir(worktree_path)`, so without its own guard the retry
+        // fails at spawn every ~30s forever. This runs on machines with and
+        // without `wt` installed, because the guard returns before spawning.
+        let mut mgr = test_manager();
+        mgr.wt_available = true;
+        mgr.placement = WorktreePlacement::Auto;
+        assert!(mgr.delegates_to_wt(), "this test must exercise the wt backend");
+
+        // A private temp root, so parallel test threads cannot race on the name.
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = create_temp_git_repo();
+        let absent = temp.path().join("worktree-that-does-not-exist");
+
+        let result = mgr
+            .remove(
+                absent.to_str().unwrap(),
+                "task-abcdef12",
+                repo.path().to_str().unwrap(),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "an already-absent worktree is a converged removal, not a failure: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_remove_under_worktrunk_delegation_prunes_a_stale_registration() {
+        // Converging is not enough on its own: `wt` leaves the registration
+        // behind when the directory goes missing, and a prunable registration
+        // blocks `wt switch <branch>` ("Worktree directory missing") while the
+        // surviving branch blocks `wt switch -c <branch>`, so the task could
+        // never get a worktree again. Nothing else in SlashIt prunes. Needs no
+        // `wt` binary: the delegation happens before anything is spawned.
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+
+        let mut mgr = test_manager();
+        mgr.placement = WorktreePlacement::Managed;
+        let info = mgr
+            .create(&repo_path, "task-abcd1234")
+            .await
+            .expect("create failed");
+
+        // Exactly the state `wt` leaves behind: directory gone, git record kept.
+        std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+        let before = WorktreeManager::worktree_list_porcelain(&repo_path).expect("git listing");
+        assert!(
+            before.contains(&info.path),
+            "the stale registration must still be there before the removal"
+        );
+
+        mgr.wt_available = true;
+        mgr.placement = WorktreePlacement::Auto;
+        assert!(mgr.delegates_to_wt(), "this test must exercise the wt backend");
+
+        mgr.remove(&info.path, "task-abcd1234", &repo_path)
+            .await
+            .expect("an already-absent worktree is a converged removal");
+
+        let after = WorktreeManager::worktree_list_porcelain(&repo_path).expect("git listing");
+        assert!(
+            !after.contains(&info.path),
+            "the stale registration must be pruned, or the branch can never be checked out again"
+        );
+        assert!(
+            !branch_exists(&repo_path, "task-abcd1234"),
+            "git owned the registration it removed, so the branch is collected too"
+        );
     }
 
     #[test]

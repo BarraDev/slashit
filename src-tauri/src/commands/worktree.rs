@@ -90,22 +90,27 @@ pub async fn cleanup_worktree(
 
     state.worktree_manager.remove(&wt_path, &branch, &repo_path).await?;
 
-    // Clear task fields
-    {
-        let mut tasks = state.task.tasks.write().await;
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.worktree_path = None;
-            // Keep branch_name for potential PR creation
-            task.updated_at = chrono::Utc::now();
-
-            let project_id = task.project_id;
-            let project_tasks: Vec<_> = tasks.values()
-                .filter(|t| t.project_id == project_id)
-                .cloned()
-                .collect();
-            let _ = state.storage.save_project_tasks(project_id, &project_tasks);
-        }
-    }
+    // The clear has to reach disk before it reaches shared memory, and the
+    // failure has to reach the caller. Clearing `worktree_path` in memory is
+    // what removes a task from `tasks_eligible_for_cleanup_retry`, which
+    // selects on the in-memory value, so a clear published over a failed write
+    // takes the task out of the only pass that would have reconciled it. This
+    // command is also not restricted to `Done` tasks, which that pass filters
+    // on, so returning the error to the dialog is the whole recovery story
+    // here: the user can press the button again.
+    //
+    // `branch_name` stays for a later PR creation, as before. The helper also
+    // declines to clear a path the task no longer records, so a re-run that
+    // recreated a worktree while this removal was in flight keeps its
+    // reference instead of having it erased by a cleanup that never touched
+    // it.
+    crate::commands::task::clear_worktree_path_durably(
+        &state.task.tasks,
+        &state.storage,
+        task_id,
+        &wt_path,
+    )
+    .await?;
 
     Ok(())
 }
