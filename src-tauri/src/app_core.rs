@@ -31,6 +31,22 @@ pub struct StartupReport {
     pub tasks: usize,
     /// Projects whose tasks were rewritten by a migration and saved back.
     pub migrated_projects: usize,
+    /// Of `migrated_projects`, how many failed to persist to disk.
+    ///
+    /// The reconciled state still lands in the returned `AppState` even when
+    /// this is nonzero: the migrations here (model normalization, orphaned
+    /// task recovery, worktree adoption/clearing) are idempotent and
+    /// re-derived from disk/filesystem/git state, not from any record of
+    /// having run before. Continuing with the reconciled in-memory state is
+    /// what makes the recovery it performs actually take effect this run;
+    /// rolling it back would put a crashed task's status right back to
+    /// "running" with nothing driving it. An ordinary save triggered by any
+    /// later mutation of the same project will carry this state to disk, and
+    /// a restart before that happens simply repeats the same reconciliation
+    /// against the same stale file and reaches the same result — so nothing
+    /// is lost, only possibly redone. This field exists so a caller's success
+    /// message cannot claim disk durability that did not happen.
+    pub unsaved_migrated_projects: usize,
     /// Worktrees found at a new location and re-linked rather than dropped.
     pub adopted_worktrees: usize,
     /// Worktrees that could not be found anywhere, whose reference was cleared.
@@ -220,6 +236,12 @@ pub async fn build_state_with_paths(
         report.tasks = tasks.len();
 
         // Persist migrated tasks so the next start does not redo the work.
+        //
+        // A save failure here is reported but does not stop the loop or fail
+        // this function: the reconciled state for this one project stays
+        // published in memory (see `unsaved_migrated_projects`), and an
+        // unrelated project's save failing must not block every other
+        // project from loading.
         for project_id in &migrated_projects {
             let project_tasks: Vec<Task> = tasks
                 .values()
@@ -233,6 +255,7 @@ pub async fn build_state_with_paths(
                 eprintln!(
                     "Warning: Failed to persist migrated tasks for project {project_id}: {e}"
                 );
+                report.unsaved_migrated_projects += 1;
             }
         }
     }
@@ -340,6 +363,152 @@ mod tests {
         assert!(state.task.tasks.read().await.is_empty());
         assert!(state.project.projects.read().await.is_empty());
         assert!(state.repository.repositories.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_migrated_project_that_fails_to_persist_still_publishes_the_recovered_state() {
+        // Regression guard for the startup persistence-failure contract: a
+        // project whose reconciled tasks cannot be written to disk must not
+        // fail the whole build (an unrelated project's disk hiccup must not
+        // block every project from opening), and the in-memory state must
+        // still carry the recovered task, not the original broken one --
+        // rolling it back would put a crashed task straight back into
+        // "running" with no agent behind it, exactly what this migration
+        // exists to fix. The report must say so, so a caller cannot print a
+        // false "saved to disk" message.
+        //
+        // To force the save specifically (not the load) to fail, this uses a
+        // real, documented seam: a routable project whose task file still
+        // sits at the legacy path (`load_all_tasks`'s own doc comment notes
+        // this happens until the owning project is saved once). The load
+        // reads the real file at the legacy path; the migration's save
+        // targets the *routed* path, which this test pre-occupies with a
+        // directory so the final `fs::rename` fails deterministically -- no
+        // chmod, no disk-full simulation, nothing timing-dependent.
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repository = domain::Repository {
+            id: uuid::Uuid::new_v4(),
+            local_path: repo_root.to_string_lossy().to_string(),
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        let project = domain::Project {
+            id: uuid::Uuid::new_v4(),
+            name: "test-project".to_string(),
+            repository_id: Some(repository.id),
+            scope: domain::ProjectScope::Standalone,
+            state_location: config::paths::StateLocation::External,
+            agent_type: domain::AgentType::ClaudeCode,
+            agent_config: domain::AgentConfig {
+                agent_type: domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let project_id = project.id;
+
+        let task = task_with(
+            domain::TaskStatus::InProgress,
+            domain::TaskPhase::Coding,
+            "default",
+        );
+        let task = Task {
+            project_id,
+            ..task
+        };
+        let task_id = task.id;
+
+        let seed_storage = Storage::with_paths((*paths).clone());
+        let mut cfg = config::storage::AppConfig {
+            projects: HashMap::new(),
+            repositories: HashMap::new(),
+            agent_configs: HashMap::new(),
+            jj_config: Default::default(),
+            worktree: Default::default(),
+            ui_preferences: Default::default(),
+        };
+        cfg.repositories
+            .insert(repository.id.to_string(), repository);
+        cfg.projects.insert(project_id.to_string(), project);
+        seed_storage.save_config(&cfg).expect("save config");
+
+        // Seed the task at the *legacy* path directly, bypassing
+        // `save_project_tasks` (which would write to the now-routable path
+        // instead).
+        let legacy_file = paths.config_dir().join("tasks").join(format!("{project_id}.toml"));
+        std::fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+        let legacy_contents = toml::to_string_pretty(&config::storage::ProjectTasksFile {
+            version: 1,
+            tasks: vec![task.clone()],
+        })
+        .unwrap();
+        std::fs::write(&legacy_file, legacy_contents).unwrap();
+
+        // Occupy the routed path -- where the migration's save must write --
+        // with a directory, so the load (which falls back to the legacy file
+        // above, since nothing routed exists yet) succeeds but the later save
+        // cannot rename its temp file onto it.
+        let key = config::paths::ProjectKey::for_path(&repo_root).key;
+        let routed_dir = paths.project_state_dir(
+            &key,
+            project_id,
+            &repo_root,
+            config::paths::StateLocation::External,
+        );
+        let routed_file = routed_dir.join("tasks.toml");
+        std::fs::create_dir_all(&routed_file).unwrap();
+
+        let (state, report) = build_state_with_paths(paths.clone())
+            .await
+            .expect("a persistence failure for one project must not fail the whole build");
+
+        assert_eq!(report.migrated_projects, 1);
+        assert_eq!(
+            report.unsaved_migrated_projects, 1,
+            "the forced rename failure must be counted, not swallowed"
+        );
+
+        let recovered = {
+            let tasks = state.task.tasks.read().await;
+            let published = tasks.get(&task_id).expect("task must still be published");
+            assert_eq!(
+                published.status,
+                domain::TaskStatus::Queue,
+                "the recovered state must still be published even though it could not be saved"
+            );
+            published.clone()
+        };
+
+        // Retry is deterministic and nothing was lost: once whatever blocked
+        // the save is gone, the exact recovered state this build already
+        // computed (standing in for the ordinary save that any later
+        // mutation of this project would trigger) persists cleanly, and a
+        // subsequent rebuild -- standing in for the next process start --
+        // finds it already reconciled at the routed path and does not
+        // migrate it again.
+        std::fs::remove_dir(&routed_file).unwrap();
+        seed_storage
+            .save_project_tasks(project_id, &[recovered])
+            .expect("save must succeed once the obstruction is gone");
+
+        let (_, second_report) = build_state_with_paths(paths)
+            .await
+            .expect("rebuild must succeed once the obstruction is gone");
+        assert_eq!(
+            second_report.migrated_projects, 0,
+            "already-reconciled data must not migrate again"
+        );
+        assert_eq!(second_report.unsaved_migrated_projects, 0);
     }
 
     #[tokio::test]

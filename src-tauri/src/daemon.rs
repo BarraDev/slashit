@@ -92,6 +92,12 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
             "slashitd: migrated tasks in {} project(s); adopted {} worktree(s), cleared {}",
             report.migrated_projects, report.adopted_worktrees, report.cleared_worktrees
         );
+        if report.unsaved_migrated_projects > 0 {
+            println!(
+                "slashitd: {} project(s) could not be saved to disk yet and will be retried automatically",
+                report.unsaved_migrated_projects
+            );
+        }
     }
 
     // CLI overrides sit above the environment and the config file, so the full
