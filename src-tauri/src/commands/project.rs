@@ -307,6 +307,50 @@ mod tests {
     }
 
     #[test]
+    fn try_persist_projects_refuses_to_reduce_a_config_it_cannot_fully_parse() {
+        // End-to-end counterpart to the storage-level test: the production
+        // writer must surface the refusal rather than committing a
+        // partially-recovered config over the real one. Built by serializing a
+        // real config and invalidating one enum variant, so every other
+        // section keeps the shape the app actually writes.
+        let (storage, _temp) = create_test_storage();
+
+        let mut seeded = AppConfig::default();
+        seeded.repositories.insert(
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            crate::domain::Repository {
+                id: Uuid::nil(),
+                local_path: "/home/user/repo".to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        let valid = toml::to_string_pretty(&seeded).expect("serialize fixture");
+        let poisoned = valid.replace("placement = \"auto\"", "placement = \"shared_root\"");
+        assert_ne!(poisoned, valid, "fixture must invalidate the placement variant");
+        std::fs::write(storage.paths().config_file(), &poisoned).expect("write fixture");
+
+        let mut projects = HashMap::new();
+        let id = Uuid::new_v4();
+        projects.insert(id, make_test_project(id));
+
+        let result = try_persist_projects(&storage, &projects);
+
+        assert!(
+            result.is_err(),
+            "persisting must fail rather than write a config rebuilt from defaults"
+        );
+        let on_disk =
+            std::fs::read_to_string(storage.paths().config_file()).expect("config still readable");
+        assert_eq!(on_disk, poisoned, "the config on disk must be untouched");
+        assert!(
+            on_disk.contains("/home/user/repo"),
+            "the repository section must survive the refused write"
+        );
+    }
+
+    #[test]
     fn try_persist_projects_missing_config_file_initializes_from_defaults() {
         // No config.toml exists yet — this must behave exactly like today:
         // an `Ok` default config that the new projects are written into.
