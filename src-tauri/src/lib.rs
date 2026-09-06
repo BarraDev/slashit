@@ -198,40 +198,76 @@ pub fn run() {
 
         // Cache `git worktree list --porcelain` per repository so tasks that
         // share a repo shell out to git at most once during this loop,
-        // rather than once per task.
-        let mut porcelain_cache: std::collections::HashMap<String, String> =
+        // rather than once per task. A failed lookup is cached too: retrying
+        // per task would not make git work, and every task in that repo must
+        // reach the same "could not verify" conclusion anyway.
+        let mut porcelain_cache: std::collections::HashMap<String, Option<String>> =
             std::collections::HashMap::new();
 
         for task in tasks.values_mut() {
-            let Some(wt_path) = task.worktree_path.as_ref() else {
+            let Some(wt_path) = task.worktree_path.clone() else {
                 continue;
             };
-            if std::path::Path::new(wt_path).exists() {
+            if std::path::Path::new(&wt_path).exists() {
                 continue;
             }
 
-            let adopted = task
-                .branch_name
-                .as_ref()
-                .zip(repo_for_project.get(&task.project_id))
-                .and_then(|(branch, repo)| {
+            let recovery = match (
+                task.branch_name.as_ref(),
+                repo_for_project.get(&task.project_id),
+            ) {
+                (Some(branch), Some(repo)) => {
                     let porcelain = porcelain_cache
                         .entry(repo.clone())
                         .or_insert_with(|| worktree::WorktreeManager::worktree_list_porcelain(repo));
-                    app_state.worktree_manager.adopt_existing(repo, branch, porcelain)
-                });
+                    app_state
+                        .worktree_manager
+                        .classify_missing_worktree(repo, branch, porcelain.as_deref())
+                }
+                // No branch was ever recorded, so there is nothing to look a
+                // worktree up by and nothing that could ever recreate it. No
+                // amount of git working would change that answer, so this is
+                // genuine absence rather than a failed check.
+                (None, _) => worktree::WorktreeRecovery::ConfirmedAbsent,
+                // A branch is recorded but the project resolves to no
+                // repository. That is not proof the worktree is gone: this
+                // table is rebuilt from config on every start, and a config
+                // that fails to deserialize cleanly is recovered with no
+                // projects and no repositories at all. Clearing here would
+                // spend every task's reference on a lookup that never
+                // happened.
+                (Some(_), None) => worktree::WorktreeRecovery::Unverified,
+            };
 
-            match adopted {
-                Some(path) => {
+            match recovery {
+                worktree::WorktreeRecovery::Adopt(path) => {
                     println!(
                         "SlashIt: Adopted relocated worktree for task '{}' at {}",
                         task.title, path
                     );
                     task.worktree_path = Some(path);
                 }
-                None => {
+                worktree::WorktreeRecovery::ConfirmedAbsent => {
                     println!("SlashIt: Worktree dir missing for task '{}', clearing reference", task.title);
                     task.worktree_path = None;
+                }
+                // Git could not be consulted, so nothing here proves the
+                // worktree is gone. `worktree_path` is the only persisted
+                // record of it, and clearing it is not recoverable from here:
+                // this loop skips a task that has none, and the executor's
+                // cleanup-retry pass filters on one too, so no later start
+                // would reconsider it. A transient git failure must not be
+                // allowed to spend it. Left untouched, and deliberately not
+                // marked migrated: nothing changed, so there is nothing to
+                // persist and the next start verifies again.
+                worktree::WorktreeRecovery::Unverified => {
+                    eprintln!(
+                        "Warning: worktree dir missing for task '{}' at {}, but its absence could \
+                         not be confirmed (git worktree list failed, or the project resolved to no \
+                         repository); keeping the reference for the next start",
+                        task.title, wt_path
+                    );
+                    continue;
                 }
             }
             migrated_projects.insert(task.project_id);
