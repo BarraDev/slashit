@@ -213,6 +213,14 @@ impl Storage {
         Ok(config)
     }
 
+    /// Read the persisted config, salvaging what it can from a file that does
+    /// not fully deserialize.
+    ///
+    /// This is the *recovery* reader. It exists so the app can still start
+    /// against a config it cannot fully understand, which is the right answer
+    /// for a read whose result is only displayed. It is the wrong answer for a
+    /// read that is about to become the next authoritative file — see
+    /// [`Self::read_config_strict`], which `update_config` uses instead.
     fn read_config(&self) -> Result<AppConfig> {
         if self.config_file.exists() {
             let contents = fs::read_to_string(&self.config_file)
@@ -289,6 +297,43 @@ impl Storage {
         }
     }
 
+    /// Read the persisted config with no recovery: a file that does not fully
+    /// deserialize is an error, never a partially-defaulted value.
+    ///
+    /// [`Self::read_config`]'s salvage path starts from `AppConfig::default()`
+    /// and only ever recovers `ui_preferences` and `jj_config`, so `projects`,
+    /// `repositories`, `agent_configs` (including `api_key`) and `worktree`
+    /// come back as defaults while the call still returns `Ok`. Writing that
+    /// value back is what turns a file the parser merely could not read into
+    /// permanent data loss, so the authoritative read-modify-write path must
+    /// not accept it. One rejected `[worktree] placement` variant is enough to
+    /// reach this, and a config written by a newer build and then read by an
+    /// older one is the realistic way it happens.
+    ///
+    /// A missing file is still `Ok(AppConfig::default())`: there is nothing to
+    /// lose, and first-run writers depend on it.
+    ///
+    /// The error is deliberately one flat message rather than a `context`
+    /// chain, because every caller renders it with `{e}`, which shows only the
+    /// outermost layer.
+    fn read_config_strict(&self) -> Result<AppConfig> {
+        if !self.config_file.exists() {
+            return Ok(AppConfig::default());
+        }
+
+        let contents = fs::read_to_string(&self.config_file)
+            .context("Failed to read config file")?;
+
+        toml::from_str::<AppConfig>(&contents).map_err(|parse_error| {
+            anyhow::anyhow!(
+                "{} could not be parsed as a complete configuration ({parse_error}); \
+                 refusing to save, because writing over it would replace every section \
+                 that did not load with defaults. Repair or remove that file to continue",
+                self.config_file.display()
+            )
+        })
+    }
+
     /// Persist global config, replacing the whole file.
     ///
     /// This file carries `AgentConfig::api_key`, so it is written atomically
@@ -314,9 +359,12 @@ impl Storage {
     /// carried over from the copy read inside this transaction, not from one
     /// the caller read at some earlier point.
     ///
-    /// A read failure propagates without writing anything. Falling back to
-    /// `AppConfig::default()` here would destroy every section the caller was
-    /// not updating, which is why `read_config`'s error is not swallowed.
+    /// The read is [`Self::read_config_strict`], not the recovering
+    /// `read_config`: carrying sections over is only meaningful if they were
+    /// actually read, and a partially-recovered config carries defaults in
+    /// place of the sections that failed to parse. A read failure of either
+    /// kind propagates without writing anything, so the file on disk is left
+    /// exactly as it was for the user to repair.
     ///
     /// `mutate` runs while the transaction guard is held, so it must not
     /// acquire any other lock or block.
@@ -325,9 +373,10 @@ impl Storage {
         F: FnOnce(&mut AppConfig),
     {
         let _tx = self.lock_config_tx();
-        let mut config = self
-            .read_config()
-            .context("Failed to load config before updating it")?;
+        // No wrapping `context` on purpose: callers render this with `{e}`,
+        // which shows only the outermost layer, and the reader's own message
+        // is the one that tells the user which file to repair and why.
+        let mut config = self.read_config_strict()?;
         mutate(&mut config);
         self.write_config(&config)
     }
@@ -786,9 +835,14 @@ default_branch = "main"
     }
 
     #[test]
-    fn test_load_config_with_valid_toml_wrong_structure() {
+    fn test_load_config_ignores_unknown_sections() {
+        // Renamed from `..._with_valid_toml_wrong_structure`: `AppConfig` sets
+        // no `deny_unknown_fields`, so this fixture deserializes cleanly and
+        // never reaches the recovery branch. What it actually pins is that an
+        // unknown section is tolerated. The recovery branch is covered by
+        // `load_config_still_recovers_from_a_config_it_cannot_fully_parse`.
         let (storage, _temp) = create_test_storage();
-        
+
         // Create a TOML file with valid TOML but unexpected structure
         // This simulates a config from a different version of the app
         let weird_toml = r#"
@@ -808,6 +862,182 @@ baz = 123
         // The valid parts should be recovered
         assert_eq!(config.ui_preferences.theme, "light");
         assert_eq!(config.ui_preferences.sidebar_width, 250);
+    }
+
+    // ============ Strict read-modify-write vs. recovery reads ============
+
+    /// A config that is valid TOML and fully populated, but that `AppConfig`'s
+    /// own deserializer rejects.
+    ///
+    /// Built by serializing a real config and then invalidating exactly one
+    /// enum variant, so every other section keeps the shape the app actually
+    /// writes rather than a hand-typed approximation. `WorktreePlacement` has
+    /// only `auto` and `managed`, so `shared_root` is rejected — this is the
+    /// shape of a config written by a newer build and read by an older one.
+    fn config_that_fails_to_deserialize() -> String {
+        let mut config = AppConfig::default();
+        config.jj_config.user_name = Some("Recoverable".to_string());
+        config.ui_preferences.theme = "light".to_string();
+        config.repositories.insert(
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            Repository {
+                id: uuid::Uuid::nil(),
+                local_path: "/home/user/repo".to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        config.agent_configs.insert(
+            "claude_code".to_string(),
+            AgentConfig {
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: vec!["--stdio".to_string()],
+                env: HashMap::new(),
+                model: Some("opus".to_string()),
+                api_key: Some("sk-must-not-be-lost".to_string()),
+            },
+        );
+
+        let valid = toml::to_string_pretty(&config).expect("fixture should serialize");
+        let poisoned = valid.replace("placement = \"auto\"", "placement = \"shared_root\"");
+        assert_ne!(
+            poisoned, valid,
+            "fixture must actually invalidate the placement variant"
+        );
+
+        // The fixture is only meaningful if it really lands on the recovery
+        // branch: valid TOML, invalid AppConfig.
+        assert!(
+            toml::from_str::<toml::Value>(&poisoned).is_ok(),
+            "fixture must stay valid TOML"
+        );
+        assert!(
+            toml::from_str::<AppConfig>(&poisoned).is_err(),
+            "fixture must fail to deserialize as AppConfig"
+        );
+
+        poisoned
+    }
+
+    #[test]
+    fn update_config_refuses_to_overwrite_a_config_it_cannot_fully_parse() {
+        let (storage, _temp) = create_test_storage();
+        let poisoned = config_that_fails_to_deserialize();
+        fs::write(&storage.config_file, &poisoned).expect("write fixture");
+
+        let result = storage.update_config(|config| {
+            config.projects.insert("new".to_string(), unreachable_project());
+        });
+
+        assert!(
+            result.is_err(),
+            "a config that did not fully parse must not be used as the basis of a write"
+        );
+
+        let on_disk = fs::read_to_string(&storage.config_file).expect("config still readable");
+        assert_eq!(
+            on_disk, poisoned,
+            "the unparsable config must be left untouched for the user to repair"
+        );
+        assert!(
+            on_disk.contains("sk-must-not-be-lost"),
+            "the api key must still be on disk"
+        );
+        assert!(
+            on_disk.contains("/home/user/repo"),
+            "the repository must still be on disk"
+        );
+    }
+
+    #[test]
+    fn update_config_preserves_sections_it_does_not_touch() {
+        // The other half of the invariant: refusing an unparsable config must
+        // not come at the cost of the normal carry-over behaviour.
+        let (storage, _temp) = create_test_storage();
+
+        let mut seed = AppConfig::default();
+        seed.jj_config.user_name = Some("Keep Me".to_string());
+        seed.ui_preferences.theme = "light".to_string();
+        seed.agent_configs.insert(
+            "claude_code".to_string(),
+            AgentConfig {
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                model: None,
+                api_key: Some("sk-keep".to_string()),
+            },
+        );
+        storage.save_config(&seed).expect("seed config");
+
+        storage
+            .update_config(|config| {
+                config.projects.insert("new".to_string(), unreachable_project());
+            })
+            .expect("a fully parsable config must still be updatable");
+
+        let loaded = storage.load_config().expect("load back");
+        assert_eq!(loaded.projects.len(), 1, "the update must be applied");
+        assert_eq!(loaded.jj_config.user_name.as_deref(), Some("Keep Me"));
+        assert_eq!(loaded.ui_preferences.theme, "light");
+        assert_eq!(
+            loaded.agent_configs["claude_code"].api_key.as_deref(),
+            Some("sk-keep")
+        );
+    }
+
+    #[test]
+    fn load_config_still_recovers_from_a_config_it_cannot_fully_parse() {
+        // Startup salvage is intentionally retained: the strict reader is only
+        // for the authoritative write path. The app must still start and show
+        // whatever survived, and the original file must still be backed up.
+        let (storage, _temp) = create_test_storage();
+        fs::write(&storage.config_file, config_that_fails_to_deserialize()).expect("write fixture");
+
+        let recovered = storage.load_config().expect("startup must not fail");
+
+        assert_eq!(recovered.ui_preferences.theme, "light", "salvaged");
+        assert_eq!(
+            recovered.jj_config.user_name.as_deref(),
+            Some("Recoverable"),
+            "salvaged"
+        );
+        assert!(
+            recovered.repositories.is_empty() && recovered.agent_configs.is_empty(),
+            "this is exactly the reduction that must never be written back"
+        );
+        assert!(
+            storage.config_file.with_extension("toml.backup").exists(),
+            "recovery must leave a backup of the original"
+        );
+    }
+
+    /// A minimal project for tests that only care that *some* mutation was
+    /// attempted, never about the project's contents.
+    fn unreachable_project() -> crate::domain::Project {
+        use crate::config::paths::StateLocation;
+        use crate::domain::{AgentType, ProjectScope};
+        crate::domain::Project {
+            id: uuid::Uuid::nil(),
+            name: "test".to_string(),
+            repository_id: None,
+            scope: ProjectScope::Standalone,
+            state_location: StateLocation::External,
+            agent_type: AgentType::ClaudeCode,
+            agent_config: AgentConfig {
+                agent_type: AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
     }
 
     #[test]
