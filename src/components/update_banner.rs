@@ -336,7 +336,19 @@ pub fn start_install(ctx: UpdaterContext) {
     watch_for_stall(ctx, generation);
 
     spawn_local(async move {
-        match updater_download_and_install().await {
+        let outcome = updater_download_and_install().await;
+        // The backend serialises installs, so `abandon_stalled` followed by a
+        // retry usually gets an immediate "already installing" error rather
+        // than a second real download — but the guard is released the instant
+        // the *backend* call returns, which can be before *this* future's own
+        // await resolves. In that window a retry can start a genuine second
+        // install, and this completion must not apply if a later attempt has
+        // since started: it would overwrite that attempt's own Downloading or
+        // Installing state with a stale Idle/RestartRequired/failure.
+        if ctx.install_generation.get_untracked() != generation {
+            return;
+        }
+        match outcome {
             Ok(()) => {
                 ctx.stalled.set(false);
                 ctx.restart_deferred.set(false);
