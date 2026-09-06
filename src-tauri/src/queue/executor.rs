@@ -113,7 +113,25 @@ impl TaskExecutor {
         }
     }
 
-    /// Start the polling loop.
+    /// Build the polling loop, leaving the choice of runtime to the caller.
+    ///
+    /// This deliberately returns the future rather than spawning it. The two
+    /// callers live in different runtime worlds: `slashitd` runs inside
+    /// `#[tokio::main]`, while the desktop app starts the loop from Tauri's
+    /// `setup()` closure, which is *not* running on a Tokio worker and has no
+    /// reactor in thread-local scope. A `tokio::spawn` inside this function
+    /// therefore panicked with "there is no reactor running" for the GUI while
+    /// working perfectly for the daemon. Spawning `tauri::async_runtime::spawn`
+    /// here instead would only move the problem: this module is deliberately
+    /// free of every `tauri::` reference so `slashitd` can link it without the
+    /// GUI toolkit, which is the whole reason [`EventSink`] exists.
+    ///
+    /// Handing back the future keeps runtime ownership explicit at each call
+    /// site — `tauri::async_runtime::spawn` in `lib.rs`, `tokio::spawn` in
+    /// `daemon.rs` — and makes constructing the loop a runtime-free operation
+    /// that cannot panic no matter who calls it. The loop body still uses
+    /// `tokio::spawn` and `tokio::time`, so it must be polled on a Tokio
+    /// runtime; Tauri's global async runtime is one.
     ///
     /// `shutdown`, when given, lets a caller stop new-task promotion
     /// cooperatively: the loop checks it before every pass and stops after
@@ -124,20 +142,19 @@ impl TaskExecutor {
     /// The desktop GUI has no such handshake and passes `None`; the loop then
     /// simply runs for the life of the process, as it always has.
     ///
-    /// Returns the loop's `JoinHandle`. A caller that sends a shutdown signal
-    /// must await it before treating "no new work will be promoted" as true:
-    /// the shutdown check only runs between passes, so a pass already past
-    /// its own check when the signal is sent can still promote and spawn a
-    /// task afterward, and that task's `running_handles` entry does not exist
-    /// until that pass finishes. Sampling `running_task_count()` without
-    /// first awaiting this handle can therefore observe zero while such a
-    /// pass is still in flight.
-    pub fn start_polling(
+    /// A caller that sends a shutdown signal must await the spawned handle
+    /// before treating "no new work will be promoted" as true: the shutdown
+    /// check only runs between passes, so a pass already past its own check
+    /// when the signal is sent can still promote and spawn a task afterward,
+    /// and that task's `running_handles` entry does not exist until that pass
+    /// finishes. Sampling `running_task_count()` without first awaiting that
+    /// handle can therefore observe zero while such a pass is still in flight.
+    pub fn polling_loop(
         self: &Arc<Self>,
         shutdown: Option<tokio::sync::watch::Receiver<bool>>,
-    ) -> JoinHandle<()> {
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let executor = Arc::clone(self);
-        tokio::spawn(async move {
+        async move {
             let mut shutdown = shutdown;
             loop {
                 if matches!(&shutdown, Some(rx) if *rx.borrow()) {
@@ -154,7 +171,7 @@ impl TaskExecutor {
                     None => tokio::time::sleep(tokio::time::Duration::from_secs(3)).await,
                 }
             }
-        })
+        }
     }
 
     /// How many tasks are executing or under review right now.
@@ -1621,8 +1638,117 @@ mod tests {
         (storage, temp)
     }
 
+    /// A `TaskExecutor` over nothing but temporary directories.
+    ///
+    /// Deliberately synchronous and runtime-free, because
+    /// [`polling_loop_can_be_built_with_no_ambient_tokio_runtime`] must be
+    /// able to build one from a plain `#[test]`. The returned temp dirs must
+    /// be kept alive for as long as the executor is used.
+    fn test_executor() -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {
+        let (storage, storage_temp) = test_storage();
+        let (registry, reg_temp) = test_registry();
+        let paths_temp = tempfile::TempDir::new().expect("paths temp dir");
+
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::new()));
+        let executor = Arc::new(TaskExecutor::new(TaskExecutorConfig {
+            tasks: tasks.clone(),
+            queue_manager: Arc::new(RwLock::new(crate::queue::QueueManager::new(
+                tasks,
+                crate::config::queue::QueueConfig::default(),
+            ))),
+            executions: Arc::new(RwLock::new(HashMap::new())),
+            logs: Arc::new(RwLock::new(HashMap::new())),
+            projects: Arc::new(RwLock::new(HashMap::new())),
+            repositories: Arc::new(RwLock::new(HashMap::new())),
+            workspace_registry: Arc::new(RwLock::new(registry)),
+            storage,
+            worktree_manager: Arc::new(WorktreeManager::new(
+                Arc::new(crate::config::paths::AppPaths::with_roots(
+                    paths_temp.path().join("config"),
+                    paths_temp.path().join("data"),
+                    paths_temp.path().join("cache"),
+                    paths_temp.path().join("runtime"),
+                )),
+                crate::config::paths::WorktreePlacement::Managed,
+            )),
+            events: crate::events::null_sink(),
+        }));
+        (executor, vec![storage_temp, reg_temp, paths_temp])
+    }
+
+    /// Regression guard for the PR #2 GUI startup panic.
+    ///
+    ///     thread 'main' panicked at src-tauri/src/queue/executor.rs:140:9:
+    ///     there is no reactor running, must be called from the context of a
+    ///     Tokio 1.x runtime
+    ///
+    /// The desktop app starts the poller from Tauri's `setup()` closure, which
+    /// runs on the main thread before the event loop starts and has no Tokio
+    /// runtime entered in thread-local scope. While this function performed the
+    /// spawn itself with `tokio::spawn`, that call reached for
+    /// `Handle::current()` and aborted the process before a window could open.
+    /// The daemon never saw it because `slashitd` is `#[tokio::main]`.
+    ///
+    /// This is deliberately **not** a `#[tokio::test]`. That attribute enters a
+    /// runtime on the test thread, which reproduces the daemon's environment
+    /// and not the GUI's — the original bug would have passed such a test. The
+    /// two properties proven here are exactly the ones the GUI needs, and the
+    /// real `slashit-ui` launch is what covers the rest of `setup()`.
+    #[test]
+    fn polling_loop_can_be_built_with_no_ambient_tokio_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "this test only proves anything while no runtime is entered on \
+             this thread; something has made one ambient"
+        );
+
+        let (executor, _temps) = test_executor();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        // Property one: building the loop is inert. At `d1cf8d58` this line
+        // read `executor.start_polling(Some(rx))` and panicked right here.
+        let polling = executor.polling_loop(Some(rx));
+
+        // Property two: the future still works when a runtime it was not
+        // created inside picks it up later — which is precisely what
+        // `tauri::async_runtime::spawn` does at the GUI call site, handing the
+        // future to a global runtime built on another thread entirely. Built
+        // after `polling` on purpose, so the future provably predates it.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        runtime.block_on(async move {
+            let handle = tokio::spawn(polling);
+
+            // `pr_check_counter` is bumped at the end of `check_and_execute`,
+            // so seeing it above zero proves a full pass ran — the loop is
+            // genuinely polling, not merely spawned. Without this the test
+            // would still pass if the loop observed shutdown before its first
+            // pass, a strictly weaker claim.
+            while executor
+                .pr_check_counter
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+
+            tx.send(true).expect("the polling task holds the receiver");
+
+            // Bounded well under the loop's own 3-second sleep, so resolving
+            // in time proves it woke on `rx.changed()`.
+            tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+                .await
+                .expect("the loop must observe shutdown, not wait out its sleep")
+                .expect("the loop must not panic");
+        });
+    }
+
     #[tokio::test]
-    async fn start_polling_stops_the_loop_once_it_observes_the_shutdown_signal() {
+    async fn polling_loop_stops_the_loop_once_it_observes_the_shutdown_signal() {
         // Regression guard for the daemon shutdown race: `daemon::run` awaits
         // exactly this `JoinHandle` before trusting `running_task_count()`,
         // on the reasoning that the loop's shutdown check only runs between
@@ -1678,7 +1804,7 @@ mod tests {
         }));
 
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let handle = executor.start_polling(Some(rx));
+        let handle = tokio::spawn(executor.polling_loop(Some(rx)));
 
         // Let at least one full pass complete before signalling shutdown.
         // `pr_check_counter` is incremented at the very end of
