@@ -130,11 +130,25 @@ impl Credentials {
     /// window: whichever caller acquires it second re-reads inside the lock
     /// and finds the winner's token already there, via the same early-return
     /// this function already had.
+    ///
+    /// A failure to acquire the lock is propagated rather than silently
+    /// skipped: this function's only caller already treats an `Err` here as
+    /// "omit the TCP listener, the local channel is unaffected" (it is
+    /// OS-authenticated and needs no token), so failing here costs nothing
+    /// that proceeding unlocked would not also have risked — and proceeding
+    /// unlocked is exactly the window this lock exists to close.
     pub fn ensure_token(path: &Path) -> io::Result<AuthToken> {
+        Self::ensure_token_within(path, std::time::Duration::from_secs(2))
+    }
+
+    /// Core of [`ensure_token`], taking the lock-acquisition bound as an
+    /// explicit argument so tests can exercise the lock-failure path in
+    /// milliseconds instead of the production 2-second bound.
+    fn ensure_token_within(path: &Path, lock_timeout: std::time::Duration) -> io::Result<AuthToken> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let _lock = CredentialsLock::acquire(path);
+        let _lock = CredentialsLock::acquire_within(path, lock_timeout)?;
 
         let mut creds = Self::load(path)?;
         if let Some(token) = &creds.ipc_token {
@@ -150,51 +164,72 @@ impl Credentials {
 /// Serializes [`Credentials::ensure_token`] across processes.
 ///
 /// A plain marker file created with `create_new`, not a kernel-level lock
-/// like the socket's `flock` in `transport::unix` — deliberately, because a
-/// stale lock left by a process that crashed while holding it must not be
-/// able to block every future startup. Acquisition is bounded: on timeout,
-/// `ensure_token` proceeds without it, degrading to the pre-existing racy
-/// behavior (a real but narrow window, requiring the opt-in TCP transport
-/// and two near-simultaneous startups) rather than hanging or failing.
+/// like the socket's `flock` in `transport::unix` — deliberately, so that a
+/// lock left behind by a process that crashed while holding it degrades to a
+/// bounded delay instead of an OS-mediated resource nothing else can free.
+/// Acquisition is bounded at 2 seconds, far longer than this lock's critical
+/// section (a handful of synchronous filesystem calls) ever legitimately
+/// takes: reaching the deadline is treated as proof the file is crash debris,
+/// not evidence of a slow live holder, and is reclaimed rather than left to
+/// block every future startup forever. Reclaiming writes a fresh random
+/// token into the file; [`Drop`] only unlinks the file if it still holds the
+/// exact token this instance wrote, so a holder that overran the deadline
+/// and only then gets around to releasing cannot delete a *different*
+/// holder's lock that reclaimed it in the meantime.
 struct CredentialsLock {
     path: PathBuf,
+    token: [u8; 16],
 }
 
 impl CredentialsLock {
-    /// `None` on timeout or if the lock file could not be created for any
-    /// other reason (for example, an unwritable config directory) — either
-    /// way, `ensure_token` runs unlocked rather than failing startup over a
-    /// lock it does not strictly need for correctness of the common case.
-    fn acquire(credentials_path: &Path) -> Option<Self> {
-        Self::acquire_within(credentials_path, std::time::Duration::from_secs(2))
-    }
-
-    fn acquire_within(credentials_path: &Path, timeout: std::time::Duration) -> Option<Self> {
+    fn acquire_within(credentials_path: &Path, timeout: std::time::Duration) -> io::Result<Self> {
         let path = credentials_path.with_extension("toml.lock");
+        let my_token = random_token();
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_) => return Some(Self { path }),
+            match Self::create(&path, &my_token) {
+                Ok(()) => return Ok(Self { path, token: my_token }),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     if std::time::Instant::now() >= deadline {
-                        return None;
+                        // Reclaiming can itself lose to a concurrent reclaimer
+                        // (another `AlreadyExists`) or hit an unrelated I/O
+                        // error; either way, propagate it as-is rather than
+                        // retrying — `ensure_token`'s only caller already
+                        // treats any error here as "skip the TCP listener".
+                        let _ = std::fs::remove_file(&path);
+                        return Self::create(&path, &my_token)
+                            .map(|()| Self { path, token: my_token });
                     }
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                Err(_) => return None,
+                Err(e) => return Err(e),
             }
         }
+    }
+
+    fn create(path: &Path, token: &[u8; 16]) -> io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        file.write_all(token)
     }
 }
 
 impl Drop for CredentialsLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if std::fs::read(&self.path).ok().as_deref() == Some(&self.token[..]) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+fn random_token() -> [u8; 16] {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes
 }
 
 #[cfg(unix)]
@@ -368,13 +403,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("credentials.toml");
 
-        let held = CredentialsLock::acquire(&path).expect("nothing else holds this lock yet");
+        let held = CredentialsLock::acquire_within(&path, std::time::Duration::from_secs(2))
+            .expect("nothing else holds this lock yet");
         let (tx, rx) = std::sync::mpsc::channel();
         let path_clone = path.clone();
         let waiter = std::thread::spawn(move || {
             let acquired_at = std::time::Instant::now();
-            let _second = CredentialsLock::acquire(&path_clone)
-                .expect("must succeed once the holder releases, well inside the 2s bound");
+            let _second =
+                CredentialsLock::acquire_within(&path_clone, std::time::Duration::from_secs(2))
+                    .expect("must succeed once the holder releases, well inside the 2s bound");
             tx.send(acquired_at.elapsed()).unwrap();
         });
 
@@ -390,19 +427,84 @@ mod tests {
     }
 
     #[test]
-    fn a_stuck_lock_times_out_instead_of_blocking_forever() {
+    fn a_stuck_lock_is_reclaimed_instead_of_blocking_forever() {
         // A lock file left behind by a process that crashed while holding it
-        // must not block acquisition forever — `ensure_token` is meant to
-        // degrade to the pre-existing racy-but-working behavior in that case,
-        // not hang startup. Uses a short bound directly rather than the
+        // must not block acquisition forever: reaching the timeout reclaims
+        // it rather than failing every future call until a human deletes the
+        // file by hand. Uses a short bound directly rather than the
         // production 2s one so this stays a fast, deterministic test.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("credentials.toml");
-        std::fs::write(path.with_extension("toml.lock"), b"").unwrap();
+        std::fs::write(path.with_extension("toml.lock"), b"stale-holder-token").unwrap();
+
+        let reclaimed = CredentialsLock::acquire_within(&path, std::time::Duration::from_millis(50));
+        assert!(
+            reclaimed.is_ok(),
+            "a pre-existing lock file must be reclaimed once it outlives the timeout"
+        );
+    }
+
+    #[test]
+    fn a_lock_that_overran_the_deadline_cannot_delete_the_reclaimer_that_replaced_it() {
+        // If the original holder finally finishes and releases *after* a
+        // waiter has already reclaimed its lock on timeout, the original
+        // holder's `Drop` must leave the reclaimer's fresh lock alone rather
+        // than deleting it out from under whoever now legitimately holds it.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("credentials.toml");
+
+        let overran = CredentialsLock::acquire_within(&path, std::time::Duration::from_millis(50))
+            .expect("nothing else holds this lock yet");
+
+        // Simulate the timeout elapsing on a second caller and reclaiming.
+        let reclaimer = CredentialsLock::acquire_within(&path, std::time::Duration::from_millis(50))
+            .expect("must reclaim once the (simulated) deadline is reached");
+
+        // The original holder is now told to release, long after losing the
+        // file to the reclaimer above.
+        drop(overran);
 
         assert!(
-            CredentialsLock::acquire_within(&path, std::time::Duration::from_millis(50)).is_none(),
-            "a pre-existing lock file must make acquisition time out, not succeed"
+            path.with_extension("toml.lock").exists(),
+            "the overrun holder's release must not delete the reclaimer's still-current lock"
+        );
+
+        drop(reclaimer);
+        assert!(
+            !path.with_extension("toml.lock").exists(),
+            "the reclaimer's own release must still clean up its lock normally"
+        );
+    }
+
+    #[test]
+    fn ensure_token_fails_instead_of_proceeding_when_the_lock_cannot_be_acquired() {
+        // Regression guard for the exact bug this fix closes: the old
+        // `ensure_token` discarded `CredentialsLock::acquire`'s result
+        // entirely (`let _lock = CredentialsLock::acquire(path);`), so *any*
+        // lock failure -- not only a plain timeout -- was silently treated as
+        // "proceed unlocked". A directory sitting at the lock's own path
+        // makes both the initial `create_new` and the post-timeout reclaim
+        // attempt fail with the same error forever (`remove_file` cannot
+        // remove a directory), giving a deterministic, un-racy way to force
+        // that failure without relying on real concurrent timing.
+        //
+        // Against the pre-fix code, this exact setup would still return
+        // `Ok`: the discarded lock result meant `ensure_token` minted and
+        // saved a token regardless of whether the lock was ever held.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("credentials.toml");
+        std::fs::create_dir(path.with_extension("toml.lock")).unwrap();
+
+        let result =
+            Credentials::ensure_token_within(&path, std::time::Duration::from_millis(50));
+
+        assert!(
+            result.is_err(),
+            "an unacquirable lock must fail ensure_token, not mint and save a token unlocked"
+        );
+        assert!(
+            !path.exists(),
+            "no credentials should ever be written when the lock could not be acquired"
         );
     }
 }
