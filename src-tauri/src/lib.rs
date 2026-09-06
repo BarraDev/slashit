@@ -96,10 +96,17 @@ pub fn run() {
         report.repositories, report.projects, report.tasks
     );
     if report.migrated_projects > 0 {
-        println!(
-            "SlashIt: Migrated tasks in {} project(s) and saved to disk",
-            report.migrated_projects
-        );
+        if report.unsaved_migrated_projects > 0 {
+            println!(
+                "SlashIt: Migrated tasks in {} project(s); {} could not be saved to disk yet and will be retried automatically",
+                report.migrated_projects, report.unsaved_migrated_projects
+            );
+        } else {
+            println!(
+                "SlashIt: Migrated tasks in {} project(s) and saved to disk",
+                report.migrated_projects
+            );
+        }
     }
 
     tauri::Builder::default()
