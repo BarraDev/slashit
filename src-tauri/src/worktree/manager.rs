@@ -15,6 +15,27 @@ pub struct WorktreeInfo {
     pub branch: String,
 }
 
+/// The outcome of checking git for a task whose recorded worktree directory
+/// has gone missing.
+///
+/// Startup used to have only two answers here, because the git listing it
+/// consulted returned an empty string whether git had reported nothing or had
+/// failed to run at all. `worktree_path` is the only persisted record of a
+/// worktree, so answering "absent" out of a failed check discarded the only
+/// handle back to a directory that may well still exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeRecovery {
+    /// Git confirms a worktree registered for this branch at an adoptable
+    /// path. The task should be re-pointed at it.
+    Adopt(String),
+    /// Git answered, and has no adoptable worktree for this branch. The
+    /// recorded path is genuinely dead and may be cleared.
+    ConfirmedAbsent,
+    /// Git could not be consulted, so absence was never established. The
+    /// reference must be kept for a later start to verify again.
+    Unverified,
+}
+
 impl WorktreeManager {
     pub fn new(paths: Arc<AppPaths>, placement: WorktreePlacement) -> Self {
         let wt_available = std::process::Command::new("which")
@@ -103,16 +124,61 @@ impl WorktreeManager {
     /// Exists for callers outside an async context (startup adoption runs
     /// before the Tauri/Tokio runtime is driving anything) that still need
     /// to verify a candidate worktree path against git's own bookkeeping.
-    /// Returns an empty listing on failure, which [`Self::worktree_for_branch`]
-    /// treats as "nothing registered" rather than panicking or adopting
-    /// blind.
-    pub fn worktree_list_porcelain(repo_path: &str) -> String {
-        std::process::Command::new("git")
+    ///
+    /// `None` means git could not be consulted at all — it failed to spawn
+    /// (no `git` on `PATH`, `repo_path` unreadable or gone) or exited
+    /// non-zero (`repo_path` is not a repository). `Some` is git's own
+    /// answer, and an empty listing inside it genuinely means nothing is
+    /// registered.
+    ///
+    /// The distinction matters because a caller cannot treat the two the
+    /// same way in both directions. Not adopting on an unusable listing is
+    /// right — adopting blind is exactly what `adoptable_path` refuses to do.
+    /// But *discarding* a recorded worktree reference needs positive proof of
+    /// absence, and this function returning a bare empty string used to
+    /// supply that proof out of a failed `git` invocation.
+    pub fn worktree_list_porcelain(repo_path: &str) -> Option<String> {
+        let output = std::process::Command::new("git")
             .args(["worktree", "list", "--porcelain"])
             .current_dir(repo_path)
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// What startup should do with a task whose recorded worktree directory
+    /// is no longer on disk.
+    ///
+    /// `porcelain` is the result of [`Self::worktree_list_porcelain`] for the
+    /// task's repository, so `None` carries "git could not tell us" through
+    /// to the decision instead of collapsing it into "nothing is registered".
+    ///
+    /// Adoption stays fail-closed: a listing that cannot be obtained never
+    /// adopts anything. For any listing git did produce the adoption decision
+    /// is unchanged; the exit-status check in
+    /// [`Self::worktree_list_porcelain`] makes adoption strictly narrower, not
+    /// wider, since a non-zero exit whose stdout happened to parse can no
+    /// longer be adopted from. What changes materially is the discard
+    /// decision, and only where absence was never actually established.
+    pub fn classify_missing_worktree(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        porcelain: Option<&str>,
+    ) -> WorktreeRecovery {
+        let Some(porcelain) = porcelain else {
+            return WorktreeRecovery::Unverified;
+        };
+
+        match self.adopt_existing(repo_path, branch, porcelain) {
+            Some(path) => WorktreeRecovery::Adopt(path),
+            None => WorktreeRecovery::ConfirmedAbsent,
+        }
     }
 
     /// An existing worktree for this branch that SlashIt should reuse.
@@ -961,7 +1027,8 @@ branch refs/heads/main
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
 
-        let porcelain = WorktreeManager::worktree_list_porcelain(repo_path);
+        let porcelain = WorktreeManager::worktree_list_porcelain(repo_path)
+            .expect("git should have answered for a real repository");
         assert!(
             porcelain.contains("branch refs/heads/main"),
             "expected the main branch in the listing, got: {porcelain}"
@@ -969,9 +1036,81 @@ branch refs/heads/main
     }
 
     #[test]
-    fn worktree_list_porcelain_returns_empty_string_when_git_fails() {
-        let porcelain = WorktreeManager::worktree_list_porcelain("/tmp/slashit_not_a_repo_at_all");
-        assert_eq!(porcelain, "");
+    fn worktree_list_porcelain_returns_none_when_git_cannot_be_spawned() {
+        // A path that does not exist fails at `chdir`, before git even runs.
+        // This used to come back as an empty listing, indistinguishable from
+        // git reporting that nothing is registered.
+        assert_eq!(
+            WorktreeManager::worktree_list_porcelain("/tmp/slashit_not_a_repo_at_all"),
+            None,
+            "an unusable repo path must not be reported as an authoritative empty listing"
+        );
+    }
+
+    #[test]
+    fn worktree_list_porcelain_returns_none_when_git_exits_non_zero() {
+        // A real directory that is not a repository: git spawns fine and
+        // exits 128 with empty stdout. Without checking the exit status this
+        // is the most dangerous case, because it looks exactly like success.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let not_a_repo = tmp.path().to_str().unwrap();
+
+        assert_eq!(
+            WorktreeManager::worktree_list_porcelain(not_a_repo),
+            None,
+            "a non-zero git exit must not be reported as an authoritative empty listing"
+        );
+    }
+
+    // classify_missing_worktree: the three answers startup needs to tell
+    // apart before it decides whether to spend a task's only worktree
+    // reference.
+
+    #[test]
+    fn classify_missing_worktree_adopts_a_registered_relocated_worktree() {
+        let mgr = test_manager();
+        let repo = "/home/u/app";
+        let branch = "task-abcd1234";
+
+        let managed = mgr.managed_path(repo, branch);
+        std::fs::create_dir_all(&managed).expect("create managed worktree dir");
+        let porcelain = format!(
+            "worktree {}\nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/{}\n",
+            managed.display(),
+            branch
+        );
+
+        let result = mgr.classify_missing_worktree(repo, branch, Some(&porcelain));
+
+        let _ = std::fs::remove_dir_all(managed.parent().unwrap());
+
+        assert_eq!(
+            result,
+            WorktreeRecovery::Adopt(managed.to_string_lossy().to_string()),
+            "a worktree git confirms at the managed path must be adopted"
+        );
+    }
+
+    #[test]
+    fn classify_missing_worktree_confirms_absence_when_git_lists_nothing() {
+        let mgr = test_manager();
+
+        assert_eq!(
+            mgr.classify_missing_worktree("/home/u/app", "task-abcd1234", Some("")),
+            WorktreeRecovery::ConfirmedAbsent,
+            "git answering with no registration is positive proof the reference is dead"
+        );
+    }
+
+    #[test]
+    fn classify_missing_worktree_reports_unverified_when_git_could_not_be_consulted() {
+        let mgr = test_manager();
+
+        assert_eq!(
+            mgr.classify_missing_worktree("/home/u/app", "task-abcd1234", None),
+            WorktreeRecovery::Unverified,
+            "a failed git lookup must not be reported as confirmed absence"
+        );
     }
 
     #[tokio::test]
