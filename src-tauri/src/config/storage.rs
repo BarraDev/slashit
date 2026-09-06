@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use uuid::Uuid;
 
 /// Task file name inside a project's own state directory.
@@ -165,6 +165,23 @@ pub struct Storage {
     /// from the table (no repository attached, or config not loaded yet) falls
     /// back to the legacy global location rather than guessing.
     routes: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
+    /// Serializes every read-modify-write transaction over `config_file`.
+    ///
+    /// `config.toml` is one shared persistence unit: each writer replaces a
+    /// single section but rewrites the whole file from its own snapshot. The
+    /// in-memory domain locks do not help — a project save and a repository
+    /// save hold *different* locks, so both could read the same config,
+    /// update their own section, and write back, with the second write
+    /// silently reverting the first. Both writes are individually atomic, so
+    /// the file is never torn; the update is simply lost.
+    ///
+    /// The guard is taken by [`Self::update_config`] and [`Self::save_config`]
+    /// and released before either returns, so it is strictly the innermost
+    /// lock in every path that reaches it (state-location guard, then the
+    /// domain map guard, then this) and cannot participate in a cycle. It is
+    /// a `std::sync::Mutex` rather than a Tokio one because the transaction
+    /// it protects is entirely synchronous file I/O with no `await` inside.
+    config_tx: Arc<Mutex<()>>,
 }
 
 impl Storage {
@@ -180,6 +197,7 @@ impl Storage {
             paths: Arc::new(paths),
             config_file,
             routes: Arc::new(RwLock::new(HashMap::new())),
+            config_tx: Arc::new(Mutex::new(())),
         }
     }
 
@@ -271,12 +289,66 @@ impl Storage {
         }
     }
 
-    /// Persist global config.
+    /// Persist global config, replacing the whole file.
     ///
     /// This file carries `AgentConfig::api_key`, so it is written atomically
     /// and locked to owner-only permissions. It is also the reason config is
     /// never relocatable into a project directory — see `config::paths`.
+    ///
+    /// Callers that need to change one section of the *current* config must
+    /// use [`Self::update_config`] instead: this method writes exactly the
+    /// value it is handed, so building that value from a separately-loaded
+    /// config reintroduces the lost-update window the transaction exists to
+    /// close.
     pub fn save_config(&self, config: &AppConfig) -> Result<()> {
+        let _tx = self.lock_config_tx();
+        self.write_config(config)
+    }
+
+    /// Apply `mutate` to the persisted config as one atomic read-modify-write.
+    ///
+    /// The load, the mutation and the store all happen under
+    /// [`Self::config_tx`], so two writers changing different sections cannot
+    /// interleave and revert one another. This is the only correct way to
+    /// change part of the config: every section the closure does not touch is
+    /// carried over from the copy read inside this transaction, not from one
+    /// the caller read at some earlier point.
+    ///
+    /// A read failure propagates without writing anything. Falling back to
+    /// `AppConfig::default()` here would destroy every section the caller was
+    /// not updating, which is why `read_config`'s error is not swallowed.
+    ///
+    /// `mutate` runs while the transaction guard is held, so it must not
+    /// acquire any other lock or block.
+    pub fn update_config<F>(&self, mutate: F) -> Result<()>
+    where
+        F: FnOnce(&mut AppConfig),
+    {
+        let _tx = self.lock_config_tx();
+        let mut config = self
+            .read_config()
+            .context("Failed to load config before updating it")?;
+        mutate(&mut config);
+        self.write_config(&config)
+    }
+
+    /// Take the config transaction guard.
+    ///
+    /// A poisoned mutex means a previous writer panicked mid-transaction. The
+    /// guard protects a file that is only ever replaced atomically, so there
+    /// is no half-written state to inherit: recovering and carrying on is
+    /// strictly better than turning every later save into a panic. This
+    /// mirrors how `refresh_routes` handles its own poisoned lock.
+    fn lock_config_tx(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.config_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Serialize and atomically replace the config file.
+    ///
+    /// Assumes [`Self::config_tx`] is already held by the caller.
+    fn write_config(&self, config: &AppConfig) -> Result<()> {
         let contents = toml::to_string_pretty(config)
             .context("Failed to serialize config")?;
         write_private_atomic(&self.config_file, contents.as_bytes())

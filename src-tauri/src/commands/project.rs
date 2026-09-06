@@ -1,6 +1,5 @@
 use crate::domain::{Project, AgentType, AgentConfig};
 use crate::config::Storage;
-use anyhow::Context;
 use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,20 +21,28 @@ type Projects = Arc<RwLock<HashMap<Uuid, Project>>>;
 /// of projects/repositories this call was not updating. The error is
 /// propagated instead so the caller can surface it rather than silently
 /// "succeeding" at wiping the user's config.
+///
+/// The read and the write go through `Storage::update_config` so they are one
+/// transaction. Loading the config here and saving it back as two separate
+/// steps would let a concurrent repository save — which holds a different
+/// in-memory lock and so is not excluded by the caller's `projects` guard —
+/// land in between, and whichever write went second would revert the other's
+/// section.
 pub(crate) fn try_persist_projects(
     storage: &Storage,
     projects: &HashMap<Uuid, Project>,
 ) -> anyhow::Result<()> {
-    let mut config = storage
-        .load_config()
-        .context("Failed to load config before persisting projects")?;
-
-    config.projects = projects
-        .iter()
-        .map(|(id, project)| (id.to_string(), project.clone()))
-        .collect();
-
-    storage.save_config(&config)
+    // No extra `context` here on purpose: every caller formats this error
+    // with `{e}`, which renders only the outermost context, so wrapping it
+    // would replace the stage that actually failed ("Failed to load config
+    // before updating it" / "Failed to write config file") with a tautology.
+    // The callers already name the operation.
+    storage.update_config(|config| {
+        config.projects = projects
+            .iter()
+            .map(|(id, project)| (id.to_string(), project.clone()))
+            .collect();
+    })
 }
 
 #[derive(Clone)]
@@ -352,6 +359,93 @@ mod tests {
         assert!(result.is_err(), "a read failure must not be treated as success");
         let on_disk = std::fs::read(&config_path).unwrap();
         assert_eq!(on_disk, original_bytes, "config on disk must be untouched by a failed persist");
+    }
+
+    #[test]
+    fn concurrent_project_and_repository_persists_never_lose_each_other() {
+        // `config.toml` is a single file holding both sections, but a project
+        // save and a repository save are serialized by two *different*
+        // in-memory locks. Each helper replaces only its own section yet
+        // rewrites the whole struct, so before `Storage::update_config` two
+        // overlapping saves could both read the same config, both report
+        // success, and leave whichever wrote second having reverted the
+        // other's section. Every write is atomic, so nothing is ever torn —
+        // the update is simply lost, which is why this needs a test rather
+        // than showing up as corruption.
+        //
+        // Both sides start from a shared barrier so their read-modify-write
+        // windows actually overlap. The assertion runs after *every* round,
+        // not just at the end: each helper persists the full accumulated map,
+        // so a section lost in one round would be rewritten by the next
+        // round's save and never observed by a single final check.
+        use crate::commands::repository::try_persist_repositories;
+        use crate::domain::Repository;
+
+        let (storage, _temp) = create_test_storage();
+
+        const ROUNDS: usize = 40;
+        let mut projects: HashMap<Uuid, Project> = HashMap::new();
+        let mut repositories: HashMap<Uuid, Repository> = HashMap::new();
+
+        for round in 1..=ROUNDS {
+            let project_id = Uuid::new_v4();
+            projects.insert(project_id, make_test_project(project_id));
+
+            let repository_id = Uuid::new_v4();
+            repositories.insert(
+                repository_id,
+                Repository {
+                    id: repository_id,
+                    local_path: format!("/repo/{round}"),
+                    remote_url: None,
+                    remote_type: None,
+                    created_at: chrono::Utc::now(),
+                },
+            );
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+
+            let project_side = {
+                let storage = storage.clone();
+                let projects = projects.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    try_persist_projects(&storage, &projects)
+                })
+            };
+
+            let repository_side = {
+                let storage = storage.clone();
+                let repositories = repositories.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    try_persist_repositories(&storage, &repositories)
+                })
+            };
+
+            project_side
+                .join()
+                .expect("project persist thread should not panic")
+                .expect("project persist should succeed");
+            repository_side
+                .join()
+                .expect("repository persist thread should not panic")
+                .expect("repository persist should succeed");
+
+            let on_disk = storage.load_config().expect("config should be readable");
+            assert_eq!(
+                on_disk.projects.len(),
+                round,
+                "round {round}: a concurrent repository save reverted the projects section"
+            );
+            assert_eq!(
+                on_disk.repositories.len(),
+                round,
+                "round {round}: a concurrent project save reverted the repositories section"
+            );
+        }
     }
 
     /// Make `config.toml` exist but unreadable, so `try_persist_projects`
