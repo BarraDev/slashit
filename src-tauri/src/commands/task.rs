@@ -51,12 +51,21 @@ struct WorktreeCleanupCtx<'a> {
 /// pointing back to it. A `resolve_repo_path` or `WorktreeManager::remove`
 /// failure is logged with the task id and path instead, and leaves
 /// `worktree_path` untouched so the directory stays recoverable.
+///
+/// What that recovery is depends on the caller, so the failure messages below
+/// deliberately do not promise a retry. Only a `CleanUpOnly` transition into
+/// `Done` is revisited by the executor's pass, which filters on
+/// `status == Done`. A `ResetAndCleanUp` transition leaves the reference on a
+/// task no pass looks at, and `delete_task` leaves no task at all — there the
+/// retained branch and git's own worktree registration are the only records,
+/// which is why `remove_with_git` keeps the branch when it did not own the
+/// removal.
 async fn cleanup_worktree(ctx: WorktreeCleanupCtx<'_>, task_id: Uuid, project_id: Uuid, wt_path: &str, branch: &str) {
     let repo_path = match resolve_repo_path(ctx.projects, ctx.repositories, project_id).await {
         Ok(p) => p,
         Err(e) => {
             eprintln!(
-                "Warning: worktree cleanup for task {task_id} could not resolve a repository path ({e}); {wt_path} is left on disk and worktree_path is retained for retry."
+                "Warning: worktree cleanup for task {task_id} could not resolve a repository path ({e}); {wt_path} is left on disk and this call cleared no reference to it."
             );
             return;
         }
@@ -64,7 +73,7 @@ async fn cleanup_worktree(ctx: WorktreeCleanupCtx<'_>, task_id: Uuid, project_id
 
     if let Err(e) = ctx.worktree_manager.remove(wt_path, branch, &repo_path).await {
         eprintln!(
-            "Warning: failed to remove worktree {wt_path} for task {task_id}: {e}. worktree_path is retained for retry."
+            "Warning: failed to remove worktree {wt_path} for task {task_id}: {e}. This call cleared no reference to it."
         );
         return;
     }
@@ -1227,6 +1236,96 @@ mod tests {
             tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
             Some(info.path.as_str()),
             "the reference must survive in memory when it could not be persisted"
+        );
+    }
+
+    /// Make every `save_project_tasks` fail deterministically by putting a
+    /// regular file where the tasks directory has to be, so the `create_dir_all`
+    /// inside the atomic write fails with `AlreadyExists`. No permission bits,
+    /// so this behaves identically for every user including root.
+    fn block_task_persistence(storage: &Storage) {
+        let blocker = storage.paths().config_dir().join("tasks");
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("place persistence blocker");
+    }
+
+    /// A task holding `wt_path`, plus a sibling in the same project that the
+    /// whole-file rewrite must not drop.
+    fn durable_clear_fixture(project_id: Uuid, wt_path: &str) -> (Uuid, Uuid, Tasks) {
+        let mut subject = create_test_task_full("subject", project_id, TaskStatus::Done, 0);
+        subject.worktree_path = Some(wt_path.to_string());
+        let sibling = create_test_task_full("sibling", project_id, TaskStatus::Backlog, 1);
+        let (subject_id, sibling_id) = (subject.id, sibling.id);
+        (
+            subject_id,
+            sibling_id,
+            Arc::new(RwLock::new(create_test_tasks_map(vec![subject, sibling]))),
+        )
+    }
+
+    #[tokio::test]
+    async fn clear_worktree_path_durably_reports_a_failed_write_and_retains_the_path() {
+        // The contract `commands::worktree::cleanup_worktree` now depends on.
+        // That command is reachable for any status, while the executor's retry
+        // pass only revisits `Done` tasks, so this `Err` is the entire recovery
+        // story there: it is what lets the dialog tell the user to try again.
+        let project_id = Uuid::new_v4();
+        let (task_id, _sibling, tasks) = durable_clear_fixture(project_id, "/tmp/wt/task-aaaa1111");
+        let (storage, _tmp) = test_storage();
+        block_task_persistence(&storage);
+
+        let result =
+            clear_worktree_path_durably(&tasks, &storage, task_id, "/tmp/wt/task-aaaa1111").await;
+
+        assert!(result.is_err(), "a failed write must be reported, not swallowed");
+        assert_eq!(
+            tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
+            Some("/tmp/wt/task-aaaa1111"),
+            "the reference must survive in memory so the retry pass can still see it"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_worktree_path_durably_declines_to_clear_a_newer_worktree_path() {
+        // `commands::worktree::cleanup_worktree` used to clear
+        // `worktree_path` unconditionally, so a re-run that recreated a
+        // worktree while the removal was in flight had the reference to its
+        // *new* worktree erased by a cleanup that never touched it.
+        let project_id = Uuid::new_v4();
+        let (task_id, _sibling, tasks) = durable_clear_fixture(project_id, "/tmp/wt/new-worktree");
+        let (storage, _tmp) = test_storage();
+
+        clear_worktree_path_durably(&tasks, &storage, task_id, "/tmp/wt/old-worktree")
+            .await
+            .expect("a stale cleanup is not an error, it simply clears nothing");
+
+        assert_eq!(
+            tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
+            Some("/tmp/wt/new-worktree"),
+            "the replacement worktree must keep its reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_worktree_path_durably_keeps_sibling_tasks() {
+        let project_id = Uuid::new_v4();
+        let (task_id, sibling_id, tasks) = durable_clear_fixture(project_id, "/tmp/wt/x");
+        let (storage, _tmp) = test_storage();
+
+        clear_worktree_path_durably(&tasks, &storage, task_id, "/tmp/wt/x")
+            .await
+            .expect("save should succeed");
+
+        let persisted = storage.load_project_tasks(project_id).expect("reload tasks");
+        assert_eq!(persisted.len(), 2, "the sibling must still be on disk");
+        assert!(
+            persisted.iter().find(|t| t.id == task_id).unwrap().worktree_path.is_none(),
+            "the cleared path must be the one on disk"
+        );
+        assert_eq!(
+            persisted.iter().find(|t| t.id == sibling_id).unwrap().title,
+            "sibling",
+            "the sibling must survive the whole-file rewrite intact"
         );
     }
 
