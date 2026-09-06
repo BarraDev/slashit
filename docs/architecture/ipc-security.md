@@ -28,7 +28,7 @@ and changing a command never means touching a platform:
 | Platform | Local transport | Peer identity established by |
 |---|---|---|
 | Linux, macOS | Unix domain socket at `$XDG_RUNTIME_DIR/slashit-app/slashit.sock` | the 0700 directory containing it |
-| Windows | named pipe `\\.\pipe\slashit-<user>` | the pipe's default security descriptor; remote clients rejected |
+| Windows | named pipe `\\.\pipe\slashit-<user>` | an explicit owner-only DACL (current user SID + `LocalSystem`); remote clients rejected |
 | any | loopback TCP, **off by default** | nothing — a bearer token is required |
 
 When `XDG_RUNTIME_DIR` is unset (normal on macOS and Windows) the fallback is

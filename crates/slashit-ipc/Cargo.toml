@@ -25,6 +25,21 @@ subtle = "2"
 # XDG_RUNTIME_DIR is unset.
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# Named-pipe DACL construction: Windows' own default security descriptor for
+# CreateNamedPipe grants full control to the Administrators group, not just
+# the creating user, so the pipe is created with an explicit owner-only
+# descriptor instead of relying on the default. Version left unpinned beyond
+# the major line already resolved transitively by tokio's own windows-sys
+# dependency, so this does not pull a second copy into the lockfile.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
