@@ -208,6 +208,12 @@ impl TaskExecutor {
             self.spawn_task_execution(task_id).await;
         }
 
+        // Same backstop as `running_handles` above: a panicked review task
+        // cannot be relied on to remove its own entry, and a leaked one here
+        // holds `running_task_count()` above zero forever, which is what
+        // daemon shutdown waits on.
+        self.reviewing_handles.write().await.retain(|_, h| !h.is_finished());
+
         // Find AiReview tasks that need automated review
         let review_pending: Vec<Uuid> = {
             let tasks = self.tasks.read().await;
@@ -1695,6 +1701,72 @@ mod tests {
             .await
             .expect("the poller must wake via `rx.changed()`, not wait out its own sleep")
             .expect("the poller task must not panic");
+    }
+
+    #[tokio::test]
+    async fn check_and_execute_prunes_a_reviewing_handle_left_behind_by_a_panic() {
+        // Mirrors the same backstop already proven for `running_handles`: a
+        // panic inside a spawned review task skips its own cleanup code, so
+        // nothing but a periodic sweep removes its entry. A leaked entry here
+        // holds `running_task_count()` above zero forever, which is exactly
+        // what daemon shutdown waits on — so this map needs the same pruning
+        // `running_handles` already had, not a separate guarantee.
+        let (storage, _storage_temp) = test_storage();
+        let (registry, _reg_temp) = test_registry();
+        let paths_temp = tempfile::TempDir::new().expect("paths temp dir");
+
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::new()));
+        let executor = TaskExecutor::new(TaskExecutorConfig {
+            tasks: tasks.clone(),
+            queue_manager: Arc::new(RwLock::new(crate::queue::QueueManager::new(
+                tasks.clone(),
+                crate::config::queue::QueueConfig::default(),
+            ))),
+            executions: Arc::new(RwLock::new(HashMap::new())),
+            logs: Arc::new(RwLock::new(HashMap::new())),
+            projects: Arc::new(RwLock::new(HashMap::new())),
+            repositories: Arc::new(RwLock::new(HashMap::new())),
+            workspace_registry: Arc::new(RwLock::new(registry)),
+            storage,
+            worktree_manager: Arc::new(WorktreeManager::new(
+                Arc::new(crate::config::paths::AppPaths::with_roots(
+                    paths_temp.path().join("config"),
+                    paths_temp.path().join("data"),
+                    paths_temp.path().join("cache"),
+                    paths_temp.path().join("runtime"),
+                )),
+                crate::config::paths::WorktreePlacement::Managed,
+            )),
+            events: crate::events::null_sink(),
+        });
+
+        let task_id = Uuid::new_v4();
+        let handle = tokio::spawn(async {
+            panic!("simulated review-task panic, before its own cleanup runs");
+        });
+        // Give the spawned task a chance to actually run and panic before
+        // asserting on it, rather than racing its own scheduling.
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        executor
+            .reviewing_handles
+            .write()
+            .await
+            .insert(task_id, handle);
+
+        executor.check_and_execute().await;
+
+        assert!(
+            executor.reviewing_handles.read().await.is_empty(),
+            "a finished (including panicked) review handle must not survive a poll pass"
+        );
+        assert_eq!(
+            executor.running_task_count().await,
+            0,
+            "a leaked reviewing_handles entry would hold this above zero forever, \
+             which is what daemon shutdown waits on"
+        );
     }
 
     #[tokio::test]
