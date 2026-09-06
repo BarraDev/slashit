@@ -10,6 +10,16 @@
 //! See `docs/architecture/ipc-security.md` for why the authorization test is
 //! the important one: `CreateTask` plus `MoveTask(in_progress)` reaches the
 //! queue executor, which runs an agent with full tool access.
+//!
+//! Unix-only for now: the harness hardcodes `Endpoint::Unix`, which
+//! `transport::connect`/`bind_endpoints` reject outright on Windows. Gating
+//! the whole file keeps that a compile-time fact instead of 16 tests panicking
+//! the first time anyone runs `cargo test` on Windows. CI already only runs
+//! `cargo check`, not `cargo test`, on non-Linux platforms, so this changes
+//! nothing observable today — it only stops a latent trap. Real Windows
+//! named-pipe integration coverage remains a tracked gap, not something this
+//! gate closes.
+#![cfg(unix)]
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
