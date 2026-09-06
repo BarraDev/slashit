@@ -20,6 +20,15 @@ pub struct UnixListenerTransport {
     listener: UnixListener,
     path: PathBuf,
     ino: u64,
+    /// The instance lease, held for as long as this listener exists.
+    ///
+    /// Never read or written — only kept alive, because the kernel releases
+    /// its `flock` when the descriptor closes. That is what makes it a
+    /// crash-safe statement of "a live process owns this endpoint": a hard
+    /// kill releases it with no stale artifact to reason about, whereas a
+    /// lockfile's mere existence would need a staleness rule, and a PID file
+    /// would need one that cannot be made correct.
+    _lease: std::fs::File,
 }
 
 impl UnixListenerTransport {
@@ -28,11 +37,14 @@ impl UnixListenerTransport {
             prepare_socket_dir(parent)?;
         }
 
-        // Held only across the reclaim-then-bind sequence below, which is a
-        // check-then-act with no atomicity of its own. See
-        // `acquire_claim_lock`; the `File` is never read, only kept alive so
-        // its `flock` is held until this scope ends.
-        let _guard = acquire_claim_lock(&path.with_extension("lock"))?;
+        // Acquired before the reclaim-then-bind sequence below, which is a
+        // check-then-act with no atomicity of its own, and then held for the
+        // listener's whole lifetime rather than released at the end of this
+        // function. Holding it is what makes owning this endpoint a lease a
+        // live process has, instead of merely a socket file that happens to
+        // exist. Non-blocking, so a second instance is told immediately that
+        // it lost rather than waiting behind the winner.
+        let lease = acquire_claim_lock(&path.with_extension("lock"))?;
 
         claim_socket(path).await?;
 
@@ -44,6 +56,7 @@ impl UnixListenerTransport {
             listener,
             path: path.to_path_buf(),
             ino,
+            _lease: lease,
         })
     }
 
@@ -116,10 +129,24 @@ fn flock_exclusive(file: &std::fs::File) -> io::Result<()> {
         fn flock(fd: i32, operation: i32) -> i32;
     }
     const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
     // Safety: `file`'s fd is open and valid for the duration of this call.
-    let ret = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+    //
+    // Non-blocking: the lease is now held for the listener's whole lifetime,
+    // so a blocking acquisition would park a losing instance until the winner
+    // exited instead of telling it immediately that it lost. `EWOULDBLOCK` is
+    // reported as `AddrInUse` so every caller sees one "someone else already
+    // owns this endpoint" error, whichever of the two guards detected it.
+    let ret = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
     if ret != 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "another SlashIt instance is already listening",
+            ));
+        }
+        return Err(err);
     }
     Ok(())
 }
