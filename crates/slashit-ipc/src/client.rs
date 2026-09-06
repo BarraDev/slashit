@@ -224,6 +224,13 @@ mod tests {
         }
     }
 
+    // `Endpoint::Unix` is OS-authenticated, so `send` reaches
+    // `transport::connect` unconditionally. On a non-Unix target that returns
+    // `ErrorKind::Unsupported`, which `describe_connect_failure` maps to
+    // `ClientError::Connect`, not the `NotRunning` timeout message this test
+    // expects — see the identical reasoning on
+    // `a_missing_local_endpoint_reports_not_running` above.
+    #[cfg(unix)]
     #[tokio::test]
     async fn waiting_gives_up_with_a_timeout_message() {
         let options = ClientOptions {
