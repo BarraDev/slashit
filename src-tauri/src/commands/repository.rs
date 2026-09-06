@@ -1,6 +1,5 @@
 use crate::domain::Repository;
 use crate::config::Storage;
-use anyhow::Context;
 use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,21 +16,26 @@ type Repositories = Arc<RwLock<HashMap<Uuid, Repository>>>;
 /// would destroy `jj_config`, `ui_preferences`, `agent_configs`, and
 /// `projects`. The error is propagated instead so the caller can surface it
 /// rather than silently "succeeding" at wiping the user's config.
-fn try_persist_repositories(
+///
+/// The read and the write go through `Storage::update_config` so they are one
+/// transaction. This is the other half of the pair described on
+/// [`crate::commands::project::try_persist_projects`]: the `repositories`
+/// guard held by the caller excludes other repository writers, but nothing
+/// about it excludes a concurrent project save from rewriting the same file.
+pub(crate) fn try_persist_repositories(
     storage: &Storage,
     repositories: &HashMap<Uuid, Repository>,
 ) -> anyhow::Result<()> {
-    let mut config = storage
-        .load_config()
-        .context("Failed to load config before persisting repositories")?;
-
-    // Update repositories in config (convert Uuid keys to String keys)
-    config.repositories = repositories
-        .iter()
-        .map(|(id, repository)| (id.to_string(), repository.clone()))
-        .collect();
-
-    storage.save_config(&config)
+    // See `try_persist_projects` for why this deliberately adds no context of
+    // its own: callers render with `{e}`, so an outer wrapper would hide the
+    // failing stage.
+    storage.update_config(|config| {
+        // Update repositories in config (convert Uuid keys to String keys)
+        config.repositories = repositories
+            .iter()
+            .map(|(id, repository)| (id.to_string(), repository.clone()))
+            .collect();
+    })
 }
 
 #[derive(Clone)]
