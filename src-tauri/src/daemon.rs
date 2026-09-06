@@ -152,7 +152,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     let _ = state.executor.set(executor.clone());
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    executor.start_polling(Some(shutdown_tx.subscribe()));
+    let polling_handle = executor.start_polling(Some(shutdown_tx.subscribe()));
     println!("slashitd: queue executor started");
 
     let control = Arc::new(DaemonControl {
@@ -212,6 +212,24 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     // failed IPC server must stop promotion too.
     let _ = shutdown_tx.send(true);
     server.abort();
+
+    // The signal above only stops the *next* pass; a pass already past its
+    // own shutdown check keeps running and can still promote and spawn a
+    // task, whose `running_handles` entry does not exist until that pass
+    // finishes. Waiting for the poller to actually return is what makes
+    // `shutdown`'s running-task count trustworthy — without it, `shutdown`
+    // could sample zero while such a pass is mid-promotion and return
+    // immediately, leaving that new task's worktree creation racing the
+    // process exit.
+    const POLL_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+    match tokio::time::timeout(POLL_STOP_GRACE, polling_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => println!("slashitd: the queue poller task panicked: {e}"),
+        Err(_) => println!(
+            "slashitd: the queue poller did not stop within {POLL_STOP_GRACE:?}; \
+             draining anyway. Any task it just started will be requeued on the next start."
+        ),
+    }
 
     shutdown(&executor).await;
     println!("slashitd: stopped");

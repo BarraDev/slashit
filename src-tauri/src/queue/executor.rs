@@ -121,11 +121,21 @@ impl TaskExecutor {
     /// `JoinHandle::abort` at an arbitrary `.await` point (worktree creation
     /// shells out to `git`/`jj`, and none of those child processes are
     /// spawned with `kill_on_drop`, so an abort mid-spawn could orphan one).
-    /// The daemon needs this so its shutdown drain can hold its stated
-    /// invariant that the in-flight set cannot grow while it waits. The
-    /// desktop GUI has no such handshake and passes `None`; the loop then
+    /// The desktop GUI has no such handshake and passes `None`; the loop then
     /// simply runs for the life of the process, as it always has.
-    pub fn start_polling(self: &Arc<Self>, shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
+    ///
+    /// Returns the loop's `JoinHandle`. A caller that sends a shutdown signal
+    /// must await it before treating "no new work will be promoted" as true:
+    /// the shutdown check only runs between passes, so a pass already past
+    /// its own check when the signal is sent can still promote and spawn a
+    /// task afterward, and that task's `running_handles` entry does not exist
+    /// until that pass finishes. Sampling `running_task_count()` without
+    /// first awaiting this handle can therefore observe zero while such a
+    /// pass is still in flight.
+    pub fn start_polling(
+        self: &Arc<Self>,
+        shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> JoinHandle<()> {
         let executor = Arc::clone(self);
         tokio::spawn(async move {
             let mut shutdown = shutdown;
@@ -144,7 +154,7 @@ impl TaskExecutor {
                     None => tokio::time::sleep(tokio::time::Duration::from_secs(3)).await,
                 }
             }
-        });
+        })
     }
 
     /// How many tasks are executing or under review right now.
@@ -1603,6 +1613,88 @@ mod tests {
                 root.join("runtime"),
             ));
         (storage, temp)
+    }
+
+    #[tokio::test]
+    async fn start_polling_stops_the_loop_once_it_observes_the_shutdown_signal() {
+        // Regression guard for the daemon shutdown race: `daemon::run` awaits
+        // exactly this `JoinHandle` before trusting `running_task_count()`,
+        // on the reasoning that the loop's shutdown check only runs between
+        // passes and therefore the handle resolving is proof no pass is still
+        // executing.
+        //
+        // This does not reproduce the specific window CodeRabbit described —
+        // a pass already past its shutdown check and partway through
+        // promoting a task when the signal arrives — because that requires a
+        // task actually in flight through real worktree creation, which has
+        // no deterministic pause point without adding a synchronization hook
+        // to `check_and_execute` itself, which would be a change to
+        // production code well beyond this fix. What this test does prove
+        // deterministically, with no sleep-based guessing: the loop is
+        // allowed to run at least one real `check_and_execute` pass to
+        // completion first (tracked via `pr_check_counter`, incremented at
+        // the end of every pass), so this cannot degenerate into "shutdown
+        // was already true before the loop was ever polled" — a strictly
+        // weaker case an earlier version of this test collapsed into on a
+        // single-threaded runtime, since sending on a `watch` channel before
+        // the receiver's task is ever scheduled leaves nothing for the first
+        // poll to observe but the already-updated value. It then proves the
+        // loop wakes via `rx.changed()` rather than merely outlasting its own
+        // timer, by bounding the wait well under the loop's 3-second
+        // between-passes sleep.
+        let (storage, _storage_temp) = test_storage();
+        let (registry, _reg_temp) = test_registry();
+        let paths_temp = tempfile::TempDir::new().expect("paths temp dir");
+
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::new()));
+        let executor = Arc::new(TaskExecutor::new(TaskExecutorConfig {
+            tasks: tasks.clone(),
+            queue_manager: Arc::new(RwLock::new(crate::queue::QueueManager::new(
+                tasks.clone(),
+                crate::config::queue::QueueConfig::default(),
+            ))),
+            executions: Arc::new(RwLock::new(HashMap::new())),
+            logs: Arc::new(RwLock::new(HashMap::new())),
+            projects: Arc::new(RwLock::new(HashMap::new())),
+            repositories: Arc::new(RwLock::new(HashMap::new())),
+            workspace_registry: Arc::new(RwLock::new(registry)),
+            storage,
+            worktree_manager: Arc::new(WorktreeManager::new(
+                Arc::new(crate::config::paths::AppPaths::with_roots(
+                    paths_temp.path().join("config"),
+                    paths_temp.path().join("data"),
+                    paths_temp.path().join("cache"),
+                    paths_temp.path().join("runtime"),
+                )),
+                crate::config::paths::WorktreePlacement::Managed,
+            )),
+            events: crate::events::null_sink(),
+        }));
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = executor.start_polling(Some(rx));
+
+        // Let at least one full pass complete before signalling shutdown.
+        // `pr_check_counter` is incremented at the very end of
+        // `check_and_execute`, so observing it above zero is proof a pass
+        // ran to completion, not merely that the loop task was scheduled.
+        while executor
+            .pr_check_counter
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+
+        tx.send(true).expect("receiver is held by the polling task");
+
+        // Bounded well under the loop's 3-second between-passes sleep:
+        // resolving inside this window is proof the loop woke via
+        // `rx.changed()`, not that it happened to finish waiting anyway.
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("the poller must wake via `rx.changed()`, not wait out its own sleep")
+            .expect("the poller task must not panic");
     }
 
     #[tokio::test]
