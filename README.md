@@ -88,7 +88,7 @@ Near-term roadmap:
 
 ## Built with
 
-Rust end to end — a [Leptos](https://leptos.dev/) 0.8 frontend compiled to WASM, a [Tauri](https://tauri.app/) v2 backend on the tokio runtime, and a standalone CLI that talks to the running app over JSON-lines on a Unix domain socket (`$XDG_RUNTIME_DIR/slashit-app/slashit.sock`) or, on Windows, a named pipe. Module-level layout is documented in [`AGENTS.md`](AGENTS.md); the transports and their access-control model in [`docs/architecture/ipc-security.md`](docs/architecture/ipc-security.md).
+Rust end to end — a [Leptos](https://leptos.dev/) 0.8 frontend compiled to WASM, a [Tauri](https://tauri.app/) v2 backend on the tokio runtime, and a standalone CLI that talks to the running app over JSON-lines on a per-user Unix domain socket (Linux, macOS) or a named pipe (Windows) — exact locations and access control in [`docs/architecture/ipc-security.md`](docs/architecture/ipc-security.md). Module-level layout is documented in [`AGENTS.md`](AGENTS.md).
 
 ## Installation
 
