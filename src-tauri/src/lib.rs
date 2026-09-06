@@ -176,7 +176,10 @@ pub fn run() {
                 },
             ));
             let _ = state.executor.set(executor.clone());
-            executor.start_polling(None);
+            // Tauri's runtime, not `tokio::spawn`: this closure runs on the
+            // main thread before the event loop starts, with no reactor in
+            // thread-local scope. Same idiom as the IPC server below.
+            tauri::async_runtime::spawn(executor.polling_loop(None));
             println!("SlashIt: Task executor started");
 
             // The control channel. The same server the daemon runs; only the

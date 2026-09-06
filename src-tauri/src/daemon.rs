@@ -172,7 +172,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     let _ = state.executor.set(executor.clone());
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let polling_handle = executor.start_polling(Some(shutdown_tx.subscribe()));
+    let polling_handle = tokio::spawn(executor.polling_loop(Some(shutdown_tx.subscribe())));
     println!("slashitd: queue executor started");
 
     let control = Arc::new(DaemonControl {
