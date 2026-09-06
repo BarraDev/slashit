@@ -82,6 +82,20 @@ impl Drop for PidFile {
 pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     let events: SharedEventSink = headless_sink(options.verbose);
 
+    // Ownership first, before a single byte of shared state is read.
+    //
+    // Hydration is not passive: it requeues tasks left `InProgress` by what it
+    // assumes was a crash, reconciles worktree references, and writes both
+    // back to disk. Doing that while another instance is live corrupts the
+    // running instance's board rather than merely duplicating work, and
+    // starting the executor afterwards would spawn a second agent on the same
+    // branch. Claiming the endpoint here means a loser exits having touched
+    // nothing shared at all.
+    let paths = crate::config::paths::AppPaths::new()
+        .map_err(|e| anyhow::anyhow!("cannot resolve application paths: {e}"))?;
+    let ipc_config = slashit_ipc::IpcConfig::load(&paths.ipc_config_file());
+    let bound = crate::ipc::BoundIpc::bind(&paths, &ipc_config).await?;
+
     let (state, report) = build_state().await?;
     println!(
         "slashitd: loaded {} repositories, {} projects, {} tasks",
@@ -165,8 +179,6 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
         shutdown: shutdown_tx.clone(),
     });
 
-    let ipc_config = slashit_ipc::IpcConfig::load(&state.paths.ipc_config_file());
-
     let ctx = Arc::new(crate::ipc::IpcContext {
         tasks: state.task.tasks.clone(),
         projects: state.project.projects.clone(),
@@ -181,10 +193,12 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
         paths: state.paths.clone(),
     });
 
+    // Serving the endpoints claimed at the top of this function. Nothing is
+    // bound here, so there is no second chance for another instance to have
+    // taken them in the meantime.
     let mut server = tokio::spawn({
         let ctx = ctx.clone();
-        let ipc_config = ipc_config.clone();
-        async move { crate::ipc::serve(ctx, ipc_config).await }
+        async move { bound.attach(ctx).serve().await }
     });
 
     println!("slashitd: ready (pid {})", std::process::id());

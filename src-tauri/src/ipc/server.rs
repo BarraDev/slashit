@@ -170,21 +170,56 @@ pub struct IpcServer {
     token: Option<Arc<AuthToken>>,
 }
 
-impl IpcServer {
-    /// Bind what the configuration asks for.
-    pub async fn bind(ctx: Arc<IpcContext>, config: &IpcConfig) -> anyhow::Result<Self> {
+/// Endpoints this process has claimed, held before any application state
+/// exists.
+///
+/// Owning the OS-authenticated local endpoint is what makes a process *the*
+/// SlashIt instance, so it has to be established before the process touches
+/// anything shared — before state is hydrated, before startup reconciliation
+/// rewrites task records, and before the executor can promote a task and
+/// spawn an agent. Claiming therefore takes only `AppPaths`, which is pure
+/// path resolution, rather than an [`IpcContext`] that can only be built from
+/// hydrated state.
+///
+/// [`attach`](Self::attach) supplies the context afterwards, once there is
+/// one, turning the claim into a servable [`IpcServer`].
+pub struct BoundIpc {
+    listeners: Vec<IpcListener>,
+    token: Option<Arc<AuthToken>>,
+}
+
+impl BoundIpc {
+    /// Claim what the configuration asks for.
+    pub async fn bind(
+        paths: &crate::config::paths::AppPaths,
+        config: &IpcConfig,
+    ) -> anyhow::Result<Self> {
         let options = BindOptions {
             allow_remote: config.tcp.allow_remote,
         };
-        Self::bind_endpoints(ctx, &config.listen_endpoints(), &options).await
+        Self::bind_endpoints(paths, &config.listen_endpoints(), &options).await
     }
 
-    /// Bind an explicit list of endpoints.
+    /// The endpoints actually bound, with any OS-chosen port resolved.
+    pub fn endpoints(&self) -> Vec<Endpoint> {
+        self.listeners.iter().map(IpcListener::endpoint).collect()
+    }
+
+    /// Hand the claimed listeners to the handlers that will serve them.
+    pub fn attach(self, ctx: Arc<IpcContext>) -> IpcServer {
+        IpcServer {
+            ctx,
+            listeners: self.listeners,
+            token: self.token,
+        }
+    }
+
+    /// Claim an explicit list of endpoints.
     ///
     /// Used by tests, which need a socket inside a tempdir rather than the
     /// user's real runtime directory.
     pub async fn bind_endpoints(
-        ctx: Arc<IpcContext>,
+        paths: &crate::config::paths::AppPaths,
         endpoints: &[Endpoint],
         options: &BindOptions,
     ) -> anyhow::Result<Self> {
@@ -202,7 +237,7 @@ impl IpcServer {
         let mut token = None;
 
         if wanted.iter().any(|e| !e.is_os_authenticated()) {
-            let path = ctx.paths.credentials_file();
+            let path = paths.credentials_file();
             match Credentials::ensure_token(&path) {
                 Ok(minted) => {
                     // The path, never the value: a token printed into a log has
@@ -257,11 +292,32 @@ impl IpcServer {
             "no IPC endpoint could be bound; this instance cannot be controlled"
         );
 
-        Ok(Self {
-            ctx,
-            listeners,
-            token,
-        })
+        Ok(Self { listeners, token })
+    }
+}
+
+impl IpcServer {
+    /// Claim the configured endpoints and attach `ctx` in one step.
+    ///
+    /// Only appropriate where the context already exists — in practice tests
+    /// and the [`serve`] convenience wrapper. Startup paths must use
+    /// [`BoundIpc::bind`] instead, so ownership is settled before there is any
+    /// state to hydrate.
+    pub async fn bind(ctx: Arc<IpcContext>, config: &IpcConfig) -> anyhow::Result<Self> {
+        let paths = ctx.paths.clone();
+        Ok(BoundIpc::bind(&paths, config).await?.attach(ctx))
+    }
+
+    /// Claim an explicit list of endpoints and attach `ctx`.
+    pub async fn bind_endpoints(
+        ctx: Arc<IpcContext>,
+        endpoints: &[Endpoint],
+        options: &BindOptions,
+    ) -> anyhow::Result<Self> {
+        let paths = ctx.paths.clone();
+        Ok(BoundIpc::bind_endpoints(&paths, endpoints, options)
+            .await?
+            .attach(ctx))
     }
 
     /// The endpoints actually bound, with any OS-chosen port resolved.

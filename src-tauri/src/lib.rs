@@ -85,6 +85,40 @@ impl AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Ownership first, before a single byte of shared state is read.
+    //
+    // The GUI and `slashitd` are separate processes, so the in-process guard
+    // that serialises `config.toml` writes cannot exclude them from each
+    // other; the OS-authenticated control channel is the only thing that can.
+    // It has to be claimed here rather than after the window is built, because
+    // hydration is not passive: it requeues tasks left `InProgress` — which,
+    // next to a live daemon, means tasks that are running right now — and
+    // writes that back to disk. Losing the race after doing so would corrupt
+    // the running instance's board and then start a second executor against
+    // it.
+    let paths = match config::paths::AppPaths::new() {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("SlashIt: cannot resolve application paths: {e}");
+            std::process::exit(1);
+        }
+    };
+    let ipc_config = slashit_ipc::IpcConfig::load(&paths.ipc_config_file());
+    let bound = match tauri::async_runtime::block_on(ipc::BoundIpc::bind(&paths, &ipc_config)) {
+        Ok(bound) => bound,
+        // Refusing to start is the whole point. Previously this failure was
+        // printed to a terminal a desktop user never sees, and the app carried
+        // on with its own executor and no control channel.
+        Err(e) => {
+            eprintln!(
+                "SlashIt: another SlashIt instance (desktop app or slashitd) is already running \
+                 and owns the control channel, so this one is exiting rather than operating on \
+                 the same data: {e}"
+            );
+            std::process::exit(1);
+        }
+    };
+
     // Hydration is async because it takes tokio locks, and a blocking
     // acquisition panics on a runtime thread. `block_on` here is safe: the
     // Tauri event loop has not started, so nothing is waiting on this thread.
@@ -161,10 +195,13 @@ pub fn run() {
                     feature_diagnostics: None,
                     paths: state.paths.clone(),
                 });
-                let ipc_config = slashit_ipc::IpcConfig::load(&state.paths.ipc_config_file());
-
+                // Serving the endpoints claimed before hydration. Nothing is
+                // bound here, so this can no longer fail because another
+                // instance took them in the meantime — that race was decided
+                // at the top of `run()`, while there was still nothing to
+                // corrupt.
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = ipc::serve(ipc_ctx, ipc_config).await {
+                    if let Err(e) = bound.attach(ipc_ctx).serve().await {
                         eprintln!("SlashIt: IPC server error: {e}");
                     }
                 });

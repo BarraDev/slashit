@@ -459,3 +459,230 @@ async fn a_read_only_verb_is_allowed_from_both_endpoints() {
         assert!(response.ok, "{name}: {response:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Single-instance ownership
+//
+// The property under test is an *ordering*, not merely "a second bind fails".
+// The GUI and `slashitd` are separate processes, so the in-process mutex that
+// serialises `config.toml` writes cannot exclude them from each other. What
+// makes a process *the* SlashIt instance is owning the OS-authenticated
+// control channel — and it has to own it before it hydrates, because
+// hydration requeues tasks left `InProgress` (next to a live instance: tasks
+// running right now) and writes that back to disk.
+//
+// These tests are deterministic. Nothing sleeps and nothing races on wall
+// clock: a `Barrier` releases both candidates together, and the loser is
+// identified by the kernel refusing it the lease, not by timing.
+// ---------------------------------------------------------------------------
+
+/// Paths rooted in `tmp`, matching what a real instance resolves at startup.
+fn instance_paths(tmp: &TempDir) -> AppPaths {
+    AppPaths::with_roots(
+        tmp.path().join("config"),
+        tmp.path().join("data"),
+        tmp.path().join("cache"),
+        tmp.path().join("runtime"),
+    )
+}
+
+fn local_endpoint(tmp: &TempDir) -> Endpoint {
+    Endpoint::Unix {
+        path: tmp.path().join("runtime").join("slashit.sock"),
+    }
+}
+
+fn bind_opts() -> BindOptions {
+    BindOptions {
+        allow_remote: false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exactly_one_of_two_concurrent_starts_owns_the_instance() {
+    use slashit_ui_lib::ipc::BoundIpc;
+
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("runtime")).unwrap();
+    let paths = Arc::new(instance_paths(&tmp));
+    let endpoint = local_endpoint(&tmp);
+
+    // Both candidates are released from the same barrier, so neither can win
+    // merely by having started earlier.
+    let gate = Arc::new(tokio::sync::Barrier::new(2));
+
+    let mut candidates = Vec::new();
+    for _ in 0..2 {
+        let paths = paths.clone();
+        let endpoint = endpoint.clone();
+        let gate = gate.clone();
+        candidates.push(tokio::spawn(async move {
+            gate.wait().await;
+            BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&endpoint), &bind_opts()).await
+        }));
+    }
+
+    let mut winners = Vec::new();
+    let mut losers = Vec::new();
+    for c in candidates {
+        match c.await.expect("candidate panicked") {
+            Ok(bound) => winners.push(bound),
+            Err(e) => losers.push(e),
+        }
+    }
+
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one instance may own the control channel, got {} winners and {} losers",
+        winners.len(),
+        losers.len()
+    );
+    assert_eq!(losers.len(), 1, "the other candidate must be refused");
+
+    let refusal = format!("{:#}", losers[0]);
+    assert!(
+        refusal.contains("cannot bind the local control channel"),
+        "the loser must be told it lost the local control channel, got: {refusal}"
+    );
+
+    // The winner is genuinely usable, not merely holding a lock.
+    assert_eq!(
+        winners[0].endpoints().len(),
+        1,
+        "the winner must hold the endpoint it claimed"
+    );
+}
+
+#[tokio::test]
+async fn the_loser_of_the_race_never_touches_shared_state() {
+    use slashit_ui_lib::ipc::BoundIpc;
+
+    // The regression this guards is the original startup ordering, where both
+    // the GUI and the daemon ran `build_state()` — hydrating, requeueing
+    // in-flight tasks and persisting the result — and only afterwards tried to
+    // bind. `BoundIpc::bind_endpoints` takes `&AppPaths` and nothing else
+    // precisely so that losing is decided while there is still nothing to
+    // corrupt. Proven here by taking a full snapshot of the config and data
+    // trees and requiring it to be untouched.
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("runtime")).unwrap();
+    let paths = Arc::new(instance_paths(&tmp));
+    let endpoint = local_endpoint(&tmp);
+
+    let _winner = BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&endpoint), &bind_opts())
+        .await
+        .expect("the first instance must win");
+
+    fn snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    out.push((path, bytes));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    let before_config = snapshot(&tmp.path().join("config"));
+    let before_data = snapshot(&tmp.path().join("data"));
+
+    let refused = BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&endpoint), &bind_opts()).await;
+    assert!(refused.is_err(), "the second instance must be refused");
+
+    assert_eq!(
+        before_config,
+        snapshot(&tmp.path().join("config")),
+        "a refused instance must not have written to the config tree"
+    );
+    assert_eq!(
+        before_data,
+        snapshot(&tmp.path().join("data")),
+        "a refused instance must not have written to the data tree — no task may be \
+         requeued or persisted by a process that does not own the instance"
+    );
+}
+
+#[tokio::test]
+async fn ownership_is_released_on_shutdown_and_can_be_reacquired() {
+    use slashit_ui_lib::ipc::BoundIpc;
+
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("runtime")).unwrap();
+    let paths = Arc::new(instance_paths(&tmp));
+    let endpoint = local_endpoint(&tmp);
+
+    let first = BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&endpoint), &bind_opts())
+        .await
+        .expect("the first instance must win");
+
+    assert!(
+        BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&endpoint), &bind_opts())
+            .await
+            .is_err(),
+        "ownership must be exclusive while the owner is alive"
+    );
+
+    // Graceful shutdown: the listeners drop, which closes the socket and
+    // releases the kernel-held lease.
+    drop(first);
+
+    BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&endpoint), &bind_opts())
+        .await
+        .expect("a later instance must be able to acquire ownership once released");
+}
+
+#[tokio::test]
+async fn a_stale_socket_left_by_a_crash_does_not_lock_the_app_out() {
+    use slashit_ui_lib::ipc::BoundIpc;
+
+    // A hard kill runs no destructor, so the socket file and the lock file are
+    // both still on disk afterwards. Neither may be read as "an instance is
+    // running": the kernel closes every descriptor when a process dies, which
+    // releases the lease, and that release is the only signal that means
+    // anything. A file that merely exists proves nothing.
+    //
+    // The post-`SIGKILL` state is reproduced on disk directly rather than by
+    // leaking a live owner. `std::mem::forget` would leave this very process
+    // holding the descriptor — and therefore still holding the lease — which
+    // is the opposite of a crash. `std::os::unix::net::UnixListener` does not
+    // unlink its path on drop, so binding and dropping one leaves exactly the
+    // orphaned socket file a killed instance leaves behind.
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("runtime")).unwrap();
+    let paths = Arc::new(instance_paths(&tmp));
+    let endpoint = local_endpoint(&tmp);
+    let socket_path = tmp.path().join("runtime").join("slashit.sock");
+    let lock_path = tmp.path().join("runtime").join("slashit.lock");
+
+    {
+        let orphaned = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("bind a socket that will be orphaned");
+        drop(orphaned);
+        // The lock file outlives the crash too; only the flock on it died.
+        std::fs::File::create(&lock_path).expect("leave a lock file behind");
+    }
+
+    assert!(
+        socket_path.exists(),
+        "precondition: a crash leaves the socket file behind"
+    );
+    assert!(
+        lock_path.exists(),
+        "precondition: a crash leaves the lock file behind"
+    );
+
+    BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&endpoint), &bind_opts())
+        .await
+        .expect("stale artifacts must not permanently lock the app out");
+}

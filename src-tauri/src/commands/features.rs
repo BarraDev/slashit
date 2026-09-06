@@ -130,9 +130,7 @@ mod tests {
         // silently turn a session-only override into permanent configuration,
         // including for a flag like `remote_access` whose whole point is that
         // it should require deliberate, persistent opt-in.
-        let _guard = crate::config::paths::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::config::paths::ENV_LOCK.lock().await;
 
         // `remote_access` is the sharpest example: it gates accepting IPC
         // connections from outside the machine, so silently persisting a

@@ -15,4 +15,4 @@ pub mod handlers;
 pub mod server;
 
 pub use handlers::Dispatch;
-pub use server::{serve, IpcContext, IpcServer, PeerContext};
+pub use server::{serve, BoundIpc, IpcContext, IpcServer, PeerContext};

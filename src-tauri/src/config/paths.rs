@@ -509,8 +509,14 @@ fn path_bytes(path: &Path) -> Vec<u8> {
 /// touches — `cargo test` runs every test in this binary as parallel threads
 /// of one process, so a lock scoped to a single variable in a single module
 /// does not protect a different variable mutated, unlocked, in another.
+///
+/// Async-aware because one holder — `commands::features`'s override test —
+/// has to keep the environment pinned across an `.await`, and a
+/// `std::sync::MutexGuard` may not be held across one. Synchronous holders
+/// take it with `blocking_lock()`; they are plain `#[test]` functions with no
+/// runtime on the thread, so that cannot deadlock.
 #[cfg(test)]
-pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -534,7 +540,7 @@ mod tests {
     /// Held under [`super::ENV_LOCK`], shared with every other test in this
     /// binary that mutates real process environment variables.
     fn with_xdg_runtime_dir<T>(value: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = super::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = super::ENV_LOCK.blocking_lock();
         let previous = std::env::var("XDG_RUNTIME_DIR").ok();
         // SAFETY: the guard above makes this the only thread touching the
         // variable, and it is restored before the guard drops.

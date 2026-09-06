@@ -1094,9 +1094,7 @@ mod tests {
         // variable, since concurrent `setenv`/`getenv` are undefined behavior
         // in the platform C library regardless of which variable each side
         // touches.
-        let _guard = crate::config::paths::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::config::paths::ENV_LOCK.blocking_lock();
 
         let key = env_var_for("daemon_mode");
         let previous = std::env::var(&key).ok();
