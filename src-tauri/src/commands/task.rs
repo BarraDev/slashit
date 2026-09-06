@@ -69,13 +69,74 @@ async fn cleanup_worktree(ctx: WorktreeCleanupCtx<'_>, task_id: Uuid, project_id
         return;
     }
 
-    let mut tasks_w = ctx.tasks.write().await;
-    if let Some(task) = tasks_w.get_mut(&task_id) {
-        if task.worktree_path.as_deref() == Some(wt_path) {
-            task.worktree_path = None;
-        }
+    if let Err(e) = clear_worktree_path_durably(ctx.tasks, ctx.storage, task_id, wt_path).await {
+        // Nothing here can retry: this path is reached from a status change or
+        // a delete, neither of which runs again on its own, and the executor's
+        // retry pass only looks at `Done` tasks. Leaving the reference in place
+        // is still the right outcome — the next start reconciles it, and any
+        // later save for this project rewrites the file — but the failure has
+        // to be visible rather than swallowed.
+        eprintln!("Warning: worktree cleanup for task {task_id}: {e}");
     }
-    persist_project_tasks(ctx.storage, &tasks_w, project_id);
+}
+
+/// Clear `task_id`'s `worktree_path`, but only once the cleared record is on
+/// disk.
+///
+/// `worktree_path` is the only persisted record of a worktree, so publishing
+/// the clear to shared memory before the write succeeds leaves the board
+/// disagreeing with disk with nothing left to reconcile them: the executor's
+/// retry pass selects on the *in-memory* value, so a task cleared in memory is
+/// never revisited, and the stale file survives until some unrelated mutation
+/// happens to rewrite it. This is the same persist-before-publish contract the
+/// project and repository saves use.
+///
+/// The whole transaction runs under one write guard, so no sibling save can
+/// land between the write and the in-memory commit.
+///
+/// `Err` means the write failed and the reference is still recorded in both
+/// places, which is what keeps a `Done` task eligible for the retry pass.
+pub(crate) async fn clear_worktree_path_durably(
+    tasks: &Tasks,
+    storage: &Storage,
+    task_id: Uuid,
+    wt_path: &str,
+) -> Result<(), String> {
+    let mut tasks_w = tasks.write().await;
+
+    let Some(task) = tasks_w.get(&task_id) else {
+        return Ok(()); // deleted while its worktree was being removed
+    };
+    if task.worktree_path.as_deref() != Some(wt_path) {
+        // The task now records a different worktree, so a re-run recreated one
+        // after this cleanup started. Clearing that reference would discard a
+        // worktree this call never removed.
+        return Ok(());
+    }
+    let project_id = task.project_id;
+
+    let staged: Vec<Task> = tasks_w
+        .values()
+        .filter(|t| t.project_id == project_id)
+        .map(|t| {
+            let mut staged = t.clone();
+            if staged.id == task_id {
+                staged.worktree_path = None;
+            }
+            staged
+        })
+        .collect();
+
+    storage
+        .save_project_tasks(project_id, &staged)
+        .map_err(|e| {
+            format!("worktree {wt_path} was removed, but clearing it from the task board failed: {e}")
+        })?;
+
+    if let Some(t) = tasks_w.get_mut(&task_id) {
+        t.worktree_path = None;
+    }
+    Ok(())
 }
 
 /// Remove a task's worktree in the background; see [`cleanup_worktree`] for
@@ -1104,6 +1165,68 @@ mod tests {
         assert!(
             !std::path::Path::new(&info.path).exists(),
             "the worktree directory itself must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_worktree_retains_worktree_path_when_the_board_cannot_be_saved() {
+        // This is the status-change and delete path, not the executor's, and
+        // it has no retry pass of its own — so publishing the clear to memory
+        // while the write failed would leave the board and disk disagreeing
+        // with nothing left to reconcile them until the next start.
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let wt_mgr = test_worktree_manager();
+        let info = wt_mgr
+            .create(&repo_path, "cleanup-unsaveable")
+            .await
+            .expect("create failed");
+
+        let project_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            test_project(project_id, Some(repo_id)),
+        )])));
+        let repositories = Arc::new(RwLock::new(HashMap::from([(
+            repo_id,
+            test_repository(repo_id, repo_path),
+        )])));
+
+        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
+        task.worktree_path = Some(info.path.clone());
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
+        let (storage, _tmp) = test_storage();
+
+        // A regular file where the tasks directory has to be makes the atomic
+        // write fail with `NotADirectory`. No permission bits, so this behaves
+        // the same for every user including root.
+        std::fs::write(
+            storage.paths().config_dir().join("tasks"),
+            b"not a directory",
+        )
+        .expect("place persistence blocker");
+
+        cleanup_worktree(
+            WorktreeCleanupCtx {
+                worktree_manager: &wt_mgr,
+                projects: &projects,
+                repositories: &repositories,
+                tasks: &tasks,
+                storage: &storage,
+            },
+            task_id,
+            project_id,
+            &info.path,
+            "cleanup-unsaveable",
+        )
+        .await;
+
+        assert_eq!(
+            tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
+            Some(info.path.as_str()),
+            "the reference must survive in memory when it could not be persisted"
         );
     }
 

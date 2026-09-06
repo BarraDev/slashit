@@ -524,7 +524,9 @@ impl WorktreeManager {
             .await
             .map_err(|e| format!("Failed to remove worktree: {}", e))?;
 
-        if !output.status.success() {
+        let mut removed_by_git = output.status.success();
+
+        if !removed_by_git {
             // Fallback to force if normal remove fails (e.g., uncommitted changes)
             let force_output = tokio::process::Command::new("git")
                 .args(["worktree", "remove", "--force", worktree_path])
@@ -533,7 +535,9 @@ impl WorktreeManager {
                 .await
                 .map_err(|e| format!("Failed to force-remove worktree: {}", e))?;
 
-            if !force_output.status.success() {
+            removed_by_git = force_output.status.success();
+
+            if !removed_by_git {
                 // Last resort: prune stale git metadata for worktrees whose
                 // directory is already gone. It cannot remove a directory
                 // that is still present, so it can never turn this into a
@@ -559,14 +563,38 @@ impl WorktreeManager {
             ));
         }
 
-        // Only safe to delete the branch once the worktree checked out on it
-        // is confirmed gone: deleting it first would make a retry unable to
-        // recreate the worktree at all.
-        let _ = tokio::process::Command::new("git")
-            .args(["branch", "-D", branch])
-            .current_dir(repo_path)
-            .output()
-            .await;
+        // Deleting the branch requires more than observing that the directory
+        // is gone. An absent directory is `Ok` above precisely because it may
+        // have been removed by an earlier attempt or by the user, and the
+        // cleanup retry pass re-enters this function every ~30s — so "the path
+        // is absent" is also exactly what a retry that removed nothing sees.
+        // `git branch -D` force-deletes regardless of merge state and leaves no
+        // branch reflog, and branch names are deterministic from the task id,
+        // so acting on that inference can destroy commits on a branch this call
+        // has no claim to.
+        //
+        // A successful `git worktree remove` means git *had a registration for
+        // this path* — note it also exits 0 for a record whose directory
+        // something else already deleted, which is the case worth keeping. It
+        // is an ownership proxy, not proof that this call did the removing, and
+        // that is the property wanted here. The check stays after the `exists`
+        // check for the original reason: deleting the branch while the worktree
+        // is still checked out on it would leave a retry unable to recreate the
+        // worktree at all.
+        if removed_by_git {
+            let _ = tokio::process::Command::new("git")
+                .args(["branch", "-D", branch])
+                .current_dir(repo_path)
+                .output()
+                .await;
+        } else {
+            // Reported rather than silent: this leaves a branch behind, and
+            // nothing else collects it.
+            eprintln!(
+                "Note: worktree {worktree_path} was already absent and git had no registration \
+                 for it, so branch {branch} was left in place rather than force-deleted"
+            );
+        }
 
         Ok(())
     }
@@ -1020,6 +1048,70 @@ branch refs/heads/main
         assert!(Path::new(&info.path).exists(), "worktree dir should exist");
         assert_eq!(info.branch, "test-branch");
         assert!(mgr.exists(&info.path));
+    }
+
+    #[tokio::test]
+    async fn integration_remove_deletes_the_branch_it_actually_removed() {
+        // The ordinary path must be unchanged: a real removal still tidies up
+        // the branch the worktree was checked out on.
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+
+        let info = mgr
+            .create(repo_path, "task-removeme")
+            .await
+            .expect("create failed");
+
+        mgr.remove(&info.path, "task-removeme", repo_path)
+            .await
+            .expect("removal of a live worktree should succeed");
+
+        assert!(!Path::new(&info.path).exists(), "worktree dir should be gone");
+        assert!(
+            !branch_exists(repo_path, "task-removeme"),
+            "a confirmed removal should still delete the branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_remove_keeps_the_branch_when_it_removed_nothing() {
+        // A retry sees exactly this: the path is already absent, so both
+        // `git worktree remove` invocations exit non-zero and nothing was
+        // removed by this call. Reporting `Ok` is right — the worktree is gone
+        // — but inferring from that that the branch is expendable is not.
+        // `git branch -D` force-deletes regardless of merge state and leaves
+        // no reflog, and branch names are deterministic from the task id, so
+        // the branch reachable here may belong to a later run.
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+
+        std::process::Command::new("git")
+            .args(["branch", "task-keepme"])
+            .current_dir(repo_path)
+            .output()
+            .expect("failed to create branch");
+        assert!(branch_exists(repo_path, "task-keepme"), "precondition");
+
+        let absent = tmp.path().join("never-existed");
+        mgr.remove(absent.to_str().unwrap(), "task-keepme", repo_path)
+            .await
+            .expect("an already-absent worktree is not a failure");
+
+        assert!(
+            branch_exists(repo_path, "task-keepme"),
+            "no git removal succeeded, so the branch must not be force-deleted"
+        );
+    }
+
+    fn branch_exists(repo_path: &str, branch: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+            .current_dir(repo_path)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     #[test]
