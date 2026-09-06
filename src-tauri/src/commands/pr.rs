@@ -3,6 +3,8 @@ use crate::domain::task::{
     ExternalRef, PrCommentKind, PrReviewApplyResult, PrReviewComment, PrReviewDecision,
     PrReviewItem, PrReviewPlan,
 };
+use crate::commands::task::Tasks;
+use crate::config::Storage;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -575,7 +577,7 @@ pub async fn analyze_pr_comments(
         raw_plan: raw_output,
         last_apply: prior_plan.and_then(|p| p.last_apply),
     };
-    save_review_plan_on_task(&state, task_uuid, plan.clone()).await;
+    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, plan.clone()).await?;
     Ok(plan)
 }
 
@@ -651,7 +653,7 @@ pub async fn discuss_pr_review_questions(
     };
 
     let merged = discuss_pr_review_questions_inner(task, working_dir, plan).await?;
-    save_review_plan_on_task(&state, task_uuid, merged.clone()).await;
+    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, merged.clone()).await?;
     Ok(merged)
 }
 
@@ -764,7 +766,7 @@ pub async fn address_pr_review(
     let mut plan = plan;
     plan.backfill_lifecycle_from_last_apply();
     let (result, updated_plan) = address_pr_review_inner(task, working_dir, plan, options, progress).await?;
-    save_review_plan_on_task(&state, task_uuid, updated_plan).await;
+    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
     Ok(result)
 }
 
@@ -1144,7 +1146,7 @@ pub async fn sync_pr_review_replies(
     plan.backfill_lifecycle_from_last_apply();
 
     let (result, updated_plan) = sync_pr_review_replies_inner(task, plan).await?;
-    save_review_plan_on_task(&state, task_uuid, updated_plan).await;
+    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
     Ok(result)
 }
 
@@ -1261,20 +1263,70 @@ fn pr_url_for_task(task: &Task) -> Result<String, String> {
         .ok_or_else(|| "Task does not have a GitHub PR".to_string())
 }
 
-async fn save_review_plan_on_task(state: &crate::AppState, task_id: Uuid, plan: PrReviewPlan) {
-    let project_id = {
-        let mut tasks = state.task.tasks.write().await;
-        let Some(t) = tasks.get_mut(&task_id) else { return; };
-        t.pr_review_plan = Some(plan);
-        t.updated_at = chrono::Utc::now();
-        t.project_id
+/// Persist `task_id`'s review plan, then publish it to shared memory.
+///
+/// A review plan is the record of which comments were parsed, which fixes were
+/// applied and which replies were posted to GitHub. The lifecycle backfill and
+/// the next re-analysis both read it back to decide what still needs doing, so
+/// a plan that lives only in memory makes the next run re-apply fixes and
+/// re-post replies that already landed.
+///
+/// This used to mutate the task under a write guard, drop it, take a fresh read
+/// guard to build the snapshot, and discard the save error, returning `()` so
+/// that no caller could see the failure. Now the whole transaction runs under
+/// one write guard and the in-memory value is committed only after the write is
+/// accepted, so a plan the caller was told about is a plan a restart will find.
+async fn save_review_plan_on_task(
+    tasks: &Tasks,
+    storage: &Storage,
+    task_id: Uuid,
+    plan: PrReviewPlan,
+) -> Result<(), String> {
+    let mut tasks_w = tasks.write().await;
+
+    let Some(task) = tasks_w.get(&task_id) else {
+        // Explicit rather than a silent `Ok`: the caller is about to hand the
+        // frontend a plan, and nothing recorded it.
+        return Err(format!("Task {task_id} no longer exists, so its review plan was not saved"));
     };
-    let tasks_r = state.task.tasks.read().await;
-    let project_tasks: Vec<Task> = tasks_r.values()
+    let project_id = task.project_id;
+    let now = chrono::Utc::now();
+
+    let staged: Vec<Task> = tasks_w
+        .values()
         .filter(|t| t.project_id == project_id)
-        .cloned()
+        .map(|t| {
+            let mut staged = t.clone();
+            if staged.id == task_id {
+                staged.pr_review_plan = Some(plan.clone());
+                staged.updated_at = now;
+            }
+            staged
+        })
         .collect();
-    let _ = state.storage.save_project_tasks(project_id, &project_tasks);
+
+    let saved = storage
+        .save_project_tasks(project_id, &staged)
+        .map_err(|e| format!("Failed to save the PR review plan for task {task_id}: {e}"));
+
+    // Committed to memory even when the write failed, which is the opposite of
+    // what the worktree cleanup helper does, and deliberately so. There, memory
+    // has to agree with the *file*, because clearing a reference in memory is
+    // what removes a task from the retry pass that would have reconciled it.
+    // Here the plan is the record of work that already happened outside this
+    // process: commits pushed, replies posted to GitHub. Dropping it would
+    // leave the session believing those items are still pending, and the
+    // obvious response -- run Apply again -- would re-post replies that already
+    // landed. `rerunning_apply_skips_already_done_items_and_runs_claude_only_
+    // for_pending` is what makes the retained plan protective.
+    //
+    // The failure is still returned, so nothing reports a durable save that did
+    // not happen.
+    if let Some(t) = tasks_w.get_mut(&task_id) {
+        t.pr_review_plan = Some(plan);
+        t.updated_at = now;
+    }
+    saved
 }
 
 fn parse_gh_ts(v: Option<&serde_json::Value>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -2397,6 +2449,156 @@ mod tests {
     use crate::test_helpers::create_test_task;
 
     use super::build_pr_body;
+    use crate::test_helpers::create_test_task_full;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn review_plan_storage() -> (Storage, tempfile::TempDir) {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let storage = Storage::with_paths(crate::config::paths::AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        ));
+        (storage, temp)
+    }
+
+    /// Make every `save_project_tasks` fail deterministically by putting a
+    /// regular file where the tasks directory has to be, so the `create_dir_all`
+    /// inside the atomic write fails with `AlreadyExists`. No permission bits,
+    /// so this behaves identically for every user including root.
+    fn block_task_persistence(storage: &Storage) {
+        let blocker = storage.paths().config_dir().join("tasks");
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("place persistence blocker");
+    }
+
+    /// A task whose PR review plan is about to be saved, plus a sibling in the
+    /// same project that the whole-file rewrite must not drop.
+    fn review_plan_fixture(project_id: Uuid) -> (Uuid, Uuid, Tasks) {
+        let subject = create_test_task_full("subject", project_id, TaskStatus::InProgress, 0);
+        let sibling = create_test_task_full("sibling", project_id, TaskStatus::Backlog, 1);
+        let (subject_id, sibling_id) = (subject.id, sibling.id);
+        let map: HashMap<Uuid, Task> =
+            vec![subject, sibling].into_iter().map(|t| (t.id, t)).collect();
+        (subject_id, sibling_id, Arc::new(RwLock::new(map)))
+    }
+
+    fn plan_with_marker(marker: &str) -> PrReviewPlan {
+        PrReviewPlan {
+            generated_at: chrono::Utc::now(),
+            pr_url: "https://github.com/org/repo/pull/1".to_string(),
+            review_decision: None,
+            comments: Vec::new(),
+            items: Vec::new(),
+            raw_plan: marker.to_string(),
+            last_apply: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn save_review_plan_reports_a_failed_write_instead_of_returning_ok() {
+        let project_id = Uuid::new_v4();
+        let (task_id, _sibling_id, tasks) = review_plan_fixture(project_id);
+        let (storage, _tmp) = review_plan_storage();
+        block_task_persistence(&storage);
+
+        let result =
+            save_review_plan_on_task(&tasks, &storage, task_id, plan_with_marker("v1")).await;
+
+        assert!(
+            result.is_err(),
+            "the four public PR-review commands propagate this with `?`, so a swallowed \
+             error is the only thing that could let them return Ok after losing the plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_review_plan_keeps_the_plan_in_memory_when_the_write_fails() {
+        // `address_pr_review` and `sync_pr_review_replies` have already pushed
+        // commits and posted GitHub replies by the time this runs, and the plan
+        // is the record of that. Dropping it because the file could not be
+        // written would leave the session believing the items are still
+        // pending, and a re-run would post those replies a second time. The
+        // error is reported; the record is kept.
+        let project_id = Uuid::new_v4();
+        let (task_id, _sibling_id, tasks) = review_plan_fixture(project_id);
+        let (storage, _tmp) = review_plan_storage();
+        block_task_persistence(&storage);
+
+        let result =
+            save_review_plan_on_task(&tasks, &storage, task_id, plan_with_marker("v1")).await;
+
+        assert!(result.is_err(), "the failed write must still be reported");
+        assert_eq!(
+            tasks.read().await.get(&task_id).unwrap().pr_review_plan.as_ref()
+                .map(|p| p.raw_plan.as_str()),
+            Some("v1"),
+            "the record of already-posted replies must survive a failed write"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_review_plan_commits_once_the_write_is_accepted() {
+        let project_id = Uuid::new_v4();
+        let (task_id, _sibling_id, tasks) = review_plan_fixture(project_id);
+        let (storage, _tmp) = review_plan_storage();
+
+        save_review_plan_on_task(&tasks, &storage, task_id, plan_with_marker("v1"))
+            .await
+            .expect("save should succeed");
+
+        assert_eq!(
+            tasks.read().await.get(&task_id).unwrap().pr_review_plan.as_ref()
+                .map(|p| p.raw_plan.as_str()),
+            Some("v1")
+        );
+        let persisted = storage.load_project_tasks(project_id).expect("reload tasks");
+        let stored = persisted.iter().find(|t| t.id == task_id).expect("subject on disk");
+        assert_eq!(
+            stored.pr_review_plan.as_ref().map(|p| p.raw_plan.as_str()),
+            Some("v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn save_review_plan_keeps_sibling_tasks() {
+        // The save rewrites the whole project file from the staged snapshot, so
+        // a sibling omitted from it would be deleted from disk.
+        let project_id = Uuid::new_v4();
+        let (task_id, sibling_id, tasks) = review_plan_fixture(project_id);
+        let (storage, _tmp) = review_plan_storage();
+
+        save_review_plan_on_task(&tasks, &storage, task_id, plan_with_marker("v1"))
+            .await
+            .expect("save should succeed");
+
+        let persisted = storage.load_project_tasks(project_id).expect("reload tasks");
+        assert_eq!(persisted.len(), 2, "the sibling must still be on disk");
+        let sibling = persisted.iter().find(|t| t.id == sibling_id).expect("sibling on disk");
+        assert!(sibling.pr_review_plan.is_none(), "the sibling must be untouched");
+    }
+
+    #[tokio::test]
+    async fn save_review_plan_reports_a_task_that_vanished() {
+        let project_id = Uuid::new_v4();
+        let (_task_id, _sibling_id, tasks) = review_plan_fixture(project_id);
+        let (storage, _tmp) = review_plan_storage();
+
+        let result =
+            save_review_plan_on_task(&tasks, &storage, Uuid::new_v4(), plan_with_marker("v1")).await;
+
+        assert!(
+            result.is_err(),
+            "a plan for a task that no longer exists was not saved, and saying otherwise \
+             would be a silent false success"
+        );
+    }
 
     // ──────────────────────────────────────────────
     // PR body "Fixes #N" generation tests
