@@ -27,7 +27,16 @@ cargo clippy
 
 # Run backend directly
 cargo run
+
+# Desktop acceptance against the real application (Linux; needs a display and
+# WebKitWebDriver). The build step is required: a plain `cargo build` binary
+# points at localhost:1420 and never loads the embedded frontend.
+cargo tauri build --debug --no-bundle
+cargo test -p slashit-acceptance --features run-acceptance
 ```
+
+See `crates/slashit-acceptance/README.md` for what the harness guarantees and
+how to run it on Arch, which ships no `WebKitWebDriver`.
 
 ## Project Structure
 
@@ -113,6 +122,29 @@ When working on this project, prefer JJ commands:
 - Better mental model for stacked changes
 - Safe change manipulation (rebase, edit, abandon)
 - Seamless Git interoperability via colocated backend
+
+### No AI Attribution in Public Repository Artifacts
+
+Commits, PR titles and bodies, PR and issue comments, issues, release notes,
+tags and any other published repository artifact must contain **no AI session
+URLs, session identifiers, or AI attribution**, unless the user explicitly
+asks for one in that specific artifact.
+
+Never add, among others:
+
+- `Claude-Session:` or any other session trailer
+- `claude.ai/code/session/...` or an equivalent link for any AI tool
+- `Co-Authored-By: Claude` (or another AI assistant)
+- "Generated with/by Claude", "Made with <AI tool>" and similar
+
+Before every commit, push, or PR/issue write, inspect what is about to become
+public -- commit messages, the PR body, comment text, generated metadata --
+and confirm none of the above is present. If attribution slipped into work
+that is still unpublished or still amendable, remove it before finishing
+rather than leaving it for a follow-up.
+
+Tool and session provenance belongs in private working notes, not in the
+repository's public history.
 
 ## Nested AGENTS.md
 
