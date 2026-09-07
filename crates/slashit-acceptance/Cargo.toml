@@ -1,0 +1,39 @@
+[package]
+name = "slashit-acceptance"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-only desktop acceptance harness driving the real SlashIt application"
+authors = ["Barradev Digital Services <admin@barradev.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/BarraDev/slashit"
+publish = false
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+# Default features. Trimming them to `["reqwest", "rustls"]` looks tempting --
+# `manager` can download browser drivers, which this harness never wants -- but
+# it makes every session creation hang until the timeout, and it does not even
+# drop the heavy TLS backend. Left at defaults deliberately.
+thirtyfour = "0.37"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+
+# The acceptance runtime -- process groups, POSIX signals, /proc, XDG roots --
+# is implemented for Linux only, and the modules that need this dependency are
+# gated to match. Adding macOS or Windows means adding their own
+# implementations, not relaxing this target.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[features]
+# The acceptance journeys drive the REAL desktop application: they need a
+# `cargo tauri build --debug --no-bundle` binary, a WebKitWebDriver and a
+# graphical session. None of that belongs in a plain `cargo test --workspace`,
+# so the test target below is not even built without this feature. The
+# harness's own unit tests carry no such requirement and always run.
+run-acceptance = []
+
+[[test]]
+name = "acceptance"
+path = "tests/acceptance.rs"
+required-features = ["run-acceptance"]
