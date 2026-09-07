@@ -61,6 +61,8 @@ pub mod context;
 #[cfg(target_os = "linux")]
 pub mod driver;
 #[cfg(target_os = "linux")]
+pub mod fake_agent;
+#[cfg(target_os = "linux")]
 pub mod process;
 #[cfg(target_os = "linux")]
 pub mod state;
@@ -69,6 +71,8 @@ pub mod state;
 pub use context::{Environment, TestContext};
 #[cfg(target_os = "linux")]
 pub use driver::Session;
+#[cfg(target_os = "linux")]
+pub use fake_agent::FakeAgent;
 #[cfg(target_os = "linux")]
 pub use state::StateRoot;
 

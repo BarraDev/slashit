@@ -143,6 +143,15 @@ jobs:
             cargo test -p slashit-acceptance --features run-acceptance \
             --test acceptance -- --test-threads=1
 
+      # Run as its own step, not as a second test target in the one above, so
+      # the log says which kind of thing broke: the harness's ability to drive
+      # the application, or the application's own behaviour.
+      - name: Product acceptance journeys
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" \
+            cargo test -p slashit-acceptance --features run-acceptance \
+            --test product_acceptance -- --test-threads=1
+
       # Only failures leave anything behind: screenshots, page source and the
       # provider log, captured while the application was still alive.
       - name: Preserve failure evidence

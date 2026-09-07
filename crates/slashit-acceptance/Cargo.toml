@@ -37,3 +37,13 @@ run-acceptance = []
 name = "acceptance"
 path = "tests/acceptance.rs"
 required-features = ["run-acceptance"]
+
+# Kept as its own target rather than folded into the journeys above. The two
+# suites fail for different reasons: `acceptance` failing means the harness can
+# no longer drive the application, `product_acceptance` failing means the
+# application no longer does what it promises. Separate targets keep that
+# distinction visible in CI output instead of only in a comment.
+[[test]]
+name = "product_acceptance"
+path = "tests/product_acceptance.rs"
+required-features = ["run-acceptance"]
