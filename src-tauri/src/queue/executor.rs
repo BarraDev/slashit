@@ -5,7 +5,7 @@ use crate::queue::QueueManager;
 use crate::worktree::{WorktreeManager, WorktreeInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::Emitter;
+use crate::events::{EventSink, SharedEventSink};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -27,6 +27,23 @@ pub enum AgentEvent {
 }
 
 type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
+
+/// Emit an `AgentEvent` through any sink.
+///
+/// The executor produces exactly one event name, so the conversion lives here
+/// rather than forcing every call site to name it.
+trait AgentEmit {
+    fn agent_event(&self, event: AgentEvent);
+}
+
+impl<T: EventSink + ?Sized> AgentEmit for T {
+    fn agent_event(&self, event: AgentEvent) {
+        match serde_json::to_value(&event) {
+            Ok(value) => self.emit_json("agent-event", value),
+            Err(e) => eprintln!("[executor] dropping agent event: {e}"),
+        }
+    }
+}
 
 pub struct TaskExecutor {
     tasks: Tasks,
@@ -58,7 +75,7 @@ pub struct TaskExecutor {
     workspace_registry: Arc<RwLock<crate::config::WorkspaceRegistry>>,
     storage: crate::config::Storage,
     worktree_manager: Arc<WorktreeManager>,
-    app_handle: tauri::AppHandle,
+    events: SharedEventSink,
     pr_check_counter: std::sync::atomic::AtomicU32,
 }
 
@@ -72,7 +89,7 @@ pub struct TaskExecutorConfig {
     pub workspace_registry: Arc<RwLock<crate::config::WorkspaceRegistry>>,
     pub storage: crate::config::Storage,
     pub worktree_manager: Arc<WorktreeManager>,
-    pub app_handle: tauri::AppHandle,
+    pub events: SharedEventSink,
 }
 
 impl TaskExecutor {
@@ -91,20 +108,80 @@ impl TaskExecutor {
             workspace_registry: config.workspace_registry,
             storage: config.storage,
             worktree_manager: config.worktree_manager,
-            app_handle: config.app_handle,
+            events: config.events,
             pr_check_counter: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
-    /// Start the polling loop.
-    pub fn start_polling(self: &Arc<Self>) {
+    /// Build the polling loop, leaving the choice of runtime to the caller.
+    ///
+    /// This deliberately returns the future rather than spawning it. The two
+    /// callers live in different runtime worlds: `slashitd` runs inside
+    /// `#[tokio::main]`, while the desktop app starts the loop from Tauri's
+    /// `setup()` closure, which is *not* running on a Tokio worker and has no
+    /// reactor in thread-local scope. A `tokio::spawn` inside this function
+    /// therefore panicked with "there is no reactor running" for the GUI while
+    /// working perfectly for the daemon. Spawning `tauri::async_runtime::spawn`
+    /// here instead would only move the problem: this module is deliberately
+    /// free of every `tauri::` reference so `slashitd` can link it without the
+    /// GUI toolkit, which is the whole reason [`EventSink`] exists.
+    ///
+    /// Handing back the future keeps runtime ownership explicit at each call
+    /// site — `tauri::async_runtime::spawn` in `lib.rs`, `tokio::spawn` in
+    /// `daemon.rs` — and makes constructing the loop a runtime-free operation
+    /// that cannot panic no matter who calls it. The loop body still uses
+    /// `tokio::spawn` and `tokio::time`, so it must be polled on a Tokio
+    /// runtime; Tauri's global async runtime is one.
+    ///
+    /// `shutdown`, when given, lets a caller stop new-task promotion
+    /// cooperatively: the loop checks it before every pass and stops after
+    /// the current pass finishes, rather than being killed via
+    /// `JoinHandle::abort` at an arbitrary `.await` point (worktree creation
+    /// shells out to `git`/`jj`, and none of those child processes are
+    /// spawned with `kill_on_drop`, so an abort mid-spawn could orphan one).
+    /// The desktop GUI has no such handshake and passes `None`; the loop then
+    /// simply runs for the life of the process, as it always has.
+    ///
+    /// A caller that sends a shutdown signal must await the spawned handle
+    /// before treating "no new work will be promoted" as true: the shutdown
+    /// check only runs between passes, so a pass already past its own check
+    /// when the signal is sent can still promote and spawn a task afterward,
+    /// and that task's `running_handles` entry does not exist until that pass
+    /// finishes. Sampling `running_task_count()` without first awaiting that
+    /// handle can therefore observe zero while such a pass is still in flight.
+    pub fn polling_loop(
+        self: &Arc<Self>,
+        shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let executor = Arc::clone(self);
-        tauri::async_runtime::spawn(async move {
+        async move {
+            let mut shutdown = shutdown;
             loop {
+                if matches!(&shutdown, Some(rx) if *rx.borrow()) {
+                    return;
+                }
                 executor.check_and_execute().await;
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                match shutdown.as_mut() {
+                    Some(rx) => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {}
+                            _ = rx.changed() => {}
+                        }
+                    }
+                    None => tokio::time::sleep(tokio::time::Duration::from_secs(3)).await,
+                }
             }
-        });
+        }
+    }
+
+    /// How many tasks are executing or under review right now.
+    ///
+    /// A shutting-down daemon uses this to wait for real work rather than
+    /// killing agents mid-run: an aborted task is left marked `in_progress`
+    /// with no process behind it, and although startup requeues those, the
+    /// work the agent had already done is discarded.
+    pub async fn running_task_count(&self) -> usize {
+        self.running_handles.read().await.len() + self.reviewing_handles.read().await.len()
     }
 
     async fn check_and_execute(&self) {
@@ -112,7 +189,7 @@ impl TaskExecutor {
         let manager = self.queue_manager.read().await;
         if manager.config().auto_promote {
             while let Some(task_id) = manager.promote_next_task().await {
-                let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                self.events.agent_event(AgentEvent::Log {
                     task_id: task_id.to_string(),
                     level: LogLevel::Info,
                     message: "Auto-promoted from queue".to_string(),
@@ -130,6 +207,13 @@ impl TaskExecutor {
                 .collect()
         };
 
+        // A panic inside a spawned task's future skips its own cleanup code
+        // entirely (unwinding runs no further statements in that task), so it
+        // cannot be relied on to remove its own entry. Pruning finished
+        // handles here — reachable on every poll tick — is the backstop that
+        // catches that case regardless of which future code path forgets to
+        // clean up after itself.
+        self.running_handles.write().await.retain(|_, h| !h.is_finished());
         let running = self.running_handles.read().await.len();
         let limit = {
             let mgr = self.queue_manager.read().await;
@@ -140,6 +224,12 @@ impl TaskExecutor {
         for task_id in pending.into_iter().take(available) {
             self.spawn_task_execution(task_id).await;
         }
+
+        // Same backstop as `running_handles` above: a panicked review task
+        // cannot be relied on to remove its own entry, and a leaked one here
+        // holds `running_task_count()` above zero forever, which is what
+        // daemon shutdown waits on.
+        self.reviewing_handles.write().await.retain(|_, h| !h.is_finished());
 
         // Find AiReview tasks that need automated review
         let review_pending: Vec<Uuid> = {
@@ -236,7 +326,7 @@ impl TaskExecutor {
 
                             if state == "MERGED" {
                                 Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
-                                let _ = self.app_handle.emit("agent-event", AgentEvent::Completed {
+                                self.events.agent_event(AgentEvent::Completed {
                                     task_id: task_id.to_string(),
                                     success: true,
                                     message: Some("PR merged — task complete".to_string()),
@@ -360,7 +450,7 @@ impl TaskExecutor {
             Ok(path) => path,
             Err(e) => {
                 Self::warn_cleanup_once(
-                    &self.app_handle,
+                    &self.events,
                     &self.cleanup_last_warning,
                     task_id,
                     format!("Cannot resolve repo path to clean up worktree: {}", e),
@@ -374,7 +464,7 @@ impl TaskExecutor {
         let wt_mgr = self.worktree_manager.clone();
         let tasks = self.tasks.clone();
         let storage = self.storage.clone();
-        let app_handle = self.app_handle.clone();
+        let events = self.events.clone();
         let in_flight = self.cleanup_in_flight.clone();
         let last_warning = self.cleanup_last_warning.clone();
         let wt_path_done = wt_path.clone();
@@ -387,7 +477,7 @@ impl TaskExecutor {
             {
                 Err(e) => {
                     Self::warn_cleanup_once(
-                        &app_handle,
+                        &events,
                         &last_warning,
                         task_id,
                         format!(
@@ -414,7 +504,7 @@ impl TaskExecutor {
     /// event, never an attempt. A different message always gets through, so a
     /// failure that changes character is still visible.
     async fn warn_cleanup_once(
-        app_handle: &tauri::AppHandle,
+        events: &SharedEventSink,
         last_warning: &RwLock<HashMap<Uuid, String>>,
         task_id: Uuid,
         message: String,
@@ -423,14 +513,11 @@ impl TaskExecutor {
             return;
         }
 
-        let _ = app_handle.emit(
-            "agent-event",
-            AgentEvent::Log {
-                task_id: task_id.to_string(),
-                level: LogLevel::Warn,
-                message,
-            },
-        );
+        events.agent_event(AgentEvent::Log {
+            task_id: task_id.to_string(),
+            level: LogLevel::Warn,
+            message,
+        });
     }
 
     /// Record `message` as this task's latest cleanup warning, returning
@@ -458,7 +545,7 @@ impl TaskExecutor {
         ).await {
             Ok(dir) => dir,
             Err(e) => {
-                let _ = self.app_handle.emit("agent-event", AgentEvent::Error {
+                self.events.agent_event(AgentEvent::Error {
                     task_id: task_id.to_string(),
                     message: format!("Cannot resolve working directory: {}", e),
                 });
@@ -506,8 +593,8 @@ impl TaskExecutor {
         };
 
         // Helper closure to handle worktree success
-        let handle_worktree_ok = |info: &WorktreeInfo, app: &tauri::AppHandle, msg: &str| {
-            let _ = app.emit("agent-event", AgentEvent::Log {
+        let handle_worktree_ok = |info: &WorktreeInfo, app: &SharedEventSink, msg: &str| {
+            app.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Info,
                 message: format!("{}: {}", msg, info.path),
@@ -519,7 +606,7 @@ impl TaskExecutor {
             // Reattach to existing branch
             match self.worktree_manager.reattach(&repo_path, &branch_name).await {
                 Ok(info) => {
-                    handle_worktree_ok(&info, &self.app_handle, "Reattached worktree");
+                    handle_worktree_ok(&info, &self.events, "Reattached worktree");
                     {
                         let mut tasks_w = self.tasks.write().await;
                         if let Some(t) = tasks_w.get_mut(&task_id) {
@@ -531,7 +618,7 @@ impl TaskExecutor {
                     (info.path.clone(), Some(info.path))
                 }
                 Err(e) => {
-                    let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                    self.events.agent_event(AgentEvent::Log {
                         task_id: task_id.to_string(),
                         level: LogLevel::Warn,
                         message: format!("Worktree reattach failed ({}), using repo dir", e),
@@ -543,7 +630,7 @@ impl TaskExecutor {
             // Stacked branch based on parent dependency
             match self.worktree_manager.create_stacked_branch(&repo_path, &branch_name, parent_branch).await {
                 Ok(info) => {
-                    handle_worktree_ok(&info, &self.app_handle, "Created stacked worktree");
+                    handle_worktree_ok(&info, &self.events, "Created stacked worktree");
                     {
                         let mut tasks_w = self.tasks.write().await;
                         if let Some(t) = tasks_w.get_mut(&task_id) {
@@ -556,14 +643,14 @@ impl TaskExecutor {
                 }
                 Err(e) => {
                     // Fallback to normal create if stacking fails
-                    let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                    self.events.agent_event(AgentEvent::Log {
                         task_id: task_id.to_string(),
                         level: LogLevel::Warn,
                         message: format!("Stacked branch failed ({}), falling back to normal create", e),
                     });
                     match self.worktree_manager.create(&repo_path, &branch_name).await {
                         Ok(info) => {
-                            handle_worktree_ok(&info, &self.app_handle, "Created worktree (fallback)");
+                            handle_worktree_ok(&info, &self.events, "Created worktree (fallback)");
                             {
                                 let mut tasks_w = self.tasks.write().await;
                                 if let Some(t) = tasks_w.get_mut(&task_id) {
@@ -575,7 +662,7 @@ impl TaskExecutor {
                             (info.path.clone(), Some(info.path))
                         }
                         Err(e2) => {
-                            let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                            self.events.agent_event(AgentEvent::Log {
                                 task_id: task_id.to_string(),
                                 level: LogLevel::Warn,
                                 message: format!("Worktree creation failed ({}), using repo dir", e2),
@@ -589,7 +676,7 @@ impl TaskExecutor {
             // Normal new branch
             match self.worktree_manager.create(&repo_path, &branch_name).await {
                 Ok(info) => {
-                    handle_worktree_ok(&info, &self.app_handle, "Created worktree");
+                    handle_worktree_ok(&info, &self.events, "Created worktree");
                     {
                         let mut tasks_w = self.tasks.write().await;
                         if let Some(t) = tasks_w.get_mut(&task_id) {
@@ -601,7 +688,7 @@ impl TaskExecutor {
                     (info.path.clone(), Some(info.path))
                 }
                 Err(e) => {
-                    let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                    self.events.agent_event(AgentEvent::Log {
                         task_id: task_id.to_string(),
                         level: LogLevel::Warn,
                         message: format!("Worktree creation failed ({}), using repo dir", e),
@@ -639,7 +726,7 @@ impl TaskExecutor {
         let executions = self.executions.clone();
         let running_handles = self.running_handles.clone();
         let logs = self.logs.clone();
-        let app_handle = self.app_handle.clone();
+        let events = self.events.clone();
         let storage = self.storage.clone();
         let working_dir_for_commit = working_dir.clone();
 
@@ -660,7 +747,7 @@ impl TaskExecutor {
             executions.write().await.insert(execution_id, execution);
             logs.write().await.insert(execution_id, Vec::new());
 
-            let _ = app_handle.emit("agent-event", AgentEvent::Log {
+            events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Info,
                 message: format!("Starting Claude agent in {}", working_dir),
@@ -687,11 +774,15 @@ impl TaskExecutor {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!("Failed to start claude: {}", e);
-                    let _ = app_handle.emit("agent-event", AgentEvent::Error {
+                    events.agent_event(AgentEvent::Error {
                         task_id: task_id.to_string(),
                         message: msg.clone(),
                     });
                     Self::set_task_error_static(&tasks, &storage, task_id, &msg).await;
+                    // This early return skips the removal after `runner.wait()`
+                    // below, so it must remove itself here or this slot never
+                    // frees up.
+                    running_handles.write().await.remove(&task_id);
                     return;
                 }
             };
@@ -701,7 +792,7 @@ impl TaskExecutor {
                 exec.status = AgentStatus::Running;
             }
 
-            let _ = app_handle.emit("agent-event", AgentEvent::PhaseChange {
+            events.agent_event(AgentEvent::PhaseChange {
                 task_id: task_id.to_string(),
                 phase: TaskPhase::Coding,
                 progress: 10,
@@ -709,7 +800,7 @@ impl TaskExecutor {
 
             // Subscribe to events and forward to frontend
             let mut event_rx = runner.subscribe();
-            let app_handle_events = app_handle.clone();
+            let events_stream = events.clone();
             let task_id_str = task_id.to_string();
             let logs_events = logs.clone();
             let execution_id_events = execution_id;
@@ -719,14 +810,14 @@ impl TaskExecutor {
                 while let Ok(event) = event_rx.recv().await {
                     match &event {
                         ClaudeEvent::TextDelta { text } => {
-                            let _ = app_handle_events.emit("agent-event", AgentEvent::Log {
+                            events_stream.agent_event(AgentEvent::Log {
                                 task_id: task_id_str.clone(),
                                 level: LogLevel::Info,
                                 message: text.clone(),
                             });
                         }
                         ClaudeEvent::ToolUse { tool, .. } => {
-                            let _ = app_handle_events.emit("agent-event", AgentEvent::ToolUse {
+                            events_stream.agent_event(AgentEvent::ToolUse {
                                 task_id: task_id_str.clone(),
                                 tool: tool.clone(),
                             });
@@ -759,7 +850,7 @@ impl TaskExecutor {
                                 .push(entry);
                         }
                         ClaudeEvent::Error { message } => {
-                            let _ = app_handle_events.emit("agent-event", AgentEvent::Error {
+                            events_stream.agent_event(AgentEvent::Error {
                                 task_id: task_id_str.clone(),
                                 message: message.clone(),
                             });
@@ -773,7 +864,7 @@ impl TaskExecutor {
             match runner.wait().await {
                 Ok(_) => {
                     // Commit changes in the worktree/working dir
-                    Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &app_handle).await;
+                    Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await;
 
                     // Move to AiReview for automated review before human review
                     Self::update_task_phase_static(&tasks, task_id, TaskPhase::QaReview, 80).await;
@@ -785,7 +876,7 @@ impl TaskExecutor {
                             t.updated_at = chrono::Utc::now();
                         }
                     }
-                    let _ = app_handle.emit("agent-event", AgentEvent::Completed {
+                    events.agent_event(AgentEvent::Completed {
                         task_id: task_id.to_string(),
                         success: true,
                         message: Some("Agent completed — moving to AI review".to_string()),
@@ -805,7 +896,7 @@ impl TaskExecutor {
                     } else {
                         err_msg.clone()
                     };
-                    let _ = app_handle.emit("agent-event", AgentEvent::Error {
+                    events.agent_event(AgentEvent::Error {
                         task_id: task_id.to_string(),
                         message: full_msg.clone(),
                     });
@@ -875,7 +966,7 @@ impl TaskExecutor {
             ).await {
                 Ok(dir) => dir,
                 Err(e) => {
-                    let _ = self.app_handle.emit("agent-event", AgentEvent::Log {
+                    self.events.agent_event(AgentEvent::Log {
                         task_id: task_id.to_string(),
                         level: LogLevel::Warn,
                         message: format!("Cannot resolve working dir for review: {}", e),
@@ -894,7 +985,7 @@ impl TaskExecutor {
 
         let tasks = self.tasks.clone();
         let reviewing_handles = self.reviewing_handles.clone();
-        let app_handle = self.app_handle.clone();
+        let events = self.events.clone();
         let storage = self.storage.clone();
         let queue_manager = self.queue_manager.clone();
 
@@ -904,7 +995,7 @@ impl TaskExecutor {
         let handle = tokio::spawn(async move {
             let task_id_str = task_id.to_string();
 
-            let _ = app_handle.emit("agent-event", AgentEvent::Log {
+            events.agent_event(AgentEvent::Log {
                 task_id: task_id_str.clone(),
                 level: LogLevel::Info,
                 message: "Starting AI review...".to_string(),
@@ -914,7 +1005,7 @@ impl TaskExecutor {
             let diff = match Self::get_diff(&working_dir).await {
                 Some(d) => d,
                 None => {
-                    let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                    events.agent_event(AgentEvent::Log {
                         task_id: task_id_str.clone(),
                         level: LogLevel::Warn,
                         message: "Could not get diff (jj/git), skipping AI review".to_string(),
@@ -932,7 +1023,7 @@ impl TaskExecutor {
             };
 
             if diff.trim().is_empty() {
-                let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
                     message: "No changes detected, skipping review".to_string(),
@@ -1003,7 +1094,7 @@ impl TaskExecutor {
                 {
                     Ok(output) if output.status.success() => {}
                     _ => {
-                        let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                        events.agent_event(AgentEvent::Log {
                             task_id: task_id_str.clone(),
                             level: LogLevel::Warn,
                             message: "CodeRabbit enabled but CLI not found. Install it or disable in Queue Settings.".to_string(),
@@ -1012,7 +1103,7 @@ impl TaskExecutor {
                     }
                 }
 
-                let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
                     message: "Running CodeRabbit review...".to_string(),
@@ -1052,7 +1143,7 @@ impl TaskExecutor {
                 && !coderabbit_result.starts_with("CodeRabbit warning:");
 
             if has_claude_issues || has_coderabbit_issues {
-                let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
                     message: "Issues found — validating and fixing...".to_string(),
@@ -1120,7 +1211,7 @@ impl TaskExecutor {
                         true
                     }
                     Err(e) => {
-                        let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                        events.agent_event(AgentEvent::Log {
                             task_id: task_id_str.clone(),
                             level: LogLevel::Error,
                             message: format!("Fix agent failed to start: {}", e),
@@ -1144,7 +1235,7 @@ impl TaskExecutor {
                 Self::transition_to_human_review(&tasks, &storage, task_id, Some(signoff)).await;
             } else {
                 // All clear — no issues
-                let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
                     message: "AI review passed — moving to human review".to_string(),
@@ -1281,7 +1372,7 @@ impl TaskExecutor {
         tasks: &Tasks,
         task_id: Uuid,
         working_dir: &str,
-        app_handle: &tauri::AppHandle,
+        events: &SharedEventSink,
     ) {
         let title = {
             let tasks_r = tasks.read().await;
@@ -1302,7 +1393,7 @@ impl TaskExecutor {
                     .current_dir(working_dir)
                     .output()
                     .await;
-                let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
                     message: "Committed via jj".to_string(),
@@ -1331,14 +1422,14 @@ impl TaskExecutor {
                 .await
             {
                 Ok(output) if output.status.success() => {
-                    let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                    events.agent_event(AgentEvent::Log {
                         task_id: task_id_str,
                         level: LogLevel::Info,
                         message: "Committed via git".to_string(),
                     });
                 }
                 _ => {
-                    let _ = app_handle.emit("agent-event", AgentEvent::Log {
+                    events.agent_event(AgentEvent::Log {
                         task_id: task_id_str,
                         level: LogLevel::Warn,
                         message: "Git commit skipped (no changes or error)".to_string(),
@@ -1350,7 +1441,7 @@ impl TaskExecutor {
 
     async fn update_task_phase(&self, task_id: Uuid, phase: TaskPhase, progress: u8) {
         Self::update_task_phase_static(&self.tasks, task_id, phase.clone(), progress).await;
-        let _ = self.app_handle.emit("agent-event", AgentEvent::PhaseChange {
+        self.events.agent_event(AgentEvent::PhaseChange {
             task_id: task_id.to_string(),
             phase,
             progress,
@@ -1545,6 +1636,263 @@ mod tests {
                 root.join("runtime"),
             ));
         (storage, temp)
+    }
+
+    /// A `TaskExecutor` over nothing but temporary directories.
+    ///
+    /// Deliberately synchronous and runtime-free, because
+    /// [`polling_loop_can_be_built_with_no_ambient_tokio_runtime`] must be
+    /// able to build one from a plain `#[test]`. The returned temp dirs must
+    /// be kept alive for as long as the executor is used.
+    fn test_executor() -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {
+        let (storage, storage_temp) = test_storage();
+        let (registry, reg_temp) = test_registry();
+        let paths_temp = tempfile::TempDir::new().expect("paths temp dir");
+
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::new()));
+        let executor = Arc::new(TaskExecutor::new(TaskExecutorConfig {
+            tasks: tasks.clone(),
+            queue_manager: Arc::new(RwLock::new(crate::queue::QueueManager::new(
+                tasks,
+                crate::config::queue::QueueConfig::default(),
+            ))),
+            executions: Arc::new(RwLock::new(HashMap::new())),
+            logs: Arc::new(RwLock::new(HashMap::new())),
+            projects: Arc::new(RwLock::new(HashMap::new())),
+            repositories: Arc::new(RwLock::new(HashMap::new())),
+            workspace_registry: Arc::new(RwLock::new(registry)),
+            storage,
+            worktree_manager: Arc::new(WorktreeManager::new(
+                Arc::new(crate::config::paths::AppPaths::with_roots(
+                    paths_temp.path().join("config"),
+                    paths_temp.path().join("data"),
+                    paths_temp.path().join("cache"),
+                    paths_temp.path().join("runtime"),
+                )),
+                crate::config::paths::WorktreePlacement::Managed,
+            )),
+            events: crate::events::null_sink(),
+        }));
+        (executor, vec![storage_temp, reg_temp, paths_temp])
+    }
+
+    /// Regression guard for the PR #2 GUI startup panic.
+    ///
+    ///     thread 'main' panicked at src-tauri/src/queue/executor.rs:140:9:
+    ///     there is no reactor running, must be called from the context of a
+    ///     Tokio 1.x runtime
+    ///
+    /// The desktop app starts the poller from Tauri's `setup()` closure, which
+    /// runs on the main thread before the event loop starts and has no Tokio
+    /// runtime entered in thread-local scope. While this function performed the
+    /// spawn itself with `tokio::spawn`, that call reached for
+    /// `Handle::current()` and aborted the process before a window could open.
+    /// The daemon never saw it because `slashitd` is `#[tokio::main]`.
+    ///
+    /// This is deliberately **not** a `#[tokio::test]`. That attribute enters a
+    /// runtime on the test thread, which reproduces the daemon's environment
+    /// and not the GUI's — the original bug would have passed such a test. The
+    /// two properties proven here are exactly the ones the GUI needs, and the
+    /// real `slashit-ui` launch is what covers the rest of `setup()`.
+    #[test]
+    fn polling_loop_can_be_built_with_no_ambient_tokio_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "this test only proves anything while no runtime is entered on \
+             this thread; something has made one ambient"
+        );
+
+        let (executor, _temps) = test_executor();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        // Property one: building the loop is inert. At `d1cf8d58` this line
+        // read `executor.start_polling(Some(rx))` and panicked right here.
+        let polling = executor.polling_loop(Some(rx));
+
+        // Property two: the future still works when a runtime it was not
+        // created inside picks it up later — which is precisely what
+        // `tauri::async_runtime::spawn` does at the GUI call site, handing the
+        // future to a global runtime built on another thread entirely. Built
+        // after `polling` on purpose, so the future provably predates it.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        runtime.block_on(async move {
+            let handle = tokio::spawn(polling);
+
+            // `pr_check_counter` is bumped at the end of `check_and_execute`,
+            // so seeing it above zero proves a full pass ran — the loop is
+            // genuinely polling, not merely spawned. Without this the test
+            // would still pass if the loop observed shutdown before its first
+            // pass, a strictly weaker claim.
+            while executor
+                .pr_check_counter
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+
+            tx.send(true).expect("the polling task holds the receiver");
+
+            // Bounded well under the loop's own 3-second sleep, so resolving
+            // in time proves it woke on `rx.changed()`.
+            tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+                .await
+                .expect("the loop must observe shutdown, not wait out its sleep")
+                .expect("the loop must not panic");
+        });
+    }
+
+    #[tokio::test]
+    async fn polling_loop_stops_the_loop_once_it_observes_the_shutdown_signal() {
+        // Regression guard for the daemon shutdown race: `daemon::run` awaits
+        // exactly this `JoinHandle` before trusting `running_task_count()`,
+        // on the reasoning that the loop's shutdown check only runs between
+        // passes and therefore the handle resolving is proof no pass is still
+        // executing.
+        //
+        // This does not reproduce the specific window CodeRabbit described —
+        // a pass already past its shutdown check and partway through
+        // promoting a task when the signal arrives — because that requires a
+        // task actually in flight through real worktree creation, which has
+        // no deterministic pause point without adding a synchronization hook
+        // to `check_and_execute` itself, which would be a change to
+        // production code well beyond this fix. What this test does prove
+        // deterministically, with no sleep-based guessing: the loop is
+        // allowed to run at least one real `check_and_execute` pass to
+        // completion first (tracked via `pr_check_counter`, incremented at
+        // the end of every pass), so this cannot degenerate into "shutdown
+        // was already true before the loop was ever polled" — a strictly
+        // weaker case an earlier version of this test collapsed into on a
+        // single-threaded runtime, since sending on a `watch` channel before
+        // the receiver's task is ever scheduled leaves nothing for the first
+        // poll to observe but the already-updated value. It then proves the
+        // loop wakes via `rx.changed()` rather than merely outlasting its own
+        // timer, by bounding the wait well under the loop's 3-second
+        // between-passes sleep.
+        let (storage, _storage_temp) = test_storage();
+        let (registry, _reg_temp) = test_registry();
+        let paths_temp = tempfile::TempDir::new().expect("paths temp dir");
+
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::new()));
+        let executor = Arc::new(TaskExecutor::new(TaskExecutorConfig {
+            tasks: tasks.clone(),
+            queue_manager: Arc::new(RwLock::new(crate::queue::QueueManager::new(
+                tasks.clone(),
+                crate::config::queue::QueueConfig::default(),
+            ))),
+            executions: Arc::new(RwLock::new(HashMap::new())),
+            logs: Arc::new(RwLock::new(HashMap::new())),
+            projects: Arc::new(RwLock::new(HashMap::new())),
+            repositories: Arc::new(RwLock::new(HashMap::new())),
+            workspace_registry: Arc::new(RwLock::new(registry)),
+            storage,
+            worktree_manager: Arc::new(WorktreeManager::new(
+                Arc::new(crate::config::paths::AppPaths::with_roots(
+                    paths_temp.path().join("config"),
+                    paths_temp.path().join("data"),
+                    paths_temp.path().join("cache"),
+                    paths_temp.path().join("runtime"),
+                )),
+                crate::config::paths::WorktreePlacement::Managed,
+            )),
+            events: crate::events::null_sink(),
+        }));
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(executor.polling_loop(Some(rx)));
+
+        // Let at least one full pass complete before signalling shutdown.
+        // `pr_check_counter` is incremented at the very end of
+        // `check_and_execute`, so observing it above zero is proof a pass
+        // ran to completion, not merely that the loop task was scheduled.
+        while executor
+            .pr_check_counter
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+
+        tx.send(true).expect("receiver is held by the polling task");
+
+        // Bounded well under the loop's 3-second between-passes sleep:
+        // resolving inside this window is proof the loop woke via
+        // `rx.changed()`, not that it happened to finish waiting anyway.
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("the poller must wake via `rx.changed()`, not wait out its own sleep")
+            .expect("the poller task must not panic");
+    }
+
+    #[tokio::test]
+    async fn check_and_execute_prunes_a_reviewing_handle_left_behind_by_a_panic() {
+        // Mirrors the same backstop already proven for `running_handles`: a
+        // panic inside a spawned review task skips its own cleanup code, so
+        // nothing but a periodic sweep removes its entry. A leaked entry here
+        // holds `running_task_count()` above zero forever, which is exactly
+        // what daemon shutdown waits on — so this map needs the same pruning
+        // `running_handles` already had, not a separate guarantee.
+        let (storage, _storage_temp) = test_storage();
+        let (registry, _reg_temp) = test_registry();
+        let paths_temp = tempfile::TempDir::new().expect("paths temp dir");
+
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::new()));
+        let executor = TaskExecutor::new(TaskExecutorConfig {
+            tasks: tasks.clone(),
+            queue_manager: Arc::new(RwLock::new(crate::queue::QueueManager::new(
+                tasks.clone(),
+                crate::config::queue::QueueConfig::default(),
+            ))),
+            executions: Arc::new(RwLock::new(HashMap::new())),
+            logs: Arc::new(RwLock::new(HashMap::new())),
+            projects: Arc::new(RwLock::new(HashMap::new())),
+            repositories: Arc::new(RwLock::new(HashMap::new())),
+            workspace_registry: Arc::new(RwLock::new(registry)),
+            storage,
+            worktree_manager: Arc::new(WorktreeManager::new(
+                Arc::new(crate::config::paths::AppPaths::with_roots(
+                    paths_temp.path().join("config"),
+                    paths_temp.path().join("data"),
+                    paths_temp.path().join("cache"),
+                    paths_temp.path().join("runtime"),
+                )),
+                crate::config::paths::WorktreePlacement::Managed,
+            )),
+            events: crate::events::null_sink(),
+        });
+
+        let task_id = Uuid::new_v4();
+        let handle = tokio::spawn(async {
+            panic!("simulated review-task panic, before its own cleanup runs");
+        });
+        // Give the spawned task a chance to actually run and panic before
+        // asserting on it, rather than racing its own scheduling.
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        executor
+            .reviewing_handles
+            .write()
+            .await
+            .insert(task_id, handle);
+
+        executor.check_and_execute().await;
+
+        assert!(
+            executor.reviewing_handles.read().await.is_empty(),
+            "a finished (including panicked) review handle must not survive a poll pass"
+        );
+        assert_eq!(
+            executor.running_task_count().await,
+            0,
+            "a leaked reviewing_handles entry would hold this above zero forever, \
+             which is what daemon shutdown waits on"
+        );
     }
 
     #[tokio::test]

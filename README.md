@@ -46,7 +46,8 @@ It's built for people who've already outgrown a single terminal tab and a stack 
 **Stay in flow**
 - Works with whatever version-control setup you already have — plain Git is fine, and [Jujutsu](https://github.com/jj-vcs/jj) (`jj`) gets first-class treatment for stacked changes if you use it.
 - A `slashit` CLI controls the running app from any terminal — handy for shell scripts and for other agents to talk to.
-- System tray keeps agents and terminals alive when the window closes; signed auto-updates ship from GitHub Releases.
+- System tray keeps agents and terminals alive when the window closes, and a headless `slashitd` keeps them running with no window at all — see [`docs/architecture/daemon.md`](docs/architecture/daemon.md).
+- Updates are downloaded from GitHub Releases and verified against a signing key before they are applied. The installers themselves are not yet code-signed by Windows or Apple, so the first launch of a fresh install shows an OS warning — see [`docs/releasing.md`](docs/releasing.md).
 
 ## Screenshots
 
@@ -76,30 +77,32 @@ The screens below preview the broader workspace, parts of which are still being 
 
 ## Status and Roadmap
 
-SlashIt is currently pre-1.0 software. The core app, CLI, IPC server, queue, terminals, updater wiring, and CI/release workflows are in place, but the public release is still being polished.
+SlashIt is currently pre-1.0 software. The core app, CLI, IPC server, headless daemon, queue, terminals, updater and CI/release workflows are in place. **No release has been published yet** — the Releases page below is empty until the first tag ships, so for now, build from source.
 
 Near-term roadmap:
 
-- Add installation walkthroughs and release notes polish.
-- Headless daemon mode, so agents and terminals survive without a window — designed in [`docs/architecture/daemon.md`](docs/architecture/daemon.md), not yet implemented.
+- Publish the first release, with installation walkthroughs. The procedure is written down in [`docs/releasing.md`](docs/releasing.md).
+- Code-sign the installers, so a first launch stops triggering SmartScreen and Gatekeeper warnings.
 - Workspace layout cleanup (the root crate is both a package and a workspace).
 - Continue hardening queue execution, agent recovery, and cross-platform packaging.
 
 ## Built with
 
-Rust end to end — a [Leptos](https://leptos.dev/) 0.8 frontend compiled to WASM, a [Tauri](https://tauri.app/) v2 backend on the tokio runtime, and a standalone CLI that talks to the running app over a Unix domain socket (JSON-lines on `$XDG_RUNTIME_DIR/slashit-app/slashit.sock`). Module-level layout is documented in [`AGENTS.md`](AGENTS.md).
+Rust end to end — a [Leptos](https://leptos.dev/) 0.8 frontend compiled to WASM, a [Tauri](https://tauri.app/) v2 backend on the tokio runtime, and a standalone CLI that talks to the running app over JSON-lines on a per-user Unix domain socket (Linux, macOS) or a named pipe (Windows) — exact locations and access control in [`docs/architecture/ipc-security.md`](docs/architecture/ipc-security.md). Module-level layout is documented in [`AGENTS.md`](AGENTS.md).
 
 ## Installation
 
 ### Pre-built Binaries
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/BarraDev/slashit/releases).
+There are none yet. The first tagged release will publish these to [GitHub Releases](https://github.com/BarraDev/slashit/releases); until then, [build from source](#build-from-source).
 
 | Platform | Format |
 |----------|--------|
 | Linux | `.AppImage`, `.deb` |
 | macOS | `.dmg` |
 | Windows | `.msi`, `.exe` |
+
+Installers are not code-signed yet, so the first launch will show a SmartScreen or Gatekeeper warning. [`docs/releasing.md`](docs/releasing.md) explains exactly what is and is not signed.
 
 ### Build from Source
 
@@ -126,6 +129,9 @@ cargo tauri build
 
 # Build CLI only
 cargo build -p slashit --release
+
+# Build the headless daemon only
+cargo build -p slashit-ui --bin slashitd --release
 ```
 
 On non-GNOME Linux desktops such as i3 or sway, `NO_AT_BRIDGE=1` prevents a known WebKitGTK AT-SPI accessibility bridge crash.
@@ -156,7 +162,7 @@ Configuration is stored in your system config directory:
 
 - Linux: `~/.config/slashit-app/`
 - macOS: `~/Library/Application Support/com.barradev.slashit-app/`
-- Windows: `%APPDATA%\com.barradev.slashit-app\`
+- Windows: `%APPDATA%\barradev\slashit-app\config\`
 
 ### Your project stays clean
 
@@ -193,6 +199,8 @@ cargo clippy -p slashit-ui -p slashit -p slashit-ipc -- -D warnings
 cargo test -p slashit-ui -p slashit-ipc
 trunk build
 ```
+
+Cutting a release is a separate procedure — version bump locations, the version grammar the Windows installer accepts, and the draft-then-publish step are all written down in [`docs/releasing.md`](docs/releasing.md).
 
 This repository uses Jujutsu (`jj`) as the primary version-control workflow with a colocated Git repository for GitHub compatibility. Plain Git contributions are welcome.
 

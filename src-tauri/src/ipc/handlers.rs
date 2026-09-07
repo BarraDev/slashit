@@ -1,34 +1,86 @@
-use slashit_ipc::*;
+//! One function per command.
+//!
+//! The handlers know nothing about transports, credentials or windows. Access
+//! control has already happened by the time [`dispatch`] is called (see
+//! [`super::server`]), and the two operations that differ between the desktop
+//! app and the daemon — showing a window, quitting — go through
+//! [`crate::instance::InstanceControl`]. That is why this module names no Tauri
+//! type at all: it is the same code in both processes.
+
+use slashit_ipc::{
+    AppStatus, InstanceInfo, IpcRequest, IpcResponse, ProjectSummary, QueueStatusInfo, TaskSummary,
+    TerminalSummary, PROTOCOL_VERSION,
+};
 use uuid::Uuid;
 
 use crate::domain::{AgentStatus, TaskPriority, TaskStatus};
 
-use super::server::IpcContext;
+use super::server::{IpcContext, PeerContext};
 
-pub async fn dispatch(req: IpcRequest, ctx: &IpcContext) -> IpcResponse {
+/// The outcome of one request.
+///
+/// A plain [`IpcResponse`] is not quite enough, because `Quit` has to happen
+/// *after* its own reply has been written: asking a daemon to stop trips the
+/// shutdown signal, and a client that asked politely should not be answered
+/// with a closed connection.
+pub struct Dispatch {
+    pub response: IpcResponse,
+
+    /// The instance was asked to stop. The server calls
+    /// [`crate::instance::InstanceControl::request_quit`] once the response is
+    /// on the wire.
+    pub then_quit: bool,
+}
+
+impl Dispatch {
+    /// An ordinary answer, with nothing deferred.
+    pub fn reply(response: IpcResponse) -> Self {
+        Self {
+            response,
+            then_quit: false,
+        }
+    }
+}
+
+/// Run one already-authorized request.
+///
+/// `peer` is carried this far only so `Ping` can report the endpoint the caller
+/// actually reached; no handler makes an access-control decision of its own,
+/// because a rule that lived in two places would eventually be applied in one.
+pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> Dispatch {
     match req {
-        IpcRequest::Status => handle_status(ctx).await,
-        IpcRequest::ListProjects => handle_list_projects(ctx).await,
-        IpcRequest::ListTasks { project_id } => handle_list_tasks(ctx, project_id).await,
+        IpcRequest::Status => Dispatch::reply(handle_status(ctx).await),
+        IpcRequest::ListProjects => Dispatch::reply(handle_list_projects(ctx).await),
+        IpcRequest::ListTasks { project_id } => {
+            Dispatch::reply(handle_list_tasks(ctx, project_id).await)
+        }
         IpcRequest::CreateTask {
             project_id,
             title,
             description,
             priority,
-        } => handle_create_task(ctx, project_id, title, description, priority).await,
-        IpcRequest::MoveTask { task_id, status } => handle_move_task(ctx, task_id, status).await,
+        } => Dispatch::reply(handle_create_task(ctx, project_id, title, description, priority).await),
+        IpcRequest::MoveTask { task_id, status } => {
+            Dispatch::reply(handle_move_task(ctx, task_id, status).await)
+        }
         IpcRequest::EditTask {
             task_id,
             title,
             description,
             priority,
-        } => handle_edit_task(ctx, task_id, title, description, priority).await,
-        IpcRequest::DeleteTask { task_id } => handle_delete_task(ctx, task_id).await,
-        IpcRequest::QueueStatus => handle_queue_status(ctx).await,
-        IpcRequest::EnqueueTask { task_id } => handle_enqueue_task(ctx, task_id).await,
-        IpcRequest::ListTerminals => handle_list_terminals(ctx).await,
-        IpcRequest::Show => handle_show(ctx),
-        IpcRequest::Quit => handle_quit(ctx),
+        } => Dispatch::reply(handle_edit_task(ctx, task_id, title, description, priority).await),
+        IpcRequest::DeleteTask { task_id } => {
+            Dispatch::reply(handle_delete_task(ctx, task_id).await)
+        }
+        IpcRequest::QueueStatus => Dispatch::reply(handle_queue_status(ctx).await),
+        IpcRequest::EnqueueTask { task_id } => {
+            Dispatch::reply(handle_enqueue_task(ctx, task_id).await)
+        }
+        IpcRequest::ListTerminals => Dispatch::reply(handle_list_terminals(ctx).await),
+        IpcRequest::Show => Dispatch::reply(handle_show(ctx)),
+        IpcRequest::Quit => handle_quit(),
+        IpcRequest::Features => Dispatch::reply(handle_features(ctx).await),
+        IpcRequest::Ping => Dispatch::reply(handle_ping(ctx, peer)),
     }
 }
 
@@ -83,7 +135,10 @@ async fn handle_list_tasks(ctx: &IpcContext, project_id: Option<String>) -> IpcR
             None => true,
         })
         .map(|t| {
-            let name = projects.get(&t.project_id).map(|p| p.name.as_str()).unwrap_or("?");
+            let name = projects
+                .get(&t.project_id)
+                .map(|p| p.name.as_str())
+                .unwrap_or("?");
             task_to_summary(t, name)
         })
         .collect();
@@ -100,7 +155,7 @@ async fn handle_create_task(
 ) -> IpcResponse {
     let project_uuid = match Uuid::parse_str(&project_id) {
         Ok(id) => id,
-        Err(_) => return IpcResponse::error(format!("Invalid project_id: {}", project_id)),
+        Err(_) => return IpcResponse::error(format!("Invalid project_id: {project_id}")),
     };
 
     // Verify project exists and get its name
@@ -108,7 +163,7 @@ async fn handle_create_task(
         let projects = ctx.projects.read().await;
         match projects.get(&project_uuid) {
             Some(p) => p.name.clone(),
-            None => return IpcResponse::error(format!("Project {} not found", project_id)),
+            None => return IpcResponse::error(format!("Project {project_id} not found")),
         }
     };
 
@@ -167,12 +222,12 @@ async fn handle_create_task(
 async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> IpcResponse {
     let task_uuid = match Uuid::parse_str(&task_id) {
         Ok(id) => id,
-        Err(_) => return IpcResponse::error(format!("Invalid task_id: {}", task_id)),
+        Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
     };
 
     let new_status = match parse_status(&status) {
         Some(s) => s,
-        None => return IpcResponse::error(format!("Invalid status: {}", status)),
+        None => return IpcResponse::error(format!("Invalid status: {status}")),
     };
 
     let projects = ctx.projects.read().await;
@@ -181,12 +236,15 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         task.status = new_status;
         task.updated_at = chrono::Utc::now();
         let project_id = task.project_id;
-        let pname = projects.get(&project_id).map(|p| p.name.as_str()).unwrap_or("?");
+        let pname = projects
+            .get(&project_id)
+            .map(|p| p.name.as_str())
+            .unwrap_or("?");
         let summary = task_to_summary(task, pname);
         persist_project_tasks(&tasks, project_id, &ctx.storage);
         IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
     } else {
-        IpcResponse::error(format!("Task {} not found", task_id))
+        IpcResponse::error(format!("Task {task_id} not found"))
     }
 }
 
@@ -199,7 +257,7 @@ async fn handle_edit_task(
 ) -> IpcResponse {
     let task_uuid = match Uuid::parse_str(&task_id) {
         Ok(id) => id,
-        Err(_) => return IpcResponse::error(format!("Invalid task_id: {}", task_id)),
+        Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
     };
 
     let projects = ctx.projects.read().await;
@@ -216,19 +274,22 @@ async fn handle_edit_task(
         }
         task.updated_at = chrono::Utc::now();
         let project_id = task.project_id;
-        let pname = projects.get(&project_id).map(|p| p.name.as_str()).unwrap_or("?");
+        let pname = projects
+            .get(&project_id)
+            .map(|p| p.name.as_str())
+            .unwrap_or("?");
         let summary = task_to_summary(task, pname);
         persist_project_tasks(&tasks, project_id, &ctx.storage);
         IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
     } else {
-        IpcResponse::error(format!("Task {} not found", task_id))
+        IpcResponse::error(format!("Task {task_id} not found"))
     }
 }
 
 async fn handle_delete_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
     let task_uuid = match Uuid::parse_str(&task_id) {
         Ok(id) => id,
-        Err(_) => return IpcResponse::error(format!("Invalid task_id: {}", task_id)),
+        Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
     };
 
     let mut tasks = ctx.tasks.write().await;
@@ -237,7 +298,7 @@ async fn handle_delete_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
         persist_project_tasks(&tasks, project_id, &ctx.storage);
         IpcResponse::success(serde_json::json!({"deleted": task_id}))
     } else {
-        IpcResponse::error(format!("Task {} not found", task_id))
+        IpcResponse::error(format!("Task {task_id} not found"))
     }
 }
 
@@ -261,7 +322,7 @@ async fn handle_queue_status(ctx: &IpcContext) -> IpcResponse {
 async fn handle_enqueue_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
     let task_uuid = match Uuid::parse_str(&task_id) {
         Ok(id) => id,
-        Err(_) => return IpcResponse::error(format!("Invalid task_id: {}", task_id)),
+        Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
     };
 
     let queue_mgr = ctx.queue_manager.read().await;
@@ -293,22 +354,58 @@ async fn handle_list_terminals(ctx: &IpcContext) -> IpcResponse {
     IpcResponse::success(serde_json::to_value(summaries).unwrap_or_default())
 }
 
+/// Bring the window forward, if this instance has one.
+///
+/// A daemon reports the failure instead of quietly succeeding: `slashit show`
+/// against a headless instance should say there is no window, not claim it
+/// raised one.
 fn handle_show(ctx: &IpcContext) -> IpcResponse {
-    use tauri::Manager;
-    if let Some(window) = ctx.app_handle.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-        IpcResponse::success(serde_json::json!({"shown": true}))
-    } else {
-        IpcResponse::error("Main window not found")
+    match ctx.control.show_window() {
+        Ok(()) => IpcResponse::success(serde_json::json!({"shown": true})),
+        Err(e) => IpcResponse::error(e),
     }
 }
 
-fn handle_quit(ctx: &IpcContext) -> IpcResponse {
-    use tauri::Emitter;
-    let _ = ctx.app_handle.emit("quit-requested", ());
-    IpcResponse::success(serde_json::json!({"quit": true}))
+/// Ask the instance to stop.
+///
+/// The quit itself is deferred to the server, which performs it only after this
+/// response has been written; see [`Dispatch::then_quit`].
+fn handle_quit() -> Dispatch {
+    Dispatch {
+        response: IpcResponse::success(serde_json::json!({"quit": true})),
+        then_quit: true,
+    }
+}
+
+/// Every feature flag with the value in force and the layer that decided it.
+///
+/// A daemon started with `--feature` overrides serves its startup snapshot,
+/// which is the only place the CLI layer is still visible — see
+/// [`IpcContext::feature_diagnostics`]. Otherwise this resolves live through
+/// the same code the settings UI calls, so `slashit features` and the toggle
+/// in the app cannot disagree about which layer won.
+async fn handle_features(ctx: &IpcContext) -> IpcResponse {
+    let flags = match &ctx.feature_diagnostics {
+        Some(cached) => cached.clone(),
+        None => ctx.features.read().await.diagnostics(),
+    };
+    IpcResponse::success(serde_json::to_value(flags).unwrap_or_default())
+}
+
+/// Report what kind of instance answered, and where.
+///
+/// The endpoint comes from the connection rather than from configuration: with
+/// several listeners bound, the useful answer is the one the caller actually
+/// reached.
+fn handle_ping(ctx: &IpcContext, peer: &PeerContext) -> IpcResponse {
+    let info = InstanceInfo {
+        mode: ctx.control.mode().as_str().to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        pid: std::process::id(),
+        endpoint: peer.endpoint.to_string(),
+    };
+    IpcResponse::success(serde_json::to_value(info).unwrap_or_default())
 }
 
 // --- Helper functions ---
@@ -362,6 +459,6 @@ fn persist_project_tasks(
         .cloned()
         .collect();
     if let Err(e) = storage.save_project_tasks(project_id, &project_tasks) {
-        eprintln!("Warning: Failed to persist tasks: {}", e);
+        eprintln!("Warning: Failed to persist tasks: {e}");
     }
 }

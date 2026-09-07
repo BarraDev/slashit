@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Barradev Digital Services <admin@barradev.com>"]
 license = "Apache-2.0"
-description = "IPC protocol types shared between SlashIt app and CLI"
+description = "IPC protocol, framing and transports shared between the SlashIt app, daemon and CLI"
 repository = "https://github.com/BarraDev/slashit"
 
 [dependencies]
@@ -12,8 +12,34 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+thiserror = "2"
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "sync", "macros"] }
+# Token generation. OsRng only; no PRNG state is kept.
+rand = "0.8"
+# Constant-time token comparison.
+subtle = "2"
 
 [target.'cfg(unix)'.dependencies]
-# Only for getuid(), to qualify the socket directory per user when
+# Only for getuid(), to qualify the runtime directory per user when
 # XDG_RUNTIME_DIR is unset.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Named-pipe DACL construction: Windows' own default security descriptor for
+# CreateNamedPipe grants full control to the Administrators group, not just
+# the creating user, so the pipe is created with an explicit owner-only
+# descriptor instead of relying on the default. Version left unpinned beyond
+# the major line already resolved transitively by tokio's own windows-sys
+# dependency, so this does not pull a second copy into the lockfile.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
