@@ -326,7 +326,7 @@ pub async fn write_to_all_ptys(
     let mut sessions = state.pty.sessions.lock().await;
     let mut success_count = 0u32;
     
-    for (_uuid, session) in sessions.iter_mut() {
+    for session in sessions.values_mut() {
         match session.write(&data) {
             Ok(_) => {
                 success_count += 1;
