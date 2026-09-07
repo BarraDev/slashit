@@ -11,6 +11,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -43,7 +44,12 @@ pub struct Session {
 impl Session {
     /// Start the provider, launch the application against `state`, and return
     /// only once the frontend has mounted.
-    pub async fn start(env: &Environment, state: &StateRoot, log_path: PathBuf) -> Result<Self> {
+    pub async fn start(
+        env: &Environment,
+        state: &StateRoot,
+        log_path: PathBuf,
+        child_env: &[(OsString, OsString)],
+    ) -> Result<Self> {
         let mut client = ReservedPort::reserve()?;
         let mut native = ReservedPort::reserve()?;
         let (client_port, native_port) = (client.port(), native.port());
@@ -59,6 +65,12 @@ impl Session {
             .arg(native_port.to_string());
         if let Some(native_driver) = env.native_driver() {
             command.arg("--native-driver").arg(native_driver);
+        }
+        // The journey's own variables go on first so the state root's go on
+        // last and win. Isolation is not something a test should be able to
+        // switch off by asking for one more variable.
+        for (key, value) in child_env {
+            command.env(key, value);
         }
         // The application is spawned by the native driver, which inherits this
         // environment. Setting it here is what keeps the run off the
