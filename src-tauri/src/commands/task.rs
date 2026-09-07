@@ -53,13 +53,14 @@ struct WorktreeCleanupCtx<'a> {
 /// `worktree_path` untouched so the directory stays recoverable.
 ///
 /// What that recovery is depends on the caller, so the failure messages below
-/// deliberately do not promise a retry. Only a `CleanUpOnly` transition into
-/// `Done` is revisited by the executor's pass, which filters on
-/// `status == Done`. A `ResetAndCleanUp` transition leaves the reference on a
-/// task no pass looks at, and `delete_task` leaves no task at all — there the
-/// retained branch and git's own worktree registration are the only records,
-/// which is why `remove_with_git` keeps the branch when it did not own the
-/// removal.
+/// deliberately do not promise a retry. A transition into `Done` is revisited
+/// by the executor's pass, which filters on `status == Done`; `delete_task`
+/// leaves no task at all, and there the retained branch and git's own worktree
+/// registration are the only records, which is why `remove_with_git` keeps the
+/// branch when it did not own the removal.
+///
+/// Re-queuing a task does not reach here at all — see
+/// [`StatusTransitionEffect::ResetExecutionState`].
 async fn cleanup_worktree(ctx: WorktreeCleanupCtx<'_>, task_id: Uuid, project_id: Uuid, wt_path: &str, branch: &str) {
     let repo_path = match resolve_repo_path(ctx.projects, ctx.repositories, project_id).await {
         Ok(p) => p,
@@ -181,35 +182,49 @@ fn spawn_worktree_cleanup(
     });
 }
 
-/// How a status transition affects a task's execution state and worktree.
+/// How a status transition affects a task's execution state and its worktree.
 ///
-/// `update_task_status` and `reorder_task` used to check these as two
-/// independent `if`s. An Error-to-Done transition matches both conditions
-/// (`old_status == Error` from the first, `new_status == Done` from the
-/// second), so with `worktree_path` no longer cleared inside the first
-/// branch, both would fire and spawn cleanup twice for the same path.
-/// Classifying the transition into one variant makes that overlap
-/// structurally impossible instead of relying on `if`/`else if` ordering at
-/// every call site.
+/// Resetting execution state and destroying a worktree are different
+/// operations, and these variants keep them apart. One variant used to do
+/// both, which made re-queuing a failed task also delete the work that task
+/// had produced. Worse, a task's branch and worktree path are derived from its
+/// id, which a retry does not change, so that asynchronous deletion raced the
+/// retry recreating them at the very same path: the cleanup could remove the
+/// *successful* second attempt's directory, branch and commits, then clear
+/// `worktree_path`, leaving a task reporting completion with nothing on disk
+/// behind it.
+///
+/// Every transition maps to exactly one variant, so no call site can spawn
+/// cleanup twice by evaluating overlapping conditions in the wrong order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatusTransitionEffect {
-    /// Moving out of an error state or back to an early column: reset
-    /// phase/progress/error, and clean up any worktree.
-    ResetAndCleanUp,
-    /// Moving to `Done`: clean up the worktree, keep everything else
-    /// (including `branch_name`, for PR creation) untouched.
-    CleanUpOnly,
-    /// No cleanup-relevant effect.
+    /// Moving back into the workflow: out of `Error`, or back to an early
+    /// column. Clears phase, progress and the error message, which is what
+    /// makes the task eligible to be picked up and run again.
+    ///
+    /// Deliberately preserves `worktree_path` and `branch_name`: the next
+    /// execution reattaches to that branch and continues from the work already
+    /// there. Discarding a worktree is an explicit destructive action, not a
+    /// side effect of moving a card back into a column.
+    ResetExecutionState,
+    /// Moving to `Done`: the task is finished with its worktree, so remove it.
+    /// Everything else — `branch_name` included, for PR creation — is left
+    /// untouched.
+    CleanUpWorktree,
+    /// No effect on execution state or worktree.
     None,
 }
 
+/// `Done` is tested first so a task finishing *out of* `Error` still gets its
+/// terminal cleanup. Calling a task done is an explicit statement that its
+/// worktree is no longer needed; re-queuing that same task is the opposite.
 fn classify_status_transition(old_status: &TaskStatus, new_status: &TaskStatus) -> StatusTransitionEffect {
-    if *old_status == TaskStatus::Error
+    if matches!(new_status, TaskStatus::Done) {
+        StatusTransitionEffect::CleanUpWorktree
+    } else if *old_status == TaskStatus::Error
         || matches!(new_status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
     {
-        StatusTransitionEffect::ResetAndCleanUp
-    } else if matches!(new_status, TaskStatus::Done) {
-        StatusTransitionEffect::CleanUpOnly
+        StatusTransitionEffect::ResetExecutionState
     } else {
         StatusTransitionEffect::None
     }
@@ -369,20 +384,17 @@ pub async fn update_task_status(
         task.status = status.clone();
         task.updated_at = chrono::Utc::now();
 
-        // Reset execution state when moving out of Error or back to early
-        // columns; clean up the worktree exactly once either way.
         match classify_status_transition(&old_status, &status) {
-            StatusTransitionEffect::ResetAndCleanUp => {
+            StatusTransitionEffect::ResetExecutionState => {
+                // `worktree_path` and `branch_name` survive on purpose: the
+                // next execution reattaches to them. See
+                // `StatusTransitionEffect`.
                 task.phase = TaskPhase::Idle;
                 task.phase_progress = 0;
                 task.overall_progress = 0;
                 task.error_message = None;
-                if let Some(wt_path) = task.worktree_path.clone() {
-                    let branch = task.branch_name.clone().unwrap_or_default();
-                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
-                }
             }
-            StatusTransitionEffect::CleanUpOnly => {
+            StatusTransitionEffect::CleanUpWorktree => {
                 // Keep branch_name for PR creation.
                 if let Some(wt_path) = task.worktree_path.clone() {
                     let branch = task.branch_name.clone().unwrap_or_default();
@@ -836,20 +848,19 @@ pub async fn reorder_task(
         if old_status != target_status {
             task.status = target_status.clone();
 
-            // Reset execution state when moving out of Error or to early
-            // columns; clean up the worktree exactly once either way.
+            // Dragging a card is the same lifecycle decision as calling
+            // `update_task_status`, and goes through the same classifier so the
+            // two cannot diverge.
             match classify_status_transition(&old_status, &target_status) {
-                StatusTransitionEffect::ResetAndCleanUp => {
+                StatusTransitionEffect::ResetExecutionState => {
+                    // Worktree and branch preserved; see
+                    // `StatusTransitionEffect`.
                     task.phase = TaskPhase::Idle;
                     task.phase_progress = 0;
                     task.overall_progress = 0;
                     task.error_message = None;
-                    if let Some(wt_path) = task.worktree_path.clone() {
-                        let branch = task.branch_name.clone().unwrap_or_default();
-                        spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
-                    }
                 }
-                StatusTransitionEffect::CleanUpOnly => {
+                StatusTransitionEffect::CleanUpWorktree => {
                     // Keep branch_name for PR creation.
                     if let Some(wt_path) = task.worktree_path.clone() {
                         let branch = task.branch_name.clone().unwrap_or_default();
@@ -934,7 +945,7 @@ pub fn update_task_status_logic(
         task.status = status.clone();
         task.updated_at = chrono::Utc::now();
 
-        if let StatusTransitionEffect::ResetAndCleanUp = classify_status_transition(&old_status, &status) {
+        if let StatusTransitionEffect::ResetExecutionState = classify_status_transition(&old_status, &status) {
             task.phase = TaskPhase::Idle;
             task.phase_progress = 0;
             task.overall_progress = 0;
@@ -992,6 +1003,13 @@ pub fn delete_task_logic(
 
 /// Core reorder logic extracted for testability
 /// Returns the updated tasks HashMap after reordering
+///
+/// Dragging a card and calling `update_task_status` are the same lifecycle
+/// decision, so this applies the transition effect through the same
+/// [`classify_status_transition`] the production `reorder_task` uses — the two
+/// entry points cannot be made to disagree about when execution state resets.
+/// Like [`update_task_status_logic`], it runs no worktree removal and so
+/// leaves `worktree_path` alone.
 #[cfg(test)]
 pub fn reorder_task_logic(
     tasks: &mut HashMap<Uuid, Task>,
@@ -1029,7 +1047,16 @@ pub fn reorder_task_logic(
     // Update the moved task's status if it changed
     if let Some(task) = tasks.get_mut(&task_id) {
         if old_status != target_status {
-            task.status = target_status;
+            task.status = target_status.clone();
+
+            if let StatusTransitionEffect::ResetExecutionState =
+                classify_status_transition(&old_status, &target_status)
+            {
+                task.phase = TaskPhase::Idle;
+                task.phase_progress = 0;
+                task.overall_progress = 0;
+                task.error_message = None;
+            }
         }
         task.updated_at = chrono::Utc::now();
     }
@@ -1507,50 +1534,209 @@ mod tests {
         );
     }
 
+    /// Every status the board has today, so the exhaustive cases below stay
+    /// exhaustive when a new one is added.
+    const ALL_STATUSES: [TaskStatus; 8] = [
+        TaskStatus::Backlog, TaskStatus::Queue, TaskStatus::InProgress, TaskStatus::AiReview,
+        TaskStatus::HumanReview, TaskStatus::Done, TaskStatus::PrCreated, TaskStatus::Error,
+    ];
+
+    /// A task that failed a run: it carries the error the run reported, and
+    /// still points at the worktree and branch that run produced.
+    fn failed_task_with_worktree(project_id: Uuid) -> Task {
+        let mut task = create_test_task_full("Failed task", project_id, TaskStatus::Error, 0);
+        task.phase = TaskPhase::Failed;
+        task.phase_progress = 40;
+        task.overall_progress = 30;
+        task.error_message = Some("the agent reported a failure".to_string());
+        task.worktree_path = Some("/tmp/wt/task-abcd1234".to_string());
+        task.branch_name = Some("task-abcd1234".to_string());
+        task
+    }
+
     #[test]
-    fn classify_status_transition_never_matches_both_effects_for_error_to_done() {
-        // The one transition where the naive two-`if` version overlapped:
-        // old_status == Error (matches the reset condition) and
-        // new_status == Done (matches the cleanup-only condition). Exactly
-        // one variant must come back, or callers spawn cleanup twice.
+    fn requeuing_a_failed_task_resets_execution_state_but_keeps_its_work() {
+        // The decided retry path: the user drags the card out of Error into
+        // Queue, the queue promotes it, and the next execution reattaches to
+        // the branch that is still there. Destroying the worktree here would
+        // throw away everything the failed attempt had already done, and --
+        // because the removal is asynchronous while the task is immediately
+        // eligible to run again -- could just as easily destroy what the
+        // *retry* produces at that same path.
         assert_eq!(
-            classify_status_transition(&TaskStatus::Error, &TaskStatus::Done),
-            StatusTransitionEffect::ResetAndCleanUp,
-            "an Error-to-Done transition must classify as exactly one effect"
+            classify_status_transition(&TaskStatus::Error, &TaskStatus::Queue),
+            StatusTransitionEffect::ResetExecutionState,
+            "retrying through Queue must not select worktree cleanup"
+        );
+
+        let project_id = Uuid::new_v4();
+        let task = failed_task_with_worktree(project_id);
+        let task_id = task.id;
+        let mut tasks = create_test_tasks_map(vec![task]);
+
+        let updated = update_task_status_logic(&mut tasks, task_id, TaskStatus::Queue)
+            .expect("the task exists");
+
+        assert_eq!(updated.status, TaskStatus::Queue);
+        assert_eq!(updated.phase, TaskPhase::Idle, "phase must reset so the poller picks it up");
+        assert_eq!(updated.phase_progress, 0);
+        assert_eq!(updated.overall_progress, 0);
+        assert_eq!(updated.error_message, None, "the previous failure must not linger");
+        assert_eq!(
+            updated.worktree_path.as_deref(),
+            Some("/tmp/wt/task-abcd1234"),
+            "the retry continues in the existing worktree"
+        );
+        assert_eq!(
+            updated.branch_name.as_deref(),
+            Some("task-abcd1234"),
+            "the retry reattaches to the existing branch"
         );
     }
 
     #[test]
-    fn classify_status_transition_covers_every_status_pair_with_exactly_one_effect() {
-        // Exhaustive over every (old, new) pair: whichever effect comes back,
-        // it must be the *only* one that would have matched under the
-        // original two independent `if` conditions, for every status this
-        // enum has today — not just the one overlapping case above.
-        let all = [
-            TaskStatus::Backlog, TaskStatus::Queue, TaskStatus::InProgress, TaskStatus::AiReview,
-            TaskStatus::HumanReview, TaskStatus::Done, TaskStatus::PrCreated, TaskStatus::Error,
-        ];
-        for old in &all {
-            for new in &all {
-                let reset_matches = *old == TaskStatus::Error
-                    || matches!(new, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress);
-                let cleanup_only_matches = matches!(new, TaskStatus::Done);
+    fn retrying_straight_into_progress_preserves_the_worktree_too() {
+        // Error -> InProgress skips the Queue column but means the same thing.
+        // A caller taking the shortcut must not get a different, destructive
+        // lifecycle than one going through Queue.
+        assert_eq!(
+            classify_status_transition(&TaskStatus::Error, &TaskStatus::InProgress),
+            StatusTransitionEffect::ResetExecutionState,
+        );
+
+        let project_id = Uuid::new_v4();
+        let task = failed_task_with_worktree(project_id);
+        let task_id = task.id;
+        let mut tasks = create_test_tasks_map(vec![task]);
+
+        let updated = update_task_status_logic(&mut tasks, task_id, TaskStatus::InProgress)
+            .expect("the task exists");
+
+        assert_eq!(updated.phase, TaskPhase::Idle);
+        assert_eq!(updated.overall_progress, 0);
+        assert_eq!(updated.error_message, None);
+        assert_eq!(updated.worktree_path.as_deref(), Some("/tmp/wt/task-abcd1234"));
+        assert_eq!(updated.branch_name.as_deref(), Some("task-abcd1234"));
+    }
+
+    #[test]
+    fn moving_a_task_back_into_the_workflow_never_destroys_its_worktree() {
+        // Backlog, Queue and InProgress are places work continues from, not
+        // places it is abandoned. Preserving the worktree is the safe default;
+        // discarding one is a separate explicit action.
+        for old in &ALL_STATUSES {
+            for new in [TaskStatus::Backlog, TaskStatus::Queue, TaskStatus::InProgress] {
+                assert_eq!(
+                    classify_status_transition(old, &new),
+                    StatusTransitionEffect::ResetExecutionState,
+                    "{old:?} -> {new:?} must reset execution state without cleaning up"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finishing_a_task_still_cleans_up_its_worktree() {
+        // The fix must not disable terminal cleanup. Done is the point where
+        // the product genuinely no longer needs the directory.
+        for old in &ALL_STATUSES {
+            assert_eq!(
+                classify_status_transition(old, &TaskStatus::Done),
+                StatusTransitionEffect::CleanUpWorktree,
+                "{old:?} -> Done must still clean up"
+            );
+        }
+    }
+
+    #[test]
+    fn abandoning_a_failed_task_as_done_cleans_up_instead_of_resetting() {
+        // The one transition that satisfies both conditions: old_status is
+        // Error *and* new_status is Done. It must resolve to the terminal
+        // meaning -- a task deliberately called finished releases its
+        // worktree -- rather than being captured by the reset path and
+        // silently keeping a directory nothing will ever look at again.
+        assert_eq!(
+            classify_status_transition(&TaskStatus::Error, &TaskStatus::Done),
+            StatusTransitionEffect::CleanUpWorktree,
+            "Error -> Done is terminal, not a retry"
+        );
+    }
+
+    #[test]
+    fn every_transition_cleans_up_exactly_when_it_reaches_done() {
+        // Exhaustive: cleanup is selected if and only if the task is becoming
+        // Done. No other transition may reach `spawn_worktree_cleanup`, and
+        // each pair yields exactly one effect, so no call site can spawn
+        // cleanup twice by matching two overlapping conditions.
+        for old in &ALL_STATUSES {
+            for new in &ALL_STATUSES {
                 let effect = classify_status_transition(old, new);
-                match effect {
-                    StatusTransitionEffect::ResetAndCleanUp => assert!(
-                        reset_matches,
-                        "{old:?} -> {new:?} classified ResetAndCleanUp but the reset condition doesn't hold"
-                    ),
-                    StatusTransitionEffect::CleanUpOnly => assert!(
-                        !reset_matches && cleanup_only_matches,
-                        "{old:?} -> {new:?} classified CleanUpOnly but reset also matches (would double-spawn)"
-                    ),
-                    StatusTransitionEffect::None => assert!(
-                        !reset_matches && !cleanup_only_matches,
-                        "{old:?} -> {new:?} classified None but one of the effects should apply"
-                    ),
+                assert_eq!(
+                    effect == StatusTransitionEffect::CleanUpWorktree,
+                    *new == TaskStatus::Done,
+                    "{old:?} -> {new:?} disagrees with 'cleanup happens only on Done'"
+                );
+                if effect == StatusTransitionEffect::None {
+                    assert!(
+                        *old != TaskStatus::Error
+                            && !matches!(
+                                new,
+                                TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress
+                            ),
+                        "{old:?} -> {new:?} classified None but should reset execution state"
+                    );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn dragging_a_card_and_updating_its_status_agree_on_lifecycle() {
+        // Two entry points, one classifier. A retry started by dropping a card
+        // into Queue must leave the task in exactly the state the direct
+        // command leaves it in -- including still holding its worktree.
+        //
+        // Restricted to transitions that actually change the status. Only
+        // `reorder_task` guards on `old != target`, so re-setting a task to
+        // the status it already has resets execution state through one entry
+        // point and not the other. That predates this fix, is not part of any
+        // retry path, and is left alone here rather than silently widened
+        // into.
+        for new in ALL_STATUSES.iter().filter(|s| **s != TaskStatus::Error) {
+            let project_id = Uuid::new_v4();
+            let task = failed_task_with_worktree(project_id);
+            let task_id = task.id;
+
+            let mut by_command = create_test_tasks_map(vec![task.clone()]);
+            let mut by_drag = create_test_tasks_map(vec![task]);
+
+            let commanded = update_task_status_logic(&mut by_command, task_id, new.clone())
+                .expect("the task exists");
+            let dragged = reorder_task_logic(&mut by_drag, task_id, Some(new.clone()), 0)
+                .expect("the task exists");
+
+            assert_eq!(commanded.status, dragged.status, "status differs for -> {new:?}");
+            assert_eq!(commanded.phase, dragged.phase, "phase differs for -> {new:?}");
+            assert_eq!(
+                commanded.phase_progress, dragged.phase_progress,
+                "phase_progress differs for -> {new:?}"
+            );
+            assert_eq!(
+                commanded.overall_progress, dragged.overall_progress,
+                "overall_progress differs for -> {new:?}"
+            );
+            assert_eq!(
+                commanded.error_message, dragged.error_message,
+                "error_message differs for -> {new:?}"
+            );
+            assert_eq!(
+                commanded.worktree_path, dragged.worktree_path,
+                "worktree_path differs for -> {new:?}"
+            );
+            assert_eq!(
+                commanded.branch_name, dragged.branch_name,
+                "branch_name differs for -> {new:?}"
+            );
         }
     }
 
