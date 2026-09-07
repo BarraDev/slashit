@@ -143,7 +143,17 @@ pub fn run() {
         }
     }
 
-    tauri::Builder::default()
+    // Acceptance builds only. The plugin embeds an HTTP server able to drive
+    // this webview, so it is compiled out entirely unless the crate is built
+    // with `--features acceptance-webdriver` — which no normal or release
+    // build does. Two whole bindings rather than one `mut` and a `cfg` block,
+    // so neither configuration needs a lint exception.
+    #[cfg(feature = "acceptance-webdriver")]
+    let builder = tauri::Builder::default().plugin(tauri_plugin_wdio_webdriver::init());
+    #[cfg(not(feature = "acceptance-webdriver"))]
+    let builder = tauri::Builder::default();
+
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())

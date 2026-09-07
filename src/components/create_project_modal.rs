@@ -188,7 +188,10 @@ pub fn CreateProjectModal(
 
     view! {
         <Show when=move || show.get()>
-            <div class="fixed inset-0 z-50 flex items-center justify-center p-4">
+            // "The wizard is open" has no other stable selector: the dialog is
+            // rendered only while `show` is true, so acceptance tests need a
+            // handle on its root to tell an opened wizard from an ignored click.
+            <div data-testid="create-project-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4">
                 <div
                     class="absolute inset-0 bg-black/70 backdrop-blur-sm"
                     on:click=move |_| set_show.set(false)
