@@ -36,6 +36,27 @@ pub const REPORTED_MODEL: &str = "slashit-fake-agent";
 /// The text the fixture returns as its result.
 pub const REPORTED_RESULT: &str = "fake agent completed without changing the repository";
 
+/// The variable that scripts how many of the leading agent runs fail.
+///
+/// Unset, or zero, means every run succeeds, which is what every journey that
+/// does not mention this variable depends on. Set to `1`, the first agent run
+/// reports failure and every run after it succeeds — enough to drive a
+/// failure, a retry and a recovery without the fixture ever being told which
+/// of those is happening.
+///
+/// Only *agent runs* are counted. `claude --version` is the product asking
+/// what is installed, a real CLI would answer it the same way whatever state
+/// it is in, and a probe that consumed the scripted failure would make the
+/// journey depend on whether the frontend happened to ask first.
+pub const FAILING_RUNS_VAR: &str = "SLASHIT_FAKE_AGENT_FAILING_RUNS";
+
+/// The text the fixture returns for a run scripted to fail.
+///
+/// The runner copies the result text of a failed run onto the task as its
+/// error message, so a journey can read this back through the product's own
+/// API and know the failure it sees is the one this executable reported.
+pub const REPORTED_FAILURE: &str = "fake agent was scripted to fail this run";
+
 /// The smallest exchange `ClaudeRunner` accepts as a successful run: a
 /// `system` line that names the session and model, a `result` line with
 /// `is_error: false`, and exit status zero.
@@ -71,20 +92,51 @@ mv "$record" "$SLASHIT_FAKE_AGENT_MARKERS/invocation-${record##*/}"
 
 # Echo the session id back, so the caller can tie this run to the one it asked
 # for rather than to any run at all.
+# The prompt flag is noted in the same pass: it is what separates an agent run
+# from `--version`, which a real CLI also answers without doing any work.
 session=""
 take_next=""
+is_run=""
 for arg in "$@"; do
     if [ -n "$take_next" ]; then
         session="$arg"
         take_next=""
         continue
     fi
-    if [ "$arg" = "--session-id" ]; then
-        take_next="yes"
-    fi
+    case "$arg" in
+        --session-id) take_next="yes" ;;
+        -p) is_run="yes" ;;
+    esac
 done
 
 printf '{"type":"system","subtype":"init","session_id":"%s","model":"__MODEL__"}\n' "$session"
+
+# Absent means nothing is scripted to fail, so a journey that does not set this
+# sees exactly the behaviour it saw before this existed -- not even the
+# bookkeeping directory below is created.
+failing=${SLASHIT_FAKE_AGENT_FAILING_RUNS:-0}
+
+if [ -n "$is_run" ] && [ "$failing" -gt 0 ]; then
+    # Claim the next run number. `mkdir` refuses an existing directory and
+    # creates a missing one in a single indivisible step, so two agents
+    # starting at the same moment can never be handed the same number -- and
+    # unlike a counter file, there is no read-modify-write to lose.
+    runs="$SLASHIT_FAKE_AGENT_MARKERS/.runs"
+    mkdir -p "$runs"
+    ordinal=1
+    while ! mkdir "$runs/$ordinal" 2>/dev/null; do
+        ordinal=$((ordinal + 1))
+    done
+
+    if [ "$ordinal" -le "$failing" ]; then
+        # A well-formed result that reports failure, with a zero exit status:
+        # the agent ran and said it could not do the work, which is a different
+        # thing from the agent crashing.
+        printf '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"%s","result":"__FAILURE__"}\n' "$session"
+        exit 0
+    fi
+fi
+
 printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","result":"__RESULT__"}\n' "$session"
 exit 0
 "#;
@@ -134,7 +186,8 @@ impl FakeAgent {
         let executable = bin_dir.join(EXECUTABLE);
         let script = SCRIPT
             .replace("__MODEL__", REPORTED_MODEL)
-            .replace("__RESULT__", REPORTED_RESULT);
+            .replace("__RESULT__", REPORTED_RESULT)
+            .replace("__FAILURE__", REPORTED_FAILURE);
         std::fs::write(&executable, script)
             .with_context(|| format!("could not write {}", executable.display()))?;
 
@@ -375,6 +428,63 @@ mod tests {
             assert!(run.status.success());
         }
 
+        assert_eq!(agent.invocation_count().expect("count"), 3);
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A scripted failure has to land on the run the journey means, and only
+    /// on that one. The two ways it could go wrong are symmetrical: a version
+    /// probe absorbing the failure would make the retry journey pass without a
+    /// failure ever happening, and a failure that repeats would make the retry
+    /// look broken when it is not.
+    #[test]
+    fn a_scripted_failure_lands_on_the_first_agent_run_only() {
+        let root = scratch("scripted-failure");
+        let agent = FakeAgent::install(&root).expect("install");
+
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new(agent.executable())
+                .args(args)
+                .env(MARKER_DIR_VAR, agent.marker_dir())
+                .env(FAILING_RUNS_VAR, "1")
+                .output()
+                .expect("run the fixture");
+            assert!(
+                output.status.success(),
+                "a scripted failure is still a zero exit: {:?}",
+                output.status.code()
+            );
+            let stdout = String::from_utf8(output.stdout).expect("the fixture emits UTF-8");
+            let last = stdout
+                .lines()
+                .rfind(|l| !l.trim().is_empty())
+                .expect("a result line")
+                .to_string();
+            serde_json::from_str::<serde_json::Value>(&last).expect("the result line parses")
+        };
+
+        // The product asking what is installed is not an agent run, so it must
+        // not consume the scripted failure.
+        let probe = run(&["--version"]);
+        assert_eq!(probe["is_error"], false, "a version probe never fails");
+
+        let first = run(&["-p", "do the work", "--session-id", "one"]);
+        assert_eq!(
+            first["is_error"], true,
+            "the first agent run is scripted to fail"
+        );
+        assert_eq!(first["result"], REPORTED_FAILURE);
+
+        let second = run(&["-p", "do the work", "--session-id", "two"]);
+        assert_eq!(
+            second["is_error"], false,
+            "only the first run was scripted to fail"
+        );
+        assert_eq!(second["result"], REPORTED_RESULT);
+
+        // The bookkeeping the fixture keeps for itself is not a record: it is a
+        // directory, and the records are files.
         assert_eq!(agent.invocation_count().expect("count"), 3);
 
         std::fs::remove_dir_all(&root).expect("clean up");
