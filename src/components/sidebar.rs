@@ -241,6 +241,18 @@ pub fn Sidebar(
                     </svg>
                 </SidebarNavItem>
                 <SidebarNavItem
+                    page="workspaces".to_string()
+                    current_page=current_page
+                    on_navigate=on_navigate
+                    label="Workspaces".to_string()
+                    shortcut="".to_string()
+                    collapsed=collapsed
+                >
+                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                    </svg>
+                </SidebarNavItem>
+                <SidebarNavItem
                     page="worktrees".to_string()
                     current_page=current_page
                     on_navigate=on_navigate

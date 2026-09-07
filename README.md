@@ -81,12 +81,13 @@ SlashIt is currently pre-1.0 software. The core app, CLI, IPC server, queue, ter
 Near-term roadmap:
 
 - Add installation walkthroughs and release notes polish.
-- Track follow-up issues for GUI binary naming, optional daemon mode, and workspace layout cleanup.
+- Headless daemon mode, so agents and terminals survive without a window — designed in [`docs/architecture/daemon.md`](docs/architecture/daemon.md), not yet implemented.
+- Workspace layout cleanup (the root crate is both a package and a workspace).
 - Continue hardening queue execution, agent recovery, and cross-platform packaging.
 
 ## Built with
 
-Rust end to end — a [Leptos](https://leptos.dev/) 0.8 frontend compiled to WASM, a [Tauri](https://tauri.app/) v2 backend on the tokio runtime, and a standalone CLI that talks to the running app over a Unix domain socket (JSON-lines on `$XDG_RUNTIME_DIR/slashit.sock`). Module-level layout is documented in [`AGENTS.md`](AGENTS.md).
+Rust end to end — a [Leptos](https://leptos.dev/) 0.8 frontend compiled to WASM, a [Tauri](https://tauri.app/) v2 backend on the tokio runtime, and a standalone CLI that talks to the running app over a Unix domain socket (JSON-lines on `$XDG_RUNTIME_DIR/slashit-app/slashit.sock`). Module-level layout is documented in [`AGENTS.md`](AGENTS.md).
 
 ## Installation
 
@@ -157,14 +158,39 @@ Configuration is stored in your system config directory:
 - macOS: `~/Library/Application Support/com.barradev.slashit-app/`
 - Windows: `%APPDATA%\com.barradev.slashit-app\`
 
+### Your project stays clean
+
+SlashIt writes nothing inside your working tree unless you ask it to. Boards,
+worktrees, terminal history and logs all live outside the project by default.
+
+Per project, under **Settings → Storage**, you can choose where the board is
+kept:
+
+| Choice | Where | Use it when |
+|---|---|---|
+| Outside the project *(default)* | `<data_dir>/projects/<project-key>/<project-id>/` | You want the repository untouched |
+| Inside the project | `<repo>/.slashit/<project-id>/` | You want the board committed and shared with your team |
+| Detect automatically | `.slashit/` if it already exists and has content, otherwise outside | Upgrading, or moving between machines |
+
+Switching between them previews the move first — how many files, how large, and
+any conflicts — and nothing is moved until you confirm. Your API keys, terminal
+scrollback and logs are never part of that choice; they always stay outside the
+project.
+
+Worktrees are created under `<data_dir>/worktrees/`, not as siblings of your
+repository. If you use [worktrunk](https://github.com/max-sixty/worktrunk),
+SlashIt defers to your `wt` configuration and hooks instead.
+
+Full details in [`docs/architecture/state-locations.md`](docs/architecture/state-locations.md).
+
 ## Development
 
 Useful local checks:
 
 ```bash
 cargo fmt --check
-cargo clippy -p slashit-app -p slashit -p slashit-ipc -- -D warnings
-cargo test -p slashit-app -p slashit-ipc
+cargo clippy -p slashit-ui -p slashit -p slashit-ipc -- -D warnings
+cargo test -p slashit-ui -p slashit-ipc
 trunk build
 ```
 

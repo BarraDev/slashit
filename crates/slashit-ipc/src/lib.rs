@@ -128,9 +128,43 @@ pub struct QueueStatusInfo {
     pub fifo_ordering: bool,
 }
 
+/// Largest accepted request, in bytes.
+///
+/// The server reads one newline-delimited JSON object per connection. Without
+/// a bound, a client that never sends a newline makes the server buffer until
+/// it runs out of memory, so the read is capped and an oversized request is
+/// rejected rather than absorbed.
+pub const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+
+/// Directory holding the runtime socket.
+///
+/// `$XDG_RUNTIME_DIR` is already per-user and mode 0700. When it is unset the
+/// fallback is `<tmp>/slashit-<uid>` rather than a fixed name directly in the
+/// temp directory: `/tmp` is world-writable and shared between users, so a
+/// predictable unqualified path there can be pre-created or squatted by
+/// another local user. The caller is responsible for creating this directory
+/// with owner-only permissions before binding — see `ipc::server::run`.
+pub fn socket_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("slashit-app");
+        }
+    }
+    std::env::temp_dir().join(format!("slashit-{}", current_uid()))
+}
+
 /// Returns the well-known Unix socket path used by both server and CLI.
 pub fn socket_path() -> PathBuf {
-    std::env::var("XDG_RUNTIME_DIR")
-        .map(|d| PathBuf::from(d).join("slashit.sock"))
-        .unwrap_or_else(|_| PathBuf::from("/tmp/slashit.sock"))
+    socket_dir().join("slashit.sock")
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // Safety: getuid is always successful and has no preconditions.
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
 }

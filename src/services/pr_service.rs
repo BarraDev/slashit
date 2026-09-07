@@ -176,9 +176,13 @@ pub async fn discuss_pr_review_questions(
 pub struct SyncPrRepliesResult {
     pub replied: u32,
     #[serde(default)]
-    pub errors: Vec<String>,
+    pub discovered: u32,
     #[serde(default)]
-    pub already_done: u32,
+    pub rewritten: u32,
+    #[serde(default)]
+    pub unmatched: u32,
+    #[serde(default)]
+    pub errors: Vec<String>,
     #[serde(default)]
     pub fix_pending: u32,
 }

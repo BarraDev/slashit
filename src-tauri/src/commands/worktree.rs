@@ -67,33 +67,50 @@ pub async fn cleanup_worktree(
 ) -> Result<(), String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
-    let (wt_path, branch) = {
+    let (wt_path, branch, project_id) = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_id).ok_or("Task not found")?;
         (
             task.worktree_path.clone().ok_or("No worktree for this task")?,
             task.branch_name.clone().unwrap_or_default(),
+            task.project_id,
         )
     };
 
-    state.worktree_manager.remove(&wt_path, &branch).await?;
+    let repo_path = {
+        let projects = state.project.projects.read().await;
+        let project = projects.get(&project_id).ok_or("Project not found")?;
+        let repo_id = project.repository_id.ok_or("No repository linked")?;
+        drop(projects);
 
-    // Clear task fields
-    {
-        let mut tasks = state.task.tasks.write().await;
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.worktree_path = None;
-            // Keep branch_name for potential PR creation
-            task.updated_at = chrono::Utc::now();
+        let repos = state.repository.repositories.read().await;
+        let repo = repos.get(&repo_id).ok_or("Repository not found")?;
+        repo.local_path.clone()
+    };
 
-            let project_id = task.project_id;
-            let project_tasks: Vec<_> = tasks.values()
-                .filter(|t| t.project_id == project_id)
-                .cloned()
-                .collect();
-            let _ = state.storage.save_project_tasks(project_id, &project_tasks);
-        }
-    }
+    state.worktree_manager.remove(&wt_path, &branch, &repo_path).await?;
+
+    // The clear has to reach disk before it reaches shared memory, and the
+    // failure has to reach the caller. Clearing `worktree_path` in memory is
+    // what removes a task from `tasks_eligible_for_cleanup_retry`, which
+    // selects on the in-memory value, so a clear published over a failed write
+    // takes the task out of the only pass that would have reconciled it. This
+    // command is also not restricted to `Done` tasks, which that pass filters
+    // on, so returning the error to the dialog is the whole recovery story
+    // here: the user can press the button again.
+    //
+    // `branch_name` stays for a later PR creation, as before. The helper also
+    // declines to clear a path the task no longer records, so a re-run that
+    // recreated a worktree while this removal was in flight keeps its
+    // reference instead of having it erased by a cleanup that never touched
+    // it.
+    crate::commands::task::clear_worktree_path_durably(
+        &state.task.tasks,
+        &state.storage,
+        task_id,
+        &wt_path,
+    )
+    .await?;
 
     Ok(())
 }

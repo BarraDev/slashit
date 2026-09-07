@@ -137,7 +137,7 @@ impl PrReviewPlan {
                 if !item.fix_done {
                     item.fix_done = true;
                 }
-                if !item.reply_posted && !failed_reply_ids.contains(&cid) {
+                if last.auto_reply == Some(true) && !item.reply_posted && !failed_reply_ids.contains(&cid) {
                     item.reply_posted = true;
                 }
             }
@@ -191,6 +191,10 @@ pub struct PrReviewItem {
     pub last_agent_summary: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub pr_reply_text: Option<String>,
+    #[serde(default)]
+    pub reply_comment_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +227,14 @@ pub struct PrReviewApplyResult {
     pub fix_errors: Vec<String>,
     #[serde(default)]
     pub push_error: Option<String>,
+    /// Whether this apply ran with `auto_reply=true` — `None` for a result
+    /// persisted before this field existed. Mirrors the backend field
+    /// exactly, including the tri-state: backfill must not treat a missing
+    /// historical value as `false`, and must not use `replies_posted` to
+    /// guess which individual item it belongs to. See the backend
+    /// `PrReviewApplyResult::auto_reply` doc for the full reasoning.
+    #[serde(default)]
+    pub auto_reply: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

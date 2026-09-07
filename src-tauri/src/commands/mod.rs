@@ -21,6 +21,8 @@ pub mod executor;
 pub mod tray;
 pub mod workflow;
 pub mod jira;
+pub mod features;
+pub mod state_location;
 
 pub use repository::*;
 pub use project::*;
@@ -43,4 +45,6 @@ pub use memory::*;
 pub use appearance::*;
 pub use executor::*;
 pub use tray::*;
+pub use features::*;
+pub use state_location::*;
 // workflow commands not yet wired up

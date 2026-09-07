@@ -16,7 +16,7 @@ pub fn create_test_task(title: &str) -> Task {
         model: "test-model".to_string(),
         planning_mode: false,
         dependencies: Vec::new(),
-        workspace_id: None,
+        worktree_id: None,
         jj_change_id: None,
         category: TaskCategory::Feature,
         priority: TaskPriority::Medium,
@@ -118,6 +118,8 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
+        pr_reply_text: None,
+        reply_comment_id: None,
         },
         PrReviewItem {
             comment_id: Some(102),
@@ -131,6 +133,8 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
+        pr_reply_text: None,
+        reply_comment_id: None,
         },
     ];
 

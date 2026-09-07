@@ -3,6 +3,8 @@ use crate::domain::task::{
     ExternalRef, PrCommentKind, PrReviewApplyResult, PrReviewComment, PrReviewDecision,
     PrReviewItem, PrReviewPlan,
 };
+use crate::commands::task::Tasks;
+use crate::config::Storage;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -511,6 +513,13 @@ pub async fn analyze_pr_comments(
     };
     let pr_url = pr_url_for_task(&task)?;
 
+    // Preserve apply history across a re-analyze: same PR URL means the user
+    // is refreshing comments, not switching contexts, so `last_apply` and the
+    // per-item lifecycle flags should carry over for items whose `comment_id`
+    // survives the re-fetch.
+    let prior_plan = task.pr_review_plan.clone()
+        .filter(|p| p.pr_url == pr_url);
+
     eprintln!("[pr-review] analyze {} for task {}", pr_url, task_uuid);
     let (review_decision, comments) = fetch_pr_review_data(&pr_url).await?;
     eprintln!(
@@ -527,7 +536,7 @@ pub async fn analyze_pr_comments(
             comments,
             items: Vec::new(),
             raw_plan: String::new(),
-            last_apply: None,
+            last_apply: prior_plan.and_then(|p| p.last_apply),
         });
     }
 
@@ -546,8 +555,18 @@ pub async fn analyze_pr_comments(
             pr_url, comments.len()
         ));
     }
-    let items = parse_review_items(&raw_output, &comments);
+    let mut items = parse_review_items(&raw_output, &comments);
     eprintln!("[pr-review] parsed {} items", items.len());
+
+    // Carry over lifecycle flags from the prior plan for items whose
+    // `comment_id` matches — the fix already landed on disk and the reply is
+    // already on the PR, so the freshly-triaged item should reflect that.
+    // Skipped for a comment GitHub reports as edited after that apply: the
+    // carried state describes the *old* text, not the one just re-triaged.
+    if let Some(prev) = prior_plan.as_ref() {
+        let applied_at = prev.last_apply.as_ref().map(|a| a.applied_at);
+        carry_forward_reanalysis_lifecycle(&mut items, &prev.items, &comments, applied_at);
+    }
 
     let plan = PrReviewPlan {
         generated_at: chrono::Utc::now(),
@@ -556,10 +575,64 @@ pub async fn analyze_pr_comments(
         comments,
         items,
         raw_plan: raw_output,
-        last_apply: None,
+        last_apply: prior_plan.and_then(|p| p.last_apply),
     };
-    save_review_plan_on_task(&state, task_uuid, plan.clone()).await;
+    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, plan.clone()).await?;
     Ok(plan)
+}
+
+/// Merge lifecycle state from a prior plan's items into freshly re-parsed
+/// items sharing the same `comment_id`, in place. Extracted from
+/// `analyze_pr_comments` for unit testing: a fresh re-parse always starts
+/// `pr_reply_text`/`reply_comment_id`/etc. as `None`/`false`, so anything
+/// already recorded against a matching prior item must be carried forward or
+/// it is silently lost on re-analyze.
+///
+/// GitHub keeps a review comment's id stable across an edit, so matching on
+/// `comment_id` alone cannot tell an unchanged comment apart from one the
+/// reviewer materially edited after `applied_at`. Carrying `fix_done`/
+/// `reply_posted` forward for the latter would make `address_pr_review_inner`
+/// skip a comment that now says something different, believing it already
+/// addressed. `comments` (the freshly-fetched set for this analysis) is
+/// checked for each matched id and the merge is skipped when its
+/// `updated_at` is newer than the apply the prior lifecycle came from.
+fn carry_forward_reanalysis_lifecycle(
+    items: &mut [PrReviewItem],
+    prior_items: &[PrReviewItem],
+    comments: &[PrReviewComment],
+    applied_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    for item in items.iter_mut() {
+        let Some(cid) = item.comment_id else { continue; };
+        let Some(prev_item) = prior_items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
+
+        // GitHub's `updated_at` has whole-second precision; `applied_at`
+        // (from `chrono::Utc::now()`) almost never does. Comparing them
+        // as-is could read a same-second edit right after the apply as
+        // "not edited" purely from sub-second truncation. Both are rounded
+        // down to the second and compared non-strictly, so a same-second
+        // timestamp is treated as a possible edit rather than assumed safe —
+        // reprocessing an unchanged comment is cheap; silently skipping an
+        // edited one is the failure mode this check exists to prevent.
+        let edited_since_last_apply = applied_at.is_some_and(|applied_at| {
+            use chrono::SubsecRound;
+            let applied_at = applied_at.trunc_subsecs(0);
+            comments.iter()
+                .find(|c| c.id == Some(cid))
+                .and_then(|c| c.updated_at)
+                .is_some_and(|updated_at| updated_at.trunc_subsecs(0) >= applied_at)
+        });
+        if edited_since_last_apply {
+            continue;
+        }
+
+        if prev_item.fix_done { item.fix_done = true; }
+        if prev_item.reply_posted { item.reply_posted = true; }
+        if item.last_error.is_none() { item.last_error = prev_item.last_error.clone(); }
+        if item.last_agent_summary.is_none() { item.last_agent_summary = prev_item.last_agent_summary.clone(); }
+        if item.pr_reply_text.is_none() { item.pr_reply_text = prev_item.pr_reply_text.clone(); }
+        if item.reply_comment_id.is_none() { item.reply_comment_id = prev_item.reply_comment_id; }
+    }
 }
 
 /// Re-discuss any items currently flagged Question that have a non-empty
@@ -580,7 +653,7 @@ pub async fn discuss_pr_review_questions(
     };
 
     let merged = discuss_pr_review_questions_inner(task, working_dir, plan).await?;
-    save_review_plan_on_task(&state, task_uuid, merged.clone()).await;
+    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, merged.clone()).await?;
     Ok(merged)
 }
 
@@ -693,7 +766,7 @@ pub async fn address_pr_review(
     let mut plan = plan;
     plan.backfill_lifecycle_from_last_apply();
     let (result, updated_plan) = address_pr_review_inner(task, working_dir, plan, options, progress).await?;
-    save_review_plan_on_task(&state, task_uuid, updated_plan).await;
+    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
     Ok(result)
 }
 
@@ -820,19 +893,20 @@ pub async fn address_pr_review_inner(
         }
 
         // --- Run agent only if the fix isn't already on disk -----------------
-        let mut agent_summary_for_reply: Option<String> = item.last_agent_summary.clone();
-
         if !item.fix_done {
             let single = vec![&item];
             let prompt = build_review_fix_prompt(&task, &pr_url, &updated_plan.comments, &single, false);
             match run_claude_pr_helper(prompt, working_dir.clone(), true).await {
                 Ok(summary) => {
                     if let Some(id) = item.comment_id { fixed_ids.push(id); }
-                    agent_summary_for_reply = Some(summary.clone());
+                    let reply_text = extract_pr_reply(&summary);
                     {
                         let p = &mut updated_plan.items[orig_idx];
                         p.fix_done = true;
                         p.last_agent_summary = Some(summary.clone());
+                        if reply_text.is_some() {
+                            p.pr_reply_text = reply_text;
+                        }
                         p.last_error = None;
                     }
                     per_item_summaries.push(format!(
@@ -888,7 +962,7 @@ pub async fn address_pr_review_inner(
         // --- Reply step (only if enabled and not yet posted) -----------------
         if options.auto_reply && !item.reply_posted {
             let item_for_body = &updated_plan.items[orig_idx];
-            let body = build_reply_body(item_for_body, agent_summary_for_reply.as_deref());
+            let body = build_reply_body(item_for_body);
             progress(PrReviewProgress {
                 task_id: task_id_str.clone(),
                 kind: "reply_started".to_string(),
@@ -898,9 +972,12 @@ pub async fn address_pr_review_inner(
                 message: None,
             });
             match post_pr_reply(&reply_repo, &reply_number, &pr_url, item.comment_id, &body).await {
-                Ok(()) => {
+                Ok(reply_id) => {
                     replies_posted += 1;
                     updated_plan.items[orig_idx].reply_posted = true;
+                    if reply_id.is_some() {
+                        updated_plan.items[orig_idx].reply_comment_id = reply_id;
+                    }
                     progress(PrReviewProgress {
                         task_id: task_id_str.clone(),
                         kind: "reply_done".to_string(),
@@ -995,6 +1072,10 @@ pub async fn address_pr_review_inner(
         failed_ids,
         fix_errors,
         push_error,
+        // A freshly-run apply always knows whether replies were requested —
+        // only a result persisted before this field existed deserializes to
+        // `None` (see `PrReviewApplyResult::auto_reply`).
+        auto_reply: Some(options.auto_reply),
     };
 
     progress(PrReviewProgress {
@@ -1017,15 +1098,26 @@ pub async fn address_pr_review_inner(
     Ok((result, updated_plan))
 }
 
-/// Result of `sync_pr_review_replies` — how many GitHub replies were posted
-/// in this catch-up pass and any per-item errors.
+/// Result of `sync_pr_review_replies` — counts the three operations Sync can
+/// perform on each item: post a missing reply, discover the GitHub ID of a
+/// reply we already posted but never tracked, and rewrite the body of a
+/// tracked reply with the current `build_reply_body` output.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyncPrRepliesResult {
+    /// Items where we created a new reply on GitHub.
     pub replied: u32,
+    /// Items whose `reply_comment_id` we filled in by querying the PR thread
+    /// (via `in_reply_to_id` matching). These also get patched in the same
+    /// pass, so they're counted in `rewritten` as well.
+    pub discovered: u32,
+    /// Items whose existing GitHub reply was overwritten with the current body
+    /// (legacy `[SlashIt agent —]` format → first-person, signature-free).
+    pub rewritten: u32,
+    /// Items with `reply_posted=true` whose reply we couldn't locate on GitHub
+    /// (e.g. PR-level fallback comment with no `in_reply_to_id`). Reported so
+    /// the user knows which ones still need manual cleanup.
+    pub unmatched: u32,
     pub errors: Vec<String>,
-    /// Number of items that already had `reply_posted=true` and were left
-    /// untouched. Useful for the UI's confirmation toast.
-    pub already_done: u32,
     /// Number of approved Fix items still missing a fix on disk
     /// (`fix_done=false`). These are NOT replied to — the user must run Apply
     /// for them. Carried back so the UI can warn instead of silently dropping.
@@ -1054,7 +1146,7 @@ pub async fn sync_pr_review_replies(
     plan.backfill_lifecycle_from_last_apply();
 
     let (result, updated_plan) = sync_pr_review_replies_inner(task, plan).await?;
-    save_review_plan_on_task(&state, task_uuid, updated_plan).await;
+    save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
     Ok(result)
 }
 
@@ -1072,7 +1164,6 @@ pub async fn sync_pr_review_replies_inner(
 
     let mut replied = 0u32;
     let mut errors: Vec<String> = Vec::new();
-    let mut already_done = 0u32;
     let mut fix_pending = 0u32;
 
     let approved_indices: Vec<usize> = updated_plan.items.iter().enumerate()
@@ -1080,32 +1171,87 @@ pub async fn sync_pr_review_replies_inner(
         .map(|(idx, _)| idx)
         .collect();
 
+    let mut discovered = 0u32;
+    let mut rewritten = 0u32;
+    let mut unmatched = 0u32;
+
     for orig_idx in approved_indices {
         let item = updated_plan.items[orig_idx].clone();
-        if item.reply_posted {
-            already_done += 1;
-            continue;
-        }
         if !item.fix_done {
             fix_pending += 1;
+            continue;
+        }
+        // Up-to-date items are left alone: a reply we posted in the current
+        // signature-free format has `pr_reply_text=Some(_)`. Anything else is
+        // either missing (Case A) or legacy (Case B/C → discover + rewrite).
+        if item.reply_posted && item.pr_reply_text.is_some() {
             continue;
         }
         let label = item.comment_id
             .map(|id| id.to_string())
             .unwrap_or_else(|| "<none>".to_string());
-        let body = build_reply_body(&item, item.last_agent_summary.as_deref());
-        match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
+        let body = build_reply_body(&item);
+
+        // Case A: no reply on GitHub yet — POST a new one.
+        if !item.reply_posted {
+            match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
+                Ok(reply_id) => {
+                    replied += 1;
+                    updated_plan.items[orig_idx].reply_posted = true;
+                    if reply_id.is_some() {
+                        updated_plan.items[orig_idx].reply_comment_id = reply_id;
+                    }
+                    updated_plan.items[orig_idx].pr_reply_text = Some(body);
+                }
+                Err(e) => errors.push(format!("comment {}: {}", label, e)),
+            }
+            continue;
+        }
+
+        // Case B: reply exists but we don't have its GitHub id — try to find it
+        // by walking the PR's inline comments and matching `in_reply_to_id` to
+        // our original comment. No text heuristics. If we still can't find it,
+        // the reply was likely a PR-level fallback comment — count as unmatched.
+        if updated_plan.items[orig_idx].reply_comment_id.is_none() {
+            let Some(original_id) = item.comment_id else {
+                unmatched += 1;
+                continue;
+            };
+            match discover_reply_comment_id(&repo, &number, original_id).await {
+                Ok(Some(found_id)) => {
+                    updated_plan.items[orig_idx].reply_comment_id = Some(found_id);
+                    discovered += 1;
+                }
+                Ok(None) => {
+                    unmatched += 1;
+                    continue;
+                }
+                Err(e) => {
+                    errors.push(format!("comment {} (discover): {}", label, e));
+                    continue;
+                }
+            }
+        }
+
+        // Case C: we now have a reply_comment_id — PATCH the body. Idempotent:
+        // if GitHub already holds the current body, nothing changes server-side.
+        let Some(reply_id) = updated_plan.items[orig_idx].reply_comment_id else {
+            unmatched += 1;
+            continue;
+        };
+        match patch_pr_inline_reply(&repo, reply_id, &body).await {
             Ok(()) => {
-                replied += 1;
-                updated_plan.items[orig_idx].reply_posted = true;
+                rewritten += 1;
+                updated_plan.items[orig_idx].pr_reply_text = Some(body);
             }
-            Err(e) => {
-                errors.push(format!("comment {}: {}", label, e));
-            }
+            Err(e) => errors.push(format!("comment {} (rewrite): {}", label, e)),
         }
     }
 
-    Ok((SyncPrRepliesResult { replied, errors, already_done, fix_pending }, updated_plan))
+    Ok((
+        SyncPrRepliesResult { replied, discovered, rewritten, unmatched, errors, fix_pending },
+        updated_plan,
+    ))
 }
 
 fn pr_url_for_task(task: &Task) -> Result<String, String> {
@@ -1117,20 +1263,70 @@ fn pr_url_for_task(task: &Task) -> Result<String, String> {
         .ok_or_else(|| "Task does not have a GitHub PR".to_string())
 }
 
-async fn save_review_plan_on_task(state: &crate::AppState, task_id: Uuid, plan: PrReviewPlan) {
-    let project_id = {
-        let mut tasks = state.task.tasks.write().await;
-        let Some(t) = tasks.get_mut(&task_id) else { return; };
-        t.pr_review_plan = Some(plan);
-        t.updated_at = chrono::Utc::now();
-        t.project_id
+/// Persist `task_id`'s review plan, then publish it to shared memory.
+///
+/// A review plan is the record of which comments were parsed, which fixes were
+/// applied and which replies were posted to GitHub. The lifecycle backfill and
+/// the next re-analysis both read it back to decide what still needs doing, so
+/// a plan that lives only in memory makes the next run re-apply fixes and
+/// re-post replies that already landed.
+///
+/// This used to mutate the task under a write guard, drop it, take a fresh read
+/// guard to build the snapshot, and discard the save error, returning `()` so
+/// that no caller could see the failure. Now the whole transaction runs under
+/// one write guard and the in-memory value is committed only after the write is
+/// accepted, so a plan the caller was told about is a plan a restart will find.
+async fn save_review_plan_on_task(
+    tasks: &Tasks,
+    storage: &Storage,
+    task_id: Uuid,
+    plan: PrReviewPlan,
+) -> Result<(), String> {
+    let mut tasks_w = tasks.write().await;
+
+    let Some(task) = tasks_w.get(&task_id) else {
+        // Explicit rather than a silent `Ok`: the caller is about to hand the
+        // frontend a plan, and nothing recorded it.
+        return Err(format!("Task {task_id} no longer exists, so its review plan was not saved"));
     };
-    let tasks_r = state.task.tasks.read().await;
-    let project_tasks: Vec<Task> = tasks_r.values()
+    let project_id = task.project_id;
+    let now = chrono::Utc::now();
+
+    let staged: Vec<Task> = tasks_w
+        .values()
         .filter(|t| t.project_id == project_id)
-        .cloned()
+        .map(|t| {
+            let mut staged = t.clone();
+            if staged.id == task_id {
+                staged.pr_review_plan = Some(plan.clone());
+                staged.updated_at = now;
+            }
+            staged
+        })
         .collect();
-    let _ = state.storage.save_project_tasks(project_id, &project_tasks);
+
+    let saved = storage
+        .save_project_tasks(project_id, &staged)
+        .map_err(|e| format!("Failed to save the PR review plan for task {task_id}: {e}"));
+
+    // Committed to memory even when the write failed, which is the opposite of
+    // what the worktree cleanup helper does, and deliberately so. There, memory
+    // has to agree with the *file*, because clearing a reference in memory is
+    // what removes a task from the retry pass that would have reconciled it.
+    // Here the plan is the record of work that already happened outside this
+    // process: commits pushed, replies posted to GitHub. Dropping it would
+    // leave the session believing those items are still pending, and the
+    // obvious response -- run Apply again -- would re-post replies that already
+    // landed. `rerunning_apply_skips_already_done_items_and_runs_claude_only_
+    // for_pending` is what makes the retained plan protective.
+    //
+    // The failure is still returned, so nothing reports a durable save that did
+    // not happen.
+    if let Some(t) = tasks_w.get_mut(&task_id) {
+        t.pr_review_plan = Some(plan);
+        t.updated_at = now;
+    }
+    saved
 }
 
 fn parse_gh_ts(v: Option<&serde_json::Value>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -1314,6 +1510,8 @@ fn parse_review_items(output: &str, comments: &[PrReviewComment]) -> Vec<PrRevie
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
         }
     }).collect()
 }
@@ -1447,57 +1645,121 @@ code.
 After completing all edits, write a short final summary listing:
 - FIXED: which items you implemented, citing the item number.
 - SKIPPED: any approved item that no longer applied and why.
+
+Then, on a NEW line, emit a `<pr_reply>` block. Its content is the message we
+will post on the PR as a reply to the original review comment. Write in first
+person as the PR author (the human), casual but professional, 1–3 sentences,
+describing what you actually changed (or "skipped — <reason>" if you couldn't
+apply it). Do NOT include a signature, salutation, sign-off, labels like
+"Summary:" or "Change:", or any agent/tool attribution. Just the message.
+
+Example format:
+
+<pr_reply>
+Switched to Promise.allSettled so the card still renders if only one of the
+fetches fails — added an i18n string for the partial-failure state too.
+</pr_reply>
 "#,
         title = task.title, pr_url = pr_url, items = items_text,
     )
 }
 
-fn build_reply_body(item: &PrReviewItem, agent_summary: Option<&str>) -> String {
-    let status = match item.decision {
-        PrReviewDecision::Fix => "Fixed",
-        PrReviewDecision::Skip => "Skipped",
-        PrReviewDecision::Question => "Needs discussion",
-    };
-    let mut body = format!("[SlashIt agent — {}]\n\n", status);
-    if !item.summary.is_empty() {
-        body.push_str(&item.summary);
-        body.push_str("\n\n");
-    }
-    if !item.reasoning.is_empty() {
-        body.push_str(&item.reasoning);
-        body.push_str("\n\n");
-    }
-    if matches!(item.decision, PrReviewDecision::Fix) && !item.proposed_change.is_empty() {
-        body.push_str("Change: ");
-        body.push_str(&item.proposed_change);
-        body.push_str("\n\n");
-    }
-    if let Some(summary) = agent_summary.map(str::trim).filter(|s| !s.is_empty()) {
-        body.push_str("Agent notes:\n");
-        body.push_str(summary);
-    }
-    body.trim().to_string()
+/// Extracts the content between `<pr_reply>` and `</pr_reply>` tags from the
+/// agent's free-form output. Returns `None` if the block is missing or empty
+/// so the caller can fall back to the triage `reasoning`.
+fn extract_pr_reply(agent_output: &str) -> Option<String> {
+    let start = agent_output.find("<pr_reply>")? + "<pr_reply>".len();
+    let rest = &agent_output[start..];
+    let end = rest.find("</pr_reply>")?;
+    let inner = rest[..end].trim();
+    (!inner.is_empty()).then(|| inner.to_string())
 }
 
+/// Builds the body we post on GitHub as the reply to the original review
+/// comment. Prefers the agent's `<pr_reply>` text (first-person, written for
+/// the reviewer). Falls back to the triage `reasoning`, which the analysis
+/// prompt already asks to be reply-friendly. No signature, no labels, no
+/// "Agent notes:" — the human is the apparent author.
+fn build_reply_body(item: &PrReviewItem) -> String {
+    if let Some(text) = item.pr_reply_text.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return text.to_string();
+    }
+    let reasoning = item.reasoning.trim();
+    if !reasoning.is_empty() {
+        return reasoning.to_string();
+    }
+    item.summary.trim().to_string()
+}
+
+/// Posts a reply on the PR. Returns the GitHub comment ID of the created
+/// reply so the caller can persist it on the item for future PATCH-edit.
+/// Returns `Ok(None)` only for the legacy `gh pr comment` fallback path where
+/// gh's CLI doesn't surface a JSON id.
 async fn post_pr_reply(
     repo: &str,
     number: &str,
     pr_url: &str,
     comment_id: Option<u64>,
     body: &str,
-) -> Result<(), String> {
+) -> Result<Option<u64>, String> {
     if let Some(id) = comment_id {
         let endpoint = format!("repos/{}/pulls/{}/comments/{}/replies", repo, number, id);
         let body_arg = format!("body={}", body);
-        if run_cmd_no_cwd("gh", &["api", "-X", "POST", &endpoint, "-f", &body_arg]).await.is_ok() {
-            return Ok(());
+        if let Ok(out) = run_cmd_no_cwd(
+            "gh",
+            &["api", "-X", "POST", &endpoint, "-f", &body_arg, "--jq", ".id"],
+        ).await {
+            let parsed = out.trim().parse::<u64>().ok();
+            return Ok(parsed);
         }
         // Inline reply failed (e.g. comment was on a Review, not an inline thread).
         // Fall through to a global PR comment so the reply is not lost.
     }
     run_cmd_no_cwd("gh", &["pr", "comment", pr_url, "--body", body])
         .await
+        .map(|_| None)
+}
+
+/// Walks the PR's inline review comments and returns the id of the reply
+/// whose `in_reply_to_id` matches `original_comment_id`. Picks the most
+/// recently created when there are multiple. Returns `Ok(None)` when no
+/// inline reply exists for that comment — the original reply may have been a
+/// PR-level fallback (no `in_reply_to_id`) or it was deleted.
+async fn discover_reply_comment_id(
+    repo: &str,
+    number: &str,
+    original_comment_id: u64,
+) -> Result<Option<u64>, String> {
+    let endpoint = format!("repos/{}/pulls/{}/comments?per_page=100", repo, number);
+    let raw = run_cmd_no_cwd("gh", &["api", "--paginate", &endpoint]).await
+        .map_err(|e| format!("gh api list failed: {}", e))?;
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&raw)
+        .map_err(|e| format!("gh api returned non-JSON: {}", e))?;
+
+    let mut best: Option<(u64, chrono::DateTime<chrono::Utc>)> = None;
+    for c in arr {
+        let in_reply_to = c.get("in_reply_to_id").and_then(|v| v.as_u64());
+        if in_reply_to != Some(original_comment_id) { continue; }
+        let Some(id) = c.get("id").and_then(|v| v.as_u64()) else { continue; };
+        let created = parse_gh_ts(c.get("created_at"))
+            .unwrap_or_else(chrono::Utc::now);
+        if best.as_ref().is_none_or(|(_, t)| created > *t) {
+            best = Some((id, created));
+        }
+    }
+    Ok(best.map(|(id, _)| id))
+}
+
+/// PATCHes the body of an existing inline PR review comment via the GitHub
+/// API. Used by Sync replies to rewrite legacy `[SlashIt agent —]`-style
+/// replies with the current first-person, signature-free body.
+async fn patch_pr_inline_reply(repo: &str, comment_id: u64, body: &str) -> Result<(), String> {
+    let endpoint = format!("repos/{}/pulls/comments/{}", repo, comment_id);
+    let body_arg = format!("body={}", body);
+    run_cmd_no_cwd("gh", &["api", "-X", "PATCH", &endpoint, "-f", &body_arg])
+        .await
         .map(|_| ())
+        .map_err(|e| format!("gh PATCH failed: {}", e))
 }
 
 async fn run_claude_pr_helper(prompt: String, working_dir: String, can_edit: bool) -> Result<String, String> {
@@ -1637,9 +1899,7 @@ fn truncate_one_line(s: &str, max: usize) -> String {
 }
 
 fn write_pr_helper_log(stdout: &str, stderr: &str, can_edit: bool) -> std::io::Result<std::path::PathBuf> {
-    let dir = directories::ProjectDirs::from("com", "barradev", "slashit-app")
-        .map(|d| d.data_dir().join("pr-helper-logs"))
-        .ok_or_else(|| std::io::Error::other("no ProjectDirs"))?;
+    let dir = crate::config::paths::AppPaths::new()?.pr_helper_logs_dir();
     std::fs::create_dir_all(&dir)?;
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let path = dir.join(format!("{}-{}.log", ts, if can_edit { "apply" } else { "readonly" }));
@@ -2189,6 +2449,156 @@ mod tests {
     use crate::test_helpers::create_test_task;
 
     use super::build_pr_body;
+    use crate::test_helpers::create_test_task_full;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn review_plan_storage() -> (Storage, tempfile::TempDir) {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let storage = Storage::with_paths(crate::config::paths::AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        ));
+        (storage, temp)
+    }
+
+    /// Make every `save_project_tasks` fail deterministically by putting a
+    /// regular file where the tasks directory has to be, so the `create_dir_all`
+    /// inside the atomic write fails with `AlreadyExists`. No permission bits,
+    /// so this behaves identically for every user including root.
+    fn block_task_persistence(storage: &Storage) {
+        let blocker = storage.paths().config_dir().join("tasks");
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("place persistence blocker");
+    }
+
+    /// A task whose PR review plan is about to be saved, plus a sibling in the
+    /// same project that the whole-file rewrite must not drop.
+    fn review_plan_fixture(project_id: Uuid) -> (Uuid, Uuid, Tasks) {
+        let subject = create_test_task_full("subject", project_id, TaskStatus::InProgress, 0);
+        let sibling = create_test_task_full("sibling", project_id, TaskStatus::Backlog, 1);
+        let (subject_id, sibling_id) = (subject.id, sibling.id);
+        let map: HashMap<Uuid, Task> =
+            vec![subject, sibling].into_iter().map(|t| (t.id, t)).collect();
+        (subject_id, sibling_id, Arc::new(RwLock::new(map)))
+    }
+
+    fn plan_with_marker(marker: &str) -> PrReviewPlan {
+        PrReviewPlan {
+            generated_at: chrono::Utc::now(),
+            pr_url: "https://github.com/org/repo/pull/1".to_string(),
+            review_decision: None,
+            comments: Vec::new(),
+            items: Vec::new(),
+            raw_plan: marker.to_string(),
+            last_apply: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn save_review_plan_reports_a_failed_write_instead_of_returning_ok() {
+        let project_id = Uuid::new_v4();
+        let (task_id, _sibling_id, tasks) = review_plan_fixture(project_id);
+        let (storage, _tmp) = review_plan_storage();
+        block_task_persistence(&storage);
+
+        let result =
+            save_review_plan_on_task(&tasks, &storage, task_id, plan_with_marker("v1")).await;
+
+        assert!(
+            result.is_err(),
+            "the four public PR-review commands propagate this with `?`, so a swallowed \
+             error is the only thing that could let them return Ok after losing the plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_review_plan_keeps_the_plan_in_memory_when_the_write_fails() {
+        // `address_pr_review` and `sync_pr_review_replies` have already pushed
+        // commits and posted GitHub replies by the time this runs, and the plan
+        // is the record of that. Dropping it because the file could not be
+        // written would leave the session believing the items are still
+        // pending, and a re-run would post those replies a second time. The
+        // error is reported; the record is kept.
+        let project_id = Uuid::new_v4();
+        let (task_id, _sibling_id, tasks) = review_plan_fixture(project_id);
+        let (storage, _tmp) = review_plan_storage();
+        block_task_persistence(&storage);
+
+        let result =
+            save_review_plan_on_task(&tasks, &storage, task_id, plan_with_marker("v1")).await;
+
+        assert!(result.is_err(), "the failed write must still be reported");
+        assert_eq!(
+            tasks.read().await.get(&task_id).unwrap().pr_review_plan.as_ref()
+                .map(|p| p.raw_plan.as_str()),
+            Some("v1"),
+            "the record of already-posted replies must survive a failed write"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_review_plan_commits_once_the_write_is_accepted() {
+        let project_id = Uuid::new_v4();
+        let (task_id, _sibling_id, tasks) = review_plan_fixture(project_id);
+        let (storage, _tmp) = review_plan_storage();
+
+        save_review_plan_on_task(&tasks, &storage, task_id, plan_with_marker("v1"))
+            .await
+            .expect("save should succeed");
+
+        assert_eq!(
+            tasks.read().await.get(&task_id).unwrap().pr_review_plan.as_ref()
+                .map(|p| p.raw_plan.as_str()),
+            Some("v1")
+        );
+        let persisted = storage.load_project_tasks(project_id).expect("reload tasks");
+        let stored = persisted.iter().find(|t| t.id == task_id).expect("subject on disk");
+        assert_eq!(
+            stored.pr_review_plan.as_ref().map(|p| p.raw_plan.as_str()),
+            Some("v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn save_review_plan_keeps_sibling_tasks() {
+        // The save rewrites the whole project file from the staged snapshot, so
+        // a sibling omitted from it would be deleted from disk.
+        let project_id = Uuid::new_v4();
+        let (task_id, sibling_id, tasks) = review_plan_fixture(project_id);
+        let (storage, _tmp) = review_plan_storage();
+
+        save_review_plan_on_task(&tasks, &storage, task_id, plan_with_marker("v1"))
+            .await
+            .expect("save should succeed");
+
+        let persisted = storage.load_project_tasks(project_id).expect("reload tasks");
+        assert_eq!(persisted.len(), 2, "the sibling must still be on disk");
+        let sibling = persisted.iter().find(|t| t.id == sibling_id).expect("sibling on disk");
+        assert!(sibling.pr_review_plan.is_none(), "the sibling must be untouched");
+    }
+
+    #[tokio::test]
+    async fn save_review_plan_reports_a_task_that_vanished() {
+        let project_id = Uuid::new_v4();
+        let (_task_id, _sibling_id, tasks) = review_plan_fixture(project_id);
+        let (storage, _tmp) = review_plan_storage();
+
+        let result =
+            save_review_plan_on_task(&tasks, &storage, Uuid::new_v4(), plan_with_marker("v1")).await;
+
+        assert!(
+            result.is_err(),
+            "a plan for a task that no longer exists was not saved, and saying otherwise \
+             would be a silent false success"
+        );
+    }
 
     // ──────────────────────────────────────────────
     // PR body "Fixes #N" generation tests
@@ -2544,6 +2954,185 @@ mod tests {
         ]}"#;
         let items = parse_review_items(raw, &comments);
         assert_eq!(items[0].user_note, "");
+    }
+
+    // ──────────────────────────────────────────────
+    // carry_forward_reanalysis_lifecycle: re-analyze must not drop reply
+    // metadata for items matched by comment_id against the prior plan.
+    // ──────────────────────────────────────────────
+
+    /// A freshly re-parsed item as `parse_review_items` would produce it:
+    /// only `comment_id`/`summary`/`decision` are populated by the agent,
+    /// every lifecycle field starts at its zero value.
+    fn fresh_item(cid: u64) -> PrReviewItem {
+        PrReviewItem {
+            comment_id: Some(cid),
+            summary: "re-parsed summary".to_string(),
+            decision: PrReviewDecision::Fix,
+            reasoning: String::new(),
+            proposed_change: String::new(),
+            approved: true,
+            user_note: String::new(),
+            fix_done: false,
+            reply_posted: false,
+            last_agent_summary: None,
+            last_error: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
+        }
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_preserves_reply_text_and_id() {
+        // Previous plan: item was fixed and replied to, with the reply text
+        // and GitHub comment id recorded.
+        let prev_item = PrReviewItem {
+            fix_done: true,
+            reply_posted: true,
+            pr_reply_text: Some("Thanks, fixed in the latest commit.".to_string()),
+            reply_comment_id: Some(9999),
+            last_agent_summary: Some("agent report".to_string()),
+            last_error: None,
+            ..fresh_item(42)
+        };
+        let mut items = vec![fresh_item(42)];
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[comment(42)], None);
+
+        assert!(items[0].fix_done, "fix_done should carry forward");
+        assert!(items[0].reply_posted, "reply_posted should carry forward");
+        assert_eq!(
+            items[0].pr_reply_text.as_deref(),
+            Some("Thanks, fixed in the latest commit."),
+            "pr_reply_text must survive re-analysis so the already-synced skip check \
+             (reply_posted && pr_reply_text.is_some()) doesn't misfire and overwrite \
+             an existing GitHub reply",
+        );
+        assert_eq!(
+            items[0].reply_comment_id,
+            Some(9999),
+            "reply_comment_id must survive re-analysis so Sync can PATCH instead of duplicate",
+        );
+        assert_eq!(items[0].last_agent_summary.as_deref(), Some("agent report"));
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_does_not_overwrite_freshly_parsed_values() {
+        // If the fresh re-parse already carries its own reply text/id (should
+        // never happen in practice — the agent doesn't fill these — but the
+        // merge must still be non-destructive), the prior plan's values must
+        // not clobber them.
+        let prev_item = PrReviewItem {
+            pr_reply_text: Some("stale text".to_string()),
+            reply_comment_id: Some(1),
+            fix_done: true,
+            reply_posted: true,
+            ..fresh_item(7)
+        };
+        let mut fresh = fresh_item(7);
+        fresh.pr_reply_text = Some("fresh text".to_string());
+        fresh.reply_comment_id = Some(2);
+        let mut items = vec![fresh];
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[comment(7)], None);
+
+        assert_eq!(items[0].pr_reply_text.as_deref(), Some("fresh text"));
+        assert_eq!(items[0].reply_comment_id, Some(2));
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_ignores_unmatched_comment_ids() {
+        let prev_item = PrReviewItem { pr_reply_text: Some("for a different comment".to_string()), ..fresh_item(1) };
+        let mut items = vec![fresh_item(2)];
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[comment(1), comment(2)], None);
+
+        assert_eq!(items[0].pr_reply_text, None, "unrelated comment_id must not merge");
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_resets_a_comment_edited_after_the_last_apply() {
+        let applied_at = "2024-06-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let prev_item = PrReviewItem {
+            fix_done: true,
+            reply_posted: true,
+            pr_reply_text: Some("addressed the original wording".to_string()),
+            reply_comment_id: Some(555),
+            ..fresh_item(42)
+        };
+        let mut items = vec![fresh_item(42)];
+
+        // The reviewer edited comment 42 after the apply that produced
+        // `prev_item`'s lifecycle — GitHub kept the same comment id.
+        let edited_comment = PrReviewComment {
+            updated_at: Some("2024-06-02T00:00:00Z".parse().unwrap()),
+            ..comment(42)
+        };
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[edited_comment], Some(applied_at));
+
+        assert!(!items[0].fix_done, "an edited comment must be treated as needing fresh processing");
+        assert!(!items[0].reply_posted, "stale reply state must not suppress handling of the edited comment");
+        assert_eq!(items[0].pr_reply_text, None, "stale reply text must not carry forward for an edited comment");
+        assert_eq!(items[0].reply_comment_id, None);
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_keeps_state_for_a_comment_unchanged_since_the_last_apply() {
+        let applied_at = "2024-06-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let prev_item = PrReviewItem {
+            fix_done: true,
+            reply_posted: true,
+            pr_reply_text: Some("addressed the original wording".to_string()),
+            reply_comment_id: Some(555),
+            ..fresh_item(42)
+        };
+        let mut items = vec![fresh_item(42)];
+
+        // Same comment id, updated_at clearly before the apply: not edited.
+        // A same-second `updated_at` is deliberately NOT used here — that
+        // case is ambiguous (GitHub's whole-second precision vs.
+        // `applied_at`'s sub-second precision) and is treated as a possible
+        // edit by the covering test below, not as proof of "unchanged".
+        let unchanged_comment = PrReviewComment {
+            updated_at: Some(applied_at - chrono::Duration::seconds(1)),
+            ..comment(42)
+        };
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[unchanged_comment], Some(applied_at));
+
+        assert!(items[0].fix_done, "an unchanged comment may retain its lifecycle");
+        assert!(items[0].reply_posted);
+        assert_eq!(items[0].pr_reply_text.as_deref(), Some("addressed the original wording"));
+        assert_eq!(items[0].reply_comment_id, Some(555));
+    }
+
+    #[test]
+    fn carry_forward_reanalysis_lifecycle_treats_a_same_second_update_as_a_possible_edit() {
+        // `applied_at` almost never lands exactly on a whole second (it comes
+        // from `chrono::Utc::now()`), while GitHub's `updated_at` always does.
+        // A comment updated in the same second as the apply must not be
+        // waved through as "unchanged" just because naive truncation makes
+        // `updated_at < applied_at` look true.
+        let applied_at = "2024-06-01T00:00:00.900Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let prev_item = PrReviewItem {
+            fix_done: true,
+            reply_posted: true,
+            pr_reply_text: Some("addressed the original wording".to_string()),
+            reply_comment_id: Some(555),
+            ..fresh_item(42)
+        };
+        let mut items = vec![fresh_item(42)];
+
+        let same_second_comment = PrReviewComment {
+            updated_at: Some("2024-06-01T00:00:00Z".parse().unwrap()),
+            ..comment(42)
+        };
+
+        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[same_second_comment], Some(applied_at));
+
+        assert!(!items[0].fix_done, "a same-second update must be treated as a possible edit, not assumed safe");
+        assert!(!items[0].reply_posted);
     }
 
     // ──────────────────────────────────────────────

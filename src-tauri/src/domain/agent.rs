@@ -4,7 +4,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentExecution {
     pub id: Uuid,
-    pub workspace_id: Uuid,
+    #[serde(default)]
+    pub worktree_id: Option<Uuid>,
     pub task_id: Option<Uuid>,
     pub agent_type: String,
     pub status: AgentStatus,

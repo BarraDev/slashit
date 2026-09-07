@@ -5,11 +5,15 @@ pub mod test_helpers;
 mod acp;
 mod jj;
 mod agents;
-mod config;
+pub mod config;
 mod session;
 mod queue;
 mod pty;
 mod worktree;
+// Unix-domain-socket IPC. Gated because the whole module is built on
+// UnixListener and mode bits; without this the Windows build fails to
+// compile rather than merely lacking the feature.
+#[cfg(unix)]
 mod ipc;
 
 use commands::*;
@@ -37,13 +41,32 @@ pub struct AppState {
     pub appearance: commands::appearance::AppearanceState,
     pub pty: PtyState,
     pub storage: Storage,
+    /// The one resolved set of application directories. Commands must read
+    /// paths from here rather than deriving their own.
+    pub paths: Arc<config::paths::AppPaths>,
+    /// Runtime feature flags, so unfinished work can ship dark.
+    pub features: Arc<tokio::sync::RwLock<config::features::FeatureFlags>>,
     pub worktree_manager: Arc<worktree::WorktreeManager>,
     pub executor: Arc<tokio::sync::OnceCell<Arc<queue::TaskExecutor>>>,
+    /// Per-project guard serializing `apply_state_migration` and
+    /// `set_state_location` for the same project. See its doc comment.
+    pub state_location_locks: Arc<commands::state_location::StateLocationLocks>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let storage = Storage::new().expect("Failed to initialize storage");
+    let paths = Arc::new(
+        config::paths::AppPaths::new().expect("Failed to resolve application directories"),
+    );
+    let storage = Storage::with_paths((*paths).clone());
+
+    // Config must be read before the worktree manager is built: it carries the
+    // worktree placement policy, and it populates Storage's project routing
+    // table, which every later task load depends on.
+    let loaded_config = storage.load_config().unwrap_or_else(|e| {
+        eprintln!("Warning: Failed to load config from disk: {}", e);
+        config::storage::AppConfig::default()
+    });
 
     let task_state = commands::task::TaskState::new();
     let queue_state = commands::queue::QueueState::new(task_state.tasks.clone());
@@ -65,17 +88,20 @@ pub fn run() {
         appearance: commands::appearance::AppearanceState::new(),
         pty: PtyState::new(),
         storage,
-        worktree_manager: Arc::new(worktree::WorktreeManager::new()),
+        worktree_manager: Arc::new(worktree::WorktreeManager::new(
+            paths.clone(),
+            loaded_config.worktree.placement,
+        )),
+        features: Arc::new(tokio::sync::RwLock::new(
+            config::features::FeatureFlags::load(&paths),
+        )),
+        paths,
         executor: Arc::new(tokio::sync::OnceCell::new()),
+        state_location_locks: Arc::new(commands::state_location::StateLocationLocks::new()),
     };
 
-    // Load persisted config from disk (synchronous at startup)
-    // Load repositories FIRST, then projects (which reference repository_id), then tasks (which reference project_id)
-    let loaded_config = app_state.storage.load_config().unwrap_or_else(|e| {
-        eprintln!("Warning: Failed to load config from disk: {}", e);
-        config::storage::AppConfig::default()
-    });
-    
+    // Repositories load FIRST, then projects (which reference repository_id),
+    // then tasks (which reference project_id).
     // Insert loaded repositories into repository state
     {
         let repositories_map = app_state.repository.repositories.clone();
@@ -152,16 +178,99 @@ pub fn run() {
             tasks.insert(task.id, task);
         }
 
-        // Verify worktree paths still exist on disk (mark stale ones)
+        // Verify worktree paths still exist on disk.
+        //
+        // A path that no longer resolves is not automatically stale: upgrading
+        // moves managed worktrees to a new root, so try to adopt the worktree
+        // at its current location before discarding the reference. Clearing
+        // first would strand the branch and any uncommitted work in it.
+        let repo_for_project: std::collections::HashMap<uuid::Uuid, String> = {
+            let projects = app_state.project.projects.blocking_read();
+            let repositories = app_state.repository.repositories.blocking_read();
+            projects
+                .iter()
+                .filter_map(|(id, project)| {
+                    let repo = repositories.get(&project.repository_id?)?;
+                    Some((*id, repo.local_path.clone()))
+                })
+                .collect()
+        };
+
+        // Cache `git worktree list --porcelain` per repository so tasks that
+        // share a repo shell out to git at most once during this loop,
+        // rather than once per task. A failed lookup is cached too: retrying
+        // per task would not make git work, and every task in that repo must
+        // reach the same "could not verify" conclusion anyway.
+        let mut porcelain_cache: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+
         for task in tasks.values_mut() {
-            if let Some(wt_path) = task.worktree_path.as_ref() {
-                if !std::path::Path::new(wt_path).exists() {
-                    // Worktree dir was deleted externally — clear the reference
+            let Some(wt_path) = task.worktree_path.clone() else {
+                continue;
+            };
+            if std::path::Path::new(&wt_path).exists() {
+                continue;
+            }
+
+            let recovery = match (
+                task.branch_name.as_ref(),
+                repo_for_project.get(&task.project_id),
+            ) {
+                (Some(branch), Some(repo)) => {
+                    let porcelain = porcelain_cache
+                        .entry(repo.clone())
+                        .or_insert_with(|| worktree::WorktreeManager::worktree_list_porcelain(repo));
+                    app_state
+                        .worktree_manager
+                        .classify_missing_worktree(repo, branch, porcelain.as_deref())
+                }
+                // No branch was ever recorded, so there is nothing to look a
+                // worktree up by and nothing that could ever recreate it. No
+                // amount of git working would change that answer, so this is
+                // genuine absence rather than a failed check.
+                (None, _) => worktree::WorktreeRecovery::ConfirmedAbsent,
+                // A branch is recorded but the project resolves to no
+                // repository. That is not proof the worktree is gone: this
+                // table is rebuilt from config on every start, and a config
+                // that fails to deserialize cleanly is recovered with no
+                // projects and no repositories at all. Clearing here would
+                // spend every task's reference on a lookup that never
+                // happened.
+                (Some(_), None) => worktree::WorktreeRecovery::Unverified,
+            };
+
+            match recovery {
+                worktree::WorktreeRecovery::Adopt(path) => {
+                    println!(
+                        "SlashIt: Adopted relocated worktree for task '{}' at {}",
+                        task.title, path
+                    );
+                    task.worktree_path = Some(path);
+                }
+                worktree::WorktreeRecovery::ConfirmedAbsent => {
                     println!("SlashIt: Worktree dir missing for task '{}', clearing reference", task.title);
                     task.worktree_path = None;
-                    migrated_projects.insert(task.project_id);
+                }
+                // Git could not be consulted, so nothing here proves the
+                // worktree is gone. `worktree_path` is the only persisted
+                // record of it, and clearing it is not recoverable from here:
+                // this loop skips a task that has none, and the executor's
+                // cleanup-retry pass filters on one too, so no later start
+                // would reconsider it. A transient git failure must not be
+                // allowed to spend it. Left untouched, and deliberately not
+                // marked migrated: nothing changed, so there is nothing to
+                // persist and the next start verifies again.
+                worktree::WorktreeRecovery::Unverified => {
+                    eprintln!(
+                        "Warning: worktree dir missing for task '{}' at {}, but its absence could \
+                         not be confirmed (git worktree list failed, or the project resolved to no \
+                         repository); keeping the reference for the next start",
+                        task.title, wt_path
+                    );
+                    continue;
                 }
             }
+            migrated_projects.insert(task.project_id);
         }
 
         println!("SlashIt: Loaded {} tasks from disk", tasks.len());
@@ -196,6 +305,7 @@ pub fn run() {
                     logs: state.agent.logs.clone(),
                     projects: state.project.projects.clone(),
                     repositories: state.repository.repositories.clone(),
+                    workspace_registry: state.workspace.registry.clone(),
                     storage: state.storage.clone(),
                     worktree_manager: state.worktree_manager.clone(),
                     app_handle: app.handle().clone(),
@@ -206,6 +316,8 @@ pub fn run() {
             println!("SlashIt: Task executor started");
 
             // IPC Unix socket server
+            #[cfg(unix)]
+            {
             let ipc_ctx = ipc::IpcContext {
                 tasks: state.task.tasks.clone(),
                 projects: state.project.projects.clone(),
@@ -221,6 +333,7 @@ pub fn run() {
                 }
             });
             println!("SlashIt: IPC server starting");
+            }
 
             // System tray
             {
@@ -264,6 +377,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             greet,
+            get_state_location,
+            set_state_location,
+            plan_state_migration,
+            apply_state_migration,
+            clean_legacy_state_dirs,
+            get_feature_flags,
+            set_feature_flag,
             create_repository,
             list_repositories,
             get_repository,
@@ -275,8 +395,8 @@ pub fn run() {
             get_project_path,
             create_workspace,
             list_workspaces,
-            remove_workspace,
-            get_workspace_status,
+            get_workspace,
+            delete_workspace,
             create_task,
             list_tasks,
             update_task_status,
