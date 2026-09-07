@@ -66,7 +66,19 @@ pub struct ClaudeRunner {
 impl ClaudeRunner {
     /// Start a Claude Code CLI run with the given config.
     pub async fn start(config: ClaudeRunConfig) -> Result<Self, String> {
-        let mut cmd = Command::new("claude");
+        Self::start_program("claude", config).await
+    }
+
+    /// Start `program` with the Claude Code CLI argument set.
+    ///
+    /// Split out from [`start`] only so the tests can point the runner at a
+    /// stand-in process that follows the same stdout/exit contract. Production
+    /// has exactly one caller and it passes `"claude"`.
+    async fn start_program(
+        program: impl AsRef<std::ffi::OsStr>,
+        config: ClaudeRunConfig,
+    ) -> Result<Self, String> {
+        let mut cmd = Command::new(program);
 
         cmd.arg("-p").arg(&config.prompt);
         cmd.arg("--verbose");
@@ -120,9 +132,15 @@ impl ClaudeRunner {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let child = cmd.spawn()
+        let mut child = cmd.spawn()
             .map_err(|e| format!("Failed to spawn claude: {}. Is claude CLI installed?", e))?;
         eprintln!("[claude-runner] spawned pid={:?}", child.id());
+
+        // Take stdout here, while the child is still ours alone, and hand it
+        // straight to the reader. Draining stdout then depends on nothing but
+        // the pipe itself: not on the child mutex, and so not on whoever is
+        // currently waiting for the process to exit.
+        let stdout = child.stdout.take();
 
         let (event_tx, _) = broadcast::channel(512);
 
@@ -135,7 +153,7 @@ impl ClaudeRunner {
             reader_handle: Mutex::new(None),
         };
 
-        let handle = runner.start_reader();
+        let handle = runner.start_reader(stdout);
         *runner.reader_handle.lock().await = Some(handle);
 
         Ok(runner)
@@ -179,6 +197,14 @@ impl ClaudeRunner {
             Some(handle) => handle.await.unwrap_or_default(),
             None => String::new(),
         };
+
+        // The child has exited and nothing below needs it, so release it rather
+        // than hold it through the join. Draining can outlast the process when a
+        // descendant inherited the pipe; that join is still unbounded, and
+        // bounding it belongs with cancellation rather than here, but at least
+        // `kill()` is no longer queued behind a caller stuck waiting on output.
+        drop(child);
+
         // Wait for the stdout reader to drain before callers read accumulated_output.
         // Without this, get_output() can race the reader and return partial/empty text.
         if let Some(handle) = self.reader_handle.lock().await.take() {
@@ -207,23 +233,26 @@ impl ClaudeRunner {
         Ok(true)
     }
 
-    fn start_reader(&self) -> tauri::async_runtime::JoinHandle<()> {
-        let child = self.child.clone();
+    /// Spawn the task that turns the child's stdout into events.
+    ///
+    /// It is given the pipe rather than the child on purpose. A reader that had
+    /// to reach through the child mutex to find its own stdout could not run
+    /// while `wait()` held that mutex, which is both a deadlock (`wait()` joins
+    /// this task) and, for a talkative child, a stalled pipe.
+    fn start_reader(
+        &self,
+        stdout: Option<tokio::process::ChildStdout>,
+    ) -> tauri::async_runtime::JoinHandle<()> {
         let event_tx = self.event_tx.clone();
         let session_id = self.session_id.clone();
         let accumulated_output = self.accumulated_output.clone();
         let result_error = self.result_error.clone();
 
         tauri::async_runtime::spawn(async move {
-            let mut child_guard = child.lock().await;
-
             // Read stdout (NDJSON stream)
-            if let Some(stdout) = child_guard.stdout.take() {
+            if let Some(stdout) = stdout {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
-
-                // Drop child guard so other operations can proceed
-                drop(child_guard);
 
                 while let Ok(Some(line)) = lines.next_line().await {
                     if line.trim().is_empty() {
@@ -359,5 +388,320 @@ async fn parse_claude_event(
         }
 
         _ => None,
+    }
+}
+
+// The fixtures below are shell scripts, so these only make sense where there is
+// a shell. The Windows and macOS CI jobs are compile-only, and the runtime job
+// is Linux.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// How long a journey is allowed to take before we call it hung.
+    ///
+    /// This is a failure bound, not a synchronisation device: every fixture
+    /// below exits on its own in well under a second, so a timeout here means
+    /// the runner stopped making progress rather than that it needed longer.
+    const DEADLINE: Duration = Duration::from_secs(15);
+
+    /// A stand-in for the Claude Code CLI.
+    ///
+    /// It models the parts of the CLI the runner actually depends on -- argv,
+    /// working directory, NDJSON on stdout, text on stderr, and an exit status
+    /// -- and nothing else. It is deliberately not an emulator of the agent.
+    struct Fixture {
+        dir: TempDir,
+        program: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new(script: &str) -> Self {
+            let dir = TempDir::new().expect("temp dir");
+            let program = dir.path().join("fake-cli");
+            let mut file = std::fs::File::create(&program).expect("create fixture");
+            file.write_all(script.as_bytes()).expect("write fixture");
+            file.flush().expect("flush fixture");
+            drop(file);
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fixture");
+            Self { dir, program }
+        }
+
+        fn config(&self) -> ClaudeRunConfig {
+            ClaudeRunConfig {
+                prompt: "do the thing".to_string(),
+                working_dir: self.dir.path().to_string_lossy().into_owned(),
+                allowed_tools: vec!["Read".to_string(), "Edit".to_string()],
+                max_turns: Some(50),
+                max_budget_usd: None,
+                session_id: Some("session-under-test".to_string()),
+                resume_session: None,
+                model: None,
+                system_prompt: None,
+                permission_mode: None,
+                disable_mcp: false,
+                additional_dirs: Vec::new(),
+            }
+        }
+
+        async fn start(&self) -> ClaudeRunner {
+            ClaudeRunner::start_program(&self.program, self.config())
+                .await
+                .expect("fixture should spawn")
+        }
+    }
+
+    /// Emits a valid exchange and exits immediately, before the caller has any
+    /// realistic chance to reach `wait()`.
+    const FAST: &str = r#"#!/bin/sh
+printf '{"type":"system","subtype":"init","session_id":"s-fast","model":"fixture-model"}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-fast","result":"done"}\n'
+exit 0
+"#;
+
+    /// Delivers its events incrementally, after a moment spent starting up.
+    ///
+    /// The sleeps model a CLI that takes time to boot and then to think between
+    /// messages. The leading one matters to the test as well as to the model:
+    /// `subscribe()` can only be called once the runner exists, and the
+    /// broadcast channel drops anything sent before a receiver joins, so a
+    /// fixture that spoke instantly would make the first event a coin toss.
+    /// Note that the tests which prove the ownership fix are the ones with no
+    /// sleeps at all.
+    const STREAMING: &str = r#"#!/bin/sh
+sleep 0.2
+printf '{"type":"system","subtype":"init","session_id":"s-stream","model":"fixture-model"}\n'
+sleep 0.1
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"alpha"}]}}\n'
+sleep 0.1
+printf '{"type":"content_block_delta","delta":{"type":"text_delta","text":"beta"}}\n'
+sleep 0.1
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-stream","result":"gamma"}\n'
+exit 0
+"#;
+
+    /// Writes far more than a pipe can hold before exiting.
+    ///
+    /// This is the same ownership problem as the fast case with a wider blast
+    /// radius: a reader that cannot reach its own stdout leaves the pipe to
+    /// fill, and the child then blocks in `write()` before it can exit, so the
+    /// `wait()` holding the reader out is waiting for an exit it is preventing.
+    const CHATTY: &str = r#"#!/bin/sh
+pad=xxxxxxxxxxxxxxxx
+pad=$pad$pad$pad$pad
+pad=$pad$pad$pad$pad
+pad=$pad$pad$pad$pad
+printf '{"type":"system","subtype":"init","session_id":"s-chatty","model":"fixture-model"}\n'
+i=0
+while [ $i -lt 512 ]; do
+    printf '{"type":"content_block_delta","delta":{"type":"text_delta","text":"%s"}}\n' "$pad"
+    i=$((i + 1))
+done
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-chatty","result":"done"}\n'
+exit 0
+"#;
+
+    /// The `pad` above quadruples three times from 16 bytes.
+    const CHATTY_PAD: usize = 16 * 4 * 4 * 4;
+    const CHATTY_LINES: usize = 512;
+
+    const CRASHING: &str = r#"#!/bin/sh
+echo "something went wrong in the CLI" >&2
+exit 3
+"#;
+
+    const CLAUDE_LEVEL_ERROR: &str = r#"#!/bin/sh
+printf '{"type":"system","subtype":"init","session_id":"s-err","model":"fixture-model"}\n'
+printf '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s-err","result":"the model refused"}\n'
+exit 0
+"#;
+
+    async fn bounded(label: &str, runner: &ClaudeRunner) -> Result<bool, String> {
+        match tokio::time::timeout(DEADLINE, runner.wait()).await {
+            Ok(result) => result,
+            Err(_) => panic!(
+                "{label}: wait() did not return within {DEADLINE:?}; the fixture exits on its own, \
+                 so the runner stopped making progress"
+            ),
+        }
+    }
+
+    /// The case the product acceptance journey hit: a process that is already
+    /// gone by the time anyone waits for it.
+    ///
+    /// Repeated, because a single pass proves nothing about a race. Each
+    /// iteration is a fresh process, so scheduling differs between them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_process_that_exits_immediately_is_still_waited_on_successfully() {
+        let fixture = Fixture::new(FAST);
+        for attempt in 0..40 {
+            let runner = fixture.start().await;
+            let ok = bounded(&format!("attempt {attempt}"), &runner).await;
+            assert_eq!(ok, Ok(true), "attempt {attempt} should succeed");
+            assert_eq!(
+                runner.get_output().await,
+                "done",
+                "attempt {attempt} should have the result text, which only the \
+                 stdout reader can produce"
+            );
+        }
+    }
+
+    /// The same case in the shape production uses.
+    ///
+    /// In the desktop app the queue loop is itself started with
+    /// `tauri::async_runtime::spawn`, so starting the runner, waiting for it and
+    /// reading its stdout all happen on Tauri's runtime. Doing only the wait
+    /// there would be a configuration the product never has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_immediate_exit_is_handled_on_the_runtime_production_uses() {
+        let fixture = Fixture::new(FAST);
+        for attempt in 0..40 {
+            let program = fixture.program.clone();
+            let config = fixture.config();
+            let handle = tauri::async_runtime::spawn(async move {
+                let runner = ClaudeRunner::start_program(&program, config)
+                    .await
+                    .map_err(|e| format!("fixture should spawn: {e}"))?;
+                tokio::time::timeout(DEADLINE, runner.wait())
+                    .await
+                    .map_err(|_| "wait() never returned".to_string())??;
+                Ok::<_, String>(runner.get_output().await)
+            });
+            let output = handle
+                .await
+                .expect("the waiting task should not panic")
+                .unwrap_or_else(|e| panic!("attempt {attempt} failed: {e}"));
+            assert_eq!(output, "done", "attempt {attempt} lost the result text");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn events_arriving_over_time_are_all_observed_before_wait_returns() {
+        let fixture = Fixture::new(STREAMING);
+        for attempt in 0..3 {
+            streaming_round(&fixture, attempt).await;
+        }
+    }
+
+    async fn streaming_round(fixture: &Fixture, attempt: usize) {
+        let runner = fixture.start().await;
+        let mut events = runner.subscribe();
+
+        let collector = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Ok(event) = events.recv().await {
+                seen.push(event);
+            }
+            seen
+        });
+
+        assert_eq!(
+            bounded(&format!("streaming {attempt}"), &runner).await,
+            Ok(true)
+        );
+
+        // The sender lives in the runner, so the collector only ends once the
+        // runner is dropped.
+        let output = runner.get_output().await;
+        drop(runner);
+        let seen = collector.await.expect("collector should not panic");
+
+        assert_eq!(
+            output, "alphabeta\ngamma",
+            "accumulated output should hold the assistant text, the delta and \
+             the result, in arrival order"
+        );
+
+        let kinds = seen.iter().map(describe).collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec!["system_init", "assistant_message", "text_delta", "result"],
+            "every event should have been broadcast, in order"
+        );
+
+        match seen.first() {
+            Some(ClaudeEvent::SystemInit {
+                session_id, model, ..
+            }) => {
+                assert_eq!(session_id, "s-stream");
+                assert_eq!(model.as_deref(), Some("fixture-model"));
+            }
+            other => panic!("expected a system init event first, got {other:?}"),
+        }
+    }
+
+    fn describe(event: &ClaudeEvent) -> &'static str {
+        match event {
+            ClaudeEvent::SystemInit { .. } => "system_init",
+            ClaudeEvent::TextDelta { .. } => "text_delta",
+            ClaudeEvent::ToolUse { .. } => "tool_use",
+            ClaudeEvent::AssistantMessage { .. } => "assistant_message",
+            ClaudeEvent::Result { .. } => "result",
+            ClaudeEvent::Error { .. } => "error",
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_process_that_outfills_the_pipe_still_finishes() {
+        let fixture = Fixture::new(CHATTY);
+        for attempt in 0..5 {
+            let runner = fixture.start().await;
+            assert_eq!(
+                bounded(&format!("chatty {attempt}"), &runner).await,
+                Ok(true)
+            );
+
+            let output = runner.get_output().await;
+            let expected = CHATTY_PAD * CHATTY_LINES;
+            assert!(
+                output.len() >= expected,
+                "attempt {attempt}: expected at least {expected} bytes of drained \
+                 stdout, got {}; anything less means the pipe was not consumed \
+                 while the process ran",
+                output.len()
+            );
+            assert!(
+                output.ends_with("\ndone"),
+                "the result should still arrive last"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_zero_exit_reports_the_exit_code_and_stderr() {
+        let fixture = Fixture::new(CRASHING);
+        for attempt in 0..10 {
+            let runner = fixture.start().await;
+            let error = bounded(&format!("crashing {attempt}"), &runner)
+                .await
+                .expect_err("a non-zero exit should be an error");
+            assert!(error.contains("Exit code 3"), "got: {error}");
+            assert!(
+                error.contains("something went wrong in the CLI"),
+                "got: {error}"
+            );
+            assert!(
+                runner.get_output().await.contains("--- STDERR ---"),
+                "stderr should also be appended to the accumulated output"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_successful_exit_carrying_an_error_result_is_still_an_error() {
+        let fixture = Fixture::new(CLAUDE_LEVEL_ERROR);
+        for attempt in 0..10 {
+            let runner = fixture.start().await;
+            let error = bounded(&format!("claude error {attempt}"), &runner)
+                .await
+                .expect_err("is_error should surface as an error");
+            assert_eq!(error, "the model refused");
+        }
     }
 }
