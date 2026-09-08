@@ -38,11 +38,18 @@ use thirtyfour::prelude::*;
 const EXECUTION_DEADLINE: Duration = Duration::from_secs(90);
 /// How long the board gets to render the finished task.
 const RENDER_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a stopped task is watched for signs of being started again.
+///
+/// Four ticks of the executor's own cadence: `polling_loop` sleeps three
+/// seconds between passes, so this is three complete opportunities to act on
+/// the task plus the one the stop itself may have landed inside.
+const RESTART_WINDOW: Duration = Duration::from_secs(12);
 const POLL: Duration = Duration::from_millis(250);
 
 /// The Kanban column for a status, as the board names it: the frontend builds
 /// the identifier with `format!("{:?}", status).to_lowercase()`.
 const HUMAN_REVIEW_COLUMN: &str = "[data-testid=\"column-humanreview\"]";
+const BACKLOG_COLUMN: &str = "[data-testid=\"column-backlog\"]";
 const ERROR_COLUMN: &str = "[data-testid=\"column-error\"]";
 const KANBAN_BOARD: &str = "[data-testid=\"kanban-board\"]";
 /// The title of one card, within whichever column is being read.
@@ -174,6 +181,342 @@ async fn retry_journey(context: &TestContext) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Prove what stopping a task does while its agent is still running.
+///
+/// Four claims, and the journey is only worth anything if it crosses the whole
+/// distance between them. The agent the user was looking at has to be gone —
+/// the actual process, named before the stop and looked for afterwards.
+/// Nothing may start the task again on its own, because a stop that quietly
+/// becomes a restart is not a stop. The task has to settle somewhere a person
+/// has to act on before it runs again, which is `backlog`, and it has to
+/// settle there on disk as well as in the board, or the next launch will
+/// disagree with what the user was just told. And nothing may be destroyed:
+/// the worktree, the branch and the work already in them all survive, because
+/// stopping is not discarding and the product has no operation that discards.
+///
+/// A stoppable run needs an agent that is still there to stop, which is what
+/// the fixture's blocking mode is for: it announces the process it is and then
+/// waits. Nothing else about the journey is arranged — the queue notices the
+/// task on its own tick, and the stop goes through the same command the
+/// frontend would invoke.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_a_running_task_ends_its_agent_and_does_not_restart_it() {
+    let context = TestContext::new("queue_task_cancellation").expect("harness setup");
+    let outcome = cancellation_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn cancellation_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+
+    let agent = FakeAgent::install(&root)?;
+    // Agent runs stay open until something ends them, so there is a real
+    // process to stop when the journey asks the product to stop one.
+    let release = agent.block_agent_runs()?;
+    context.set_child_env("PATH", agent.path_value());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
+    context.set_child_env(fake_agent::BLOCK_FIFO_VAR, &release);
+
+    pin_worktree_placement(&context.state().config_file())?;
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("cancellation").await?;
+    let outcome = stop_a_running_task(session.driver(), &agent, &repository, &root).await;
+
+    // A run the product ended is already gone, so there is normally nothing
+    // here to release. Anything still alive is a failure, and it is left
+    // exactly as it is: the session's own shutdown ends it along with the
+    // application, since it owns the process group and returns only once that
+    // group is gone. Releasing the runs here instead would let them finish and
+    // carry the task onward, overwriting the on-disk state a preserved failure
+    // exists to show.
+    context
+        .close_session(session, "cancellation", &outcome)
+        .await?;
+    outcome
+}
+
+/// What the journey saw in the interval after the stop was requested.
+struct AfterStop {
+    /// Whether the process the product was asked to stop is still running.
+    agent_alive: bool,
+    /// Agent runs that started after the stop.
+    runs: usize,
+    /// The processes those runs announced.
+    pids: Vec<u32>,
+}
+
+/// Start one real execution, stop it through the product's own command, and
+/// report every way the result departs from what the product says it does.
+///
+/// The violations are collected rather than raised one at a time. Stopping
+/// touches the process, the queue, the task and the disk at once, and a report
+/// that stopped at whichever of those broke first would describe a fraction of
+/// what happened and hide the rest until the next run.
+async fn stop_a_running_task(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    repository: &GitFixture,
+    root: &Path,
+) -> Result<()> {
+    ui::assert_frontend_is_real(driver).await?;
+
+    let Prerequisites {
+        project_id,
+        task_id,
+        title,
+    } = create_prerequisites(
+        driver,
+        repository,
+        "Cancellation journey",
+        "Exercises stopping a task while its agent is still running.",
+    )
+    .await?;
+
+    let already_ran = agent_runs(agent)?.len();
+    if already_ran != 0 {
+        bail!("the agent ran {already_ran} times before the task was ever started");
+    }
+
+    // --- A real execution, still running -----------------------------------
+    ui::invoke(
+        driver,
+        "update_task_status",
+        json!({ "taskId": task_id, "status": "in_progress" }),
+    )
+    .await?;
+
+    let agent_pid = await_one_blocked_agent(agent).await?;
+
+    // The process that announced itself belongs to the task run, not to the
+    // product asking what version is installed.
+    let runs = agent_runs(agent)?;
+    if runs.len() != 1 {
+        bail!(
+            "{} agent runs started before the stop, expected exactly one",
+            runs.len()
+        );
+    }
+    let invocation = &runs[0];
+    if invocation.flag("--output-format") != Some(OsStr::new("stream-json")) {
+        bail!(
+            "the agent was not invoked with the streaming protocol the runner parses: {:?}",
+            invocation.args
+        );
+    }
+    let prompt = invocation
+        .flag("-p")
+        .context("the agent was invoked without a prompt")?;
+    if prompt.is_empty() {
+        bail!("the agent was invoked with an empty prompt");
+    }
+
+    // And it ran where the product's own executions run.
+    let worktree_path = invocation.working_dir.clone();
+    let resolved_worktree = resolve(&worktree_path);
+    if !resolved_worktree.starts_with(resolve(repository.state_root())) {
+        bail!(
+            "the agent ran in {}, which is outside this run's state root {} — isolation is \
+             leaking",
+            worktree_path.display(),
+            repository.state_root().display()
+        );
+    }
+    if resolved_worktree == resolve(&repository.path_buf()) {
+        bail!("the agent ran in the repository itself instead of a task worktree");
+    }
+
+    if !agent.is_running(agent_pid) {
+        bail!(
+            "the agent process {agent_pid} was already gone before the stop was requested, so \
+             this journey would prove nothing about stopping it"
+        );
+    }
+
+    // --- The one action under test -----------------------------------------
+    //
+    // The command the frontend invokes, not the executor method behind it.
+    ui::invoke(driver, "stop_task_execution", json!({ "taskId": task_id })).await?;
+
+    // The phase the moment the stop returned, read through the product's own
+    // command. Reported rather than asserted: it is what tells a reader whether
+    // a later phase was left by the stop or written by something that ran after
+    // it, and the queue is free to have acted before this line.
+    let phase_at_stop =
+        ui::invoke(driver, "get_execution_status", json!({ "taskId": task_id })).await?;
+
+    let after = observe_after_stop(agent, agent_pid).await?;
+
+    // --- What the product now says about the task --------------------------
+    let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
+    let task = find_task(&listed, &task_id)
+        .context("the product no longer lists the task it was asked to stop")?;
+    let status = status_of(&task).unwrap_or("unreadable").to_string();
+    let phase = task
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or("unreadable")
+        .to_string();
+    let progress = task.get("phase_progress").and_then(Value::as_i64);
+    let branch = task
+        .get("branch_name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let mut broken: Vec<String> = Vec::new();
+
+    if after.agent_alive {
+        broken.push(format!(
+            "the agent process {agent_pid} is still running {}s after the product reported the \
+             stop as done — the user was told the run was over while it carried on working in \
+             the task's worktree",
+            RESTART_WINDOW.as_secs()
+        ));
+    }
+    if after.runs > 0 {
+        broken.push(format!(
+            "{} further agent run(s) started within {}s of the stop with no user action in \
+             between, as process(es) {:?} — nothing asked for this work again",
+            after.runs,
+            RESTART_WINDOW.as_secs(),
+            after.pids
+        ));
+    }
+    if status != "backlog" {
+        broken.push(format!(
+            "the task settled at status {status:?}; a stopped task belongs in `backlog`, the \
+             one place the queue will not start it from without someone asking"
+        ));
+    }
+    if phase != "idle" {
+        broken.push(format!(
+            "the task settled at phase {phase:?}; the run it names is not happening any more"
+        ));
+    }
+    if progress != Some(0) {
+        broken.push(format!(
+            "the task reports {progress:?} phase progress for a run that was stopped"
+        ));
+    }
+
+    // Nothing may be destroyed. Stopping is not discarding, and the product has
+    // no operation that discards.
+    if !worktree_path.is_dir() {
+        broken.push(format!(
+            "the worktree {} the agent was working in no longer exists",
+            worktree_path.display()
+        ));
+    }
+    match &branch {
+        Some(name) if !repository.has_branch(name)? => broken.push(format!(
+            "the task still records branch {name} but the branch no longer exists"
+        )),
+        Some(_) => {}
+        None => broken.push(
+            "the task records no branch, so the work the stopped run had produced can no longer \
+             be found"
+                .to_string(),
+        ),
+    }
+
+    // The state the product reports has to be the state on disk, proven the
+    // same structural way every other journey proves it.
+    let executed = ExecutedTask {
+        id: task_id.clone(),
+        title: title.clone(),
+        worktree_path: worktree_path.clone(),
+    };
+    if let Err(error) = assert_persisted(root, &executed, &status) {
+        broken.push(format!(
+            "the state the product reports is not the state on disk: {error:#}"
+        ));
+    }
+
+    // And a user has to be able to see where the task ended up.
+    if let Err(error) = show_on_board(driver, &project_id, BACKLOG_COLUMN, &title).await {
+        broken.push(format!(
+            "the board does not show the stopped task: {error:#}"
+        ));
+    }
+
+    if !broken.is_empty() {
+        bail!(
+            "stopping a running task did not do what the product says it does:\n  - {}\n\nthe \
+             product reported phase {phase_at_stop} the moment the stop returned, and the agent \
+             it was asked to stop was process {agent_pid}",
+            broken.join("\n  - ")
+        );
+    }
+
+    Ok(())
+}
+
+/// Wait until exactly one agent run has started and announced its process.
+async fn await_one_blocked_agent(agent: &FakeAgent) -> Result<u32> {
+    let started = Instant::now();
+    loop {
+        let pids = agent.blocked_pids()?;
+        match pids.as_slice() {
+            [] => {}
+            [only] => return Ok(*only),
+            several => bail!(
+                "{} agent runs started at once, expected one: {several:?}",
+                several.len()
+            ),
+        }
+        if started.elapsed() > EXECUTION_DEADLINE {
+            bail!(
+                "no agent run announced itself within {}s of the task moving to in_progress; the \
+                 fixture records in {}",
+                EXECUTION_DEADLINE.as_secs(),
+                agent.marker_dir().display()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Watch for one bounded interval after the stop.
+///
+/// The interval is spent in full, because half of what it establishes is a
+/// negative: nothing may start the task again. Its length comes from the
+/// executor's own cadence rather than from a guess — `polling_loop` sleeps
+/// three seconds between passes, so four ticks is three complete opportunities
+/// to act on the task plus the one the stop itself may have landed inside.
+///
+/// A process cannot come back once it is gone, so one look at the end is the
+/// whole question about the stopped agent; the interval is what makes the
+/// answer about the queue mean anything.
+async fn observe_after_stop(agent: &FakeAgent, stopped: u32) -> Result<AfterStop> {
+    tokio::time::sleep(RESTART_WINDOW).await;
+
+    let pids: Vec<u32> = agent
+        .blocked_pids()?
+        .into_iter()
+        .filter(|pid| *pid != stopped)
+        .collect();
+
+    Ok(AfterStop {
+        agent_alive: agent.is_running(stopped),
+        // Counted from the invocation records rather than from the announced
+        // processes: a run that started and has not reached its announcement
+        // yet is still a run that started.
+        runs: agent_runs(agent)?.len().saturating_sub(1),
+        pids,
+    })
+}
+
+/// Open the board and confirm a card with this title is in this column.
+async fn show_on_board(
+    driver: &WebDriver,
+    project_id: &str,
+    column: &str,
+    title: &str,
+) -> Result<()> {
+    open_board(driver, project_id).await?;
+    assert_card_in_column(driver, column, title).await
 }
 
 async fn fail_then_retry(
