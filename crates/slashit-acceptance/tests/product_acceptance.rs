@@ -616,44 +616,68 @@ async fn execute_one_task(
 /// path that would quietly stop proving anything the day it moved.
 fn assert_persisted(root: &Path, task: &ExecutedTask, status: &str) -> Result<()> {
     let mut examined = 0usize;
-    let mut holding: Vec<PathBuf> = Vec::new();
+    let mut found_as: Vec<String> = Vec::new();
     for file in toml_files(root)? {
         let Ok(contents) = std::fs::read_to_string(&file) else {
             continue;
         };
         examined += 1;
-        if !contents.contains(&task.id) {
+        // A state root holds more than the task store, and not every file in it
+        // has to parse for this assertion to mean something.
+        let Ok(document) = contents.parse::<toml::Value>() else {
             continue;
-        }
-        holding.push(file);
-        // One file carrying the id, the title and the settled status is the
+        };
+        let Some(record) = task_record(&document, &task.id) else {
+            continue;
+        };
+        let title = record.get("title").and_then(toml::Value::as_str);
+        let recorded = record.get("status").and_then(toml::Value::as_str);
+        // One record carrying the id, the title and the settled status is the
         // whole claim. Others may exist — the store has had more than one
         // layout — and an older one lagging behind is not evidence that this
         // state was never written.
-        if contents.contains(&task.title) && contents.contains(status) {
+        if title == Some(task.title.as_str()) && recorded == Some(status) {
             return Ok(());
         }
+        found_as.push(format!(
+            "{} records it as {title:?} with status {recorded:?}",
+            file.display()
+        ));
     }
 
-    if holding.is_empty() {
+    if found_as.is_empty() {
         bail!(
-            "no file under {} mentions task {} — nothing was persisted ({examined} TOML files \
-             examined)",
+            "no file under {} holds a task record with id {} — nothing was persisted ({examined} \
+             TOML files examined)",
             root.display(),
             task.id
         );
     }
 
     bail!(
-        "task {} is recorded in {} but no file carries its title and the status {status:?}, so \
-         the state the application reported never reached the disk",
+        "task {} is persisted, but not as the state the application reported — expected the title \
+         {:?} with status {status:?}, and {}",
         task.id,
-        holding
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        task.title,
+        found_as.join("; ")
     )
+}
+
+/// The stored record for `id` in one parsed task store, if it holds one.
+///
+/// `Storage::save_project_tasks` writes a `version` and an array of tasks, so
+/// one file routinely holds several. That is why this reads the array and
+/// matches on the record's own `id` rather than looking for the values anywhere
+/// in the document: a file can perfectly well contain the wanted id, the wanted
+/// title and the wanted status while no single task has all three, and a proof
+/// that cannot tell those apart is not proving the task was persisted.
+fn task_record<'a>(document: &'a toml::Value, id: &str) -> Option<&'a toml::value::Table> {
+    document
+        .get("tasks")?
+        .as_array()?
+        .iter()
+        .filter_map(toml::Value::as_table)
+        .find(|record| record.get("id").and_then(toml::Value::as_str) == Some(id))
 }
 
 /// Every `.toml` under `root`, recursively.
@@ -1138,6 +1162,115 @@ mod tests {
                 .iter()
                 .map(OsString::from)
                 .collect(),
+        }
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "slashit-persistence-{}-{}-{label}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        dir
+    }
+
+    /// A store written the way `Storage::save_project_tasks` writes one.
+    fn store(root: &Path, records: &[(&str, &str, &str)]) -> PathBuf {
+        let mut document = String::from("version = 1\n");
+        for (id, title, status) in records {
+            document.push_str(&format!(
+                "\n[[tasks]]\nid = \"{id}\"\ntitle = \"{title}\"\nstatus = \"{status}\"\n"
+            ));
+        }
+        let file = root.join("tasks.toml");
+        std::fs::write(&file, document).expect("write the task store");
+        file
+    }
+
+    fn executed(id: &str, title: &str) -> ExecutedTask {
+        ExecutedTask {
+            id: id.to_string(),
+            title: title.to_string(),
+            worktree_path: PathBuf::from("/tmp/wt/task-abcd1234"),
+        }
+    }
+
+    /// The state the journeys actually assert: one record holding all three.
+    #[test]
+    fn a_record_carrying_the_id_title_and_status_together_is_the_proof() {
+        let root = scratch("settled");
+        store(
+            &root,
+            &[
+                ("11111111-aaaa", "some other task", "backlog"),
+                ("22222222-bbbb", "the task under test", "human_review"),
+            ],
+        );
+
+        assert!(assert_persisted(
+            &root,
+            &executed("22222222-bbbb", "the task under test"),
+            "human_review"
+        )
+        .is_ok());
+    }
+
+    /// The proof this helper exists to make impossible. Neither record is the
+    /// task the journey settled: one has its id under a different title and
+    /// status, the other has the title and status under a different id. Read as
+    /// loose strings the file contains every value being looked for, which is
+    /// exactly why looking for loose strings proved nothing.
+    #[test]
+    fn values_split_across_two_records_are_not_a_persisted_task() {
+        let root = scratch("split");
+        store(
+            &root,
+            &[
+                ("22222222-bbbb", "some other task", "backlog"),
+                ("11111111-aaaa", "the task under test", "human_review"),
+            ],
+        );
+
+        assert!(
+            assert_persisted(
+                &root,
+                &executed("22222222-bbbb", "the task under test"),
+                "human_review"
+            )
+            .is_err(),
+            "a task's id, title and status were read from different records"
+        );
+    }
+
+    /// Rejections that would otherwise look like the settled state.
+    #[test]
+    fn a_record_that_does_not_match_is_not_the_proof() {
+        let root = scratch("mismatched");
+        store(
+            &root,
+            &[("22222222-bbbb", "the task under test", "in_progress")],
+        );
+
+        for (case, id, status) in [
+            (
+                "the task was never written at all",
+                "33333333-cccc",
+                "human_review",
+            ),
+            (
+                "the record settled at another status",
+                "22222222-bbbb",
+                "human_review",
+            ),
+        ] {
+            assert!(
+                assert_persisted(&root, &executed(id, "the task under test"), status).is_err(),
+                "{case} was accepted as proof of the settled state"
+            );
         }
     }
 
