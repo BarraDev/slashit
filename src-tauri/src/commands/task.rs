@@ -389,10 +389,7 @@ pub async fn update_task_status(
                 // `worktree_path` and `branch_name` survive on purpose: the
                 // next execution reattaches to them. See
                 // `StatusTransitionEffect`.
-                task.phase = TaskPhase::Idle;
-                task.phase_progress = 0;
-                task.overall_progress = 0;
-                task.error_message = None;
+                task.reset_execution_state();
             }
             StatusTransitionEffect::CleanUpWorktree => {
                 // Keep branch_name for PR creation.
@@ -855,10 +852,7 @@ pub async fn reorder_task(
                 StatusTransitionEffect::ResetExecutionState => {
                     // Worktree and branch preserved; see
                     // `StatusTransitionEffect`.
-                    task.phase = TaskPhase::Idle;
-                    task.phase_progress = 0;
-                    task.overall_progress = 0;
-                    task.error_message = None;
+                    task.reset_execution_state();
                 }
                 StatusTransitionEffect::CleanUpWorktree => {
                     // Keep branch_name for PR creation.
@@ -946,10 +940,7 @@ pub fn update_task_status_logic(
         task.updated_at = chrono::Utc::now();
 
         if let StatusTransitionEffect::ResetExecutionState = classify_status_transition(&old_status, &status) {
-            task.phase = TaskPhase::Idle;
-            task.phase_progress = 0;
-            task.overall_progress = 0;
-            task.error_message = None;
+            task.reset_execution_state();
         }
 
         Some(task.clone())
@@ -1052,10 +1043,7 @@ pub fn reorder_task_logic(
             if let StatusTransitionEffect::ResetExecutionState =
                 classify_status_transition(&old_status, &target_status)
             {
-                task.phase = TaskPhase::Idle;
-                task.phase_progress = 0;
-                task.overall_progress = 0;
-                task.error_message = None;
+                task.reset_execution_state();
             }
         }
         task.updated_at = chrono::Utc::now();
