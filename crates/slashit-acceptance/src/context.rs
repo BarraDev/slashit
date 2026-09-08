@@ -11,7 +11,8 @@ use crate::driver::Session;
 use crate::process;
 use crate::state::{claim_unique, StateRoot};
 use anyhow::{bail, Context, Result};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Where the harness finds the things it does not build itself.
@@ -84,6 +85,15 @@ pub struct TestContext {
     state: StateRoot,
     artifacts: PathBuf,
     sessions_started: Cell<usize>,
+    /// Extra variables for the application process tree, on top of the ones
+    /// the state root sets.
+    ///
+    /// Deliberately a list of pairs rather than anything cleverer: the only
+    /// thing a journey has needed so far is a `PATH` whose `claude` is a
+    /// fixture instead of the developer's real one, and a mechanism that can
+    /// only add named variables to one command cannot grow into a way of
+    /// reaching into the application.
+    child_env: RefCell<Vec<(OsString, OsString)>>,
 }
 
 impl TestContext {
@@ -111,11 +121,24 @@ impl TestContext {
             state,
             artifacts,
             sessions_started: Cell::new(0),
+            child_env: RefCell::new(Vec::new()),
         })
     }
 
     pub fn state(&self) -> &StateRoot {
         &self.state
+    }
+
+    /// Set a variable every session started after this call launches the
+    /// application with.
+    ///
+    /// Sessions already running keep the environment they were started with,
+    /// which is what makes a restart journey able to change one.
+    pub fn set_child_env(&self, key: impl Into<OsString>, value: impl Into<OsString>) {
+        let key = key.into();
+        let mut env = self.child_env.borrow_mut();
+        env.retain(|(existing, _)| existing != &key);
+        env.push((key, value.into()));
     }
 
     /// Launch the application against this context's state root.
@@ -128,7 +151,10 @@ impl TestContext {
         let log = self
             .artifacts
             .join(format!("{index}-{label}-provider.log"));
-        Session::start(&self.environment, &self.state, log)
+        // Copied out before the await: holding the borrow across it would let
+        // a `set_child_env` from another task panic the whole run.
+        let child_env = self.child_env.borrow().clone();
+        Session::start(&self.environment, &self.state, log, &child_env)
             .await
             .with_context(|| format!("could not start session {index} ({label})"))
     }
