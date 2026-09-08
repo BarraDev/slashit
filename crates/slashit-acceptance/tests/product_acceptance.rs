@@ -213,9 +213,13 @@ async fn fail_then_retry(
     // tells the two runs apart later. Records are named by `mktemp` and read
     // back in name order, which is unique but not chronological, so position
     // in that list proves nothing about which run came first.
+    // An empty value is as unusable here as a missing one: it identifies no
+    // execution, and taking it would make every later comparison against it
+    // meaningless while still looking like a session.
     let failed_session = first_run[0]
         .flag("--session-id")
-        .context("the failed run carried no --session-id to tell the retry apart from")?
+        .filter(|session| !session.is_empty())
+        .context("the failed run carried no usable --session-id to tell the retry apart from")?
         .to_os_string();
     let failed_worktree = resolve(&first_run[0].working_dir);
     if !failed_worktree.starts_with(resolve(repository.state_root())) {
@@ -940,10 +944,13 @@ fn agent_runs(agent: &FakeAgent) -> Result<Vec<fake_agent::Invocation>> {
 /// about the retry would still pass while describing the attempt it retried.
 ///
 /// The executor gives each execution a fresh session id, so that is the one
-/// value the two runs cannot share, and identity is what this selects on. A run
-/// carrying no session id is not a candidate: absence is not a different
-/// identity, and accepting it would let the journey keep passing if the
-/// executor ever stopped giving the retry a session of its own.
+/// value the two runs cannot share, and identity is what this selects on. A
+/// candidate has to carry an identity of its own to be one: the runner omits
+/// the flag entirely for a `None` session and passes it empty for an empty one,
+/// so both are shapes the product can really produce, and neither is a
+/// different identity. Accepting either would let the journey keep passing on
+/// the day the executor stopped giving a retry a session of its own — the one
+/// thing this selection exists to notice.
 fn retry_among<'a>(
     runs: &'a [fake_agent::Invocation],
     failed_session: &OsStr,
@@ -953,7 +960,7 @@ fn retry_among<'a>(
         .filter(|run| {
             matches!(
                 run.flag("--session-id"),
-                Some(session) if session != failed_session
+                Some(session) if !session.is_empty() && session != failed_session
             )
         })
         .collect();
@@ -1134,6 +1141,15 @@ mod tests {
         }
     }
 
+    /// What the runner produces for a `None` session: the flag is not passed at
+    /// all, rather than passed with nothing after it.
+    fn run_without_a_session(working_dir: &str) -> fake_agent::Invocation {
+        fake_agent::Invocation {
+            working_dir: PathBuf::from(working_dir),
+            args: ["-p", "do the work"].iter().map(OsString::from).collect(),
+        }
+    }
+
     /// The selection has to survive the records arriving in an order that says
     /// nothing about when they ran, because that is the only order the fixture
     /// guarantees. Reversed here on purpose: positional selection would return
@@ -1162,49 +1178,52 @@ mod tests {
         }
     }
 
-    /// Two runs reporting one session would mean the journey cannot say which
-    /// execution it is describing, so it must not quietly pick either.
+    /// Everything the retry is not, read together, because the ways this can go
+    /// wrong are variations on one idea: a record the journey cannot show to be
+    /// a second execution with an identity of its own. Each row would otherwise
+    /// be selected and then satisfy every remaining assertion in the stage,
+    /// since both attempts of a retried task share a worktree and a set of
+    /// flags — which is what makes these quiet rather than loud.
     #[test]
-    fn an_indistinguishable_pair_of_runs_is_refused() {
-        let failed = OsString::from("session-of-the-failure");
-        let runs = vec![
-            run("session-of-the-failure", "/tmp/wt/task-abcd1234"),
-            run("session-of-the-failure", "/tmp/wt/task-abcd1234"),
-        ];
-
-        assert!(retry_among(&runs, &failed).is_err());
-    }
-
-    /// A run with no session id is not a distinct execution, it is an execution
-    /// the journey cannot identify at all. Accepting it would mean the stage
-    /// still passed on the day the executor stopped giving the retry a session
-    /// of its own — the very thing the identity check exists to notice.
-    #[test]
-    fn a_run_without_a_session_is_not_the_retry() {
+    fn no_run_without_an_identity_of_its_own_is_taken_as_the_retry() {
         let failed = OsString::from("session-of-the-failure");
         let shared_worktree = "/tmp/wt/task-abcd1234";
-        let runs = vec![
-            run("session-of-the-failure", shared_worktree),
-            fake_agent::Invocation {
-                working_dir: PathBuf::from(shared_worktree),
-                args: ["-p", "do the work"].iter().map(OsString::from).collect(),
-            },
-        ];
 
-        assert!(retry_among(&runs, &failed).is_err());
-    }
-
-    /// More retries than the journey arranged means something ran that it did
-    /// not account for, which is not something to select a "the" retry from.
-    #[test]
-    fn more_than_one_unexpected_run_is_refused() {
-        let failed = OsString::from("session-of-the-failure");
-        let runs = vec![
-            run("session-of-the-failure", "/tmp/wt/task-abcd1234"),
-            run("session-of-the-retry", "/tmp/wt/task-abcd1234"),
-            run("session-of-something-else", "/tmp/wt/task-abcd1234"),
-        ];
-
-        assert!(retry_among(&runs, &failed).is_err());
+        for (case, runs) in [
+            (
+                "a candidate that never reported a session",
+                vec![
+                    run("session-of-the-failure", shared_worktree),
+                    run_without_a_session(shared_worktree),
+                ],
+            ),
+            (
+                "a candidate whose session is empty",
+                vec![
+                    run("session-of-the-failure", shared_worktree),
+                    run("", shared_worktree),
+                ],
+            ),
+            (
+                "two runs reporting the failed attempt's own session",
+                vec![
+                    run("session-of-the-failure", shared_worktree),
+                    run("session-of-the-failure", shared_worktree),
+                ],
+            ),
+            (
+                "more separately identified runs than the journey arranged",
+                vec![
+                    run("session-of-the-failure", shared_worktree),
+                    run("session-of-the-retry", shared_worktree),
+                    run("session-of-something-else", shared_worktree),
+                ],
+            ),
+        ] {
+            assert!(
+                retry_among(&runs, &failed).is_err(),
+                "{case} was accepted as the retry"
+            );
+        }
     }
 }
