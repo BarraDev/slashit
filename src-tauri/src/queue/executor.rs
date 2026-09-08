@@ -318,7 +318,7 @@ impl TaskExecutor {
                             let state = json.get("state").and_then(|s| s.as_str()).unwrap_or("");
 
                             // Update the ExternalRef state
-                            let mut pending_worktree_removal: Option<(String, String)> = None;
+                            let mut pending_worktree_removal: Option<String> = None;
                             {
                                 let mut tasks_w = self.tasks.write().await;
                                 if let Some(t) = tasks_w.get_mut(&task_id) {
@@ -342,8 +342,7 @@ impl TaskExecutor {
                                             // below actually succeeds, so a crash or a
                                             // failed removal leaves it in place for retry.
                                             if let Some(wt_path) = t.worktree_path.clone() {
-                                                let branch = t.branch_name.clone().unwrap_or_default();
-                                                pending_worktree_removal = Some((wt_path, branch));
+                                                pending_worktree_removal = Some(wt_path);
                                             }
                                         }
                                         "CLOSED" => {
@@ -356,8 +355,8 @@ impl TaskExecutor {
 
                             // Spawned after `tasks_w` is dropped above, since
                             // `spawn_worktree_cleanup` takes its own locks.
-                            if let Some((wt_path, branch)) = pending_worktree_removal {
-                                self.spawn_worktree_cleanup(task_id, wt_path, branch).await;
+                            if let Some(wt_path) = pending_worktree_removal {
+                                self.spawn_worktree_cleanup(task_id, wt_path).await;
                             }
 
                             if state == "MERGED" {
@@ -393,8 +392,8 @@ impl TaskExecutor {
                 let in_flight = self.cleanup_in_flight.read().await;
                 Self::tasks_eligible_for_cleanup_retry(&tasks, &in_flight)
             };
-            for (task_id, wt_path, branch) in cleanup_retries {
-                self.spawn_worktree_cleanup(task_id, wt_path, branch).await;
+            for (task_id, wt_path) in cleanup_retries {
+                self.spawn_worktree_cleanup(task_id, wt_path).await;
             }
         }
     }
@@ -406,15 +405,12 @@ impl TaskExecutor {
     fn tasks_eligible_for_cleanup_retry(
         tasks: &HashMap<Uuid, Task>,
         in_flight: &std::collections::HashSet<Uuid>,
-    ) -> Vec<(Uuid, String, String)> {
+    ) -> Vec<(Uuid, String)> {
         tasks
             .values()
             .filter(|t| t.status == TaskStatus::Done)
             .filter(|t| !in_flight.contains(&t.id))
-            .filter_map(|t| {
-                let wt_path = t.worktree_path.clone()?;
-                Some((t.id, wt_path, t.branch_name.clone().unwrap_or_default()))
-            })
+            .filter_map(|t| Some((t.id, t.worktree_path.clone()?)))
             .collect()
     }
 
@@ -451,10 +447,9 @@ impl TaskExecutor {
         storage: &crate::config::Storage,
         task_id: Uuid,
         wt_path: &str,
-        branch: &str,
         repo_path: &str,
     ) -> Result<(), String> {
-        wt_mgr.remove(wt_path, branch, repo_path).await?;
+        wt_mgr.remove(wt_path, repo_path).await?;
 
         // Persist before publishing. Shared with the status-change and delete
         // cleanup path in `commands::task`, which had the identical defect:
@@ -470,7 +465,7 @@ impl TaskExecutor {
     /// retry pass in [`check_and_execute`](Self::check_and_execute) for a
     /// task whose earlier attempt failed — `worktree_path` stays set on
     /// failure, so the next maintenance pass finds it eligible again.
-    async fn spawn_worktree_cleanup(&self, task_id: Uuid, wt_path: String, branch: String) {
+    async fn spawn_worktree_cleanup(&self, task_id: Uuid, wt_path: String) {
         if !Self::try_reserve_cleanup(&self.cleanup_in_flight, task_id).await {
             return; // already retrying this task's worktree
         }
@@ -507,7 +502,7 @@ impl TaskExecutor {
 
         tokio::spawn(async move {
             match Self::attempt_worktree_cleanup(
-                &wt_mgr, &tasks, &storage, task_id, &wt_path, &branch, &repo_path,
+                &wt_mgr, &tasks, &storage, task_id, &wt_path, &repo_path,
             )
             .await
             {
@@ -2507,7 +2502,7 @@ mod tests {
 
         assert_eq!(
             result,
-            vec![(eligible_id, "/tmp/eligible".to_string(), "eligible-branch".to_string())],
+            vec![(eligible_id, "/tmp/eligible".to_string())],
             "only the Done task with a retained worktree_path and no in-flight attempt must be eligible"
         );
     }
@@ -2545,7 +2540,6 @@ mod tests {
             &storage,
             task_id,
             &wt_path,
-            "some-branch",
             repo_temp.path().to_str().unwrap(),
         )
         .await;
@@ -2576,7 +2570,6 @@ mod tests {
             &storage,
             task_id,
             &wt_path,
-            "some-branch",
             repo_temp.path().to_str().unwrap(),
         )
         .await;
@@ -2678,7 +2671,7 @@ mod tests {
         let blocker = block_task_persistence(&storage);
 
         let result = TaskExecutor::attempt_worktree_cleanup(
-            &wt_mgr, &tasks, &storage, task_id, &wt_path, "task-branch", &repo_path,
+            &wt_mgr, &tasks, &storage, task_id, &wt_path, &repo_path,
         )
         .await;
 
@@ -2697,7 +2690,7 @@ mod tests {
                 &std::collections::HashSet::new(),
             )
             .iter()
-            .any(|(id, _, _)| *id == task_id),
+            .any(|(id, _)| *id == task_id),
             "the task must remain eligible for a later retry"
         );
 
@@ -2706,7 +2699,7 @@ mod tests {
         std::fs::remove_file(&blocker).expect("unblock persistence");
 
         TaskExecutor::attempt_worktree_cleanup(
-            &wt_mgr, &tasks, &storage, task_id, &wt_path, "task-branch", &repo_path,
+            &wt_mgr, &tasks, &storage, task_id, &wt_path, &repo_path,
         )
         .await
         .expect("the retry must succeed once the board can be saved");
@@ -2746,7 +2739,7 @@ mod tests {
         ])));
 
         TaskExecutor::attempt_worktree_cleanup(
-            &wt_mgr, &tasks, &storage, target_id, &wt_path, "task-branch", &repo_path,
+            &wt_mgr, &tasks, &storage, target_id, &wt_path, &repo_path,
         )
         .await
         .expect("cleanup should succeed");
@@ -2783,7 +2776,7 @@ mod tests {
         let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
 
         TaskExecutor::attempt_worktree_cleanup(
-            &wt_mgr, &tasks, &storage, task_id, &wt_path, "task-branch", &repo_path,
+            &wt_mgr, &tasks, &storage, task_id, &wt_path, &repo_path,
         )
         .await
         .expect("the stale cleanup itself is not a failure");
