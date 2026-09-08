@@ -209,6 +209,14 @@ async fn fail_then_retry(
     .await?;
 
     let first_run = await_agent_runs(agent, 1).await?;
+    // The executor gives every execution a fresh session id, so this is what
+    // tells the two runs apart later. Records are named by `mktemp` and read
+    // back in name order, which is unique but not chronological, so position
+    // in that list proves nothing about which run came first.
+    let failed_session = first_run[0]
+        .flag("--session-id")
+        .context("the failed run carried no --session-id to tell the retry apart from")?
+        .to_os_string();
     let failed_worktree = resolve(&first_run[0].working_dir);
     if !failed_worktree.starts_with(resolve(repository.state_root())) {
         bail!(
@@ -353,7 +361,7 @@ async fn fail_then_retry(
             runs.len() - 1
         );
     }
-    let second_run = &runs[1];
+    let second_run = retry_among(&runs, &failed_session)?;
     if second_run.flag("--output-format") != Some(OsStr::new("stream-json")) {
         bail!(
             "the retried run did not use the streaming protocol the runner parses: {:?}",
@@ -922,6 +930,40 @@ fn agent_runs(agent: &FakeAgent) -> Result<Vec<fake_agent::Invocation>> {
         .collect())
 }
 
+/// The run that is not the one `failed_session` identifies.
+///
+/// Records are read back in file-name order, and the fixture names them with
+/// `mktemp`, which is unique but not monotonic — so the position of a record in
+/// `runs` says nothing about when it ran. Both attempts of a retried task also
+/// share a worktree and a set of flags, which is what makes picking the wrong
+/// one dangerous rather than merely wrong: every assertion the journey makes
+/// about the retry would still pass while describing the attempt it retried.
+///
+/// The executor gives each execution a fresh session id, so that is the one
+/// value the two runs cannot share, and identity is what this selects on.
+fn retry_among<'a>(
+    runs: &'a [fake_agent::Invocation],
+    failed_session: &OsStr,
+) -> Result<&'a fake_agent::Invocation> {
+    let retries: Vec<&fake_agent::Invocation> = runs
+        .iter()
+        .filter(|run| run.flag("--session-id") != Some(failed_session))
+        .collect();
+
+    match retries.as_slice() {
+        [only] => Ok(only),
+        [] => bail!(
+            "every agent run reports session {failed_session:?}, so the retry cannot be told \
+             apart from the attempt it was retrying"
+        ),
+        many => bail!(
+            "{} agent runs carry a session other than the failed attempt's, expected exactly one \
+             retry",
+            many.len()
+        ),
+    }
+}
+
 fn created_id(value: Value, command: &str) -> Result<String> {
     value
         .get("id")
@@ -1067,4 +1109,75 @@ fn git(dir: &Path, args: &[&str]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn run(session: &str, working_dir: &str) -> fake_agent::Invocation {
+        fake_agent::Invocation {
+            working_dir: PathBuf::from(working_dir),
+            args: ["-p", "do the work", "--session-id", session]
+                .iter()
+                .map(OsString::from)
+                .collect(),
+        }
+    }
+
+    /// The selection has to survive the records arriving in an order that says
+    /// nothing about when they ran, because that is the only order the fixture
+    /// guarantees. Reversed here on purpose: positional selection would return
+    /// the failed attempt and every assertion downstream would still pass.
+    #[test]
+    fn the_retry_is_found_by_session_whatever_order_the_records_arrive_in() {
+        let failed = OsString::from("session-of-the-failure");
+        let shared_worktree = "/tmp/wt/task-abcd1234";
+
+        for runs in [
+            vec![
+                run("session-of-the-failure", shared_worktree),
+                run("session-of-the-retry", shared_worktree),
+            ],
+            vec![
+                run("session-of-the-retry", shared_worktree),
+                run("session-of-the-failure", shared_worktree),
+            ],
+        ] {
+            let retry = retry_among(&runs, &failed).expect("one run is not the failed attempt");
+            assert_eq!(
+                retry.flag("--session-id"),
+                Some(OsStr::new("session-of-the-retry")),
+                "the retry was selected by position rather than by session"
+            );
+        }
+    }
+
+    /// Two runs reporting one session would mean the journey cannot say which
+    /// execution it is describing, so it must not quietly pick either.
+    #[test]
+    fn an_indistinguishable_pair_of_runs_is_refused() {
+        let failed = OsString::from("session-of-the-failure");
+        let runs = vec![
+            run("session-of-the-failure", "/tmp/wt/task-abcd1234"),
+            run("session-of-the-failure", "/tmp/wt/task-abcd1234"),
+        ];
+
+        assert!(retry_among(&runs, &failed).is_err());
+    }
+
+    /// More retries than the journey arranged means something ran that it did
+    /// not account for, which is not something to select a "the" retry from.
+    #[test]
+    fn more_than_one_unexpected_run_is_refused() {
+        let failed = OsString::from("session-of-the-failure");
+        let runs = vec![
+            run("session-of-the-failure", "/tmp/wt/task-abcd1234"),
+            run("session-of-the-retry", "/tmp/wt/task-abcd1234"),
+            run("session-of-something-else", "/tmp/wt/task-abcd1234"),
+        ];
+
+        assert!(retry_among(&runs, &failed).is_err());
+    }
 }
