@@ -5321,6 +5321,7 @@ dependencies = [
  "serde_json",
  "thirtyfour",
  "tokio",
+ "toml 0.8.2",
 ]
 
 [[package]]
