@@ -940,21 +940,29 @@ fn agent_runs(agent: &FakeAgent) -> Result<Vec<fake_agent::Invocation>> {
 /// about the retry would still pass while describing the attempt it retried.
 ///
 /// The executor gives each execution a fresh session id, so that is the one
-/// value the two runs cannot share, and identity is what this selects on.
+/// value the two runs cannot share, and identity is what this selects on. A run
+/// carrying no session id is not a candidate: absence is not a different
+/// identity, and accepting it would let the journey keep passing if the
+/// executor ever stopped giving the retry a session of its own.
 fn retry_among<'a>(
     runs: &'a [fake_agent::Invocation],
     failed_session: &OsStr,
 ) -> Result<&'a fake_agent::Invocation> {
     let retries: Vec<&fake_agent::Invocation> = runs
         .iter()
-        .filter(|run| run.flag("--session-id") != Some(failed_session))
+        .filter(|run| {
+            matches!(
+                run.flag("--session-id"),
+                Some(session) if session != failed_session
+            )
+        })
         .collect();
 
     match retries.as_slice() {
         [only] => Ok(only),
         [] => bail!(
-            "every agent run reports session {failed_session:?}, so the retry cannot be told \
-             apart from the attempt it was retrying"
+            "no agent run carries a session of its own other than {failed_session:?}, so the \
+             retry cannot be told apart from the attempt it was retrying"
         ),
         many => bail!(
             "{} agent runs carry a session other than the failed attempt's, expected exactly one \
@@ -1162,6 +1170,25 @@ mod tests {
         let runs = vec![
             run("session-of-the-failure", "/tmp/wt/task-abcd1234"),
             run("session-of-the-failure", "/tmp/wt/task-abcd1234"),
+        ];
+
+        assert!(retry_among(&runs, &failed).is_err());
+    }
+
+    /// A run with no session id is not a distinct execution, it is an execution
+    /// the journey cannot identify at all. Accepting it would mean the stage
+    /// still passed on the day the executor stopped giving the retry a session
+    /// of its own — the very thing the identity check exists to notice.
+    #[test]
+    fn a_run_without_a_session_is_not_the_retry() {
+        let failed = OsString::from("session-of-the-failure");
+        let shared_worktree = "/tmp/wt/task-abcd1234";
+        let runs = vec![
+            run("session-of-the-failure", shared_worktree),
+            fake_agent::Invocation {
+                working_dir: PathBuf::from(shared_worktree),
+                args: ["-p", "do the work"].iter().map(OsString::from).collect(),
+            },
         ];
 
         assert!(retry_among(&runs, &failed).is_err());
