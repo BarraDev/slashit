@@ -1,0 +1,120 @@
+#!/bin/sh
+# A stand-in for the Claude Code CLI, used by the SlashIt acceptance journeys.
+# It never contacts a model. It records how it was called and emits the
+# smallest stream-json exchange the real runner treats as a success.
+set -e
+
+if [ -z "$SLASHIT_FAKE_AGENT_MARKERS" ]; then
+    echo "fake claude: SLASHIT_FAKE_AGENT_MARKERS is not set" >&2
+    exit 97
+fi
+
+# Written in a staging directory and moved into place, because the test polls
+# this directory while the agent is running: `mktemp` creates the file before
+# anything is in it, so a reader could otherwise see a record that exists but
+# is still empty. A rename within one filesystem is atomic, so only finished
+# records are ever visible.
+staging="$SLASHIT_FAKE_AGENT_MARKERS/.staging"
+mkdir -p "$staging"
+record=$(mktemp "$staging/XXXXXX")
+printf '%s\0' "$PWD" "$@" > "$record"
+mv "$record" "$SLASHIT_FAKE_AGENT_MARKERS/invocation-${record##*/}"
+
+# Echo the session id back, so the caller can tie this run to the one it asked
+# for rather than to any run at all.
+# The prompt flag is noted in the same pass: it is what separates an agent run
+# from `--version`, which a real CLI also answers without doing any work.
+session=""
+take_next=""
+is_run=""
+for arg in "$@"; do
+    if [ -n "$take_next" ]; then
+        session="$arg"
+        take_next=""
+        continue
+    fi
+    case "$arg" in
+        --session-id) take_next="yes" ;;
+        -p) is_run="yes" ;;
+    esac
+done
+
+printf '{"type":"system","subtype":"init","session_id":"%s","model":"slashit-fake-agent"}\n' "$session"
+
+# Leave work behind, when a journey asked for it. Written into "$PWD", which is
+# the directory the product started this run in -- the task's worktree -- so
+# the executor's own commit picks it up like any other change an agent makes.
+if [ -n "$SLASHIT_FAKE_AGENT_WRITE_FILE" ] && [ -n "$is_run" ]; then
+    printf '%s' "work produced by the fake agent
+" > "$SLASHIT_FAKE_AGENT_WRITE_FILE"
+fi
+
+# Blocking mode, when a journey asked for it. A run that blocks gets a release
+# pipe of its own: it creates the pipe and opens it before it announces itself,
+# and takes both away again once its release has arrived.
+#
+# The order is the whole contract. What a test acts on is the announcement, and
+# a release sent to a pipe nobody has open is refused outright rather than
+# queued -- so a run that announced itself before it could be read from would
+# be advertising a run that cannot yet be released. Read-write is the mode that
+# makes that order possible at all: opening the pipe read-only would block here
+# waiting for a writer that only ever arrives with the release.
+#
+# One pipe per run rather than one shared by all of them, because a release
+# written to a shared pipe carries no address: it would be taken by whichever
+# waiting run the kernel handed it to, which is not necessarily the one it was
+# sent for. `$$` is this process, because the product exec'd this script
+# directly.
+if [ -n "$SLASHIT_FAKE_AGENT_BLOCK_DIR" ] && [ -n "$is_run" ]; then
+    processes="$SLASHIT_FAKE_AGENT_MARKERS/.processes"
+    mkdir -p "$processes/.staging"
+    pidfile=$(mktemp "$processes/.staging/XXXXXX")
+    name=${pidfile##*/}
+    printf '%s\n' "$$" > "$pidfile"
+
+    pipe="$SLASHIT_FAKE_AGENT_BLOCK_DIR/$name"
+    mkfifo "$pipe"
+    exec 3<> "$pipe"
+
+    # Staged and renamed for the same reason the invocation record is: a reader
+    # must never see a record that exists but is still empty.
+    mv "$pidfile" "$processes/$name"
+
+    # Blocks in the kernel until this run's own release arrives. A failed read
+    # is a released or closed pipe, not a reason to abandon the run.
+    read -r _release <&3 || true
+
+    # Stop being releasable in the same breath as stopping to wait, so that an
+    # announced run is one that is still owed a release and nothing else.
+    rm -f "$processes/$name" "$pipe"
+    exec 3<&-
+fi
+
+# Absent means nothing is scripted to fail, so a journey that does not set this
+# sees exactly the behaviour it saw before this existed -- not even the
+# bookkeeping directory below is created.
+failing=${SLASHIT_FAKE_AGENT_FAILING_RUNS:-0}
+
+if [ -n "$is_run" ] && [ "$failing" -gt 0 ]; then
+    # Claim the next run number. `mkdir` refuses an existing directory and
+    # creates a missing one in a single indivisible step, so two agents
+    # starting at the same moment can never be handed the same number -- and
+    # unlike a counter file, there is no read-modify-write to lose.
+    runs="$SLASHIT_FAKE_AGENT_MARKERS/.runs"
+    mkdir -p "$runs"
+    ordinal=1
+    while ! mkdir "$runs/$ordinal" 2>/dev/null; do
+        ordinal=$((ordinal + 1))
+    done
+
+    if [ "$ordinal" -le "$failing" ]; then
+        # A well-formed result that reports failure, with a zero exit status:
+        # the agent ran and said it could not do the work, which is a different
+        # thing from the agent crashing.
+        printf '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"%s","result":"fake agent was scripted to fail this run"}\n' "$session"
+        exit 0
+    fi
+fi
+
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","result":"fake agent completed without changing the repository"}\n' "$session"
+exit 0

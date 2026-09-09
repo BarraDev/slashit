@@ -408,7 +408,6 @@ async fn parse_claude_event(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::io::Write;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -430,16 +429,28 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(script: &str) -> Self {
+        /// Locate one of the checked-in fixture scripts, and give it a
+        /// directory of its own to run in.
+        ///
+        /// The script is a file that already exists rather than one written
+        /// here and then run. `execve` refuses a file that any process has
+        /// open for writing, and a process that has forked but has not yet
+        /// reached its own `exec` still holds a copy of every descriptor its
+        /// parent had open at the moment of the fork -- so a test that writes
+        /// its own executable can have that write carried past the point where
+        /// it runs the file, by an entirely unrelated concurrent spawn in the
+        /// same test binary, and get `ETXTBSY`. A file nobody ever opens for
+        /// writing cannot be caught that way.
+        fn new(fixture: &str) -> Self {
             let dir = TempDir::new().expect("temp dir");
-            let program = dir.path().join("fake-cli");
-            let mut file = std::fs::File::create(&program).expect("create fixture");
-            file.write_all(script.as_bytes()).expect("write fixture");
-            file.flush().expect("flush fixture");
-            drop(file);
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fixture");
+            let program = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/claude-cli")
+                .join(fixture);
+            assert!(
+                program.is_file(),
+                "the fixture script {} is missing",
+                program.display()
+            );
             Self { dir, program }
         }
 
@@ -469,11 +480,7 @@ mod tests {
 
     /// Emits a valid exchange and exits immediately, before the caller has any
     /// realistic chance to reach `wait()`.
-    const FAST: &str = r#"#!/bin/sh
-printf '{"type":"system","subtype":"init","session_id":"s-fast","model":"fixture-model"}\n'
-printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-fast","result":"done"}\n'
-exit 0
-"#;
+    const FAST: &str = "fast";
 
     /// Delivers its events incrementally, after a moment spent starting up.
     ///
@@ -484,17 +491,7 @@ exit 0
     /// fixture that spoke instantly would make the first event a coin toss.
     /// Note that the tests which prove the ownership fix are the ones with no
     /// sleeps at all.
-    const STREAMING: &str = r#"#!/bin/sh
-sleep 0.2
-printf '{"type":"system","subtype":"init","session_id":"s-stream","model":"fixture-model"}\n'
-sleep 0.1
-printf '{"type":"assistant","message":{"content":[{"type":"text","text":"alpha"}]}}\n'
-sleep 0.1
-printf '{"type":"content_block_delta","delta":{"type":"text_delta","text":"beta"}}\n'
-sleep 0.1
-printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-stream","result":"gamma"}\n'
-exit 0
-"#;
+    const STREAMING: &str = "streaming";
 
     /// Writes far more than a pipe can hold before exiting.
     ///
@@ -502,46 +499,22 @@ exit 0
     /// radius: a reader that cannot reach its own stdout leaves the pipe to
     /// fill, and the child then blocks in `write()` before it can exit, so the
     /// `wait()` holding the reader out is waiting for an exit it is preventing.
-    const CHATTY: &str = r#"#!/bin/sh
-pad=xxxxxxxxxxxxxxxx
-pad=$pad$pad$pad$pad
-pad=$pad$pad$pad$pad
-pad=$pad$pad$pad$pad
-printf '{"type":"system","subtype":"init","session_id":"s-chatty","model":"fixture-model"}\n'
-i=0
-while [ $i -lt 512 ]; do
-    printf '{"type":"content_block_delta","delta":{"type":"text_delta","text":"%s"}}\n' "$pad"
-    i=$((i + 1))
-done
-printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-chatty","result":"done"}\n'
-exit 0
-"#;
+    const CHATTY: &str = "chatty";
 
-    /// The `pad` above quadruples three times from 16 bytes.
+    /// The `pad` in the `chatty` fixture quadruples three times from 16 bytes.
     const CHATTY_PAD: usize = 16 * 4 * 4 * 4;
     const CHATTY_LINES: usize = 512;
 
-    const CRASHING: &str = r#"#!/bin/sh
-echo "something went wrong in the CLI" >&2
-exit 3
-"#;
+    const CRASHING: &str = "crashing";
 
     /// Announces itself and then stays alive until something ends it.
     ///
     /// `exec` on purpose: the process that waits is the same process the
     /// runner spawned, so the pid recorded here is the one the runner owns and
     /// the fixture has no descendant of its own to confuse the question.
-    const BLOCKING: &str = r#"#!/bin/sh
-printf '{"type":"system","subtype":"init","session_id":"s-block","model":"fixture-model"}\n'
-printf '%s\n' "$$" > blocked.pid
-exec sleep 300
-"#;
+    const BLOCKING: &str = "blocking";
 
-    const CLAUDE_LEVEL_ERROR: &str = r#"#!/bin/sh
-printf '{"type":"system","subtype":"init","session_id":"s-err","model":"fixture-model"}\n'
-printf '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s-err","result":"the model refused"}\n'
-exit 0
-"#;
+    const CLAUDE_LEVEL_ERROR: &str = "claude-level-error";
 
     async fn bounded(label: &str, runner: &ClaudeRunner) -> Result<bool, String> {
         match tokio::time::timeout(DEADLINE, runner.wait()).await {

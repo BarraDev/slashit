@@ -217,7 +217,7 @@ async fn cancellation_journey(context: &TestContext) -> Result<()> {
     let release = agent.block_agent_runs()?;
     context.set_child_env("PATH", agent.path_value());
     context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
-    context.set_child_env(fake_agent::BLOCK_FIFO_VAR, &release);
+    context.set_child_env(fake_agent::BLOCK_DIR_VAR, &release);
 
     pin_worktree_placement(&context.state().config_file())?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
