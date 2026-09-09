@@ -51,6 +51,13 @@ pub fn ipc_test_context(paths: std::sync::Arc<crate::config::paths::AppPaths>) -
         features: Arc::new(RwLock::new(
             crate::config::features::FeatureFlags::default(),
         )),
+        repositories: Arc::new(RwLock::new(HashMap::new())),
+        worktree_manager: Arc::new(crate::worktree::WorktreeManager::new(
+            paths.clone(),
+            crate::config::paths::WorktreePlacement::default(),
+        )),
+        task_lifecycle_locks: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
+        executor: Arc::new(tokio::sync::OnceCell::new()),
         feature_diagnostics: None,
         paths,
     }
@@ -91,6 +98,7 @@ pub fn create_test_task(title: &str) -> Task {
         error_message: None,
         worktree_path: None,
         branch_name: None,
+        cleanup_in_flight: false,
         position: 0,
         pr_review_plan: None,
         created_at: Utc::now(),

@@ -11,6 +11,7 @@ mod queue;
 mod pty;
 mod worktree;
 /// Building `AppState` once, for whichever front end wants it.
+pub mod lifecycle;
 pub mod app_core;
 /// Headless execution, sharing the whole stack with the GUI.
 pub mod daemon;
@@ -67,6 +68,10 @@ pub struct AppState {
     /// Per-project guard serializing `apply_state_migration` and
     /// `set_state_location` for the same project. See its doc comment.
     pub state_location_locks: Arc<commands::state_location::StateLocationLocks>,
+    /// Per-task guard serializing one task's lifecycle transitions. Shared with
+    /// the queue executor and the IPC handlers, so a card dragged in the app, a
+    /// `slashit` command and an agent starting all queue behind the same lease.
+    pub task_lifecycle_locks: Arc<lifecycle::TaskLifecycleLocks>,
 }
 
 impl AppState {
@@ -183,6 +188,7 @@ pub fn run() {
                     storage: state.storage.clone(),
                     worktree_manager: state.worktree_manager.clone(),
                     events: events.clone(),
+                    lifecycle: state.task_lifecycle_locks.clone(),
                 },
             ));
             let _ = state.executor.set(executor.clone());
@@ -205,6 +211,10 @@ pub fn run() {
                     events: events.clone(),
                     control: control.clone(),
                     features: state.features.clone(),
+                    repositories: state.repository.repositories.clone(),
+                    worktree_manager: state.worktree_manager.clone(),
+                    task_lifecycle_locks: state.task_lifecycle_locks.clone(),
+                    executor: state.executor.clone(),
                     feature_diagnostics: None,
                     paths: state.paths.clone(),
                 });

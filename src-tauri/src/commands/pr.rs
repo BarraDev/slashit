@@ -326,7 +326,7 @@ pub async fn sync_existing_pr(
 
     match find_existing_pr_for_branch_strict(&working_dir, &branch).await? {
         Some(pr_url) => {
-            link_pr_to_task(&state, task_uuid, &pr_url).await;
+            link_pr_to_task(&state, task_uuid, &pr_url).await?;
             let tasks = state.task.tasks.read().await;
             Ok(tasks.get(&task_uuid).cloned())
         }
@@ -480,7 +480,14 @@ pub async fn recover_private_email_and_create_pr(
     };
 
     if let Some(existing_pr_url) = find_existing_pr_for_branch(&working_dir, &branch).await? {
-        link_pr_to_task(&state, task_uuid, &existing_pr_url).await;
+        // Reported rather than propagated: the pull request exists, and a
+        // caller that got an `Err` here would be left without its URL. The
+        // failure is not swallowed -- a refused cleanup is persisted onto
+        // the task as `error_message` and rendered on its card, which is
+        // where it belongs.
+        if let Err(e) = link_pr_to_task(&state, task_uuid, &existing_pr_url).await {
+            eprintln!("Warning: linking the pull request to task {task_uuid} was incomplete: {e}");
+        }
         return Ok(existing_pr_url);
     }
 
@@ -1310,9 +1317,10 @@ async fn save_review_plan_on_task(
         .map_err(|e| format!("Failed to save the PR review plan for task {task_id}: {e}"));
 
     // Committed to memory even when the write failed, which is the opposite of
-    // what the worktree cleanup helper does, and deliberately so. There, memory
-    // has to agree with the *file*, because clearing a reference in memory is
-    // what removes a task from the retry pass that would have reconciled it.
+    // what terminalization does, and deliberately so. There, memory has to
+    // agree with the *file*, because the file is what the next start reads and
+    // a board that claims a worktree is gone when the file still names it has
+    // nothing left to reconcile the two.
     // Here the plan is the record of work that already happened outside this
     // process: commits pushed, replies posted to GitHub. Dropping it would
     // leave the session believing those items are still pending, and the
@@ -1960,7 +1968,14 @@ async fn create_pr_inner(
 
     if let Some(branch) = task_branch_name.as_deref() {
         if let Some(existing_pr_url) = find_existing_pr_for_branch(&working_dir, branch).await? {
-            link_pr_to_task(state, task_uuid, &existing_pr_url).await;
+            // Reported rather than propagated: the pull request exists, and a
+            // caller that got an `Err` here would be left without its URL. The
+            // failure is not swallowed -- a refused cleanup is persisted onto
+            // the task as `error_message` and rendered on its card, which is
+            // where it belongs.
+            if let Err(e) = link_pr_to_task(state, task_uuid, &existing_pr_url).await {
+                eprintln!("Warning: linking the pull request to task {task_uuid} was incomplete: {e}");
+            }
             return Ok(existing_pr_url);
         }
     }
@@ -1970,7 +1985,14 @@ async fn create_pr_inner(
         .map_err(friendly_pr_error)?;
 
     if let Some(existing_pr_url) = find_existing_pr_for_branch(&working_dir, &branch).await? {
-        link_pr_to_task(state, task_uuid, &existing_pr_url).await;
+        // Reported rather than propagated: the pull request exists, and a
+        // caller that got an `Err` here would be left without its URL. The
+        // failure is not swallowed -- a refused cleanup is persisted onto
+        // the task as `error_message` and rendered on its card, which is
+        // where it belongs.
+        if let Err(e) = link_pr_to_task(state, task_uuid, &existing_pr_url).await {
+            eprintln!("Warning: linking the pull request to task {task_uuid} was incomplete: {e}");
+        }
         return Ok(existing_pr_url);
     }
 
@@ -1985,7 +2007,14 @@ async fn create_pr_inner(
         &working_dir,
     ).await.map_err(friendly_pr_error)?;
 
-    link_pr_to_task(state, task_uuid, &pr_url).await;
+    // Reported rather than propagated: the pull request exists, and a
+    // caller that got an `Err` here would be left without its URL. The
+    // failure is not swallowed -- a refused cleanup is persisted onto
+    // the task as `error_message` and rendered on its card, which is
+    // where it belongs.
+    if let Err(e) = link_pr_to_task(state, task_uuid, &pr_url).await {
+        eprintln!("Warning: linking the pull request to task {task_uuid} was incomplete: {e}");
+    }
 
     Ok(pr_url)
 }
@@ -2063,49 +2092,102 @@ async fn find_existing_pr_for_branch_strict(
         .map(|url| url.to_string()))
 }
 
+/// Record a PR against a task and move the task to the status that PR implies.
+///
+/// Two steps, deliberately separate. The pull request itself is recorded first,
+/// under the task's lease, and unconditionally: whether GitHub reports it
+/// merged is a fact about GitHub, and it stays true whatever git then decides
+/// about the checkout. Folding it into the terminalization would tie it to that
+/// decision, and every refusal that answers before the cleanup begins -- an
+/// agent still running, a quarantined worktree, an unresolvable repository --
+/// would drop the pull request entirely, leaving a task with no `pr_url` for a
+/// PR the user is looking at.
+///
+/// Only then, if it is merged, is the terminal claim made, through
+/// [`crate::lifecycle::terminalize`]: the worktree is removed first and `Done`
+/// is committed only if that succeeded. A refusal comes back as `Err` and the
+/// task keeps its PR, its status, its worktree and its branch.
+///
+/// Returns a `Result` because of that: this used to be infallible and swallowed
+/// its own persistence errors, which is precisely how a `Done` that never
+/// cleaned up anything reached the board.
 async fn link_pr_to_task(
     state: &crate::AppState,
     task_uuid: Uuid,
     pr_url: &str,
-) {
+) -> Result<(), String> {
     let remote_state = fetch_pr_state(pr_url).await;
-    {
-        let mut tasks = state.task.tasks.write().await;
-        if let Some(task) = tasks.get_mut(&task_uuid) {
-            task.pr_url = Some(pr_url.to_string());
-            if let Some(mut ref_) = parse_pr_url_to_ref(pr_url) {
-                if let (ExternalRef::GithubPr { state: ref mut s, .. }, Some(remote)) = (&mut ref_, remote_state.as_ref()) {
-                    *s = Some(remote.clone());
-                }
-                if !task.external_refs.iter().any(|r| matches!(r, ExternalRef::GithubPr { url, .. } if url == pr_url)) {
-                    task.external_refs.push(ref_);
-                } else if let Some(remote) = remote_state.as_ref() {
-                    for r in task.external_refs.iter_mut() {
-                        if let ExternalRef::GithubPr { url, state: s, .. } = r {
-                            if url == pr_url {
-                                *s = Some(remote.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            task.status = if matches!(remote_state.as_deref(), Some("MERGED")) {
-                TaskStatus::Done
-            } else {
-                TaskStatus::PrCreated
-            };
-            task.updated_at = chrono::Utc::now();
-        }
-    }
+    let merged = matches!(remote_state.as_deref(), Some("MERGED"));
 
-    let tasks_r = state.task.tasks.read().await;
-    if let Some(task) = tasks_r.get(&task_uuid) {
+    {
+        let _lease = state.task_lifecycle_locks.acquire(task_uuid).await?;
+        let mut tasks = state.task.tasks.write().await;
+
+        let Some(task) = tasks.get_mut(&task_uuid) else {
+            return Ok(());
+        };
+        apply_pr_link(task, pr_url, remote_state.as_deref());
+        // Withheld when merged: the status a merged PR implies is `Done`, and
+        // that is the terminalization's to write, after the cleanup it depends
+        // on has succeeded.
+        if !merged {
+            task.status = TaskStatus::PrCreated;
+        }
+        task.updated_at = chrono::Utc::now();
         let project_id = task.project_id;
-        let project_tasks: Vec<Task> = tasks_r.values()
+
+        let staged: Vec<Task> = tasks
+            .values()
             .filter(|t| t.project_id == project_id)
             .cloned()
             .collect();
-        let _ = state.storage.save_project_tasks(project_id, &project_tasks);
+        state
+            .storage
+            .save_project_tasks(project_id, &staged)
+            .map_err(|e| format!("recording the pull request on task {task_uuid} failed: {e}"))?;
+    }
+
+    if !merged {
+        return Ok(());
+    }
+
+    match crate::lifecycle::terminalize(
+        crate::commands::task::terminalize_ctx(state),
+        task_uuid,
+        crate::lifecycle::Origin::User,
+        crate::lifecycle::TerminalizeRequest::new(TaskStatus::Done),
+    )
+    .await
+    {
+        Ok(_) | Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => Ok(()),
+        Err(refusal) => Err(refusal.to_string()),
+    }
+}
+
+/// Write `pr_url` and its remote state onto `task`, adding the external ref if
+/// it is not already there and refreshing it if it is.
+///
+/// Split out of [`link_pr_to_task`] so the merged path can hand it to
+/// [`crate::lifecycle::terminalize`] as the fact to record before anything
+/// destructive runs, and the ordinary path can apply it directly.
+fn apply_pr_link(task: &mut Task, pr_url: &str, remote_state: Option<&str>) {
+    task.pr_url = Some(pr_url.to_string());
+    let Some(mut ref_) = parse_pr_url_to_ref(pr_url) else {
+        return;
+    };
+    if let (ExternalRef::GithubPr { state: ref mut s, .. }, Some(remote)) = (&mut ref_, remote_state) {
+        *s = Some(remote.to_string());
+    }
+    if !task.external_refs.iter().any(|r| matches!(r, ExternalRef::GithubPr { url, .. } if url == pr_url)) {
+        task.external_refs.push(ref_);
+    } else if let Some(remote) = remote_state {
+        for r in task.external_refs.iter_mut() {
+            if let ExternalRef::GithubPr { url, state: s, .. } = r {
+                if url == pr_url {
+                    *s = Some(remote.to_string());
+                }
+            }
+        }
     }
 }
 
@@ -2149,7 +2231,12 @@ pub async fn refresh_task_pr_state(
         return Err("Failed to fetch PR state from gh".to_string());
     };
 
+    // The refreshed state is recorded first and unconditionally, for the same
+    // reason `link_pr_to_task` does it: what GitHub reports is true regardless
+    // of what git says about the checkout, and every refusal that answers
+    // before the cleanup begins would otherwise discard it.
     let updated = {
+        let _lease = state.task_lifecycle_locks.acquire(task_uuid).await?;
         let mut tasks = state.task.tasks.write().await;
         let task = tasks.get_mut(&task_uuid).ok_or("Task not found")?;
         for r in task.external_refs.iter_mut() {
@@ -2159,21 +2246,43 @@ pub async fn refresh_task_pr_state(
                 }
             }
         }
-        task.status = match remote_state.as_str() {
-            "MERGED" => TaskStatus::Done,
-            "CLOSED" | "OPEN" => TaskStatus::PrCreated,
-            _ => task.status.clone(),
-        };
+        // `MERGED` implies `Done`, which the terminalization below writes only
+        // after the cleanup it depends on has succeeded.
+        if matches!(remote_state.as_str(), "CLOSED" | "OPEN") {
+            task.status = TaskStatus::PrCreated;
+        }
         task.updated_at = chrono::Utc::now();
-        task.clone()
+        let updated = task.clone();
+
+        let staged: Vec<Task> = tasks
+            .values()
+            .filter(|t| t.project_id == updated.project_id)
+            .cloned()
+            .collect();
+        state
+            .storage
+            .save_project_tasks(updated.project_id, &staged)
+            .map_err(|e| format!("recording the pull request state failed: {e}"))?;
+        updated
     };
 
-    let tasks_r = state.task.tasks.read().await;
-    let project_tasks: Vec<Task> = tasks_r.values()
-        .filter(|t| t.project_id == updated.project_id)
-        .cloned()
-        .collect();
-    let _ = state.storage.save_project_tasks(updated.project_id, &project_tasks);
+    // A merged PR is the same terminal claim a card dragged onto Done makes, so
+    // it goes through the same operation: the worktree is removed first, and
+    // `Done` is committed only if that succeeded.
+    if remote_state == "MERGED" {
+        return match crate::lifecycle::terminalize(
+            crate::commands::task::terminalize_ctx(&state),
+            task_uuid,
+            crate::lifecycle::Origin::User,
+            crate::lifecycle::TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        {
+            Ok(task) => Ok(Some(task)),
+            Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => Ok(None),
+            Err(refusal) => Err(refusal.to_string()),
+        };
+    }
 
     Ok(Some(updated))
 }

@@ -203,6 +203,7 @@ async fn handle_create_task(
         error_message: None,
         worktree_path: None,
         branch_name: None,
+        cleanup_in_flight: false,
         pr_review_plan: None,
         created_at: now,
         updated_at: now,
@@ -219,6 +220,18 @@ async fn handle_create_task(
     IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
 }
 
+/// Move a task to another column from the CLI.
+///
+/// A move into `Done` is the same terminal claim the desktop app makes, and
+/// takes the same route: [`crate::lifecycle::terminalize`] removes the worktree
+/// first and commits the status only if that succeeded. This handler used to
+/// assign the status directly and had no worktree manager at all, so
+/// `slashit move <task> done` finished tasks on the board and left their
+/// checkouts behind for a periodic sweep to notice.
+///
+/// Every other move takes the task's lifecycle lease, so it cannot land in the
+/// middle of a cleanup and be overwritten by the commit that cleanup is about
+/// to make.
 async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> IpcResponse {
     let task_uuid = match Uuid::parse_str(&task_id) {
         Ok(id) => id,
@@ -228,6 +241,36 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
     let new_status = match parse_status(&status) {
         Some(s) => s,
         None => return IpcResponse::error(format!("Invalid status: {status}")),
+    };
+
+    if matches!(new_status, crate::domain::TaskStatus::Done) {
+        return match crate::lifecycle::terminalize(
+            terminalize_ctx(ctx),
+            task_uuid,
+            crate::lifecycle::Origin::User,
+            crate::lifecycle::TerminalizeRequest::new(new_status),
+        )
+        .await
+        {
+            Ok(task) => {
+                let projects = ctx.projects.read().await;
+                let pname = projects
+                    .get(&task.project_id)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("?");
+                let summary = task_to_summary(&task, pname);
+                IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
+            }
+            Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => {
+                IpcResponse::error(format!("Task {task_id} not found"))
+            }
+            Err(refusal) => IpcResponse::error(refusal.to_string()),
+        };
+    }
+
+    let _lease = match ctx.task_lifecycle_locks.acquire(task_uuid).await {
+        Ok(lease) => lease,
+        Err(e) => return IpcResponse::error(e),
     };
 
     let projects = ctx.projects.read().await;
@@ -245,6 +288,23 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
     } else {
         IpcResponse::error(format!("Task {task_id} not found"))
+    }
+}
+
+/// The handles [`crate::lifecycle::terminalize`] needs, out of an
+/// [`IpcContext`].
+fn terminalize_ctx(ctx: &IpcContext) -> crate::lifecycle::TerminalizeCtx<'_> {
+    crate::lifecycle::TerminalizeCtx {
+        tasks: &ctx.tasks,
+        projects: &ctx.projects,
+        repositories: &ctx.repositories,
+        worktree_manager: &ctx.worktree_manager,
+        storage: &ctx.storage,
+        authority: &ctx.task_lifecycle_locks,
+        running: ctx
+            .executor
+            .get()
+            .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership),
     }
 }
 

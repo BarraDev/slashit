@@ -1,6 +1,6 @@
 use crate::domain::{
     Task, TaskStatus, TaskCategory, TaskPriority, TaskComplexity,
-    TaskImpact, SecuritySeverity, TaskPhase, Subtask, Project, Repository,
+    TaskImpact, SecuritySeverity, TaskPhase, Subtask,
 };
 use crate::domain::task::ExternalRef;
 use crate::config::Storage;
@@ -9,170 +9,27 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Resolve a project's repository local path.
+/// Assemble the handles [`crate::lifecycle::terminalize`] needs out of an
+/// `AppState`.
 ///
-/// Used to give worktree cleanup (spawned after a task's status changes) the
-/// `repo_path` that `WorktreeManager::remove` needs to run its git commands
-/// in the right directory. Takes the project/repository maps directly so it
-/// can be called from inside a `tauri::async_runtime::spawn`ed closure that
-/// only cloned those two `Arc`s, not the whole `AppState`.
-async fn resolve_repo_path(
-    projects: &Arc<RwLock<HashMap<Uuid, Project>>>,
-    repositories: &Arc<RwLock<HashMap<Uuid, Repository>>>,
-    project_id: Uuid,
-) -> Result<String, String> {
-    let projects_r = projects.read().await;
-    let project = projects_r.get(&project_id).ok_or("Project not found")?;
-    let repo_id = project.repository_id.ok_or("No repository linked")?;
-    drop(projects_r);
-
-    let repos = repositories.read().await;
-    let repo = repos.get(&repo_id).ok_or("Repository not found")?;
-    Ok(repo.local_path.clone())
-}
-
-/// Resource handles [`cleanup_worktree`] needs, grouped so the function
-/// itself only takes the values that vary per call.
-struct WorktreeCleanupCtx<'a> {
-    worktree_manager: &'a crate::worktree::WorktreeManager,
-    projects: &'a Arc<RwLock<HashMap<Uuid, Project>>>,
-    repositories: &'a Arc<RwLock<HashMap<Uuid, Repository>>>,
-    tasks: &'a Tasks,
-    storage: &'a Storage,
-}
-
-/// Core of [`spawn_worktree_cleanup`], split out so tests can `.await` it
-/// directly instead of going through `tauri::async_runtime::spawn`.
-///
-/// `worktree_path` is the only persisted record of this directory. Every
-/// call site used to clear it — followed immediately by a synchronous
-/// persist — before the detached removal here even ran, so a crash or a
-/// failed `git worktree remove` orphaned the directory with nothing left
-/// pointing back to it. A `resolve_repo_path` or `WorktreeManager::remove`
-/// failure is logged with the task id and path instead, and leaves
-/// `worktree_path` untouched so the directory stays recoverable.
-///
-/// What that recovery is depends on the caller, so the failure messages below
-/// deliberately do not promise a retry. A transition into `Done` is revisited
-/// by the executor's pass, which filters on `status == Done`; `delete_task`
-/// leaves no task at all, and there the retained branch is the only record of
-/// what the task produced, which is one of the reasons removal never touches
-/// it.
-///
-/// Re-queuing a task does not reach here at all — see
-/// [`StatusTransitionEffect::ResetExecutionState`].
-async fn cleanup_worktree(ctx: WorktreeCleanupCtx<'_>, task_id: Uuid, project_id: Uuid, wt_path: &str) {
-    let repo_path = match resolve_repo_path(ctx.projects, ctx.repositories, project_id).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "Warning: worktree cleanup for task {task_id} could not resolve a repository path ({e}); {wt_path} is left on disk and this call cleared no reference to it."
-            );
-            return;
-        }
-    };
-
-    if let Err(e) = ctx.worktree_manager.remove(wt_path, &repo_path).await {
-        eprintln!(
-            "Warning: failed to remove worktree {wt_path} for task {task_id}: {e}. This call cleared no reference to it."
-        );
-        return;
+/// Kept here rather than on `AppState` because `crate::lifecycle` is
+/// deliberately free of every `tauri::` reference so the daemon links it, and
+/// `AppState` is not: the daemon builds the same context from its own handles.
+pub(crate) fn terminalize_ctx(state: &crate::AppState) -> crate::lifecycle::TerminalizeCtx<'_> {
+    crate::lifecycle::TerminalizeCtx {
+        tasks: &state.task.tasks,
+        projects: &state.project.projects,
+        repositories: &state.repository.repositories,
+        worktree_manager: &state.worktree_manager,
+        storage: &state.storage,
+        authority: &state.task_lifecycle_locks,
+        // `get()` rather than waiting: before the executor is initialised there
+        // is no queue, so there is nothing that could be running.
+        running: state
+            .executor
+            .get()
+            .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership),
     }
-
-    if let Err(e) = clear_worktree_path_durably(ctx.tasks, ctx.storage, task_id, wt_path).await {
-        // Nothing here can retry: this path is reached from a status change or
-        // a delete, neither of which runs again on its own, and the executor's
-        // retry pass only looks at `Done` tasks. Leaving the reference in place
-        // is still the right outcome — the next start reconciles it, and any
-        // later save for this project rewrites the file — but the failure has
-        // to be visible rather than swallowed.
-        eprintln!("Warning: worktree cleanup for task {task_id}: {e}");
-    }
-}
-
-/// Clear `task_id`'s `worktree_path`, but only once the cleared record is on
-/// disk.
-///
-/// `worktree_path` is the only persisted record of a worktree, so publishing
-/// the clear to shared memory before the write succeeds leaves the board
-/// disagreeing with disk with nothing left to reconcile them: the executor's
-/// retry pass selects on the *in-memory* value, so a task cleared in memory is
-/// never revisited, and the stale file survives until some unrelated mutation
-/// happens to rewrite it. This is the same persist-before-publish contract the
-/// project and repository saves use.
-///
-/// The whole transaction runs under one write guard, so no sibling save can
-/// land between the write and the in-memory commit.
-///
-/// `Err` means the write failed and the reference is still recorded in both
-/// places, which is what keeps a `Done` task eligible for the retry pass.
-pub(crate) async fn clear_worktree_path_durably(
-    tasks: &Tasks,
-    storage: &Storage,
-    task_id: Uuid,
-    wt_path: &str,
-) -> Result<(), String> {
-    let mut tasks_w = tasks.write().await;
-
-    let Some(task) = tasks_w.get(&task_id) else {
-        return Ok(()); // deleted while its worktree was being removed
-    };
-    if task.worktree_path.as_deref() != Some(wt_path) {
-        // The task now records a different worktree, so a re-run recreated one
-        // after this cleanup started. Clearing that reference would discard a
-        // worktree this call never removed.
-        return Ok(());
-    }
-    let project_id = task.project_id;
-
-    let staged: Vec<Task> = tasks_w
-        .values()
-        .filter(|t| t.project_id == project_id)
-        .map(|t| {
-            let mut staged = t.clone();
-            if staged.id == task_id {
-                staged.worktree_path = None;
-            }
-            staged
-        })
-        .collect();
-
-    storage
-        .save_project_tasks(project_id, &staged)
-        .map_err(|e| {
-            format!("worktree {wt_path} was removed, but clearing it from the task board failed: {e}")
-        })?;
-
-    if let Some(t) = tasks_w.get_mut(&task_id) {
-        t.worktree_path = None;
-    }
-    Ok(())
-}
-
-/// Remove a task's worktree in the background; see [`cleanup_worktree`] for
-/// the retain-on-failure invariant this preserves.
-fn spawn_worktree_cleanup(state: &crate::AppState, task_id: Uuid, project_id: Uuid, wt_path: String) {
-    let wt_mgr = state.worktree_manager.clone();
-    let projects = state.project.projects.clone();
-    let repositories = state.repository.repositories.clone();
-    let tasks = state.task.tasks.clone();
-    let storage = state.storage.clone();
-
-    tauri::async_runtime::spawn(async move {
-        cleanup_worktree(
-            WorktreeCleanupCtx {
-                worktree_manager: &wt_mgr,
-                projects: &projects,
-                repositories: &repositories,
-                tasks: &tasks,
-                storage: &storage,
-            },
-            task_id,
-            project_id,
-            &wt_path,
-        )
-        .await;
-    });
 }
 
 /// How a status transition affects a task's execution state and its worktree.
@@ -336,6 +193,7 @@ pub async fn create_task(
         error_message: None,
         worktree_path: None,
         branch_name: None,
+        cleanup_in_flight: false,
         pr_review_plan: None,
         created_at: now,
         updated_at: now,
@@ -363,6 +221,23 @@ pub async fn list_tasks(
         .collect())
 }
 
+/// Move a task to `status`, doing whatever that transition actually requires
+/// before saying it happened.
+///
+/// A move into `Done` is not a field assignment: it is the claim that the task
+/// is finished with its worktree, so it goes through
+/// [`crate::lifecycle::terminalize`], which removes the checkout first and
+/// commits `Done` only if that succeeded. A refusal comes back as `Err` with
+/// git's own reason, and the task is exactly where it was -- the frontend
+/// already surfaces that and leaves the card in place.
+///
+/// Every other transition takes the same per-task lease before touching
+/// anything. Not for symmetry: a move back into a working column resets the
+/// task's execution state, and doing that while a cleanup is midway through
+/// removing the checkout would either make the task executable against a
+/// directory that is being deleted, or be silently overwritten by the
+/// terminal commit that cleanup is about to make. The lease is what makes the
+/// two orderings the only two possible.
 #[tauri::command]
 pub async fn update_task_status(
     state: tauri::State<'_, crate::AppState>,
@@ -370,6 +245,23 @@ pub async fn update_task_status(
     status: TaskStatus,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+
+    if matches!(status, TaskStatus::Done) {
+        return match crate::lifecycle::terminalize(
+            terminalize_ctx(&state),
+            task_id,
+            crate::lifecycle::Origin::User,
+            crate::lifecycle::TerminalizeRequest::new(status),
+        )
+        .await
+        {
+            Ok(task) => Ok(Some(task)),
+            Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => Ok(None),
+            Err(refusal) => Err(refusal.to_string()),
+        };
+    }
+
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
     let mut tasks = state.task.tasks.write().await;
 
     if let Some(task) = tasks.get_mut(&task_id) {
@@ -384,13 +276,12 @@ pub async fn update_task_status(
                 // `StatusTransitionEffect`.
                 task.reset_execution_state();
             }
-            StatusTransitionEffect::CleanUpWorktree => {
-                // Keep branch_name for PR creation. Removal leaves the
-                // branch alone, so it still names something afterwards.
-                if let Some(wt_path) = task.worktree_path.clone() {
-                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path);
-                }
-            }
+            // Unreachable: `CleanUpWorktree` is exactly the `Done` case, and
+            // that returned above. Left as an explicit arm rather than a
+            // catch-all so a future classifier that starts returning it from
+            // somewhere else fails to compile here instead of silently
+            // skipping the cleanup.
+            StatusTransitionEffect::CleanUpWorktree => {}
             StatusTransitionEffect::None => {}
         }
 
@@ -763,22 +654,57 @@ pub async fn delete_task(
     task_id: String,
 ) -> Result<bool, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+
+    // Delete holds the same lease as every other lifecycle operation, so it
+    // cannot land between a cleanup starting and that cleanup recording its
+    // outcome, and cannot remove the record of a task an agent is running.
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+
+    // Clean up before removing the record, and synchronously: a detached
+    // removal would outlive this lease and act on a task nothing is holding
+    // any more. `desired` is the task's current status because a delete is not
+    // a status change; what is wanted here is the safe removal and its durable
+    // bookkeeping, which is the same operation.
+    let record = {
+        let tasks = state.task.tasks.read().await;
+        tasks
+            .get(&task_id)
+            .map(|t| (t.status.clone(), t.worktree_path.clone(), t.branch_name.clone()))
+    };
+    if let Some((current_status, worktree_path, branch_name)) = record {
+        if let Err(refusal) = crate::lifecycle::terminalize_leased(
+            terminalize_ctx(&state),
+            task_id,
+            crate::lifecycle::Origin::User,
+            crate::lifecycle::TerminalizeRequest::new(current_status),
+        )
+        .await
+        {
+            // The record is about to be deleted, so there is nothing left to
+            // retain the path on and nothing that will revisit it. Git refusing
+            // to remove a checkout that still holds uncommitted work is the
+            // expected reason, and leaving that work on disk is the intended
+            // outcome: the branch survives too, so everything the task
+            // committed stays reachable even though the record naming it does
+            // not.
+            //
+            // The path and the branch are named here rather than left to the
+            // refusal's own words, which for some refusals mention neither.
+            // This message is the last thing that will ever point at either.
+            eprintln!(
+                "Warning: deleting task {task_id} could not remove its worktree: {refusal}. \
+                 The checkout at {} is left on disk and nothing records it any more; its \
+                 commits remain on branch {}.",
+                worktree_path.as_deref().unwrap_or("(none recorded)"),
+                branch_name.as_deref().unwrap_or("(none recorded)"),
+            );
+        }
+    }
+
     let mut tasks = state.task.tasks.write().await;
 
     // Get project_id before removal for persistence
     let project_id = tasks.get(&task_id).map(|t| t.project_id);
-
-    // Cleanup the worktree before removing the task. The task record itself
-    // is about to be deleted, so a failure here has no persisted task left to
-    // retain the path on — the failure is logged so the orphaned directory
-    // is at least discoverable, per `spawn_worktree_cleanup`'s own logging.
-    // The branch survives either way, so the commits the task produced stay
-    // reachable even when the record that named them does not.
-    if let Some(task) = tasks.get(&task_id) {
-        if let Some(wt_path) = task.worktree_path.clone() {
-            spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path);
-        }
-    }
 
     let removed = tasks.remove(&task_id).is_some();
     
@@ -792,8 +718,60 @@ pub async fn delete_task(
     Ok(removed)
 }
 
-/// Reorder a task within its column or when moving to a new column
-/// new_position is the target position index in the destination column
+/// Renumber `target_status`'s column so `task_id` sits at `new_position` and
+/// every card in that column has a distinct, gapless position.
+///
+/// Takes the map it should mutate rather than reading the live one, so the
+/// terminal path can run it inside
+/// [`crate::lifecycle::terminalize`](crate::lifecycle::terminalize)'s final
+/// write. Positions computed before a cleanup subprocess ran are stale by the
+/// time it finishes -- another card may have been dragged into the same column
+/// meanwhile -- and committing them would publish the card at a position that
+/// was correct a second ago.
+fn renumber_column(
+    staged: &mut HashMap<Uuid, Task>,
+    project_id: Uuid,
+    task_id: Uuid,
+    target_status: &TaskStatus,
+    new_position: i32,
+) {
+    let mut column: Vec<(Uuid, i32)> = staged
+        .values()
+        .filter(|t| t.project_id == project_id && t.status == *target_status && t.id != task_id)
+        .map(|t| (t.id, t.position))
+        .collect();
+    column.sort_by_key(|(_, pos)| *pos);
+
+    let clamped = new_position.max(0).min(column.len() as i32) as usize;
+    column.insert(clamped, (task_id, 0));
+
+    let now = chrono::Utc::now();
+    for (idx, (tid, _)) in column.iter().enumerate() {
+        if let Some(task) = staged.get_mut(tid) {
+            task.position = idx as i32;
+            task.updated_at = now;
+        }
+    }
+}
+
+/// Reorder a task within its column or when moving to a new column.
+/// `new_position` is the target position index in the destination column.
+///
+/// Dragging a card onto `Done` is the same lifecycle decision as calling
+/// [`update_task_status`] with `Done`, and reaches the same
+/// [`crate::lifecycle::terminalize_leased`], so the two cannot diverge: the
+/// worktree is removed first, and the card only lands in the column if that
+/// succeeded. The new column positions are computed inside that operation's
+/// final write rather than before the removal, so they describe the board as it
+/// is when they are saved.
+///
+/// The lease is taken before anything is read, and the transition is classified
+/// exactly once from that one reading. Deciding first and locking afterwards
+/// looks equivalent and is not: the status a pre-lease read returns is the
+/// status the task had before whatever was holding the lease finished with it,
+/// so a drag classified as an ordinary move could become a move into `Done` by
+/// the time it was applied -- and would then write `Done` itself, with no
+/// cleanup, which is the one thing this design exists to make impossible.
 #[tauri::command]
 pub async fn reorder_task(
     state: tauri::State<'_, crate::AppState>,
@@ -802,68 +780,63 @@ pub async fn reorder_task(
     new_position: i32,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
 
-    // Get the task and its current/new status
-    let (project_id, old_status, target_status) = {
-        if let Some(task) = tasks.get(&task_id) {
-            let target = new_status.clone().unwrap_or(task.status.clone());
-            (task.project_id, task.status.clone(), target)
-        } else {
-            return Ok(None);
-        }
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+
+    let Some((project_id, old_status)) = ({
+        let tasks = state.task.tasks.read().await;
+        tasks.get(&task_id).map(|t| (t.project_id, t.status.clone()))
+    }) else {
+        return Ok(None);
+    };
+    let target_status = new_status.unwrap_or_else(|| old_status.clone());
+
+    let effect = if old_status == target_status {
+        StatusTransitionEffect::None
+    } else {
+        classify_status_transition(&old_status, &target_status)
     };
 
-    // Collect task IDs in the target column, sorted by position
-    let mut column_tasks: Vec<(Uuid, i32)> = tasks
-        .values()
-        .filter(|t| t.project_id == project_id && t.status == target_status && t.id != task_id)
-        .map(|t| (t.id, t.position))
-        .collect();
-    column_tasks.sort_by_key(|(_, pos)| *pos);
+    if effect == StatusTransitionEffect::CleanUpWorktree {
+        let column = target_status.clone();
+        let reposition = move |staged: &mut HashMap<Uuid, Task>| {
+            renumber_column(staged, project_id, task_id, &column, new_position);
+        };
+        let mut request = crate::lifecycle::TerminalizeRequest::new(target_status);
+        request.on_success = Some(&reposition);
 
-    // Insert the moved task at the new position and recalculate positions
-    let clamped_position = new_position.max(0).min(column_tasks.len() as i32) as usize;
-    column_tasks.insert(clamped_position, (task_id, 0)); // position will be recalculated
-
-    // Update positions for all tasks in the column
-    for (idx, (tid, _)) in column_tasks.iter().enumerate() {
-        if let Some(task) = tasks.get_mut(tid) {
-            task.position = idx as i32;
-            task.updated_at = chrono::Utc::now();
-        }
+        return match crate::lifecycle::terminalize_leased(
+            terminalize_ctx(&state),
+            task_id,
+            crate::lifecycle::Origin::User,
+            request,
+        )
+        .await
+        {
+            // Read back rather than used directly, because the caller wants
+            // the whole committed record and the position it landed at, which
+            // is the one the board and the file now agree on.
+            Ok(_) => Ok(state.task.tasks.read().await.get(&task_id).cloned()),
+            Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => Ok(None),
+            Err(refusal) => Err(refusal.to_string()),
+        };
     }
 
-    // Update the moved task's status if it changed
-    if let Some(task) = tasks.get_mut(&task_id) {
-        if old_status != target_status {
-            task.status = target_status.clone();
+    let mut tasks = state.task.tasks.write().await;
 
-            // Dragging a card is the same lifecycle decision as calling
-            // `update_task_status`, and goes through the same classifier so the
-            // two cannot diverge.
-            match classify_status_transition(&old_status, &target_status) {
-                StatusTransitionEffect::ResetExecutionState => {
-                    // Worktree and branch preserved; see
-                    // `StatusTransitionEffect`.
-                    task.reset_execution_state();
-                }
-                StatusTransitionEffect::CleanUpWorktree => {
-                    // Keep branch_name for PR creation. Removal leaves the
-                    // branch alone, so it still names something afterwards.
-                    if let Some(wt_path) = task.worktree_path.clone() {
-                        spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path);
-                    }
-                }
-                StatusTransitionEffect::None => {}
+    if effect != StatusTransitionEffect::None || old_status != target_status {
+        if let Some(task) = tasks.get_mut(&task_id) {
+            task.status = target_status.clone();
+            if effect == StatusTransitionEffect::ResetExecutionState {
+                // Worktree and branch preserved; see `StatusTransitionEffect`.
+                task.reset_execution_state();
             }
         }
-        task.updated_at = chrono::Utc::now();
     }
 
-    let updated_task = tasks.get(&task_id).cloned();
+    renumber_column(&mut tasks, project_id, task_id, &target_status, new_position);
 
-    // Persist to disk
+    let updated_task = tasks.get(&task_id).cloned();
     persist_project_tasks(&state.storage, &tasks, project_id);
 
     Ok(updated_task)
@@ -919,9 +892,10 @@ pub async fn remove_external_ref(
 /// helper cannot drift into teaching a different contract than production.
 ///
 /// Deliberately does **not** clear `worktree_path`: production only clears it
-/// once [`cleanup_worktree`]'s actual removal succeeds, and this helper never
-/// runs any removal. Clearing it here would model a cleanup that never
-/// happened, exactly the bug this file's worktree-lifecycle fix closed.
+/// in the same durable write [`crate::lifecycle::terminalize`] makes once the
+/// removal has actually succeeded, and this helper runs no removal. Clearing it
+/// here would model a cleanup that never happened, exactly the bug the
+/// worktree-lifecycle work closed.
 #[cfg(test)]
 pub fn update_task_status_logic(
     tasks: &mut HashMap<Uuid, Task>,
@@ -986,15 +960,16 @@ pub fn delete_task_logic(
     tasks.remove(&task_id).is_some()
 }
 
-/// Core reorder logic extracted for testability
-/// Returns the updated tasks HashMap after reordering
+/// Core reorder logic extracted for testability.
 ///
-/// Dragging a card and calling `update_task_status` are the same lifecycle
-/// decision, so this applies the transition effect through the same
-/// [`classify_status_transition`] the production `reorder_task` uses — the two
-/// entry points cannot be made to disagree about when execution state resets.
-/// Like [`update_task_status_logic`], it runs no worktree removal and so
-/// leaves `worktree_path` alone.
+/// Delegates the position arithmetic to the production [`renumber_column`] and
+/// the transition decision to the production [`classify_status_transition`], so
+/// the tests below exercise the code the commands run rather than a copy of it.
+/// What it deliberately does not do is any worktree removal: a `Done`
+/// transition in the real `reorder_task` goes through
+/// [`crate::lifecycle::terminalize`], which needs a repository and a
+/// filesystem, so the cases covered here are the column arithmetic and the
+/// execution-state reset.
 #[cfg(test)]
 pub fn reorder_task_logic(
     tasks: &mut HashMap<Uuid, Task>,
@@ -1002,46 +977,24 @@ pub fn reorder_task_logic(
     new_status: Option<TaskStatus>,
     new_position: i32,
 ) -> Option<Task> {
-    // Get the task and its current/new status
     let (project_id, old_status, target_status) = {
         let task = tasks.get(&task_id)?;
-        let target = new_status.clone().unwrap_or(task.status.clone());
+        let target = new_status.unwrap_or_else(|| task.status.clone());
         (task.project_id, task.status.clone(), target)
     };
 
-    // Collect task IDs in the target column, sorted by position
-    let mut column_tasks: Vec<(Uuid, i32)> = tasks
-        .values()
-        .filter(|t| t.project_id == project_id && t.status == target_status && t.id != task_id)
-        .map(|t| (t.id, t.position))
-        .collect();
-    column_tasks.sort_by_key(|(_, pos)| *pos);
-
-    // Insert the moved task at the new position and recalculate positions
-    let clamped_position = new_position.max(0).min(column_tasks.len() as i32) as usize;
-    column_tasks.insert(clamped_position, (task_id, 0)); // position will be recalculated
-
-    // Update positions for all tasks in the column
-    for (idx, (tid, _)) in column_tasks.iter().enumerate() {
-        if let Some(task) = tasks.get_mut(tid) {
-            task.position = idx as i32;
-            task.updated_at = chrono::Utc::now();
-        }
-    }
-
-    // Update the moved task's status if it changed
-    if let Some(task) = tasks.get_mut(&task_id) {
-        if old_status != target_status {
+    if old_status != target_status {
+        if let Some(task) = tasks.get_mut(&task_id) {
             task.status = target_status.clone();
-
             if let StatusTransitionEffect::ResetExecutionState =
                 classify_status_transition(&old_status, &target_status)
             {
                 task.reset_execution_state();
             }
         }
-        task.updated_at = chrono::Utc::now();
     }
+
+    renumber_column(tasks, project_id, task_id, &target_status, new_position);
 
     tasks.get(&task_id).cloned()
 }
@@ -1056,462 +1009,6 @@ mod tests {
     fn create_test_tasks_map(tasks: Vec<Task>) -> HashMap<Uuid, Task> {
         tasks.into_iter().map(|t| (t.id, t)).collect()
     }
-
-    fn test_worktree_manager() -> crate::worktree::WorktreeManager {
-        let root = std::env::temp_dir().join(format!("slashit-task-wt-test-{}", Uuid::new_v4()));
-        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
-            root.join("config"),
-            root.join("data"),
-            root.join("cache"),
-            root.join("runtime"),
-        ));
-        // `Managed` forces the git-native path regardless of whether `wt`
-        // happens to be installed on the machine running this test.
-        crate::worktree::WorktreeManager::new(paths, crate::config::paths::WorktreePlacement::Managed)
-    }
-
-    fn test_storage() -> (Storage, tempfile::TempDir) {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let root = temp.path();
-        std::fs::create_dir_all(root.join("config")).unwrap();
-        std::fs::create_dir_all(root.join("data")).unwrap();
-        let storage = Storage::with_paths(crate::config::paths::AppPaths::with_roots(
-            root.join("config"),
-            root.join("data"),
-            root.join("cache"),
-            root.join("runtime"),
-        ));
-        (storage, temp)
-    }
-
-    fn create_temp_git_repo() -> tempfile::TempDir {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(tmp.path())
-                .output()
-                .expect("git command failed to spawn")
-        };
-        git(&["init", "-q"]);
-        git(&["config", "user.email", "test@example.com"]);
-        git(&["config", "user.name", "Test"]);
-        std::fs::write(tmp.path().join("f.txt"), "x").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-q", "-m", "init"]);
-        tmp
-    }
-
-    fn test_project(id: Uuid, repository_id: Option<Uuid>) -> Project {
-        Project {
-            id,
-            name: "test-project".to_string(),
-            repository_id,
-            scope: crate::domain::ProjectScope::Standalone,
-            state_location: crate::config::paths::StateLocation::External,
-            agent_type: crate::domain::AgentType::ClaudeCode,
-            agent_config: crate::domain::AgentConfig {
-                agent_type: crate::domain::AgentType::ClaudeCode,
-                command: "claude".to_string(),
-                args: Vec::new(),
-                env: HashMap::new(),
-                model: None,
-                api_key: None,
-            },
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
-    }
-
-    fn test_repository(id: Uuid, local_path: String) -> Repository {
-        Repository {
-            id,
-            local_path,
-            remote_url: None,
-            remote_type: None,
-            created_at: chrono::Utc::now(),
-        }
-    }
-
-    #[tokio::test]
-    async fn cleanup_worktree_clears_worktree_path_only_after_successful_removal() {
-        let repo = create_temp_git_repo();
-        let repo_path = repo.path().to_str().unwrap().to_string();
-        let wt_mgr = test_worktree_manager();
-        let info = wt_mgr
-            .create(&repo_path, "cleanup-success")
-            .await
-            .expect("create failed");
-
-        let project_id = Uuid::new_v4();
-        let repo_id = Uuid::new_v4();
-        let projects = Arc::new(RwLock::new(HashMap::from([(
-            project_id,
-            test_project(project_id, Some(repo_id)),
-        )])));
-        let repositories = Arc::new(RwLock::new(HashMap::from([(
-            repo_id,
-            test_repository(repo_id, repo_path),
-        )])));
-
-        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
-        task.worktree_path = Some(info.path.clone());
-        let task_id = task.id;
-        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
-        let (storage, _tmp) = test_storage();
-
-        cleanup_worktree(
-            WorktreeCleanupCtx {
-                worktree_manager: &wt_mgr,
-                projects: &projects,
-                repositories: &repositories,
-                tasks: &tasks,
-                storage: &storage,
-            },
-            task_id,
-            project_id,
-            &info.path,
-        )
-        .await;
-
-        let tasks_r = tasks.read().await;
-        assert_eq!(
-            tasks_r.get(&task_id).unwrap().worktree_path, None,
-            "worktree_path must be cleared once removal actually succeeded"
-        );
-        assert!(
-            !std::path::Path::new(&info.path).exists(),
-            "the worktree directory itself must be gone"
-        );
-    }
-
-    #[tokio::test]
-    async fn cleanup_worktree_retains_worktree_path_when_the_board_cannot_be_saved() {
-        // This is the status-change and delete path, not the executor's, and
-        // it has no retry pass of its own — so publishing the clear to memory
-        // while the write failed would leave the board and disk disagreeing
-        // with nothing left to reconcile them until the next start.
-        let repo = create_temp_git_repo();
-        let repo_path = repo.path().to_str().unwrap().to_string();
-        let wt_mgr = test_worktree_manager();
-        let info = wt_mgr
-            .create(&repo_path, "cleanup-unsaveable")
-            .await
-            .expect("create failed");
-
-        let project_id = Uuid::new_v4();
-        let repo_id = Uuid::new_v4();
-        let projects = Arc::new(RwLock::new(HashMap::from([(
-            project_id,
-            test_project(project_id, Some(repo_id)),
-        )])));
-        let repositories = Arc::new(RwLock::new(HashMap::from([(
-            repo_id,
-            test_repository(repo_id, repo_path),
-        )])));
-
-        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
-        task.worktree_path = Some(info.path.clone());
-        let task_id = task.id;
-        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
-        let (storage, _tmp) = test_storage();
-
-        // A regular file where the tasks directory has to be makes the atomic
-        // write fail with `NotADirectory`. No permission bits, so this behaves
-        // the same for every user including root.
-        std::fs::write(
-            storage.paths().config_dir().join("tasks"),
-            b"not a directory",
-        )
-        .expect("place persistence blocker");
-
-        cleanup_worktree(
-            WorktreeCleanupCtx {
-                worktree_manager: &wt_mgr,
-                projects: &projects,
-                repositories: &repositories,
-                tasks: &tasks,
-                storage: &storage,
-            },
-            task_id,
-            project_id,
-            &info.path,
-        )
-        .await;
-
-        assert_eq!(
-            tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
-            Some(info.path.as_str()),
-            "the reference must survive in memory when it could not be persisted"
-        );
-    }
-
-    /// Make every `save_project_tasks` fail deterministically by putting a
-    /// regular file where the tasks directory has to be, so the `create_dir_all`
-    /// inside the atomic write fails with `AlreadyExists`. No permission bits,
-    /// so this behaves identically for every user including root.
-    fn block_task_persistence(storage: &Storage) {
-        let blocker = storage.paths().config_dir().join("tasks");
-        let _ = std::fs::remove_dir_all(&blocker);
-        std::fs::write(&blocker, b"not a directory").expect("place persistence blocker");
-    }
-
-    /// A task holding `wt_path`, plus a sibling in the same project that the
-    /// whole-file rewrite must not drop.
-    fn durable_clear_fixture(project_id: Uuid, wt_path: &str) -> (Uuid, Uuid, Tasks) {
-        let mut subject = create_test_task_full("subject", project_id, TaskStatus::Done, 0);
-        subject.worktree_path = Some(wt_path.to_string());
-        let sibling = create_test_task_full("sibling", project_id, TaskStatus::Backlog, 1);
-        let (subject_id, sibling_id) = (subject.id, sibling.id);
-        (
-            subject_id,
-            sibling_id,
-            Arc::new(RwLock::new(create_test_tasks_map(vec![subject, sibling]))),
-        )
-    }
-
-    #[tokio::test]
-    async fn clear_worktree_path_durably_cannot_lose_a_concurrent_update_to_a_sibling_task() {
-        // Regression guard for the stale-snapshot race, carried over from the
-        // daemon branch's own independent fix for this same defect. Both
-        // branches fixed it; this shared helper is the implementation that
-        // survived, because all three cleanup call sites use it, but that
-        // branch's concurrency proof was the stronger of the two and is kept
-        // here rather than dropped with the commit it came from.
-        //
-        // The defect: read the task map, build a whole-project snapshot,
-        // release the guard, and only then persist. A concurrent write to a
-        // *different* task in the same project that reached disk during that
-        // gap would be silently reverted by the now-stale snapshot, because
-        // `save_project_tasks` rewrites the entire project file.
-        //
-        // Proven deterministically rather than by timing luck.
-        // `tokio::sync::RwLock` is task-fair: waiters are granted the lock in
-        // the order they enqueued. `clear_worktree_path_durably` holds a
-        // single *write* guard continuously from the `worktree_path` check
-        // through the synchronous save that follows — strictly stronger than
-        // the read guard the original proof assumed. Taking a write guard here
-        // first blocks both competing operations; letting the cleanup enqueue
-        // before the sibling writer does means fairness guarantees the writer
-        // cannot persist until cleanup's save has already completed.
-        let project_id = Uuid::new_v4();
-        let wt_path = "/tmp/slashit-test-concurrent-cleanup";
-        let (task_id, sibling_id, tasks) = durable_clear_fixture(project_id, wt_path);
-        let (storage, _tmp) = test_storage();
-
-        // Block every reader and writer until both competing operations are
-        // confirmed enqueued, in the intended FIFO order.
-        let blocker = tasks.write().await;
-
-        let cleanup_tasks = tasks.clone();
-        let cleanup_storage = storage.clone();
-        let cleanup_handle = tokio::spawn(async move {
-            clear_worktree_path_durably(&cleanup_tasks, &cleanup_storage, task_id, wt_path).await
-        });
-        // Let the executor poll `cleanup_handle` at least once, so its
-        // `tasks.write()` request registers in the lock's wait queue before
-        // the sibling writer's does below.
-        tokio::task::yield_now().await;
-
-        let writer_tasks = tasks.clone();
-        let writer_storage = storage.clone();
-        let writer_handle = tokio::spawn(async move {
-            let mut w = writer_tasks.write().await;
-            w.get_mut(&sibling_id).unwrap().title = "renamed while cleanup was pending".to_string();
-            let snapshot: Vec<Task> = w
-                .values()
-                .filter(|t| t.project_id == project_id)
-                .cloned()
-                .collect();
-            drop(w);
-            writer_storage
-                .save_project_tasks(project_id, &snapshot)
-                .unwrap();
-        });
-        tokio::task::yield_now().await;
-
-        // Both are queued behind this guard now, cleanup ahead of the writer.
-        drop(blocker);
-
-        cleanup_handle
-            .await
-            .expect("cleanup task panicked")
-            .expect("cleanup should succeed");
-        writer_handle.await.expect("writer task panicked");
-
-        let persisted = storage
-            .load_project_tasks(project_id)
-            .expect("tasks must be readable from disk");
-        let sibling = persisted
-            .iter()
-            .find(|t| t.id == sibling_id)
-            .expect("sibling must still be on disk");
-        assert_eq!(
-            sibling.title, "renamed while cleanup was pending",
-            "a concurrent update to a sibling task must survive the cleanup save; a stale \
-             whole-project snapshot would have reverted it"
-        );
-
-        let subject = persisted
-            .iter()
-            .find(|t| t.id == task_id)
-            .expect("subject must still be on disk");
-        assert_eq!(
-            subject.worktree_path, None,
-            "the cleanup's own clear must also have reached disk"
-        );
-    }
-
-    #[tokio::test]
-    async fn clear_worktree_path_durably_reports_a_failed_write_and_retains_the_path() {
-        // The contract `commands::worktree::cleanup_worktree` now depends on.
-        // That command is reachable for any status, while the executor's retry
-        // pass only revisits `Done` tasks, so this `Err` is the entire recovery
-        // story there: it is what lets the dialog tell the user to try again.
-        let project_id = Uuid::new_v4();
-        let (task_id, _sibling, tasks) = durable_clear_fixture(project_id, "/tmp/wt/task-aaaa1111");
-        let (storage, _tmp) = test_storage();
-        block_task_persistence(&storage);
-
-        let result =
-            clear_worktree_path_durably(&tasks, &storage, task_id, "/tmp/wt/task-aaaa1111").await;
-
-        assert!(result.is_err(), "a failed write must be reported, not swallowed");
-        assert_eq!(
-            tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
-            Some("/tmp/wt/task-aaaa1111"),
-            "the reference must survive in memory so the retry pass can still see it"
-        );
-    }
-
-    #[tokio::test]
-    async fn clear_worktree_path_durably_declines_to_clear_a_newer_worktree_path() {
-        // `commands::worktree::cleanup_worktree` used to clear
-        // `worktree_path` unconditionally, so a re-run that recreated a
-        // worktree while the removal was in flight had the reference to its
-        // *new* worktree erased by a cleanup that never touched it.
-        let project_id = Uuid::new_v4();
-        let (task_id, _sibling, tasks) = durable_clear_fixture(project_id, "/tmp/wt/new-worktree");
-        let (storage, _tmp) = test_storage();
-
-        clear_worktree_path_durably(&tasks, &storage, task_id, "/tmp/wt/old-worktree")
-            .await
-            .expect("a stale cleanup is not an error, it simply clears nothing");
-
-        assert_eq!(
-            tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
-            Some("/tmp/wt/new-worktree"),
-            "the replacement worktree must keep its reference"
-        );
-    }
-
-    #[tokio::test]
-    async fn clear_worktree_path_durably_keeps_sibling_tasks() {
-        let project_id = Uuid::new_v4();
-        let (task_id, sibling_id, tasks) = durable_clear_fixture(project_id, "/tmp/wt/x");
-        let (storage, _tmp) = test_storage();
-
-        clear_worktree_path_durably(&tasks, &storage, task_id, "/tmp/wt/x")
-            .await
-            .expect("save should succeed");
-
-        let persisted = storage.load_project_tasks(project_id).expect("reload tasks");
-        assert_eq!(persisted.len(), 2, "the sibling must still be on disk");
-        assert!(
-            persisted.iter().find(|t| t.id == task_id).unwrap().worktree_path.is_none(),
-            "the cleared path must be the one on disk"
-        );
-        assert_eq!(
-            persisted.iter().find(|t| t.id == sibling_id).unwrap().title,
-            "sibling",
-            "the sibling must survive the whole-file rewrite intact"
-        );
-    }
-
-    #[tokio::test]
-    async fn cleanup_worktree_retains_worktree_path_when_repo_path_cannot_be_resolved() {
-        let wt_mgr = test_worktree_manager();
-        // `project_id` deliberately has no entry in `projects` below, so
-        // `resolve_repo_path` fails before any git command ever runs.
-        let project_id = Uuid::new_v4();
-        let projects = Arc::new(RwLock::new(HashMap::new()));
-        let repositories = Arc::new(RwLock::new(HashMap::new()));
-
-        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
-        task.worktree_path = Some("/tmp/does-not-matter".to_string());
-        let task_id = task.id;
-        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
-        let (storage, _tmp) = test_storage();
-
-        cleanup_worktree(
-            WorktreeCleanupCtx {
-                worktree_manager: &wt_mgr,
-                projects: &projects,
-                repositories: &repositories,
-                tasks: &tasks,
-                storage: &storage,
-            },
-            task_id,
-            project_id,
-            "/tmp/does-not-matter",
-        )
-        .await;
-
-        let tasks_r = tasks.read().await;
-        assert_eq!(
-            tasks_r.get(&task_id).unwrap().worktree_path.as_deref(),
-            Some("/tmp/does-not-matter"),
-            "an unresolved repo path must leave worktree_path untouched, not clear it"
-        );
-    }
-
-    #[tokio::test]
-    async fn cleanup_worktree_retains_worktree_path_when_removal_fails() {
-        let wt_mgr = test_worktree_manager();
-        let project_id = Uuid::new_v4();
-        let repo_id = Uuid::new_v4();
-        // A repo path that does not exist on disk makes every git invocation
-        // in `remove_with_git` fail to spawn (its `current_dir` is invalid),
-        // giving a real, deterministic removal failure to test against.
-        let bogus_repo_path = "/definitely/does/not/exist/slashit-test-xyz".to_string();
-
-        let projects = Arc::new(RwLock::new(HashMap::from([(
-            project_id,
-            test_project(project_id, Some(repo_id)),
-        )])));
-        let repositories = Arc::new(RwLock::new(HashMap::from([(
-            repo_id,
-            test_repository(repo_id, bogus_repo_path),
-        )])));
-
-        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
-        task.worktree_path = Some("/tmp/some-worktree-path".to_string());
-        let task_id = task.id;
-        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
-        let (storage, _tmp) = test_storage();
-
-        cleanup_worktree(
-            WorktreeCleanupCtx {
-                worktree_manager: &wt_mgr,
-                projects: &projects,
-                repositories: &repositories,
-                tasks: &tasks,
-                storage: &storage,
-            },
-            task_id,
-            project_id,
-            "/tmp/some-worktree-path",
-        )
-        .await;
-
-        let tasks_r = tasks.read().await;
-        assert_eq!(
-            tasks_r.get(&task_id).unwrap().worktree_path.as_deref(),
-            Some("/tmp/some-worktree-path"),
-            "a failed removal must leave worktree_path in place for retry"
-        );
-    }
-
     /// Every status the board has today, so the exhaustive cases below stay
     /// exhaustive when a new one is added.
     const ALL_STATUSES: [TaskStatus; 8] = [
@@ -1643,9 +1140,9 @@ mod tests {
     #[test]
     fn every_transition_cleans_up_exactly_when_it_reaches_done() {
         // Exhaustive: cleanup is selected if and only if the task is becoming
-        // Done. No other transition may reach `spawn_worktree_cleanup`, and
-        // each pair yields exactly one effect, so no call site can spawn
-        // cleanup twice by matching two overlapping conditions.
+        // Done. No other transition may reach `crate::lifecycle::terminalize`,
+        // and each pair yields exactly one effect, so no call site can start
+        // two cleanups by matching two overlapping conditions.
         for old in &ALL_STATUSES {
             for new in &ALL_STATUSES {
                 let effect = classify_status_transition(old, new);
@@ -2088,7 +1585,7 @@ mod tests {
         assert_eq!(updated.status, TaskStatus::Done);
         // This helper never runs worktree removal, so it must not model
         // removal as already successful — production only clears
-        // `worktree_path` once `cleanup_worktree`'s actual removal succeeds.
+        // `worktree_path` in the write that commits a removal that worked.
         assert_eq!(updated.worktree_path, Some("/tmp/wt-test".to_string()));
         // branch_name kept for PR creation either way.
         assert_eq!(updated.branch_name, Some("feature-branch".to_string()));

@@ -38,18 +38,43 @@ pub enum WorktreeRecovery {
 }
 
 impl WorktreeManager {
-    pub fn new(paths: Arc<AppPaths>, placement: WorktreePlacement) -> Self {
-        let wt_available = std::process::Command::new("which")
-            .arg("wt")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+    /// Whether `name` is an executable on `PATH`.
+    ///
+    /// A directory walk rather than `which`, because `which` is a subprocess
+    /// and this runs during construction. A forked child inherits every open
+    /// descriptor until it reaches `exec`, and the single-instance ownership
+    /// lease is an `flock` held on one of them, so a probe that forks while
+    /// that lease is being released holds it open past the release -- long
+    /// enough for the next acquisition to be told, wrongly, that another
+    /// instance is already listening. Measured: with the two `which` calls in
+    /// place the IPC ownership regression failed 9 runs in 12 against parallel
+    /// construction, and 0 in 12 with them gone.
+    ///
+    /// Answering it directly is also simply the smaller thing to do: two
+    /// process spawns at startup, to read a variable this process already has.
+    fn on_path(name: &str) -> bool {
+        let Some(path) = std::env::var_os("PATH") else {
+            return false;
+        };
+        std::env::split_paths(&path).any(|dir| {
+            let candidate = dir.join(name);
+            std::fs::metadata(&candidate).is_ok_and(|meta| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    meta.is_file() && meta.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    meta.is_file()
+                }
+            })
+        })
+    }
 
-        let gs_available = std::process::Command::new("which")
-            .arg("git-spice")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+    pub fn new(paths: Arc<AppPaths>, placement: WorktreePlacement) -> Self {
+        let wt_available = Self::on_path("wt");
+        let gs_available = Self::on_path("git-spice");
 
         if gs_available {
             println!("SlashIt: git-spice detected — available for stacked PRs");
@@ -220,6 +245,21 @@ impl WorktreeManager {
         }
 
         None
+    }
+
+    /// The path git currently has registered for `branch`, whether or not
+    /// anything is there.
+    ///
+    /// Unlike [`Self::adopt_any_registered`] this does not ask whether the
+    /// directory exists, and that is the entire point of it. Startup uses it to
+    /// decide whether an interrupted cleanup finished: a removal deletes the
+    /// checkout's contents and takes the registration down last, so a
+    /// registration that is still there is proof the removal did not reach its
+    /// end, however empty the directory looks. Adoption must not use it, for
+    /// the same reason -- a surviving registration is exactly the case where
+    /// there is nothing safe to adopt.
+    pub fn registration_for_branch(porcelain: &str, branch: &str) -> Option<String> {
+        Self::worktree_for_branch(porcelain, branch)
     }
 
     /// Any worktree git currently has registered for `branch`, regardless of
@@ -540,10 +580,10 @@ impl WorktreeManager {
             // That is anti-convergent rather than merely unhelpful: a first
             // attempt that did remove the directory guarantees every later
             // attempt fails. A cleanup that removed the worktree but could not
-            // save the board retains `worktree_path` on purpose, so the ~30s
-            // retry pass would then retry that task forever -- and this is the
-            // default backend whenever `wt` is installed, because
-            // `WorktreePlacement::Auto` is the default.
+            // save the board retains `worktree_path` on purpose, so every
+            // explicit retry the user asks for would fail on a worktree that is
+            // already gone -- and this is the default backend whenever `wt` is
+            // installed, because `WorktreePlacement::Auto` is the default.
             //
             // Handing this case to git rather than just returning `Ok(())` is
             // what makes it converge to a *usable* state. `wt` leaves the
@@ -558,8 +598,18 @@ impl WorktreeManager {
             return self.remove_with_git(worktree_path, repo_path).await;
         }
 
+        // `--no-delete-branch` is what keeps this backend's contract the same
+        // as the git one's. Measured against worktrunk v0.29.0: without it,
+        // `wt remove` deletes the task branch whenever the branch sits on the
+        // same commit as main -- it prints "Removing <branch> worktree &
+        // branch in background (same commit as main)" and the branch is gone
+        // afterwards. That is not an exotic state; it is the ordinary end of a
+        // task, reached by every task whose agent committed nothing and by
+        // every task whose work has already landed. The task branch is durable
+        // committed task state -- it is what `create_pr` pushes and what
+        // `reattach` checks out again -- so it has to survive cleanup.
         let output = tokio::process::Command::new("wt")
-            .args(["remove", "-y", "--no-verify"])
+            .args(["remove", "-y", "--no-verify", "--no-delete-branch"])
             .current_dir(worktree_path)
             .output()
             .await
@@ -602,7 +652,18 @@ impl WorktreeManager {
         // `git worktree` command will touch again.
         let record = WorktreeRecord::save(worktree_path, repo_path).await;
 
-        // Try normal remove first
+        // The ordinary removal is the only removal. There is deliberately no
+        // `--force` fallback and no other destructive retry: `git worktree
+        // remove` refuses precisely when the checkout holds content no commit
+        // names -- a modified tracked file, a staged change, a non-ignored
+        // untracked file -- and that refusal is the last thing standing
+        // between an automatic cleanup and work that exists nowhere else.
+        // Treating it as a signal to re-run with `--force` deleted exactly the
+        // content the refusal was protecting, and then reported `Ok(())`, on
+        // which the caller durably clears `worktree_path`. Git's own notion of
+        // dirty is the whole policy here, so nothing below parses stderr to
+        // second-guess it; ignored build output is not dirty to git and this
+        // removal takes the checkout away build output and all.
         let output = tokio::process::Command::new("git")
             .args(["worktree", "remove", worktree_path])
             .current_dir(repo_path)
@@ -610,29 +671,35 @@ impl WorktreeManager {
             .await
             .map_err(|e| format!("Failed to remove worktree: {}", e))?;
 
-        if !output.status.success() {
-            // Fallback to force if normal remove fails (e.g. uncommitted
-            // changes). Its exit status decides nothing on its own; the
-            // directory below is the only trustworthy signal either way.
-            tokio::process::Command::new("git")
-                .args(["worktree", "remove", "--force", worktree_path])
-                .current_dir(repo_path)
-                .output()
-                .await
-                .map_err(|e| format!("Failed to force-remove worktree: {}", e))?;
-        }
+        // Kept for the failure message below. A refusal git explains in
+        // stderr is the only thing that can tell the user *which* file is
+        // holding the cleanup back, and a non-zero exit on its own cannot.
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
-        // Every attempt above can fail with a non-zero exit — which is not a
-        // Rust `Err` — without the directory actually being gone. The only
-        // trustworthy signal that removal worked is checking for the
-        // directory itself; reporting success otherwise would let a caller
-        // clear `worktree_path` for a worktree that is still on disk, losing
-        // the only handle back to it.
+        // The command can fail with a non-zero exit — which is not a Rust
+        // `Err` — without the directory actually being gone, and it can also
+        // exit zero while leaving it behind. The only trustworthy signal that
+        // removal worked is checking for the directory itself; reporting
+        // success otherwise would let a caller clear `worktree_path` for a
+        // worktree that is still on disk, losing the only handle back to it.
         if self.exists(worktree_path) {
-            let mut failure = format!(
-                "worktree at {} still exists after worktree remove and --force both ran",
-                worktree_path
-            );
+            // Git's own words are carried through verbatim, because this
+            // string is what surfaces to the user and "cleanup failed" is not
+            // something anyone can act on. "contains modified or untracked
+            // files, use --force to delete it" names the fix a human may
+            // legitimately choose by hand; SlashIt just will not choose it for
+            // them.
+            let mut failure = if stderr.is_empty() {
+                format!(
+                    "worktree at {worktree_path} still exists after `git worktree remove`, which \
+                     gave no reason"
+                )
+            } else {
+                format!(
+                    "worktree at {worktree_path} still exists after `git worktree remove`: \
+                     {stderr}"
+                )
+            };
             // A removal git abandoned partway has also cost the worktree its
             // record, and the retry this `Err` schedules cannot do anything
             // without one. Putting it back is what makes the next attempt an
@@ -743,8 +810,8 @@ impl WorktreeManager {
 /// working tree" however the path is spelled, `repair` declines because the
 /// `.git` file now points at nothing, and `add` refuses a path that exists.
 /// The record is the only thing that makes a checkout removable, so losing it
-/// turns an unfinished removal into an impossible one, and the executor's
-/// periodic pass then retries a task that no attempt can ever complete.
+/// turns an unfinished removal into an impossible one: no later attempt, however
+/// many times a person asks for it, could ever get anywhere.
 ///
 /// What keeps this from reaching a worktree it has no business in is the
 /// record's own absence, checked at the moment of putting it back rather than
@@ -948,12 +1015,13 @@ mod tests {
 
     #[tokio::test]
     async fn remove_converges_on_an_absent_directory_under_worktrunk_delegation() {
-        // The retry pass PR #1 adds only terminates if a second removal of an
-        // already-absent worktree succeeds. `remove_with_git` gets that from
-        // its `exists()` gate; `remove_with_wt` spawns with
-        // `current_dir(worktree_path)`, so without its own guard the retry
-        // fails at spawn every ~30s forever. This runs on machines with and
-        // without `wt` installed, because the guard returns before spawning.
+        // A second removal of an already-absent worktree has to succeed, or
+        // the state is one nothing can ever finish: `remove_with_git` gets that
+        // from its `exists()` gate; `remove_with_wt` spawns with
+        // `current_dir(worktree_path)`, so without its own guard it fails at
+        // spawn every time it is asked, however many times the user asks. This
+        // runs on machines with and without `wt` installed, because the guard
+        // returns before spawning.
         let mut mgr = test_manager();
         mgr.wt_available = true;
         mgr.placement = WorktreePlacement::Auto;
@@ -1538,7 +1606,9 @@ branch refs/heads/some-other-branch
         // non-zero, and nothing was removed by this call. Reporting `Ok` is
         // right — the worktree is gone — and the branch, which this call has
         // no claim on whatsoever, must be exactly as it was. Kept as its own
-        // case because it is the one a ~30s retry pass actually re-enters.
+        // case because it is the one an explicit retry actually re-enters:
+        // asking again for a cleanup that already removed the directory must
+        // converge rather than fail forever.
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
@@ -1567,9 +1637,9 @@ branch refs/heads/some-other-branch
     /// A worktree is disposable exactly to the extent that everything in it
     /// is recoverable from somewhere else, and not-yet-committed content is
     /// precisely what is not: no commit, and therefore no branch, names it.
-    /// `remove` is reached automatically -- one drag onto Done, or the ~30s
-    /// retry pass -- so there is no moment at which anybody is asked whether
-    /// this particular checkout is expendable.
+    /// `remove` is reached automatically -- one drag onto Done is enough --
+    /// so there is no moment at which anybody is asked whether this particular
+    /// checkout is expendable.
     ///
     /// Three classes of content have that property and are run as one table
     /// rather than three near-identical tests, because the contract is one
@@ -1580,12 +1650,18 @@ branch refs/heads/some-other-branch
     /// bytes, leave the registration git needs in order to address that
     /// checkout again, and leave the task branch.
     ///
-    /// Expected to fail on the current implementation, and for one specific
-    /// reason: `remove_with_git` treats the refusal `git worktree remove`
-    /// correctly issues for a dirty checkout as a signal to re-run it with
-    /// `--force`, which deletes the content and then returns `Ok(())`. The
-    /// caller durably clears `worktree_path` on that `Ok`, so the work is
-    /// gone and nothing records that it ever existed.
+    /// The behaviour this pins down is that `remove_with_git` makes exactly
+    /// one removal attempt, the ordinary `git worktree remove`, and reports
+    /// git's refusal as an `Err`. It used to read that refusal as a signal to
+    /// re-run with `--force`, which deleted the content and then returned
+    /// `Ok(())`; the caller durably clears `worktree_path` on that `Ok`, so
+    /// the work was gone and nothing recorded that it had ever existed.
+    ///
+    /// The error text is asserted on too, and against git's own words rather
+    /// than a phrase invented here. "Cleanup failed" tells a user nothing
+    /// they can act on, whereas git names the file that is holding the
+    /// removal back, and that is the whole difference between a dead end and
+    /// a next step.
     #[tokio::test]
     async fn a_dirty_worktree_survives_automatic_cleanup() {
         /// One class of content that lives nowhere but in the checkout.
@@ -1663,15 +1739,35 @@ branch refs/heads/some-other-branch
                 case.class
             );
 
+            // Git's refusal is read from git rather than written down here,
+            // so the assertion below stays true across git versions and
+            // across the wording of the advice they give. Running the plain
+            // removal to get it is safe: it refuses at validation and touches
+            // neither the checkout nor its registration, which is the very
+            // property the rest of this test is about.
+            let refusal = git_removal_refusal(repo_path, &info.path);
+            assert!(
+                !refusal.is_empty(),
+                "precondition [{}]: git itself must refuse to remove this checkout, or there is \
+                 no refusal for cleanup to relay",
+                case.class
+            );
+
             let result = mgr.remove(&info.path, repo_path).await;
 
             let class = case.class;
-            if result.is_ok() {
-                violations.push(format!(
+            match &result {
+                Ok(()) => violations.push(format!(
                     "[{class}] cleanup reported success for a checkout holding content no commit \
                      names; the caller clears worktree_path on that answer, so the last handle \
                      to that content goes too"
-                ));
+                )),
+                Err(error) if !error.contains(&refusal) => violations.push(format!(
+                    "[{class}] the failure surfaced to the user does not carry git's reason, so \
+                     nobody can tell which file is holding cleanup back: cleanup said {error:?}, \
+                     git said {refusal:?}"
+                )),
+                Err(_) => {}
             }
             if !Path::new(&info.path).exists() {
                 violations.push(format!(
@@ -1707,6 +1803,96 @@ branch refs/heads/some-other-branch
             violations.is_empty(),
             "automatic cleanup destroyed content that existed nowhere else:\n{}",
             violations.join("\n")
+        );
+    }
+
+    /// `remove` never reaches for `--force`, stated as the consequence that
+    /// distinguishes running it from not running it.
+    ///
+    /// The direct structural proof would be a `git` shim first on `PATH` that
+    /// logs its own argv, the way `tests/task_terminal_cleanup_lifecycle.rs`
+    /// does it. That is not available in this module: installing a shim means
+    /// mutating `PATH` with `std::env::set_var`, which is process-global and
+    /// unsound while any other thread may be reading the environment, and
+    /// these tests run as `#[tokio::test]` functions inside the crate's one
+    /// parallel test binary. It is the same objection that keeps
+    /// `integration_remove_worktree_uses_repo_path_not_process_cwd` away from
+    /// `std::env::set_current_dir`, and a separate integration binary is
+    /// where a shim belongs.
+    ///
+    /// So the outcome carries the proof. `git worktree remove --force` on a
+    /// checkout holding a modified tracked file deletes that checkout and
+    /// exits zero -- asserted here as a positive control at the end, against
+    /// this exact checkout, so it is a measured fact about this arrangement
+    /// and not a claim about git in general. Finding the checkout, the
+    /// modification and the registration all intact after `remove` returned
+    /// is therefore only explicable by no `--force` having run.
+    ///
+    /// Weaker than an argv log in one respect: it cannot see a `--force` that
+    /// was spawned and then failed for an unrelated reason. Stronger in
+    /// another: it is stated in terms of what a user loses rather than in
+    /// terms of an argument string, so a destructive fallback reintroduced
+    /// under any other spelling -- `-f`, a recursive delete in Rust, a helper
+    /// that hides the flag -- fails it just the same.
+    #[tokio::test]
+    async fn remove_never_falls_back_to_a_forced_deletion() {
+        // Tracked because `create_temp_git_repo` committed README.md, so
+        // these bytes are a modification git can see and refuse over.
+        const UNCOMMITTED: &str = "# test\nedited in the worktree, never committed\n";
+
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        // `Managed` forces the git backend even on a machine with `wt`
+        // installed, so this test is about `remove_with_git` everywhere.
+        let mut mgr = test_manager();
+        mgr.wt_available = true;
+        mgr.placement = WorktreePlacement::Managed;
+        assert!(
+            !mgr.delegates_to_wt(),
+            "this test must exercise the git backend whatever is installed on the host"
+        );
+
+        let info = mgr
+            .create(repo_path, "task-no-force")
+            .await
+            .expect("create failed");
+        let readme = Path::new(&info.path).join("README.md");
+        std::fs::write(&readme, UNCOMMITTED).expect("write uncommitted content");
+
+        let error = mgr
+            .remove(&info.path, repo_path)
+            .await
+            .expect_err("a checkout git refuses to remove has not been cleaned up");
+
+        assert!(
+            Path::new(&info.path).exists(),
+            "the checkout is still there, which is the entire point: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&readme).ok().as_deref(),
+            Some(UNCOMMITTED),
+            "and it still holds the bytes that exist in no commit anywhere"
+        );
+        let listing = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        assert!(
+            listing.contains(&info.path),
+            "the registration survives too, or the retry has nothing to address; listing was: \
+             {listing}"
+        );
+        assert!(
+            branch_exists(repo_path, "task-no-force"),
+            "and no removal, refused or otherwise, touches the branch"
+        );
+
+        // The positive control. `--force` is run here, by the test, against
+        // this same checkout: it succeeds and the directory goes. Everything
+        // asserted above is therefore a state `--force` cannot leave behind.
+        run_git(repo_path, &["worktree", "remove", "--force", &info.path]);
+        assert!(
+            !Path::new(&info.path).exists(),
+            "positive control: `--force` deletes this exact checkout, so the survival asserted \
+             above is only reachable if remove never ran it"
         );
     }
 
@@ -1847,24 +2033,24 @@ branch refs/heads/some-other-branch
 
     /// Cleanup under worktrunk must not delete the task branch.
     ///
-    /// `remove_with_wt` runs `wt remove -y --no-verify`, and `wt remove`
-    /// deletes the branch by design whenever it decides that merging it would
-    /// add nothing. The first and cheapest of its five checks is "branch HEAD
-    /// equals the default branch", which is the state of every task whose
-    /// agent committed nothing and of every task whose work has already
-    /// landed. Measured against worktrunk v0.29.0: without
+    /// `wt remove` deletes the branch by design whenever it decides that
+    /// merging it would add nothing. The first and cheapest of its five
+    /// checks is "branch HEAD equals the default branch", which is the state
+    /// of every task whose agent committed nothing and of every task whose
+    /// work has already landed. Measured against worktrunk v0.29.0: without
     /// `--no-delete-branch` it prints "Removing <branch> worktree & branch in
     /// background (same commit as main)" and the branch is gone afterwards;
     /// with `--no-delete-branch` it prints "Branch integrated (same commit as
     /// main); retained with --no-delete-branch" and the branch survives.
     ///
-    /// That leaves the two backends disagreeing about the one thing
-    /// `remove`'s contract is entirely about. `remove_with_git` stopped
-    /// running `git branch -D` precisely because a task branch is routinely
-    /// the only ref naming the commits a task produced; the backend that is
-    /// default on any machine with `wt` installed still deletes it.
-    /// `branch_name` is what `create_pr` pushes and what `reattach`
-    /// re-checks-out, so both break.
+    /// `remove_with_wt` therefore passes `--no-delete-branch`, and this test
+    /// is what holds that flag in place. Without it the two backends disagree
+    /// about the one thing `remove`'s contract is entirely about:
+    /// `remove_with_git` stopped running `git branch -D` precisely because a
+    /// task branch is routinely the only ref naming the commits a task
+    /// produced, while the backend that is default on any machine with `wt`
+    /// installed would still delete it. `branch_name` is what `create_pr`
+    /// pushes and what `reattach` re-checks-out, so both break.
     ///
     /// Ignored by default because it is the only test in this file that needs
     /// the `wt` binary on PATH, following the PTY tests that are ignored for
@@ -1949,8 +2135,8 @@ branch refs/heads/some-other-branch
         assert!(
             branch_exists(&repo_path, "task-worktrunk"),
             "wt cleanup deleted the task branch, which is what create_pr pushes and what \
-             reattach checks out again; remove_with_wt needs --no-delete-branch. remove \
-             returned {result:?}"
+             reattach checks out again; remove_with_wt must keep passing --no-delete-branch. \
+             remove returned {result:?}"
         );
     }
 
@@ -2008,6 +2194,28 @@ branch refs/heads/some-other-branch
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// What `git worktree remove <worktree_path>` says when it refuses,
+    /// trimmed the way `remove_with_git` trims it, or the empty string if git
+    /// did not refuse at all.
+    ///
+    /// Read out of git rather than written down as a literal, because the
+    /// exact wording ("contains modified or untracked files, use --force to
+    /// delete it") is git's to change and nothing here has an opinion about
+    /// it. Provoking a refusal costs nothing: git validates before it
+    /// deletes, so a refused removal leaves the checkout and its registration
+    /// exactly as they were.
+    fn git_removal_refusal(repo_path: &str, worktree_path: &str) -> String {
+        let output = std::process::Command::new("git")
+            .args(["worktree", "remove", worktree_path])
+            .current_dir(repo_path)
+            .output()
+            .unwrap_or_else(|e| panic!("git worktree remove failed to spawn: {e}"));
+        if output.status.success() {
+            return String::new();
+        }
+        String::from_utf8_lossy(&output.stderr).trim().to_string()
     }
 
     fn branch_exists(repo_path: &str, branch: &str) -> bool {
@@ -2254,18 +2462,24 @@ branch refs/heads/some-other-branch
         );
     }
 
-    /// Deterministic reproduction of the false-success bug: both `git
-    /// worktree remove` and `--force` fail to actually delete the directory
-    /// (a permission-blocked, non-empty subdirectory defeats the recursive
-    /// delete each of them relies on), so `remove_with_git` must report
-    /// `Err` — never silently `Ok(())` for a worktree still on disk.
+    /// Deterministic reproduction of the false-success bug: `git worktree
+    /// remove` cannot actually delete the directory (a permission-blocked,
+    /// non-empty subdirectory defeats the recursive delete it relies on), so
+    /// `remove_with_git` must report `Err` — never silently `Ok(())` for a
+    /// worktree still on disk.
+    ///
+    /// This is the case the physical-existence check exists for and the one
+    /// no exit status can decide, which is why it stays interesting now that
+    /// there is only ever one attempt: the obstacle here is the filesystem
+    /// rather than anything git has an opinion about, so a removal can get
+    /// most of the way through and still leave a directory behind.
     ///
     /// Unix-only: relies on `std::os::unix::fs::PermissionsExt` and the
     /// `ipc` module's `current_uid()`, neither of which exist when compiling
     /// for Windows (`ipc` itself is `#[cfg(unix)]`-gated in `lib.rs`).
     #[cfg(unix)]
     #[tokio::test]
-    async fn remove_with_git_reports_err_when_the_directory_survives_every_fallback() {
+    async fn remove_with_git_reports_err_when_the_directory_survives_the_removal() {
         use std::os::unix::fs::PermissionsExt;
 
         if crate::ipc::server::current_uid() == 0 {
@@ -2285,8 +2499,8 @@ branch refs/heads/some-other-branch
         std::fs::create_dir(&blocked).unwrap();
         std::fs::write(blocked.join("file.txt"), b"content").unwrap();
         // No read/write/execute: git cannot list or unlink this directory's
-        // contents, so the directory itself can never become empty and
-        // neither remove nor --force can fully delete it.
+        // contents, so the directory itself can never become empty and the
+        // removal cannot fully delete it.
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let result = mgr.remove(&info.path, repo_path).await;
@@ -2321,7 +2535,7 @@ branch refs/heads/some-other-branch
     /// and dropped the record for a directory still fully present. Nothing
     /// can remove a path git no longer registers: every later attempt then
     /// failed with "is not a working tree", `exists` stayed true, and the
-    /// executor's ~30s pass re-scheduled a task that no attempt could ever
+    /// no later attempt, however many times the user asked, could ever
     /// finish. The prune is gone now, and the assertion holds all the same --
     /// it is about the record surviving, not about what might destroy it.
     ///
@@ -2364,7 +2578,7 @@ branch refs/heads/some-other-branch
         assert!(
             registered.contains(&info.path),
             "the registration must survive a removal that did nothing, or nothing can ever \
-             remove the directory again and the retry pass runs forever"
+             remove the directory again and no later attempt can converge"
         );
 
         mgr.remove(&info.path, repo_path)
@@ -2391,8 +2605,20 @@ branch refs/heads/some-other-branch
     /// not a working tree" however the path is spelled, `git worktree repair`
     /// declines because the `.git` file points at a record that is gone, and
     /// `git worktree add` refuses a path that exists. The record has to be put
-    /// back, or the removal is not merely unfinished but impossible, and the
-    /// executor's ~30s pass retries a task no attempt can ever complete.
+    /// back, or the removal is not merely unfinished but impossible: every
+    /// later attempt, explicit or not, would fail on a record that is gone.
+    ///
+    /// The obstacle is git-ignored, and it has to be. `remove_with_git` makes
+    /// one non-forcing attempt, so anything `git status` can see makes git
+    /// refuse at validation and delete nothing at all -- a different failure,
+    /// covered by `a_dirty_worktree_survives_automatic_cleanup`, and one that
+    /// never reaches the code this test is about. Ignored content is the only
+    /// kind git will accept a removal over and then trip on, which makes it
+    /// the only way in to the abandoned-partway state now that nothing forces
+    /// its way past a refusal. Measured: with a non-ignored obstacle git says
+    /// "contains modified or untracked files" and the checkout is untouched;
+    /// with an ignored one it says "failed to delete: Permission denied",
+    /// having already removed part of the checkout and its own record.
     ///
     /// Unix-only for the same reason as the tests above.
     #[cfg(unix)]
@@ -2413,6 +2639,26 @@ branch refs/heads/some-other-branch
             .await
             .expect("create failed");
 
+        // Committed first, so that `blocked/` is ignored rather than
+        // untracked by the time it exists: an untracked directory is content
+        // the single non-forcing attempt refuses over, and refusing is not
+        // the failure this test is about.
+        std::fs::write(Path::new(&info.path).join(".gitignore"), "blocked/\n")
+            .expect("write .gitignore");
+        run_git(&info.path, &["add", ".gitignore"]);
+        run_git(
+            &info.path,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "ignore the obstacle",
+            ],
+        );
+
         // Mode 0o500, not 0o000: git has to be able to see that there is
         // something inside to delete, so that it fails on the unlink rather
         // than refusing at validation the way the test above arranges.
@@ -2421,6 +2667,12 @@ branch refs/heads/some-other-branch
         std::fs::write(blocked.join("held.txt"), b"held").expect("fill the obstacle");
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o500))
             .expect("close off the obstacle");
+
+        assert!(
+            run_git(&info.path, &["status", "--porcelain"]).is_empty(),
+            "precondition: git must see nothing to refuse over, or the removal never gets far \
+             enough to be abandoned partway"
+        );
 
         let abandoned = mgr.remove(&info.path, repo_path).await;
         let registered = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
