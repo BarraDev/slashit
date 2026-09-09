@@ -2034,6 +2034,226 @@ async fn assert_card_absent_from_board(driver: &WebDriver, title: &str) -> Resul
     Ok(())
 }
 
+/// How long the retry pass gets to collect a worktree whose first cleanup
+/// failed.
+///
+/// The pass runs once every ten ticks of the executor's three-second loop, so
+/// a full cycle is thirty seconds. Two cycles plus the tick the failure landed
+/// in is what this allows; it is derived from that cadence rather than picked,
+/// and a value below one cycle could not observe the behaviour at all.
+const CLEANUP_RETRY_DEADLINE: Duration = Duration::from_secs(75);
+
+/// Makes a directory unreachable for as long as it is held, and puts it back
+/// afterwards however the journey ends.
+///
+/// Restoring on drop is not tidiness: the harness has to be able to delete the
+/// run's state root, and a directory left at mode zero would survive the test
+/// and the cleanup after it.
+struct Unreachable {
+    path: PathBuf,
+    restore: u32,
+}
+
+impl Unreachable {
+    /// Take away every permission on `path`.
+    ///
+    /// This is the smallest obstacle that makes removal fail without altering
+    /// anything git owns: `git worktree remove` cannot read `.git` inside a
+    /// directory it may not enter, so it refuses before deleting a single
+    /// file, `--force` refuses the same way, and `prune` leaves a record whose
+    /// directory is plainly still there. The worktree is exactly as it was, so
+    /// a later attempt has something to succeed at — which is the whole point
+    /// of a retry contract.
+    fn hold(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let restore = std::fs::metadata(path)
+            .with_context(|| format!("could not read the mode of {}", path.display()))?
+            .permissions()
+            .mode();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
+            .with_context(|| format!("could not close off {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            restore,
+        })
+    }
+
+    fn release(self) -> Result<()> {
+        // Dropping does the same thing; this exists so a journey can say when
+        // it wants the obstacle gone and fail if it could not be removed.
+        let path = self.path.clone();
+        let restore = self.restore;
+        std::mem::forget(self);
+        Self::restore_mode(&path, restore)
+    }
+
+    fn restore_mode(path: &Path, mode: u32) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("could not reopen {}", path.display()))
+    }
+}
+
+impl Drop for Unreachable {
+    fn drop(&mut self) {
+        let _ = Self::restore_mode(&self.path, self.restore);
+    }
+}
+
+/// Prove that a `Done` cleanup which could not remove the worktree keeps the
+/// task recoverable, and that the product's own retry pass finishes the job
+/// once the obstacle is gone.
+///
+/// This is the contract the source claims and nothing had exercised end to
+/// end: `worktree_path` is described as the only persisted record of the
+/// directory, it is deliberately retained when removal fails, and the periodic
+/// pass selects `Done` tasks that still hold one. A journey is what turns
+/// those three statements into a single proven behaviour.
+///
+/// The obstacle is a permission the journey takes away and gives back. It is
+/// not a simulated failure: the product runs its real `git worktree remove`
+/// against a directory it genuinely cannot remove, and later against the same
+/// directory once it can.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_done_cleanup_that_fails_keeps_the_worktree_and_is_retried_until_it_succeeds() {
+    if unsafe { libc::geteuid() } == 0 {
+        // Root ignores the permission bits the obstacle is made of, so the
+        // first cleanup would succeed and the journey would prove nothing.
+        eprintln!("skipped: running as root, where the obstacle has no effect");
+        return;
+    }
+    let context = TestContext::new("queue_task_done_retry").expect("harness setup");
+    let outcome = done_retry_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn done_retry_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+
+    let agent = FakeAgent::install(&root)?;
+    context.set_child_env("PATH", agent.path_value());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
+    context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
+
+    pin_worktree_placement(&context.state().config_file())?;
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("done-retry").await?;
+    let outcome = retry_a_failed_cleanup(session.driver(), &agent, &repository).await;
+    context
+        .close_session(session, "done-retry", &outcome)
+        .await?;
+    outcome
+}
+
+async fn retry_a_failed_cleanup(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    repository: &GitFixture,
+) -> Result<()> {
+    let executed = execute_one_task(driver, agent, repository).await?;
+    let work = establish_work(driver, repository, &executed).await?;
+
+    // The obstacle goes up before the task is finished, so the product's very
+    // first removal attempt is the one that fails.
+    let obstacle = Unreachable::hold(&executed.worktree_path)?;
+
+    ui::invoke(
+        driver,
+        "reorder_task",
+        json!({
+            "taskId": executed.id,
+            "newStatus": "done",
+            "newPosition": 0,
+        }),
+    )
+    .await?;
+
+    let settled = await_status(driver, &executed.project_id, &executed.id, &["done"]).await?;
+
+    // --- What a failed cleanup has to leave behind -------------------------
+    //
+    // Read after a full retry cycle, so this is not merely the state before
+    // the first attempt got as far as failing.
+    tokio::time::sleep(Duration::from_secs(35)).await;
+
+    let during = ui::invoke(
+        driver,
+        "list_tasks",
+        json!({ "projectId": executed.project_id }),
+    )
+    .await?;
+    let during = find_task(&during, &executed.id)
+        .context("the task disappeared while its cleanup was failing")?;
+
+    let retained = during.get("worktree_path").and_then(Value::as_str);
+    if retained.map(|path| resolve(Path::new(path))) != Some(resolve(&executed.worktree_path)) {
+        bail!(
+            "a cleanup that could not remove the worktree cleared {retained:?} anyway — the only \
+             persisted record of {} is gone and nothing can find it again",
+            executed.worktree_path.display()
+        );
+    }
+    if !executed.worktree_path.exists() {
+        bail!(
+            "the product reported nothing but {} is gone, so the removal it could not do \
+             happened anyway",
+            executed.worktree_path.display()
+        );
+    }
+    if !repository.has_branch(&work.branch)? {
+        bail!(
+            "branch {} was deleted by a cleanup that never removed the worktree it belongs to",
+            work.branch
+        );
+    }
+    if status_of(&settled) != Some("done") {
+        bail!("a task whose cleanup failed should still be done, found {settled}");
+    }
+
+    // --- And the product's own retry has to finish it ----------------------
+    obstacle.release()?;
+
+    let started = Instant::now();
+    loop {
+        let listed = ui::invoke(
+            driver,
+            "list_tasks",
+            json!({ "projectId": executed.project_id }),
+        )
+        .await?;
+        let task = find_task(&listed, &executed.id)
+            .context("the task disappeared while its cleanup was being retried")?;
+        let cleared = task
+            .get("worktree_path")
+            .map(|value| value.is_null())
+            .unwrap_or(true);
+        if cleared && !executed.worktree_path.exists() {
+            break;
+        }
+        if started.elapsed() > CLEANUP_RETRY_DEADLINE {
+            bail!(
+                "the worktree was still not cleaned up {}s after the obstacle was removed: \
+                 directory present = {}, task still records {:?} — the retry the source \
+                 promises never converged",
+                CLEANUP_RETRY_DEADLINE.as_secs(),
+                executed.worktree_path.exists(),
+                task.get("worktree_path")
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+
+    if repository.registers_worktree(&executed.worktree_path)? {
+        bail!(
+            "git still registers a worktree at {} after the retry reported it cleaned up",
+            executed.worktree_path.display()
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
