@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "something went wrong in the CLI" >&2
+exit 3

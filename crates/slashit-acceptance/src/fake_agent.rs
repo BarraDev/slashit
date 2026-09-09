@@ -84,128 +84,45 @@ pub const WORK_CONTENT: &str = "work produced by the fake agent\n";
 
 /// The variable that holds an agent run open instead of letting it finish.
 ///
-/// Its value is the path of a FIFO [`FakeAgent::block_agent_runs`] created.
-/// Unset — which is every journey that does not ask for it — the fixture
-/// behaves exactly as it did before this existed, and neither the pipe nor the
-/// bookkeeping directory below is created.
+/// Its value is the directory [`FakeAgent::block_agent_runs`] created. Unset —
+/// which is every journey that does not ask for it — the fixture behaves
+/// exactly as it did before this existed, and neither that directory nor the
+/// bookkeeping one below is created.
 ///
-/// A run that blocks first announces its own process id, then waits on the
-/// pipe. Waiting on a pipe rather than sleeping is what makes a cancellation
-/// journey deterministic: the run ends because the product terminated it or
-/// because the test released it, never because an interval happened to elapse.
+/// A run that blocks creates a release pipe of its own in that directory,
+/// opens it, and only then announces its process id; it removes both once its
+/// release arrives. Waiting on a pipe rather than sleeping is what makes a
+/// cancellation journey deterministic: the run ends because the product
+/// terminated it or because the test released it, never because an interval
+/// happened to elapse. Opening before announcing is what makes a release
+/// deliverable: an announced run is already readable, so a release aimed at it
+/// cannot be refused for want of a reader.
 ///
 /// Only *agent runs* block. `claude --version` is the product asking what is
 /// installed, and a probe that hung would stall the frontend rather than the
 /// execution the journey is about.
-pub const BLOCK_FIFO_VAR: &str = "SLASHIT_FAKE_AGENT_BLOCK_FIFO";
+pub const BLOCK_DIR_VAR: &str = "SLASHIT_FAKE_AGENT_BLOCK_DIR";
 
-/// The smallest exchange `ClaudeRunner` accepts as a successful run: a
-/// `system` line that names the session and model, a `result` line with
-/// `is_error: false`, and exit status zero.
+/// The fixture script: a file that already exists, rather than one written
+/// here and then run.
 ///
-/// Written as `/bin/sh` because the harness may not assume any language
-/// runtime beyond a POSIX shell, and because the whole point is that this is
-/// an ordinary external program.
+/// `execve` refuses a file that any process has open for writing, and a
+/// process that has forked but has not yet reached its own `exec` still holds
+/// a copy of every descriptor its parent had open at the moment of the fork.
+/// A test that writes its own executable can therefore have that write carried
+/// past the point where it runs the file, by an entirely unrelated concurrent
+/// spawn, and get `ETXTBSY`. A file nobody ever opens for writing cannot be
+/// caught that way, so the script is checked in and only ever linked to.
 ///
-/// `printf '%s\0'` rather than one line per argument: the prompt the product
-/// sends contains newlines, so a line-oriented record could not be parsed back
-/// unambiguously. NUL is the one byte an argument cannot contain.
-const SCRIPT: &str = r#"#!/bin/sh
-# A stand-in for the Claude Code CLI, used by the SlashIt acceptance journeys.
-# It never contacts a model. It records how it was called and emits the
-# smallest stream-json exchange the real runner treats as a success.
-set -e
-
-if [ -z "$SLASHIT_FAKE_AGENT_MARKERS" ]; then
-    echo "fake claude: SLASHIT_FAKE_AGENT_MARKERS is not set" >&2
-    exit 97
-fi
-
-# Written in a staging directory and moved into place, because the test polls
-# this directory while the agent is running: `mktemp` creates the file before
-# anything is in it, so a reader could otherwise see a record that exists but
-# is still empty. A rename within one filesystem is atomic, so only finished
-# records are ever visible.
-staging="$SLASHIT_FAKE_AGENT_MARKERS/.staging"
-mkdir -p "$staging"
-record=$(mktemp "$staging/XXXXXX")
-printf '%s\0' "$PWD" "$@" > "$record"
-mv "$record" "$SLASHIT_FAKE_AGENT_MARKERS/invocation-${record##*/}"
-
-# Echo the session id back, so the caller can tie this run to the one it asked
-# for rather than to any run at all.
-# The prompt flag is noted in the same pass: it is what separates an agent run
-# from `--version`, which a real CLI also answers without doing any work.
-session=""
-take_next=""
-is_run=""
-for arg in "$@"; do
-    if [ -n "$take_next" ]; then
-        session="$arg"
-        take_next=""
-        continue
-    fi
-    case "$arg" in
-        --session-id) take_next="yes" ;;
-        -p) is_run="yes" ;;
-    esac
-done
-
-printf '{"type":"system","subtype":"init","session_id":"%s","model":"__MODEL__"}\n' "$session"
-
-# Leave work behind, when a journey asked for it. Written into "$PWD", which is
-# the directory the product started this run in -- the task's worktree -- so
-# the executor's own commit picks it up like any other change an agent makes.
-if [ -n "$SLASHIT_FAKE_AGENT_WRITE_FILE" ] && [ -n "$is_run" ]; then
-    printf '%s' "__WORK_CONTENT__" > "$SLASHIT_FAKE_AGENT_WRITE_FILE"
-fi
-
-# Blocking mode, when a journey asked for it. Announce this process before
-# waiting on the pipe, so the test can name the exact process it is about to
-# ask the product to stop instead of inferring one. Staged and renamed for the
-# same reason the invocation record is: a reader must never see a half-written
-# pid. `$$` is this process, because the product exec'd this script directly.
-if [ -n "$SLASHIT_FAKE_AGENT_BLOCK_FIFO" ] && [ -n "$is_run" ]; then
-    processes="$SLASHIT_FAKE_AGENT_MARKERS/.processes"
-    mkdir -p "$processes/.staging"
-    pidfile=$(mktemp "$processes/.staging/XXXXXX")
-    printf '%s\n' "$$" > "$pidfile"
-    mv "$pidfile" "$processes/${pidfile##*/}"
-
-    # Blocks in the kernel until a writer opens the pipe. A failed read is a
-    # released or closed pipe, not a reason to abandon the run.
-    read -r _release < "$SLASHIT_FAKE_AGENT_BLOCK_FIFO" || true
-fi
-
-# Absent means nothing is scripted to fail, so a journey that does not set this
-# sees exactly the behaviour it saw before this existed -- not even the
-# bookkeeping directory below is created.
-failing=${SLASHIT_FAKE_AGENT_FAILING_RUNS:-0}
-
-if [ -n "$is_run" ] && [ "$failing" -gt 0 ]; then
-    # Claim the next run number. `mkdir` refuses an existing directory and
-    # creates a missing one in a single indivisible step, so two agents
-    # starting at the same moment can never be handed the same number -- and
-    # unlike a counter file, there is no read-modify-write to lose.
-    runs="$SLASHIT_FAKE_AGENT_MARKERS/.runs"
-    mkdir -p "$runs"
-    ordinal=1
-    while ! mkdir "$runs/$ordinal" 2>/dev/null; do
-        ordinal=$((ordinal + 1))
-    done
-
-    if [ "$ordinal" -le "$failing" ]; then
-        # A well-formed result that reports failure, with a zero exit status:
-        # the agent ran and said it could not do the work, which is a different
-        # thing from the agent crashing.
-        printf '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"%s","result":"__FAILURE__"}\n' "$session"
-        exit 0
-    fi
-fi
-
-printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","result":"__RESULT__"}\n' "$session"
-exit 0
-"#;
+/// It is `/bin/sh` because the harness may not assume any language runtime
+/// beyond a POSIX shell, and because the whole point is that this is an
+/// ordinary external program. The values it reports are the constants above,
+/// written out, and a test in this module asserts that they still are.
+fn script_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(EXECUTABLE)
+}
 
 /// One recorded run of the fixture.
 pub struct Invocation {
@@ -249,18 +166,28 @@ impl FakeAgent {
                 .with_context(|| format!("could not create {}", dir.display()))?;
         }
 
-        let executable = bin_dir.join(EXECUTABLE);
-        let script = SCRIPT
-            .replace("__MODEL__", REPORTED_MODEL)
-            .replace("__WORK_CONTENT__", WORK_CONTENT)
-            .replace("__RESULT__", REPORTED_RESULT)
-            .replace("__FAILURE__", REPORTED_FAILURE);
-        std::fs::write(&executable, script)
-            .with_context(|| format!("could not write {}", executable.display()))?;
-
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("could not make {} executable", executable.display()))?;
+
+        let script = script_path();
+        let mode = std::fs::metadata(&script)
+            .with_context(|| format!("could not read the fixture script {}", script.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            bail!(
+                "the fixture script {} is not executable — the checkout lost its mode bits",
+                script.display()
+            );
+        }
+
+        let executable = bin_dir.join(EXECUTABLE);
+        std::os::unix::fs::symlink(&script, &executable).with_context(|| {
+            format!(
+                "could not point {} at {}",
+                executable.display(),
+                script.display()
+            )
+        })?;
 
         let inherited = std::env::var_os("PATH").unwrap_or_default();
         let mut path_value = bin_dir.clone().into_os_string();
@@ -340,40 +267,49 @@ impl FakeAgent {
         Ok(self.invocations()?.len())
     }
 
-    /// Hold every agent run open: announce its process id, then wait.
+    /// Hold every agent run open until something releases it.
     ///
-    /// Returns the value for [`BLOCK_FIFO_VAR`], which the caller sets on the
-    /// application's environment. The pipe is created here rather than by the
-    /// fixture so that it exists before the application does — a run that had
-    /// to create it could race a test already trying to release it.
+    /// Returns the value for [`BLOCK_DIR_VAR`], which the caller sets on the
+    /// application's environment. The directory is created here rather than by
+    /// the fixture so that it exists before the application does; the pipes
+    /// inside it belong to the runs, one each, and are created by the run that
+    /// waits on one.
     pub fn block_agent_runs(&self) -> Result<PathBuf> {
-        use std::os::unix::ffi::OsStrExt;
-
-        let pipe = self.release_pipe();
-        let path = std::ffi::CString::new(pipe.as_os_str().as_bytes())
-            .with_context(|| format!("{} is not a usable path", pipe.display()))?;
-
-        // SAFETY: the pointer is to a NUL-terminated path this process keeps
-        // alive across the call, which is all `mkfifo` asks of its caller.
-        if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("could not create the release pipe {}", pipe.display()));
-        }
-        Ok(pipe)
+        let dir = self.release_dir();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+        Ok(dir)
     }
 
     /// The process ids of runs that announced themselves and then blocked.
     ///
-    /// Empty unless a journey asked for [`BLOCK_FIFO_VAR`]. The names are
-    /// `mktemp` names — unique but not monotonic — so a caller telling one run
-    /// from another must compare sets, never positions.
+    /// Empty unless a journey asked for [`BLOCK_DIR_VAR`]. A run withdraws its
+    /// own announcement as its release arrives, so these are the runs blocked
+    /// now rather than the runs that ever blocked — except for runs something
+    /// else ended while they waited, which withdraw nothing and stay listed.
     pub fn blocked_pids(&self) -> Result<Vec<u32>> {
+        let mut pids: Vec<u32> = self
+            .blocked_runs()?
+            .into_iter()
+            .map(|(_, pid)| pid)
+            .collect();
+        pids.sort_unstable();
+        Ok(pids)
+    }
+
+    /// Every announced run: the name it announced itself under, and its pid.
+    ///
+    /// The name is also the name of that run's own release pipe, which is what
+    /// lets a release be addressed to one run rather than offered to all of
+    /// them. They are `mktemp` names — unique but not monotonic — so a caller
+    /// telling one run from another must compare sets, never positions.
+    fn blocked_runs(&self) -> Result<Vec<(OsString, u32)>> {
         let dir = self.process_dir();
         if !dir.is_dir() {
             return Ok(Vec::new());
         }
 
-        let mut pids = Vec::new();
+        let mut runs = Vec::new();
         for entry in std::fs::read_dir(&dir)
             .with_context(|| format!("could not read {}", dir.display()))?
             .flatten()
@@ -391,10 +327,9 @@ impl FakeAgent {
                     path.display()
                 )
             })?;
-            pids.push(pid);
+            runs.push((entry.file_name(), pid));
         }
-        pids.sort_unstable();
-        Ok(pids)
+        Ok(runs)
     }
 
     /// Whether `pid` is still a running process of this fixture.
@@ -428,43 +363,61 @@ impl FakeAgent {
             .any(|argument| Path::new(OsStr::from_bytes(argument)) == self.executable)
     }
 
-    /// Let every currently blocked run finish.
+    /// Let every currently blocked run finish, and say how many took a release.
     ///
-    /// The pipe is opened non-blocking on purpose. With no reader the open
-    /// fails immediately with `ENXIO`, so releasing runs the product has
-    /// already terminated is a no-op — rather than a test that hangs forever
-    /// holding open a pipe nobody will ever read.
+    /// One release per announced run, written to that run's own pipe. A
+    /// release written to a pipe shared by every run would carry no address:
+    /// it would be taken by whichever waiting run the kernel handed it to,
+    /// which is not necessarily the one whose state justified sending it.
+    ///
+    /// The pipe is opened non-blocking on purpose, and the fixture earns that
+    /// by opening its own pipe before it announces itself: an announced run is
+    /// a reader by construction, so a release aimed at one cannot be refused
+    /// for want of a reader. A refusal therefore means that run has stopped
+    /// waiting in between — the product terminating it mid-release is the
+    /// ordinary way that happens — and it is counted as what it is, a run that
+    /// took no release. Any other failure is a broken fixture rather than a
+    /// race to swallow.
     pub fn release_blocked_runs(&self) -> Result<usize> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
 
-        let pipe = self.release_pipe();
         let mut released = 0;
-        // At most one release per run that ever blocked: a bound the fixture's
-        // own records supply, rather than a guessed number of attempts.
-        for _ in 0..self.blocked_pids()?.len() {
-            let Ok(mut writer) = std::fs::OpenOptions::new()
+        for (name, _) in self.blocked_runs()? {
+            let pipe = self.release_dir().join(&name);
+            let delivered = std::fs::OpenOptions::new()
                 .write(true)
                 .custom_flags(libc::O_NONBLOCK)
                 .open(&pipe)
-            else {
-                break; // nothing is waiting on it
-            };
-            writer
-                .write_all(b"release\n")
-                .with_context(|| format!("could not release a run through {}", pipe.display()))?;
-            released += 1;
+                .and_then(|mut writer| writer.write_all(b"release\n"));
+            match delivered {
+                Ok(()) => released += 1,
+                // That run stopped waiting: `ENXIO` because nothing has the
+                // pipe open to read from any more, `ENOENT` because the run
+                // took the pipe away with it, `EPIPE` because it stopped
+                // reading between the open and the write.
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENXIO | libc::ENOENT | libc::EPIPE)
+                    ) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("could not release a run through {}", pipe.display())
+                    })
+                }
+            }
         }
         Ok(released)
     }
 
-    /// The pipe a blocked run waits on.
+    /// Where a blocked run puts the pipe it waits on.
     ///
     /// Inside the marker directory, so the harness's existing cleanup removes
     /// it, and hidden from [`invocations`](Self::invocations) by the same
-    /// `is_file` filter that hides the staging directory: a FIFO is not a
-    /// regular file.
-    fn release_pipe(&self) -> PathBuf {
+    /// `is_file` filter that hides the staging directory: a directory is not a
+    /// regular file, and neither is a pipe.
+    fn release_dir(&self) -> PathBuf {
         self.marker_dir.join(".release")
     }
 
@@ -534,6 +487,28 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create the scratch directory");
         dir
+    }
+
+    /// The script is a file of its own now, so this is what keeps the values
+    /// it reports and the values this module names from drifting apart.
+    #[test]
+    fn the_fixture_reports_what_this_module_says_it_reports() {
+        let script = std::fs::read_to_string(script_path()).expect("read the fixture script");
+        for expected in [
+            REPORTED_MODEL,
+            REPORTED_RESULT,
+            REPORTED_FAILURE,
+            WORK_CONTENT,
+            MARKER_DIR_VAR,
+            FAILING_RUNS_VAR,
+            WRITE_FILE_VAR,
+            BLOCK_DIR_VAR,
+        ] {
+            assert!(
+                script.contains(expected),
+                "the fixture script never mentions {expected:?}"
+            );
+        }
     }
 
     /// The fixture has to behave like the program it stands in for, so the
@@ -690,6 +665,51 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("clean up");
     }
 
+    /// A fixture process the test owns, ended whatever becomes of the test.
+    ///
+    /// A failed assertion unwinds straight past the `wait` that would have
+    /// collected the run, and a dropped [`std::process::Child`] is neither
+    /// killed nor reaped, so a panicking test would otherwise hand a still
+    /// blocked run to whatever cleans up after the job. That is not a way of
+    /// passing: every assertion below still fails exactly when it did.
+    struct OwnedRun(std::process::Child);
+
+    impl std::ops::Deref for OwnedRun {
+        type Target = std::process::Child;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for OwnedRun {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl Drop for OwnedRun {
+        fn drop(&mut self) {
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Start one agent run that will block until it is released.
+    fn blocking_run(agent: &FakeAgent, releases: &Path, session: &str) -> OwnedRun {
+        OwnedRun(
+            std::process::Command::new(agent.executable())
+                .args(["-p", "do the work", "--session-id", session])
+                .env(MARKER_DIR_VAR, agent.marker_dir())
+                .env(BLOCK_DIR_VAR, releases)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("start the fixture"),
+        )
+    }
+
     /// Wait for `condition`, or give up and say what was still true.
     fn until(condition: impl Fn() -> bool, complaint: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -707,15 +727,11 @@ mod tests {
     fn a_blocking_run_announces_its_own_process_and_waits_to_be_released() {
         let root = scratch("blocking");
         let agent = FakeAgent::install(&root).expect("install");
-        let pipe = agent.block_agent_runs().expect("create the release pipe");
+        let releases = agent
+            .block_agent_runs()
+            .expect("create the release directory");
 
-        let mut child = std::process::Command::new(agent.executable())
-            .args(["-p", "do the work", "--session-id", "blocked"])
-            .env(MARKER_DIR_VAR, agent.marker_dir())
-            .env(BLOCK_FIFO_VAR, &pipe)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("start the fixture");
+        let mut child = blocking_run(&agent, &releases, "blocked");
 
         until(
             || agent.blocked_pids().expect("read the pid records").len() == 1,
@@ -754,6 +770,172 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("clean up");
     }
 
+    /// The contract the whole release protocol stands on: a run that has
+    /// announced itself is *already* able to take a release.
+    ///
+    /// Announcing and becoming readable are two different events, and while
+    /// they were ordered the other way round there was a window in which a
+    /// test could see a blocked run and still be refused when it tried to
+    /// release it — a non-blocking open of a pipe with no reader fails with
+    /// `ENXIO` outright rather than waiting for one. So this races the fixture
+    /// on purpose, with none of `until`'s polite pause between seeing the pid
+    /// and acting on it. Under the previous ordering that window was not
+    /// merely likely but reliable: reacting this promptly lost every attempt.
+    ///
+    /// The ordering is now a property of the fixture's program text rather
+    /// than of scheduling, so one attempt already settles it; the repetition
+    /// is what would catch a later change that made it depend on timing
+    /// again.
+    #[test]
+    fn a_run_is_ready_to_be_released_by_the_time_it_announces_itself() {
+        let root = scratch("blocking-readiness");
+        let agent = FakeAgent::install(&root).expect("install");
+
+        // Enough attempts that an ordering which only usually wins would be
+        // found out, few enough that this stays a fraction of a second.
+        for attempt in 1..=25 {
+            // Each attempt is its own experiment. A record outlives the run
+            // something else ended, so a leftover would have the next attempt
+            // counting the previous one's process.
+            std::fs::remove_dir_all(agent.process_dir()).ok();
+            std::fs::remove_dir_all(agent.release_dir()).ok();
+            let releases = agent
+                .block_agent_runs()
+                .expect("create the release directory");
+            let mut run = blocking_run(&agent, &releases, "ready");
+
+            let pid = loop {
+                if let [pid] = agent.blocked_pids().expect("read the pid records")[..] {
+                    break pid;
+                }
+            };
+
+            assert_eq!(
+                agent.release_blocked_runs().expect("release"),
+                1,
+                "attempt {attempt}: the announced run would not take its release"
+            );
+            assert!(
+                run.wait().expect("wait for the released run").success(),
+                "attempt {attempt}: a released run still exits zero"
+            );
+            assert!(
+                !agent.is_running(pid),
+                "attempt {attempt}: the released run must be gone"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// Several runs blocked at once is what a concurrency journey will ask
+    /// for, so a release has to be per run rather than per pipe: three blocked
+    /// runs take three releases, and all three of them end.
+    #[test]
+    fn every_blocked_run_takes_its_own_release() {
+        let root = scratch("blocking-several");
+        let agent = FakeAgent::install(&root).expect("install");
+        let releases = agent
+            .block_agent_runs()
+            .expect("create the release directory");
+
+        let mut runs: Vec<OwnedRun> = (1..=3)
+            .map(|ordinal| blocking_run(&agent, &releases, &format!("blocked-{ordinal}")))
+            .collect();
+        let mut started: Vec<u32> = runs.iter().map(|run| run.id()).collect();
+        started.sort_unstable();
+
+        until(
+            || agent.blocked_pids().expect("read the pid records").len() == 3,
+            "three runs never announced themselves as blocked",
+        );
+        assert_eq!(
+            agent.blocked_pids().expect("read the pid records"),
+            started,
+            "the announced processes are the three that were started"
+        );
+
+        assert_eq!(
+            agent.release_blocked_runs().expect("release"),
+            3,
+            "three blocked runs should take three releases"
+        );
+
+        for run in &mut runs {
+            assert!(
+                run.wait().expect("wait for the released run").success(),
+                "every released run still exits zero"
+            );
+        }
+        for pid in started {
+            assert!(
+                !agent.is_running(pid),
+                "no released run may outlive the test"
+            );
+        }
+
+        // And releasing again hands out nothing. The three records are still
+        // there, so a release counted per record rather than per waiting run
+        // would claim three more and leave them in the pipe for whatever
+        // blocked on it next.
+        assert_eq!(
+            agent.release_blocked_runs().expect("release"),
+            0,
+            "a run that has taken its release does not take another"
+        );
+        assert_eq!(agent.invocation_count().expect("count"), 3);
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A release belongs to a run that is still waiting for one. The records
+    /// outlive the processes they name, so counting records rather than live
+    /// runs would report a release that nobody was there to take — and would
+    /// let a journey conclude it had freed a run the product had already
+    /// killed.
+    #[test]
+    fn a_run_that_has_already_ended_does_not_take_a_release() {
+        let root = scratch("blocking-ended");
+        let agent = FakeAgent::install(&root).expect("install");
+        let releases = agent
+            .block_agent_runs()
+            .expect("create the release directory");
+
+        let mut ended = blocking_run(&agent, &releases, "ended");
+        let mut waiting = blocking_run(&agent, &releases, "waiting");
+        let ended_pid = ended.id();
+        let waiting_pid = waiting.id();
+
+        until(
+            || agent.blocked_pids().expect("read the pid records").len() == 2,
+            "both runs never announced themselves as blocked",
+        );
+
+        // Killed and collected, the way the product ends a run it is stopping:
+        // the pid record it left behind stays exactly where it was.
+        ended.kill().expect("end one of the blocked runs");
+        ended.wait().expect("collect the ended run");
+        assert!(!agent.is_running(ended_pid));
+        assert_eq!(
+            agent.blocked_pids().expect("read the pid records").len(),
+            2,
+            "a record outlives the run it names"
+        );
+
+        assert_eq!(
+            agent.release_blocked_runs().expect("release"),
+            1,
+            "only the run still waiting should take a release"
+        );
+        assert!(
+            waiting.wait().expect("wait for the released run").success(),
+            "the run that was still waiting is the one that was released"
+        );
+        assert!(!agent.is_running(waiting_pid));
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
     /// The product asks what is installed through the same executable. A probe
     /// that blocked would stall the frontend rather than the execution a
     /// cancellation journey is about, and would leave a pid record that the
@@ -762,12 +944,14 @@ mod tests {
     fn a_version_probe_does_not_block_when_agent_runs_do() {
         let root = scratch("blocking-probe");
         let agent = FakeAgent::install(&root).expect("install");
-        let pipe = agent.block_agent_runs().expect("create the release pipe");
+        let releases = agent
+            .block_agent_runs()
+            .expect("create the release directory");
 
         let probe = std::process::Command::new(agent.executable())
             .arg("--version")
             .env(MARKER_DIR_VAR, agent.marker_dir())
-            .env(BLOCK_FIFO_VAR, &pipe)
+            .env(BLOCK_DIR_VAR, &releases)
             .output()
             .expect("run the probe");
 
