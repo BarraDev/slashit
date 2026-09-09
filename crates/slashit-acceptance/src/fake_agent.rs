@@ -57,6 +57,31 @@ pub const FAILING_RUNS_VAR: &str = "SLASHIT_FAKE_AGENT_FAILING_RUNS";
 /// API and know the failure it sees is the one this executable reported.
 pub const REPORTED_FAILURE: &str = "fake agent was scripted to fail this run";
 
+/// The variable that makes an agent run leave a file behind in the working
+/// directory it was started in.
+///
+/// Its value is the file name; the contents are always [`WORK_CONTENT`], so a
+/// journey can recognise the work by reading it rather than by trusting that
+/// something was written. Unset -- which is every journey that does not ask
+/// for it -- the fixture changes nothing about the repository, exactly as it
+/// did before this existed.
+///
+/// Only *agent runs* write. `claude --version` is the product asking what is
+/// installed, and a probe that dropped a file into whatever directory it was
+/// called from would put work in places no task owns.
+///
+/// A destructive journey needs this: proving that removing a worktree loses
+/// the work in it is only worth anything if there was work in it. The
+/// executor commits whatever the run produced, so a file written here becomes
+/// a real commit on the task's real branch.
+pub const WRITE_FILE_VAR: &str = "SLASHIT_FAKE_AGENT_WRITE_FILE";
+
+/// What a run writes when [`WRITE_FILE_VAR`] asks it to.
+///
+/// Fixed rather than generated: a journey that finds this text has found the
+/// output of this executable and not of anything else in the run.
+pub const WORK_CONTENT: &str = "work produced by the fake agent\n";
+
 /// The variable that holds an agent run open instead of letting it finish.
 ///
 /// Its value is the path of a FIFO [`FakeAgent::block_agent_runs`] created.
@@ -127,6 +152,13 @@ for arg in "$@"; do
 done
 
 printf '{"type":"system","subtype":"init","session_id":"%s","model":"__MODEL__"}\n' "$session"
+
+# Leave work behind, when a journey asked for it. Written into "$PWD", which is
+# the directory the product started this run in -- the task's worktree -- so
+# the executor's own commit picks it up like any other change an agent makes.
+if [ -n "$SLASHIT_FAKE_AGENT_WRITE_FILE" ] && [ -n "$is_run" ]; then
+    printf '%s' "__WORK_CONTENT__" > "$SLASHIT_FAKE_AGENT_WRITE_FILE"
+fi
 
 # Blocking mode, when a journey asked for it. Announce this process before
 # waiting on the pipe, so the test can name the exact process it is about to
@@ -220,6 +252,7 @@ impl FakeAgent {
         let executable = bin_dir.join(EXECUTABLE);
         let script = SCRIPT
             .replace("__MODEL__", REPORTED_MODEL)
+            .replace("__WORK_CONTENT__", WORK_CONTENT)
             .replace("__RESULT__", REPORTED_RESULT)
             .replace("__FAILURE__", REPORTED_FAILURE);
         std::fs::write(&executable, script)

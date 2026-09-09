@@ -425,6 +425,7 @@ async fn stop_a_running_task(
     // same structural way every other journey proves it.
     let executed = ExecutedTask {
         id: task_id.clone(),
+        project_id: project_id.to_string(),
         title: title.clone(),
         worktree_path: worktree_path.clone(),
     };
@@ -602,6 +603,7 @@ async fn fail_then_retry(
     // closed the application here would find it as they left it.
     let failure_on_disk = ExecutedTask {
         id: task_id.clone(),
+        project_id: project_id.clone(),
         title: title.clone(),
         worktree_path: failed_worktree.clone(),
     };
@@ -797,6 +799,7 @@ async fn fail_then_retry(
 
     Ok(ExecutedTask {
         id: task_id,
+        project_id,
         title,
         worktree_path: retried_worktree,
     })
@@ -805,6 +808,10 @@ async fn fail_then_retry(
 /// What the journey learned about the task it drove.
 struct ExecutedTask {
     id: String,
+    /// The project the task belongs to, which is what `list_tasks` is keyed
+    /// on: a journey that carries the task further has to be able to read it
+    /// back through the product's own API.
+    project_id: String,
     title: String,
     worktree_path: PathBuf,
 }
@@ -947,6 +954,7 @@ async fn execute_one_task(
 
     Ok(ExecutedTask {
         id: task_id,
+        project_id,
         title,
         worktree_path,
     })
@@ -1467,6 +1475,107 @@ impl GitFixture {
             .with_context(|| format!("could not look up branch {branch}"))?;
         Ok(status.status.success())
     }
+
+    /// Whether git still has a worktree registration for `path`.
+    ///
+    /// The directory being gone and git having forgotten it are two different
+    /// facts, and a destructive journey needs both: `git worktree remove`
+    /// deletes a directory *and* a record under `.git/worktrees`, and a
+    /// cleanup that left the record behind would leave the repository unable
+    /// to give this branch a worktree again.
+    fn registers_worktree(&self, path: &Path) -> Result<bool> {
+        let output = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(&self.path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .context("could not list the fixture's worktrees")?;
+        if !output.status.success() {
+            bail!(
+                "git worktree list failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let wanted = resolve(path);
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|listed| resolve(Path::new(listed)) == wanted))
+    }
+
+    /// The commit `branch` points at, or `None` if there is no such branch.
+    fn branch_tip(&self, branch: &str) -> Result<Option<String>> {
+        let output = std::process::Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(&self.path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .with_context(|| format!("could not resolve branch {branch}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
+    }
+
+    /// The contents of `file` as `revision` has it, or `None` if either the
+    /// revision or the path is not there.
+    ///
+    /// This is what separates work that is merely on disk from work that is
+    /// committed: a file only in the worktree dies with the directory, while
+    /// one in the commit survives for as long as something still points at
+    /// that commit.
+    fn file_at(&self, revision: &str, file: &str) -> Result<Option<String>> {
+        let output = std::process::Command::new("git")
+            .args(["show", &format!("{revision}:{file}")])
+            .current_dir(&self.path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .with_context(|| format!("could not read {file} at {revision}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()))
+    }
+
+    /// Every ref in the repository from which `commit` can still be reached.
+    ///
+    /// Empty means the commit is unreachable: still in the object database
+    /// until git collects it, but with nothing naming it, and nothing in the
+    /// product able to find it again. That is the question a destructive
+    /// journey is really asking about the work an agent produced.
+    fn refs_reaching(&self, commit: &str) -> Result<Vec<String>> {
+        let output = std::process::Command::new("git")
+            .args(["for-each-ref", "--contains", commit, "--format=%(refname)"])
+            .current_dir(&self.path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .with_context(|| format!("could not look for refs reaching {commit}"))?;
+        if !output.status.success() {
+            bail!(
+                "git for-each-ref --contains failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<()> {
@@ -1489,6 +1598,438 @@ fn git(dir: &Path, args: &[&str]) -> Result<()> {
             dir.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
+    }
+    Ok(())
+}
+
+/// The file the destructive journeys have the agent leave behind.
+///
+/// A destructive test is only worth running against work that exists: the
+/// question these journeys ask is what the product does to an agent's output,
+/// and an empty worktree cannot answer it.
+const WORK_FILE: &str = "agent-work.txt";
+
+/// How long the product gets to finish a cleanup it started.
+///
+/// Both destructive paths spawn the removal and return before it runs, so the
+/// journey has to wait for something rather than read it straight away. Thirty
+/// seconds is the same headroom the board assertions get; the removal itself
+/// is a handful of `git` calls against a repository with two commits in it.
+const CLEANUP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The Kanban column a finished task lands in.
+const DONE_COLUMN: &str = "[data-testid=\"column-done\"]";
+
+/// What the journey proved about a task's work before anything destroyed it.
+struct EstablishedWork {
+    /// The branch the executor created for the task and committed to.
+    branch: String,
+    /// The commit that branch pointed at, holding the agent's file.
+    commit: String,
+}
+
+/// Prove that a real agent run left real, committed work on the task's own
+/// branch, and return the identity of that work.
+///
+/// Everything here is read from git rather than from the product, and each
+/// fact is separate from the others on purpose. That the directory is there
+/// says nothing about whether git knows about it; that a file is in the
+/// directory says nothing about whether it was committed; and it is only the
+/// commit that makes the later question — whether destroying the worktree
+/// destroys the work — mean anything at all.
+async fn establish_work(
+    driver: &WebDriver,
+    repository: &GitFixture,
+    executed: &ExecutedTask,
+) -> Result<EstablishedWork> {
+    let task = ui::invoke(
+        driver,
+        "list_tasks",
+        json!({ "projectId": executed.project_id }),
+    )
+    .await?;
+    let task = find_task(&task, &executed.id)
+        .with_context(|| format!("the product no longer lists task {}", executed.id))?;
+
+    let branch = task
+        .get("branch_name")
+        .and_then(Value::as_str)
+        .context("the executed task records no branch, so it produced nothing to destroy")?
+        .to_string();
+
+    if !executed.worktree_path.is_dir() {
+        bail!(
+            "the product records worktree {} but nothing is there",
+            executed.worktree_path.display()
+        );
+    }
+    if !repository.registers_worktree(&executed.worktree_path)? {
+        bail!(
+            "git has no worktree registration for {} — the directory was not created as a git \
+             worktree of the fixture",
+            executed.worktree_path.display()
+        );
+    }
+
+    let on_disk = std::fs::read_to_string(executed.worktree_path.join(WORK_FILE))
+        .with_context(|| format!("the agent left no {WORK_FILE} in its worktree"))?;
+    if on_disk != fake_agent::WORK_CONTENT {
+        bail!("{WORK_FILE} holds {on_disk:?}, which is not what the agent writes");
+    }
+
+    let committed = repository
+        .file_at(&branch, WORK_FILE)?
+        .with_context(|| format!("branch {branch} does not carry {WORK_FILE}"))?;
+    if committed != fake_agent::WORK_CONTENT {
+        bail!("branch {branch} carries {committed:?} as {WORK_FILE}, not what the agent wrote");
+    }
+
+    let commit = repository
+        .branch_tip(&branch)?
+        .with_context(|| format!("branch {branch} does not exist"))?;
+
+    // The work is on this branch and on nothing else. Without this the journey
+    // could not tell losing the branch from losing the work, because a commit
+    // some other ref also reaches survives the branch going away.
+    let reaching = repository.refs_reaching(&commit)?;
+    if reaching != vec![format!("refs/heads/{branch}")] {
+        bail!(
+            "the work commit {commit} is reachable from {reaching:?}, so branch {branch} is not \
+             the only thing holding it and this journey would prove nothing"
+        );
+    }
+
+    Ok(EstablishedWork { branch, commit })
+}
+
+/// Wait for the worktree the product said it would remove to actually go, and
+/// report what git makes of it afterwards.
+///
+/// A directory that is gone while git still lists a registration for it is not
+/// a finished cleanup: `wt switch` refuses a worktree whose directory is
+/// missing and refuses to create one whose branch already exists, so the task
+/// would be left unable to have a worktree at all.
+async fn await_worktree_removal(repository: &GitFixture, worktree: &Path) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let on_disk = worktree.exists();
+        let registered = repository.registers_worktree(worktree)?;
+        if !on_disk && !registered {
+            return Ok(());
+        }
+        if started.elapsed() > CLEANUP_DEADLINE {
+            bail!(
+                "{} was not cleaned up within {}s: directory present = {on_disk}, git \
+                 registration present = {registered}",
+                worktree.display(),
+                CLEANUP_DEADLINE.as_secs()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Hold the product to not having destroyed the only copy of the work.
+///
+/// Removing the worktree directory is what `Done` and delete are for. Removing
+/// the last reference to the commits made inside it is a different act, and
+/// this is the assertion that keeps the two apart: after the dust settles,
+/// something in the repository still has to be able to name the work.
+fn assert_work_survives(
+    repository: &GitFixture,
+    work: &EstablishedWork,
+    what_happened: &str,
+) -> Result<()> {
+    let reaching = repository.refs_reaching(&work.commit)?;
+    if reaching.is_empty() {
+        bail!(
+            "{what_happened} left commit {} — the only copy of the work the agent produced — \
+             reachable from no ref at all. Branch {} is gone, the worktree is gone, and nothing \
+             in the repository can name that commit again; it survives only as a dangling \
+             object until git collects it.",
+            work.commit,
+            work.branch
+        );
+    }
+    Ok(())
+}
+
+/// Prove what moving a finished task to `Done` does to the work it produced.
+///
+/// `Done` is meant to be the end of a task's need for a worktree, so the
+/// worktree going away is the behaviour under test rather than a defect. What
+/// the journey will not accept is the same action taking the work with it: the
+/// task ran, the executor committed what the agent wrote to the task's branch,
+/// and no part of moving a card into the last column says that those commits
+/// should stop existing.
+///
+/// Driven through `reorder_task`, which is exactly what the board sends when a
+/// card is dragged into a column — no cleanup helper is called, and the test
+/// deletes nothing itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn finishing_a_task_removes_its_worktree_without_destroying_its_work() {
+    let context = TestContext::new("queue_task_done").expect("harness setup");
+    let outcome = done_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn done_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+
+    let agent = FakeAgent::install(&root)?;
+    context.set_child_env("PATH", agent.path_value());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
+    // The run has to produce something, or destroying its worktree would
+    // destroy nothing and the journey would pass for the wrong reason.
+    context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
+
+    pin_worktree_placement(&context.state().config_file())?;
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("done").await?;
+    let outcome = finish_a_task(session.driver(), &agent, &repository).await;
+    context.close_session(session, "done", &outcome).await?;
+    let (executed, work) = outcome?;
+
+    // The settled state is on disk and not only in the application's memory.
+    assert_persisted(&root, &executed, "done")?;
+
+    // Read once more after the application is gone, so nothing about a running
+    // process can be holding the answer up.
+    if executed.worktree_path.exists() {
+        bail!(
+            "the worktree {} outlived the application that was told to remove it",
+            executed.worktree_path.display()
+        );
+    }
+    assert_work_survives(&repository, &work, "moving the task to Done")?;
+
+    let invocations = agent_runs(&agent)?.len();
+    if invocations != 1 {
+        bail!("the agent ran {invocations} times over the whole journey, expected exactly once");
+    }
+
+    Ok(())
+}
+
+async fn finish_a_task(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    repository: &GitFixture,
+) -> Result<(ExecutedTask, EstablishedWork)> {
+    let executed = execute_one_task(driver, agent, repository).await?;
+    let work = establish_work(driver, repository, &executed).await?;
+
+    // --- The one action under test -----------------------------------------
+    //
+    // What the board sends when a card is dropped into the Done column.
+    ui::invoke(
+        driver,
+        "reorder_task",
+        json!({
+            "taskId": executed.id,
+            "newStatus": "done",
+            "newPosition": 0,
+        }),
+    )
+    .await?;
+
+    // --- What the product says happened ------------------------------------
+    let settled = await_status(driver, &executed.project_id, &executed.id, &["done"]).await?;
+
+    await_worktree_removal(repository, &executed.worktree_path).await?;
+
+    // The reference is cleared only once the removal succeeded, so a cleared
+    // one is the product's own statement that the directory really went.
+    let cleared = await_worktree_path_cleared(driver, &executed).await?;
+    if let Some(still) = cleared {
+        bail!(
+            "the task still records worktree {still} after its removal, so the board and the \
+             disk disagree about a directory that is gone"
+        );
+    }
+
+    // Execution state is not reset on the way to Done: the task is finished,
+    // not sent back into the workflow.
+    let status = status_of(&settled);
+    if status != Some("done") {
+        bail!("the task reports {status:?} instead of done");
+    }
+
+    // --- What it did to the work -------------------------------------------
+    assert_work_survives(repository, &work, "moving the task to Done")?;
+
+    // The product keeps `branch_name` past Done on purpose — its own comment
+    // says it is kept for PR creation — so the name it keeps has to still
+    // name something.
+    let recorded_branch = settled.get("branch_name").and_then(Value::as_str);
+    if recorded_branch != Some(work.branch.as_str()) {
+        bail!(
+            "the finished task records branch {recorded_branch:?}, expected {:?}",
+            work.branch
+        );
+    }
+    if !repository.has_branch(&work.branch)? {
+        bail!(
+            "the finished task still records branch {} for creating a pull request from, but \
+             the branch itself was deleted",
+            work.branch
+        );
+    }
+
+    // --- Proof a user would see it -----------------------------------------
+    open_board(driver, &executed.project_id).await?;
+    assert_card_in_column(driver, DONE_COLUMN, &executed.title).await?;
+
+    Ok((executed, work))
+}
+
+/// Wait until the product stops recording a worktree for the task, and return
+/// whatever it still records when the wait runs out.
+async fn await_worktree_path_cleared(
+    driver: &WebDriver,
+    executed: &ExecutedTask,
+) -> Result<Option<String>> {
+    let started = Instant::now();
+    loop {
+        let listed = ui::invoke(
+            driver,
+            "list_tasks",
+            json!({ "projectId": executed.project_id }),
+        )
+        .await?;
+        let recorded = find_task(&listed, &executed.id)
+            .and_then(|task| task.get("worktree_path").cloned())
+            .filter(|value| !value.is_null())
+            .and_then(|value| value.as_str().map(str::to_string));
+        if recorded.is_none() {
+            return Ok(None);
+        }
+        if started.elapsed() > CLEANUP_DEADLINE {
+            return Ok(recorded);
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Prove what deleting a task does to the work it produced.
+///
+/// Deleting is the other destructive path, and it is not the same contract as
+/// `Done`: the task record itself disappears, so the retry pass that rescues a
+/// failed `Done` cleanup has nothing left to select. What the journey holds
+/// the product to is the part that is the same either way — the user asked to
+/// be rid of a task, not to have the commits it produced become unreachable.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_task_removes_its_worktree_without_destroying_its_work() {
+    let context = TestContext::new("queue_task_delete").expect("harness setup");
+    let outcome = delete_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn delete_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+
+    let agent = FakeAgent::install(&root)?;
+    context.set_child_env("PATH", agent.path_value());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
+    context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
+
+    pin_worktree_placement(&context.state().config_file())?;
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("delete").await?;
+    let outcome = delete_a_task(session.driver(), &agent, &repository).await;
+    context.close_session(session, "delete", &outcome).await?;
+    let (executed, work) = outcome?;
+
+    // Gone from disk as well as from the running application.
+    if find_persisted(&root, &executed.id)? {
+        bail!(
+            "task {} was deleted but a persisted record of it is still in the state root",
+            executed.id
+        );
+    }
+    if executed.worktree_path.exists() {
+        bail!(
+            "the worktree {} outlived the application that was told to remove it",
+            executed.worktree_path.display()
+        );
+    }
+    assert_work_survives(&repository, &work, "deleting the task")?;
+
+    Ok(())
+}
+
+async fn delete_a_task(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    repository: &GitFixture,
+) -> Result<(ExecutedTask, EstablishedWork)> {
+    let executed = execute_one_task(driver, agent, repository).await?;
+    let work = establish_work(driver, repository, &executed).await?;
+
+    // --- The one action under test -----------------------------------------
+    let deleted = ui::invoke(driver, "delete_task", json!({ "taskId": executed.id })).await?;
+    if deleted != Value::Bool(true) {
+        bail!("delete_task answered {deleted} rather than reporting the task deleted");
+    }
+
+    // --- What the product says happened ------------------------------------
+    let listed = ui::invoke(
+        driver,
+        "list_tasks",
+        json!({ "projectId": executed.project_id }),
+    )
+    .await?;
+    if find_task(&listed, &executed.id).is_some() {
+        bail!(
+            "the product still lists task {} after deleting it",
+            executed.id
+        );
+    }
+
+    await_worktree_removal(repository, &executed.worktree_path).await?;
+
+    // --- What it did to the work -------------------------------------------
+    assert_work_survives(repository, &work, "deleting the task")?;
+
+    // --- Proof a user would see it -----------------------------------------
+    open_board(driver, &executed.project_id).await?;
+    assert_card_absent_from_board(driver, &executed.title).await?;
+
+    let invocations = agent_runs(agent)?.len();
+    if invocations != 1 {
+        bail!("the agent ran {invocations} times over the whole journey, expected exactly once");
+    }
+
+    Ok((executed, work))
+}
+
+/// Whether any persisted record in the state root still carries this task id.
+fn find_persisted(root: &Path, task_id: &str) -> Result<bool> {
+    for file in toml_files(root)? {
+        let Ok(contents) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Ok(document) = contents.parse::<toml::Value>() else {
+            continue;
+        };
+        if task_record(&document, task_id).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Assert `title` is on no column of the board.
+///
+/// Checked across the whole board rather than one column, because a delete
+/// that only moved the card would otherwise pass by leaving it somewhere else.
+async fn assert_card_absent_from_board(driver: &WebDriver, title: &str) -> Result<()> {
+    let board = ui::visible(driver, KANBAN_BOARD).await?;
+    let shown = card_titles(&board).await?;
+    if shown.iter().any(|found| found == title) {
+        bail!("the board still shows a card titled {title:?} after the task was deleted");
     }
     Ok(())
 }
@@ -1537,6 +2078,7 @@ mod tests {
     fn executed(id: &str, title: &str) -> ExecutedTask {
         ExecutedTask {
             id: id.to_string(),
+            project_id: "project-under-test".to_string(),
             title: title.to_string(),
             worktree_path: PathBuf::from("/tmp/wt/task-abcd1234"),
         }
