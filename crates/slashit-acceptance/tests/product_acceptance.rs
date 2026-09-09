@@ -2253,6 +2253,410 @@ async fn retry_a_failed_cleanup(
 
     Ok(())
 }
+/// An obstacle git walks into rather than one it refuses at.
+///
+/// [`Unreachable`] closes off the worktree directory itself, so git cannot
+/// read `<worktree>/.git`, declines the removal before touching anything, and
+/// leaves the checkout exactly as it was. This one is a level further in: the
+/// worktree is perfectly readable, git validates it, accepts the removal and
+/// starts deleting, and only then reaches a directory whose entries it is not
+/// allowed to unlink. What git does at that point is what these journeys are
+/// about, and it is nothing like refusing.
+///
+/// Mode `0o500` rather than `0o000` on purpose. Git has to be able to see that
+/// there is something inside to delete, so that it fails on the unlink and not
+/// on the listing; a directory it may not even open is the *other* obstacle,
+/// and it produces the other outcome.
+struct Undeletable {
+    directory: PathBuf,
+    restore: u32,
+}
+
+impl Undeletable {
+    /// Plant the obstacle inside `worktree` and hold it.
+    fn plant(worktree: &Path) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = worktree.join("blocked");
+        std::fs::create_dir(&directory)
+            .with_context(|| format!("could not create {}", directory.display()))?;
+        std::fs::write(directory.join("held.txt"), b"held by the obstacle\n")
+            .context("could not put anything inside the obstacle")?;
+        let restore = std::fs::metadata(&directory)
+            .with_context(|| format!("could not read the mode of {}", directory.display()))?
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+            .with_context(|| format!("could not close off {}", directory.display()))?;
+        Ok(Self { directory, restore })
+    }
+
+    fn release(self) -> Result<()> {
+        let directory = self.directory.clone();
+        let restore = self.restore;
+        std::mem::forget(self);
+        Self::restore_mode(&directory, restore)
+    }
+
+    fn restore_mode(directory: &Path, mode: u32) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if !directory.exists() {
+            // The removal this obstacle was blocking finally happened, which
+            // is the outcome every journey using it is waiting for.
+            return Ok(());
+        }
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("could not reopen {}", directory.display()))
+    }
+}
+
+impl Drop for Undeletable {
+    fn drop(&mut self) {
+        let _ = Self::restore_mode(&self.directory, self.restore);
+    }
+}
+
+/// Prove that a cleanup git gives up on halfway through is still a cleanup the
+/// product can finish.
+///
+/// The retry contract [`a_done_cleanup_that_fails_keeps_the_worktree_and_is_retried_until_it_succeeds`]
+/// establishes is only worth having if it holds for the removals that actually
+/// fail. That journey uses an obstacle git refuses at, which leaves the
+/// checkout whole and the record intact, so a later attempt has something to
+/// succeed at. This one uses an obstacle git discovers only after it has
+/// committed to the removal — and a removal git abandons partway is a
+/// different situation entirely, because git tears down the worktree's
+/// registration on its way out whether or not the checkout it was deleting is
+/// still there.
+///
+/// Nothing in this journey knows that. It asks the product the same question
+/// the other one does: the obstacle is gone, so is the worktree gone too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cleanup_git_abandons_partway_is_still_retried_until_it_succeeds() {
+    if unsafe { libc::geteuid() } == 0 {
+        // Root ignores the permission bits the obstacle is made of, so the
+        // first cleanup would succeed and the journey would prove nothing.
+        eprintln!("skipped: running as root, where the obstacle has no effect");
+        return;
+    }
+    let context = TestContext::new("queue_task_partial_cleanup").expect("harness setup");
+    let outcome = partial_cleanup_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn partial_cleanup_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+
+    let agent = FakeAgent::install(&root)?;
+    context.set_child_env("PATH", agent.path_value());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
+    context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
+
+    pin_worktree_placement(&context.state().config_file())?;
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("partial-cleanup").await?;
+    let outcome = retry_a_cleanup_git_abandoned(session.driver(), &agent, &repository).await;
+    context
+        .close_session(session, "partial-cleanup", &outcome)
+        .await?;
+    outcome
+}
+
+async fn retry_a_cleanup_git_abandoned(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    repository: &GitFixture,
+) -> Result<()> {
+    let executed = execute_one_task(driver, agent, repository).await?;
+    let work = establish_work(driver, repository, &executed).await?;
+
+    // Planted before the task is finished, so the product's very first removal
+    // is the one git abandons.
+    let obstacle = Undeletable::plant(&executed.worktree_path)?;
+
+    ui::invoke(
+        driver,
+        "reorder_task",
+        json!({
+            "taskId": executed.id,
+            "newStatus": "done",
+            "newPosition": 0,
+        }),
+    )
+    .await?;
+
+    let settled = await_status(driver, &executed.project_id, &executed.id, &["done"]).await?;
+
+    // Read after a full retry cycle, so these are the facts a task is left
+    // with rather than the ones it had before the first attempt failed.
+    tokio::time::sleep(Duration::from_secs(35)).await;
+
+    let during = ui::invoke(
+        driver,
+        "list_tasks",
+        json!({ "projectId": executed.project_id }),
+    )
+    .await?;
+    let during = find_task(&during, &executed.id)
+        .context("the task disappeared while its cleanup was failing")?;
+
+    let retained = during.get("worktree_path").and_then(Value::as_str);
+    if retained.map(|path| resolve(Path::new(path))) != Some(resolve(&executed.worktree_path)) {
+        bail!(
+            "a cleanup that could not remove the worktree cleared {retained:?} anyway — the only \
+             persisted record of {} is gone and nothing can find it again",
+            executed.worktree_path.display()
+        );
+    }
+    if !executed.worktree_path.exists() {
+        bail!(
+            "the product reported nothing but {} is gone, so the removal it could not do \
+             happened anyway",
+            executed.worktree_path.display()
+        );
+    }
+    if !repository.has_branch(&work.branch)? {
+        bail!(
+            "branch {} was deleted by a cleanup that never removed the worktree it belongs to",
+            work.branch
+        );
+    }
+    if status_of(&settled) != Some("done") {
+        bail!("a task whose cleanup failed should still be done, found {settled}");
+    }
+
+    // --- And the retry has to finish once the obstacle is gone -------------
+    obstacle.release()?;
+
+    let started = Instant::now();
+    loop {
+        let listed = ui::invoke(
+            driver,
+            "list_tasks",
+            json!({ "projectId": executed.project_id }),
+        )
+        .await?;
+        let task = find_task(&listed, &executed.id)
+            .context("the task disappeared while its cleanup was being retried")?;
+        let cleared = task
+            .get("worktree_path")
+            .map(|value| value.is_null())
+            .unwrap_or(true);
+        if cleared && !executed.worktree_path.exists() {
+            break;
+        }
+        if started.elapsed() > CLEANUP_RETRY_DEADLINE {
+            bail!(
+                "the worktree was still not cleaned up {}s after the obstacle was removed: \
+                 directory present = {}, git still registers it = {}, task still records {:?} — \
+                 a removal git gave up on partway is one the product can never finish",
+                CLEANUP_RETRY_DEADLINE.as_secs(),
+                executed.worktree_path.exists(),
+                repository.registers_worktree(&executed.worktree_path)?,
+                task.get("worktree_path")
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+
+    if repository.registers_worktree(&executed.worktree_path)? {
+        bail!(
+            "git still registers a worktree at {} after the retry reported it cleaned up",
+            executed.worktree_path.display()
+        );
+    }
+    assert_work_survives(
+        repository,
+        &work,
+        "a cleanup git abandoned partway and the retry pass then finished",
+    )?;
+
+    Ok(())
+}
+
+/// A second worktree in the same repository, belonging to nobody in this
+/// journey.
+///
+/// It exists to be left alone. Cleaning up one task is an operation on that
+/// task's worktree, and a journey can only show that by having something else
+/// registered at the same time that must come out the other side untouched.
+struct Bystander {
+    path: PathBuf,
+    branch: String,
+    file: PathBuf,
+}
+
+impl Bystander {
+    /// Register a worktree of `repository` that this journey never cleans up.
+    fn register(repository: &GitFixture) -> Result<Self> {
+        let path = repository.state_root().join("bystander-worktree");
+        let branch = "bystander-work".to_string();
+        git(
+            &repository.path_buf(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                &path.to_string_lossy(),
+            ],
+        )?;
+        let file = path.join("bystander.txt");
+        std::fs::write(&file, b"work that belongs to nobody in this journey\n")
+            .with_context(|| format!("could not write {}", file.display()))?;
+        git(&path, &["add", "bystander.txt"])?;
+        git(&path, &["commit", "--quiet", "-m", "bystander work"])?;
+        Ok(Self { path, branch, file })
+    }
+}
+
+/// Prove that cleaning up one task's worktree does not reach into another's.
+///
+/// The product's git cleanup ends in a repository-wide `git worktree prune`,
+/// which takes no path and decides what is stale by whether it can read each
+/// registered worktree's `.git`. A worktree it is not allowed to look at reads
+/// the same as one that is gone, so a second worktree that is entirely present
+/// — merely unreadable at the moment, as one on an unmounted drive or behind a
+/// permission would be — loses the registration it needs, while its files sit
+/// untouched on disk and its branch stays exactly where it was. Nothing about
+/// that worktree took part in the cleanup that destroyed it.
+///
+/// The route into that prune is the defect
+/// [`a_cleanup_git_abandons_partway_is_still_retried_until_it_succeeds`]
+/// describes: once git has abandoned a removal it has also forgotten the
+/// worktree, so every later attempt reports that there is no working tree
+/// there, and if the leftover directory is then cleared the product falls
+/// through to the one step that is not about this task at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn cleaning_up_one_task_leaves_another_worktree_registered() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: running as root, where the obstacle has no effect");
+        return;
+    }
+    let context = TestContext::new("queue_task_bystander").expect("harness setup");
+    let outcome = bystander_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn bystander_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+
+    let agent = FakeAgent::install(&root)?;
+    context.set_child_env("PATH", agent.path_value());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
+    context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
+
+    pin_worktree_placement(&context.state().config_file())?;
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("bystander").await?;
+    let outcome = clean_up_beside_a_bystander(session.driver(), &agent, &repository).await;
+    context.close_session(session, "bystander", &outcome).await?;
+    outcome
+}
+
+async fn clean_up_beside_a_bystander(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    repository: &GitFixture,
+) -> Result<()> {
+    let executed = execute_one_task(driver, agent, repository).await?;
+    establish_work(driver, repository, &executed).await?;
+
+    let bystander = Bystander::register(repository)?;
+    // Unreadable, not absent. Everything it holds is still on disk, and the
+    // only thing that changes is that git can no longer look inside it — which
+    // is indistinguishable, to a repository-wide prune, from having been
+    // deleted.
+    let unreadable = Unreachable::hold(&bystander.path)?;
+
+    let obstacle = Undeletable::plant(&executed.worktree_path)?;
+
+    ui::invoke(
+        driver,
+        "reorder_task",
+        json!({
+            "taskId": executed.id,
+            "newStatus": "done",
+            "newPosition": 0,
+        }),
+    )
+    .await?;
+    await_status(driver, &executed.project_id, &executed.id, &["done"]).await?;
+
+    // One full retry cycle, so the removal has been attempted and abandoned
+    // before anything else happens.
+    tokio::time::sleep(Duration::from_secs(35)).await;
+
+    // The leftover directory is cleared the way a user clearing it would: the
+    // obstacle goes, then the directory goes. What the product does next is
+    // entirely about a task whose worktree is no longer there.
+    obstacle.release()?;
+    if executed.worktree_path.exists() {
+        std::fs::remove_dir_all(&executed.worktree_path).with_context(|| {
+            format!(
+                "could not clear the leftover at {}",
+                executed.worktree_path.display()
+            )
+        })?;
+    }
+
+    // The shared helper allows one cleanup's worth of time; this waits for the
+    // retry pass, which is the same deadline the other retry journey derives
+    // from the executor's thirty-second cadence.
+    let started = Instant::now();
+    loop {
+        let listed = ui::invoke(
+            driver,
+            "list_tasks",
+            json!({ "projectId": executed.project_id }),
+        )
+        .await?;
+        let task = find_task(&listed, &executed.id)
+            .context("the task disappeared while its cleanup was being retried")?;
+        let cleared = task
+            .get("worktree_path")
+            .map(|value| value.is_null())
+            .unwrap_or(true);
+        if cleared {
+            break;
+        }
+        if started.elapsed() > CLEANUP_RETRY_DEADLINE {
+            bail!(
+                "the task still records {:?} {}s after its worktree was cleared away",
+                task.get("worktree_path"),
+                CLEANUP_RETRY_DEADLINE.as_secs()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+
+    // --- What the bystander must still have --------------------------------
+    if !repository.registers_worktree(&bystander.path)? {
+        bail!(
+            "cleaning up {} destroyed the registration of {}, which took no part in it — the \
+             directory is still there, so nothing can remove it and nothing can check its \
+             branch out again",
+            executed.worktree_path.display(),
+            bystander.path.display()
+        );
+    }
+    unreadable.release()?;
+    if !bystander.file.is_file() {
+        bail!(
+            "{} lost the work it was holding while another task was cleaned up",
+            bystander.path.display()
+        );
+    }
+    if !repository.has_branch(&bystander.branch)? {
+        bail!(
+            "branch {} was deleted by a cleanup that had nothing to do with it",
+            bystander.branch
+        );
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
