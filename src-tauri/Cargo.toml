@@ -67,4 +67,11 @@ acceptance-webdriver = ["dep:tauri-plugin-wdio-webdriver"]
 [dev-dependencies]
 tempfile = "3"
 mockall = "0.13"
+# TEST-ONLY. `tauri::test::mock_app` is the only public way to obtain a real
+# `tauri::State<AppState>`: `State` is a newtype over a private reference with
+# no constructor, so a test that wants to drive a `#[tauri::command]` body
+# itself -- rather than a copy of it -- has to go through a managed app. Being
+# a dev-dependency feature, it is not unified into `cargo build`/`cargo tauri
+# build`, so no shipped binary carries the mock runtime.
+tauri = { version = "2", features = ["test"] }
 

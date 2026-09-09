@@ -1561,6 +1561,399 @@ branch refs/heads/some-other-branch
         );
     }
 
+    /// Automatic cleanup must not be able to destroy work that exists only in
+    /// the checkout it is deleting.
+    ///
+    /// A worktree is disposable exactly to the extent that everything in it
+    /// is recoverable from somewhere else, and not-yet-committed content is
+    /// precisely what is not: no commit, and therefore no branch, names it.
+    /// `remove` is reached automatically -- one drag onto Done, or the ~30s
+    /// retry pass -- so there is no moment at which anybody is asked whether
+    /// this particular checkout is expendable.
+    ///
+    /// Three classes of content have that property and are run as one table
+    /// rather than three near-identical tests, because the contract is one
+    /// contract: a tracked file edited in place, a change staged but not
+    /// committed, and an ordinary untracked file. Each is what an interrupted
+    /// agent run routinely leaves behind. For each, the removal must refuse
+    /// and say so: report `Err`, leave the checkout on disk holding its exact
+    /// bytes, leave the registration git needs in order to address that
+    /// checkout again, and leave the task branch.
+    ///
+    /// Expected to fail on the current implementation, and for one specific
+    /// reason: `remove_with_git` treats the refusal `git worktree remove`
+    /// correctly issues for a dirty checkout as a signal to re-run it with
+    /// `--force`, which deletes the content and then returns `Ok(())`. The
+    /// caller durably clears `worktree_path` on that `Ok`, so the work is
+    /// gone and nothing records that it ever existed.
+    #[tokio::test]
+    async fn a_dirty_worktree_survives_automatic_cleanup() {
+        /// One class of content that lives nowhere but in the checkout.
+        struct DirtyCase {
+            /// Named in every assertion, so a failure says which class broke.
+            class: &'static str,
+            /// The file the class is expressed in, relative to the checkout.
+            file: &'static str,
+            /// Its exact bytes, which are what must still be there afterwards.
+            contents: &'static str,
+            /// Whether the change is `git add`ed before cleanup runs.
+            staged: bool,
+        }
+
+        const CASES: &[DirtyCase] = &[
+            DirtyCase {
+                class: "tracked file modified but not committed",
+                // Tracked because `create_temp_git_repo` committed it.
+                file: "README.md",
+                contents: "# test\nedited in the worktree, never committed\n",
+                staged: false,
+            },
+            DirtyCase {
+                class: "change staged but not committed",
+                file: "staged-in-the-worktree.txt",
+                contents: "staged in the worktree, never committed\n",
+                staged: true,
+            },
+            DirtyCase {
+                class: "non-ignored untracked file created",
+                file: "untracked-in-the-worktree.txt",
+                contents: "written in the worktree, never added\n",
+                staged: false,
+            },
+        ];
+
+        // Every violation of every case is collected rather than asserted on
+        // the spot, so one run names all three classes and everything each of
+        // them lost. A fail-fast table would report only the first class and
+        // hide whether the other two behave the same way.
+        let mut violations: Vec<String> = Vec::new();
+
+        for case in CASES {
+            let tmp = create_temp_git_repo();
+            let repo_path = tmp.path().to_str().unwrap();
+
+            // `Managed` is a placement users actually select, not a harness
+            // fiction, and it forces the git backend even where `wt` is
+            // installed. `wt_available` is therefore set to the value that
+            // would otherwise delegate, which makes the assertion below a
+            // real statement about the gate rather than about the host: this
+            // test exercises `remove_with_git` on every machine, and says so.
+            let mut mgr = test_manager();
+            mgr.wt_available = true;
+            mgr.placement = WorktreePlacement::Managed;
+            assert!(
+                !mgr.delegates_to_wt(),
+                "[{}] this test must exercise the git backend whatever is installed on the host",
+                case.class
+            );
+
+            let info = mgr
+                .create(repo_path, "task-dirty")
+                .await
+                .expect("create failed");
+            let file = Path::new(&info.path).join(case.file);
+            std::fs::write(&file, case.contents).expect("write uncommitted content");
+            if case.staged {
+                run_git(&info.path, &["add", case.file]);
+            }
+            assert!(
+                !run_git(&info.path, &["status", "--porcelain"]).is_empty(),
+                "precondition [{}]: git itself must agree the checkout holds content no commit \
+                 names, or the case under test was never set up",
+                case.class
+            );
+
+            let result = mgr.remove(&info.path, repo_path).await;
+
+            let class = case.class;
+            if result.is_ok() {
+                violations.push(format!(
+                    "[{class}] cleanup reported success for a checkout holding content no commit \
+                     names; the caller clears worktree_path on that answer, so the last handle \
+                     to that content goes too"
+                ));
+            }
+            if !Path::new(&info.path).exists() {
+                violations.push(format!(
+                    "[{class}] the checkout at {} was deleted, and the uncommitted content went \
+                     with it",
+                    info.path
+                ));
+            }
+            let survived = std::fs::read_to_string(&file).ok();
+            if survived.as_deref() != Some(case.contents) {
+                violations.push(format!(
+                    "[{class}] {} no longer holds the bytes that existed only in this checkout: \
+                     {survived:?}",
+                    file.display()
+                ));
+            }
+            let listing = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+            if !listing.contains(&info.path) {
+                violations.push(format!(
+                    "[{class}] the checkout is no longer registered with git, so no `git \
+                     worktree` command can address it again and the retry has nothing to retry; \
+                     listing was: {listing}"
+                ));
+            }
+            if !branch_exists(repo_path, "task-dirty") {
+                violations.push(format!(
+                    "[{class}] the task branch was destroyed along with the checkout"
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "automatic cleanup destroyed content that existed nowhere else:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// A clean checkout stays removable even when its branch carries a commit
+    /// that `main` does not.
+    ///
+    /// This is the guard rail for the fix that
+    /// `a_dirty_worktree_survives_automatic_cleanup` asks for. That refusal
+    /// has to stay scoped to content no commit names; widening it into "never
+    /// remove a worktree whose branch is unmerged" is an easy way to make the
+    /// dirty cases pass and would leave every finished task's checkout on
+    /// disk forever, since a task branch is unmerged for as long as its PR is
+    /// open.
+    ///
+    /// `integration_a_removed_worktree_can_be_reattached_from_its_branch`
+    /// already removes a worktree whose branch carries a commit, so the delta
+    /// here is deliberately small: the unmerged-relative-to-`main` state is
+    /// asserted as a precondition rather than merely arranged, and the
+    /// registration is asserted to be gone as well as the directory. A fix
+    /// that starts consulting merge state then fails here, under a name that
+    /// says what it broke.
+    #[tokio::test]
+    async fn a_clean_worktree_whose_branch_has_unmerged_commits_is_still_removable() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+
+        let info = mgr
+            .create(repo_path, "task-unmerged")
+            .await
+            .expect("create failed");
+        let work = commit_work(&info.path, "agent-work.txt");
+
+        assert!(
+            run_git(&info.path, &["status", "--porcelain"]).is_empty(),
+            "precondition: the checkout must be clean, or this would be testing a dirty case"
+        );
+        assert!(
+            !run_git(
+                repo_path,
+                &["branch", "--merged", "main", "--format=%(refname)"]
+            )
+            .lines()
+            .any(|refname| refname == "refs/heads/task-unmerged"),
+            "precondition: the branch must be unmerged relative to main, or the state this test \
+             is named for was never reached"
+        );
+
+        mgr.remove(&info.path, repo_path)
+            .await
+            .expect("a clean checkout stays removable however its branch relates to main");
+
+        assert!(
+            !Path::new(&info.path).exists(),
+            "the checkout must go: finished tasks are how the disk is reclaimed"
+        );
+        let listing = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        assert!(
+            !listing.contains(&info.path),
+            "the registration must go with it, or the branch can never be checked out again; \
+             listing was: {listing}"
+        );
+        assert!(
+            branch_exists(repo_path, "task-unmerged"),
+            "the branch survives every removal, and this one is not an exception"
+        );
+        assert!(
+            refs_reaching(repo_path, &work).contains(&"refs/heads/task-unmerged".to_string()),
+            "and the commit that made it unmerged is still named by it"
+        );
+    }
+
+    /// Content git itself ignores is not work, and cleanup treats it the way
+    /// git does.
+    ///
+    /// SlashIt invents no policy here. `git worktree remove` deletes a
+    /// checkout whose only non-committed content is git-ignored, and an
+    /// agent's build output and editor droppings are exactly that. So the
+    /// refusal `a_dirty_worktree_survives_automatic_cleanup` asks for has to
+    /// be keyed on the same notion of dirty that `git status` reports, not on
+    /// "anything no commit names" -- otherwise the first build a task runs
+    /// would pin its checkout to disk permanently.
+    #[tokio::test]
+    async fn a_worktree_whose_only_uncommitted_content_is_ignored_is_still_removed() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+
+        let info = mgr
+            .create(repo_path, "task-ignored")
+            .await
+            .expect("create failed");
+        std::fs::write(Path::new(&info.path).join(".gitignore"), "build/\n")
+            .expect("write .gitignore");
+        run_git(&info.path, &["add", ".gitignore"]);
+        run_git(
+            &info.path,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "ignore build output",
+            ],
+        );
+        std::fs::create_dir(Path::new(&info.path).join("build")).expect("create build dir");
+        std::fs::write(
+            Path::new(&info.path).join("build").join("artifact.o"),
+            "build output\n",
+        )
+        .expect("write build output");
+
+        assert!(
+            run_git(&info.path, &["status", "--porcelain"]).is_empty(),
+            "precondition: git must consider the checkout clean, since that is the notion of \
+             dirty this policy defers to"
+        );
+        assert!(
+            run_git(&info.path, &["status", "--porcelain", "--ignored"]).contains("build/"),
+            "precondition: and something must actually be ignored, or this test proves nothing"
+        );
+
+        mgr.remove(&info.path, repo_path)
+            .await
+            .expect("ignored content is not a reason to keep a checkout alive");
+
+        assert!(
+            !Path::new(&info.path).exists(),
+            "ordinary git semantics: the checkout goes, build output and all"
+        );
+        assert!(
+            branch_exists(repo_path, "task-ignored"),
+            "and the branch is left alone, as it is by every other removal"
+        );
+    }
+
+    /// Cleanup under worktrunk must not delete the task branch.
+    ///
+    /// `remove_with_wt` runs `wt remove -y --no-verify`, and `wt remove`
+    /// deletes the branch by design whenever it decides that merging it would
+    /// add nothing. The first and cheapest of its five checks is "branch HEAD
+    /// equals the default branch", which is the state of every task whose
+    /// agent committed nothing and of every task whose work has already
+    /// landed. Measured against worktrunk v0.29.0: without
+    /// `--no-delete-branch` it prints "Removing <branch> worktree & branch in
+    /// background (same commit as main)" and the branch is gone afterwards;
+    /// with `--no-delete-branch` it prints "Branch integrated (same commit as
+    /// main); retained with --no-delete-branch" and the branch survives.
+    ///
+    /// That leaves the two backends disagreeing about the one thing
+    /// `remove`'s contract is entirely about. `remove_with_git` stopped
+    /// running `git branch -D` precisely because a task branch is routinely
+    /// the only ref naming the commits a task produced; the backend that is
+    /// default on any machine with `wt` installed still deletes it.
+    /// `branch_name` is what `create_pr` pushes and what `reattach`
+    /// re-checks-out, so both break.
+    ///
+    /// Ignored by default because it is the only test in this file that needs
+    /// the `wt` binary on PATH, following the PTY tests that are ignored for
+    /// needing to spawn real processes. Run it with
+    /// `cargo test -- --ignored`.
+    ///
+    /// The checkout is made with plain `git worktree add` rather than through
+    /// `mgr.create`, deliberately. `wt switch` is the only worktrunk
+    /// subcommand that consults the `worktree-path` template, and
+    /// `remove_with_wt` passes no `--config`, so creating through the
+    /// delegating backend would drop a worktree into whichever global root
+    /// the developer running the test has configured -- for a real user, a
+    /// directory full of their own work. `wt remove` acts on the checkout it
+    /// is invoked in, so driving it against a checkout git made under a temp
+    /// dir exercises exactly the code under test and can write nowhere else.
+    #[tokio::test]
+    #[ignore] // Ignore by default as it requires the `wt` binary on PATH
+    async fn integration_worktrunk_cleanup_keeps_the_task_branch() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap().to_string();
+        let checkout_root = tempfile::TempDir::new().expect("tempdir");
+        let checkout = checkout_root
+            .path()
+            .join("task-checkout")
+            .to_string_lossy()
+            .to_string();
+
+        run_git(
+            &repo_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "task-worktrunk",
+                checkout.as_str(),
+                "main",
+            ],
+        );
+        assert_eq!(
+            run_git(&repo_path, &["rev-parse", "refs/heads/task-worktrunk"]),
+            run_git(&repo_path, &["rev-parse", "refs/heads/main"]),
+            "precondition: the branch must sit on main's commit, which is the state wt reads as \
+             safe to delete and the state a task that committed nothing is in"
+        );
+
+        let mgr = WorktreeManager {
+            wt_available: true,
+            gs_available: false,
+            paths: test_paths(),
+            placement: WorktreePlacement::Auto,
+        };
+        assert!(
+            mgr.delegates_to_wt(),
+            "this test must exercise the wt backend"
+        );
+
+        let result = mgr.remove(&checkout, &repo_path).await;
+
+        // `wt remove` does the work in a background process and returns
+        // straight away, so the branch has to be judged after that process
+        // has finished rather than after `wt` exits: a branch that is still
+        // there the instant `wt` returns may simply not have been deleted
+        // yet, and asserting then would pass for the wrong reason.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let listing = WorktreeManager::worktree_list_porcelain(&repo_path).unwrap_or_default();
+            let settled = !Path::new(&checkout).exists() && !listing.contains(&checkout);
+            if settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wt never finished removing {checkout}; remove returned {result:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Branch deletion is the tail of that same background job, so give it
+        // a moment past the registration teardown before calling the branch a
+        // survivor.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert!(
+            branch_exists(&repo_path, "task-worktrunk"),
+            "wt cleanup deleted the task branch, which is what create_pr pushes and what \
+             reattach checks out again; remove_with_wt needs --no-delete-branch. remove \
+             returned {result:?}"
+        );
+    }
+
     /// What a run of the fake agent leaves behind, so a test can recognise
     /// its own work rather than trust that something was written.
     const WORK: &str = "work produced in the worktree\n";
