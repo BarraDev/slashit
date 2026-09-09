@@ -67,12 +67,11 @@ pub async fn cleanup_worktree(
 ) -> Result<(), String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
-    let (wt_path, branch, project_id) = {
+    let (wt_path, project_id) = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_id).ok_or("Task not found")?;
         (
             task.worktree_path.clone().ok_or("No worktree for this task")?,
-            task.branch_name.clone().unwrap_or_default(),
             task.project_id,
         )
     };
@@ -88,7 +87,7 @@ pub async fn cleanup_worktree(
         repo.local_path.clone()
     };
 
-    state.worktree_manager.remove(&wt_path, &branch, &repo_path).await?;
+    state.worktree_manager.remove(&wt_path, &repo_path).await?;
 
     // The clear has to reach disk before it reaches shared memory, and the
     // failure has to reach the caller. Clearing `worktree_path` in memory is
@@ -99,7 +98,9 @@ pub async fn cleanup_worktree(
     // on, so returning the error to the dialog is the whole recovery story
     // here: the user can press the button again.
     //
-    // `branch_name` stays for a later PR creation, as before. The helper also
+    // `branch_name` stays for a later PR creation, and now names a branch
+    // that is still there to push: removal takes the checkout only. The
+    // helper also
     // declines to clear a path the task no longer records, so a re-run that
     // recreated a worktree while this removal was in flight keeps its
     // reference instead of having it erased by a cleanup that never touched

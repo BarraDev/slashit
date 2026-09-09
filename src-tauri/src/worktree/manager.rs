@@ -421,12 +421,21 @@ impl WorktreeManager {
         }
     }
 
-    /// Remove a worktree for a task.
-    pub async fn remove(&self, worktree_path: &str, branch: &str, repo_path: &str) -> Result<(), String> {
+    /// Remove a task's worktree -- the disposable checkout, and nothing else.
+    ///
+    /// Takes no branch, on purpose. A worktree is a second checkout of a
+    /// branch that already exists without it, so removing one is not a reason
+    /// to remove the other, and the branch is routinely the only ref naming
+    /// the commits the task produced. Nothing this method can observe
+    /// distinguishes work that is safe elsewhere from work that exists
+    /// nowhere else, so it does not decide; callers that genuinely want a
+    /// branch gone need their own contract for saying so, and today none
+    /// does.
+    pub async fn remove(&self, worktree_path: &str, repo_path: &str) -> Result<(), String> {
         if self.delegates_to_wt() {
-            self.remove_with_wt(worktree_path, branch, repo_path).await
+            self.remove_with_wt(worktree_path, repo_path).await
         } else {
-            self.remove_with_git(worktree_path, branch, repo_path).await
+            self.remove_with_git(worktree_path, repo_path).await
         }
     }
 
@@ -523,12 +532,7 @@ impl WorktreeManager {
         self.find_worktree_path(repo_path, branch).await
     }
 
-    async fn remove_with_wt(
-        &self,
-        worktree_path: &str,
-        branch: &str,
-        repo_path: &str,
-    ) -> Result<(), String> {
+    async fn remove_with_wt(&self, worktree_path: &str, repo_path: &str) -> Result<(), String> {
         if !self.exists(worktree_path) {
             // `wt` is spawned with `current_dir(worktree_path)`, so a missing
             // directory fails at spawn with `NotFound` before `wt` ever runs.
@@ -548,10 +552,8 @@ impl WorktreeManager {
             // `wt switch -c <branch>` refuses because the branch still exists,
             // so the task could never get a worktree again. Nothing else in
             // SlashIt runs `git worktree prune`. `remove_with_git` prunes the
-            // stale record and applies the same ownership rule it uses
-            // everywhere else, deleting the branch only when git actually had a
-            // registration to remove.
-            return self.remove_with_git(worktree_path, branch, repo_path).await;
+            // stale record, and like this backend it leaves the branch alone.
+            return self.remove_with_git(worktree_path, repo_path).await;
         }
 
         let output = tokio::process::Command::new("wt")
@@ -591,7 +593,7 @@ impl WorktreeManager {
             .await
     }
 
-    async fn remove_with_git(&self, worktree_path: &str, branch: &str, repo_path: &str) -> Result<(), String> {
+    async fn remove_with_git(&self, worktree_path: &str, repo_path: &str) -> Result<(), String> {
         // Try normal remove first
         let output = tokio::process::Command::new("git")
             .args(["worktree", "remove", worktree_path])
@@ -600,9 +602,7 @@ impl WorktreeManager {
             .await
             .map_err(|e| format!("Failed to remove worktree: {}", e))?;
 
-        let mut removed_by_git = output.status.success();
-
-        if !removed_by_git {
+        if !output.status.success() {
             // Fallback to force if normal remove fails (e.g., uncommitted changes)
             let force_output = tokio::process::Command::new("git")
                 .args(["worktree", "remove", "--force", worktree_path])
@@ -611,9 +611,7 @@ impl WorktreeManager {
                 .await
                 .map_err(|e| format!("Failed to force-remove worktree: {}", e))?;
 
-            removed_by_git = force_output.status.success();
-
-            if !removed_by_git {
+            if !force_output.status.success() {
                 // Last resort: prune stale git metadata for worktrees whose
                 // directory is already gone. It cannot remove a directory
                 // that is still present, so it can never turn this into a
@@ -639,38 +637,30 @@ impl WorktreeManager {
             ));
         }
 
-        // Deleting the branch requires more than observing that the directory
-        // is gone. An absent directory is `Ok` above precisely because it may
-        // have been removed by an earlier attempt or by the user, and the
-        // cleanup retry pass re-enters this function every ~30s — so "the path
-        // is absent" is also exactly what a retry that removed nothing sees.
-        // `git branch -D` force-deletes regardless of merge state and leaves no
-        // branch reflog, and branch names are deterministic from the task id,
-        // so acting on that inference can destroy commits on a branch this call
-        // has no claim to.
+        // The branch is not touched here, and that is the whole point of this
+        // function's contract.
         //
-        // A successful `git worktree remove` means git *had a registration for
-        // this path* — note it also exits 0 for a record whose directory
-        // something else already deleted, which is the case worth keeping. It
-        // is an ownership proxy, not proof that this call did the removing, and
-        // that is the property wanted here. The check stays after the `exists`
-        // check for the original reason: deleting the branch while the worktree
-        // is still checked out on it would leave a retry unable to recreate the
-        // worktree at all.
-        if removed_by_git {
-            let _ = tokio::process::Command::new("git")
-                .args(["branch", "-D", branch])
-                .current_dir(repo_path)
-                .output()
-                .await;
-        } else {
-            // Reported rather than silent: this leaves a branch behind, and
-            // nothing else collects it.
-            eprintln!(
-                "Note: worktree {worktree_path} was already absent and git had no registration \
-                 for it, so branch {branch} was left in place rather than force-deleted"
-            );
-        }
+        // This used to run `git branch -D` whenever a `git worktree remove`
+        // had exited 0. `-D` force-deletes regardless of merge state and
+        // leaves no branch reflog, so for the ordinary case -- a task whose
+        // agent committed its work on the task branch and pushed nothing --
+        // the branch was the only ref naming those commits, and deleting it
+        // left them reachable from nothing at all. `git fsck` can still find
+        // the objects until they are collected; the product cannot find them
+        // at any point, which is the part that matters. Both destructive
+        // paths reach here, so one drag onto Done or one context-menu delete
+        // was enough.
+        //
+        // Nothing about a removed checkout implies the branch is expendable.
+        // The rest of SlashIt agrees and always has: every caller keeps
+        // `branch_name` on the task explicitly "for PR creation", `create_pr`
+        // pushes exactly that branch, and a re-queued task reattaches to it
+        // with `git worktree add <path> <branch>`. Deleting it broke both,
+        // and left `branch_name` pointing at a ref that no longer existed.
+        //
+        // What remains is an uncollected local branch per finished task.
+        // That is the intended trade: a leaked ref is visible, inspectable
+        // and deletable by hand, and destroyed work is none of those.
 
         Ok(())
     }
@@ -794,11 +784,7 @@ mod tests {
         let absent = temp.path().join("worktree-that-does-not-exist");
 
         let result = mgr
-            .remove(
-                absent.to_str().unwrap(),
-                "task-abcdef12",
-                repo.path().to_str().unwrap(),
-            )
+            .remove(absent.to_str().unwrap(), repo.path().to_str().unwrap())
             .await;
 
         assert!(
@@ -837,7 +823,7 @@ mod tests {
         mgr.placement = WorktreePlacement::Auto;
         assert!(mgr.delegates_to_wt(), "this test must exercise the wt backend");
 
-        mgr.remove(&info.path, "task-abcd1234", &repo_path)
+        mgr.remove(&info.path, &repo_path)
             .await
             .expect("an already-absent worktree is a converged removal");
 
@@ -847,8 +833,9 @@ mod tests {
             "the stale registration must be pruned, or the branch can never be checked out again"
         );
         assert!(
-            !branch_exists(&repo_path, "task-abcd1234"),
-            "git owned the registration it removed, so the branch is collected too"
+            branch_exists(&repo_path, "task-abcd1234"),
+            "the two backends must not differ on data loss: `wt remove` never deletes a branch, \
+             and the git path it delegates to must not either"
         );
     }
 
@@ -1261,9 +1248,13 @@ branch refs/heads/some-other-branch
     }
 
     #[tokio::test]
-    async fn integration_remove_deletes_the_branch_it_actually_removed() {
-        // The ordinary path must be unchanged: a real removal still tidies up
-        // the branch the worktree was checked out on.
+    async fn integration_remove_leaves_the_work_in_the_worktree_reachable() {
+        // The invariant the whole contract exists for, stated the way a user
+        // would lose it: an agent produced a commit, that commit is on the
+        // task branch and on nothing else, and removing the checkout must not
+        // take it away. Asserted on refs rather than on `git show`, because
+        // the objects survive a `branch -D` for as long as it takes gc to run
+        // -- a commit no ref can name is already lost to the product.
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
@@ -1273,26 +1264,97 @@ branch refs/heads/some-other-branch
             .await
             .expect("create failed");
 
-        mgr.remove(&info.path, "task-removeme", repo_path)
+        let work = commit_work(&info.path, "agent-work.txt");
+        assert_eq!(
+            refs_reaching(repo_path, &work),
+            vec!["refs/heads/task-removeme".to_string()],
+            "precondition: the branch must be the only thing naming this commit, or the test \
+             could pass on some other ref holding it"
+        );
+
+        mgr.remove(&info.path, repo_path)
+            .await
+            .expect("removal of a live worktree should succeed");
+
+        assert!(!Path::new(&info.path).exists(), "worktree dir should be gone");
+        assert_eq!(
+            refs_reaching(repo_path, &work),
+            vec!["refs/heads/task-removeme".to_string()],
+            "removing the checkout must leave the commit reachable; an empty list here is the \
+             data loss this contract forbids"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_remove_keeps_the_branch_it_removed_the_worktree_for() {
+        // The branch survives a removal it *did* own, not just one it did
+        // not. This is the case that used to force-delete: `git worktree
+        // remove` exits 0, and that used to be read as permission to run
+        // `git branch -D`.
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+
+        let info = mgr
+            .create(repo_path, "task-removeme")
+            .await
+            .expect("create failed");
+        assert!(branch_exists(repo_path, "task-removeme"), "precondition");
+
+        mgr.remove(&info.path, repo_path)
             .await
             .expect("removal of a live worktree should succeed");
 
         assert!(!Path::new(&info.path).exists(), "worktree dir should be gone");
         assert!(
-            !branch_exists(repo_path, "task-removeme"),
-            "a confirmed removal should still delete the branch"
+            branch_exists(repo_path, "task-removeme"),
+            "removal takes the checkout only: the branch is what a later PR push and a later \
+             reattach both need"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_a_removed_worktree_can_be_reattached_from_its_branch() {
+        // What the retained branch is worth: `reattach` is the path a
+        // re-queued task takes, and with the branch gone its
+        // `git worktree add <path> <branch>` fails and the executor falls
+        // back to running the agent in the user's own repository.
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+
+        let info = mgr
+            .create(repo_path, "task-reattach")
+            .await
+            .expect("create failed");
+        let work = commit_work(&info.path, "agent-work.txt");
+
+        mgr.remove(&info.path, repo_path).await.expect("remove failed");
+
+        let again = mgr
+            .reattach(repo_path, "task-reattach")
+            .await
+            .expect("a removed worktree must be recreatable from the branch it left behind");
+
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&again.path).join("agent-work.txt")).ok(),
+            Some(WORK.to_string()),
+            "the reattached worktree must hold the work the first one produced"
+        );
+        assert!(
+            refs_reaching(repo_path, &work).contains(&"refs/heads/task-reattach".to_string()),
+            "and the commit must still be named by the branch it was reattached from"
         );
     }
 
     #[tokio::test]
     async fn integration_remove_keeps_the_branch_when_it_removed_nothing() {
-        // A retry sees exactly this: the path is already absent, so both
-        // `git worktree remove` invocations exit non-zero and nothing was
-        // removed by this call. Reporting `Ok` is right — the worktree is gone
-        // — but inferring from that that the branch is expendable is not.
-        // `git branch -D` force-deletes regardless of merge state and leaves
-        // no reflog, and branch names are deterministic from the task id, so
-        // the branch reachable here may belong to a later run.
+        // Convergence without collateral damage: a retry sees the path
+        // already absent, both `git worktree remove` invocations exit
+        // non-zero, and nothing was removed by this call. Reporting `Ok` is
+        // right — the worktree is gone — and the branch, which this call has
+        // no claim on whatsoever, must be exactly as it was. Kept as its own
+        // case because it is the one a ~30s retry pass actually re-enters.
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
@@ -1305,7 +1367,7 @@ branch refs/heads/some-other-branch
         assert!(branch_exists(repo_path, "task-keepme"), "precondition");
 
         let absent = tmp.path().join("never-existed");
-        mgr.remove(absent.to_str().unwrap(), "task-keepme", repo_path)
+        mgr.remove(absent.to_str().unwrap(), repo_path)
             .await
             .expect("an already-absent worktree is not a failure");
 
@@ -1313,6 +1375,62 @@ branch refs/heads/some-other-branch
             branch_exists(repo_path, "task-keepme"),
             "no git removal succeeded, so the branch must not be force-deleted"
         );
+    }
+
+    /// What a run of the fake agent leaves behind, so a test can recognise
+    /// its own work rather than trust that something was written.
+    const WORK: &str = "work produced in the worktree\n";
+
+    /// Write [`WORK`] into `worktree_path` and commit it, returning the sha.
+    ///
+    /// Mirrors what the executor does with whatever an agent produced: the
+    /// run's output becomes a real commit on the task's real branch, which is
+    /// what makes the branch the only thing naming it.
+    fn commit_work(worktree_path: &str, file: &str) -> String {
+        std::fs::write(Path::new(worktree_path).join(file), WORK).expect("write work");
+        run_git(worktree_path, &["add", "-A"]);
+        run_git(
+            worktree_path,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "agent work",
+            ],
+        );
+        run_git(worktree_path, &["rev-parse", "HEAD"])
+    }
+
+    /// Every ref in `repo_path` from which `commit` can still be reached.
+    ///
+    /// Empty means the commit is unreachable: still in the object database
+    /// until git collects it, but named by nothing, and so gone as far as
+    /// anything in SlashIt is concerned.
+    fn refs_reaching(repo_path: &str, commit: &str) -> Vec<String> {
+        run_git(
+            repo_path,
+            &["for-each-ref", "--contains", commit, "--format=%(refname)"],
+        )
+        .lines()
+        .map(str::to_string)
+        .collect()
+    }
+
+    fn run_git(dir: &str, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     fn branch_exists(repo_path: &str, branch: &str) -> bool {
@@ -1463,7 +1581,7 @@ branch refs/heads/some-other-branch
             .expect("create failed");
         assert!(Path::new(&info.path).exists());
 
-        let result = mgr.remove(&info.path, "managed-remove", repo_path).await;
+        let result = mgr.remove(&info.path, repo_path).await;
         assert!(
             result.is_ok(),
             "remove should use the git-managed path, not remove_with_wt: {:?}",
@@ -1492,23 +1610,16 @@ branch refs/heads/some-other-branch
         // `.current_dir` on every git invocation, so this no longer needs to
         // mutate the process-wide CWD (which was also unsound under
         // parallel test execution).
-        let result = mgr.remove(&info.path, "remove-me", repo_path).await;
+        let result = mgr.remove(&info.path, repo_path).await;
         assert!(result.is_ok(), "remove should succeed: {:?}", result.err());
         assert!(
             !Path::new(&info.path).exists(),
             "worktree directory should be removed"
         );
 
-        // Verify the branch was also deleted
-        let branch_check = std::process::Command::new("git")
-            .args(["branch", "--list", "remove-me"])
-            .current_dir(repo_path)
-            .output()
-            .expect("git branch list failed");
-        let branches = String::from_utf8_lossy(&branch_check.stdout);
         assert!(
-            !branches.contains("remove-me"),
-            "branch should be deleted after remove"
+            branch_exists(repo_path, "remove-me"),
+            "the branch is not the worktree and is not removed with it"
         );
     }
 
@@ -1541,7 +1652,7 @@ branch refs/heads/some-other-branch
             .await
             .expect("create failed");
 
-        let result = mgr.remove(&info.path, "cwd-independent", &target_repo_path).await;
+        let result = mgr.remove(&info.path, &target_repo_path).await;
 
         assert!(result.is_ok(), "remove should succeed: {:?}", result.err());
         assert!(
@@ -1549,25 +1660,20 @@ branch refs/heads/some-other-branch
             "worktree directory should be removed from the target repo"
         );
 
-        let branch_check = std::process::Command::new("git")
-            .args(["branch", "--list", "cwd-independent"])
-            .current_dir(&target_repo_path)
-            .output()
-            .expect("git branch list failed");
+        // The observable proof that git ran against `target_repo_path` and
+        // not the ambient CWD is the registration, since the branch is no
+        // longer touched by a removal at all.
+        let listing = WorktreeManager::worktree_list_porcelain(&target_repo_path)
+            .expect("git should have answered for the target repo");
         assert!(
-            !String::from_utf8_lossy(&branch_check.stdout).contains("cwd-independent"),
-            "branch should be deleted from the target repo"
+            !listing.contains(&info.path),
+            "the registration should be gone from the target repo"
         );
 
         // The unrelated repo must never have been touched by any of this.
-        let unrelated_branch_check = std::process::Command::new("git")
-            .args(["branch", "--list", "cwd-independent"])
-            .current_dir(unrelated_repo.path())
-            .output()
-            .expect("git branch list failed");
         assert!(
-            String::from_utf8_lossy(&unrelated_branch_check.stdout).trim().is_empty(),
-            "the unrelated repo must never see a branch created/removed in the target repo"
+            !branch_exists(unrelated_repo.path().to_str().unwrap(), "cwd-independent"),
+            "the unrelated repo must never see a branch created in the target repo"
         );
     }
 
@@ -1606,7 +1712,7 @@ branch refs/heads/some-other-branch
         // fallback (normal remove, --force, prune) can fully delete it.
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let result = mgr.remove(&info.path, "undeletable", repo_path).await;
+        let result = mgr.remove(&info.path, repo_path).await;
 
         // Restore permissions so the temp dir can be cleaned up on drop.
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1626,7 +1732,7 @@ branch refs/heads/some-other-branch
     async fn integration_remove_nonexistent_does_not_panic() {
         let mgr = test_manager();
         // Removing a non-existent worktree should not panic (may return Err, that is fine).
-        let _ = mgr.remove("/tmp/slashit_no_such_wt", "no-branch", "/tmp").await;
+        let _ = mgr.remove("/tmp/slashit_no_such_wt", "/tmp").await;
     }
 
     #[tokio::test]
