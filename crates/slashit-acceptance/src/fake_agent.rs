@@ -804,10 +804,25 @@ mod tests {
                 .expect("create the release directory");
             let mut run = blocking_run(&agent, &releases, "ready");
 
+            // Nothing here pauses: the promptness is the experiment. What the
+            // spin does need is a way to lose. If the fixture died before it
+            // announced itself, or is still alive and never will, say which
+            // instead of turning at full speed until CI gives up and reports a
+            // timeout in place of a cause. Neither bound takes any part in the
+            // protocol -- reaching one is a test failure, never a release.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let pid = loop {
                 if let [pid] = agent.blocked_pids().expect("read the pid records")[..] {
                     break pid;
                 }
+                assert!(
+                    run.try_wait().expect("poll the run").is_none(),
+                    "attempt {attempt}: the run ended before it announced itself"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "attempt {attempt}: the run never announced itself"
+                );
             };
 
             assert_eq!(
