@@ -1,0 +1,13 @@
+#!/bin/sh
+pad=xxxxxxxxxxxxxxxx
+pad=$pad$pad$pad$pad
+pad=$pad$pad$pad$pad
+pad=$pad$pad$pad$pad
+printf '{"type":"system","subtype":"init","session_id":"s-chatty","model":"fixture-model"}\n'
+i=0
+while [ $i -lt 512 ]; do
+    printf '{"type":"content_block_delta","delta":{"type":"text_delta","text":"%s"}}\n' "$pad"
+    i=$((i + 1))
+done
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-chatty","result":"done"}\n'
+exit 0
