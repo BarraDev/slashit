@@ -57,6 +57,23 @@ pub const FAILING_RUNS_VAR: &str = "SLASHIT_FAKE_AGENT_FAILING_RUNS";
 /// API and know the failure it sees is the one this executable reported.
 pub const REPORTED_FAILURE: &str = "fake agent was scripted to fail this run";
 
+/// The variable that holds an agent run open instead of letting it finish.
+///
+/// Its value is the path of a FIFO [`FakeAgent::block_agent_runs`] created.
+/// Unset — which is every journey that does not ask for it — the fixture
+/// behaves exactly as it did before this existed, and neither the pipe nor the
+/// bookkeeping directory below is created.
+///
+/// A run that blocks first announces its own process id, then waits on the
+/// pipe. Waiting on a pipe rather than sleeping is what makes a cancellation
+/// journey deterministic: the run ends because the product terminated it or
+/// because the test released it, never because an interval happened to elapse.
+///
+/// Only *agent runs* block. `claude --version` is the product asking what is
+/// installed, and a probe that hung would stall the frontend rather than the
+/// execution the journey is about.
+pub const BLOCK_FIFO_VAR: &str = "SLASHIT_FAKE_AGENT_BLOCK_FIFO";
+
 /// The smallest exchange `ClaudeRunner` accepts as a successful run: a
 /// `system` line that names the session and model, a `result` line with
 /// `is_error: false`, and exit status zero.
@@ -110,6 +127,23 @@ for arg in "$@"; do
 done
 
 printf '{"type":"system","subtype":"init","session_id":"%s","model":"__MODEL__"}\n' "$session"
+
+# Blocking mode, when a journey asked for it. Announce this process before
+# waiting on the pipe, so the test can name the exact process it is about to
+# ask the product to stop instead of inferring one. Staged and renamed for the
+# same reason the invocation record is: a reader must never see a half-written
+# pid. `$$` is this process, because the product exec'd this script directly.
+if [ -n "$SLASHIT_FAKE_AGENT_BLOCK_FIFO" ] && [ -n "$is_run" ]; then
+    processes="$SLASHIT_FAKE_AGENT_MARKERS/.processes"
+    mkdir -p "$processes/.staging"
+    pidfile=$(mktemp "$processes/.staging/XXXXXX")
+    printf '%s\n' "$$" > "$pidfile"
+    mv "$pidfile" "$processes/${pidfile##*/}"
+
+    # Blocks in the kernel until a writer opens the pipe. A failed read is a
+    # released or closed pipe, not a reason to abandon the run.
+    read -r _release < "$SLASHIT_FAKE_AGENT_BLOCK_FIFO" || true
+fi
 
 # Absent means nothing is scripted to fail, so a journey that does not set this
 # sees exactly the behaviour it saw before this existed -- not even the
@@ -271,6 +305,139 @@ impl FakeAgent {
     /// How many times the fixture has run.
     pub fn invocation_count(&self) -> Result<usize> {
         Ok(self.invocations()?.len())
+    }
+
+    /// Hold every agent run open: announce its process id, then wait.
+    ///
+    /// Returns the value for [`BLOCK_FIFO_VAR`], which the caller sets on the
+    /// application's environment. The pipe is created here rather than by the
+    /// fixture so that it exists before the application does — a run that had
+    /// to create it could race a test already trying to release it.
+    pub fn block_agent_runs(&self) -> Result<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let pipe = self.release_pipe();
+        let path = std::ffi::CString::new(pipe.as_os_str().as_bytes())
+            .with_context(|| format!("{} is not a usable path", pipe.display()))?;
+
+        // SAFETY: the pointer is to a NUL-terminated path this process keeps
+        // alive across the call, which is all `mkfifo` asks of its caller.
+        if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("could not create the release pipe {}", pipe.display()));
+        }
+        Ok(pipe)
+    }
+
+    /// The process ids of runs that announced themselves and then blocked.
+    ///
+    /// Empty unless a journey asked for [`BLOCK_FIFO_VAR`]. The names are
+    /// `mktemp` names — unique but not monotonic — so a caller telling one run
+    /// from another must compare sets, never positions.
+    pub fn blocked_pids(&self) -> Result<Vec<u32>> {
+        let dir = self.process_dir();
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut pids = Vec::new();
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("could not read {}", dir.display()))?
+            .flatten()
+        {
+            let path = entry.path();
+            // The staging subdirectory a half-written record lives in.
+            if !path.is_file() {
+                continue;
+            }
+            let recorded = std::fs::read_to_string(&path)
+                .with_context(|| format!("could not read the pid record {}", path.display()))?;
+            let pid = recorded.trim().parse::<u32>().with_context(|| {
+                format!(
+                    "the pid record {} does not hold a process id: {recorded:?}",
+                    path.display()
+                )
+            })?;
+            pids.push(pid);
+        }
+        pids.sort_unstable();
+        Ok(pids)
+    }
+
+    /// Whether `pid` is still a running process of this fixture.
+    ///
+    /// Two things a bare `kill(pid, 0)` gets wrong here, and both of them would
+    /// report a terminated agent as alive: a process that has exited but has
+    /// not been reaped is still a process, and a process id the system has
+    /// since handed to something else is still a process. So the state and the
+    /// command line are read from `/proc`, and only a live process whose
+    /// command line names this fixture counts as this fixture running.
+    pub fn is_running(&self, pid: u32) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false; // exited and reaped, or never existed
+        };
+        // The command field is parenthesised and may itself contain spaces and
+        // parentheses, so the state is the first field after the last `)`.
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next());
+        if state == Some("Z") {
+            return false; // exited, still waiting to be reaped
+        }
+
+        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        cmdline
+            .split(|byte| *byte == 0)
+            .any(|argument| Path::new(OsStr::from_bytes(argument)) == self.executable)
+    }
+
+    /// Let every currently blocked run finish.
+    ///
+    /// The pipe is opened non-blocking on purpose. With no reader the open
+    /// fails immediately with `ENXIO`, so releasing runs the product has
+    /// already terminated is a no-op — rather than a test that hangs forever
+    /// holding open a pipe nobody will ever read.
+    pub fn release_blocked_runs(&self) -> Result<usize> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let pipe = self.release_pipe();
+        let mut released = 0;
+        // At most one release per run that ever blocked: a bound the fixture's
+        // own records supply, rather than a guessed number of attempts.
+        for _ in 0..self.blocked_pids()?.len() {
+            let Ok(mut writer) = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&pipe)
+            else {
+                break; // nothing is waiting on it
+            };
+            writer
+                .write_all(b"release\n")
+                .with_context(|| format!("could not release a run through {}", pipe.display()))?;
+            released += 1;
+        }
+        Ok(released)
+    }
+
+    /// The pipe a blocked run waits on.
+    ///
+    /// Inside the marker directory, so the harness's existing cleanup removes
+    /// it, and hidden from [`invocations`](Self::invocations) by the same
+    /// `is_file` filter that hides the staging directory: a FIFO is not a
+    /// regular file.
+    fn release_pipe(&self) -> PathBuf {
+        self.marker_dir.join(".release")
+    }
+
+    /// Where a blocking run announces its process id.
+    fn process_dir(&self) -> PathBuf {
+        self.marker_dir.join(".processes")
     }
 }
 
@@ -486,6 +653,134 @@ mod tests {
         // The bookkeeping the fixture keeps for itself is not a record: it is a
         // directory, and the records are files.
         assert_eq!(agent.invocation_count().expect("count"), 3);
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// Wait for `condition`, or give up and say what was still true.
+    fn until(condition: impl Fn() -> bool, complaint: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "{complaint}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Blocking mode is what a cancellation journey stands on, so it has to
+    /// hold up on its own: the run must still be there to be stopped, it must
+    /// have named the process that a test can then watch, and that process must
+    /// be the one the caller started rather than some descendant of it.
+    #[test]
+    fn a_blocking_run_announces_its_own_process_and_waits_to_be_released() {
+        let root = scratch("blocking");
+        let agent = FakeAgent::install(&root).expect("install");
+        let pipe = agent.block_agent_runs().expect("create the release pipe");
+
+        let mut child = std::process::Command::new(agent.executable())
+            .args(["-p", "do the work", "--session-id", "blocked"])
+            .env(MARKER_DIR_VAR, agent.marker_dir())
+            .env(BLOCK_FIFO_VAR, &pipe)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the fixture");
+
+        until(
+            || agent.blocked_pids().expect("read the pid records").len() == 1,
+            "the run never announced itself as blocked",
+        );
+
+        // The announced process is the one the caller started, not a child of
+        // it. Everything a journey concludes about termination depends on this
+        // being the process the product itself holds.
+        let pids = agent.blocked_pids().expect("read the pid records");
+        assert_eq!(pids, vec![child.id()]);
+        let pid = pids[0];
+        assert!(agent.is_running(pid), "the announced process must be alive");
+
+        // Still there to be stopped: blocking is the whole point.
+        assert!(
+            child.try_wait().expect("poll the child").is_none(),
+            "the run finished instead of blocking"
+        );
+
+        assert_eq!(
+            agent.release_blocked_runs().expect("release"),
+            1,
+            "one blocked run should take one release"
+        );
+        let status = child.wait().expect("wait for the released run");
+        assert!(status.success(), "a released run still exits zero");
+        assert!(
+            !agent.is_running(pid),
+            "the process must be gone once it has exited and been reaped"
+        );
+
+        // And it recorded itself the way every other run does.
+        assert_eq!(agent.invocation_count().expect("count"), 1);
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The product asks what is installed through the same executable. A probe
+    /// that blocked would stall the frontend rather than the execution a
+    /// cancellation journey is about, and would leave a pid record that the
+    /// journey would then have to tell apart from a real run.
+    #[test]
+    fn a_version_probe_does_not_block_when_agent_runs_do() {
+        let root = scratch("blocking-probe");
+        let agent = FakeAgent::install(&root).expect("install");
+        let pipe = agent.block_agent_runs().expect("create the release pipe");
+
+        let probe = std::process::Command::new(agent.executable())
+            .arg("--version")
+            .env(MARKER_DIR_VAR, agent.marker_dir())
+            .env(BLOCK_FIFO_VAR, &pipe)
+            .output()
+            .expect("run the probe");
+
+        assert!(probe.status.success());
+        assert!(
+            agent
+                .blocked_pids()
+                .expect("read the pid records")
+                .is_empty(),
+            "a probe must not announce itself as a blocked run"
+        );
+        assert_eq!(
+            agent.release_blocked_runs().expect("release"),
+            0,
+            "there was nothing to release"
+        );
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// Nothing blocks unless a journey asks for it, so the journeys that
+    /// existed before this did are unaffected by it.
+    #[test]
+    fn a_run_without_the_pipe_finishes_as_it_always_did() {
+        let root = scratch("blocking-absent");
+        let agent = FakeAgent::install(&root).expect("install");
+
+        let run = std::process::Command::new(agent.executable())
+            .args(["-p", "do the work", "--session-id", "free"])
+            .env(MARKER_DIR_VAR, agent.marker_dir())
+            .output()
+            .expect("run the fixture");
+
+        assert!(run.status.success());
+        assert!(
+            agent
+                .blocked_pids()
+                .expect("read the pid records")
+                .is_empty(),
+            "no pid record should exist when nothing was asked to block"
+        );
+        let stdout = String::from_utf8(run.stdout).expect("the fixture emits UTF-8");
+        assert!(
+            stdout.contains(REPORTED_RESULT),
+            "the run should have completed normally: {stdout}"
+        );
 
         std::fs::remove_dir_all(&root).expect("clean up");
     }
