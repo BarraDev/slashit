@@ -77,15 +77,19 @@ use slashit_ui_lib::AppState;
 /// How long a call is given to come back before the test concludes it has
 /// chosen to *wait* rather than answer.
 ///
-/// This is not a synchronisation device and the failing path never reaches it:
-/// on today's code every call under test returns in microseconds, and the
-/// interleaving itself is established entirely by the FIFO handshake. It exists
-/// only so that a future implementation which holds a competing transition open
-/// until cleanup finishes -- an explicitly permitted design -- is scored as
-/// "did not publish a successor state" instead of hanging this test forever.
-/// Erring long is deliberate: the only thing a too-generous bound can cause is
-/// a slow pass for a correct implementation, never a pass for a broken one.
-const DESIGN_MAY_WAIT: Duration = Duration::from_secs(60);
+/// This is not a synchronisation device, and the failure it guards against
+/// never reaches it: a defective implementation publishes its successor state
+/// synchronously, in microseconds, so a bound of any size catches it. What the
+/// bound is for is the implemented design, which holds a competing transition
+/// behind the task's lifecycle lease until the parked cleanup settles -- an
+/// outcome this file explicitly permits and scores as "did not publish a
+/// successor state".
+///
+/// Short rather than generous, because both are equally sound here and the
+/// difference is entirely how long a *passing* run takes: nothing that is going
+/// to answer without the barrier being released needs longer than this, and
+/// anything that does answer is answering from the lease being free.
+const DESIGN_MAY_WAIT: Duration = Duration::from_secs(5);
 
 /// A bound on the one call this file requires to come back *unblocked*.
 ///
@@ -150,6 +154,11 @@ fn install_test_environment() -> TestEnvironment {
 # destructive boundary `git worktree remove [--force] <target>` for a target
 # one of this binary's tests has armed a FIFO directory for; that invocation
 # announces itself, waits to be released, and only then does what it was asked.
+#
+# The `--force` arm is kept although production no longer has a forced
+# removal, and that is what makes it useful: it announces itself as 'force',
+# so a forced removal reintroduced anywhere under the armed path shows up as
+# an unexpected crossing in the assertions below rather than passing unseen.
 REAL_GIT='{real_git}'
 BARRIER_ROOT='{barrier_root}'
 
@@ -665,14 +674,24 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
             .cloned()
             .expect("the task must still exist");
 
-        // (4c) And what a successor execution would attach to. `reattach` is
-        //      what `spawn_task_execution` calls for a task that already has a
-        //      branch; adopting a registered checkout, as here, only reads.
-        let successor_checkout = state
-            .worktree_manager
-            .reattach(&fixture.repo_path, &fixture.branch)
-            .await
-            .map(|info| info.path);
+        // (4c) And what a successor execution would be given. This goes
+        //      through `create_worktree`, the command every successor
+        //      acquisition reaches -- not `WorktreeManager::reattach`
+        //      underneath it. The distinction is the property: the manager is
+        //      handed a branch and knows nothing about tasks, so it can only
+        //      ever answer "git has this registered"; whether *this task* may
+        //      be given that checkout right now is a lifecycle question, and
+        //      asking it anywhere else would test a layer that cannot know the
+        //      answer.
+        let successor_checkout = tokio::time::timeout(
+            DESIGN_MAY_WAIT,
+            slashit_ui_lib::commands::worktree::create_worktree(
+                app.state(),
+                fixture.task_id.to_string(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| Err("still waiting for the cleanup to settle".to_string()));
 
         // (5) Let the removal finish before anything is asserted, so a failing
         //     run cannot leave a git process parked while the harness unwinds.
@@ -723,7 +742,7 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
         if successor_checkout.as_deref() == Ok(fixture.worktree_path.as_str()) {
             violations.push(format!(
                 "a successor execution acquired the very checkout the parked cleanup was \
-                 about to delete: reattach resolved to {successor:?}",
+                 about to delete: the worktree command resolved to {successor:?}",
                 successor = successor_checkout,
             ));
         }
@@ -794,12 +813,15 @@ fn a_terminal_transition_whose_cleanup_did_not_happen_is_not_reported_as_done() 
         tokio::pin!(terminal);
         let mut terminal_outcome: Option<Result<Option<Task>, String>> = None;
 
-        // `remove_with_git` tries the ordinary removal and then the `--force`
-        // fallback, so the boundary is crossed twice. Waiting for both is what
-        // makes "the cleanup is over and it removed nothing" a fact rather than
-        // a guess: after the second crossing there is no git left to run.
+        // `remove_with_git` makes exactly one attempt: the ordinary removal,
+        // never a forced one. Waiting for that single crossing is what makes
+        // "the cleanup is over and it removed nothing" a fact rather than a
+        // guess -- after it there is no git left to run. The count is itself an
+        // assertion: the shim announces a forced removal as `force`, so a
+        // destructive fallback reintroduced here would produce a second
+        // crossing this loop never collects and the equality below never sees.
         let mut crossings: Vec<(String, String)> = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..1 {
             let arrival_fut = read_announcement(&mut barrier.arrived);
             tokio::pin!(arrival_fut);
             let arrival = loop {
@@ -820,11 +842,8 @@ fn a_terminal_transition_whose_cleanup_did_not_happen_is_not_reported_as_done() 
         }
         assert_eq!(
             crossings,
-            vec![
-                ("plain".to_string(), "111".to_string()),
-                ("force".to_string(), "111".to_string()),
-            ],
-            "both removal attempts must have been refused for this test to mean anything"
+            vec![("plain".to_string(), "111".to_string())],
+            "the one removal attempt must have been refused for this test to mean anything"
         );
 
         if terminal_outcome.is_none() {
@@ -889,5 +908,216 @@ fn a_terminal_transition_whose_cleanup_did_not_happen_is_not_reported_as_done() 
             joined = violations.join("\n - "),
             path = fixture.worktree_path,
         );
+    });
+}
+
+/// A card dragged onto `Done` lands at the position it was dropped at, computed
+/// against the board as it is when the move is committed rather than as it was
+/// before the cleanup ran.
+///
+/// The two halves of a terminal drag are separated by a subprocess. Positions
+/// worked out before it describe a column that may have changed by the time the
+/// removal finishes -- another card dropped into `Done` meanwhile is the
+/// ordinary way -- and committing them would publish the card at a position
+/// that was right a moment ago and renumber its new neighbours from a stale
+/// reading. So this asserts the whole `Done` column, not just the moved card:
+/// a correct implementation leaves it gapless and in the order the user sees.
+#[test]
+fn a_terminal_drag_commits_column_positions_computed_after_its_cleanup() {
+    LazyLock::force(&ENVIRONMENT);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let (fixture, state) = rt.block_on(build_fixture("reorder"));
+    let app = tauri::test::mock_app();
+    app.manage(state);
+
+    rt.block_on(async {
+        let state: &AppState = app.state::<AppState>().inner();
+        let project_id = state
+            .task
+            .tasks
+            .read()
+            .await
+            .get(&fixture.task_id)
+            .expect("the fixture task")
+            .project_id;
+
+        // Two cards already finished, so the destination column is not empty
+        // and an off-by-one is visible rather than absorbed.
+        let mut settled = Vec::new();
+        for (index, name) in ["already done A", "already done B"].iter().enumerate() {
+            let mut task =
+                create_test_task_full(name, project_id, TaskStatus::Done, index as i32);
+            task.phase = TaskPhase::Complete;
+            settled.push(task.id);
+            state.task.tasks.write().await.insert(task.id, task);
+        }
+
+        // Dropped between them. The cleanup is real and succeeds -- the
+        // fixture's checkout is clean -- so this is the ordinary terminal drag,
+        // with a `git worktree remove` between the drop and the commit.
+        let moved = slashit_ui_lib::commands::task::reorder_task(
+            app.state(),
+            fixture.task_id.to_string(),
+            Some(TaskStatus::Done),
+            1,
+        )
+        .await
+        .expect("a clean checkout must be removable")
+        .expect("the task must still exist");
+
+        assert_eq!(moved.status, TaskStatus::Done);
+        assert_eq!(moved.worktree_path, None, "the terminal move cleaned up first");
+        assert_eq!(moved.position, 1, "the card lands where it was dropped");
+        assert!(
+            !Path::new(&fixture.worktree_path).exists(),
+            "and the checkout it was finished with is gone"
+        );
+
+        let tasks = state.task.tasks.read().await;
+        let mut column: Vec<(i32, String)> = tasks
+            .values()
+            .filter(|t| t.project_id == project_id && t.status == TaskStatus::Done)
+            .map(|t| (t.position, t.title.clone()))
+            .collect();
+        column.sort();
+        assert_eq!(
+            column,
+            vec![
+                (0, "already done A".to_string()),
+                (1, "reorder".to_string()),
+                (2, "already done B".to_string()),
+            ],
+            "the whole column must be gapless and in the order the drop implies"
+        );
+
+        // The same column on disk, because that is the one a restart reads.
+        let persisted = state
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable");
+        let mut persisted_column: Vec<(i32, String)> = persisted
+            .iter()
+            .filter(|t| t.status == TaskStatus::Done)
+            .map(|t| (t.position, t.title.clone()))
+            .collect();
+        persisted_column.sort();
+        assert_eq!(persisted_column, column, "memory and disk must agree");
+
+        drop(tasks);
+        assert_eq!(settled.len(), 2);
+    });
+}
+
+/// A drag classified before the lease was held is a drag classified against the
+/// past, and `Done` reached the board without any cleanup because of it.
+///
+/// The window is real and narrow. `reorder_task` used to read the task's status
+/// first and decide from that reading whether the move was terminal, then wait
+/// for the task's lifecycle lease. Whatever held that lease could finish and
+/// leave the task in a different column, and the decision was never revisited:
+/// a move that looked like an ordinary reposition within `Done` became a move
+/// *into* `Done`, took the ordinary path, and assigned the status itself. The
+/// worktree was never touched and the board said the task was finished with it.
+///
+/// This drives that exact interleaving through the real command. The lease is
+/// held by this test, standing in for any lifecycle operation; the status
+/// changes underneath while the drag waits for it. It does not assert which
+/// answer the command gives -- refusing the move is as good as performing it --
+/// only that a committed `Done` is a `Done` whose cleanup actually happened.
+#[test]
+fn a_drag_that_waited_for_the_lease_is_classified_against_the_task_it_finds() {
+    LazyLock::force(&ENVIRONMENT);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let (fixture, state) = rt.block_on(build_fixture("late-classification"));
+    let app = tauri::test::mock_app();
+    app.manage(state);
+
+    rt.block_on(async {
+        let state: &AppState = app.state::<AppState>().inner();
+
+        // The precondition the defect needs: a task already in `Done` that
+        // still holds a checkout. Reachable in production from a record written
+        // by an older build, and from attaching a worktree to a finished task.
+        {
+            let mut tasks = state.task.tasks.write().await;
+            let task = tasks.get_mut(&fixture.task_id).expect("the fixture task");
+            task.status = TaskStatus::Done;
+        }
+
+        let lease = state
+            .task_lifecycle_locks
+            .acquire(fixture.task_id)
+            .await
+            .expect("the lease must be free at the start");
+
+        // Dropped onto `Done`, from `Done`. Whatever the command samples now is
+        // what it must not still be acting on after it has waited.
+        let drag = slashit_ui_lib::commands::task::reorder_task(
+            app.state(),
+            fixture.task_id.to_string(),
+            Some(TaskStatus::Done),
+            0,
+        );
+        tokio::pin!(drag);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut drag)
+                .await
+                .is_err(),
+            "the drag must be waiting for the lease this test is holding"
+        );
+
+        // The task leaves `Done` while the drag waits, which is what makes the
+        // drag's own reading stale.
+        {
+            let mut tasks = state.task.tasks.write().await;
+            let task = tasks.get_mut(&fixture.task_id).expect("the fixture task");
+            task.status = TaskStatus::InProgress;
+            task.phase = TaskPhase::Coding;
+        }
+        drop(lease);
+
+        let outcome = tokio::time::timeout(DESIGN_MAY_WAIT, &mut drag)
+            .await
+            .expect("the drag must finish once the lease is free");
+
+        let authoritative = state
+            .task
+            .tasks
+            .read()
+            .await
+            .get(&fixture.task_id)
+            .cloned()
+            .expect("the task must still exist");
+
+        if authoritative.status == TaskStatus::Done {
+            assert_eq!(
+                authoritative.worktree_path, None,
+                "the board says this task is finished with its worktree while still \
+                 recording one; the move was classified before the lease was held, so it \
+                 wrote `Done` itself instead of going through terminalization. It answered \
+                 {outcome:?}"
+            );
+            assert!(
+                !Path::new(&fixture.worktree_path).exists(),
+                "`Done` was committed but the checkout at {} is still on disk, so no \
+                 cleanup ran",
+                fixture.worktree_path
+            );
+        } else {
+            // Refusing or declining to move is a perfectly good answer; the
+            // checkout must simply still be intact.
+            assert!(
+                Path::new(&fixture.worktree_path).exists(),
+                "the move did not reach `Done`, so nothing may have removed the checkout"
+            );
+        }
     });
 }

@@ -8,6 +8,27 @@ pub async fn create_worktree(
 ) -> Result<String, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
+    // Acquiring a worktree for a task is a lifecycle ownership change, so it
+    // waits behind any cleanup, terminalization or delete already running for
+    // the same task. Without this, a create could hand back the very directory
+    // a removal is midway through deleting.
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+
+    // A cleanup that a previous process never finished leaves the recorded
+    // checkout untrustworthy: nothing on disk says how much of it a dead
+    // `git worktree remove` already took apart. Reattaching to it would hand an
+    // agent a half-removed directory. See `Task::cleanup_in_flight`.
+    {
+        let tasks = state.task.tasks.read().await;
+        let task = tasks.get(&task_id).ok_or("Task not found")?;
+        if task.cleanup_in_flight {
+            return Err(format!(
+                "task {task_id} has a worktree cleanup that was interrupted and not yet \
+                 resolved; it needs attention before a worktree can be attached again"
+            ));
+        }
+    }
+
     // Resolve repo path
     let repo_path = {
         let tasks = state.task.tasks.read().await;
@@ -60,6 +81,18 @@ pub async fn create_worktree(
     Ok(info.path)
 }
 
+/// Remove a task's worktree at the user's explicit request, without saying
+/// anything about whether the task is finished.
+///
+/// Shares [`crate::lifecycle::terminalize_leased`] with the terminal path, so
+/// the destructive step, its durable interrupted-cleanup record and its
+/// persist-before-publish clearing are the same code. `desired` is the task's
+/// current status precisely because this is not a terminal transition: a user
+/// discarding a checkout has not said the work is over.
+///
+/// A refusal reaches the dialog with git's own reason, and the worktree, the
+/// branch and everything uncommitted inside survive. The user can press the
+/// button again once they have dealt with whatever git objected to.
 #[tauri::command]
 pub async fn cleanup_worktree(
     state: tauri::State<'_, crate::AppState>,
@@ -67,53 +100,26 @@ pub async fn cleanup_worktree(
 ) -> Result<(), String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
-    let (wt_path, project_id) = {
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+
+    let current_status = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_id).ok_or("Task not found")?;
-        (
-            task.worktree_path.clone().ok_or("No worktree for this task")?,
-            task.project_id,
-        )
+        if task.worktree_path.is_none() {
+            return Err("No worktree for this task".to_string());
+        }
+        task.status.clone()
     };
 
-    let repo_path = {
-        let projects = state.project.projects.read().await;
-        let project = projects.get(&project_id).ok_or("Project not found")?;
-        let repo_id = project.repository_id.ok_or("No repository linked")?;
-        drop(projects);
-
-        let repos = state.repository.repositories.read().await;
-        let repo = repos.get(&repo_id).ok_or("Repository not found")?;
-        repo.local_path.clone()
-    };
-
-    state.worktree_manager.remove(&wt_path, &repo_path).await?;
-
-    // The clear has to reach disk before it reaches shared memory, and the
-    // failure has to reach the caller. Clearing `worktree_path` in memory is
-    // what removes a task from `tasks_eligible_for_cleanup_retry`, which
-    // selects on the in-memory value, so a clear published over a failed write
-    // takes the task out of the only pass that would have reconciled it. This
-    // command is also not restricted to `Done` tasks, which that pass filters
-    // on, so returning the error to the dialog is the whole recovery story
-    // here: the user can press the button again.
-    //
-    // `branch_name` stays for a later PR creation, and now names a branch
-    // that is still there to push: removal takes the checkout only. The
-    // helper also
-    // declines to clear a path the task no longer records, so a re-run that
-    // recreated a worktree while this removal was in flight keeps its
-    // reference instead of having it erased by a cleanup that never touched
-    // it.
-    crate::commands::task::clear_worktree_path_durably(
-        &state.task.tasks,
-        &state.storage,
+    crate::lifecycle::terminalize_leased(
+        crate::commands::task::terminalize_ctx(&state),
         task_id,
-        &wt_path,
+        crate::lifecycle::Origin::User,
+        crate::lifecycle::TerminalizeRequest::new(current_status),
     )
-    .await?;
-
-    Ok(())
+    .await
+    .map(|_| ())
+    .map_err(|refusal| refusal.to_string())
 }
 
 #[tauri::command]

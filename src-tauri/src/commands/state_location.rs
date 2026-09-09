@@ -235,7 +235,7 @@ fn record_migrated_location(
 /// Bundles the resource handles [`apply_state_migration_committed`] and
 /// [`set_state_location_committed`] need, so passing them through stays under
 /// clippy's argument-count lint without smuggling anything through global
-/// state — mirrors `WorktreeCleanupCtx` in `commands::task`.
+/// state — the same shape [`crate::lifecycle::TerminalizeCtx`] uses.
 struct StateLocationCtx<'a> {
     locks: &'a StateLocationLocks,
     projects: &'a RwLock<HashMap<Uuid, Project>>,

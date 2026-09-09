@@ -113,6 +113,23 @@ pub struct IpcContext {
     /// The resolved application directories. The credentials file lives here,
     /// which is where the TCP bearer token is minted and read.
     pub paths: Arc<crate::config::paths::AppPaths>,
+
+    /// The handles a lifecycle transition needs.
+    ///
+    /// `slashit move <task> done` is the same terminal claim as dragging the
+    /// card, so it goes through the same
+    /// [`crate::lifecycle::terminalize`] and needs the same things it does:
+    /// somewhere to resolve the repository from, something to remove the
+    /// worktree with, and the lease that serializes it against the desktop app
+    /// and the queue. Before this, the move handler had none of them and
+    /// simply assigned the status, which is how a task could reach `Done` over
+    /// IPC with its worktree untouched.
+    pub repositories: Arc<RwLock<HashMap<Uuid, crate::domain::Repository>>>,
+    pub worktree_manager: Arc<crate::worktree::WorktreeManager>,
+    pub task_lifecycle_locks: Arc<crate::lifecycle::TaskLifecycleLocks>,
+    /// The live queue, when this process runs one, so a terminalization can
+    /// tell whether an agent currently owns the task.
+    pub executor: Arc<tokio::sync::OnceCell<Arc<crate::queue::TaskExecutor>>>,
 }
 
 /// The current process's effective user id.
