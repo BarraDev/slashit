@@ -973,6 +973,94 @@ mod tests {
     /// lifecycle status is left exactly where it was: this reconciliation
     /// learned that a directory is gone, which says nothing about whether the
     /// work is finished, so inventing `Done` here would be inventing a fact.
+    /// A quarantine whose own persistence fails still leaves the durable state
+    /// safe, which is the property that matters and the one that is easy to
+    /// state wrongly.
+    ///
+    /// Startup reconciliation deliberately keeps its result in memory when a
+    /// project's save fails -- see `StartupReport::unsaved_migrated_projects`,
+    /// which predates this quarantine and exists so no caller can claim
+    /// durability that did not happen. The question that leaves open is whether
+    /// the *new* reconciliation can publish something the file contradicts in a
+    /// direction that is unsafe. It cannot, and this pins why: the load-bearing
+    /// field is `cleanup_in_flight`, the quarantine never clears it, and a
+    /// failed save therefore leaves the file holding the more cautious value,
+    /// not the less. What is lost is the human-readable reason, which the next
+    /// start re-derives from the same filesystem and git state and reaches the
+    /// same answer from -- so nothing is lost, only possibly redone.
+    #[tokio::test]
+    async fn a_quarantine_that_cannot_be_persisted_leaves_the_file_no_less_cautious() {
+        let tmp = TempDir::new().unwrap();
+        let (paths, task_id, wt_path) = interrupted_cleanup_fixture(&tmp, true).await;
+
+        // Let the load succeed and make only the save fail, the same way
+        // `a_migrated_project_that_fails_to_persist_still_publishes_the_recovered_state`
+        // does: the seeded board is moved to the legacy path the loader falls
+        // back to, and the routed path the save must write is occupied by a
+        // directory so the atomic rename cannot land.
+        let routed = find_routed_tasks_file(paths.data_dir()).expect("the fixture seeded a board");
+        let project_id: uuid::Uuid = {
+            let seeded: config::storage::ProjectTasksFile =
+                toml::from_str(&std::fs::read_to_string(&routed).unwrap()).unwrap();
+            seeded.tasks[0].project_id
+        };
+        let legacy = paths.config_dir().join("tasks").join(format!("{project_id}.toml"));
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::rename(&routed, &legacy).unwrap();
+        std::fs::create_dir_all(&routed).unwrap();
+
+        let (state, report) = build_state_with_paths(paths)
+            .await
+            .expect("one project that cannot be saved must not stop the process from starting");
+
+        assert_eq!(report.quarantined_worktrees, 1);
+        assert_eq!(
+            report.unsaved_migrated_projects, 1,
+            "the report has to say the reconciliation did not reach the disk"
+        );
+
+        let on_disk: config::storage::ProjectTasksFile =
+            toml::from_str(&std::fs::read_to_string(&legacy).unwrap()).unwrap();
+        let durable = on_disk.tasks.iter().find(|t| t.id == task_id).expect("still on disk");
+        assert!(
+            durable.cleanup_in_flight,
+            "the file must still say a cleanup was interrupted, because that flag is what makes \
+             the next start quarantine this task again rather than run it"
+        );
+
+        let tasks = state.task.tasks.read().await;
+        let task = tasks.get(&task_id).expect("task must still exist");
+        assert!(
+            task.cleanup_in_flight,
+            "and memory must agree with it, so nothing the file contradicts is exposed as \
+             runnable"
+        );
+        assert_eq!(
+            task.worktree_path.as_deref(),
+            Some(wt_path.as_str()),
+            "the only reference to a checkout nothing touched must survive both"
+        );
+        assert!(
+            std::path::Path::new(&wt_path).exists(),
+            "and startup still runs nothing destructive"
+        );
+    }
+
+    /// The `tasks.toml` a routed save writes, wherever the fixture put it.
+    fn find_routed_tasks_file(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(root).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                if let Some(found) = find_routed_tasks_file(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|n| n == "tasks.toml") {
+                return Some(path);
+            }
+        }
+        None
+    }
+
     #[tokio::test]
     async fn an_interrupted_cleanup_that_had_already_finished_is_reconciled() {
         let tmp = TempDir::new().unwrap();

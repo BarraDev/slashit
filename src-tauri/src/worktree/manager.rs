@@ -2701,6 +2701,30 @@ branch refs/heads/some-other-branch
             "a record that was put back has been renamed into place, not left lying beside it"
         );
 
+        // What git deleted on its way out is not always nothing. It walks the
+        // checkout in readdir order and stops where the obstacle is, so
+        // whether it had already unlinked a tracked file by then is the
+        // filesystem's answer and not this test's -- measured: none of them
+        // here, some of them on the hosted ubuntu-22.04 runner, from the same
+        // fixture and the same git invocation.
+        //
+        // A checkout missing tracked files is dirty, and `remove_with_git`
+        // refuses dirt with "contains modified or untracked files" no matter
+        // who made it, git included. That refusal is the contract working, not
+        // the failure this test is about, and the removal is deliberately not
+        // the thing that repairs it: putting the checkout back in order is the
+        // user's own `git checkout`, which the acceptance journey for this
+        // same abandonment spells out as the step before asking again. Running
+        // it unconditionally is what lets the assertion below mean the one
+        // thing this test exists for -- that the restored record makes a later
+        // attempt possible at all -- under either ordering.
+        run_git(&info.path, &["checkout", "--", "."]);
+        assert!(
+            run_git(&info.path, &["status", "--porcelain"]).is_empty(),
+            "the checkout has to be back in order before the retry, or what the retry measures \
+             is the ordinary dirty refusal and not the record that was put back"
+        );
+
         mgr.remove(&info.path, repo_path)
             .await
             .expect("the attempt made once the obstacle is gone is the one that has to converge");

@@ -326,7 +326,20 @@ pub async fn sync_existing_pr(
 
     match find_existing_pr_for_branch_strict(&working_dir, &branch).await? {
         Some(pr_url) => {
-            link_pr_to_task(&state, task_uuid, &pr_url).await?;
+            // Only a link that never reached the disk is a failure to report
+            // here. A merged PR whose cleanup was refused is still a PR this
+            // command successfully synced: the task is on the board with its
+            // `pr_url` and the refusal on its card, and answering `Err` would
+            // hide the task the caller asked for behind a cleanup problem it
+            // did not ask about.
+            if let Err(PrLinkFailure::NotRecorded(reason)) =
+                link_pr_to_task(&state, task_uuid, &pr_url).await
+            {
+                return Err(format!(
+                    "Pull request is at {pr_url}, but SlashIt could not record it on the task: \
+                     {reason}"
+                ));
+            }
             let tasks = state.task.tasks.read().await;
             Ok(tasks.get(&task_uuid).cloned())
         }
@@ -480,13 +493,20 @@ pub async fn recover_private_email_and_create_pr(
     };
 
     if let Some(existing_pr_url) = find_existing_pr_for_branch(&working_dir, &branch).await? {
-        // Reported rather than propagated: the pull request exists, and a
-        // caller that got an `Err` here would be left without its URL. The
-        // failure is not swallowed -- a refused cleanup is persisted onto
-        // the task as `error_message` and rendered on its card, which is
-        // where it belongs.
-        if let Err(e) = link_pr_to_task(&state, task_uuid, &existing_pr_url).await {
-            eprintln!("Warning: linking the pull request to task {task_uuid} was incomplete: {e}");
+        // Classified rather than flattened. A cleanup this refused is a task that
+        // is simply not finished, and the refusal is already persisted onto its
+        // card as `error_message`; the pull request is real either way and the
+        // caller is owed its URL. A link that never reached the disk is the other
+        // thing entirely: SlashIt does not know about a PR that exists, so the URL
+        // travels back inside the error and asking again rediscovers this same PR
+        // rather than opening a second one.
+        if let Err(failure @ PrLinkFailure::NotRecorded(_)) =
+            link_pr_to_task(&state, task_uuid, &existing_pr_url).await
+        {
+            return Err(format!(
+                "Pull request is at {existing_pr_url}, but SlashIt could not record it on the task: \
+                 {failure}"
+            ));
         }
         return Ok(existing_pr_url);
     }
@@ -1968,13 +1988,20 @@ async fn create_pr_inner(
 
     if let Some(branch) = task_branch_name.as_deref() {
         if let Some(existing_pr_url) = find_existing_pr_for_branch(&working_dir, branch).await? {
-            // Reported rather than propagated: the pull request exists, and a
-            // caller that got an `Err` here would be left without its URL. The
-            // failure is not swallowed -- a refused cleanup is persisted onto
-            // the task as `error_message` and rendered on its card, which is
-            // where it belongs.
-            if let Err(e) = link_pr_to_task(state, task_uuid, &existing_pr_url).await {
-                eprintln!("Warning: linking the pull request to task {task_uuid} was incomplete: {e}");
+            // Classified rather than flattened. A cleanup this refused is a task that
+            // is simply not finished, and the refusal is already persisted onto its
+            // card as `error_message`; the pull request is real either way and the
+            // caller is owed its URL. A link that never reached the disk is the other
+            // thing entirely: SlashIt does not know about a PR that exists, so the URL
+            // travels back inside the error and asking again rediscovers this same PR
+            // rather than opening a second one.
+            if let Err(failure @ PrLinkFailure::NotRecorded(_)) =
+                link_pr_to_task(state, task_uuid, &existing_pr_url).await
+            {
+                return Err(format!(
+                    "Pull request is at {existing_pr_url}, but SlashIt could not record it on the task: \
+                     {failure}"
+                ));
             }
             return Ok(existing_pr_url);
         }
@@ -1985,13 +2012,20 @@ async fn create_pr_inner(
         .map_err(friendly_pr_error)?;
 
     if let Some(existing_pr_url) = find_existing_pr_for_branch(&working_dir, &branch).await? {
-        // Reported rather than propagated: the pull request exists, and a
-        // caller that got an `Err` here would be left without its URL. The
-        // failure is not swallowed -- a refused cleanup is persisted onto
-        // the task as `error_message` and rendered on its card, which is
-        // where it belongs.
-        if let Err(e) = link_pr_to_task(state, task_uuid, &existing_pr_url).await {
-            eprintln!("Warning: linking the pull request to task {task_uuid} was incomplete: {e}");
+        // Classified rather than flattened. A cleanup this refused is a task that
+        // is simply not finished, and the refusal is already persisted onto its
+        // card as `error_message`; the pull request is real either way and the
+        // caller is owed its URL. A link that never reached the disk is the other
+        // thing entirely: SlashIt does not know about a PR that exists, so the URL
+        // travels back inside the error and asking again rediscovers this same PR
+        // rather than opening a second one.
+        if let Err(failure @ PrLinkFailure::NotRecorded(_)) =
+            link_pr_to_task(state, task_uuid, &existing_pr_url).await
+        {
+            return Err(format!(
+                "Pull request is at {existing_pr_url}, but SlashIt could not record it on the task: \
+                 {failure}"
+            ));
         }
         return Ok(existing_pr_url);
     }
@@ -2007,15 +2041,21 @@ async fn create_pr_inner(
         &working_dir,
     ).await.map_err(friendly_pr_error)?;
 
-    // Reported rather than propagated: the pull request exists, and a
-    // caller that got an `Err` here would be left without its URL. The
-    // failure is not swallowed -- a refused cleanup is persisted onto
-    // the task as `error_message` and rendered on its card, which is
-    // where it belongs.
-    if let Err(e) = link_pr_to_task(state, task_uuid, &pr_url).await {
-        eprintln!("Warning: linking the pull request to task {task_uuid} was incomplete: {e}");
+    // Classified rather than flattened. A cleanup this refused is a task that
+    // is simply not finished, and the refusal is already persisted onto its
+    // card as `error_message`; the pull request is real either way and the
+    // caller is owed its URL. A link that never reached the disk is the other
+    // thing entirely: SlashIt does not know about a PR that exists, so the URL
+    // travels back inside the error and asking again rediscovers this same PR
+    // rather than opening a second one.
+    if let Err(failure @ PrLinkFailure::NotRecorded(_)) =
+        link_pr_to_task(state, task_uuid, &pr_url).await
+    {
+        return Err(format!(
+            "Pull request is at {pr_url}, but SlashIt could not record it on the task: \
+             {failure}"
+        ));
     }
-
     Ok(pr_url)
 }
 
@@ -2092,6 +2132,33 @@ async fn find_existing_pr_for_branch_strict(
         .map(|url| url.to_string()))
 }
 
+/// Why recording a pull request on a task did not fully succeed.
+///
+/// Two outcomes that look alike from the outside and must not be treated alike.
+/// One means SlashIt does not know about a pull request that exists; the other
+/// means it knows, durably, and only the cleanup that a merged PR implies was
+/// refused. Flattening them is what let a command report success after losing
+/// the link, and report failure after keeping it.
+#[derive(Debug)]
+enum PrLinkFailure {
+    /// The pull request exists, and SlashIt failed to record it on the task.
+    /// Nothing was written, so the board and the file still agree -- on the
+    /// state that does not mention the PR.
+    NotRecorded(String),
+    /// The pull request is recorded and on disk. It was merged, so a terminal
+    /// cleanup followed, and that cleanup was refused. The PR fact stands; the
+    /// task is simply not finished.
+    NotTerminalized(String),
+}
+
+impl std::fmt::Display for PrLinkFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRecorded(reason) | Self::NotTerminalized(reason) => f.write_str(reason),
+        }
+    }
+}
+
 /// Record a PR against a task and move the task to the status that PR implies.
 ///
 /// Two steps, deliberately separate. The pull request itself is recorded first,
@@ -2103,55 +2170,66 @@ async fn find_existing_pr_for_branch_strict(
 /// would drop the pull request entirely, leaving a task with no `pr_url` for a
 /// PR the user is looking at.
 ///
-/// Only then, if it is merged, is the terminal claim made, through
-/// [`crate::lifecycle::terminalize`]: the worktree is removed first and `Done`
-/// is committed only if that succeeded. A refusal comes back as `Err` and the
-/// task keeps its PR, its status, its worktree and its branch.
+/// Only then, if it is merged, is the terminal claim made: the worktree is
+/// removed first and `Done` is committed only if that succeeded. A refusal
+/// comes back as [`PrLinkFailure::NotTerminalized`] and the task keeps its PR,
+/// its status, its worktree and its branch.
 ///
-/// Returns a `Result` because of that: this used to be infallible and swallowed
-/// its own persistence errors, which is precisely how a `Done` that never
-/// cleaned up anything reached the board.
+/// One lease covers both steps. They are two halves of a single thing the user
+/// asked for, and taking the lease twice manufactured a window in which some
+/// other transition could take the task between them -- turning one operation
+/// into a `Busy` race against itself.
+///
+/// The record is staged, persisted and only then published. This used to mutate
+/// the live task map and save afterwards, so a failed save left `pr_url`, the
+/// external reference and the status visible on the board and absent from the
+/// file, which is exactly the state a restart silently undoes.
 async fn link_pr_to_task(
     state: &crate::AppState,
     task_uuid: Uuid,
     pr_url: &str,
-) -> Result<(), String> {
+) -> Result<(), PrLinkFailure> {
     let remote_state = fetch_pr_state(pr_url).await;
     let merged = matches!(remote_state.as_deref(), Some("MERGED"));
 
-    {
-        let _lease = state.task_lifecycle_locks.acquire(task_uuid).await?;
-        let mut tasks = state.task.tasks.write().await;
+    let _lease = state
+        .task_lifecycle_locks
+        .acquire(task_uuid)
+        .await
+        .map_err(PrLinkFailure::NotRecorded)?;
 
-        let Some(task) = tasks.get_mut(&task_uuid) else {
-            return Ok(());
-        };
-        apply_pr_link(task, pr_url, remote_state.as_deref());
-        // Withheld when merged: the status a merged PR implies is `Done`, and
-        // that is the terminalization's to write, after the cleanup it depends
-        // on has succeeded.
-        if !merged {
-            task.status = TaskStatus::PrCreated;
-        }
-        task.updated_at = chrono::Utc::now();
-        let project_id = task.project_id;
-
-        let staged: Vec<Task> = tasks
-            .values()
-            .filter(|t| t.project_id == project_id)
-            .cloned()
-            .collect();
-        state
-            .storage
-            .save_project_tasks(project_id, &staged)
-            .map_err(|e| format!("recording the pull request on task {task_uuid} failed: {e}"))?;
+    // Nothing to record on, and nothing owed: a task that is gone is not a
+    // failure to report a PR against.
+    if !state.task.tasks.read().await.contains_key(&task_uuid) {
+        return Ok(());
     }
+
+    let remote = remote_state.clone();
+    let apply = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_uuid) {
+            apply_pr_link(task, pr_url, remote.as_deref());
+            // Withheld when merged: the status a merged PR implies is `Done`,
+            // and that is the terminalization's to write, after the cleanup it
+            // depends on has succeeded.
+            if !merged {
+                task.status = TaskStatus::PrCreated;
+            }
+        }
+    };
+
+    crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply)
+        .await
+        .map_err(|e| {
+            PrLinkFailure::NotRecorded(format!(
+                "recording the pull request on task {task_uuid} failed: {e}"
+            ))
+        })?;
 
     if !merged {
         return Ok(());
     }
 
-    match crate::lifecycle::terminalize(
+    match crate::lifecycle::terminalize_leased(
         crate::commands::task::terminalize_ctx(state),
         task_uuid,
         crate::lifecycle::Origin::User,
@@ -2160,7 +2238,31 @@ async fn link_pr_to_task(
     .await
     {
         Ok(_) | Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => Ok(()),
-        Err(refusal) => Err(refusal.to_string()),
+
+        // `CleanupRefused` has already written its own reason onto the task, in
+        // the same durable commit that decided to keep the worktree. Every
+        // other refusal answers before that commit exists and would otherwise
+        // leave the card silent about a merged pull request that did not
+        // finish, so the reason is recorded here instead. Best effort by
+        // construction: this is the diagnostic for a refusal, and failing to
+        // store it must not overwrite what the refusal actually was.
+        Err(refusal) => {
+            let reason = refusal.to_string();
+            if !matches!(refusal, crate::lifecycle::TerminalizeRefusal::CleanupRefused { .. }) {
+                let note = reason.clone();
+                let explain = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
+                    if let Some(task) = staged.get_mut(&task_uuid) {
+                        task.error_message = Some(format!(
+                            "The pull request is merged, but the task was not finished: {note}"
+                        ));
+                    }
+                };
+                let _ =
+                    crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &explain)
+                        .await;
+            }
+            Err(PrLinkFailure::NotTerminalized(reason))
+        }
     }
 }
 
@@ -2234,43 +2336,50 @@ pub async fn refresh_task_pr_state(
     // The refreshed state is recorded first and unconditionally, for the same
     // reason `link_pr_to_task` does it: what GitHub reports is true regardless
     // of what git says about the checkout, and every refusal that answers
-    // before the cleanup begins would otherwise discard it.
-    let updated = {
-        let _lease = state.task_lifecycle_locks.acquire(task_uuid).await?;
-        let mut tasks = state.task.tasks.write().await;
-        let task = tasks.get_mut(&task_uuid).ok_or("Task not found")?;
-        for r in task.external_refs.iter_mut() {
-            if let ExternalRef::GithubPr { url, state: s, .. } = r {
-                if url == &pr_url {
-                    *s = Some(remote_state.clone());
+    // before the cleanup begins would otherwise discard it. Staged, persisted,
+    // then published, and under one lease that also covers the terminalization
+    // below -- the two halves are one thing the user asked for, and dropping
+    // the lease between them let another transition take the task and turned
+    // this operation into a `Busy` race against itself.
+    let _lease = state
+        .task_lifecycle_locks
+        .acquire(task_uuid)
+        .await
+        .map_err(|e| format!("recording the pull request state failed: {e}"))?;
+
+    let refreshed = remote_state.clone();
+    let target = pr_url.clone();
+    let apply = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_uuid) {
+            for r in task.external_refs.iter_mut() {
+                if let ExternalRef::GithubPr { url, state: s, .. } = r {
+                    if url == &target {
+                        *s = Some(refreshed.clone());
+                    }
                 }
             }
+            // `MERGED` implies `Done`, which the terminalization below writes
+            // only after the cleanup it depends on has succeeded.
+            if matches!(refreshed.as_str(), "CLOSED" | "OPEN") {
+                task.status = TaskStatus::PrCreated;
+            }
         }
-        // `MERGED` implies `Done`, which the terminalization below writes only
-        // after the cleanup it depends on has succeeded.
-        if matches!(remote_state.as_str(), "CLOSED" | "OPEN") {
-            task.status = TaskStatus::PrCreated;
-        }
-        task.updated_at = chrono::Utc::now();
-        let updated = task.clone();
+    };
 
-        let staged: Vec<Task> = tasks
-            .values()
-            .filter(|t| t.project_id == updated.project_id)
-            .cloned()
-            .collect();
-        state
-            .storage
-            .save_project_tasks(updated.project_id, &staged)
-            .map_err(|e| format!("recording the pull request state failed: {e}"))?;
-        updated
+    crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply)
+        .await
+        .map_err(|e| format!("recording the pull request state failed: {e}"))?;
+
+    let updated = {
+        let tasks = state.task.tasks.read().await;
+        tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
 
     // A merged PR is the same terminal claim a card dragged onto Done makes, so
     // it goes through the same operation: the worktree is removed first, and
     // `Done` is committed only if that succeeded.
     if remote_state == "MERGED" {
-        return match crate::lifecycle::terminalize(
+        return match crate::lifecycle::terminalize_leased(
             crate::commands::task::terminalize_ctx(&state),
             task_uuid,
             crate::lifecycle::Origin::User,
@@ -2280,7 +2389,10 @@ pub async fn refresh_task_pr_state(
         {
             Ok(task) => Ok(Some(task)),
             Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => Ok(None),
-            Err(refusal) => Err(refusal.to_string()),
+            // The refresh itself succeeded and is on disk. A refused cleanup
+            // means the task is not finished, which its card now says; it does
+            // not mean the state this command was asked to refresh is unknown.
+            Err(_) => Ok(state.task.tasks.read().await.get(&task_uuid).cloned()),
         };
     }
 
