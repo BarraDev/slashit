@@ -51,6 +51,13 @@ impl QueueManager {
         let queued_tasks: Vec<_> = tasks
             .values()
             .filter(|t| t.status == TaskStatus::Queue)
+            // A task whose cleanup was interrupted cannot be executed -- see
+            // `TaskExecutor::is_pending` -- so promoting it would only park it
+            // in a column that claims it is running while nothing is. Worse,
+            // the promotion below clears `error_message`, which for a
+            // quarantined task is the one place the interrupted cleanup is
+            // explained to the user.
+            .filter(|t| !t.cleanup_in_flight)
             .collect();
 
         let next_task = if self.config.fifo_ordering {
@@ -185,6 +192,7 @@ mod tests {
                 error_message: None,
                 worktree_path: None,
                 branch_name: None,
+                cleanup_in_flight: false,
                 position: 0,
                 pr_review_plan: None,
                 created_at: chrono::Utc::now(),

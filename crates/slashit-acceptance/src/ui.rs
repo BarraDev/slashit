@@ -124,11 +124,51 @@ pub async fn assert_absent(driver: &WebDriver, selector: &str) -> Result<()> {
 /// webview, the IPC channel, the command registry and the backend state are
 /// all working together — not that a Rust function is callable.
 pub async fn invoke(driver: &WebDriver, command: &str, args: Value) -> Result<Value> {
+    match dispatch(driver, command, args).await? {
+        Ok(value) => Ok(value),
+        Err(error) => bail!("invoke({command}) failed in the application: {error}"),
+    }
+}
+
+/// Call a Tauri command that the journey expects the application to refuse,
+/// and hand back the reason it gave.
+///
+/// A refusal is a product behaviour in its own right — the backend declines an
+/// operation and says why, and the reason is what the user has to act on — so
+/// asserting one needs the application's own words rather than the wrapper
+/// [`invoke`] puts around them. Succeeding is the failure here: it means the
+/// product did the thing the journey established it must not be able to do.
+pub async fn invoke_expecting_refusal(
+    driver: &WebDriver,
+    command: &str,
+    args: Value,
+) -> Result<String> {
+    match dispatch(driver, command, args).await? {
+        Ok(value) => bail!(
+            "invoke({command}) was expected to be refused by the application, but it succeeded \
+             and answered {value}"
+        ),
+        Err(error) => Ok(error),
+    }
+}
+
+/// One round trip through the bridge, keeping the application's own `Ok` and
+/// `Err` apart from the failures of getting there at all.
+///
+/// The outer `Result` is the harness's — the bridge is missing, the script
+/// could not be dispatched, the envelope came back unrecognisable. The inner
+/// one is the command's own answer, which both callers above interpret for
+/// themselves.
+async fn dispatch(
+    driver: &WebDriver,
+    command: &str,
+    args: Value,
+) -> Result<Result<Value, String>> {
     const SCRIPT: &str = r#"
         const done = arguments[arguments.length - 1];
         const [command, args] = arguments;
         if (!window.__TAURI__ || !window.__TAURI__.core) {
-            done({ err: "window.__TAURI__.core is missing; withGlobalTauri is off" });
+            done({ bridge: "window.__TAURI__.core is missing; withGlobalTauri is off" });
         } else {
             window.__TAURI__.core.invoke(command, args)
                 .then((value) => done({ ok: value === undefined ? null : value }))
@@ -142,11 +182,18 @@ pub async fn invoke(driver: &WebDriver, command: &str, args: Value) -> Result<Va
         .map_err(|e| anyhow!("invoke({command}) could not be dispatched: {e}"))?;
 
     let value = returned.json();
+    // Reported separately from the command's own `Err`, and never as one: a
+    // journey that expects to be refused would otherwise read a window with no
+    // IPC bridge at all as the application declining, and pass.
+    if let Some(missing) = value.get("bridge").and_then(Value::as_str) {
+        bail!("invoke({command}) never reached the application: {missing}");
+    }
     if let Some(error) = value.get("err").and_then(Value::as_str) {
-        bail!("invoke({command}) failed in the application: {error}");
+        return Ok(Err(error.to_string()));
     }
     value
         .get("ok")
         .cloned()
+        .map(Ok)
         .ok_or_else(|| anyhow!("invoke({command}) returned an unrecognised envelope: {value}"))
 }

@@ -167,6 +167,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
             storage: state.storage.clone(),
             worktree_manager: state.worktree_manager.clone(),
             events: events.clone(),
+            lifecycle: state.task_lifecycle_locks.clone(),
         },
     ));
     let _ = state.executor.set(executor.clone());
@@ -189,6 +190,10 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
         events: events.clone(),
         control: control.clone(),
         features: state.features.clone(),
+        repositories: state.repository.repositories.clone(),
+        worktree_manager: state.worktree_manager.clone(),
+        task_lifecycle_locks: state.task_lifecycle_locks.clone(),
+        executor: state.executor.clone(),
         feature_diagnostics,
         paths: state.paths.clone(),
     });
