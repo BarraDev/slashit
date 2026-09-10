@@ -1362,6 +1362,126 @@ mod tests {
         );
     }
 
+    /// A pull request already on disk is not lost when the terminalization that
+    /// follows it cannot write its own result.
+    ///
+    /// The sequence the PR commands run: record the pull request, then
+    /// terminalize under the same lease. Blocking persistence from the start
+    /// only re-tests the record, which already reports its own failure. What
+    /// this pins is the second half -- the record succeeded and is durable, and
+    /// the write the terminalization needs is the one that fails.
+    ///
+    /// The stamp is what fails here, so nothing destructive ran and the
+    /// checkout is still there. Asking again is an ordinary retry.
+    #[tokio::test]
+    async fn a_recorded_pull_request_survives_a_terminalization_that_cannot_be_stamped() {
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
+
+        let link = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(task) = staged.get_mut(&id) {
+                task.pr_url = Some("https://example.invalid/pull/7".to_string());
+            }
+        };
+        record(&world.tasks, &world.storage, id, &link)
+            .await
+            .expect("the pull request itself records normally");
+        assert_eq!(
+            world.persisted(id).pr_url.as_deref(),
+            Some("https://example.invalid/pull/7"),
+            "the pull request has to be durable before the interesting part begins"
+        );
+
+        // Only now does the storage break, so the failure belongs to the
+        // terminalization rather than to the record.
+        world.block_persistence();
+
+        let refusal = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect_err("a terminal write that failed is not a terminalization");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::NotRecorded(_)),
+            "a failed write has to be reported as one, not as a refusal to write: {refusal:?}"
+        );
+
+        let after = world.task(id).await;
+        assert_ne!(after.status, TaskStatus::Done, "and nothing may claim it finished");
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://example.invalid/pull/7"),
+            "the durable pull request is not rolled back by a later failure"
+        );
+        assert!(
+            !after.cleanup_in_flight,
+            "a cleanup that was never announced was never begun"
+        );
+        assert_eq!(
+            after.worktree_path.as_deref(),
+            Some(wt.as_str()),
+            "the checkout keeps the only handle back to it"
+        );
+        assert!(
+            std::path::Path::new(&wt).exists(),
+            "and nothing destructive ran, so asking again is an ordinary retry"
+        );
+    }
+
+    /// The same guarantee where the failing write is the final one rather than
+    /// the stamp.
+    ///
+    /// A task with no checkout has nothing to remove, so `terminalize_leased`
+    /// goes straight to the commit. That is the other write that can fail after
+    /// the pull request is already durable, and it must not report success
+    /// either.
+    #[tokio::test]
+    async fn a_recorded_pull_request_survives_a_terminal_commit_that_cannot_be_saved() {
+        let world = world(true);
+        let (id, sibling_id) = seed(&world, TaskStatus::InProgress, None).await;
+
+        let link = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(task) = staged.get_mut(&id) {
+                task.pr_url = Some("https://example.invalid/pull/9".to_string());
+            }
+        };
+        record(&world.tasks, &world.storage, id, &link)
+            .await
+            .expect("the pull request itself records normally");
+
+        world.block_persistence();
+
+        let refusal = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect_err("a terminal write that failed is not a terminalization");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::NotRecorded(_)),
+            "the commit is a write, and a failed write is reported as one: {refusal:?}"
+        );
+
+        let after = world.task(id).await;
+        assert_ne!(after.status, TaskStatus::Done);
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://example.invalid/pull/9"),
+            "the durable pull request survives the failure that followed it"
+        );
+        assert_eq!(
+            world.task(sibling_id).await.status,
+            TaskStatus::Backlog,
+            "and the rest of the project was never republished by the failed attempt"
+        );
+    }
+
     // ===== delete =====
 
     #[tokio::test]
