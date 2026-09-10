@@ -414,7 +414,8 @@ pub async fn delete(ctx: TerminalizeCtx<'_>, task_id: Uuid) -> Result<bool, Term
         // Asking again is then an ordinary delete with nothing left to clean
         // up.
         TerminalizeRefusal::NotRecorded(format!(
-            "the worktree for task {task_id} was cleaned up, but removing the task from the              board failed, so the task is still there and can simply be deleted again: {e}"
+            "the worktree for task {task_id} was cleaned up, but removing the task from the \
+             board failed, so the task is still there and can simply be deleted again: {e}"
         ))
     })?;
 
