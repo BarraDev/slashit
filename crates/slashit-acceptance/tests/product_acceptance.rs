@@ -2066,6 +2066,77 @@ async fn current_status(driver: &WebDriver, executed: &ExecutedTask) -> Result<S
     Ok(status.to_string())
 }
 
+/// Spend the window the deleted retry pass ran on, twice, and prove nothing in
+/// the product moved during either half.
+///
+/// Both journeys that end in a kept worktree hold the product to the same
+/// contract: a refused cleanup stays refused until a person asks again, and the
+/// obstacle going away by itself is not a person asking. Spelling that out
+/// twice meant two copies of the same pair of multi-line diagnostics, where an
+/// edit to one silently weakened the other journey's.
+///
+/// `release_obstacle` is the only thing that genuinely differs -- each journey
+/// blocks the removal its own way -- so it is the only thing passed in. The
+/// window itself is unchanged: still `NO_RETRY_WINDOW` before the release and
+/// `NO_RETRY_WINDOW` after it, with a full `assert_worktree_kept` at each end
+/// rather than a cheaper check.
+async fn assert_nothing_retried_the_removal(
+    driver: &WebDriver,
+    repository: &GitFixture,
+    executed: &ExecutedTask,
+    before: &str,
+    work: &EstablishedWork,
+    release_obstacle: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // The window the deleted retry pass ran on, spent doing nothing at all.
+    // Everything the caller asserted has to still hold afterwards, because a
+    // refused cleanup stays refused until a person asks again.
+    tokio::time::sleep(NO_RETRY_WINDOW).await;
+
+    assert_worktree_kept(
+        driver,
+        repository,
+        executed,
+        before,
+        work,
+        &format!(
+            "{}s later, with nobody having asked for anything in between",
+            NO_RETRY_WINDOW.as_secs()
+        ),
+    )
+    .await
+    .context(
+        "something inside the product re-attempted a destructive cleanup that nobody asked \
+         for. No user action happened between the refusal and this read, so whatever changed \
+         was a worktree removal running on a timer — the one thing this contract says must \
+         not exist.",
+    )?;
+
+    // Releasing the obstacle is not an event the product may act on. The
+    // removal would succeed now, and that is precisely why this is worth
+    // waiting out: nothing in SlashIt watches a kept worktree for its obstacle
+    // going away, so the only thing that may change here is nothing.
+    release_obstacle()?;
+    tokio::time::sleep(NO_RETRY_WINDOW).await;
+
+    assert_worktree_kept(
+        driver,
+        repository,
+        executed,
+        before,
+        work,
+        "after the obstacle was released and still nobody had asked for anything",
+    )
+    .await
+    .context(
+        "the worktree went away by itself once it became removable, so some pass is watching \
+         refused cleanups and finishing them unprompted. A removal the product was told to \
+         keep may only happen when a person asks for it again.",
+    )?;
+
+    Ok(())
+}
+
 /// Assert that a task whose cleanup the product refused still holds everything
 /// the refusal promised to keep, and hand back the worktree path it records.
 ///
@@ -2377,54 +2448,10 @@ async fn finish_a_refused_cleanup_by_asking_again(
         );
     }
 
-    // --- And nothing may attempt the removal again on its own --------------
-    //
-    // The window the deleted retry pass ran on, spent doing nothing at all.
-    // Everything asserted above has to still hold afterwards, because a
-    // refused cleanup stays refused until a person asks again.
-    tokio::time::sleep(NO_RETRY_WINDOW).await;
-
-    assert_worktree_kept(
-        driver,
-        repository,
-        &executed,
-        &before,
-        &work,
-        &format!(
-            "{}s later, with nobody having asked for anything in between",
-            NO_RETRY_WINDOW.as_secs()
-        ),
-    )
-    .await
-    .context(
-        "something inside the product re-attempted a destructive cleanup that nobody asked \
-         for. No user action happened between the refusal and this read, so whatever changed \
-         was a worktree removal running on a timer — the one thing this contract says must \
-         not exist.",
-    )?;
-
-    // --- Releasing the obstacle is not an event the product may act on -----
-    //
-    // The removal would succeed now, and that is precisely why this is worth
-    // waiting out: nothing in SlashIt watches a kept worktree for its obstacle
-    // going away, so the only thing that may change here is nothing.
-    obstacle.release()?;
-    tokio::time::sleep(NO_RETRY_WINDOW).await;
-
-    assert_worktree_kept(
-        driver,
-        repository,
-        &executed,
-        &before,
-        &work,
-        "after the obstacle was released and still nobody had asked for anything",
-    )
-    .await
-    .context(
-        "the worktree went away by itself once it became removable, so some pass is watching \
-         refused cleanups and finishing them unprompted. A removal the product was told to \
-         keep may only happen when a person asks for it again.",
-    )?;
+    assert_nothing_retried_the_removal(driver, repository, &executed, &before, &work, || {
+        obstacle.release()
+    })
+    .await?;
 
     // The checkout is readable again, and what the agent left in it is still
     // exactly what it left: a refusal keeps the directory, not merely a record
@@ -2659,46 +2686,10 @@ async fn finish_a_cleanup_git_abandoned_by_asking_again(
         );
     }
 
-    // --- And nothing may attempt the removal again on its own --------------
-    tokio::time::sleep(NO_RETRY_WINDOW).await;
-
-    assert_worktree_kept(
-        driver,
-        repository,
-        &executed,
-        &before,
-        &work,
-        &format!(
-            "{}s later, with nobody having asked for anything in between",
-            NO_RETRY_WINDOW.as_secs()
-        ),
-    )
-    .await
-    .context(
-        "something inside the product re-attempted a destructive cleanup that nobody asked \
-         for. No user action happened between the refusal and this read, so whatever changed \
-         was a worktree removal running on a timer — the one thing this contract says must \
-         not exist.",
-    )?;
-
-    // --- Releasing the obstacle is not an event the product may act on -----
-    obstacle.release()?;
-    tokio::time::sleep(NO_RETRY_WINDOW).await;
-
-    assert_worktree_kept(
-        driver,
-        repository,
-        &executed,
-        &before,
-        &work,
-        "after the obstacle was released and still nobody had asked for anything",
-    )
-    .await
-    .context(
-        "the worktree went away by itself once it became removable, so some pass is watching \
-         refused cleanups and finishing them unprompted. A removal the product was told to \
-         keep may only happen when a person asks for it again.",
-    )?;
+    assert_nothing_retried_the_removal(driver, repository, &executed, &before, &work, || {
+        obstacle.release()
+    })
+    .await?;
 
     // What a user has to put right before asking again. Git abandons the
     // removal partway through the checkout, so some of the files it had

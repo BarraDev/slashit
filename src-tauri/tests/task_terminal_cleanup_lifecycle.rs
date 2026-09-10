@@ -98,6 +98,23 @@ const DESIGN_MAY_WAIT: Duration = Duration::from_secs(5);
 /// assertion instead of a hung test binary.
 const UNRELATED_REMOVAL_MUST_NOT_BLOCK: Duration = Duration::from_secs(30);
 
+/// A bound on the barrier answering at all.
+///
+/// The same kind of thing as [`UNRELATED_REMOVAL_MUST_NOT_BLOCK`] and just as
+/// much not synchronisation: the shim announces only after `git worktree
+/// remove <the armed path>` has actually been invoked, so a production path
+/// that answers without ever reaching that boundary never announces, and a
+/// production path that is killed between arriving and finishing never says it
+/// finished. Unbounded, either one is a test binary that hangs on a pipe with
+/// nothing left to write to it and no name for what went wrong. Bounded, both
+/// are the named assertion that the destructive boundary was not reached the
+/// way this test requires.
+///
+/// Generous on purpose. It is never spent on a passing run -- the announcement
+/// is written before the real git is allowed to run -- so its only job is to
+/// be longer than any legitimate scheduling delay.
+const BARRIER_MUST_ANSWER: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Process-wide test environment
 // ---------------------------------------------------------------------------
@@ -337,6 +354,24 @@ impl Drop for Barrier {
 ///
 /// Byte at a time because the messages are a word long and a partial read must
 /// not be mistaken for a whole one.
+/// [`read_announcement`] with a failure bound, for the reads a hung shim would
+/// otherwise park forever.
+///
+/// The bound never replaces the synchronisation: what is awaited is still the
+/// announcement itself, and a passing run reads it immediately. `what` names
+/// the crossing so an elapsed bound fails by name instead of by timeout.
+async fn announcement_within(pipe: &mut pipe::Receiver, what: &str) -> String {
+    match tokio::time::timeout(BARRIER_MUST_ANSWER, read_announcement(pipe)).await {
+        Ok(announced) => announced,
+        Err(_) => panic!(
+            "the barrier never announced that {what}, within {}s. The shim writes it before the \
+             real git is allowed to run, so either the production path never reached the \
+             destructive boundary this test arms, or the shim died before it could say so.",
+            BARRIER_MUST_ANSWER.as_secs()
+        ),
+    }
+}
+
 async fn read_announcement(pipe: &mut pipe::Receiver) -> String {
     let mut line = Vec::new();
     loop {
@@ -592,7 +627,12 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
         //     destructive step. The announcement is the proof: the shim only
         //     writes it after `git worktree remove <this exact path>` has been
         //     invoked and before the real git has been allowed to run.
-        let arrival_fut = read_announcement(&mut barrier.arrived);
+        // Bounded, because once the `terminal` branch has resolved it is
+        // disabled and only the arrival future is left: a production path that
+        // answers without ever invoking the armed removal leaves this loop with
+        // nothing that can ever complete. The bound is a failure name, not
+        // synchronisation -- the announcement is still what is waited for.
+        let arrival_fut = announcement_within(&mut barrier.arrived, "the removal was reached");
         tokio::pin!(arrival_fut);
         let arrival = loop {
             tokio::select! {
@@ -700,7 +740,7 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
             .write_all(b"release\n")
             .await
             .expect("release the boundary");
-        let removal_status = read_announcement(&mut barrier.finished).await;
+        let removal_status = announcement_within(&mut barrier.finished, "the removal finished").await;
 
         // (6) What the code actually does, recorded rather than assumed.
         let checkout_survived = Path::new(&fixture.worktree_path).exists();
@@ -822,7 +862,11 @@ fn a_terminal_transition_whose_cleanup_did_not_happen_is_not_reported_as_done() 
         // crossing this loop never collects and the equality below never sees.
         let mut crossings: Vec<(String, String)> = Vec::new();
         for _ in 0..1 {
-            let arrival_fut = read_announcement(&mut barrier.arrived);
+            // Bounded for the same reason as the arrival above, and it matters
+            // more here: the count below is itself the assertion that no forced
+            // removal followed, so a crossing that never arrives has to fail as
+            // a missing crossing rather than as a hung binary.
+            let arrival_fut = announcement_within(&mut barrier.arrived, "the removal was reached");
             tokio::pin!(arrival_fut);
             let arrival = loop {
                 tokio::select! {
@@ -837,7 +881,7 @@ fn a_terminal_transition_whose_cleanup_did_not_happen_is_not_reported_as_done() 
                 .write_all(b"release\n")
                 .await
                 .expect("release the boundary");
-            let status = read_announcement(&mut barrier.finished).await;
+            let status = announcement_within(&mut barrier.finished, "the removal finished").await;
             crossings.push((arrival, status));
         }
         assert_eq!(

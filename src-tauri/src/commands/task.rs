@@ -655,67 +655,15 @@ pub async fn delete_task(
 ) -> Result<bool, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
-    // Delete holds the same lease as every other lifecycle operation, so it
-    // cannot land between a cleanup starting and that cleanup recording its
-    // outcome, and cannot remove the record of a task an agent is running.
-    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
-
-    // Clean up before removing the record, and synchronously: a detached
-    // removal would outlive this lease and act on a task nothing is holding
-    // any more. `desired` is the task's current status because a delete is not
-    // a status change; what is wanted here is the safe removal and its durable
-    // bookkeeping, which is the same operation.
-    let record = {
-        let tasks = state.task.tasks.read().await;
-        tasks
-            .get(&task_id)
-            .map(|t| (t.status.clone(), t.worktree_path.clone(), t.branch_name.clone()))
-    };
-    if let Some((current_status, worktree_path, branch_name)) = record {
-        if let Err(refusal) = crate::lifecycle::terminalize_leased(
-            terminalize_ctx(&state),
-            task_id,
-            crate::lifecycle::Origin::User,
-            crate::lifecycle::TerminalizeRequest::new(current_status),
-        )
+    // The whole policy -- take the lease, prove no agent owns the task, clean
+    // the checkout up safely, and only then remove the record, persisting
+    // before publishing -- lives in `lifecycle::delete`, which the daemon's IPC
+    // handler calls too. A refusal is returned rather than logged past: the
+    // task keeps its record, its `worktree_path`, its branch and its work, and
+    // the user can put the checkout right and ask again.
+    crate::lifecycle::delete(terminalize_ctx(&state), task_id)
         .await
-        {
-            // The record is about to be deleted, so there is nothing left to
-            // retain the path on and nothing that will revisit it. Git refusing
-            // to remove a checkout that still holds uncommitted work is the
-            // expected reason, and leaving that work on disk is the intended
-            // outcome: the branch survives too, so everything the task
-            // committed stays reachable even though the record naming it does
-            // not.
-            //
-            // The path and the branch are named here rather than left to the
-            // refusal's own words, which for some refusals mention neither.
-            // This message is the last thing that will ever point at either.
-            eprintln!(
-                "Warning: deleting task {task_id} could not remove its worktree: {refusal}. \
-                 The checkout at {} is left on disk and nothing records it any more; its \
-                 commits remain on branch {}.",
-                worktree_path.as_deref().unwrap_or("(none recorded)"),
-                branch_name.as_deref().unwrap_or("(none recorded)"),
-            );
-        }
-    }
-
-    let mut tasks = state.task.tasks.write().await;
-
-    // Get project_id before removal for persistence
-    let project_id = tasks.get(&task_id).map(|t| t.project_id);
-
-    let removed = tasks.remove(&task_id).is_some();
-    
-    // Persist to disk if task was removed
-    if removed {
-        if let Some(pid) = project_id {
-            persist_project_tasks(&state.storage, &tasks, pid);
-        }
-    }
-    
-    Ok(removed)
+        .map_err(|refusal| refusal.to_string())
 }
 
 /// Renumber `target_status`'s column so `task_id` sits at `new_position` and
@@ -951,14 +899,6 @@ pub fn remove_external_ref_logic(
     }
 }
 
-/// Core delete_task logic extracted for testability
-#[cfg(test)]
-pub fn delete_task_logic(
-    tasks: &mut HashMap<Uuid, Task>,
-    task_id: Uuid,
-) -> bool {
-    tasks.remove(&task_id).is_some()
-}
 
 /// Core reorder logic extracted for testability.
 ///
@@ -1799,43 +1739,13 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // ===== delete_task tests =====
-
-    #[test]
-    fn test_delete_existing_task_returns_true_and_removes() {
-        let project_id = Uuid::new_v4();
-        let task = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
-        let task_id = task.id;
-        let mut tasks = create_test_tasks_map(vec![task]);
-
-        let removed = delete_task_logic(&mut tasks, task_id);
-        assert!(removed);
-        assert!(!tasks.contains_key(&task_id));
-    }
-
-    #[test]
-    fn test_delete_nonexistent_task_returns_false() {
-        let mut tasks: HashMap<Uuid, Task> = HashMap::new();
-        let fake_id = Uuid::new_v4();
-        let removed = delete_task_logic(&mut tasks, fake_id);
-        assert!(!removed);
-    }
-
-    #[test]
-    fn test_delete_task_does_not_affect_other_tasks() {
-        let project_id = Uuid::new_v4();
-        let task1 = create_test_task_full("Task 1", project_id, TaskStatus::Backlog, 0);
-        let task2 = create_test_task_full("Task 2", project_id, TaskStatus::Queue, 0);
-        let task1_id = task1.id;
-        let task2_id = task2.id;
-        let mut tasks = create_test_tasks_map(vec![task1, task2]);
-
-        let removed = delete_task_logic(&mut tasks, task1_id);
-        assert!(removed);
-        assert!(!tasks.contains_key(&task1_id));
-        assert!(tasks.contains_key(&task2_id));
-        assert_eq!(tasks.len(), 1);
-    }
+    // The delete_task tests that stood here exercised a `#[cfg(test)]` shim
+    // that was a bare `HashMap::remove`. `delete_task` now routes through
+    // `lifecycle::delete`, which takes the lease, refuses while an agent owns
+    // the task, cleans the checkout up first and persists before publishing --
+    // none of which the shim could see, so passing it proved nothing about the
+    // command. That contract is pinned in `crate::lifecycle::tests` and, for
+    // the daemon's front door, in `crate::ipc::handlers::tests`.
 
     // ===== Edge case: reorder with invalid task_id =====
 

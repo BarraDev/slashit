@@ -295,6 +295,133 @@ pub async fn terminalize(
     terminalize_leased(ctx, task_id, origin, request).await
 }
 
+
+/// Record facts about a task durably, without attempting any transition.
+///
+/// The persist-before-publish half of [`terminalize`] on its own, for a caller
+/// that has established something true -- a pull request observed merged, the
+/// reason a transition cannot proceed -- and must not lose it merely because
+/// the transition it would normally accompany was refused. Nothing here is
+/// destructive and nothing here moves a task between columns.
+///
+/// The order is the same contract the rest of the backend holds: the file
+/// accepts the change before the board shows it, so a failure leaves both the
+/// shared map and the disk exactly as they were and the caller is told so.
+pub async fn record(
+    tasks: &Tasks,
+    storage: &Storage,
+    task_id: Uuid,
+    amend: Amend<'_>,
+) -> Result<(), String> {
+    let mut tasks_w = tasks.write().await;
+    let Some(project_id) = tasks_w.get(&task_id).map(|t| t.project_id) else {
+        return Err(format!("task {task_id} is no longer on the board"));
+    };
+
+    let mut staged = stage_project(&tasks_w, project_id);
+    amend(&mut staged);
+    if let Some(task) = staged.get_mut(&task_id) {
+        task.updated_at = chrono::Utc::now();
+    }
+
+    publish(&mut tasks_w, storage, project_id, staged)
+}
+
+/// Remove a task's record, once and only once nothing is owed on its behalf.
+///
+/// Deleting is not a status change, so nothing here moves a task to a terminal
+/// column. What it shares with terminalization is the obligation: the record is
+/// the only thing that names a checkout, so removing one while its worktree is
+/// still there strands the directory with nothing left pointing at it and no
+/// later operation able to find it. The cleanup therefore runs first, under the
+/// same lease, and a refusal ends the delete instead of being logged past --
+/// the task, its `worktree_path`, its branch and every uncommitted byte
+/// survive, and the user can deal with the checkout and ask again.
+///
+/// `Ok(false)` means there was no such task, which is not a failure: the caller
+/// asked for it to be gone and it is.
+///
+/// One operation for both front doors. The desktop command and the daemon's IPC
+/// handler call this rather than each holding a copy of the policy, because a
+/// delete that is safe through one and unsafe through the other is not a safe
+/// delete.
+pub async fn delete(ctx: TerminalizeCtx<'_>, task_id: Uuid) -> Result<bool, TerminalizeRefusal> {
+    // Held across the cleanup *and* the record removal, so nothing can start a
+    // transition against a task that is on its way out, and the removal cannot
+    // land between a cleanup starting and that cleanup recording its outcome.
+    let _lease = ctx
+        .authority
+        .acquire(task_id)
+        .await
+        .map_err(TerminalizeRefusal::Busy)?;
+
+    // Kept before `ctx` is handed to the terminalization, which consumes it.
+    let tasks = ctx.tasks;
+    let storage = ctx.storage;
+
+    // Re-read under the lease: anything sampled before waiting for it is a
+    // guess about the past.
+    let (project_id, current_status) = {
+        let tasks_r = tasks.read().await;
+        match tasks_r.get(&task_id) {
+            Some(task) => (task.project_id, task.status.clone()),
+            None => return Ok(false),
+        }
+    };
+
+    // `desired` is the status the task already has: a delete is not a status
+    // change, and what is wanted here is the safe removal together with its
+    // durable bookkeeping, which is one operation. `terminalize_leased` because
+    // the lease is already held; releasing and retaking it around this would
+    // open exactly the window the lease exists to close.
+    match terminalize_leased(
+        ctx,
+        task_id,
+        Origin::User,
+        TerminalizeRequest::new(current_status),
+    )
+    .await
+    {
+        Ok(_) => {}
+        // It went while this was working. Nothing is owed on a record that is
+        // not there.
+        Err(TerminalizeRefusal::TaskNotFound) => return Ok(false),
+        // Every other refusal ends the delete. `CleanupRefused` is the expected
+        // one -- git will not take a checkout that holds work no commit names
+        // -- but `ExecutionActive` matters just as much: an agent is running
+        // and that checkout is its working directory. None of them may be
+        // reported as a successful delete, because for all of them the cleanup
+        // obligation the record carries is still outstanding.
+        Err(refusal) => return Err(refusal),
+    }
+
+    // The checkout is gone and that fact is already durable, so what is left is
+    // one write. The file accepts the board without the task before the shared
+    // map loses it: a delete the file did not accept is one the next start
+    // undoes, and reporting it as done would leave the user looking at a task
+    // that comes back.
+    let mut tasks_w = tasks.write().await;
+    let mut staged = stage_project(&tasks_w, project_id);
+    if staged.remove(&task_id).is_none() {
+        return Ok(false);
+    }
+
+    let list: Vec<Task> = staged.values().cloned().collect();
+    storage.save_project_tasks(project_id, &list).map_err(|e| {
+        // The record stays, and it stays truthful: the terminalization above
+        // already committed `worktree_path = None` and `cleanup_in_flight =
+        // false`, so what survives says the cleanup succeeded, which it did.
+        // Asking again is then an ordinary delete with nothing left to clean
+        // up.
+        TerminalizeRefusal::NotRecorded(format!(
+            "the worktree for task {task_id} was cleaned up, but removing the task from the              board failed, so the task is still there and can simply be deleted again: {e}"
+        ))
+    })?;
+
+    tasks_w.remove(&task_id);
+    Ok(true)
+}
+
 /// [`terminalize`] for a caller that already holds the task's lease.
 ///
 /// Split out so an operation which must take the lease for its own reasons --
@@ -1176,6 +1303,199 @@ mod tests {
     // -----------------------------------------------------------------------
     // The lease itself
     // -----------------------------------------------------------------------
+
+    // ===== record =====
+
+    #[tokio::test]
+    async fn a_record_the_file_refuses_is_not_published_to_the_board() {
+        let world = world(true);
+        let (id, _) = seed(&world, TaskStatus::InProgress, None).await;
+        world.block_persistence();
+
+        let note = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(task) = staged.get_mut(&id) {
+                task.pr_url = Some("https://example.invalid/pr/1".to_string());
+                task.status = TaskStatus::PrCreated;
+            }
+        };
+        let failure = record(&world.tasks, &world.storage, id, &note)
+            .await
+            .expect_err("a write the file refused is not a record");
+        assert!(!failure.is_empty(), "and the caller has to be told why");
+
+        // This is the whole point of the ordering. Publishing first left
+        // `pr_url` and a moved status visible on the board and absent from the
+        // file, which is the one state a restart silently undoes.
+        let after = world.task(id).await;
+        assert_eq!(after.pr_url, None, "nothing may be published that the file did not accept");
+        assert_eq!(after.status, TaskStatus::InProgress, "including the status it implied");
+    }
+
+    #[tokio::test]
+    async fn a_record_publishes_exactly_what_reached_the_disk() {
+        let world = world(true);
+        let (id, sibling_id) = seed(&world, TaskStatus::InProgress, None).await;
+
+        let note = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(task) = staged.get_mut(&id) {
+                task.pr_url = Some("https://example.invalid/pr/1".to_string());
+                task.status = TaskStatus::PrCreated;
+            }
+        };
+        record(&world.tasks, &world.storage, id, &note)
+            .await
+            .expect("an ordinary record must succeed");
+
+        let after = world.task(id).await;
+        assert_eq!(after.pr_url.as_deref(), Some("https://example.invalid/pr/1"));
+        assert_eq!(after.status, TaskStatus::PrCreated);
+        assert_eq!(
+            world.persisted(id).pr_url.as_deref(),
+            Some("https://example.invalid/pr/1"),
+            "the board and the file have to say the same thing"
+        );
+        assert_eq!(
+            world.persisted(sibling_id).status,
+            TaskStatus::Backlog,
+            "and the rest of the project is written back unchanged rather than lost"
+        );
+    }
+
+    // ===== delete =====
+
+    #[tokio::test]
+    async fn a_delete_whose_cleanup_git_refuses_keeps_the_task_and_everything_it_names() {
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        // Uncommitted, non-ignored work: git refuses this checkout through the
+        // ordinary production path, and refusing is the whole point.
+        std::fs::write(std::path::Path::new(&wt).join("unsaved.txt"), "not committed\n").unwrap();
+        let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
+
+        let refusal = delete(world.ctx(), id)
+            .await
+            .expect_err("a delete whose cleanup was refused is not a delete");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }),
+            "the refusal has to be git's, carried through: {refusal:?}"
+        );
+
+        // The record is the only thing that names this checkout and this
+        // branch. Deleting it after a refusal is what strands the directory
+        // with nothing able to find it again.
+        let after = world.task(id).await;
+        assert_eq!(after.worktree_path.as_deref(), Some(wt.as_str()));
+        assert_eq!(after.branch_name.as_deref(), Some("task-abcd1234"));
+        assert_eq!(
+            world.persisted(id).worktree_path.as_deref(),
+            Some(wt.as_str()),
+            "and the file has to agree, because the file is what the next start reads"
+        );
+        assert!(
+            std::path::Path::new(&wt).join("unsaved.txt").exists(),
+            "the work the refusal was protecting must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_refuses_while_an_agent_owns_the_task_and_removes_nothing() {
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
+
+        let running = AgentIsRunning;
+        let mut ctx = world.ctx();
+        ctx.running = Some(&running);
+
+        let refusal = delete(ctx, id)
+            .await
+            .expect_err("the checkout is the agent's working directory");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::ExecutionActive),
+            "expected an execution refusal, got {refusal:?}"
+        );
+
+        assert!(
+            world.tasks.read().await.contains_key(&id),
+            "the record of a task an agent is running may not be removed out from under it"
+        );
+        assert!(
+            std::path::Path::new(&wt).exists(),
+            "and nothing may be deleted from the directory it is working in"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_whose_cleanup_succeeded_removes_the_task_from_memory_and_disk() {
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        let (id, sibling_id) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
+
+        assert!(delete(world.ctx(), id).await.expect("the delete must succeed"));
+
+        assert!(!world.tasks.read().await.contains_key(&id));
+        assert!(
+            !world
+                .storage
+                .load_project_tasks(world.project_id)
+                .expect("the board must be readable")
+                .iter()
+                .any(|t| t.id == id),
+            "a delete the file did not accept is one the next start undoes"
+        );
+        assert!(!std::path::Path::new(&wt).exists(), "the checkout goes with it");
+        let branches = std::process::Command::new("git")
+            .args(["branch", "--list", "task-abcd1234"])
+            .current_dir(repo_path(&world))
+            .output()
+            .expect("git branch --list");
+        assert!(
+            !String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "but not the branch, so what the task committed stays reachable"
+        );
+        assert!(
+            world.tasks.read().await.contains_key(&sibling_id),
+            "and nothing else in the project moves"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_whose_last_write_fails_is_not_reported_as_done_and_can_be_retried() {
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
+
+        // The cleanup succeeds and its outcome is recorded; only the write that
+        // takes the task off the board is made to fail. Blocking persistence
+        // any earlier would refuse before anything destructive ran, which is a
+        // different contract and already covered.
+        assert!(delete(world.ctx(), id).await.expect("the first delete succeeds"));
+        let (id2, _) = seed(&world, TaskStatus::InProgress, None).await;
+        world.block_persistence();
+
+        let refusal = delete(world.ctx(), id2)
+            .await
+            .expect_err("a delete the file did not accept is not a delete");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::NotRecorded(_)),
+            "expected the board write to be reported, got {refusal:?}"
+        );
+        assert!(
+            world.tasks.read().await.contains_key(&id2),
+            "the record has to survive, because a task the user is still shown is a task they \
+             can delete again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_of_a_task_that_is_not_there_is_not_a_failure() {
+        let world = world(true);
+        assert!(
+            !delete(world.ctx(), Uuid::new_v4())
+                .await
+                .expect("asking for something already gone is not an error"),
+        );
+    }
 
     #[tokio::test]
     async fn the_lease_is_exclusive_per_task_and_free_between_tasks() {

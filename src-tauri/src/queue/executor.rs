@@ -394,15 +394,27 @@ impl TaskExecutor {
     /// state written, no opportunity consumed, and the next ordinary poll finds
     /// the task exactly as eligible as before.
     ///
-    /// Once the lease is held the question is really asked, and
-    /// [`crate::lifecycle::terminalize`] records the merge in the same durable
-    /// write that announces the cleanup, before any destructive step. So a
-    /// refusal keeps the merge, keeps the worktree, keeps the branch and says
-    /// why -- and the now-`MERGED` ref is what stops this trying again on a
-    /// timer. From there only an explicit lifecycle action finishes the task,
-    /// which is the point: an automatic retry every thirty seconds is a
-    /// destructive operation nobody asked for twice.
+    /// The lease is taken here rather than left to [`crate::lifecycle::
+    /// terminalize`] so that every refusal is classified while this still owns
+    /// the task. Reconstructing what happened after the lease has been released
+    /// is guessing about a moment that has passed, and the decisions below --
+    /// whether anything durable is owed, and whether another pass may try again
+    /// -- are exactly the decisions that must not be guesses.
+    ///
+    /// What the classification is for: a refusal that is a passing condition
+    /// leaves nothing written, so an ordinary later poll retries it. A refusal
+    /// that is a stable blocker is recorded durably, which both tells the user
+    /// why and stops the polling, because asking GitHub the same question every
+    /// thirty seconds forever cannot change a repository that does not resolve.
+    /// Neither kind ever re-runs a destructive step on a timer: once the merge
+    /// is durable, only an explicit lifecycle action finishes the task.
     async fn complete_merged_task(&self, task_id: Uuid, number: u32, state: &str) {
+        // Declined, not failed. Nothing was asked and nothing is owed, so the
+        // next pass finds the task exactly as eligible as this one did.
+        let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
+            return;
+        };
+
         let record_merge = move |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
                 Self::record_pr_state(t, number, state);
@@ -421,7 +433,7 @@ impl TaskExecutor {
         request.record_first = Some(&record_merge);
         request.on_success = Some(&mark_complete);
 
-        let outcome = crate::lifecycle::terminalize(
+        let outcome = crate::lifecycle::terminalize_leased(
             crate::lifecycle::TerminalizeCtx {
                 tasks: &self.tasks,
                 projects: &self.projects,
@@ -444,12 +456,12 @@ impl TaskExecutor {
                 message: Some("PR merged — task complete".to_string()),
             }),
 
-            // Answered: git was asked and said no, or the answer could not be
-            // saved. Reported once, because reaching here means the merged
-            // state was persisted first, and the poll above excludes a ref it
-            // has already recorded as `MERGED`.
-            Err(refusal @ crate::lifecycle::TerminalizeRefusal::CleanupRefused { .. })
-            | Err(refusal @ crate::lifecycle::TerminalizeRefusal::NotRecorded(_)) => {
+            // Answered, and the merge is durable: `record_first` reached the
+            // disk in the write that announced the cleanup, before anything
+            // destructive ran. The poll above excludes a ref it has already
+            // recorded as `MERGED`, so this is said once and no later pass
+            // re-attempts the removal.
+            Err(refusal @ crate::lifecycle::TerminalizeRefusal::CleanupRefused { .. }) => {
                 self.events.agent_event(AgentEvent::Log {
                     task_id: task_id.to_string(),
                     level: LogLevel::Warn,
@@ -459,11 +471,81 @@ impl TaskExecutor {
                 })
             }
 
-            // Declined: nothing was asked, nothing was written, nothing is
-            // owed. Saying so every thirty seconds would be noise about a
-            // condition the task already reports for itself, and the next pass
-            // finds the task exactly as eligible as this one did.
-            Err(_) => {}
+            // Storage refused a write. Which write decides everything, and the
+            // variant alone does not say: from the announcement it means
+            // nothing reached the disk at all -- not even the merge -- so the
+            // ref is still un-recorded and an ordinary later poll retries this,
+            // correctly, because no durable latch exists to say otherwise. From
+            // the final commit it means the merge and the in-flight stamp are
+            // both durable, the poll's own filters exclude the task on either
+            // count, and the next start reconciles it. Reported either way, and
+            // no destructive step is scheduled by either.
+            Err(refusal @ crate::lifecycle::TerminalizeRefusal::NotRecorded(_)) => {
+                self.events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "The pull request is merged, but the task was not finished: {refusal}"
+                    ),
+                })
+            }
+
+            // A stable blocker, and the one refusal that answers before
+            // anything durable is written while never being able to resolve
+            // itself. Polling it is a `gh pr view` every thirty seconds that
+            // can only ever reach here again, so the merge and the reason are
+            // recorded now: the ref becomes `MERGED`, which is what takes the
+            // task out of the poll's selection, and the card says what the user
+            // has to fix. The task stays non-terminal, its worktree and branch
+            // are untouched, and no git command has run.
+            Err(refusal @ crate::lifecycle::TerminalizeRefusal::RepositoryUnresolved(_)) => {
+                let reason = refusal.to_string();
+                let latch = move |staged: &mut HashMap<Uuid, Task>| {
+                    if let Some(t) = staged.get_mut(&task_id) {
+                        Self::record_pr_state(t, number, state);
+                        t.error_message = Some(format!(
+                            "The pull request is merged, but the task was not finished: {reason}"
+                        ));
+                    }
+                };
+                // A failure here writes nothing, which leaves the ref
+                // un-recorded and the task eligible again -- the same safe
+                // direction as the announcement failure above. It is said in
+                // the same event rather than a separate line, because "this is
+                // why the task did not finish" and "and that reason did not
+                // reach the card either" are one thing the user needs to read
+                // together.
+                let stored =
+                    crate::lifecycle::record(&self.tasks, &self.storage, task_id, &latch).await;
+                let message = match stored {
+                    Ok(()) => format!(
+                        "The pull request is merged, but the task was not finished: {refusal}"
+                    ),
+                    Err(e) => format!(
+                        "The pull request is merged, but the task was not finished: {refusal}. \
+                         Recording that on the task failed as well, so this will be tried again: \
+                         {e}"
+                    ),
+                };
+                self.events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Warn,
+                    message,
+                })
+            }
+
+            // Passing conditions, and a task that is gone. An agent owns the
+            // task, or an interrupted cleanup is quarantined, or the lease was
+            // taken between the two lines above. Nothing was asked, nothing was
+            // written, nothing is owed -- and saying so every thirty seconds
+            // would be noise about a condition the task already reports for
+            // itself. Cleanup is never forced under a running agent, and a
+            // quarantine is never touched automatically; both simply become
+            // eligible again once the condition that is holding them clears.
+            Err(crate::lifecycle::TerminalizeRefusal::ExecutionActive)
+            | Err(crate::lifecycle::TerminalizeRefusal::Quarantined(_))
+            | Err(crate::lifecycle::TerminalizeRefusal::Busy(_))
+            | Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => {}
         }
     }
 
@@ -1770,6 +1852,121 @@ mod tests {
                 root.join("runtime"),
             ));
         (storage, temp)
+    }
+
+    // ===== automatic completion of a merged pull request =====
+
+    /// A task the poll would select: non-terminal, with one open PR ref.
+    async fn task_with_open_pr(executor: &TaskExecutor, worktree: Option<&str>) -> (Uuid, Uuid) {
+        let project_id = Uuid::new_v4();
+        let mut task = crate::test_helpers::create_test_task_full(
+            "merged",
+            project_id,
+            TaskStatus::PrCreated,
+            0,
+        );
+        task.worktree_path = worktree.map(|s| s.to_string());
+        task.branch_name = Some("task-abcd1234".to_string());
+        task.external_refs.push(crate::domain::task::ExternalRef::GithubPr {
+            number: 7,
+            repo: "owner/repo".to_string(),
+            url: "https://example.invalid/pr/7".to_string(),
+            state: None,
+        });
+        let id = task.id;
+        executor.tasks.write().await.insert(id, task.clone());
+        executor
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
+        (id, project_id)
+    }
+
+    fn recorded_pr_state(task: &Task) -> Option<String> {
+        task.external_refs.iter().find_map(|r| match r {
+            crate::domain::task::ExternalRef::GithubPr { state, .. } => state.clone(),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_merge_that_cannot_resolve_a_repository_is_recorded_once_instead_of_polled_forever() {
+        // No project and no repository, which is what `RepositoryUnresolved`
+        // actually is: a task that still names a checkout under a project that
+        // resolves to nothing. The refusal answers before any git command, and
+        // before this correction it wrote nothing at all -- so the poll picked
+        // the same task up again thirty seconds later, and every thirty seconds
+        // after that, forever.
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = task_with_open_pr(&executor, Some("/nonexistent/checkout")).await;
+
+        executor.complete_merged_task(id, 7, "MERGED").await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            recorded_pr_state(&after).as_deref(),
+            Some("MERGED"),
+            "the merge is a fact about GitHub and recording it is what takes this task out of \
+             the poll's selection"
+        );
+        assert!(
+            after.error_message.is_some(),
+            "and the card has to say why a merged pull request did not finish the task"
+        );
+        assert_eq!(
+            after.status,
+            TaskStatus::PrCreated,
+            "the task is not finished, so it may not be moved as though it were"
+        );
+        assert_eq!(
+            after.worktree_path.as_deref(),
+            Some("/nonexistent/checkout"),
+            "and nothing may drop the only reference to a checkout that was never touched"
+        );
+        assert!(!after.cleanup_in_flight, "no cleanup was ever announced");
+
+        let on_disk = executor
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .find(|t| t.id == id)
+            .expect("the task must be on disk");
+        assert_eq!(
+            recorded_pr_state(&on_disk).as_deref(),
+            Some("MERGED"),
+            "the file is what the next start reads, so a latch only in memory is no latch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_found_while_the_task_is_busy_writes_nothing_and_stays_eligible() {
+        let (executor, _temps) = test_executor();
+        let (id, _project_id) = task_with_open_pr(&executor, None).await;
+
+        // Someone else owns the task's lifecycle right now. Declining has to
+        // cost nothing: writing `MERGED` here would spend the one automatic
+        // completion this task ever gets on a pass that did nothing, because
+        // the poll skips a ref it has already recorded as merged.
+        let held = executor
+            .lifecycle
+            .try_acquire(id)
+            .await
+            .expect("the lease must be free to take");
+
+        executor.complete_merged_task(id, 7, "MERGED").await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            recorded_pr_state(&after),
+            None,
+            "nothing was attempted, so nothing may have been written -- and an un-recorded ref \
+             is exactly what leaves the task as eligible on the next pass as it was on this one"
+        );
+        assert_eq!(after.status, TaskStatus::PrCreated);
+        assert!(!after.cleanup_in_flight);
+
+        drop(held);
     }
 
     /// A `TaskExecutor` over nothing but temporary directories.
