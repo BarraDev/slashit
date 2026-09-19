@@ -28,7 +28,7 @@ impl Default for RoadmapState {
 
 #[tauri::command]
 pub async fn create_roadmap_feature(
-    state: tauri::State<'_, RoadmapState>,
+    state: tauri::State<'_, crate::AppState>,
     request: CreateFeatureRequest,
 ) -> Result<RoadmapFeature, String> {
     let id = Uuid::new_v4();
@@ -50,7 +50,7 @@ pub async fn create_roadmap_feature(
         updated_at: now,
     };
 
-    let mut features = state.features.write().await;
+    let mut features = state.roadmap.features.write().await;
     features.insert(id, feature.clone());
 
     Ok(feature)
@@ -58,12 +58,12 @@ pub async fn create_roadmap_feature(
 
 #[tauri::command]
 pub async fn update_roadmap_feature(
-    state: tauri::State<'_, RoadmapState>,
+    state: tauri::State<'_, crate::AppState>,
     feature_id: String,
     request: UpdateFeatureRequest,
 ) -> Result<Option<RoadmapFeature>, String> {
     let feature_id = Uuid::parse_str(&feature_id).map_err(|e| e.to_string())?;
-    let mut features = state.features.write().await;
+    let mut features = state.roadmap.features.write().await;
 
     if let Some(feature) = features.get_mut(&feature_id) {
         if let Some(title) = request.title {
@@ -100,22 +100,22 @@ pub async fn update_roadmap_feature(
 
 #[tauri::command]
 pub async fn delete_roadmap_feature(
-    state: tauri::State<'_, RoadmapState>,
+    state: tauri::State<'_, crate::AppState>,
     feature_id: String,
 ) -> Result<bool, String> {
     let feature_id = Uuid::parse_str(&feature_id).map_err(|e| e.to_string())?;
-    let mut features = state.features.write().await;
+    let mut features = state.roadmap.features.write().await;
 
     Ok(features.remove(&feature_id).is_some())
 }
 
 #[tauri::command]
 pub async fn list_roadmap_features(
-    state: tauri::State<'_, RoadmapState>,
+    state: tauri::State<'_, crate::AppState>,
     project_id: Option<String>,
     status: Option<String>,
 ) -> Result<Vec<RoadmapFeature>, String> {
-    let features = state.features.read().await;
+    let features = state.roadmap.features.read().await;
     let mut result: Vec<RoadmapFeature> = features.values().cloned().collect();
 
     if let Some(project_id_str) = project_id {
@@ -157,25 +157,25 @@ pub async fn list_roadmap_features(
 
 #[tauri::command]
 pub async fn get_roadmap_feature(
-    state: tauri::State<'_, RoadmapState>,
+    state: tauri::State<'_, crate::AppState>,
     feature_id: String,
 ) -> Result<Option<RoadmapFeature>, String> {
     let feature_id = Uuid::parse_str(&feature_id).map_err(|e| e.to_string())?;
-    let features = state.features.read().await;
+    let features = state.roadmap.features.read().await;
 
     Ok(features.get(&feature_id).cloned())
 }
 
 #[tauri::command]
 pub async fn link_task_to_feature(
-    state: tauri::State<'_, RoadmapState>,
+    state: tauri::State<'_, crate::AppState>,
     feature_id: String,
     task_id: String,
 ) -> Result<Option<RoadmapFeature>, String> {
     let feature_id = Uuid::parse_str(&feature_id).map_err(|e| e.to_string())?;
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
-    let mut features = state.features.write().await;
+    let mut features = state.roadmap.features.write().await;
 
     if let Some(feature) = features.get_mut(&feature_id) {
         if !feature.linked_task_ids.contains(&task_id) {
@@ -190,14 +190,14 @@ pub async fn link_task_to_feature(
 
 #[tauri::command]
 pub async fn unlink_task_from_feature(
-    state: tauri::State<'_, RoadmapState>,
+    state: tauri::State<'_, crate::AppState>,
     feature_id: String,
     task_id: String,
 ) -> Result<Option<RoadmapFeature>, String> {
     let feature_id = Uuid::parse_str(&feature_id).map_err(|e| e.to_string())?;
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
-    let mut features = state.features.write().await;
+    let mut features = state.roadmap.features.write().await;
 
     if let Some(feature) = features.get_mut(&feature_id) {
         feature.linked_task_ids.retain(|id| id != &task_id);
@@ -205,5 +205,42 @@ pub async fn unlink_task_from_feature(
         Ok(Some(feature.clone()))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_ask_for_the_state_the_app_actually_manages() {
+        // `run()` calls `.manage()` exactly once, with `AppState`. Tauri looks
+        // `State<T>` up by `TypeId` in that map, so a command asking for
+        // `State<RoadmapState>` — a type that only ever exists as a *field* of
+        // `AppState` — is rejected at invoke time with "state not managed for
+        // field ... You must call `.manage()` before using this command". Every
+        // command below is registered and reachable from the roadmap page, so
+        // the whole page failed.
+        //
+        // The helper is deliberately never awaited: `tauri::State` wraps a
+        // private field and cannot be constructed outside a running app, so the
+        // type check *is* the assertion. Reverting any signature to the
+        // sub-state stops this file compiling.
+        async fn binds_to_app_state(
+            state: tauri::State<'_, crate::AppState>,
+            create: CreateFeatureRequest,
+            update: UpdateFeatureRequest,
+            id: String,
+        ) {
+            let _ = create_roadmap_feature(state.clone(), create).await;
+            let _ = update_roadmap_feature(state.clone(), id.clone(), update).await;
+            let _ = delete_roadmap_feature(state.clone(), id.clone()).await;
+            let _ = list_roadmap_features(state.clone(), None, None).await;
+            let _ = get_roadmap_feature(state.clone(), id.clone()).await;
+            let _ = link_task_to_feature(state.clone(), id.clone(), id.clone()).await;
+            let _ = unlink_task_from_feature(state, id.clone(), id).await;
+        }
+
+        let _ = &binds_to_app_state;
     }
 }

@@ -11,6 +11,24 @@ release will contain.
 
 ### Added
 
+- **Headless daemon mode.** A `slashitd` binary runs the IPC server and the
+  queue executor with no window and no webview, so agents and terminals can
+  outlive the desktop app entirely. It is not a second implementation: the
+  daemon and the GUI build the same state, serve the same command set and
+  resolve the same feature flags, differing only in where events go and in
+  whether there is a window to raise.
+- **The control channel works on every platform.** A Unix domain socket on
+  Linux and macOS, a named pipe on Windows, and — off by default — a loopback
+  TCP listener for cases neither covers. The first two are access-controlled
+  by the operating system, so reaching them already proves you are the owning
+  user; TCP proves nothing, so it exists only alongside a bearer token held in
+  a 0600 file and compared in constant time. See
+  [`docs/architecture/ipc-security.md`](docs/architecture/ipc-security.md).
+- **In-app updates.** The app checks for a new release, shows what is
+  available, and installs it on request. Updates are verified against a
+  signing key before they are applied; the installers themselves are not yet
+  OS code-signed, which is stated plainly in
+  [`docs/releasing.md`](docs/releasing.md).
 - **Project storage location.** Each project chooses whether its board lives
   outside the project (the default, leaving your repository untouched) or
   inside it at `.slashit/` so it can be committed and shared. Changing the
@@ -18,9 +36,12 @@ release will contain.
   nothing until confirmed. See
   [`docs/architecture/state-locations.md`](docs/architecture/state-locations.md).
 - **Runtime feature flags** in `features.toml`, so unfinished work can ship
-  off by default.
-- Architecture documentation for state locations, the IPC security model and
-  the planned headless daemon.
+  off by default. A flag resolves through a command-line override, then
+  `SLASHIT_FEATURE_<NAME>`, then the file, then its default, and `slashit
+  features` reports the value *and* which layer decided it — "the flag is on"
+  is not an actionable answer when someone is asking why.
+- Architecture documentation for state locations, the IPC security model, the
+  headless daemon and the release procedure.
 - Meta-workspace model: a workspace folder that coordinates several projects.
 - PR comment review workflow with per-item approve, fix and skip.
 - Community health files for the public contribution flow.
@@ -36,9 +57,30 @@ release will contain.
 - Task files move from one global directory into each project's own state
   directory. The old location is still read, so no task disappears on upgrade;
   the move happens on the next save.
+- The frontend crate is now `slashit-frontend`, and the Playwright harness
+  `slashit-e2e`. Nothing user-visible changes. Of the workspace's names —
+  `slashit-ui` for the desktop app, `slashit` for the CLI, `slashit-ipc` for
+  the shared protocol — only `slashit-app-ui` failed to say which piece it
+  was. It could not simply become `slashit-ui`, because the Tauri crate
+  already is: two packages with one name in a workspace is a Cargo error and
+  would make `cargo -p slashit-ui` ambiguous. Application data still lives
+  under `slashit-app`, which is frozen.
 
 ### Fixed
 
+- **A release candidate would have shipped without a Windows installer.** WiX
+  accepts only numeric version components, so `0.1.0-rc.1` made the MSI
+  bundler bail — but not until the whole release build had already compiled on
+  the Windows runner, and only there, leaving a release that looked nearly
+  complete with nothing for Windows users. The release workflow now rejects an
+  unpackageable version in seconds, before any platform build starts, and
+  [`docs/releasing.md`](docs/releasing.md) documents the numeric form
+  (`0.1.0-1`) that does work.
+- **A release could be named after a version other than its tag.** The release
+  name was substituted from `tauri.conf.json` rather than from the git ref, so
+  pushing `v0.1.0-rc.1` against an app version of `0.1.0` silently produced a
+  release called `v0.1.0`. The tag and the app version are now checked against
+  each other, and the release takes its name from the ref.
 - **A task branch could resolve to your main checkout.** Worktree lookup
   matched the branch name as a substring of the whole `git worktree list`
   block, including the line holding the repository path, so a branch whose

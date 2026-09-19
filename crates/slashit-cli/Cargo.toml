@@ -12,8 +12,11 @@ name = "slashit"
 path = "src/main.rs"
 
 [dependencies]
+# Owns the protocol, the transports and the round trip. The CLI has no socket
+# code of its own any more, which is why `net`, `io-util` and `time` are gone
+# from the tokio features below: nothing here touches a stream directly.
 slashit-ipc = { path = "../slashit-ipc" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"

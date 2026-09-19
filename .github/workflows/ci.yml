@@ -1,5 +1,11 @@
 name: CI
 
+# Neither job pushes, comments, or otherwise writes back to the repository —
+# both only check out, build and test. Least privilege the default GITHUB_TOKEN
+# down to that.
+permissions:
+  contents: read
+
 on:
   # Validating every push to `main` is enough on the push side: everything
   # else reaches `main` as a pull request, and gets validated there.
@@ -19,11 +25,12 @@ on:
 jobs:
   check:
     runs-on: ubuntu-22.04
+    name: Lint, test and build (ubuntu-22.04)
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy
 
@@ -36,7 +43,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Clippy (backend + CLI)
         run: cargo clippy -p slashit-ui -p slashit -p slashit-ipc -- -D warnings
@@ -45,9 +52,40 @@ jobs:
         run: cargo test -p slashit-ui -p slashit-ipc
 
       - name: Install trunk
-        uses: jetli/trunk-action@v0.5.1
+        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
         with:
           version: latest
 
       - name: Build frontend
         run: trunk build
+
+  # Windows and macOS were previously first compiled at tag time, inside the
+  # release build. That is the worst possible place to discover a
+  # `#[cfg(unix)]` that should have been `#[cfg(not(windows))]`: the tag is
+  # already pushed and the fix needs a new one. The IPC layer now carries three
+  # transports (Unix socket, named pipe, TCP) selected by cfg, so the class of
+  # break this catches is not hypothetical -- it has already happened once.
+  #
+  # `cargo check`, not `clippy -D warnings` and not `tauri build`: this gate
+  # exists to answer "does it still compile off Linux", cheaply enough to run
+  # on every pull request. Lint policy and bundling stay on the Linux job and
+  # the release workflow respectively. The repository is public, so these
+  # runners cost nothing.
+  cross-compile:
+    name: Compile check (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Check (backend + CLI + IPC)
+        run: cargo check -p slashit-ui -p slashit -p slashit-ipc

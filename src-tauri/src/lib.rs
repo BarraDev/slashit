@@ -10,17 +10,24 @@ mod session;
 mod queue;
 mod pty;
 mod worktree;
-// Unix-domain-socket IPC. Gated because the whole module is built on
-// UnixListener and mode bits; without this the Windows build fails to
-// compile rather than merely lacking the feature.
-#[cfg(unix)]
-mod ipc;
+/// Building `AppState` once, for whichever front end wants it.
+pub mod app_core;
+/// Headless execution, sharing the whole stack with the GUI.
+pub mod daemon;
+/// Transport-neutral event emission, so the backend does not need a webview.
+pub mod events;
+/// What kind of process this is, and the few operations that differ.
+pub mod instance;
+// The control channel. No longer Unix-gated: the transport layer now provides
+// a Windows named pipe alongside the Unix socket, so the module compiles and
+// works on every supported platform.
+pub mod ipc;
 
 use commands::*;
 use config::Storage;
 use pty::PtyState;
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -39,8 +46,17 @@ pub struct AppState {
     pub mcp: commands::mcp::McpState,
     pub memory: commands::memory::MemoryState,
     pub appearance: commands::appearance::AppearanceState,
+    pub updater: commands::updater::UpdaterState,
     pub pty: PtyState,
     pub storage: Storage,
+    /// Where backend events go.
+    ///
+    /// A `OnceLock` because the sink is not knowable when the state is built:
+    /// the GUI's sink needs an `AppHandle`, which only exists once Tauri has
+    /// set up. The daemon installs its sink immediately. Until one is
+    /// installed, emitting is a no-op rather than a panic — losing a progress
+    /// event during startup is not worth aborting over.
+    pub events: Arc<std::sync::OnceLock<events::SharedEventSink>>,
     /// The one resolved set of application directories. Commands must read
     /// paths from here rather than deriving their own.
     pub paths: Arc<config::paths::AppPaths>,
@@ -53,240 +69,77 @@ pub struct AppState {
     pub state_location_locks: Arc<commands::state_location::StateLocationLocks>,
 }
 
+impl AppState {
+    /// The installed event sink, or a discarding one if none is installed yet.
+    pub fn events(&self) -> events::SharedEventSink {
+        self.events.get().cloned().unwrap_or_else(events::null_sink)
+    }
+
+    /// Install the sink for this process. The first call wins.
+    pub fn set_event_sink(&self, sink: events::SharedEventSink) {
+        if self.events.set(sink).is_err() {
+            eprintln!("[events] a sink was already installed; ignoring the second one");
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let paths = Arc::new(
-        config::paths::AppPaths::new().expect("Failed to resolve application directories"),
-    );
-    let storage = Storage::with_paths((*paths).clone());
-
-    // Config must be read before the worktree manager is built: it carries the
-    // worktree placement policy, and it populates Storage's project routing
-    // table, which every later task load depends on.
-    let loaded_config = storage.load_config().unwrap_or_else(|e| {
-        eprintln!("Warning: Failed to load config from disk: {}", e);
-        config::storage::AppConfig::default()
-    });
-
-    let task_state = commands::task::TaskState::new();
-    let queue_state = commands::queue::QueueState::new(task_state.tasks.clone());
-    let app_state = AppState {
-        repository: commands::repository::RepositoryState::new(),
-        project: commands::project::ProjectState::new(),
-        workspace: commands::workspace::WorkspaceState::new().expect("Failed to initialize workspace state"),
-        task: task_state,
-        agent: commands::agent::AgentState::new(),
-        session: commands::session::SessionState::new(),
-        jj: commands::jj::JjState::new(),
-        queue: queue_state,
-        roadmap: commands::roadmap::RoadmapState::new(),
-        file: commands::file::FileState::new(),
-        github: commands::github::GithubState::new(),
-        changelog: commands::changelog::ChangelogState::new(),
-        mcp: commands::mcp::McpState::new(),
-        memory: commands::memory::MemoryState::new(),
-        appearance: commands::appearance::AppearanceState::new(),
-        pty: PtyState::new(),
-        storage,
-        worktree_manager: Arc::new(worktree::WorktreeManager::new(
-            paths.clone(),
-            loaded_config.worktree.placement,
-        )),
-        features: Arc::new(tokio::sync::RwLock::new(
-            config::features::FeatureFlags::load(&paths),
-        )),
-        paths,
-        executor: Arc::new(tokio::sync::OnceCell::new()),
-        state_location_locks: Arc::new(commands::state_location::StateLocationLocks::new()),
+    // Ownership first, before a single byte of shared state is read.
+    //
+    // The GUI and `slashitd` are separate processes, so the in-process guard
+    // that serialises `config.toml` writes cannot exclude them from each
+    // other; the OS-authenticated control channel is the only thing that can.
+    // It has to be claimed here rather than after the window is built, because
+    // hydration is not passive: it requeues tasks left `InProgress` — which,
+    // next to a live daemon, means tasks that are running right now — and
+    // writes that back to disk. Losing the race after doing so would corrupt
+    // the running instance's board and then start a second executor against
+    // it.
+    let paths = match config::paths::AppPaths::new() {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("SlashIt: cannot resolve application paths: {e}");
+            std::process::exit(1);
+        }
+    };
+    let ipc_config = slashit_ipc::IpcConfig::load(&paths.ipc_config_file());
+    let bound = match tauri::async_runtime::block_on(ipc::BoundIpc::bind(&paths, &ipc_config)) {
+        Ok(bound) => bound,
+        // Refusing to start is the whole point. Previously this failure was
+        // printed to a terminal a desktop user never sees, and the app carried
+        // on with its own executor and no control channel.
+        Err(e) => {
+            eprintln!(
+                "SlashIt: another SlashIt instance (desktop app or slashitd) is already running \
+                 and owns the control channel, so this one is exiting rather than operating on \
+                 the same data: {e}"
+            );
+            std::process::exit(1);
+        }
     };
 
-    // Repositories load FIRST, then projects (which reference repository_id),
-    // then tasks (which reference project_id).
-    // Insert loaded repositories into repository state
-    {
-        let repositories_map = app_state.repository.repositories.clone();
-        let mut repositories = repositories_map.blocking_write();
-        for (id_str, mut repository) in loaded_config.repositories {
-            if let Ok(id) = uuid::Uuid::parse_str(&id_str) {
-                // Ensure the repository's id field matches the key
-                repository.id = id;
-                repositories.insert(id, repository);
-            } else {
-                eprintln!("Warning: Invalid repository UUID in config: {}", id_str);
-            }
-        }
-        println!("SlashIt: Loaded {} repositories from disk", repositories.len());
-    }
-    
-    // Insert loaded projects into project state
-    {
-        let projects_map = app_state.project.projects.clone();
-        let mut projects = projects_map.blocking_write();
-        for (id_str, mut project) in loaded_config.projects {
-            if let Ok(id) = uuid::Uuid::parse_str(&id_str) {
-                // Ensure the project's id field matches the key
-                project.id = id;
-                projects.insert(id, project);
-            } else {
-                eprintln!("Warning: Invalid project UUID in config: {}", id_str);
-            }
-        }
-        println!("SlashIt: Loaded {} projects from disk", projects.len());
-    }
+    // Hydration is async because it takes tokio locks, and a blocking
+    // acquisition panics on a runtime thread. `block_on` here is safe: the
+    // Tauri event loop has not started, so nothing is waiting on this thread.
+    let (app_state, report) = tauri::async_runtime::block_on(app_core::build_state())
+        .expect("Failed to build application state");
 
-    // Load persisted tasks from disk (synchronous at startup)
-    let loaded_tasks = app_state.storage.load_all_tasks().unwrap_or_else(|e| {
-        eprintln!("Warning: Failed to load tasks from disk: {}", e);
-        Vec::new()
-    });
-    
-    // Insert loaded tasks into task state synchronously at startup
-    let mut migrated_projects = std::collections::HashSet::new();
-    {
-        let tasks_map = app_state.task.tasks.clone();
-        let mut tasks = tasks_map.blocking_write();
-        for mut task in loaded_tasks {
-            let mut changed = false;
-
-            // Migrate old model names to "default"
-            if task.model.starts_with("claude-3") || task.model.starts_with("claude-2") {
-                task.model = "default".to_string();
-                changed = true;
-            }
-
-            // Reset orphaned InProgress/AiReview tasks back to Queue
-            if matches!(task.status, domain::TaskStatus::InProgress | domain::TaskStatus::AiReview) {
-                println!("SlashIt: Resetting orphaned task '{}' from {:?} back to Queue", task.title, task.status);
-                task.status = domain::TaskStatus::Queue;
-                changed = true;
-            }
-
-            // Fix inconsistent phase (e.g. status=Queue but phase=Failed)
-            if matches!(task.status, domain::TaskStatus::Backlog | domain::TaskStatus::Queue)
-                && task.phase != domain::TaskPhase::Idle
-            {
-                task.phase = domain::TaskPhase::Idle;
-                task.phase_progress = 0;
-                task.overall_progress = 0;
-                task.error_message = None;
-                changed = true;
-            }
-
-            if changed {
-                migrated_projects.insert(task.project_id);
-            }
-            tasks.insert(task.id, task);
-        }
-
-        // Verify worktree paths still exist on disk.
-        //
-        // A path that no longer resolves is not automatically stale: upgrading
-        // moves managed worktrees to a new root, so try to adopt the worktree
-        // at its current location before discarding the reference. Clearing
-        // first would strand the branch and any uncommitted work in it.
-        let repo_for_project: std::collections::HashMap<uuid::Uuid, String> = {
-            let projects = app_state.project.projects.blocking_read();
-            let repositories = app_state.repository.repositories.blocking_read();
-            projects
-                .iter()
-                .filter_map(|(id, project)| {
-                    let repo = repositories.get(&project.repository_id?)?;
-                    Some((*id, repo.local_path.clone()))
-                })
-                .collect()
-        };
-
-        // Cache `git worktree list --porcelain` per repository so tasks that
-        // share a repo shell out to git at most once during this loop,
-        // rather than once per task. A failed lookup is cached too: retrying
-        // per task would not make git work, and every task in that repo must
-        // reach the same "could not verify" conclusion anyway.
-        let mut porcelain_cache: std::collections::HashMap<String, Option<String>> =
-            std::collections::HashMap::new();
-
-        for task in tasks.values_mut() {
-            let Some(wt_path) = task.worktree_path.clone() else {
-                continue;
-            };
-            if std::path::Path::new(&wt_path).exists() {
-                continue;
-            }
-
-            let recovery = match (
-                task.branch_name.as_ref(),
-                repo_for_project.get(&task.project_id),
-            ) {
-                (Some(branch), Some(repo)) => {
-                    let porcelain = porcelain_cache
-                        .entry(repo.clone())
-                        .or_insert_with(|| worktree::WorktreeManager::worktree_list_porcelain(repo));
-                    app_state
-                        .worktree_manager
-                        .classify_missing_worktree(repo, branch, porcelain.as_deref())
-                }
-                // No branch was ever recorded, so there is nothing to look a
-                // worktree up by and nothing that could ever recreate it. No
-                // amount of git working would change that answer, so this is
-                // genuine absence rather than a failed check.
-                (None, _) => worktree::WorktreeRecovery::ConfirmedAbsent,
-                // A branch is recorded but the project resolves to no
-                // repository. That is not proof the worktree is gone: this
-                // table is rebuilt from config on every start, and a config
-                // that fails to deserialize cleanly is recovered with no
-                // projects and no repositories at all. Clearing here would
-                // spend every task's reference on a lookup that never
-                // happened.
-                (Some(_), None) => worktree::WorktreeRecovery::Unverified,
-            };
-
-            match recovery {
-                worktree::WorktreeRecovery::Adopt(path) => {
-                    println!(
-                        "SlashIt: Adopted relocated worktree for task '{}' at {}",
-                        task.title, path
-                    );
-                    task.worktree_path = Some(path);
-                }
-                worktree::WorktreeRecovery::ConfirmedAbsent => {
-                    println!("SlashIt: Worktree dir missing for task '{}', clearing reference", task.title);
-                    task.worktree_path = None;
-                }
-                // Git could not be consulted, so nothing here proves the
-                // worktree is gone. `worktree_path` is the only persisted
-                // record of it, and clearing it is not recoverable from here:
-                // this loop skips a task that has none, and the executor's
-                // cleanup-retry pass filters on one too, so no later start
-                // would reconsider it. A transient git failure must not be
-                // allowed to spend it. Left untouched, and deliberately not
-                // marked migrated: nothing changed, so there is nothing to
-                // persist and the next start verifies again.
-                worktree::WorktreeRecovery::Unverified => {
-                    eprintln!(
-                        "Warning: worktree dir missing for task '{}' at {}, but its absence could \
-                         not be confirmed (git worktree list failed, or the project resolved to no \
-                         repository); keeping the reference for the next start",
-                        task.title, wt_path
-                    );
-                    continue;
-                }
-            }
-            migrated_projects.insert(task.project_id);
-        }
-
-        println!("SlashIt: Loaded {} tasks from disk", tasks.len());
-
-        // Persist migrated tasks back to disk
-        for project_id in &migrated_projects {
-            let project_tasks: Vec<domain::Task> = tasks.values()
-                .filter(|t| &t.project_id == project_id)
-                .cloned()
-                .collect();
-            if let Err(e) = app_state.storage.save_project_tasks(*project_id, &project_tasks) {
-                eprintln!("Warning: Failed to persist migrated tasks for project {}: {}", project_id, e);
-            }
-        }
-        if !migrated_projects.is_empty() {
-            println!("SlashIt: Migrated tasks in {} project(s) and saved to disk", migrated_projects.len());
+    println!(
+        "SlashIt: Loaded {} repositories, {} projects, {} tasks from disk",
+        report.repositories, report.projects, report.tasks
+    );
+    if report.migrated_projects > 0 {
+        if report.unsaved_migrated_projects > 0 {
+            println!(
+                "SlashIt: Migrated tasks in {} project(s); {} could not be saved to disk yet and will be retried automatically",
+                report.migrated_projects, report.unsaved_migrated_projects
+            );
+        } else {
+            println!(
+                "SlashIt: Migrated tasks in {} project(s) and saved to disk",
+                report.migrated_projects
+            );
         }
     }
 
@@ -297,6 +150,17 @@ pub fn run() {
         .manage(app_state)
         .setup(|app| {
             let state: tauri::State<AppState> = app.state();
+
+            // The webview exists now, so the sink the rest of the backend
+            // emits through can finally be installed.
+            let events: events::SharedEventSink =
+                Arc::new(events::TauriEventSink::new(app.handle().clone()));
+            state.set_event_sink(events.clone());
+
+            let control: instance::SharedInstanceControl = Arc::new(GuiControl {
+                handle: app.handle().clone(),
+            });
+
             let executor = Arc::new(queue::TaskExecutor::new(
                 queue::executor::TaskExecutorConfig {
                     tasks: state.task.tasks.clone(),
@@ -308,31 +172,43 @@ pub fn run() {
                     workspace_registry: state.workspace.registry.clone(),
                     storage: state.storage.clone(),
                     worktree_manager: state.worktree_manager.clone(),
-                    app_handle: app.handle().clone(),
+                    events: events.clone(),
                 },
             ));
             let _ = state.executor.set(executor.clone());
-            executor.start_polling();
+            // Tauri's runtime, not `tokio::spawn`: this closure runs on the
+            // main thread before the event loop starts, with no reactor in
+            // thread-local scope. Same idiom as the IPC server below.
+            tauri::async_runtime::spawn(executor.polling_loop(None));
             println!("SlashIt: Task executor started");
 
-            // IPC Unix socket server
-            #[cfg(unix)]
+            // The control channel. The same server the daemon runs; only the
+            // sink and the window control differ.
             {
-            let ipc_ctx = ipc::IpcContext {
-                tasks: state.task.tasks.clone(),
-                projects: state.project.projects.clone(),
-                executions: state.agent.executions.clone(),
-                pty: state.pty.clone(),
-                queue_manager: state.queue.manager.clone(),
-                storage: state.storage.clone(),
-                app_handle: app.handle().clone(),
-            };
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = ipc::server::run(ipc_ctx).await {
-                    eprintln!("SlashIt: IPC server error: {}", e);
-                }
-            });
-            println!("SlashIt: IPC server starting");
+                let ipc_ctx = Arc::new(ipc::IpcContext {
+                    tasks: state.task.tasks.clone(),
+                    projects: state.project.projects.clone(),
+                    executions: state.agent.executions.clone(),
+                    pty: state.pty.clone(),
+                    queue_manager: state.queue.manager.clone(),
+                    storage: state.storage.clone(),
+                    events: events.clone(),
+                    control: control.clone(),
+                    features: state.features.clone(),
+                    feature_diagnostics: None,
+                    paths: state.paths.clone(),
+                });
+                // Serving the endpoints claimed before hydration. Nothing is
+                // bound here, so this can no longer fail because another
+                // instance took them in the meantime — that race was decided
+                // at the top of `run()`, while there was still nothing to
+                // corrupt.
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = bound.attach(ipc_ctx).serve().await {
+                        eprintln!("SlashIt: IPC server error: {e}");
+                    }
+                });
+                println!("SlashIt: IPC server starting");
             }
 
             // System tray
@@ -384,6 +260,11 @@ pub fn run() {
             clean_legacy_state_dirs,
             get_feature_flags,
             set_feature_flag,
+            describe_feature_flags,
+            updater_status,
+            updater_check,
+            updater_download_and_install,
+            updater_restart,
             create_repository,
             list_repositories,
             get_repository,
@@ -567,12 +448,29 @@ fn toggle_window(app: &tauri::AppHandle) {
     }
 }
 
+/// Ask to quit, confirming first when work would be lost.
+///
+/// Spawns rather than blocking. The counts come from tokio locks, and this is
+/// reachable both from the tray menu (the event-loop thread, where a blocking
+/// acquisition is legal) and from an IPC `Quit` (a runtime worker, where the
+/// same call would panic). Doing the work on the runtime is correct from
+/// either caller.
 fn request_quit(app: &tauri::AppHandle) {
-    let state = app.state::<AppState>();
-    let pty_count = state.pty.sessions.blocking_lock().len();
-    let agent_count = {
-        let execs = state.agent.executions.blocking_read();
-        execs
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        request_quit_inner(&app).await;
+    });
+}
+
+async fn request_quit_inner(app: &tauri::AppHandle) {
+    let (pty_count, agent_count) = {
+        let state = app.state::<AppState>();
+        let pty_count = state.pty.sessions.lock().await.len();
+        let agent_count = state
+            .agent
+            .executions
+            .read()
+            .await
             .values()
             .filter(|e| {
                 matches!(
@@ -580,7 +478,8 @@ fn request_quit(app: &tauri::AppHandle) {
                     crate::domain::AgentStatus::Running | crate::domain::AgentStatus::Starting
                 )
             })
-            .count()
+            .count();
+        (pty_count, agent_count)
     };
 
     if pty_count == 0 && agent_count == 0 {
@@ -588,12 +487,35 @@ fn request_quit(app: &tauri::AppHandle) {
         return;
     }
 
+    // Something is still running, so surface the window and let the frontend
+    // ask before anything is killed.
     show_window(app);
-    let _ = app.emit(
+    let state = app.state::<AppState>();
+    state.events().emit_json(
         "quit-requested",
         serde_json::json!({
             "pty_count": pty_count,
             "agent_count": agent_count,
         }),
     );
+}
+
+/// The GUI's answer to the operations that differ between front ends.
+struct GuiControl {
+    handle: tauri::AppHandle,
+}
+
+impl instance::InstanceControl for GuiControl {
+    fn mode(&self) -> instance::InstanceMode {
+        instance::InstanceMode::Gui
+    }
+
+    fn show_window(&self) -> Result<(), String> {
+        show_window(&self.handle);
+        Ok(())
+    }
+
+    fn request_quit(&self) {
+        request_quit(&self.handle);
+    }
 }

@@ -1264,6 +1264,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clear_worktree_path_durably_cannot_lose_a_concurrent_update_to_a_sibling_task() {
+        // Regression guard for the stale-snapshot race, carried over from the
+        // daemon branch's own independent fix for this same defect. Both
+        // branches fixed it; this shared helper is the implementation that
+        // survived, because all three cleanup call sites use it, but that
+        // branch's concurrency proof was the stronger of the two and is kept
+        // here rather than dropped with the commit it came from.
+        //
+        // The defect: read the task map, build a whole-project snapshot,
+        // release the guard, and only then persist. A concurrent write to a
+        // *different* task in the same project that reached disk during that
+        // gap would be silently reverted by the now-stale snapshot, because
+        // `save_project_tasks` rewrites the entire project file.
+        //
+        // Proven deterministically rather than by timing luck.
+        // `tokio::sync::RwLock` is task-fair: waiters are granted the lock in
+        // the order they enqueued. `clear_worktree_path_durably` holds a
+        // single *write* guard continuously from the `worktree_path` check
+        // through the synchronous save that follows — strictly stronger than
+        // the read guard the original proof assumed. Taking a write guard here
+        // first blocks both competing operations; letting the cleanup enqueue
+        // before the sibling writer does means fairness guarantees the writer
+        // cannot persist until cleanup's save has already completed.
+        let project_id = Uuid::new_v4();
+        let wt_path = "/tmp/slashit-test-concurrent-cleanup";
+        let (task_id, sibling_id, tasks) = durable_clear_fixture(project_id, wt_path);
+        let (storage, _tmp) = test_storage();
+
+        // Block every reader and writer until both competing operations are
+        // confirmed enqueued, in the intended FIFO order.
+        let blocker = tasks.write().await;
+
+        let cleanup_tasks = tasks.clone();
+        let cleanup_storage = storage.clone();
+        let cleanup_handle = tokio::spawn(async move {
+            clear_worktree_path_durably(&cleanup_tasks, &cleanup_storage, task_id, wt_path).await
+        });
+        // Let the executor poll `cleanup_handle` at least once, so its
+        // `tasks.write()` request registers in the lock's wait queue before
+        // the sibling writer's does below.
+        tokio::task::yield_now().await;
+
+        let writer_tasks = tasks.clone();
+        let writer_storage = storage.clone();
+        let writer_handle = tokio::spawn(async move {
+            let mut w = writer_tasks.write().await;
+            w.get_mut(&sibling_id).unwrap().title = "renamed while cleanup was pending".to_string();
+            let snapshot: Vec<Task> = w
+                .values()
+                .filter(|t| t.project_id == project_id)
+                .cloned()
+                .collect();
+            drop(w);
+            writer_storage
+                .save_project_tasks(project_id, &snapshot)
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        // Both are queued behind this guard now, cleanup ahead of the writer.
+        drop(blocker);
+
+        cleanup_handle
+            .await
+            .expect("cleanup task panicked")
+            .expect("cleanup should succeed");
+        writer_handle.await.expect("writer task panicked");
+
+        let persisted = storage
+            .load_project_tasks(project_id)
+            .expect("tasks must be readable from disk");
+        let sibling = persisted
+            .iter()
+            .find(|t| t.id == sibling_id)
+            .expect("sibling must still be on disk");
+        assert_eq!(
+            sibling.title, "renamed while cleanup was pending",
+            "a concurrent update to a sibling task must survive the cleanup save; a stale \
+             whole-project snapshot would have reverted it"
+        );
+
+        let subject = persisted
+            .iter()
+            .find(|t| t.id == task_id)
+            .expect("subject must still be on disk");
+        assert_eq!(
+            subject.worktree_path, None,
+            "the cleanup's own clear must also have reached disk"
+        );
+    }
+
+    #[tokio::test]
     async fn clear_worktree_path_durably_reports_a_failed_write_and_retains_the_path() {
         // The contract `commands::worktree::cleanup_worktree` now depends on.
         // That command is reachable for any status, while the executor's retry
