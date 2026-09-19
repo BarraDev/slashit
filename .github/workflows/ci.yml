@@ -1,10 +1,20 @@
 name: CI
 
 on:
+  # Validating every push to `main` is enough on the push side: everything
+  # else reaches `main` as a pull request, and gets validated there.
   push:
     branches: [main]
+
+  # Deliberately unfiltered. A stacked pull request targets the branch below
+  # it rather than `main`, and those base branches are ordinary implementation
+  # branches whose names follow no fixed convention — `feat/**` today,
+  # `test/**`, `fix/**` and `ci/**` already, and whatever the next change
+  # needs. A base-branch allowlist here would let branch naming decide whether
+  # a change is validated at all, and a pull request showing no checks reads
+  # as "nothing to run" rather than "never tested". Every pull request gets
+  # CI; what it happens to be based on is not the workflow's business.
   pull_request:
-    branches: [main]
 
 jobs:
   check:
