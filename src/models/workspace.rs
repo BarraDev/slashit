@@ -1,21 +1,14 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// A meta-workspace folder that coordinates one or more projects.
+///
+/// Mirrors `src-tauri/src/domain/workspace.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: Uuid,
-    pub project_id: Uuid,
     pub name: String,
-    pub path: String,
-    pub base_revision: Option<String>,
-    pub current_change_id: Option<String>,
+    pub root_path: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceStatus {
-    pub workspace_id: Uuid,
-    pub current_change_id: Option<String>,
-    pub pending_changes: bool,
-    pub conflicted: bool,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }

@@ -20,6 +20,10 @@ pub struct ClaudeRunConfig {
     /// When true, pass --strict-mcp-config without any --mcp-config files,
     /// effectively disabling all MCP servers (project + user) for this run.
     pub disable_mcp: bool,
+    /// Extra directories to expose to Claude via repeated `--add-dir` flags.
+    /// Used when running from a meta-workspace cwd so the agent can also
+    /// read/write a specific project tree.
+    pub additional_dirs: Vec<std::path::PathBuf>,
 }
 
 /// Events emitted by the Claude runner during execution.
@@ -99,6 +103,17 @@ impl ClaudeRunner {
 
         if config.disable_mcp {
             cmd.arg("--strict-mcp-config");
+        }
+
+        for dir in &config.additional_dirs {
+            if !dir.is_dir() {
+                eprintln!(
+                    "[claude-runner] skipping --add-dir for missing directory: {}",
+                    dir.display()
+                );
+                continue;
+            }
+            cmd.arg("--add-dir").arg(dir);
         }
 
         cmd.current_dir(&config.working_dir);

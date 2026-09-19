@@ -7,9 +7,9 @@ extern "C" {
     async fn invoke(cmd: &str, args: JsValue) -> JsValue;
 }
 
-pub async fn start_agent(workspace_id: String, task_id: Option<String>) -> Result<AgentExecution, String> {
+pub async fn start_agent(worktree_id: String, task_id: Option<String>) -> Result<AgentExecution, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
-        "workspaceId": workspace_id,
+        "worktreeId": worktree_id,
         "taskId": task_id,
     })).unwrap();
 

@@ -39,10 +39,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Clippy (backend + CLI)
-        run: cargo clippy -p slashit-app -p slashit -p slashit-ipc -- -D warnings
+        run: cargo clippy -p slashit-ui -p slashit -p slashit-ipc -- -D warnings
 
       - name: Tests (backend)
-        run: cargo test -p slashit-app -p slashit-ipc
+        run: cargo test -p slashit-ui -p slashit-ipc
 
       - name: Install trunk
         uses: jetli/trunk-action@v0.5.1

@@ -8,6 +8,7 @@ pub mod session;
 pub mod agent;
 pub mod roadmap;
 pub mod github;
+pub mod state_location;
 
 pub use project::*;
 pub use repository::*;
@@ -17,3 +18,4 @@ pub use session::*;
 pub use agent::*;
 pub use roadmap::*;
 pub use github::*;
+pub use state_location::*;

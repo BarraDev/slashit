@@ -1,6 +1,6 @@
 use crate::domain::{
     Task, TaskStatus, TaskCategory, TaskPriority, TaskComplexity,
-    TaskImpact, SecuritySeverity, TaskPhase, Subtask
+    TaskImpact, SecuritySeverity, TaskPhase, Subtask, Project, Repository,
 };
 use crate::domain::task::ExternalRef;
 use crate::config::Storage;
@@ -8,6 +8,212 @@ use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Resolve a project's repository local path.
+///
+/// Used to give worktree cleanup (spawned after a task's status changes) the
+/// `repo_path` that `WorktreeManager::remove` needs to run its git commands
+/// in the right directory. Takes the project/repository maps directly so it
+/// can be called from inside a `tauri::async_runtime::spawn`ed closure that
+/// only cloned those two `Arc`s, not the whole `AppState`.
+async fn resolve_repo_path(
+    projects: &Arc<RwLock<HashMap<Uuid, Project>>>,
+    repositories: &Arc<RwLock<HashMap<Uuid, Repository>>>,
+    project_id: Uuid,
+) -> Result<String, String> {
+    let projects_r = projects.read().await;
+    let project = projects_r.get(&project_id).ok_or("Project not found")?;
+    let repo_id = project.repository_id.ok_or("No repository linked")?;
+    drop(projects_r);
+
+    let repos = repositories.read().await;
+    let repo = repos.get(&repo_id).ok_or("Repository not found")?;
+    Ok(repo.local_path.clone())
+}
+
+/// Resource handles [`cleanup_worktree`] needs, grouped so the function
+/// itself only takes the values that vary per call.
+struct WorktreeCleanupCtx<'a> {
+    worktree_manager: &'a crate::worktree::WorktreeManager,
+    projects: &'a Arc<RwLock<HashMap<Uuid, Project>>>,
+    repositories: &'a Arc<RwLock<HashMap<Uuid, Repository>>>,
+    tasks: &'a Tasks,
+    storage: &'a Storage,
+}
+
+/// Core of [`spawn_worktree_cleanup`], split out so tests can `.await` it
+/// directly instead of going through `tauri::async_runtime::spawn`.
+///
+/// `worktree_path` is the only persisted record of this directory. Every
+/// call site used to clear it — followed immediately by a synchronous
+/// persist — before the detached removal here even ran, so a crash or a
+/// failed `git worktree remove` orphaned the directory with nothing left
+/// pointing back to it. A `resolve_repo_path` or `WorktreeManager::remove`
+/// failure is logged with the task id and path instead, and leaves
+/// `worktree_path` untouched so the directory stays recoverable.
+///
+/// What that recovery is depends on the caller, so the failure messages below
+/// deliberately do not promise a retry. Only a `CleanUpOnly` transition into
+/// `Done` is revisited by the executor's pass, which filters on
+/// `status == Done`. A `ResetAndCleanUp` transition leaves the reference on a
+/// task no pass looks at, and `delete_task` leaves no task at all — there the
+/// retained branch and git's own worktree registration are the only records,
+/// which is why `remove_with_git` keeps the branch when it did not own the
+/// removal.
+async fn cleanup_worktree(ctx: WorktreeCleanupCtx<'_>, task_id: Uuid, project_id: Uuid, wt_path: &str, branch: &str) {
+    let repo_path = match resolve_repo_path(ctx.projects, ctx.repositories, project_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "Warning: worktree cleanup for task {task_id} could not resolve a repository path ({e}); {wt_path} is left on disk and this call cleared no reference to it."
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = ctx.worktree_manager.remove(wt_path, branch, &repo_path).await {
+        eprintln!(
+            "Warning: failed to remove worktree {wt_path} for task {task_id}: {e}. This call cleared no reference to it."
+        );
+        return;
+    }
+
+    if let Err(e) = clear_worktree_path_durably(ctx.tasks, ctx.storage, task_id, wt_path).await {
+        // Nothing here can retry: this path is reached from a status change or
+        // a delete, neither of which runs again on its own, and the executor's
+        // retry pass only looks at `Done` tasks. Leaving the reference in place
+        // is still the right outcome — the next start reconciles it, and any
+        // later save for this project rewrites the file — but the failure has
+        // to be visible rather than swallowed.
+        eprintln!("Warning: worktree cleanup for task {task_id}: {e}");
+    }
+}
+
+/// Clear `task_id`'s `worktree_path`, but only once the cleared record is on
+/// disk.
+///
+/// `worktree_path` is the only persisted record of a worktree, so publishing
+/// the clear to shared memory before the write succeeds leaves the board
+/// disagreeing with disk with nothing left to reconcile them: the executor's
+/// retry pass selects on the *in-memory* value, so a task cleared in memory is
+/// never revisited, and the stale file survives until some unrelated mutation
+/// happens to rewrite it. This is the same persist-before-publish contract the
+/// project and repository saves use.
+///
+/// The whole transaction runs under one write guard, so no sibling save can
+/// land between the write and the in-memory commit.
+///
+/// `Err` means the write failed and the reference is still recorded in both
+/// places, which is what keeps a `Done` task eligible for the retry pass.
+pub(crate) async fn clear_worktree_path_durably(
+    tasks: &Tasks,
+    storage: &Storage,
+    task_id: Uuid,
+    wt_path: &str,
+) -> Result<(), String> {
+    let mut tasks_w = tasks.write().await;
+
+    let Some(task) = tasks_w.get(&task_id) else {
+        return Ok(()); // deleted while its worktree was being removed
+    };
+    if task.worktree_path.as_deref() != Some(wt_path) {
+        // The task now records a different worktree, so a re-run recreated one
+        // after this cleanup started. Clearing that reference would discard a
+        // worktree this call never removed.
+        return Ok(());
+    }
+    let project_id = task.project_id;
+
+    let staged: Vec<Task> = tasks_w
+        .values()
+        .filter(|t| t.project_id == project_id)
+        .map(|t| {
+            let mut staged = t.clone();
+            if staged.id == task_id {
+                staged.worktree_path = None;
+            }
+            staged
+        })
+        .collect();
+
+    storage
+        .save_project_tasks(project_id, &staged)
+        .map_err(|e| {
+            format!("worktree {wt_path} was removed, but clearing it from the task board failed: {e}")
+        })?;
+
+    if let Some(t) = tasks_w.get_mut(&task_id) {
+        t.worktree_path = None;
+    }
+    Ok(())
+}
+
+/// Remove a task's worktree in the background; see [`cleanup_worktree`] for
+/// the retain-on-failure invariant this preserves.
+fn spawn_worktree_cleanup(
+    state: &crate::AppState,
+    task_id: Uuid,
+    project_id: Uuid,
+    wt_path: String,
+    branch: String,
+) {
+    let wt_mgr = state.worktree_manager.clone();
+    let projects = state.project.projects.clone();
+    let repositories = state.repository.repositories.clone();
+    let tasks = state.task.tasks.clone();
+    let storage = state.storage.clone();
+
+    tauri::async_runtime::spawn(async move {
+        cleanup_worktree(
+            WorktreeCleanupCtx {
+                worktree_manager: &wt_mgr,
+                projects: &projects,
+                repositories: &repositories,
+                tasks: &tasks,
+                storage: &storage,
+            },
+            task_id,
+            project_id,
+            &wt_path,
+            &branch,
+        )
+        .await;
+    });
+}
+
+/// How a status transition affects a task's execution state and worktree.
+///
+/// `update_task_status` and `reorder_task` used to check these as two
+/// independent `if`s. An Error-to-Done transition matches both conditions
+/// (`old_status == Error` from the first, `new_status == Done` from the
+/// second), so with `worktree_path` no longer cleared inside the first
+/// branch, both would fire and spawn cleanup twice for the same path.
+/// Classifying the transition into one variant makes that overlap
+/// structurally impossible instead of relying on `if`/`else if` ordering at
+/// every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusTransitionEffect {
+    /// Moving out of an error state or back to an early column: reset
+    /// phase/progress/error, and clean up any worktree.
+    ResetAndCleanUp,
+    /// Moving to `Done`: clean up the worktree, keep everything else
+    /// (including `branch_name`, for PR creation) untouched.
+    CleanUpOnly,
+    /// No cleanup-relevant effect.
+    None,
+}
+
+fn classify_status_transition(old_status: &TaskStatus, new_status: &TaskStatus) -> StatusTransitionEffect {
+    if *old_status == TaskStatus::Error
+        || matches!(new_status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
+    {
+        StatusTransitionEffect::ResetAndCleanUp
+    } else if matches!(new_status, TaskStatus::Done) {
+        StatusTransitionEffect::CleanUpOnly
+    } else {
+        StatusTransitionEffect::None
+    }
+}
 
 pub type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
 
@@ -97,7 +303,7 @@ pub async fn create_task(
         model: params.model,
         planning_mode: params.planning_mode,
         dependencies,
-        workspace_id: None,
+        worktree_id: None,
         jj_change_id: None,
         category: params.category.unwrap_or_default(),
         priority: params.priority.unwrap_or_default(),
@@ -163,46 +369,35 @@ pub async fn update_task_status(
         task.status = status.clone();
         task.updated_at = chrono::Utc::now();
 
-        // Reset execution state when moving out of Error or back to early columns
-        if old_status == TaskStatus::Error
-            || matches!(status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
-        {
-            task.phase = TaskPhase::Idle;
-            task.phase_progress = 0;
-            task.overall_progress = 0;
-            task.error_message = None;
-            // Cleanup worktree dir but keep branch for potential re-use
-            if let Some(wt_path) = &task.worktree_path {
-                let wt_path = wt_path.clone();
-                let branch = task.branch_name.clone().unwrap_or_default();
-                let wt_mgr = state.worktree_manager.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = wt_mgr.remove(&wt_path, &branch).await;
-                });
+        // Reset execution state when moving out of Error or back to early
+        // columns; clean up the worktree exactly once either way.
+        match classify_status_transition(&old_status, &status) {
+            StatusTransitionEffect::ResetAndCleanUp => {
+                task.phase = TaskPhase::Idle;
+                task.phase_progress = 0;
+                task.overall_progress = 0;
+                task.error_message = None;
+                if let Some(wt_path) = task.worktree_path.clone() {
+                    let branch = task.branch_name.clone().unwrap_or_default();
+                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+                }
             }
-            task.worktree_path = None;
-        }
-
-        // Cleanup worktree when moving to Done (keep branch for PR)
-        if matches!(status, TaskStatus::Done) {
-            if let Some(wt_path) = &task.worktree_path {
-                let wt_path = wt_path.clone();
-                let branch = task.branch_name.clone().unwrap_or_default();
-                let wt_mgr = state.worktree_manager.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = wt_mgr.remove(&wt_path, &branch).await;
-                });
+            StatusTransitionEffect::CleanUpOnly => {
+                // Keep branch_name for PR creation.
+                if let Some(wt_path) = task.worktree_path.clone() {
+                    let branch = task.branch_name.clone().unwrap_or_default();
+                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+                }
             }
-            task.worktree_path = None;
-            // Keep branch_name for PR creation
+            StatusTransitionEffect::None => {}
         }
 
         let updated_task = task.clone();
         let project_id = task.project_id;
-        
+
         // Persist to disk
         persist_project_tasks(&state.storage, &tasks, project_id);
-        
+
         Ok(Some(updated_task))
     } else {
         Ok(None)
@@ -571,15 +766,14 @@ pub async fn delete_task(
     // Get project_id before removal for persistence
     let project_id = tasks.get(&task_id).map(|t| t.project_id);
 
-    // Cleanup worktree and branch before removing
+    // Cleanup worktree and branch before removing. The task record itself is
+    // about to be deleted, so a failure here has no persisted task left to
+    // retain the path on — the failure is logged so the orphaned directory
+    // is at least discoverable, per `spawn_worktree_cleanup`'s own logging.
     if let Some(task) = tasks.get(&task_id) {
-        if let Some(wt_path) = &task.worktree_path {
-            let wt_path = wt_path.clone();
+        if let Some(wt_path) = task.worktree_path.clone() {
             let branch = task.branch_name.clone().unwrap_or_default();
-            let wt_mgr = state.worktree_manager.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = wt_mgr.remove(&wt_path, &branch).await;
-            });
+            spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
         }
     }
 
@@ -642,38 +836,27 @@ pub async fn reorder_task(
         if old_status != target_status {
             task.status = target_status.clone();
 
-            // Reset execution state when moving out of Error or to early columns
-            if old_status == TaskStatus::Error
-                || matches!(target_status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
-            {
-                task.phase = TaskPhase::Idle;
-                task.phase_progress = 0;
-                task.overall_progress = 0;
-                task.error_message = None;
-                // Cleanup worktree dir but keep branch for potential re-use
-                if let Some(wt_path) = &task.worktree_path {
-                    let wt_path = wt_path.clone();
-                    let branch = task.branch_name.clone().unwrap_or_default();
-                    let wt_mgr = state.worktree_manager.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = wt_mgr.remove(&wt_path, &branch).await;
-                    });
+            // Reset execution state when moving out of Error or to early
+            // columns; clean up the worktree exactly once either way.
+            match classify_status_transition(&old_status, &target_status) {
+                StatusTransitionEffect::ResetAndCleanUp => {
+                    task.phase = TaskPhase::Idle;
+                    task.phase_progress = 0;
+                    task.overall_progress = 0;
+                    task.error_message = None;
+                    if let Some(wt_path) = task.worktree_path.clone() {
+                        let branch = task.branch_name.clone().unwrap_or_default();
+                        spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+                    }
                 }
-                task.worktree_path = None;
-            }
-
-            // Cleanup worktree when moving to Done (keep branch for PR)
-            if matches!(target_status, TaskStatus::Done) {
-                if let Some(wt_path) = &task.worktree_path {
-                    let wt_path = wt_path.clone();
-                    let branch = task.branch_name.clone().unwrap_or_default();
-                    let wt_mgr = state.worktree_manager.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = wt_mgr.remove(&wt_path, &branch).await;
-                    });
+                StatusTransitionEffect::CleanUpOnly => {
+                    // Keep branch_name for PR creation.
+                    if let Some(wt_path) = task.worktree_path.clone() {
+                        let branch = task.branch_name.clone().unwrap_or_default();
+                        spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+                    }
                 }
-                task.worktree_path = None;
-                // Keep branch_name for PR creation
+                StatusTransitionEffect::None => {}
             }
         }
         task.updated_at = chrono::Utc::now();
@@ -729,8 +912,17 @@ pub async fn remove_external_ref(
     }
 }
 
-/// Core update_task_status logic extracted for testability
-/// Applies status transition rules without Tauri state or persistence
+/// Core update_task_status logic extracted for testability.
+///
+/// Applies status transition rules without Tauri state, worktree removal, or
+/// persistence. Classification is delegated to [`classify_status_transition`]
+/// — the same function `update_task_status`/`reorder_task` use — so this
+/// helper cannot drift into teaching a different contract than production.
+///
+/// Deliberately does **not** clear `worktree_path`: production only clears it
+/// once [`cleanup_worktree`]'s actual removal succeeds, and this helper never
+/// runs any removal. Clearing it here would model a cleanup that never
+/// happened, exactly the bug this file's worktree-lifecycle fix closed.
 #[cfg(test)]
 pub fn update_task_status_logic(
     tasks: &mut HashMap<Uuid, Task>,
@@ -742,20 +934,11 @@ pub fn update_task_status_logic(
         task.status = status.clone();
         task.updated_at = chrono::Utc::now();
 
-        // Reset execution state when moving out of Error or back to early columns
-        if old_status == TaskStatus::Error
-            || matches!(status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
-        {
+        if let StatusTransitionEffect::ResetAndCleanUp = classify_status_transition(&old_status, &status) {
             task.phase = TaskPhase::Idle;
             task.phase_progress = 0;
             task.overall_progress = 0;
             task.error_message = None;
-            task.worktree_path = None;
-        }
-
-        // Cleanup worktree when moving to Done (keep branch for PR)
-        if matches!(status, TaskStatus::Done) {
-            task.worktree_path = None;
         }
 
         Some(task.clone())
@@ -818,12 +1001,9 @@ pub fn reorder_task_logic(
 ) -> Option<Task> {
     // Get the task and its current/new status
     let (project_id, old_status, target_status) = {
-        if let Some(task) = tasks.get(&task_id) {
-            let target = new_status.clone().unwrap_or(task.status.clone());
-            (task.project_id, task.status.clone(), target)
-        } else {
-            return None;
-        }
+        let task = tasks.get(&task_id)?;
+        let target = new_status.clone().unwrap_or(task.status.clone());
+        (task.project_id, task.status.clone(), target)
     };
 
     // Collect task IDs in the target column, sorted by position
@@ -866,6 +1046,420 @@ mod tests {
     /// Helper to create a HashMap of tasks for testing
     fn create_test_tasks_map(tasks: Vec<Task>) -> HashMap<Uuid, Task> {
         tasks.into_iter().map(|t| (t.id, t)).collect()
+    }
+
+    fn test_worktree_manager() -> crate::worktree::WorktreeManager {
+        let root = std::env::temp_dir().join(format!("slashit-task-wt-test-{}", Uuid::new_v4()));
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        ));
+        // `Managed` forces the git-native path regardless of whether `wt`
+        // happens to be installed on the machine running this test.
+        crate::worktree::WorktreeManager::new(paths, crate::config::paths::WorktreePlacement::Managed)
+    }
+
+    fn test_storage() -> (Storage, tempfile::TempDir) {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let storage = Storage::with_paths(crate::config::paths::AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        ));
+        (storage, temp)
+    }
+
+    fn create_temp_git_repo() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .output()
+                .expect("git command failed to spawn")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        tmp
+    }
+
+    fn test_project(id: Uuid, repository_id: Option<Uuid>) -> Project {
+        Project {
+            id,
+            name: "test-project".to_string(),
+            repository_id,
+            scope: crate::domain::ProjectScope::Standalone,
+            state_location: crate::config::paths::StateLocation::External,
+            agent_type: crate::domain::AgentType::ClaudeCode,
+            agent_config: crate::domain::AgentConfig {
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn test_repository(id: Uuid, local_path: String) -> Repository {
+        Repository {
+            id,
+            local_path,
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_worktree_clears_worktree_path_only_after_successful_removal() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let wt_mgr = test_worktree_manager();
+        let info = wt_mgr
+            .create(&repo_path, "cleanup-success")
+            .await
+            .expect("create failed");
+
+        let project_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            test_project(project_id, Some(repo_id)),
+        )])));
+        let repositories = Arc::new(RwLock::new(HashMap::from([(
+            repo_id,
+            test_repository(repo_id, repo_path),
+        )])));
+
+        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
+        task.worktree_path = Some(info.path.clone());
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
+        let (storage, _tmp) = test_storage();
+
+        cleanup_worktree(
+            WorktreeCleanupCtx {
+                worktree_manager: &wt_mgr,
+                projects: &projects,
+                repositories: &repositories,
+                tasks: &tasks,
+                storage: &storage,
+            },
+            task_id,
+            project_id,
+            &info.path,
+            "cleanup-success",
+        )
+        .await;
+
+        let tasks_r = tasks.read().await;
+        assert_eq!(
+            tasks_r.get(&task_id).unwrap().worktree_path, None,
+            "worktree_path must be cleared once removal actually succeeded"
+        );
+        assert!(
+            !std::path::Path::new(&info.path).exists(),
+            "the worktree directory itself must be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_worktree_retains_worktree_path_when_the_board_cannot_be_saved() {
+        // This is the status-change and delete path, not the executor's, and
+        // it has no retry pass of its own — so publishing the clear to memory
+        // while the write failed would leave the board and disk disagreeing
+        // with nothing left to reconcile them until the next start.
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let wt_mgr = test_worktree_manager();
+        let info = wt_mgr
+            .create(&repo_path, "cleanup-unsaveable")
+            .await
+            .expect("create failed");
+
+        let project_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            test_project(project_id, Some(repo_id)),
+        )])));
+        let repositories = Arc::new(RwLock::new(HashMap::from([(
+            repo_id,
+            test_repository(repo_id, repo_path),
+        )])));
+
+        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
+        task.worktree_path = Some(info.path.clone());
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
+        let (storage, _tmp) = test_storage();
+
+        // A regular file where the tasks directory has to be makes the atomic
+        // write fail with `NotADirectory`. No permission bits, so this behaves
+        // the same for every user including root.
+        std::fs::write(
+            storage.paths().config_dir().join("tasks"),
+            b"not a directory",
+        )
+        .expect("place persistence blocker");
+
+        cleanup_worktree(
+            WorktreeCleanupCtx {
+                worktree_manager: &wt_mgr,
+                projects: &projects,
+                repositories: &repositories,
+                tasks: &tasks,
+                storage: &storage,
+            },
+            task_id,
+            project_id,
+            &info.path,
+            "cleanup-unsaveable",
+        )
+        .await;
+
+        assert_eq!(
+            tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
+            Some(info.path.as_str()),
+            "the reference must survive in memory when it could not be persisted"
+        );
+    }
+
+    /// Make every `save_project_tasks` fail deterministically by putting a
+    /// regular file where the tasks directory has to be, so the `create_dir_all`
+    /// inside the atomic write fails with `AlreadyExists`. No permission bits,
+    /// so this behaves identically for every user including root.
+    fn block_task_persistence(storage: &Storage) {
+        let blocker = storage.paths().config_dir().join("tasks");
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("place persistence blocker");
+    }
+
+    /// A task holding `wt_path`, plus a sibling in the same project that the
+    /// whole-file rewrite must not drop.
+    fn durable_clear_fixture(project_id: Uuid, wt_path: &str) -> (Uuid, Uuid, Tasks) {
+        let mut subject = create_test_task_full("subject", project_id, TaskStatus::Done, 0);
+        subject.worktree_path = Some(wt_path.to_string());
+        let sibling = create_test_task_full("sibling", project_id, TaskStatus::Backlog, 1);
+        let (subject_id, sibling_id) = (subject.id, sibling.id);
+        (
+            subject_id,
+            sibling_id,
+            Arc::new(RwLock::new(create_test_tasks_map(vec![subject, sibling]))),
+        )
+    }
+
+    #[tokio::test]
+    async fn clear_worktree_path_durably_reports_a_failed_write_and_retains_the_path() {
+        // The contract `commands::worktree::cleanup_worktree` now depends on.
+        // That command is reachable for any status, while the executor's retry
+        // pass only revisits `Done` tasks, so this `Err` is the entire recovery
+        // story there: it is what lets the dialog tell the user to try again.
+        let project_id = Uuid::new_v4();
+        let (task_id, _sibling, tasks) = durable_clear_fixture(project_id, "/tmp/wt/task-aaaa1111");
+        let (storage, _tmp) = test_storage();
+        block_task_persistence(&storage);
+
+        let result =
+            clear_worktree_path_durably(&tasks, &storage, task_id, "/tmp/wt/task-aaaa1111").await;
+
+        assert!(result.is_err(), "a failed write must be reported, not swallowed");
+        assert_eq!(
+            tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
+            Some("/tmp/wt/task-aaaa1111"),
+            "the reference must survive in memory so the retry pass can still see it"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_worktree_path_durably_declines_to_clear_a_newer_worktree_path() {
+        // `commands::worktree::cleanup_worktree` used to clear
+        // `worktree_path` unconditionally, so a re-run that recreated a
+        // worktree while the removal was in flight had the reference to its
+        // *new* worktree erased by a cleanup that never touched it.
+        let project_id = Uuid::new_v4();
+        let (task_id, _sibling, tasks) = durable_clear_fixture(project_id, "/tmp/wt/new-worktree");
+        let (storage, _tmp) = test_storage();
+
+        clear_worktree_path_durably(&tasks, &storage, task_id, "/tmp/wt/old-worktree")
+            .await
+            .expect("a stale cleanup is not an error, it simply clears nothing");
+
+        assert_eq!(
+            tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
+            Some("/tmp/wt/new-worktree"),
+            "the replacement worktree must keep its reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_worktree_path_durably_keeps_sibling_tasks() {
+        let project_id = Uuid::new_v4();
+        let (task_id, sibling_id, tasks) = durable_clear_fixture(project_id, "/tmp/wt/x");
+        let (storage, _tmp) = test_storage();
+
+        clear_worktree_path_durably(&tasks, &storage, task_id, "/tmp/wt/x")
+            .await
+            .expect("save should succeed");
+
+        let persisted = storage.load_project_tasks(project_id).expect("reload tasks");
+        assert_eq!(persisted.len(), 2, "the sibling must still be on disk");
+        assert!(
+            persisted.iter().find(|t| t.id == task_id).unwrap().worktree_path.is_none(),
+            "the cleared path must be the one on disk"
+        );
+        assert_eq!(
+            persisted.iter().find(|t| t.id == sibling_id).unwrap().title,
+            "sibling",
+            "the sibling must survive the whole-file rewrite intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_worktree_retains_worktree_path_when_repo_path_cannot_be_resolved() {
+        let wt_mgr = test_worktree_manager();
+        // `project_id` deliberately has no entry in `projects` below, so
+        // `resolve_repo_path` fails before any git command ever runs.
+        let project_id = Uuid::new_v4();
+        let projects = Arc::new(RwLock::new(HashMap::new()));
+        let repositories = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
+        task.worktree_path = Some("/tmp/does-not-matter".to_string());
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
+        let (storage, _tmp) = test_storage();
+
+        cleanup_worktree(
+            WorktreeCleanupCtx {
+                worktree_manager: &wt_mgr,
+                projects: &projects,
+                repositories: &repositories,
+                tasks: &tasks,
+                storage: &storage,
+            },
+            task_id,
+            project_id,
+            "/tmp/does-not-matter",
+            "some-branch",
+        )
+        .await;
+
+        let tasks_r = tasks.read().await;
+        assert_eq!(
+            tasks_r.get(&task_id).unwrap().worktree_path.as_deref(),
+            Some("/tmp/does-not-matter"),
+            "an unresolved repo path must leave worktree_path untouched, not clear it"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_worktree_retains_worktree_path_when_removal_fails() {
+        let wt_mgr = test_worktree_manager();
+        let project_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        // A repo path that does not exist on disk makes every git invocation
+        // in `remove_with_git` fail to spawn (its `current_dir` is invalid),
+        // giving a real, deterministic removal failure to test against.
+        let bogus_repo_path = "/definitely/does/not/exist/slashit-test-xyz".to_string();
+
+        let projects = Arc::new(RwLock::new(HashMap::from([(
+            project_id,
+            test_project(project_id, Some(repo_id)),
+        )])));
+        let repositories = Arc::new(RwLock::new(HashMap::from([(
+            repo_id,
+            test_repository(repo_id, bogus_repo_path),
+        )])));
+
+        let mut task = create_test_task_full("t", project_id, TaskStatus::Done, 0);
+        task.worktree_path = Some("/tmp/some-worktree-path".to_string());
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(create_test_tasks_map(vec![task])));
+        let (storage, _tmp) = test_storage();
+
+        cleanup_worktree(
+            WorktreeCleanupCtx {
+                worktree_manager: &wt_mgr,
+                projects: &projects,
+                repositories: &repositories,
+                tasks: &tasks,
+                storage: &storage,
+            },
+            task_id,
+            project_id,
+            "/tmp/some-worktree-path",
+            "some-branch",
+        )
+        .await;
+
+        let tasks_r = tasks.read().await;
+        assert_eq!(
+            tasks_r.get(&task_id).unwrap().worktree_path.as_deref(),
+            Some("/tmp/some-worktree-path"),
+            "a failed removal must leave worktree_path in place for retry"
+        );
+    }
+
+    #[test]
+    fn classify_status_transition_never_matches_both_effects_for_error_to_done() {
+        // The one transition where the naive two-`if` version overlapped:
+        // old_status == Error (matches the reset condition) and
+        // new_status == Done (matches the cleanup-only condition). Exactly
+        // one variant must come back, or callers spawn cleanup twice.
+        assert_eq!(
+            classify_status_transition(&TaskStatus::Error, &TaskStatus::Done),
+            StatusTransitionEffect::ResetAndCleanUp,
+            "an Error-to-Done transition must classify as exactly one effect"
+        );
+    }
+
+    #[test]
+    fn classify_status_transition_covers_every_status_pair_with_exactly_one_effect() {
+        // Exhaustive over every (old, new) pair: whichever effect comes back,
+        // it must be the *only* one that would have matched under the
+        // original two independent `if` conditions, for every status this
+        // enum has today — not just the one overlapping case above.
+        let all = [
+            TaskStatus::Backlog, TaskStatus::Queue, TaskStatus::InProgress, TaskStatus::AiReview,
+            TaskStatus::HumanReview, TaskStatus::Done, TaskStatus::PrCreated, TaskStatus::Error,
+        ];
+        for old in &all {
+            for new in &all {
+                let reset_matches = *old == TaskStatus::Error
+                    || matches!(new, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress);
+                let cleanup_only_matches = matches!(new, TaskStatus::Done);
+                let effect = classify_status_transition(old, new);
+                match effect {
+                    StatusTransitionEffect::ResetAndCleanUp => assert!(
+                        reset_matches,
+                        "{old:?} -> {new:?} classified ResetAndCleanUp but the reset condition doesn't hold"
+                    ),
+                    StatusTransitionEffect::CleanUpOnly => assert!(
+                        !reset_matches && cleanup_only_matches,
+                        "{old:?} -> {new:?} classified CleanUpOnly but reset also matches (would double-spawn)"
+                    ),
+                    StatusTransitionEffect::None => assert!(
+                        !reset_matches && !cleanup_only_matches,
+                        "{old:?} -> {new:?} classified None but one of the effects should apply"
+                    ),
+                }
+            }
+        }
     }
 
     #[test]
@@ -1223,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn test_status_any_to_done_clears_worktree_path() {
+    fn test_status_any_to_done_retains_worktree_path_until_cleanup_succeeds() {
         let project_id = Uuid::new_v4();
         let mut task = create_test_task_full("Task 1", project_id, TaskStatus::InProgress, 0);
         task.worktree_path = Some("/tmp/wt-test".to_string());
@@ -1236,9 +1830,12 @@ mod tests {
         assert!(result.is_some());
         let updated = result.unwrap();
         assert_eq!(updated.status, TaskStatus::Done);
-        // worktree_path cleared (both by the early-column reset and Done cleanup)
-        assert!(updated.worktree_path.is_none());
-        // branch_name kept for PR creation (Done cleanup does not clear it)
+        // This helper never runs worktree removal, so it must not model
+        // removal as already successful — production only clears
+        // `worktree_path` once `cleanup_worktree`'s actual removal succeeds.
+        assert_eq!(updated.worktree_path, Some("/tmp/wt-test".to_string()));
+        // branch_name kept for PR creation either way.
+        assert_eq!(updated.branch_name, Some("feature-branch".to_string()));
     }
 
     #[test]

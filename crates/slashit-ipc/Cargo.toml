@@ -12,3 +12,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+[target.'cfg(unix)'.dependencies]
+# Only for getuid(), to qualify the socket directory per user when
+# XDG_RUNTIME_DIR is unset.
+libc = "0.2"

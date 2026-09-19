@@ -1,5 +1,5 @@
+use crate::config::paths::AppPaths;
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-const APP_NAME: &str = "slashit-app";
 const MAX_SCROLLBACK_SIZE: usize = 100 * 1024; // 100KB per session
 
 /// Metadata about a PTY session that persists across app restarts
@@ -119,16 +118,19 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn new() -> Result<Self> {
-        let proj_dirs = ProjectDirs::from("com", "barradev", APP_NAME)
-            .context("Failed to get project directories")?;
+        let paths = AppPaths::new().context("Failed to resolve application directories")?;
+        Self::with_paths(&paths)
+    }
 
-        let data_dir = proj_dirs.data_dir();
-        fs::create_dir_all(data_dir)
-            .context("Failed to create data directory")?;
+    /// Build against explicit roots. Terminal scrollback is machine-local, so
+    /// it always lives under `data_dir` and is never relocatable into a project.
+    pub fn with_paths(paths: &AppPaths) -> Result<Self> {
+        let data_dir = paths.data_dir();
+        fs::create_dir_all(data_dir).context("Failed to create data directory")?;
 
-        let store_path = data_dir.join("terminal_sessions.toml");
-
-        Ok(Self { store_path })
+        Ok(Self {
+            store_path: data_dir.join("terminal_sessions.toml"),
+        })
     }
 
     /// Load all session metadata from disk

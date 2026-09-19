@@ -36,17 +36,17 @@ impl Default for AgentState {
 #[tauri::command]
 pub async fn start_agent(
     state: tauri::State<'_, crate::AppState>,
-    workspace_id: String,
+    worktree_id: String,
     task_id: Option<String>,
 ) -> Result<AgentExecution, String> {
-    let workspace_id = Uuid::parse_str(&workspace_id).map_err(|e| e.to_string())?;
+    let worktree_id = Uuid::parse_str(&worktree_id).map_err(|e| e.to_string())?;
     let task_id = task_id.and_then(|t| Uuid::parse_str(&t).ok());
     let id = Uuid::new_v4();
     let now = chrono::Utc::now();
 
     let execution = AgentExecution {
         id,
-        workspace_id,
+        worktree_id: Some(worktree_id),
         task_id,
         agent_type: "claude-code".to_string(),
         status: AgentStatus::Starting,

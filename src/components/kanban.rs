@@ -202,8 +202,22 @@ pub fn Kanban(
                         item_status.update(|m| { m.insert(id, PrItemStatus::Failed(err)); });
                     }
                 }
+                // Backend emits this for items already `fix_done && reply_posted`
+                // at apply time. Drop the Running marker so the persisted lifecycle
+                // badge (Fixed · Replied) takes over instead of getting frozen.
+                "item_skipped" => {
+                    if let Some(id) = ev.comment_id {
+                        item_status.update(|m| { m.remove(&id); });
+                    }
+                }
                 "all_done" => {
                     overall.set(None);
+                    // Defensive cleanup: if any item is still marked Running here,
+                    // a terminal event must have been missed. Clear so badges fall
+                    // back to the persisted plan, which is authoritative post-run.
+                    item_status.update(|m| {
+                        m.retain(|_, v| !matches!(v, PrItemStatus::Running));
+                    });
                 }
                 _ => {}
             }
@@ -355,7 +369,13 @@ pub fn Kanban(
                 .map(|p| !p.comments.is_empty() || !p.items.is_empty())
                 .unwrap_or(false);
             if has_useful_cache {
-                pr_review_plan.set(task.pr_review_plan.clone());
+                // Reconcile lifecycle flags from the persisted last_apply before
+                // showing — older plans saved before per-item flags existed have
+                // fix_done/reply_posted=false on items the prior apply actually
+                // landed, so the badges would lie otherwise.
+                let mut cached = task.pr_review_plan.clone().expect("checked above");
+                cached.backfill_lifecycle_from_last_apply();
+                pr_review_plan.set(Some(cached));
                 pr_review_loading.set(false);
                 show_pr_review_modal.set(true);
                 return;
@@ -989,21 +1009,23 @@ fn PrReviewModal(
         });
     };
 
-    // Count of approved Fix items whose code edit is on disk but whose GitHub
-    // reply was never posted. Drives the "Sync replies" button visibility.
+    // Count of items Sync would act on: missing replies (POST) plus legacy
+    // replies that need to be located on GitHub and rewritten to the
+    // signature-free format (`reply_posted=true` but `pr_reply_text=None`).
+    // Items with `pr_reply_text=Some(_)` are already in the new format.
     let deferred_reply_count = move || plan.get()
         .map(|p| p.items.iter()
             .filter(|i| i.approved
                 && matches!(i.decision, PrReviewDecisionKind::Fix)
                 && i.fix_done
-                && !i.reply_posted)
+                && (!i.reply_posted || i.pr_reply_text.is_none()))
             .count())
         .unwrap_or(0);
 
     let on_sync_replies = move |_| {
         let Some(task_value) = task.get() else { return; };
         if deferred_reply_count() == 0 {
-            toast::error("No deferred replies — every fixed item already has a reply".to_string());
+            toast::error("Nothing to sync — every fixed item already has a reply in the current format".to_string());
             return;
         }
         // Reuse the `applying` lock for the modal-busy treatment; sync is a
@@ -1015,12 +1037,14 @@ fn PrReviewModal(
             match sync_pr_review_replies(task_id.clone()).await {
                 Ok(result) => {
                     let mut parts: Vec<String> = Vec::new();
-                    if result.replied > 0 { parts.push(format!("Posted {} replies", result.replied)); }
-                    if result.already_done > 0 { parts.push(format!("{} already done", result.already_done)); }
+                    if result.replied > 0 { parts.push(format!("Posted {} new", result.replied)); }
+                    if result.rewritten > 0 { parts.push(format!("Rewrote {} ({} via discovery)", result.rewritten, result.discovered)); }
+                    if result.unmatched > 0 { parts.push(format!("{} could not be located on GitHub", result.unmatched)); }
                     if result.fix_pending > 0 { parts.push(format!("{} still need a fix", result.fix_pending)); }
                     if !result.errors.is_empty() { parts.push(format!("{} errors", result.errors.len())); }
                     let msg = if parts.is_empty() { "Nothing to sync".to_string() } else { parts.join(", ") };
-                    if result.errors.is_empty() && result.replied > 0 {
+                    let did_work = result.replied > 0 || result.rewritten > 0;
+                    if result.errors.is_empty() && did_work {
                         toast::success(msg);
                     } else if !result.errors.is_empty() {
                         let detail = result.errors.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
@@ -1037,6 +1061,11 @@ fn PrReviewModal(
                             if let Some(refreshed_plan) = updated.pr_review_plan.clone() {
                                 plan.set(Some(refreshed_plan));
                             }
+                            set_tasks.update(|tasks| {
+                                if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
+                                    *t = updated;
+                                }
+                            });
                         }
                     });
                 }
@@ -1373,16 +1402,24 @@ fn PrReviewModal(
                                     format!("Re-discuss {} questions", pending_discussion_count())
                                 }}
                             </button>
-                            <Show when=move || { deferred_reply_count() > 0 }>
-                                <button
-                                    class="px-3 py-1.5 rounded-lg text-xs text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 transition-colors disabled:opacity-40"
-                                    on:click=on_sync_replies
-                                    disabled=move || busy()
-                                    title="Post deferred replies on GitHub for items that were fixed but never replied to. No agent run, no push."
-                                >
-                                    {move || format!("Sync {} replies", deferred_reply_count())}
-                                </button>
-                            </Show>
+                            <button
+                                class=move || {
+                                    if deferred_reply_count() > 0 {
+                                        "px-3 py-1.5 rounded-lg text-xs text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 transition-colors disabled:opacity-40"
+                                    } else {
+                                        "px-3 py-1.5 rounded-lg text-xs text-white/40 border border-white/10 cursor-not-allowed"
+                                    }
+                                }
+                                on:click=on_sync_replies
+                                disabled=move || busy() || deferred_reply_count() == 0
+                                title="Post deferred replies on GitHub for items that were fixed but never replied to. No agent run, no push. Enabled when at least one fixed item has no reply yet."
+                            >
+                                {move || {
+                                    let n = deferred_reply_count();
+                                    if n == 0 { "Sync replies".to_string() }
+                                    else { format!("Sync {} replies", n) }
+                                }}
+                            </button>
                             <button
                                 class="px-3 py-1.5 rounded-lg text-xs text-white/70 hover:bg-white/10 transition-colors disabled:opacity-40"
                                 on:click=move |_| trigger_analyze(true)
@@ -1502,6 +1539,7 @@ fn render_review_item(
     }).unwrap_or_else(|| "PR-level".to_string());
     let original_body = related.as_ref().map(|c| c.body.clone());
     let author = related.as_ref().map(|c| c.author.clone()).unwrap_or_default();
+    let comment_url = related.as_ref().and_then(|c| c.url.clone());
 
     let decision_class = match item.decision {
         PrReviewDecisionKind::Fix => "border-emerald-500/30 bg-emerald-500/[0.04]",
@@ -1537,6 +1575,28 @@ fn render_review_item(
                         <span class="font-mono">{location}</span>
                         {(!author.is_empty()).then(|| view! { <span>"-"</span> <span>{author}</span> })}
                         {comment_id.map(|id| view! { <span class="opacity-60">{format!("(id {})", id)}</span> })}
+                        {comment_url.map(|url| {
+                            let url_for_click = url.clone();
+                            view! {
+                                <button
+                                    type="button"
+                                    on:click=move |_| {
+                                        let u = url_for_click.clone();
+                                        leptos::task::spawn_local(async move {
+                                            if let Err(e) = crate::services::open_url_external(u).await {
+                                                toast::error(format!("Could not open link: {}", e));
+                                            }
+                                        });
+                                    }
+                                    class="inline-flex items-center gap-1 px-1 py-0.5 rounded text-white/55 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                                    title="Open comment on GitHub"
+                                >
+                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" d="M14 3h7v7m0-7L10 14m-4-4H5a2 2 0 00-2 2v7a2 2 0 002 2h7a2 2 0 002-2v-1"/>
+                                    </svg>
+                                </button>
+                            }
+                        })}
                         {
                             // Live status from the in-flight run takes priority. Outside of a run,
                             // fall back to the persisted lifecycle: fix_done + reply_posted determine

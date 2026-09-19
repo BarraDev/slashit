@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    slashit_app_lib::run()
+    slashit_ui_lib::run()
 }
