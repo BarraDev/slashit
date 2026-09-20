@@ -513,6 +513,27 @@ impl WorktreeManager {
         Path::new(worktree_path).exists()
     }
 
+    /// Whether `path` is proven gone, as opposed to merely unreadable.
+    ///
+    /// [`Self::exists`] answers `false` for two different things: a path
+    /// that genuinely is not there, and a path `metadata` could not be asked
+    /// about at all (a parent directory closed off, a transient I/O error).
+    /// A removal's success gate needs positive evidence of absence rather
+    /// than an absence of evidence, so only the first of those answers
+    /// `true` here.
+    ///
+    /// `metadata` follows symlinks, as [`Path::exists`] does, and the two
+    /// have to agree: a link pointing at nothing is a path with no worktree
+    /// at it, and refusing to call that absent would withhold convergence
+    /// from a removal that really did finish, leaving a caller retrying a
+    /// worktree that is already gone.
+    fn proven_absent(path: &str) -> bool {
+        matches!(
+            std::fs::metadata(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
     // --- Private: wt-based operations ---
 
     async fn create_with_wt(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
@@ -573,14 +594,17 @@ impl WorktreeManager {
         // A zero exit is not proof of removal. `wt remove` reports the removal
         // as happening in the background, and it exits zero even when the
         // directory survives -- an unwritable parent is enough to reproduce
-        // it. The only trustworthy signal is the directory itself, which is
-        // exactly why `remove_with_git` decides on `exists()` rather than on
-        // git's exit status. Without this check the caller would durably clear
-        // `worktree_path`, discarding the only handle back to a worktree that
-        // still holds the user's work.
-        if self.exists(worktree_path) {
+        // it. The only trustworthy signal is positive proof the directory is
+        // gone, which `exists()` cannot give: it answers `false` both when
+        // the directory truly is not there and when it merely could not be
+        // looked at (a parent directory closed off between validation and
+        // now, a transient I/O error), and reporting success on the second
+        // would let the caller durably clear `worktree_path`, discarding the
+        // only handle back to a worktree that may still hold the user's
+        // work. `proven_absent` answers only the first case.
+        if !Self::proven_absent(worktree_path) {
             return Err(format!(
-                "wt remove reported success but {worktree_path} is still on disk"
+                "wt remove reported success but {worktree_path} could not be proven gone"
             ));
         }
 
@@ -624,13 +648,18 @@ impl WorktreeManager {
 
         // Every attempt above can fail with a non-zero exit — which is not a
         // Rust `Err` — without the directory actually being gone. The only
-        // trustworthy signal that removal worked is checking for the
-        // directory itself; reporting success otherwise would let a caller
-        // clear `worktree_path` for a worktree that is still on disk, losing
-        // the only handle back to it.
-        if self.exists(worktree_path) {
+        // trustworthy signal that removal worked is positive proof the
+        // directory is gone, which `exists()` cannot give: it answers
+        // `false` both when the directory truly is not there and when it
+        // merely could not be looked at (a parent directory closed off
+        // between validation and now, a transient I/O error), and reporting
+        // success on the second would let a caller clear `worktree_path` for
+        // a worktree that may still be on disk, losing the only handle back
+        // to it. `proven_absent` answers only the first case.
+        if !Self::proven_absent(worktree_path) {
             let mut failure = format!(
-                "worktree at {} still exists after worktree remove and --force both ran",
+                "worktree at {} could not be proven gone after worktree remove and --force both \
+                 ran",
                 worktree_path
             );
             // A removal git abandoned partway has also cost the worktree its
@@ -1909,6 +1938,142 @@ branch refs/heads/some-other-branch
             Path::new(&info.path).exists(),
             "the worktree directory must still be there when removal is reported as failed, so \
              a caller retains worktree_path for a future retry"
+        );
+    }
+
+    /// The distinction [`WorktreeManager::exists`] cannot make, and the
+    /// reason a removal's success gate is decided on `proven_absent` instead
+    /// of on it.
+    ///
+    /// The tests above chmod something *inside* the worktree -- a
+    /// subdirectory, or the worktree directory itself -- which still lets
+    /// `metadata` on the worktree path resolve (or answer `NotFound` once
+    /// the whole thing is gone). This targets the worktree's *parent*
+    /// instead, so `metadata(worktree_path)` itself fails with a permission
+    /// error rather than `NotFound` -- the one case `exists()` cannot tell
+    /// apart from genuine absence.
+    #[cfg(unix)]
+    #[test]
+    fn proven_absent_separates_not_there_from_could_not_look() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::ipc::server::current_uid() == 0 {
+            return; // root ignores the permission bits this test relies on
+        }
+
+        let tmp = create_temp_git_repo();
+        let closed = tmp.path().join("closed");
+        std::fs::create_dir(&closed).expect("create the unreadable parent");
+        let hidden = closed.join("worktree");
+        std::fs::create_dir(&hidden).expect("create the worktree inside it");
+        let hidden = hidden.to_str().unwrap().to_string();
+        let never = tmp.path().join("never-existed");
+        let never = never.to_str().unwrap().to_string();
+
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000))
+            .expect("close off the parent");
+        let exists_says = test_manager().exists(&hidden);
+        let proven_says = WorktreeManager::proven_absent(&hidden);
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755))
+            .expect("reopen the parent");
+
+        assert!(
+            !exists_says,
+            "`exists` reports a path it was not allowed to look at as absent -- that is the \
+             answer a removal's success gate must not inherit"
+        );
+        assert!(
+            !proven_says,
+            "a path that could not be looked at is not proven absent, and a removal must not \
+             report success on that basis"
+        );
+        assert!(
+            WorktreeManager::proven_absent(&never),
+            "a path that is genuinely not there is the case the success gate exists for"
+        );
+
+        // A link pointing at nothing has no worktree at it, and `exists`
+        // already says so. Disagreeing here would strand every caller of a
+        // removal that really did finish: the success gate would report
+        // `Err` for a worktree that is already gone, and no retry could ever
+        // converge on it.
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("nothing-here"), &dangling)
+            .expect("create the dangling link");
+        let dangling = dangling.to_str().unwrap().to_string();
+        assert!(
+            !test_manager().exists(&dangling),
+            "`exists` follows the link and finds nothing"
+        );
+        assert!(
+            WorktreeManager::proven_absent(&dangling),
+            "and this must agree with it, or a removal that really finished would be reported \
+             as one that did not"
+        );
+    }
+
+    /// The exact parent-blocked scenario the `exists()`-gated success check
+    /// this module used to have could misclassify as removed: both `git
+    /// worktree remove` and the caller's own filesystem check answer "not
+    /// there" for a directory the caller was simply never allowed to look
+    /// at.
+    ///
+    /// `git worktree remove` itself exits `0` here without touching the
+    /// directory at all -- it cannot even stat the path through a
+    /// closed-off parent, and answers that the same way it would answer a
+    /// worktree that is genuinely gone. That is `?`-mapped to a spawn/exit
+    /// failure in the tests above, where the obstacle is inside the
+    /// worktree rather than in its parent; here it is git's own exit status
+    /// that is misleading, which is exactly why the success gate this test
+    /// is about does not trust it either. The gate itself is proven
+    /// directly against `proven_absent` in the unit test above; this is the
+    /// same scenario at the level `remove()` callers observe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_reports_err_rather_than_false_success_when_the_worktree_cannot_be_looked_at() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::ipc::server::current_uid() == 0 {
+            return; // root ignores the permission bits this test relies on
+        }
+
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        let mgr = test_manager();
+        let info = mgr
+            .create(repo_path, "task-parent-blocked")
+            .await
+            .expect("create failed");
+
+        let parent = Path::new(&info.path)
+            .parent()
+            .expect("a worktree path has a parent")
+            .to_path_buf();
+        let restore_mode = std::fs::metadata(&parent)
+            .expect("read the parent's mode")
+            .permissions()
+            .mode();
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
+            .expect("close off the parent");
+        let result = mgr.remove(&info.path, repo_path).await;
+        // Reopened before asserting, so a failure still leaves a removable
+        // temp dir behind and so the worktree can be confirmed still present
+        // below.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(restore_mode))
+            .expect("reopen the parent");
+
+        assert!(
+            result.is_err(),
+            "a removal that could not prove the worktree gone must report Err, not silently \
+             `Ok(())`, which would let the caller discard the only handle back to a worktree \
+             that may still be fully present: {result:?}"
+        );
+        assert!(
+            Path::new(&info.path).exists(),
+            "the worktree was never actually touched by this removal attempt, so it must still \
+             be there once its parent is reopened"
         );
     }
 
