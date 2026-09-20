@@ -132,6 +132,17 @@ impl ClaudeRunner {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
+        // A backstop, not the way runs are ended. Cancellation is cooperative
+        // and kills explicitly, because only the code that owns the run can
+        // also record what happened to it. But nothing here is dropped while
+        // its process is meant to carry on — every caller waits and then kills
+        // — so a `ClaudeRunner` that goes away with a live child means
+        // something skipped its own cleanup: a panic unwinding past it, a
+        // future dropped by a path added later, the runtime shutting down.
+        // Without this, the default is to leave that agent running with
+        // nothing pointing at it.
+        cmd.kill_on_drop(true);
+
         let mut child = cmd.spawn()
             .map_err(|e| format!("Failed to spawn claude: {}. Is claude CLI installed?", e))?;
         eprintln!("[claude-runner] spawned pid={:?}", child.id());
@@ -515,6 +526,17 @@ echo "something went wrong in the CLI" >&2
 exit 3
 "#;
 
+    /// Announces itself and then stays alive until something ends it.
+    ///
+    /// `exec` on purpose: the process that waits is the same process the
+    /// runner spawned, so the pid recorded here is the one the runner owns and
+    /// the fixture has no descendant of its own to confuse the question.
+    const BLOCKING: &str = r#"#!/bin/sh
+printf '{"type":"system","subtype":"init","session_id":"s-block","model":"fixture-model"}\n'
+printf '%s\n' "$$" > blocked.pid
+exec sleep 300
+"#;
+
     const CLAUDE_LEVEL_ERROR: &str = r#"#!/bin/sh
 printf '{"type":"system","subtype":"init","session_id":"s-err","model":"fixture-model"}\n'
 printf '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s-err","result":"the model refused"}\n'
@@ -702,6 +724,103 @@ exit 0
                 .await
                 .expect_err("is_error should surface as an error");
             assert_eq!(error, "the model refused");
+        }
+    }
+
+    /// Whether `pid` is still a running process.
+    ///
+    /// A process that has exited but has not been reaped yet is still a
+    /// process, and reading it as one would report a terminated agent as
+    /// alive -- which is the exact mistake these tests exist to catch. The
+    /// state is the first field after the last `)`, because the command field
+    /// is parenthesised and may itself contain spaces and parentheses.
+    #[cfg(target_os = "linux")]
+    fn is_alive(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            != Some("Z")
+    }
+
+    /// The pid the blocking fixture wrote, once it has written it.
+    #[cfg(target_os = "linux")]
+    async fn blocked_pid(fixture: &Fixture) -> u32 {
+        let path = fixture.dir.path().join("blocked.pid");
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+            }
+            assert!(
+                started.elapsed() < DEADLINE,
+                "the blocking fixture never announced its process"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wait_that_loses_a_race_releases_the_child_to_be_killed() {
+        // The shape cancellation uses. `wait()` holds the child for as long as
+        // it is waiting, so if losing a `select!` did not release it, the
+        // `kill()` that follows would queue behind the very process it is
+        // trying to end -- and wait forever, because nothing else was ever
+        // going to end it.
+        let fixture = Fixture::new(BLOCKING);
+        let runner = fixture.start().await;
+        let pid = blocked_pid(&fixture).await;
+        assert!(is_alive(pid), "the fixture must still be running");
+
+        tokio::select! {
+            biased;
+
+            _ = runner.wait() => panic!("the fixture does not exit on its own"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        tokio::time::timeout(DEADLINE, runner.kill())
+            .await
+            .expect("kill must not block on the child a dropped wait was holding")
+            .expect("kill must succeed");
+
+        assert!(
+            !is_alive(pid),
+            "the process is still there after the kill that owns ending it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runner_dropped_with_a_live_child_does_not_leave_it_running() {
+        // The backstop, for the paths that skip their own cleanup: a panic
+        // unwinding past the kill, a future dropped by something added later.
+        // Without `kill_on_drop` the default is to leave the agent running
+        // with nothing pointing at it.
+        let fixture = Fixture::new(BLOCKING);
+        let pid = {
+            // Named so it lives to the end of the block and is dropped here,
+            // which is the event under test.
+            let _runner = fixture.start().await;
+            let pid = blocked_pid(&fixture).await;
+            assert!(is_alive(pid), "the fixture must still be running");
+            pid
+        };
+
+        // The signal goes out with the drop; the reaping that follows is the
+        // runtime's to schedule, so this waits for it rather than assuming it
+        // has already happened.
+        let started = std::time::Instant::now();
+        while is_alive(pid) {
+            assert!(
+                started.elapsed() < DEADLINE,
+                "dropping the runner left process {pid} running"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }

@@ -116,6 +116,24 @@ pub struct Task {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+impl Task {
+    /// Return the task to a state work can start from again, keeping the work
+    /// it has already produced.
+    ///
+    /// Phase, progress and any recorded error describe a run that is no longer
+    /// happening, so leaving them behind would have the board report a run
+    /// nothing is driving. `worktree_path` and `branch_name` deliberately
+    /// survive: the next execution reattaches to that branch and continues
+    /// from what is already there. Discarding a worktree is an explicit
+    /// destructive action, never a side effect of a run ending.
+    pub fn reset_execution_state(&mut self) {
+        self.phase = TaskPhase::Idle;
+        self.phase_progress = 0;
+        self.overall_progress = 0;
+        self.error_message = None;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PrReviewPlan {
     pub generated_at: chrono::DateTime<chrono::Utc>,

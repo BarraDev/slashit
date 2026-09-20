@@ -28,6 +28,23 @@ pub enum AgentEvent {
 
 type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
 
+/// A task execution the executor can still reach.
+///
+/// The join handle on its own is not enough to stop one. Aborting it drops the
+/// future wherever it is parked, and that future is exactly what owns the
+/// agent process: the `kill()` that ends the process, the bookkeeping that
+/// records the execution as stopped and the removal from `running_handles` are
+/// all statements *after* the await it is parked on, so an abort skips every
+/// one of them and leaves the agent running with nothing pointing at it.
+///
+/// `cancel` asks the future to end instead. It stops waiting on the process,
+/// then runs the same cleanup any other outcome runs, which is what makes
+/// "the stop returned" mean "the agent is gone".
+struct RunningTask {
+    handle: JoinHandle<()>,
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
 /// Emit an `AgentEvent` through any sink.
 ///
 /// The executor produces exactly one event name, so the conversion lives here
@@ -49,7 +66,7 @@ pub struct TaskExecutor {
     tasks: Tasks,
     queue_manager: Arc<RwLock<QueueManager>>,
     executions: Arc<RwLock<HashMap<Uuid, AgentExecution>>>,
-    running_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
+    running_handles: Arc<RwLock<HashMap<Uuid, RunningTask>>>,
     reviewing_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
     /// Task ids with a worktree-cleanup attempt currently in flight, so a
     /// merged-PR transition and the periodic retry pass can never schedule
@@ -184,6 +201,22 @@ impl TaskExecutor {
         self.running_handles.read().await.len() + self.reviewing_handles.read().await.len()
     }
 
+    /// Whether the poller should start this task on this pass.
+    ///
+    /// `InProgress` alone does not mean "running": it is also what a task
+    /// promoted out of the queue looks like in the instant before an agent
+    /// exists for it. The idle phase is what distinguishes the two, because
+    /// [`spawn_task_execution`](Self::spawn_task_execution) moves the task to
+    /// `Coding` before it spawns anything.
+    ///
+    /// The consequence is worth naming where the rule lives: anything that
+    /// writes this exact pair is asking for the task to be executed, whatever
+    /// it meant to say. That is why [`stop_task`](Self::stop_task) does not
+    /// leave a stopped task here.
+    fn is_pending(task: &Task) -> bool {
+        task.status == TaskStatus::InProgress && task.phase == TaskPhase::Idle
+    }
+
     async fn check_and_execute(&self) {
         // Auto-promote tasks from Queue → InProgress when capacity is available
         let manager = self.queue_manager.read().await;
@@ -202,7 +235,7 @@ impl TaskExecutor {
         let pending: Vec<Uuid> = {
             let tasks = self.tasks.read().await;
             tasks.values()
-                .filter(|t| t.status == TaskStatus::InProgress && t.phase == TaskPhase::Idle)
+                .filter(|t| Self::is_pending(t))
                 .map(|t| t.id)
                 .collect()
         };
@@ -213,7 +246,10 @@ impl TaskExecutor {
         // handles here — reachable on every poll tick — is the backstop that
         // catches that case regardless of which future code path forgets to
         // clean up after itself.
-        self.running_handles.write().await.retain(|_, h| !h.is_finished());
+        self.running_handles
+            .write()
+            .await
+            .retain(|_, r| !r.handle.is_finished());
         let running = self.running_handles.read().await.len();
         let limit = {
             let mgr = self.queue_manager.read().await;
@@ -729,6 +765,14 @@ impl TaskExecutor {
         let events = self.events.clone();
         let storage = self.storage.clone();
         let working_dir_for_commit = working_dir.clone();
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+
+        // The lock is taken before the spawn and held across the insert so
+        // there is no instant in which an execution is running and
+        // `stop_task` can find nothing to stop. The future takes this same
+        // lock, but only to remove itself once it is finished, so it waits
+        // here rather than deadlocking.
+        let mut handles = self.running_handles.write().await;
 
         let handle = tokio::spawn(async move {
             let execution_id = Uuid::new_v4();
@@ -860,51 +904,84 @@ impl TaskExecutor {
                 }
             });
 
-            // Wait for completion
-            match runner.wait().await {
-                Ok(_) => {
-                    // Commit changes in the worktree/working dir
-                    Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await;
+            // Wait for the run to finish, or for a stop to end it early.
+            //
+            // Biased so that a process which has already exited is reported as
+            // the completion it is: when both arms are ready the run finished
+            // before the stop reached it, and calling that a cancellation would
+            // throw away a result the agent had already produced.
+            let stopped = tokio::select! {
+                biased;
 
-                    // Move to AiReview for automated review before human review
-                    Self::update_task_phase_static(&tasks, task_id, TaskPhase::QaReview, 80).await;
-                    {
-                        let mut tasks_w = tasks.write().await;
-                        if let Some(t) = tasks_w.get_mut(&task_id) {
-                            t.status = TaskStatus::AiReview;
-                            t.overall_progress = 80;
-                            t.updated_at = chrono::Utc::now();
+                result = runner.wait() => {
+                    match result {
+                        Ok(_) => {
+                            // Commit changes in the worktree/working dir
+                            Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await;
+
+                            // Move to AiReview for automated review before human review
+                            Self::update_task_phase_static(&tasks, task_id, TaskPhase::QaReview, 80).await;
+                            {
+                                let mut tasks_w = tasks.write().await;
+                                if let Some(t) = tasks_w.get_mut(&task_id) {
+                                    t.status = TaskStatus::AiReview;
+                                    t.overall_progress = 80;
+                                    t.updated_at = chrono::Utc::now();
+                                }
+                            }
+                            events.agent_event(AgentEvent::Completed {
+                                task_id: task_id.to_string(),
+                                success: true,
+                                message: Some("Agent completed — moving to AI review".to_string()),
+                            });
+                            Self::persist_task_static(&tasks, &storage, task_id).await;
+                        }
+                        Err(err_msg) => {
+                            // Include accumulated stdout if stderr was empty
+                            let full_msg = if err_msg.contains("no details") {
+                                let stdout_output = runner.get_output().await;
+                                let last_lines: String = stdout_output.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
+                                if last_lines.is_empty() {
+                                    err_msg.clone()
+                                } else {
+                                    format!("{} — {}", err_msg, last_lines)
+                                }
+                            } else {
+                                err_msg.clone()
+                            };
+                            events.agent_event(AgentEvent::Error {
+                                task_id: task_id.to_string(),
+                                message: full_msg.clone(),
+                            });
+                            Self::set_task_error_static(&tasks, &storage, task_id, &full_msg).await;
                         }
                     }
-                    events.agent_event(AgentEvent::Completed {
-                        task_id: task_id.to_string(),
-                        success: true,
-                        message: Some("Agent completed — moving to AI review".to_string()),
-                    });
-                    Self::persist_task_static(&tasks, &storage, task_id).await;
+                    false
                 }
-                Err(err_msg) => {
-                    // Include accumulated stdout if stderr was empty
-                    let full_msg = if err_msg.contains("no details") {
-                        let stdout_output = runner.get_output().await;
-                        let last_lines: String = stdout_output.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
-                        if last_lines.is_empty() {
-                            err_msg.clone()
-                        } else {
-                            format!("{} — {}", err_msg, last_lines)
-                        }
-                    } else {
-                        err_msg.clone()
-                    };
-                    events.agent_event(AgentEvent::Error {
-                        task_id: task_id.to_string(),
-                        message: full_msg.clone(),
-                    });
-                    Self::set_task_error_static(&tasks, &storage, task_id, &full_msg).await;
-                }
+
+                // Dropping the `wait()` future above releases the child,
+                // which is what lets the `kill()` in the shared cleanup below
+                // reach the process at all. `wait()` must not be entered
+                // again after that — it takes the child's stderr on its way
+                // in, so a second call would report a run with no output.
+                //
+                // A closed channel is treated the same as a stop on purpose:
+                // it means the executor is no longer tracking this run, and a
+                // run nothing is tracking is exactly what must not be left
+                // with a process behind it.
+                _ = cancelled.changed() => true,
+            };
+
+            if stopped {
+                events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Info,
+                    message: "Stopped — ending the agent".to_string(),
+                });
             }
 
-            // Cleanup
+            // Cleanup — the one path every outcome reaches, cancellation
+            // included.
             let _ = runner.kill().await;
             running_handles.write().await.remove(&task_id);
 
@@ -914,7 +991,7 @@ impl TaskExecutor {
             }
         });
 
-        self.running_handles.write().await.insert(task_id, handle);
+        handles.insert(task_id, RunningTask { handle, cancel });
     }
 
     pub async fn execute_task(&self, task_id: Uuid) -> Result<(), String> {
@@ -937,18 +1014,129 @@ impl TaskExecutor {
         Ok(())
     }
 
+    /// End a task's execution at the user's request.
+    ///
+    /// `Ok` means the agent process is gone *and* the stop is on disk, so a
+    /// caller that got it can say the run is over rather than that it has
+    /// been asked to be over. `Err` means the process was still ended, but
+    /// the record of that could not be saved; the message says so, because
+    /// the difference decides what the next startup does with the task.
+    ///
+    /// Two things this deliberately does not do. It does not abort the
+    /// execution future: see [`RunningTask`] for why aborting the owner of the
+    /// process is what leaves the process behind. And it does not leave the
+    /// task `InProgress`, because that plus an idle phase is precisely what
+    /// [`is_pending`](Self::is_pending) means by "start this", so a stop that
+    /// left it there would be undone by the queue on its next pass.
+    ///
+    /// Stopping is not discarding: the worktree, the branch and the commits
+    /// the run had already made all survive, and a later explicit move back
+    /// into a working column reattaches to them.
     pub async fn stop_task(&self, task_id: Uuid) -> Result<(), String> {
-        if let Some(handle) = self.running_handles.write().await.remove(&task_id) {
-            handle.abort();
+        // Taken out of the map before awaiting anything, so the guard is
+        // released before the future below tries to remove itself.
+        let running = self.running_handles.write().await.remove(&task_id);
+
+        if let Some(running) = running {
+            let _ = running.cancel.send(true);
+            // A run that finished on its own between the removal and here has
+            // already recorded its own outcome; joining it is still correct,
+            // it simply returns at once. A panicked run returns an error,
+            // which the settling below is what covers.
+            let _ = running.handle.await;
         }
-        {
-            let mut tasks = self.tasks.write().await;
-            if let Some(t) = tasks.get_mut(&task_id) {
-                t.phase = TaskPhase::Idle;
-                t.phase_progress = 0;
-                t.updated_at = chrono::Utc::now();
-            }
+
+        Self::settle_stopped_static(&self.tasks, &self.storage, task_id).await
+    }
+
+    /// Record a stopped task as work that is waiting for a person again.
+    ///
+    /// `Backlog` is chosen out of the states the product already has, not
+    /// invented for this: it is the only one that is not runnable without an
+    /// explicit action, is not resumed by the hydration pass that requeues
+    /// tasks a crash left `InProgress`, keeps the worktree that `Done` would
+    /// remove, and claims no failure that did not happen. Moving the card back
+    /// into a working column resets execution state and reattaches to the
+    /// preserved branch, which is the same route a retry already takes.
+    ///
+    /// Guarded on `InProgress` so a stop that arrives after the run finished
+    /// on its own does not pull a task back out of the review it had already
+    /// reached. That is the honest resolution of that race: the run was over
+    /// before the stop got there.
+    ///
+    /// Persists before publishing, the same contract
+    /// [`clear_worktree_path_durably`](crate::commands::task::clear_worktree_path_durably)
+    /// holds, and for a sharper reason. What survives a failed write is the
+    /// `in_progress` this task started as, and the next startup reads that as
+    /// a run a crash interrupted and puts it back on the queue. Reporting the
+    /// stop from memory alone would therefore hand the user a stop that a
+    /// restart quietly undoes. Leaving memory as it was instead of settling
+    /// it is also what keeps the failure recoverable: the task is still
+    /// `InProgress`, so simply stopping it again once the disk is writable
+    /// works, where a memory-only settle would make every later stop a no-op
+    /// against a file still saying `in_progress`.
+    ///
+    /// The whole transaction runs under one write guard, and the save is
+    /// synchronous, so no sibling mutation can land between the write and the
+    /// in-memory commit.
+    ///
+    /// The cost of not publishing is worth stating plainly: a task whose
+    /// phase was already `Idle` stays [`is_pending`](Self::is_pending) after
+    /// a failed write, so the queue may start it again on a later pass. That
+    /// is what an unwritable disk does to every other in-flight task too, and
+    /// it follows from memory and the file agreeing. Publishing `Backlog`
+    /// anyway would buy that one case at the price of a worse one: the guard
+    /// above would then send the user's next stop straight to `Ok`, for a
+    /// task the file still has as running -- the exact answer this returns a
+    /// `Result` to stop giving.
+    async fn settle_stopped_static(
+        tasks: &Tasks,
+        storage: &crate::config::Storage,
+        task_id: Uuid,
+    ) -> Result<(), String> {
+        let mut tasks_w = tasks.write().await;
+
+        let Some(task) = tasks_w.get(&task_id) else {
+            return Ok(()); // deleted while its agent was being stopped
+        };
+        if task.status != TaskStatus::InProgress {
+            return Ok(());
         }
+        let project_id = task.project_id;
+
+        let stopped = {
+            let mut stopped = task.clone();
+            stopped.status = TaskStatus::Backlog;
+            stopped.reset_execution_state();
+            stopped.updated_at = chrono::Utc::now();
+            stopped
+        };
+
+        let staged: Vec<Task> = tasks_w
+            .values()
+            .filter(|t| t.project_id == project_id)
+            .map(|t| {
+                if t.id == task_id {
+                    stopped.clone()
+                } else {
+                    t.clone()
+                }
+            })
+            .collect();
+
+        storage
+            .save_project_tasks(project_id, &staged)
+            .map_err(|e| {
+                format!(
+                    "the agent was stopped, but recording task {task_id} as stopped \
+                     failed, so it is still saved as running and a restart would start \
+                     it again: {e}"
+                )
+            })?;
+
+        // Published only now, and as exactly the record that reached the
+        // disk, so the board cannot show a stop the file does not have.
+        tasks_w.insert(task_id, stopped);
         Ok(())
     }
 
@@ -1505,7 +1693,15 @@ impl TaskExecutor {
                 .filter(|t| t.project_id == project_id)
                 .cloned()
                 .collect();
-            let _ = storage.save_project_tasks(project_id, &project_tasks);
+            // Reported rather than discarded, as the command-side
+            // `persist_project_tasks` already does. A board that disagrees
+            // with the disk is recoverable while someone knows it happened.
+            // Where the disagreement would be acted on rather than merely
+            // displayed, publishing waits for the write instead: see
+            // `settle_stopped_static`.
+            if let Err(e) = storage.save_project_tasks(project_id, &project_tasks) {
+                eprintln!("[executor] failed to persist tasks for project {project_id}: {e}");
+            }
         }
     }
 }
@@ -1892,6 +2088,353 @@ mod tests {
             0,
             "a leaked reviewing_handles entry would hold this above zero forever, \
              which is what daemon shutdown waits on"
+        );
+    }
+
+    /// A task in the state the poller starts work from, with a run behind it.
+    ///
+    /// The worktree and branch are the work the run had already produced;
+    /// nothing about stopping may take them away.
+    fn running_task(project_id: Uuid) -> Task {
+        let mut task = create_test_task_full("running", project_id, TaskStatus::InProgress, 0);
+        task.phase = TaskPhase::Coding;
+        task.phase_progress = 5;
+        task.overall_progress = 5;
+        task.worktree_path = Some("/tmp/worktree-under-test".to_string());
+        task.branch_name = Some("task-under-test".to_string());
+        task
+    }
+
+    /// Register an execution the way [`TaskExecutor::spawn_task_execution`]
+    /// does, over a future that ends only when it is cancelled.
+    ///
+    /// `cleaned_up` is set by that future *after* it observes the
+    /// cancellation, which is the whole point: it stands for the `kill()` and
+    /// the bookkeeping the real execution runs on its way out. An abort would
+    /// drop the future at its await and never set it.
+    async fn register_cancellable_execution(
+        executor: &TaskExecutor,
+        task_id: Uuid,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let cleaned_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let flag = cleaned_up.clone();
+        let handle = tokio::spawn(async move {
+            let _ = cancelled.changed().await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        executor
+            .running_handles
+            .write()
+            .await
+            .insert(task_id, RunningTask { handle, cancel });
+        cleaned_up
+    }
+
+    #[tokio::test]
+    async fn stopping_a_task_lets_the_execution_run_its_own_cleanup_before_returning() {
+        // The defect this replaces: `stop_task` aborted the execution future,
+        // which drops it at whatever await it is parked on. The future is what
+        // owns the agent process, so the `kill()` after that await never ran
+        // and the agent outlived the stop. Nothing about task state proves
+        // that; only the cleanup having run does.
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+
+        let cleaned_up = register_cancellable_execution(&executor, task_id).await;
+
+        executor
+            .stop_task(task_id)
+            .await
+            .expect("stop must succeed");
+
+        assert!(
+            cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "stop_task returned before the execution finished ending itself, so a caller \
+             cannot treat `Ok` as meaning the agent is gone"
+        );
+        assert!(
+            executor.running_handles.read().await.is_empty(),
+            "the stopped execution must not be left registered as running"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_task_settles_where_the_queue_will_not_pick_it_up_again() {
+        // `InProgress` + an idle phase is exactly what `is_pending` means by
+        // "start this task", and it is what the old stop left behind, so the
+        // very next poll pass ran the task again with nothing having asked
+        // for it.
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        register_cancellable_execution(&executor, task_id).await;
+
+        executor
+            .stop_task(task_id)
+            .await
+            .expect("stop must succeed");
+
+        let tasks = executor.tasks.read().await;
+        let stopped = tasks.get(&task_id).expect("the task must still exist");
+        assert_eq!(stopped.status, TaskStatus::Backlog);
+        assert_eq!(stopped.phase, TaskPhase::Idle);
+        assert_eq!(stopped.phase_progress, 0);
+        assert_eq!(stopped.overall_progress, 0);
+        assert_eq!(
+            stopped.error_message, None,
+            "nothing failed, so a stop must not claim a failure"
+        );
+        assert!(
+            !TaskExecutor::is_pending(stopped),
+            "a stopped task must not satisfy the predicate the poller starts work from"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_a_task_keeps_the_work_it_had_already_produced() {
+        // Stopping is not discarding, and the product has no operation that
+        // discards. The branch is what a later run reattaches to.
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        register_cancellable_execution(&executor, task_id).await;
+
+        executor
+            .stop_task(task_id)
+            .await
+            .expect("stop must succeed");
+
+        let tasks = executor.tasks.read().await;
+        let stopped = tasks.get(&task_id).expect("the task must still exist");
+        assert_eq!(
+            stopped.worktree_path.as_deref(),
+            Some("/tmp/worktree-under-test")
+        );
+        assert_eq!(stopped.branch_name.as_deref(), Some("task-under-test"));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_task_is_still_stopped_after_a_restart() {
+        // What is in memory does not survive the application; what is on disk
+        // is what the next launch believes. An unpersisted stop would leave
+        // `in_progress` there, and hydration requeues exactly that.
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let (task_id, project_id) = (task.id, task.project_id);
+        executor.tasks.write().await.insert(task_id, task);
+        register_cancellable_execution(&executor, task_id).await;
+
+        executor
+            .stop_task(task_id)
+            .await
+            .expect("stop must succeed");
+
+        let persisted = executor
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the stopped task must have been written");
+        let record = persisted
+            .iter()
+            .find(|t| t.id == task_id)
+            .expect("the stopped task must be in the file");
+        assert_eq!(record.status, TaskStatus::Backlog);
+        assert_eq!(record.phase, TaskPhase::Idle);
+        assert_eq!(record.branch_name.as_deref(), Some("task-under-test"));
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_could_not_be_saved_is_reported_rather_than_returned_as_success() {
+        // The failure this forbids is the quiet one. Memory is not what the
+        // next launch reads, so a stop that only reached memory is a stop the
+        // restart undoes: the file still says `in_progress`, and hydration
+        // reads that as a run a crash interrupted and puts it back on the
+        // queue. Answering `Ok` there tells the user the run is over and then
+        // starts it again behind them.
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let (task_id, project_id) = (task.id, task.project_id);
+        executor.tasks.write().await.insert(task_id, task);
+        let cleaned_up = register_cancellable_execution(&executor, task_id).await;
+
+        let blocker = block_task_persistence(&executor.storage);
+
+        let result = executor.stop_task(task_id).await;
+
+        let message = result.expect_err(
+            "a stop whose outcome never reached the disk must not be reported as a stop",
+        );
+        assert!(
+            message.contains("stopped"),
+            "the message must say the agent was stopped, so the user knows what did \
+             happen as well as what did not: {message}"
+        );
+        assert!(
+            cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "the agent must still have been ended -- the error is about recording the \
+             stop, not about failing to perform it"
+        );
+
+        {
+            // Nothing was published, so the two views agree: this is still the
+            // `InProgress` work it was, which is what makes stopping it again
+            // the recovery. Settling memory alone and reporting the error
+            // would instead send the next stop down the already-settled path
+            // and answer `Ok` for a file that still says `in_progress`.
+            let tasks = executor.tasks.read().await;
+            let held = tasks.get(&task_id).expect("the task must still exist");
+            assert_eq!(held.status, TaskStatus::InProgress);
+            assert_eq!(held.phase, TaskPhase::Coding);
+            assert_eq!(held.phase_progress, 5);
+        }
+
+        // What the failed stop left behind is the crash-recoverable record, so
+        // once the disk takes writes again that is what lands on it: exactly
+        // the `InProgress` hydration reads as a run to requeue. Reporting `Ok`
+        // above would have been the forbidden pairing -- success told to the
+        // user, runnable work left on disk.
+        std::fs::remove_file(&blocker).expect("unblock persistence");
+        TaskExecutor::persist_task_static(&executor.tasks, &executor.storage, task_id).await;
+        let residual = executor
+            .storage
+            .load_project_tasks(project_id)
+            .expect("read the tasks back")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task must be in the file");
+        assert_eq!(
+            residual.status,
+            TaskStatus::InProgress,
+            "the state a failed stop leaves is the one a restart starts again"
+        );
+
+        // The same request, once the disk can take it, settles the task -- and
+        // only now is the stop something a restart will honour.
+        executor
+            .stop_task(task_id)
+            .await
+            .expect("stopping again once persistence works must settle the task");
+
+        let persisted = executor
+            .storage
+            .load_project_tasks(project_id)
+            .expect("read the tasks back");
+        let record = persisted
+            .iter()
+            .find(|t| t.id == task_id)
+            .expect("the stopped task must be in the file");
+        assert_eq!(record.status, TaskStatus::Backlog);
+        assert_eq!(record.phase, TaskPhase::Idle);
+        assert_eq!(record.branch_name.as_deref(), Some("task-under-test"));
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_arrives_after_the_run_finished_leaves_the_result_alone() {
+        // The two can happen at once. If the run got there first it produced a
+        // real result, and pulling the task back out of the review it reached
+        // would discard it -- so the honest resolution is that the stop was
+        // too late, not that the run never happened.
+        let (executor, _temps) = test_executor();
+        let mut task = running_task(Uuid::new_v4());
+        task.status = TaskStatus::AiReview;
+        task.phase = TaskPhase::QaReview;
+        task.overall_progress = 80;
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+
+        // A finished execution is what "the run got there first" looks like to
+        // the executor: the future ran its own cleanup and recorded the result.
+        let (cancel, _cancelled) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async {});
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        executor
+            .running_handles
+            .write()
+            .await
+            .insert(task_id, RunningTask { handle, cancel });
+
+        executor
+            .stop_task(task_id)
+            .await
+            .expect("stop must succeed");
+
+        let tasks = executor.tasks.read().await;
+        let task = tasks.get(&task_id).expect("the task must still exist");
+        assert_eq!(
+            task.status,
+            TaskStatus::AiReview,
+            "a completed run must not be rewritten as a stopped one"
+        );
+        assert_eq!(task.phase, TaskPhase::QaReview);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_task_nothing_is_running_still_takes_it_off_the_queue() {
+        // The handle can be gone without the task having settled -- the poll
+        // pass prunes a panicked execution's entry, and a panic skips the
+        // cleanup that would have recorded an outcome. Leaving the task
+        // `in_progress` there means the queue starts it again, which is the
+        // behaviour the user just asked to end.
+        let (executor, _temps) = test_executor();
+        let mut task = running_task(Uuid::new_v4());
+        task.phase = TaskPhase::Idle;
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+
+        executor
+            .stop_task(task_id)
+            .await
+            .expect("stop must succeed");
+
+        let tasks = executor.tasks.read().await;
+        let stopped = tasks.get(&task_id).expect("the task must still exist");
+        assert_eq!(stopped.status, TaskStatus::Backlog);
+        assert!(!TaskExecutor::is_pending(stopped));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_task_can_be_started_again_on_the_work_it_kept() {
+        // Stopping has to be reversible by an ordinary product action, or it
+        // is a way of losing a task rather than of pausing one. Moving the
+        // card back into a working column is that action, and it goes through
+        // the same classifier every other column move does.
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        register_cancellable_execution(&executor, task_id).await;
+
+        executor
+            .stop_task(task_id)
+            .await
+            .expect("stop must succeed");
+
+        let mut tasks = executor.tasks.write().await;
+        let restarted = crate::commands::task::update_task_status_logic(
+            &mut tasks,
+            task_id,
+            TaskStatus::InProgress,
+        )
+        .expect("the stopped task must still be there to move");
+
+        assert!(
+            TaskExecutor::is_pending(&restarted),
+            "moving a stopped task back into a working column must make it runnable again"
+        );
+        assert_eq!(
+            restarted.branch_name.as_deref(),
+            Some("task-under-test"),
+            "the run that follows reattaches to this branch, so it must have survived the stop"
+        );
+        assert_eq!(
+            restarted.worktree_path.as_deref(),
+            Some("/tmp/worktree-under-test")
         );
     }
 
