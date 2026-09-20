@@ -43,6 +43,26 @@ hex = "0.4"
 tauri-plugin-updater = "2"
 # Argument parsing for the `slashitd` binary.
 clap = { version = "4", features = ["derive"] }
+# Embedded W3C WebDriver server, for acceptance builds only. Optional, so a
+# normal build never compiles or links it. See the `acceptance-webdriver`
+# feature below.
+tauri-plugin-wdio-webdriver = { version = "1.4", optional = true }
+
+[features]
+# ACCEPTANCE BUILDS ONLY. Never enable this for a release.
+#
+# It embeds an HTTP WebDriver server inside the application that can locate
+# elements, click, and evaluate arbitrary JavaScript in the webview. That is
+# exactly what an acceptance harness needs and exactly what a shipped binary
+# must not offer. It is opt-in rather than default so the plugin is absent
+# from `cargo build`, `cargo tauri build` and the release workflow alike.
+#
+# The Linux acceptance gate does not use it: there the provider is the
+# external `tauri-driver`, and the application under test is a normal build.
+# This exists for macOS, where `tauri-driver` is unavailable and the embedded
+# server is the only Rust-only path -- and it has not yet been exercised on
+# real Apple hardware.
+acceptance-webdriver = ["dep:tauri-plugin-wdio-webdriver"]
 
 [dev-dependencies]
 tempfile = "3"

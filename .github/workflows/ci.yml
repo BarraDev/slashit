@@ -1,8 +1,14 @@
 name: CI
 
-# Neither job pushes, comments, or otherwise writes back to the repository —
-# both only check out, build and test. Least privilege the default GITHUB_TOKEN
+# No job here pushes, comments, or otherwise writes back to the repository —
+# they only check out, build and test. Least privilege the default GITHUB_TOKEN
 # down to that.
+#
+# Every checkout also sets `persist-credentials: false`. `actions/checkout`
+# otherwise leaves the token in `.git/config`, and these jobs build and run
+# code from the pull request's own revision -- including a desktop acceptance
+# job that uploads `target/acceptance` as an artifact when it fails. A token
+# that is never written to the workspace cannot be read out of it.
 permissions:
   contents: read
 
@@ -28,6 +34,8 @@ jobs:
     name: Lint, test and build (ubuntu-22.04)
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -38,9 +46,7 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+        uses: ./.github/actions/linux-build-deps
 
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -48,8 +54,27 @@ jobs:
       - name: Clippy (backend + CLI)
         run: cargo clippy -p slashit-ui -p slashit -p slashit-ipc -- -D warnings
 
-      - name: Tests (backend)
-        run: cargo test -p slashit-ui -p slashit-ipc
+      # `--all-targets --features run-acceptance` so the acceptance journeys
+      # themselves are linted, not just the harness library. They are behind a
+      # required feature and would otherwise never be compiled here.
+      - name: Clippy (acceptance harness)
+        run: cargo clippy -p slashit-acceptance --all-targets --features run-acceptance -- -D warnings
+
+      - name: Tests (backend + harness units)
+        run: cargo test -p slashit-ui -p slashit-ipc -p slashit-acceptance
+
+      # The embedded WebDriver server can drive the webview and evaluate
+      # arbitrary JavaScript. Asserting it stays out of a default build is
+      # cheaper than trusting that nobody adds it to `default` by accident.
+      - name: The embedded WebDriver plugin must be opt-in
+        run: |
+          set -euo pipefail
+          if cargo tree -p slashit-ui -e normal | grep -q tauri-plugin-wdio-webdriver; then
+            echo "::error::tauri-plugin-wdio-webdriver is reachable from a default build"
+            exit 1
+          fi
+          cargo tree -p slashit-ui -e normal --features acceptance-webdriver \
+            | grep -q tauri-plugin-wdio-webdriver
 
       - name: Install trunk
         uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
@@ -58,6 +83,76 @@ jobs:
 
       - name: Build frontend
         run: trunk build
+
+  # Desktop acceptance against the REAL application: a real Tauri process, the
+  # real Leptos/WASM frontend and the real Rust backend, driven over W3C
+  # WebDriver by `thirtyfour`. No Node, npm or WebdriverIO is involved.
+  #
+  # Linux carries this burden alone and deliberately. macOS and Windows desktop
+  # acceptance answer "does this still work on the platform?", which is a
+  # question worth asking at a release candidate or when the harness itself
+  # changes -- not on every commit, where it would buy repetition rather than
+  # signal and would compete for scarce macOS capacity. Neither is wired to run
+  # automatically here; the existing compile checks below are unchanged.
+  acceptance:
+    runs-on: ubuntu-22.04
+    name: Desktop acceptance (ubuntu-22.04)
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install Linux dependencies
+        uses: ./.github/actions/linux-build-deps
+        with:
+          webdriver: 'true'
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install trunk
+        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
+        with:
+          version: latest
+
+      - name: Install the Tauri CLI and tauri-driver
+        run: |
+          cargo install tauri-cli --version "^2.10" --locked
+          cargo install tauri-driver --version "^2" --locked
+
+      # Not `cargo build`. That produces a binary pointing at devUrl
+      # (http://localhost:1420) which renders a connection-error page with no
+      # Trunk server running; `cargo tauri build` enables `custom-protocol` and
+      # embeds the frontend. The journeys assert the difference rather than
+      # trusting this comment.
+      - name: Build the application under test
+        run: cargo tauri build --debug --no-bundle
+
+      # Hosted runners have no display, so the application renders into Xvfb.
+      # One test at a time: two desktop applications competing for one virtual
+      # display buys nothing and makes a failure harder to read.
+      - name: Acceptance journeys
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" \
+            cargo test -p slashit-acceptance --features run-acceptance \
+            --test acceptance -- --test-threads=1
+
+      # Only failures leave anything behind: screenshots, page source and the
+      # provider log, captured while the application was still alive.
+      - name: Preserve failure evidence
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v7.0.1
+        with:
+          name: acceptance-failure-artifacts
+          path: target/acceptance
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Windows and macOS were previously first compiled at tag time, inside the
   # release build. That is the worst possible place to discover a
@@ -80,6 +175,8 @@ jobs:
         platform: [windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -87,5 +184,12 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      - name: Check (backend + CLI + IPC)
-        run: cargo check -p slashit-ui -p slashit -p slashit-ipc
+      # `slashit-acceptance` is included on purpose even though its runtime is
+      # Linux-only. Its portable half (the WebDriver assertions, the port
+      # helpers, the diagnostics) is what a future macOS or Windows provider
+      # will reuse, and this is what keeps the boundary honest: the moment a
+      # `/proc` read, a `libc::kill` or an XDG assumption escapes its
+      # `#[cfg(target_os = "linux")]`, this job fails instead of the platform
+      # quietly becoming unbuildable.
+      - name: Check (backend + CLI + IPC + acceptance harness)
+        run: cargo check -p slashit-ui -p slashit -p slashit-ipc -p slashit-acceptance
