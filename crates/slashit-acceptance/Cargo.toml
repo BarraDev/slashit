@@ -25,6 +25,13 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"]
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# Only the product journeys need this, and only to read the task store back:
+# proving a task persisted means finding its record, not finding its id, title
+# and status loose in the same file. Pinned to the version the application
+# already writes with, so the harness reads what the product wrote.
+[dev-dependencies]
+toml = "0.8"
+
 [features]
 # The acceptance journeys drive the REAL desktop application: they need a
 # `cargo tauri build --debug --no-bundle` binary, a WebKitWebDriver and a
@@ -36,4 +43,14 @@ run-acceptance = []
 [[test]]
 name = "acceptance"
 path = "tests/acceptance.rs"
+required-features = ["run-acceptance"]
+
+# Kept as its own target rather than folded into the journeys above. The two
+# suites fail for different reasons: `acceptance` failing means the harness can
+# no longer drive the application, `product_acceptance` failing means the
+# application no longer does what it promises. Separate targets keep that
+# distinction visible in CI output instead of only in a comment.
+[[test]]
+name = "product_acceptance"
+path = "tests/product_acceptance.rs"
 required-features = ["run-acceptance"]
