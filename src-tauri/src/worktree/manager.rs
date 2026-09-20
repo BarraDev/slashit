@@ -2222,11 +2222,13 @@ branch refs/heads/some-other-branch
     /// merging it would add nothing. The first and cheapest of its five
     /// checks is "branch HEAD equals the default branch", which is the state
     /// of every task whose agent committed nothing and of every task whose
-    /// work has already landed. Measured against worktrunk v0.29.0: without
-    /// `--no-delete-branch` it prints "Removing <branch> worktree & branch in
-    /// background (same commit as main)" and the branch is gone afterwards;
-    /// with `--no-delete-branch` it prints "Branch integrated (same commit as
-    /// main); retained with --no-delete-branch" and the branch survives.
+    /// work has already landed. Measured against worktrunk (v0.29.0
+    /// originally, and confirmed again on v0.68.0): without
+    /// `--no-delete-branch` it prints "Removing <branch> worktree & branch
+    /// [in background] (same commit as main)" and the branch is gone
+    /// afterwards; with `--no-delete-branch` it prints "Branch integrated
+    /// (same commit as main); retained with --no-delete-branch" and the
+    /// branch survives.
     ///
     /// `remove_with_wt` therefore passes `--no-delete-branch`, and this test
     /// is what holds that flag in place. Without it the two backends disagree
@@ -2237,9 +2239,9 @@ branch refs/heads/some-other-branch
     /// installed would still delete it. `branch_name` is what `create_pr`
     /// pushes and what `reattach` re-checks-out, so both break.
     ///
-    /// Ignored by default because it is the only test in this file that needs
-    /// the `wt` binary on PATH, following the PTY tests that are ignored for
-    /// needing to spawn real processes. Run it with
+    /// Ignored by default, like every other real-`wt` test in this file, for
+    /// needing the `wt` binary on PATH -- following the PTY tests that are
+    /// ignored for needing to spawn real processes. Run it with
     /// `cargo test -- --ignored`.
     ///
     /// The checkout is made with plain `git worktree add` rather than through
@@ -2294,29 +2296,15 @@ branch refs/heads/some-other-branch
 
         let result = mgr.remove(&checkout, &repo_path).await;
 
-        // `wt remove` does the work in a background process and returns
-        // straight away, so the branch has to be judged after that process
-        // has finished rather than after `wt` exits: a branch that is still
-        // there the instant `wt` returns may simply not have been deleted
-        // yet, and asserting then would pass for the wrong reason.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            let listing = WorktreeManager::worktree_list_porcelain(&repo_path).unwrap_or_default();
-            let settled = !Path::new(&checkout).exists() && !listing.contains(&checkout);
-            if settled {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "wt never finished removing {checkout}; remove returned {result:?}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        // Branch deletion is the tail of that same background job, so give it
-        // a moment past the registration teardown before calling the branch a
-        // survivor.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
+        // `--no-delete-branch` alone left `wt remove`'s own removal running in
+        // a detached background job that could still be mid-flight -- deleting
+        // the branch as its tail step -- the instant this call returned, which
+        // is why this test used to poll for the job to settle before judging
+        // the branch. `remove_with_wt` also passes `--foreground` now, which
+        // blocks until that removal, branch decision included, has actually
+        // finished; `result` is therefore already the final outcome.
+        assert!(result.is_ok(), "remove_with_wt must converge on this checkout: {result:?}");
+        assert!(!Path::new(&checkout).exists(), "the checkout must actually be gone");
         assert!(
             branch_exists(&repo_path, "task-worktrunk"),
             "wt cleanup deleted the task branch, which is what create_pr pushes and what \
