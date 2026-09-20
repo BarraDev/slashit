@@ -558,6 +558,20 @@ impl WorktreeManager {
 
     // --- Private: wt-based operations ---
 
+    /// The exact `wt remove` invocation this backend runs for every real
+    /// removal. Kept as a named constant, rather than inlined at the one
+    /// call site, so the branch-preservation and synchronicity contract it
+    /// encodes -- `--foreground`, `--no-delete-branch` -- can be asserted
+    /// deterministically (see
+    /// [`tests::wt_remove_args_run_in_the_foreground_and_keep_the_branch`])
+    /// without spawning `wt` at all.
+    ///
+    /// `--no-hooks` is the current spelling for what used to be
+    /// `--no-verify`; `wt` still accepts the old name but warns it is
+    /// deprecated.
+    const WT_REMOVE_ARGS: [&'static str; 5] =
+        ["remove", "-y", "--no-hooks", "--foreground", "--no-delete-branch"];
+
     async fn create_with_wt(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
         let output = tokio::process::Command::new("wt")
             .args(["switch", "-c", branch, "--no-cd", "-y", "--no-verify"])
@@ -653,7 +667,7 @@ impl WorktreeManager {
         let record = WorktreeRecord::save(worktree_path, repo_path).await;
 
         let output = tokio::process::Command::new("wt")
-            .args(["remove", "-y", "--no-verify"])
+            .args(Self::WT_REMOVE_ARGS)
             .current_dir(worktree_path)
             .output()
             .await
@@ -664,24 +678,23 @@ impl WorktreeManager {
         // is not that signal for this backend either.
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
-        // `wt remove` does the actual deletion in a background process and
-        // returns as soon as that process is launched -- confirmed by hand
-        // against a real, installed `wt`: the checkout is still fully
-        // present, as a real directory, immediately after a call that
-        // reported success. Deciding failure on that alone would call
-        // `finish_removal` while a legitimate removal is still finishing,
-        // and its restore step would then put git's registration back while
-        // that same background job is still working through deleting it --
-        // turning a merely-too-early check into an actively corrupted one,
-        // confirmed the same way: the checkout was left stuck, neither
-        // removed nor recoverable, once restore raced it. This gives that
-        // background job a bounded chance to land before treating an
-        // unresolved state as a real failure worth restoring anything over.
-        let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !Self::proven_absent(worktree_path) && std::time::Instant::now() < settle_deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
+        // `wt remove` defaults to deleting the actual worktree in a detached
+        // background job and returning as soon as that job is launched, but
+        // `--foreground` opts this call out of that: confirmed by hand
+        // against a real, installed `wt`, the checkout is already gone --
+        // no sleep needed to observe it -- immediately after a `--foreground`
+        // call returns, including through the cross-filesystem fallback to
+        // plain `git worktree remove` `wt` documents for that mode. There is
+        // therefore nothing to wait out here; `proven_absent` below is
+        // evaluated exactly once, right after this call returns.
+        //
+        // That still is not the same as trusting the exit status itself: a
+        // pre-remove hook failing, or `wt` hitting trouble partway through
+        // its own removal (the scenario
+        // `remove_with_wt_preserves_and_restores_the_registration_when_its_own_removal_cannot_finish`
+        // exercises), can each surface as success or failure independently
+        // of whether the checkout actually survived. `finish_removal` (via
+        // `proven_absent`) is still the only thing that decides.
         let failure = if output.status.success() {
             format!("wt remove reported success but {worktree_path} could not be proven gone")
         } else if stderr.is_empty() {
@@ -2155,6 +2168,30 @@ branch refs/heads/some-other-branch
         );
     }
 
+    /// The branch-preservation and synchronicity contract `remove_with_wt`
+    /// depends on, proven against the exact argument list it spawns rather
+    /// than against real `wt` output -- so it runs on every machine, with or
+    /// without the `wt` binary on `PATH`, and needs no process at all.
+    ///
+    /// `remove_with_wt_preserves_and_restores_the_registration_when_its_own_removal_cannot_finish`
+    /// is the real-`wt` counterpart that exercises what these flags actually
+    /// do; this test is what keeps that contract from silently regressing on
+    /// every other run, since that one is `#[ignore]`d.
+    #[test]
+    fn wt_remove_args_run_in_the_foreground_and_keep_the_branch() {
+        let args = WorktreeManager::WT_REMOVE_ARGS;
+        assert!(
+            args.contains(&"--foreground"),
+            "without this, `wt remove` returns before the removal it started has finished, and \
+             the caller has nothing to evaluate `proven_absent` against yet: {args:?}"
+        );
+        assert!(
+            args.contains(&"--no-delete-branch"),
+            "without this, Worktrunk decides for itself whether the task's branch survives \
+             removal -- SlashIt must be the one requiring that it does: {args:?}"
+        );
+    }
+
     /// The exact parent-blocked scenario the `exists()`-gated success check
     /// this module used to have could misclassify as removed: both `git
     /// worktree remove` and the caller's own filesystem check answer "not
@@ -2597,11 +2634,10 @@ branch refs/heads/some-other-branch
     /// needs *write* permission on that same parent and cannot get it,
     /// deleting the worktree's `.git` pointer and pruning git's
     /// registration before failing on the directory itself. Confirmed by
-    /// hand against a real, installed `wt` before writing this test, in
-    /// both `--foreground` and the default background mode `remove_with_wt`
-    /// actually uses, and stable immediately after `wt remove` returns --
-    /// checked with no sleep, and again a second later, with the same
-    /// result both times.
+    /// hand against a real, installed `wt` before writing this test, and
+    /// stable immediately after the `--foreground` call returns -- checked
+    /// with no sleep, and again a second later, with the same result both
+    /// times.
     ///
     /// The retry is not asserted to fully remove the checkout, and that is
     /// deliberate, not a weaker test. `wt`'s own partial-removal attempt here
@@ -2619,13 +2655,16 @@ branch refs/heads/some-other-branch
     /// while the checkout is still there.
     ///
     /// The checkout is made with plain `git worktree add` rather than
-    /// through `mgr.create` or `wt switch`, for the same reason
-    /// `integration_worktrunk_cleanup_keeps_the_task_branch` does it: `wt
-    /// switch` is the only worktrunk subcommand that consults the
-    /// `worktree-path` template, and creating through it would drop a
-    /// worktree into whichever global root the developer running this test
-    /// has configured -- for a real user, a directory full of their own
-    /// work.
+    /// through `mgr.create` or `wt switch`: `wt switch` is the only
+    /// worktrunk subcommand that consults the `worktree-path` template, and
+    /// creating through it would drop a worktree into whichever global root
+    /// the developer running this test has configured -- for a real user, a
+    /// directory full of their own work. The branch is created at the same
+    /// commit as `main` (no commits follow `git worktree add`), which is
+    /// exactly the case Worktrunk's own merge-detection considers safe to
+    /// delete on an ordinary `wt remove` -- so the branch surviving below is
+    /// proof of `--no-delete-branch` overriding that heuristic, not an
+    /// accident of the branch already being unmerged.
     ///
     /// Ignored by default because it is the only other test in this file
     /// that needs the `wt` binary on `PATH`. Run it with
@@ -2687,39 +2726,36 @@ branch refs/heads/some-other-branch
              wt's own partial removal"
         );
 
-        // A few retries, not a wait for convergence: `remove_with_wt` now
-        // gives its own background job a settle window internally, so each
-        // call here already accounts for that race on its own. What these
-        // retries must never observe, converging or not, is `Ok(())`
-        // returned while the checkout is still on disk.
-        let mut last = None;
-        for _ in 0..3 {
-            let result = mgr.remove(&checkout, &repo_path).await;
-            let gone = !Path::new(&checkout).exists();
-            assert!(
-                result.is_ok() == gone,
-                "remove() must never report Ok(()) while the checkout is still present, nor Err \
-                 once it is actually gone: {result:?}, gone={gone}"
-            );
-            last = Some(gone);
-            if gone {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let converged = last.expect("the loop above always runs at least once");
+        // `--foreground` makes this deterministic rather than a race to
+        // catch a background job before it lands, so a single retry, not
+        // several spaced by sleeps, is enough to observe the stable outcome.
+        // It is not asserted to converge: `wt`'s own partial-removal attempt
+        // above deletes tracked file content on its way to failing (see the
+        // doc comment above), leaving the checkout dirty, and a forceless
+        // retry against a dirty checkout correctly keeps refusing.
+        let retried = mgr.remove(&checkout, &repo_path).await;
+        let converged = !Path::new(&checkout).exists();
+        assert!(
+            retried.is_ok() == converged,
+            "remove() must never report Ok(()) while the checkout is still present, nor Err \
+             once it is actually gone: {retried:?}, converged={converged}"
+        );
 
-        // Branch preservation on a real, successful `wt remove` is not this
-        // fix's contract on this branch -- `remove_with_wt` here does not
-        // yet pass `--no-delete-branch` (a separate, later addition this
-        // pass must not duplicate ahead of it) -- so it is only checked in
-        // the case that actually converged.
+        // Branch preservation is unconditional here, unlike the checkout
+        // itself: `--no-delete-branch` is on every `wt remove` call this
+        // backend makes, including the blocked one above, so Worktrunk never
+        // reaches its own merge-detection for this branch regardless of
+        // whether the retry actually converged.
+        assert!(
+            branch_exists(&repo_path, "task-wt-parent-blocked"),
+            "SlashIt requires --no-delete-branch on every wt remove call, so the branch must \
+             survive whether or not the checkout itself converged"
+        );
+
         if converged {
             assert!(
-                branch_exists(&repo_path, "task-wt-parent-blocked"),
-                "if the branch is gone too here, wt's own default merge-detection deleted it, \
-                 not this fix -- but the branch surviving is worth confirming whenever removal \
-                 does fully converge"
+                saved_records(&repo_path).is_empty(),
+                "no saved-record debris should remain once the worktree has actually converged"
             );
         }
     }
