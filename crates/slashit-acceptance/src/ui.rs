@@ -63,44 +63,38 @@ pub async fn assert_frontend_is_real(driver: &WebDriver) -> Result<()> {
         bail!("the window is showing a browser error page (matched {marker:?}), not SlashIt");
     }
 
-    let root = driver
+    driver
         .query(By::Css(ROOT_ELEMENT))
         .wait(ELEMENT_TIMEOUT, POLL)
+        .and_displayed()
         .first()
         .await
-        .with_context(|| format!("the Leptos root {ROOT_ELEMENT} is not present"))?;
-    if !root
-        .is_displayed()
-        .await
-        .context("could not ask whether the Leptos root is displayed")?
-    {
-        bail!("{ROOT_ELEMENT} exists but is not displayed — the frontend mounted into a hidden tree");
-    }
+        .with_context(|| {
+            format!(
+                "the Leptos root {ROOT_ELEMENT} never became visible within {}s — it may not be \
+                 present, or it mounted into a hidden tree",
+                ELEMENT_TIMEOUT.as_secs()
+            )
+        })?;
 
     Ok(())
 }
 
 /// Locate a visible element, or fail saying which selector and how long.
 pub async fn visible(driver: &WebDriver, selector: &str) -> Result<WebElement> {
-    let element = driver
+    driver
         .query(By::Css(selector))
         .wait(ELEMENT_TIMEOUT, POLL)
+        .and_displayed()
         .first()
         .await
         .with_context(|| {
             format!(
-                "{selector} did not appear within {}s",
+                "{selector} did not become visible within {}s (it may never have appeared, or \
+                 appeared but stayed hidden)",
                 ELEMENT_TIMEOUT.as_secs()
             )
-        })?;
-    if !element
-        .is_displayed()
-        .await
-        .with_context(|| format!("could not ask whether {selector} is displayed"))?
-    {
-        bail!("{selector} exists but is not displayed");
-    }
-    Ok(element)
+        })
 }
 
 /// Assert an element is not in the document right now.
