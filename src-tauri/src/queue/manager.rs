@@ -42,12 +42,24 @@ impl QueueManager {
         in_progress_count < self.config.parallel_task_limit as usize
     }
 
-    pub async fn promote_next_task(&self) -> Option<Uuid> {
-        if !self.can_start_task().await {
+    /// Which queued task would be promoted next, or `None` if there is
+    /// nothing to promote right now.
+    ///
+    /// Pure: takes no lock and writes nothing. Selection has to run under the
+    /// same write-lock hold the caller then commits the promotion with --
+    /// see `lifecycle::commit_selected` -- or two callers racing this could
+    /// both select the same task before either one's write lands. This is
+    /// why the signature takes the map directly rather than reading
+    /// `self.tasks` itself.
+    pub(crate) fn select_promotable(&self, tasks: &HashMap<Uuid, Task>) -> Option<Uuid> {
+        let in_progress_count = tasks
+            .values()
+            .filter(|t| t.status == TaskStatus::InProgress)
+            .count();
+        if in_progress_count >= self.config.parallel_task_limit as usize {
             return None;
         }
 
-        let mut tasks = self.tasks.write().await;
         let queued_tasks: Vec<_> = tasks
             .values()
             .filter(|t| t.status == TaskStatus::Queue)
@@ -60,28 +72,23 @@ impl QueueManager {
             .filter(|t| !t.cleanup_in_flight)
             .collect();
 
-        let next_task = if self.config.fifo_ordering {
-            queued_tasks
-                .into_iter()
-                .min_by_key(|t| t.created_at)
+        if self.config.fifo_ordering {
+            queued_tasks.into_iter().min_by_key(|t| t.created_at).map(|t| t.id)
         } else {
-            queued_tasks.first().copied()
-        };
-
-        if let Some(task) = next_task {
-            let task_id = task.id;
-            if let Some(task) = tasks.get_mut(&task_id) {
-                task.status = TaskStatus::InProgress;
-                task.phase = TaskPhase::Idle;
-                task.phase_progress = 0;
-                task.overall_progress = 0;
-                task.error_message = None;
-                task.updated_at = chrono::Utc::now();
-                return Some(task_id);
-            }
+            queued_tasks.first().map(|t| t.id)
         }
+    }
 
-        None
+    /// The fields a promotion resets, applied by every caller of
+    /// [`Self::select_promotable`] so the desktop command, the daemon's
+    /// automatic poll, and any future front door agree on what "promoted"
+    /// means.
+    pub(crate) fn apply_promotion(task: &mut Task) {
+        task.status = TaskStatus::InProgress;
+        task.phase = TaskPhase::Idle;
+        task.phase_progress = 0;
+        task.overall_progress = 0;
+        task.error_message = None;
     }
 
     pub async fn get_queued_tasks(&self) -> Vec<Task> {
@@ -97,28 +104,6 @@ impl QueueManager {
         }
 
         queued_tasks
-    }
-
-    pub async fn enqueue_task(&self, task_id: Uuid) -> Result<(), String> {
-        let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.status = TaskStatus::Queue;
-            task.updated_at = chrono::Utc::now();
-            Ok(())
-        } else {
-            Err(format!("Task {} not found", task_id))
-        }
-    }
-
-    pub async fn requeue_task(&self, task_id: Uuid) -> Result<(), String> {
-        let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.status = TaskStatus::Queue;
-            task.updated_at = chrono::Utc::now();
-            Ok(())
-        } else {
-            Err(format!("Task {} not found", task_id))
-        }
     }
 
     pub async fn get_in_progress_count(&self) -> usize {
@@ -230,13 +215,31 @@ mod tests {
         )
     }
 
-    // === promote_next_task ===
+    // === select_promotable ===
+    //
+    // Pure selection now, with no map of its own to mutate: these tests apply
+    // `QueueManager::apply_promotion` themselves and write the result back,
+    // exactly what `lifecycle::commit_selected` does under its own write
+    // lock in production. Durability itself -- the reason the mutating
+    // `promote_next_task` this replaced no longer exists -- is proven at the
+    // `commands::queue` and `queue::executor` front doors instead.
+
+    /// Mirrors the production sequence `commit_selected` runs, but against a
+    /// plain map with no persistence, since these tests are about selection
+    /// and field-reset semantics, not durability.
+    async fn promote(manager: &QueueManager, tasks: &Tasks) -> Option<Uuid> {
+        let mut store = tasks.write().await;
+        let task_id = manager.select_promotable(&store)?;
+        let task = store.get_mut(&task_id).expect("selected id must be in the map");
+        QueueManager::apply_promotion(task);
+        Some(task_id)
+    }
 
     #[tokio::test]
     async fn test_promote_next_task_empty_queue() {
         let tasks = make_tasks_map(vec![]);
-        let manager = make_manager(tasks, 3);
-        assert_eq!(manager.promote_next_task().await, None);
+        let manager = make_manager(tasks.clone(), 3);
+        assert_eq!(promote(&manager, &tasks).await, None);
     }
 
     #[tokio::test]
@@ -246,7 +249,7 @@ mod tests {
         let tasks = make_tasks_map(vec![task]);
         let manager = make_manager(tasks.clone(), 3);
 
-        let result = manager.promote_next_task().await;
+        let result = promote(&manager, &tasks).await;
         assert_eq!(result, Some(task_id));
 
         let store = tasks.read().await;
@@ -259,9 +262,9 @@ mod tests {
         let in_progress = create_test_task_with_status("Running", TaskStatus::InProgress);
         let queued = create_test_task_with_status("Waiting", TaskStatus::Queue);
         let tasks = make_tasks_map(vec![in_progress, queued]);
-        let manager = make_manager(tasks, 1);
+        let manager = make_manager(tasks.clone(), 1);
 
-        assert_eq!(manager.promote_next_task().await, None);
+        assert_eq!(promote(&manager, &tasks).await, None);
     }
 
     #[tokio::test]
@@ -274,9 +277,9 @@ mod tests {
         newer.created_at = Utc::now() - Duration::hours(1);
 
         let tasks = make_tasks_map(vec![newer, older]);
-        let manager = make_manager(tasks, 3);
+        let manager = make_manager(tasks.clone(), 3);
 
-        let result = manager.promote_next_task().await;
+        let result = promote(&manager, &tasks).await;
         assert_eq!(result, Some(older_id));
     }
 
@@ -291,7 +294,7 @@ mod tests {
         let tasks = make_tasks_map(vec![task]);
         let manager = make_manager(tasks.clone(), 3);
 
-        manager.promote_next_task().await;
+        promote(&manager, &tasks).await;
 
         let store = tasks.read().await;
         let promoted = store.get(&task_id).unwrap();
@@ -301,69 +304,17 @@ mod tests {
         assert!(promoted.error_message.is_none());
     }
 
-    // === enqueue_task ===
-
     #[tokio::test]
-    async fn test_enqueue_task_existing() {
-        let task = create_test_task_with_status("Backlog Task", TaskStatus::Backlog);
-        let task_id = task.id;
-        let tasks = make_tasks_map(vec![task]);
+    async fn test_promote_next_task_excludes_a_quarantined_task() {
+        // A task whose cleanup was interrupted must not be handed to the
+        // executor even though it is otherwise queued and capacity is free --
+        // see the comment on `select_promotable` for why.
+        let mut quarantined = create_test_task_with_status("Quarantined", TaskStatus::Queue);
+        quarantined.cleanup_in_flight = true;
+        let tasks = make_tasks_map(vec![quarantined]);
         let manager = make_manager(tasks.clone(), 3);
 
-        let result = manager.enqueue_task(task_id).await;
-        assert!(result.is_ok());
-
-        let store = tasks.read().await;
-        assert_eq!(store.get(&task_id).unwrap().status, TaskStatus::Queue);
-    }
-
-    #[tokio::test]
-    async fn test_enqueue_task_nonexistent() {
-        let tasks = make_tasks_map(vec![]);
-        let manager = make_manager(tasks, 3);
-
-        let result = manager.enqueue_task(Uuid::new_v4()).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_enqueue_task_updates_timestamp() {
-        let mut task = create_test_task_with_status("Old Task", TaskStatus::Backlog);
-        let old_time = Utc::now() - Duration::hours(5);
-        task.updated_at = old_time;
-        let task_id = task.id;
-        let tasks = make_tasks_map(vec![task]);
-        let manager = make_manager(tasks.clone(), 3);
-
-        manager.enqueue_task(task_id).await.unwrap();
-
-        let store = tasks.read().await;
-        assert!(store.get(&task_id).unwrap().updated_at > old_time);
-    }
-
-    // === requeue_task ===
-
-    #[tokio::test]
-    async fn test_requeue_task_existing() {
-        let task = create_test_task_with_status("Failed Task", TaskStatus::InProgress);
-        let task_id = task.id;
-        let tasks = make_tasks_map(vec![task]);
-        let manager = make_manager(tasks.clone(), 3);
-
-        let result = manager.requeue_task(task_id).await;
-        assert!(result.is_ok());
-
-        let store = tasks.read().await;
-        assert_eq!(store.get(&task_id).unwrap().status, TaskStatus::Queue);
-    }
-
-    #[tokio::test]
-    async fn test_requeue_task_nonexistent() {
-        let tasks = make_tasks_map(vec![]);
-        let manager = make_manager(tasks, 3);
-
-        let result = manager.requeue_task(Uuid::new_v4()).await;
-        assert!(result.is_err());
+        assert_eq!(promote(&manager, &tasks).await, None);
     }
 
     // === get_queued_tasks ===
@@ -508,19 +459,19 @@ mod tests {
         let b1 = create_test_task_with_status("B1", TaskStatus::Backlog);
         let b2 = create_test_task_with_status("B2", TaskStatus::Backlog);
         let tasks = make_tasks_map(vec![b1, b2]);
-        let manager = make_manager(tasks, 3);
+        let manager = make_manager(tasks.clone(), 3);
 
-        assert_eq!(manager.promote_next_task().await, None);
+        assert_eq!(promote(&manager, &tasks).await, None);
     }
 
     #[tokio::test]
     async fn test_capacity_limit_zero() {
         let q = create_test_task_with_status("Queued", TaskStatus::Queue);
         let tasks = make_tasks_map(vec![q]);
-        let manager = make_manager(tasks, 0);
+        let manager = make_manager(tasks.clone(), 0);
 
         assert!(!manager.can_start_task().await);
-        assert_eq!(manager.promote_next_task().await, None);
+        assert_eq!(promote(&manager, &tasks).await, None);
         assert_eq!(manager.get_capacity_available().await, 0);
     }
 
@@ -538,11 +489,11 @@ mod tests {
         let manager = make_manager(tasks.clone(), 1);
 
         // First promote succeeds
-        let first = manager.promote_next_task().await;
+        let first = promote(&manager, &tasks).await;
         assert_eq!(first, Some(q1_id));
 
         // Second promote blocked (at capacity)
-        let second = manager.promote_next_task().await;
+        let second = promote(&manager, &tasks).await;
         assert_eq!(second, None);
 
         // Simulate completion: change first task away from InProgress
@@ -552,7 +503,7 @@ mod tests {
         }
 
         // Now second can be promoted
-        let third = manager.promote_next_task().await;
+        let third = promote(&manager, &tasks).await;
         assert_eq!(third, Some(q2_id));
     }
 
@@ -568,14 +519,14 @@ mod tests {
         q3.created_at = Utc::now() - Duration::hours(1);
 
         let tasks = make_tasks_map(vec![q1, q2, q3]);
-        let manager = make_manager(tasks, 2);
+        let manager = make_manager(tasks.clone(), 2);
 
         // First two promotions succeed
-        assert!(manager.promote_next_task().await.is_some());
-        assert!(manager.promote_next_task().await.is_some());
+        assert!(promote(&manager, &tasks).await.is_some());
+        assert!(promote(&manager, &tasks).await.is_some());
 
         // Third blocked by capacity
-        assert_eq!(manager.promote_next_task().await, None);
+        assert_eq!(promote(&manager, &tasks).await, None);
         assert_eq!(manager.get_capacity_available().await, 0);
     }
 }

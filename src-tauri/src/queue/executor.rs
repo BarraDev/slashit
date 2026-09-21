@@ -236,18 +236,56 @@ impl TaskExecutor {
     }
 
     async fn check_and_execute(&self) {
-        // Auto-promote tasks from Queue → InProgress when capacity is available
-        let manager = self.queue_manager.read().await;
-        if manager.config().auto_promote {
-            while let Some(task_id) = manager.promote_next_task().await {
-                self.events.agent_event(AgentEvent::Log {
-                    task_id: task_id.to_string(),
-                    level: LogLevel::Info,
-                    message: "Auto-promoted from queue".to_string(),
-                });
+        // Auto-promote tasks from Queue → InProgress when capacity is available.
+        //
+        // Durably: a promotion this loop makes has to survive a restart just
+        // as surely as one a person triggers through `commands::queue`, or an
+        // auto-promoted task that crashed before its next explicit save would
+        // come back `Queue` on disk while every other part of the running
+        // process still believed it was `InProgress`. See
+        // `lifecycle::commit_selected`.
+        let auto_promote = self.queue_manager.read().await.config().auto_promote;
+        if auto_promote {
+            loop {
+                let manager = self.queue_manager.read().await;
+                let select = |tasks: &HashMap<Uuid, Task>| manager.select_promotable(tasks);
+                let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {
+                    if let Some(task) = staged.get_mut(&task_id) {
+                        QueueManager::apply_promotion(task);
+                    }
+                };
+                let promoted = crate::lifecycle::commit_selected(
+                    &self.tasks,
+                    &self.storage,
+                    select,
+                    amend,
+                )
+                .await;
+                drop(manager);
+
+                match promoted {
+                    Ok(Some(task)) => {
+                        self.events.agent_event(AgentEvent::Log {
+                            task_id: task.id.to_string(),
+                            level: LogLevel::Info,
+                            message: "Auto-promoted from queue".to_string(),
+                        });
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        // Nothing was promoted: `commit_selected` never
+                        // publishes to the shared map unless the disk write
+                        // it depends on already succeeded. Stopping here
+                        // rather than retrying immediately avoids spinning
+                        // against a durably broken write on every poll tick;
+                        // the next tick tries again from the same truthful
+                        // state.
+                        eprintln!("[executor] auto-promotion did not persist: {e}");
+                        break;
+                    }
+                }
             }
         }
-        drop(manager);
 
         // Find InProgress tasks that haven't started execution yet
         let pending: Vec<Uuid> = {
@@ -1914,6 +1952,119 @@ mod tests {
                 root.join("runtime"),
             ));
         (storage, temp)
+    }
+
+    /// Removes write permission on `dir` for the lifetime of the guard, and
+    /// restores it on drop -- including on an unwinding panic -- so a failed
+    /// assertion never leaves a directory `tempfile::TempDir` cannot clean up.
+    struct Unwritable(std::path::PathBuf);
+
+    impl Unwritable {
+        fn on(dir: &std::path::Path) -> Self {
+            std::fs::create_dir_all(dir).expect("create the directory to lock down");
+            std::fs::set_permissions(
+                dir,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o500),
+            )
+            .expect("remove write permission");
+            Self(dir.to_path_buf())
+        }
+    }
+
+    impl Drop for Unwritable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(
+                &self.0,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            );
+        }
+    }
+
+    /// The same defect Unit 4A closed for the ordinary mutation front doors,
+    /// found in the one queue mutation that is not behind any front door at
+    /// all: the poll's own auto-promotion, which used to move `Queue` tasks
+    /// to `InProgress` in the shared map with no call to `Storage` ever in
+    /// the loop. A crash right after such a promotion came back `Queue` on
+    /// disk while the rest of the running process -- until its own crash --
+    /// believed the task was executing. This forces a real durable-write
+    /// failure and proves the fix: the poll leaves the task exactly as it
+    /// found it, both in memory and on disk, rather than reporting nothing
+    /// while quietly diverging from the file.
+    #[tokio::test]
+    async fn auto_promotion_leaves_the_task_untouched_when_the_durable_write_fails() {
+        let (storage, storage_temp) = test_storage();
+        let (registry, _reg_temp) = test_registry();
+        let paths_temp = tempfile::TempDir::new().expect("paths temp dir");
+
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("queued", project_id, TaskStatus::Queue, 0);
+        task.phase = TaskPhase::Idle;
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task.clone())])));
+        storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board with the previous, good value");
+
+        let executor = TaskExecutor::new(TaskExecutorConfig {
+            tasks: tasks.clone(),
+            queue_manager: Arc::new(RwLock::new(QueueManager::new(
+                tasks.clone(),
+                crate::config::queue::QueueConfig {
+                    auto_promote: true,
+                    ..Default::default()
+                },
+            ))),
+            executions: Arc::new(RwLock::new(HashMap::new())),
+            logs: Arc::new(RwLock::new(HashMap::new())),
+            projects: Arc::new(RwLock::new(HashMap::new())),
+            repositories: Arc::new(RwLock::new(HashMap::new())),
+            workspace_registry: Arc::new(RwLock::new(registry)),
+            storage,
+            worktree_manager: Arc::new(WorktreeManager::new(
+                Arc::new(crate::config::paths::AppPaths::with_roots(
+                    paths_temp.path().join("config"),
+                    paths_temp.path().join("data"),
+                    paths_temp.path().join("cache"),
+                    paths_temp.path().join("runtime"),
+                )),
+                crate::config::paths::WorktreePlacement::Managed,
+            )),
+            events: crate::events::null_sink(),
+            lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
+        });
+
+        let guard = Unwritable::on(&storage_temp.path().join("config").join("tasks"));
+
+        executor.check_and_execute().await;
+
+        drop(guard);
+
+        let in_memory = tasks
+            .read()
+            .await
+            .get(&task_id)
+            .cloned()
+            .expect("the record itself must survive a failed persist");
+        assert_eq!(
+            in_memory.status,
+            TaskStatus::Queue,
+            "memory must keep the previous value when the disk write failed, \
+             not report a promotion that never reached disk"
+        );
+
+        let on_disk = executor
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the previous file must still be readable");
+        let disk_task = on_disk
+            .iter()
+            .find(|t| t.id == task_id)
+            .expect("the previous record must still be there");
+        assert_eq!(
+            disk_task.status,
+            TaskStatus::Queue,
+            "disk must keep the previous value too, not a torn or partial write"
+        );
     }
 
     // ===== automatic completion of a merged pull request =====

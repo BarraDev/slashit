@@ -1,4 +1,5 @@
 use crate::config::QueueConfig;
+use crate::domain::{Task, TaskStatus};
 use crate::queue::QueueManager;
 use crate::commands::task::Tasks;
 use uuid::Uuid;
@@ -67,14 +68,33 @@ pub async fn update_queue_config(
     Ok(new_config)
 }
 
+/// Durably, rather than through a `QueueManager` method that only ever
+/// mutated the shared map: that ordering published the status change in
+/// memory before persistence was attempted at all. See
+/// `lifecycle::commit_task`.
+async fn enqueue_durably(
+    state: &tauri::State<'_, crate::AppState>,
+    task_id: Uuid,
+) -> Result<(), String> {
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            task.status = TaskStatus::Queue;
+        }
+    };
+    match crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await?
+    {
+        Some(_) => Ok(()),
+        None => Err(format!("Task {} not found", task_id)),
+    }
+}
+
 #[tauri::command]
 pub async fn add_to_queue(
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<(), String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let manager = state.queue.manager.read().await;
-    manager.enqueue_task(task_id).await
+    enqueue_durably(&state, task_id).await
 }
 
 #[tauri::command]
@@ -82,12 +102,11 @@ pub async fn bulk_add_to_queue(
     state: tauri::State<'_, crate::AppState>,
     task_ids: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    let manager = state.queue.manager.read().await;
     let mut results = Vec::new();
 
     for task_id in task_ids {
         match Uuid::parse_str(&task_id) {
-            Ok(id) => match manager.enqueue_task(id).await {
+            Ok(id) => match enqueue_durably(&state, id).await {
                 Ok(()) => results.push(format!("Added {} to queue", task_id)),
                 Err(e) => results.push(format!("Failed to add {}: {}", task_id, e)),
             },
@@ -120,10 +139,16 @@ pub async fn promote_next_task(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Option<String>, String> {
     let manager = state.queue.manager.read().await;
-    match manager.promote_next_task().await {
-        Some(task_id) => Ok(Some(task_id.to_string())),
-        None => Ok(None),
-    }
+    let select = |tasks: &HashMap<Uuid, Task>| manager.select_promotable(tasks);
+    let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            QueueManager::apply_promotion(task);
+        }
+    };
+    let promoted =
+        crate::lifecycle::commit_selected(&state.task.tasks, &state.storage, select, amend)
+            .await?;
+    Ok(promoted.map(|task| task.id.to_string()))
 }
 
 #[tauri::command]
@@ -148,6 +173,5 @@ pub async fn requeue_task(
     task_id: String,
 ) -> Result<(), String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let manager = state.queue.manager.read().await;
-    manager.requeue_task(task_id).await
+    enqueue_durably(&state, task_id).await
 }
