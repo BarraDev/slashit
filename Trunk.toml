@@ -7,11 +7,8 @@ tailwindcss = "4.1.10"
 [watch]
 ignore = [
     "./src-tauri",
-    "./target",
-    "./dist",
     "./Cargo.lock",
     "./.git",
-    "./.jj",
 ]
 
 [serve]
