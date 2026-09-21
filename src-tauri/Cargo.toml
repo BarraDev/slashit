@@ -66,5 +66,18 @@ acceptance-webdriver = ["dep:tauri-plugin-wdio-webdriver"]
 
 [dev-dependencies]
 tempfile = "3"
+# TEST-ONLY. `test-util` is what makes `tokio::time::pause` available, so a
+# regression can assert that a bounded wait *is* bounded without spending the
+# bound in wall-clock time. Not part of tokio's `full`, and a dev-dependency
+# feature is not unified into `cargo build`, so no shipped binary carries the
+# paused-clock machinery.
+tokio = { version = "1", features = ["full", "test-util"] }
 mockall = "0.13"
+# TEST-ONLY. `tauri::test::mock_app` is the only public way to obtain a real
+# `tauri::State<AppState>`: `State` is a newtype over a private reference with
+# no constructor, so a test that wants to drive a `#[tauri::command]` body
+# itself -- rather than a copy of it -- has to go through a managed app. Being
+# a dev-dependency feature, it is not unified into `cargo build`/`cargo tauri
+# build`, so no shipped binary carries the mock runtime.
+tauri = { version = "2", features = ["test"] }
 

@@ -1,3 +1,3 @@
 mod manager;
 
-pub use manager::{WorktreeInfo, WorktreeManager, WorktreeRecovery};
+pub use manager::{WorktreeManager, WorktreeRecovery};

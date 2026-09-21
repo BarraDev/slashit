@@ -2,7 +2,7 @@ use crate::agents::runner::{ClaudeRunner, ClaudeRunConfig, ClaudeEvent};
 use crate::domain::{Task, TaskStatus, TaskPhase, AgentExecution, AgentStatus, AgentLogEntry, LogLevel, QaSignoff, QaStatus};
 use crate::queue::prompt::{build_task_prompt, build_review_prompt, build_fix_prompt};
 use crate::queue::QueueManager;
-use crate::worktree::{WorktreeManager, WorktreeInfo};
+use crate::worktree::WorktreeManager;
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::events::{EventSink, SharedEventSink};
@@ -68,24 +68,15 @@ pub struct TaskExecutor {
     executions: Arc<RwLock<HashMap<Uuid, AgentExecution>>>,
     running_handles: Arc<RwLock<HashMap<Uuid, RunningTask>>>,
     reviewing_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
-    /// Task ids with a worktree-cleanup attempt currently in flight, so a
-    /// merged-PR transition and the periodic retry pass can never schedule
-    /// two removals for the same task at once. See
-    /// [`spawn_worktree_cleanup`](Self::spawn_worktree_cleanup).
-    cleanup_in_flight: Arc<RwLock<std::collections::HashSet<Uuid>>>,
-    /// The last cleanup warning already reported for a task, so the ~30s retry
-    /// pass reports a persistent failure once rather than on every sweep.
+    /// The per-task lifecycle lease, shared with the desktop commands and the
+    /// IPC handlers.
     ///
-    /// Retrying is deliberately unchanged — the reference must stay recorded
-    /// until removal is confirmed — but the conditions that keep failing are
-    /// steady states (a project that resolves to no repository, a directory
-    /// git will not remove, a task file that cannot be written), so repeating
-    /// the same sentence to the user twice a minute forever is noise, not
-    /// information. Keyed by message so a *different* failure still surfaces,
-    /// and cleared on success, so a condition that recurs is reported again.
-    /// In-memory only: a restart is exactly when the underlying state may have
-    /// changed, so re-reporting once then is correct.
-    cleanup_last_warning: Arc<RwLock<HashMap<Uuid, String>>>,
+    /// It replaces a `HashSet` of task ids this executor used to keep for the
+    /// same purpose, which had two defects an owned guard does not: it was
+    /// released by an explicit statement, so a panic inside a cleanup stranded
+    /// the task forever, and it was private to the executor, so it never
+    /// serialized against a card the user dragged at the same moment.
+    lifecycle: Arc<crate::lifecycle::TaskLifecycleLocks>,
     logs: Arc<RwLock<HashMap<Uuid, Vec<AgentLogEntry>>>>,
     projects: Arc<RwLock<HashMap<Uuid, crate::domain::Project>>>,
     repositories: Arc<RwLock<HashMap<Uuid, crate::domain::Repository>>>,
@@ -107,6 +98,7 @@ pub struct TaskExecutorConfig {
     pub storage: crate::config::Storage,
     pub worktree_manager: Arc<WorktreeManager>,
     pub events: SharedEventSink,
+    pub lifecycle: Arc<crate::lifecycle::TaskLifecycleLocks>,
 }
 
 impl TaskExecutor {
@@ -117,8 +109,7 @@ impl TaskExecutor {
             executions: config.executions,
             running_handles: Arc::new(RwLock::new(HashMap::new())),
             reviewing_handles: Arc::new(RwLock::new(HashMap::new())),
-            cleanup_in_flight: Arc::new(RwLock::new(std::collections::HashSet::new())),
-            cleanup_last_warning: Arc::new(RwLock::new(HashMap::new())),
+            lifecycle: config.lifecycle,
             logs: config.logs,
             projects: config.projects,
             repositories: config.repositories,
@@ -214,7 +205,43 @@ impl TaskExecutor {
     /// it meant to say. That is why [`stop_task`](Self::stop_task) does not
     /// leave a stopped task here.
     fn is_pending(task: &Task) -> bool {
-        task.status == TaskStatus::InProgress && task.phase == TaskPhase::Idle
+        task.status == TaskStatus::InProgress
+            && task.phase == TaskPhase::Idle
+            // A cleanup this or an earlier process started and never recorded
+            // the outcome of leaves the recorded checkout untrustworthy, and an
+            // agent started against it would be working inside a directory a
+            // removal may still be taking apart. Startup quarantines such a
+            // task rather than adopting or re-removing it; this is the gate
+            // that keeps it out of the queue until someone resolves it.
+            && !task.cleanup_in_flight
+    }
+
+    /// Whether an agent is attached to this task right now.
+    ///
+    /// The handle maps are the live ownership fact, and they are the only one:
+    /// a task's persisted status cannot answer this, because a crash leaves
+    /// `InProgress` behind with no process under it.
+    ///
+    /// Both maps, because the question this answers is "would deleting this
+    /// task's checkout take it away from something". A review run works in the
+    /// same directory the execution does -- it reads the diff there, runs the
+    /// fix agent there and commits there -- so a terminalization that only
+    /// looked at `running_handles` would happily remove a checkout an AI review
+    /// was halfway through.
+    pub async fn is_task_running(&self, task_id: Uuid) -> bool {
+        let running = self
+            .running_handles
+            .read()
+            .await
+            .get(&task_id)
+            .is_some_and(|r| !r.handle.is_finished());
+        running
+            || self
+                .reviewing_handles
+                .read()
+                .await
+                .get(&task_id)
+                .is_some_and(|h| !h.is_finished())
     }
 
     async fn check_and_execute(&self) {
@@ -258,7 +285,9 @@ impl TaskExecutor {
         let available = limit.saturating_sub(running);
 
         for task_id in pending.into_iter().take(available) {
-            self.spawn_task_execution(task_id).await;
+            // Declining is ordinary here: the task keeps its state and the next
+            // pass, three seconds later, tries again.
+            let _started = self.spawn_task_execution(task_id).await;
         }
 
         // Same backstop as `running_handles` above: a panicked review task
@@ -292,6 +321,11 @@ impl TaskExecutor {
                 let tasks = self.tasks.read().await;
                 tasks.values()
                     .filter(|t| matches!(t.status, TaskStatus::PrCreated | TaskStatus::HumanReview | TaskStatus::Done))
+                    // A quarantined task cannot be finished automatically, so
+                    // polling it is a `gh pr view` every thirty seconds that
+                    // can only ever end in the same refusal. Its interrupted
+                    // cleanup is already reported on the task itself.
+                    .filter(|t| !t.cleanup_in_flight)
                     .flat_map(|t| {
                         t.external_refs.iter().filter_map(move |r| {
                             if let ExternalRef::GithubPr { number, repo, state, .. } = r {
@@ -317,259 +351,238 @@ impl TaskExecutor {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str) {
                             let state = json.get("state").and_then(|s| s.as_str()).unwrap_or("");
 
-                            // Update the ExternalRef state
-                            let mut pending_worktree_removal: Option<String> = None;
-                            {
+                            if state == "MERGED" {
+                                self.complete_merged_task(task_id, number, state).await;
+                            } else if !state.is_empty() {
                                 let mut tasks_w = self.tasks.write().await;
                                 if let Some(t) = tasks_w.get_mut(&task_id) {
-                                    for r in &mut t.external_refs {
-                                        if let ExternalRef::GithubPr { number: n, state: ref mut s, .. } = r {
-                                            if *n == number {
-                                                *s = Some(state.to_string());
-                                            }
-                                        }
+                                    Self::record_pr_state(t, number, state);
+                                    if state == "CLOSED" {
+                                        t.error_message =
+                                            Some("PR was closed without merge".to_string());
                                     }
-
-                                    match state {
-                                        "MERGED" => {
-                                            t.status = TaskStatus::Done;
-                                            t.overall_progress = 100;
-                                            t.phase = TaskPhase::Complete;
-                                            t.updated_at = chrono::Utc::now();
-                                            // Not cleared here: `worktree_path` is the only
-                                            // persisted record of this directory. It is
-                                            // cleared (and re-persisted) only once removal
-                                            // below actually succeeds, so a crash or a
-                                            // failed removal leaves it in place for retry.
-                                            if let Some(wt_path) = t.worktree_path.clone() {
-                                                pending_worktree_removal = Some(wt_path);
-                                            }
-                                        }
-                                        "CLOSED" => {
-                                            t.error_message = Some("PR was closed without merge".to_string());
-                                        }
-                                        _ => {} // OPEN — update state only
-                                    }
+                                    t.updated_at = chrono::Utc::now();
                                 }
-                            }
-
-                            // Spawned after `tasks_w` is dropped above, since
-                            // `spawn_worktree_cleanup` takes its own locks.
-                            if let Some(wt_path) = pending_worktree_removal {
-                                self.spawn_worktree_cleanup(task_id, wt_path).await;
-                            }
-
-                            if state == "MERGED" {
-                                Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
-                                self.events.agent_event(AgentEvent::Completed {
-                                    task_id: task_id.to_string(),
-                                    success: true,
-                                    message: Some("PR merged — task complete".to_string()),
-                                });
-                            } else if state == "CLOSED" || !state.is_empty() {
+                                drop(tasks_w);
                                 Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
                             }
                         }
                     }
                 }
             }
+        }
+    }
 
-            // Retry worktree cleanup for tasks whose earlier attempt failed.
-            //
-            // The loop above only polls a `GithubPr` ref while it is not yet
-            // in a terminal state, so once a task reaches `Done` its ref is
-            // excluded from every future `gh pr view` here — correctly, that
-            // call must not run again for an already-merged PR. But it also
-            // means the merged-transition cleanup spawned above is the last
-            // time that code path ever looks at the task, so a failed
-            // removal would otherwise sit on `worktree_path` forever with no
-            // automatic path back. This pass, running on the same ~30s
-            // cadence, is that path: any `Done` task still holding a
-            // `worktree_path` gets another attempt, guarded so a task
-            // already being retried is never scheduled twice.
-            let cleanup_retries = {
-                let tasks = self.tasks.read().await;
-                let in_flight = self.cleanup_in_flight.read().await;
-                Self::tasks_eligible_for_cleanup_retry(&tasks, &in_flight)
-            };
-            for (task_id, wt_path) in cleanup_retries {
-                self.spawn_worktree_cleanup(task_id, wt_path).await;
+    /// Write a PR's remote state onto the task's matching external ref.
+    fn record_pr_state(task: &mut Task, number: u32, state: &str) {
+        for r in &mut task.external_refs {
+            if let crate::domain::task::ExternalRef::GithubPr { number: n, state: ref mut s, .. } = r {
+                if *n == number {
+                    *s = Some(state.to_string());
+                }
             }
         }
     }
 
-    /// Tasks whose worktree cleanup should be (re)tried on this maintenance
-    /// pass: already `Done` and still holding a `worktree_path` because a
-    /// previous removal attempt failed, and not already being retried by an
-    /// in-flight attempt.
-    fn tasks_eligible_for_cleanup_retry(
-        tasks: &HashMap<Uuid, Task>,
-        in_flight: &std::collections::HashSet<Uuid>,
-    ) -> Vec<(Uuid, String)> {
-        tasks
-            .values()
-            .filter(|t| t.status == TaskStatus::Done)
-            .filter(|t| !in_flight.contains(&t.id))
-            .filter_map(|t| Some((t.id, t.worktree_path.clone()?)))
-            .collect()
-    }
-
-    /// Reserve `task_id`'s cleanup slot, or refuse if one is already held.
+    /// Finish a task whose pull request GitHub now reports as merged.
     ///
-    /// A `HashSet` rather than tracking `JoinHandle`s: nothing needs to
-    /// cancel a cleanup attempt, only prevent two of them running for the
-    /// same task at once, and `HashSet::insert`'s own return value makes the
-    /// check-and-reserve atomic under a single write lock.
-    async fn try_reserve_cleanup(
-        in_flight: &RwLock<std::collections::HashSet<Uuid>>,
-        task_id: Uuid,
-    ) -> bool {
-        in_flight.write().await.insert(task_id)
-    }
-
-    async fn release_cleanup(in_flight: &RwLock<std::collections::HashSet<Uuid>>, task_id: Uuid) {
-        in_flight.write().await.remove(&task_id);
-    }
-
-    /// Attempt the actual removal and, only once the cleared record is on
-    /// disk, drop `worktree_path` from shared memory.
+    /// Ordering is the whole content of this function. The merged fact is not
+    /// written before the lease is obtained, and that is deliberate: the poll
+    /// above skips any ref already recorded `MERGED`, so persisting it while
+    /// the task was busy would spend the one automatic completion this task
+    /// ever gets on a pass that did nothing. Declining is therefore free -- no
+    /// state written, no opportunity consumed, and the next ordinary poll finds
+    /// the task exactly as eligible as before.
     ///
-    /// `Ok(())` therefore means both that the worktree is gone and that the
-    /// task board says so. A persistence failure is reported as a failed
-    /// cleanup, which is what keeps the task eligible for the retry pass.
+    /// The lease is taken here rather than left to [`crate::lifecycle::
+    /// terminalize`] so that every refusal is classified while this still owns
+    /// the task. Reconstructing what happened after the lease has been released
+    /// is guessing about a moment that has passed, and the decisions below --
+    /// whether anything durable is owed, and whether another pass may try again
+    /// -- are exactly the decisions that must not be guesses.
     ///
-    /// Takes no `AppHandle`, so it is unit-testable without a running Tauri
-    /// app; [`spawn_worktree_cleanup`](Self::spawn_worktree_cleanup) wraps it
-    /// with the in-flight guard and user-visible failure logging.
-    async fn attempt_worktree_cleanup(
-        wt_mgr: &WorktreeManager,
-        tasks: &Tasks,
-        storage: &crate::config::Storage,
-        task_id: Uuid,
-        wt_path: &str,
-        repo_path: &str,
-    ) -> Result<(), String> {
-        wt_mgr.remove(wt_path, repo_path).await?;
+    /// What the classification is for: a refusal that is a passing condition
+    /// leaves nothing written, so an ordinary later poll retries it. A refusal
+    /// that is a stable blocker is recorded durably, which both tells the user
+    /// why and stops the polling, because asking GitHub the same question every
+    /// thirty seconds forever cannot change a repository that does not resolve.
+    /// Neither kind ever re-runs a destructive step on a timer: once the merge
+    /// is durable, only an explicit lifecycle action finishes the task.
+    async fn complete_merged_task(&self, task_id: Uuid, number: u32, state: &str) {
+        // Declined, not failed. Nothing was asked and nothing is owed, so the
+        // next pass finds the task exactly as eligible as this one did.
+        let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
+            return;
+        };
 
-        // Persist before publishing. Shared with the status-change and delete
-        // cleanup path in `commands::task`, which had the identical defect:
-        // both used to clear `worktree_path` in memory and then persist with
-        // the error discarded.
-        crate::commands::task::clear_worktree_path_durably(tasks, storage, task_id, wt_path).await
-    }
-
-    /// Remove `task_id`'s worktree in the background, guarded so a second
-    /// call for the same task while one is already running is a no-op.
-    ///
-    /// Used both right after a PR is observed merged and by the periodic
-    /// retry pass in [`check_and_execute`](Self::check_and_execute) for a
-    /// task whose earlier attempt failed — `worktree_path` stays set on
-    /// failure, so the next maintenance pass finds it eligible again.
-    async fn spawn_worktree_cleanup(&self, task_id: Uuid, wt_path: String) {
-        if !Self::try_reserve_cleanup(&self.cleanup_in_flight, task_id).await {
-            return; // already retrying this task's worktree
-        }
-
-        let repo_path = match Self::resolve_working_dir_for_task(
-            &self.tasks,
-            &self.projects,
-            &self.repositories,
-            task_id,
-        )
-        .await
-        {
-            Ok(path) => path,
-            Err(e) => {
-                Self::warn_cleanup_once(
-                    &self.events,
-                    &self.cleanup_last_warning,
-                    task_id,
-                    format!("Cannot resolve repo path to clean up worktree: {}", e),
-                )
-                .await;
-                Self::release_cleanup(&self.cleanup_in_flight, task_id).await;
-                return;
+        let record_merge = move |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
+                Self::record_pr_state(t, number, state);
+            }
+        };
+        // Only true of a task that is actually finished, so it is withheld from
+        // a refusal along with the status itself.
+        let mark_complete = move |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
+                t.overall_progress = 100;
+                t.phase = TaskPhase::Complete;
             }
         };
 
-        let wt_mgr = self.worktree_manager.clone();
-        let tasks = self.tasks.clone();
-        let storage = self.storage.clone();
-        let events = self.events.clone();
-        let in_flight = self.cleanup_in_flight.clone();
-        let last_warning = self.cleanup_last_warning.clone();
-        let wt_path_done = wt_path.clone();
+        let mut request = crate::lifecycle::TerminalizeRequest::new(TaskStatus::Done);
+        request.record_first = Some(&record_merge);
+        request.on_success = Some(&mark_complete);
 
-        tokio::spawn(async move {
-            match Self::attempt_worktree_cleanup(
-                &wt_mgr, &tasks, &storage, task_id, &wt_path, &repo_path,
-            )
-            .await
-            {
-                Err(e) => {
-                    Self::warn_cleanup_once(
-                        &events,
-                        &last_warning,
-                        task_id,
-                        format!(
-                            "Failed to remove worktree {}: {}. It stays recorded on the task and will be retried automatically on a later maintenance pass.",
-                            wt_path_done, e
-                        ),
-                    )
-                    .await;
-                }
-                Ok(()) => {
-                    // Cleanup converged, so a failure that recurs later is news
-                    // again rather than a repeat.
-                    last_warning.write().await.remove(&task_id);
-                }
+        let outcome = crate::lifecycle::terminalize_leased(
+            crate::lifecycle::TerminalizeCtx {
+                tasks: &self.tasks,
+                projects: &self.projects,
+                repositories: &self.repositories,
+                worktree_manager: &self.worktree_manager,
+                storage: &self.storage,
+                authority: &self.lifecycle,
+                running: Some(self),
+            },
+            task_id,
+            crate::lifecycle::Origin::Automatic,
+            request,
+        )
+        .await;
+
+        match outcome {
+            Ok(_) => self.events.agent_event(AgentEvent::Completed {
+                task_id: task_id.to_string(),
+                success: true,
+                message: Some("PR merged — task complete".to_string()),
+            }),
+
+            // Answered, and the merge is durable: `record_first` reached the
+            // disk in the write that announced the cleanup, before anything
+            // destructive ran. The poll above excludes a ref it has already
+            // recorded as `MERGED`, so this is said once and no later pass
+            // re-attempts the removal.
+            Err(refusal @ crate::lifecycle::TerminalizeRefusal::CleanupRefused { .. }) => {
+                self.events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "The pull request is merged, but the task was not finished: {refusal}"
+                    ),
+                })
             }
-            Self::release_cleanup(&in_flight, task_id).await;
-        });
+
+            // Storage refused a write. Which write decides everything, and the
+            // variant alone does not say: from the announcement it means
+            // nothing reached the disk at all -- not even the merge -- so the
+            // ref is still un-recorded and an ordinary later poll retries this,
+            // correctly, because no durable latch exists to say otherwise. From
+            // the final commit it means the merge and the in-flight stamp are
+            // both durable, the poll's own filters exclude the task on either
+            // count, and the next start reconciles it. Reported either way, and
+            // no destructive step is scheduled by either.
+            Err(refusal @ crate::lifecycle::TerminalizeRefusal::NotRecorded(_)) => {
+                self.events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "The pull request is merged, but the task was not finished: {refusal}"
+                    ),
+                })
+            }
+
+            // A stable blocker, and the one refusal that answers before
+            // anything durable is written while never being able to resolve
+            // itself. Polling it is a `gh pr view` every thirty seconds that
+            // can only ever reach here again, so the merge and the reason are
+            // recorded now: the ref becomes `MERGED`, which is what takes the
+            // task out of the poll's selection, and the card says what the user
+            // has to fix. The task stays non-terminal, its worktree and branch
+            // are untouched, and no git command has run.
+            Err(refusal @ crate::lifecycle::TerminalizeRefusal::RepositoryUnresolved(_)) => {
+                let reason = refusal.to_string();
+                let latch = move |staged: &mut HashMap<Uuid, Task>| {
+                    if let Some(t) = staged.get_mut(&task_id) {
+                        Self::record_pr_state(t, number, state);
+                        t.error_message = Some(format!(
+                            "The pull request is merged, but the task was not finished: {reason}"
+                        ));
+                    }
+                };
+                // A failure here writes nothing, which leaves the ref
+                // un-recorded and the task eligible again -- the same safe
+                // direction as the announcement failure above. It is said in
+                // the same event rather than a separate line, because "this is
+                // why the task did not finish" and "and that reason did not
+                // reach the card either" are one thing the user needs to read
+                // together.
+                let stored =
+                    crate::lifecycle::record(&self.tasks, &self.storage, task_id, &latch).await;
+                let message = match stored {
+                    Ok(()) => format!(
+                        "The pull request is merged, but the task was not finished: {refusal}"
+                    ),
+                    Err(e) => format!(
+                        "The pull request is merged, but the task was not finished: {refusal}. \
+                         Recording that on the task failed as well, so this will be tried again: \
+                         {e}"
+                    ),
+                };
+                self.events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Warn,
+                    message,
+                })
+            }
+
+            // Passing conditions, and a task that is gone. An agent owns the
+            // task, or an interrupted cleanup is quarantined, or the lease was
+            // taken between the two lines above. Nothing was asked, nothing was
+            // written, nothing is owed -- and saying so every thirty seconds
+            // would be noise about a condition the task already reports for
+            // itself. Cleanup is never forced under a running agent, and a
+            // quarantine is never touched automatically; both simply become
+            // eligible again once the condition that is holding them clears.
+            Err(crate::lifecycle::TerminalizeRefusal::ExecutionActive)
+            | Err(crate::lifecycle::TerminalizeRefusal::Quarantined(_))
+            | Err(crate::lifecycle::TerminalizeRefusal::Busy(_))
+            | Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => {}
+        }
     }
 
-    /// Emit a cleanup warning unless the identical one was already reported for
-    /// this task and nothing has succeeded since.
+    /// Start an agent for `task_id`, or leave the task alone.
     ///
-    /// The retry cadence is unaffected: this suppresses only the repeated
-    /// event, never an attempt. A different message always gets through, so a
-    /// failure that changes character is still visible.
-    async fn warn_cleanup_once(
-        events: &SharedEventSink,
-        last_warning: &RwLock<HashMap<Uuid, String>>,
-        task_id: Uuid,
-        message: String,
-    ) {
-        if !Self::record_cleanup_warning(last_warning, task_id, &message).await {
-            return;
+    /// Acquiring the task's worktree is an ownership change, so it happens
+    /// under the task's lifecycle lease: while this holds it, no cleanup,
+    /// terminalization or delete can be midway through removing the very
+    /// checkout being handed to the agent. The lease is released as soon as the
+    /// run is registered in `running_handles`, which is from then on the live
+    /// ownership fact. Holding it for the agent's whole lifetime would make
+    /// `stop_task` -- which needs the same lease to take ownership away --
+    /// wait for the run it is trying to end.
+    ///
+    /// Declining the lease is not a failure: the task keeps whatever state it
+    /// had and the next poll, three seconds later, tries again.
+    /// Returns whether an execution was actually registered, so a caller that
+    /// answers a person can say what happened rather than assume it worked.
+    async fn spawn_task_execution(&self, task_id: Uuid) -> bool {
+        let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
+            return false; // another lifecycle operation owns this task right now
+        };
+
+        // Re-read under the lease. The pending set was sampled before waiting
+        // for it, and a task that has since been stopped, finished or
+        // quarantined must not be started off that stale reading.
+        {
+            let tasks = self.tasks.read().await;
+            match tasks.get(&task_id) {
+                Some(task) if Self::is_pending(task) => {}
+                _ => return false,
+            }
+        }
+        if self.is_task_running(task_id).await {
+            return false; // one agent per task
         }
 
-        events.agent_event(AgentEvent::Log {
-            task_id: task_id.to_string(),
-            level: LogLevel::Warn,
-            message,
-        });
-    }
-
-    /// Record `message` as this task's latest cleanup warning, returning
-    /// whether it is new and therefore worth reporting.
-    ///
-    /// Split out from [`warn_cleanup_once`](Self::warn_cleanup_once) so the
-    /// suppression rule is testable without a running Tauri app.
-    async fn record_cleanup_warning(
-        last_warning: &RwLock<HashMap<Uuid, String>>,
-        task_id: Uuid,
-        message: &str,
-    ) -> bool {
-        let mut seen = last_warning.write().await;
-        if seen.get(&task_id).is_some_and(|previous| previous == message) {
-            return false;
-        }
-        seen.insert(task_id, message.to_string());
-        true
-    }
-
-    async fn spawn_task_execution(&self, task_id: Uuid) {
         // Resolve repo path from task → project → repository chain
         let repo_path = match Self::resolve_working_dir_for_task(
             &self.tasks, &self.projects, &self.repositories, task_id,
@@ -581,7 +594,7 @@ impl TaskExecutor {
                     message: format!("Cannot resolve working directory: {}", e),
                 });
                 Self::set_task_error_static(&self.tasks, &self.storage, task_id, &e).await;
-                return;
+                return false;
             }
         };
 
@@ -623,111 +636,84 @@ impl TaskExecutor {
             None
         };
 
-        // Helper closure to handle worktree success
-        let handle_worktree_ok = |info: &WorktreeInfo, app: &SharedEventSink, msg: &str| {
-            app.agent_event(AgentEvent::Log {
-                task_id: task_id.to_string(),
-                level: LogLevel::Info,
-                message: format!("{}: {}", msg, info.path),
-            });
-        };
-
-        // Create or reattach to worktree for this task
-        let (working_dir, _worktree_path) = if let Some(ref _existing) = existing_branch {
-            // Reattach to existing branch
-            match self.worktree_manager.reattach(&repo_path, &branch_name).await {
-                Ok(info) => {
-                    handle_worktree_ok(&info, &self.events, "Reattached worktree");
-                    {
-                        let mut tasks_w = self.tasks.write().await;
-                        if let Some(t) = tasks_w.get_mut(&task_id) {
-                            t.worktree_path = Some(info.path.clone());
-                            t.branch_name = Some(info.branch.clone());
-                        }
-                    }
-                    Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
-                    (info.path.clone(), Some(info.path))
-                }
+        // Acquire the task's worktree, or give up on this attempt.
+        //
+        // There is deliberately no fallback. Every arm here used to fall
+        // through to `repo_path` on failure and carry on, which meant a task
+        // whose worktree could not be created ran its agent in the user's main
+        // checkout: the prompt, `--add-dir`, the agent's own working directory
+        // and `commit_changes` all read this one value, so the run would end by
+        // rewriting the current change description or committing every
+        // uncommitted file in that repository under a task title. A task
+        // without its own worktree has nowhere to work, and saying so is the
+        // only safe answer.
+        let acquired = if existing_branch.is_some() {
+            self.worktree_manager
+                .reattach(&repo_path, &branch_name)
+                .await
+                .map(|info| (info, "Reattached worktree"))
+        } else if let Some(parent_branch) = base_branch.as_deref() {
+            match self
+                .worktree_manager
+                .create_stacked_branch(&repo_path, &branch_name, parent_branch)
+                .await
+            {
+                Ok(info) => Ok((info, "Created stacked worktree")),
                 Err(e) => {
+                    // Stacking is an optimisation, so losing it is not fatal:
+                    // an ordinary branch off the default base still gives the
+                    // task a worktree of its own.
                     self.events.agent_event(AgentEvent::Log {
                         task_id: task_id.to_string(),
                         level: LogLevel::Warn,
-                        message: format!("Worktree reattach failed ({}), using repo dir", e),
+                        message: format!(
+                            "Stacked branch failed ({e}), falling back to normal create"
+                        ),
                     });
-                    (repo_path.clone(), None)
-                }
-            }
-        } else if let Some(ref parent_branch) = base_branch {
-            // Stacked branch based on parent dependency
-            match self.worktree_manager.create_stacked_branch(&repo_path, &branch_name, parent_branch).await {
-                Ok(info) => {
-                    handle_worktree_ok(&info, &self.events, "Created stacked worktree");
-                    {
-                        let mut tasks_w = self.tasks.write().await;
-                        if let Some(t) = tasks_w.get_mut(&task_id) {
-                            t.worktree_path = Some(info.path.clone());
-                            t.branch_name = Some(info.branch.clone());
-                        }
-                    }
-                    Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
-                    (info.path.clone(), Some(info.path))
-                }
-                Err(e) => {
-                    // Fallback to normal create if stacking fails
-                    self.events.agent_event(AgentEvent::Log {
-                        task_id: task_id.to_string(),
-                        level: LogLevel::Warn,
-                        message: format!("Stacked branch failed ({}), falling back to normal create", e),
-                    });
-                    match self.worktree_manager.create(&repo_path, &branch_name).await {
-                        Ok(info) => {
-                            handle_worktree_ok(&info, &self.events, "Created worktree (fallback)");
-                            {
-                                let mut tasks_w = self.tasks.write().await;
-                                if let Some(t) = tasks_w.get_mut(&task_id) {
-                                    t.worktree_path = Some(info.path.clone());
-                                    t.branch_name = Some(info.branch.clone());
-                                }
-                            }
-                            Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
-                            (info.path.clone(), Some(info.path))
-                        }
-                        Err(e2) => {
-                            self.events.agent_event(AgentEvent::Log {
-                                task_id: task_id.to_string(),
-                                level: LogLevel::Warn,
-                                message: format!("Worktree creation failed ({}), using repo dir", e2),
-                            });
-                            (repo_path.clone(), None)
-                        }
-                    }
+                    self.worktree_manager
+                        .create(&repo_path, &branch_name)
+                        .await
+                        .map(|info| (info, "Created worktree (fallback)"))
                 }
             }
         } else {
-            // Normal new branch
-            match self.worktree_manager.create(&repo_path, &branch_name).await {
-                Ok(info) => {
-                    handle_worktree_ok(&info, &self.events, "Created worktree");
-                    {
-                        let mut tasks_w = self.tasks.write().await;
-                        if let Some(t) = tasks_w.get_mut(&task_id) {
-                            t.worktree_path = Some(info.path.clone());
-                            t.branch_name = Some(info.branch.clone());
-                        }
-                    }
-                    Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
-                    (info.path.clone(), Some(info.path))
-                }
-                Err(e) => {
-                    self.events.agent_event(AgentEvent::Log {
-                        task_id: task_id.to_string(),
-                        level: LogLevel::Warn,
-                        message: format!("Worktree creation failed ({}), using repo dir", e),
-                    });
-                    (repo_path.clone(), None)
-                }
+            self.worktree_manager
+                .create(&repo_path, &branch_name)
+                .await
+                .map(|info| (info, "Created worktree"))
+        };
+
+        let (info, what_happened) = match acquired {
+            Ok(acquired) => acquired,
+            Err(e) => {
+                let message = format!(
+                    "No worktree could be attached to this task ({e}), so it was not \
+                     started. Running it in the repository itself would put the agent's \
+                     changes in your working checkout."
+                );
+                self.events.agent_event(AgentEvent::Error {
+                    task_id: task_id.to_string(),
+                    message: message.clone(),
+                });
+                Self::set_task_error_static(&self.tasks, &self.storage, task_id, &message).await;
+                return false;
             }
         };
+
+        self.events.agent_event(AgentEvent::Log {
+            task_id: task_id.to_string(),
+            level: LogLevel::Info,
+            message: format!("{}: {}", what_happened, info.path),
+        });
+        {
+            let mut tasks_w = self.tasks.write().await;
+            if let Some(t) = tasks_w.get_mut(&task_id) {
+                t.worktree_path = Some(info.path.clone());
+                t.branch_name = Some(info.branch.clone());
+            }
+        }
+        Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
+        let working_dir = info.path;
 
         let (prompt, task_model) = {
             let tasks = self.tasks.read().await;
@@ -740,7 +726,8 @@ impl TaskExecutor {
                     };
                     (build_task_prompt(t, Some(working_dir.as_str())), model)
                 },
-                None => return,
+                // Deleted while its worktree was being attached.
+                None => return false,
             }
         };
 
@@ -987,6 +974,7 @@ impl TaskExecutor {
         });
 
         handles.insert(task_id, RunningTask { handle, cancel });
+        true
     }
 
     pub async fn execute_task(&self, task_id: Uuid) -> Result<(), String> {
@@ -995,6 +983,16 @@ impl TaskExecutor {
             let task = tasks.get(&task_id).ok_or("Task not found")?;
             if task.status != TaskStatus::InProgress && task.status != TaskStatus::Queue {
                 return Err(format!("Task in {:?}, expected InProgress or Queue", task.status));
+            }
+            // See `is_pending`: the recorded checkout is untrustworthy until
+            // the interrupted cleanup is resolved, and starting an agent in it
+            // is exactly what the quarantine exists to prevent.
+            if task.cleanup_in_flight {
+                return Err(
+                    "This task has a worktree cleanup that was interrupted and not yet \
+                     resolved; it needs attention before it can run again"
+                        .to_string(),
+                );
             }
         }
         {
@@ -1005,7 +1003,15 @@ impl TaskExecutor {
                 t.updated_at = chrono::Utc::now();
             }
         }
-        self.spawn_task_execution(task_id).await;
+        if !self.spawn_task_execution(task_id).await {
+            // The task is left where it is, which is what the three-second
+            // poll looks for, so this is a deferral rather than a loss. Saying
+            // `Ok` would tell the caller an agent is running when none is.
+            return Err(format!(
+                "task {task_id} could not be started right now; it stays queued and the \
+                 executor will pick it up on its next pass"
+            ));
+        }
         Ok(())
     }
 
@@ -1028,6 +1034,16 @@ impl TaskExecutor {
     /// the run had already made all survive, and a later explicit move back
     /// into a working column reattaches to them.
     pub async fn stop_task(&self, task_id: Uuid) -> Result<(), String> {
+        // Stopping is an ownership change, so it takes the task's lifecycle
+        // lease like every other one. It cannot deadlock against the run it is
+        // ending: `spawn_task_execution` releases the lease as soon as it has
+        // registered the run, and the execution future itself never asks for
+        // it -- everything it does on the way out (killing the process,
+        // removing its `running_handles` entry, recording the execution) uses
+        // its own locks. So the longest this can wait is the tail of another
+        // lifecycle operation, never the lifetime of an agent.
+        let _lease = self.lifecycle.acquire(task_id).await?;
+
         // Taken out of the map before awaiting anything, so the guard is
         // released before the future below tries to remove itself.
         let running = self.running_handles.write().await.remove(&task_id);
@@ -1059,9 +1075,8 @@ impl TaskExecutor {
     /// reached. That is the honest resolution of that race: the run was over
     /// before the stop got there.
     ///
-    /// Persists before publishing, the same contract
-    /// [`clear_worktree_path_durably`](crate::commands::task::clear_worktree_path_durably)
-    /// holds, and for a sharper reason. What survives a failed write is the
+    /// Persists before publishing, the same contract every durable write in
+    /// [`crate::lifecycle`] holds, and for a sharper reason. What survives a failed write is the
     /// `in_progress` this task started as, and the next startup reads that as
     /// a run a crash interrupted and puts it back on the queue. Reporting the
     /// stop from memory alone would therefore hand the user a stop that a
@@ -1136,34 +1151,35 @@ impl TaskExecutor {
     }
 
     async fn spawn_review(&self, task_id: Uuid) {
-        // Use worktree path if available, otherwise repo path
-        let worktree_path = {
+        // The task's own worktree, or no review at all.
+        //
+        // This used to fall back to the repository path, and a review is not a
+        // read-only operation: the fix agent runs in this directory and the
+        // block below finishes by running `jj describe` in it. Against the
+        // user's own checkout that rewrites their current change description
+        // under a task title. A task with no worktree has nothing of its own to
+        // review, and saying so is the only safe answer.
+        let Some(working_dir) = ({
             let tasks_r = self.tasks.read().await;
             tasks_r.get(&task_id).and_then(|t| t.worktree_path.clone())
-        };
-        let working_dir = if let Some(wt) = worktree_path {
-            wt
-        } else {
-            match Self::resolve_working_dir_for_task(
-                &self.tasks, &self.projects, &self.repositories, task_id,
-            ).await {
-                Ok(dir) => dir,
-                Err(e) => {
-                    self.events.agent_event(AgentEvent::Log {
-                        task_id: task_id.to_string(),
-                        level: LogLevel::Warn,
-                        message: format!("Cannot resolve working dir for review: {}", e),
-                    });
-                    let signoff = QaSignoff {
-                        status: QaStatus::Rejected,
-                        issues_found: vec![format!("AI review skipped: {}", e)],
-                        timestamp: chrono::Utc::now(),
-                        session_id: Uuid::new_v4(),
-                    };
-                    Self::transition_to_human_review(&self.tasks, &self.storage, task_id, Some(signoff)).await;
-                    return;
-                }
-            }
+        }) else {
+            let reason = "this task has no worktree of its own, so there is nothing to \
+                          review and reviewing the repository itself would put the fix \
+                          agent's changes in your working checkout";
+            self.events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message: format!("AI review skipped: {reason}"),
+            });
+            let signoff = QaSignoff {
+                status: QaStatus::Rejected,
+                issues_found: vec![format!("AI review skipped: {reason}")],
+                timestamp: chrono::Utc::now(),
+                session_id: Uuid::new_v4(),
+            };
+            Self::transition_to_human_review(&self.tasks, &self.storage, task_id, Some(signoff))
+                .await;
+            return;
         };
 
         let tasks = self.tasks.clone();
@@ -1701,6 +1717,15 @@ impl TaskExecutor {
     }
 }
 
+/// The queue is what knows whether an agent is attached to a task, so it is
+/// what [`crate::lifecycle::terminalize`] asks before it deletes a checkout.
+#[async_trait::async_trait]
+impl crate::lifecycle::ExecutionOwnership for TaskExecutor {
+    async fn is_task_running(&self, task_id: Uuid) -> bool {
+        TaskExecutor::is_task_running(self, task_id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1829,6 +1854,121 @@ mod tests {
         (storage, temp)
     }
 
+    // ===== automatic completion of a merged pull request =====
+
+    /// A task the poll would select: non-terminal, with one open PR ref.
+    async fn task_with_open_pr(executor: &TaskExecutor, worktree: Option<&str>) -> (Uuid, Uuid) {
+        let project_id = Uuid::new_v4();
+        let mut task = crate::test_helpers::create_test_task_full(
+            "merged",
+            project_id,
+            TaskStatus::PrCreated,
+            0,
+        );
+        task.worktree_path = worktree.map(|s| s.to_string());
+        task.branch_name = Some("task-abcd1234".to_string());
+        task.external_refs.push(crate::domain::task::ExternalRef::GithubPr {
+            number: 7,
+            repo: "owner/repo".to_string(),
+            url: "https://example.invalid/pr/7".to_string(),
+            state: None,
+        });
+        let id = task.id;
+        executor.tasks.write().await.insert(id, task.clone());
+        executor
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
+        (id, project_id)
+    }
+
+    fn recorded_pr_state(task: &Task) -> Option<String> {
+        task.external_refs.iter().find_map(|r| match r {
+            crate::domain::task::ExternalRef::GithubPr { state, .. } => state.clone(),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_merge_that_cannot_resolve_a_repository_is_recorded_once_instead_of_polled_forever() {
+        // No project and no repository, which is what `RepositoryUnresolved`
+        // actually is: a task that still names a checkout under a project that
+        // resolves to nothing. The refusal answers before any git command, and
+        // before this correction it wrote nothing at all -- so the poll picked
+        // the same task up again thirty seconds later, and every thirty seconds
+        // after that, forever.
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = task_with_open_pr(&executor, Some("/nonexistent/checkout")).await;
+
+        executor.complete_merged_task(id, 7, "MERGED").await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            recorded_pr_state(&after).as_deref(),
+            Some("MERGED"),
+            "the merge is a fact about GitHub and recording it is what takes this task out of \
+             the poll's selection"
+        );
+        assert!(
+            after.error_message.is_some(),
+            "and the card has to say why a merged pull request did not finish the task"
+        );
+        assert_eq!(
+            after.status,
+            TaskStatus::PrCreated,
+            "the task is not finished, so it may not be moved as though it were"
+        );
+        assert_eq!(
+            after.worktree_path.as_deref(),
+            Some("/nonexistent/checkout"),
+            "and nothing may drop the only reference to a checkout that was never touched"
+        );
+        assert!(!after.cleanup_in_flight, "no cleanup was ever announced");
+
+        let on_disk = executor
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .find(|t| t.id == id)
+            .expect("the task must be on disk");
+        assert_eq!(
+            recorded_pr_state(&on_disk).as_deref(),
+            Some("MERGED"),
+            "the file is what the next start reads, so a latch only in memory is no latch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_found_while_the_task_is_busy_writes_nothing_and_stays_eligible() {
+        let (executor, _temps) = test_executor();
+        let (id, _project_id) = task_with_open_pr(&executor, None).await;
+
+        // Someone else owns the task's lifecycle right now. Declining has to
+        // cost nothing: writing `MERGED` here would spend the one automatic
+        // completion this task ever gets on a pass that did nothing, because
+        // the poll skips a ref it has already recorded as merged.
+        let held = executor
+            .lifecycle
+            .try_acquire(id)
+            .await
+            .expect("the lease must be free to take");
+
+        executor.complete_merged_task(id, 7, "MERGED").await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            recorded_pr_state(&after),
+            None,
+            "nothing was attempted, so nothing may have been written -- and an un-recorded ref \
+             is exactly what leaves the task as eligible on the next pass as it was on this one"
+        );
+        assert_eq!(after.status, TaskStatus::PrCreated);
+        assert!(!after.cleanup_in_flight);
+
+        drop(held);
+    }
+
     /// A `TaskExecutor` over nothing but temporary directories.
     ///
     /// Deliberately synchronous and runtime-free, because
@@ -1863,6 +2003,7 @@ mod tests {
                 crate::config::paths::WorktreePlacement::Managed,
             )),
             events: crate::events::null_sink(),
+            lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
         }));
         (executor, vec![storage_temp, reg_temp, paths_temp])
     }
@@ -1992,6 +2133,7 @@ mod tests {
                 crate::config::paths::WorktreePlacement::Managed,
             )),
             events: crate::events::null_sink(),
+            lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
         }));
 
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -2055,6 +2197,7 @@ mod tests {
                 crate::config::paths::WorktreePlacement::Managed,
             )),
             events: crate::events::null_sink(),
+            lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
         });
 
         let task_id = Uuid::new_v4();
@@ -2124,6 +2267,187 @@ mod tests {
             .await
             .insert(task_id, RunningTask { handle, cancel });
         cleaned_up
+    }
+
+    /// A task whose worktree cannot be acquired is not started, and above all
+    /// is not started somewhere else.
+    ///
+    /// Every one of the three acquisition arms used to fall through to the
+    /// repository path on failure and carry on. That value is not just the
+    /// agent's working directory: it also reaches the prompt, `--add-dir` and
+    /// `commit_changes`, so the run ended by describing the user's current
+    /// change or committing every uncommitted file in their checkout under a
+    /// task title. There is no safe substitute for a task's own worktree, so
+    /// there is no fallback.
+    ///
+    /// The repository here is a real directory that is not a git repository,
+    /// which is a deterministic `git worktree add` failure needing no
+    /// permissions, no timing and no shim.
+    #[tokio::test]
+    async fn a_task_whose_worktree_cannot_be_acquired_never_runs_in_the_repository_itself() {
+        let (executor, temps) = test_executor();
+
+        let not_a_repo = temps[0].path().join("not-a-repository");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        let repo_path = not_a_repo.to_string_lossy().to_string();
+
+        let project_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        executor.repositories.write().await.insert(
+            repository_id,
+            crate::domain::Repository {
+                id: repository_id,
+                local_path: repo_path.clone(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        let mut project = test_project(project_id, ProjectScope::Standalone);
+        project.repository_id = Some(repository_id);
+        executor.projects.write().await.insert(project_id, project);
+
+        let mut task = create_test_task_full("no worktree possible", project_id, TaskStatus::InProgress, 0);
+        task.phase = TaskPhase::Idle;
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+
+        executor.spawn_task_execution(task_id).await;
+
+        assert!(
+            executor.running_handles.read().await.is_empty(),
+            "no agent may be started for a task that has nowhere to work"
+        );
+
+        let after = executor.tasks.read().await.get(&task_id).cloned().unwrap();
+        assert_eq!(after.status, TaskStatus::Error);
+        assert_ne!(
+            after.worktree_path.as_deref(),
+            Some(repo_path.as_str()),
+            "the repository is never recorded as the task's worktree"
+        );
+        assert!(
+            after.error_message.as_deref().is_some_and(|m| m.contains("worktree")),
+            "the reason has to name what went wrong: {:?}",
+            after.error_message
+        );
+
+        assert!(
+            std::fs::read_dir(&not_a_repo).unwrap().next().is_none(),
+            "the repository directory must be exactly as it was found"
+        );
+    }
+
+    /// An AI review has nowhere to run without the task's own worktree, and
+    /// does not borrow the repository instead.
+    ///
+    /// A review is not a read-only pass over a diff: the fix agent runs in this
+    /// directory and the run finishes with `jj describe` in it. Pointed at the
+    /// user's checkout that rewrites their current change description under a
+    /// task title, and the task never had a worktree of its own to review. The
+    /// honest outcome is the one a person can act on -- send it to human review
+    /// and say why.
+    #[tokio::test]
+    async fn a_review_with_no_worktree_is_skipped_rather_than_run_in_the_repository() {
+        let (executor, temps) = test_executor();
+
+        let repo = temps[0].path().join("repository");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("untouched.txt"), "the user's own checkout\n").unwrap();
+        let repo_path = repo.to_string_lossy().to_string();
+
+        let project_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        executor.repositories.write().await.insert(
+            repository_id,
+            crate::domain::Repository {
+                id: repository_id,
+                local_path: repo_path,
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        let mut project = test_project(project_id, ProjectScope::Standalone);
+        project.repository_id = Some(repository_id);
+        executor.projects.write().await.insert(project_id, project);
+
+        let mut task =
+            create_test_task_full("nothing to review", project_id, TaskStatus::AiReview, 0);
+        task.phase = TaskPhase::QaReview;
+        task.worktree_path = None;
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+
+        executor.spawn_review(task_id).await;
+
+        let after = executor.tasks.read().await.get(&task_id).cloned().unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::HumanReview,
+            "a review that cannot run has to hand the task to a person"
+        );
+        let signoff = after.qa_signoff.expect("the skip must be recorded as a signoff");
+        assert_eq!(signoff.status, QaStatus::Rejected);
+        assert!(
+            signoff.issues_found.iter().any(|i| i.contains("worktree")),
+            "the reason has to name what was missing: {:?}",
+            signoff.issues_found
+        );
+
+        assert_eq!(
+            std::fs::read_dir(&repo).unwrap().count(),
+            1,
+            "nothing may have been created in the repository"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("untouched.txt")).unwrap(),
+            "the user's own checkout\n"
+        );
+    }
+
+    /// The lease a run was started under is not held for the run's lifetime,
+    /// which is what stops `stop_task` waiting on the very execution it is
+    /// trying to end.
+    ///
+    /// Registration in `running_handles` is the live ownership fact from the
+    /// moment the run exists; the lease only serializes the handover. Holding
+    /// it across the agent's lifetime instead would make every stop wait for
+    /// the agent to finish on its own, which is precisely the opposite of what
+    /// stopping means.
+    #[tokio::test]
+    async fn stopping_a_running_task_never_waits_on_a_lease_that_run_is_holding() {
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        let cleaned_up = register_cancellable_execution(&executor, task_id).await;
+
+        assert!(
+            executor.lifecycle.try_acquire(task_id).await.is_some(),
+            "a registered run must leave the task's lifecycle lease free"
+        );
+
+        // Bounded so a design that did hold the lease fails here as a named
+        // assertion instead of hanging the test binary. The bound is never
+        // reached by a correct implementation: the stop takes an uncontended
+        // lease and returns as soon as the execution's own cleanup has run.
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            executor.stop_task(task_id),
+        )
+        .await
+        .expect("stop_task must not wait on the run it is ending");
+
+        assert!(stopped.is_ok(), "{stopped:?}");
+        assert!(
+            cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "a successful stop means the execution actually finished its own cleanup"
+        );
+        assert!(
+            executor.lifecycle.try_acquire(task_id).await.is_some(),
+            "and released the lease it took to do it"
+        );
     }
 
     #[tokio::test]
@@ -2432,192 +2756,6 @@ mod tests {
             Some("/tmp/worktree-under-test")
         );
     }
-
-    #[tokio::test]
-    async fn try_reserve_cleanup_prevents_a_second_concurrent_attempt_for_the_same_task() {
-        let in_flight: RwLock<std::collections::HashSet<Uuid>> =
-            RwLock::new(std::collections::HashSet::new());
-        let task_id = Uuid::new_v4();
-
-        assert!(
-            TaskExecutor::try_reserve_cleanup(&in_flight, task_id).await,
-            "the first reservation for a task must succeed"
-        );
-        assert!(
-            !TaskExecutor::try_reserve_cleanup(&in_flight, task_id).await,
-            "a second reservation while the first is still held must be refused"
-        );
-
-        TaskExecutor::release_cleanup(&in_flight, task_id).await;
-
-        assert!(
-            TaskExecutor::try_reserve_cleanup(&in_flight, task_id).await,
-            "releasing the guard must allow a later attempt to reserve it again"
-        );
-    }
-
-    #[test]
-    fn tasks_eligible_for_cleanup_retry_finds_only_done_tasks_with_a_retained_worktree_path() {
-        let mut tasks = HashMap::new();
-
-        let eligible = create_test_task_full(
-            "merged, cleanup failed",
-            Uuid::new_v4(),
-            TaskStatus::Done,
-            0,
-        );
-        let eligible_id = eligible.id;
-        let mut eligible = eligible;
-        eligible.worktree_path = Some("/tmp/eligible".to_string());
-        eligible.branch_name = Some("eligible-branch".to_string());
-        tasks.insert(eligible_id, eligible);
-
-        let mut already_clean =
-            create_test_task_full("merged, already clean", Uuid::new_v4(), TaskStatus::Done, 0);
-        already_clean.worktree_path = None;
-        tasks.insert(already_clean.id, already_clean);
-
-        let mut still_running = create_test_task_full(
-            "not complete yet",
-            Uuid::new_v4(),
-            TaskStatus::InProgress,
-            0,
-        );
-        still_running.worktree_path = Some("/tmp/still-running".to_string());
-        tasks.insert(still_running.id, still_running);
-
-        let mut already_retrying = create_test_task_full(
-            "merged, retry in flight",
-            Uuid::new_v4(),
-            TaskStatus::Done,
-            0,
-        );
-        already_retrying.worktree_path = Some("/tmp/already-retrying".to_string());
-        let already_retrying_id = already_retrying.id;
-        tasks.insert(already_retrying_id, already_retrying);
-
-        let in_flight = std::collections::HashSet::from([already_retrying_id]);
-
-        let result = TaskExecutor::tasks_eligible_for_cleanup_retry(&tasks, &in_flight);
-
-        assert_eq!(
-            result,
-            vec![(eligible_id, "/tmp/eligible".to_string())],
-            "only the Done task with a retained worktree_path and no in-flight attempt must be eligible"
-        );
-    }
-
-    #[tokio::test]
-    async fn attempt_worktree_cleanup_preserves_the_path_on_failure_and_clears_it_once_it_succeeds()
-    {
-        let (storage, _storage_temp) = test_storage();
-        let repo_temp = tempfile::TempDir::new().expect("repo temp dir");
-        let blocking_dir = tempfile::TempDir::new().expect("worktree temp dir");
-        let wt_path = blocking_dir.path().to_str().unwrap().to_string();
-
-        let wt_mgr = WorktreeManager::new(
-            Arc::new(crate::config::paths::AppPaths::with_roots(
-                repo_temp.path().join("config"),
-                repo_temp.path().join("data"),
-                repo_temp.path().join("cache"),
-                repo_temp.path().join("runtime"),
-            )),
-            crate::config::paths::WorktreePlacement::Managed,
-        );
-
-        let mut task = create_test_task_full("merge cleanup", Uuid::new_v4(), TaskStatus::Done, 0);
-        task.worktree_path = Some(wt_path.clone());
-        let task_id = task.id;
-        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
-
-        // `repo_temp` is not a git repository and `wt_path` was never
-        // registered as a worktree, so every fallback inside `remove` fails
-        // at the git level — but the directory genuinely still exists, so
-        // this is a real (not faked) removal failure.
-        let first = TaskExecutor::attempt_worktree_cleanup(
-            &wt_mgr,
-            &tasks,
-            &storage,
-            task_id,
-            &wt_path,
-            repo_temp.path().to_str().unwrap(),
-        )
-        .await;
-
-        assert!(
-            first.is_err(),
-            "removal must fail while the directory still exists"
-        );
-        assert_eq!(
-            tasks
-                .read()
-                .await
-                .get(&task_id)
-                .unwrap()
-                .worktree_path
-                .as_deref(),
-            Some(wt_path.as_str()),
-            "a failed attempt must leave worktree_path in place for a later retry"
-        );
-
-        // Simulate whatever was blocking removal having been resolved by
-        // the time the next maintenance pass retries.
-        std::fs::remove_dir_all(&wt_path).unwrap();
-
-        let second = TaskExecutor::attempt_worktree_cleanup(
-            &wt_mgr,
-            &tasks,
-            &storage,
-            task_id,
-            &wt_path,
-            repo_temp.path().to_str().unwrap(),
-        )
-        .await;
-
-        assert!(
-            second.is_ok(),
-            "removal must succeed once the directory is actually gone"
-        );
-        assert_eq!(
-            tasks.read().await.get(&task_id).unwrap().worktree_path,
-            None,
-            "a successful retry must clear worktree_path"
-        );
-    }
-
-    #[tokio::test]
-    async fn repeated_identical_cleanup_warnings_are_reported_once() {
-        // The ~30s retry pass re-attempts a permanently failing cleanup
-        // forever, which is the intended safety behaviour. What must not
-        // repeat forever is the user-visible event.
-        let seen: RwLock<HashMap<Uuid, String>> = RwLock::new(HashMap::new());
-        let task_id = Uuid::new_v4();
-
-        assert!(
-            TaskExecutor::record_cleanup_warning(&seen, task_id, "no repository").await,
-            "the first failure must be reported"
-        );
-        assert!(
-            !TaskExecutor::record_cleanup_warning(&seen, task_id, "no repository").await,
-            "the same failure on the next sweep must not be reported again"
-        );
-        assert!(
-            TaskExecutor::record_cleanup_warning(&seen, task_id, "directory is locked").await,
-            "a failure that changes character must still be reported"
-        );
-        assert!(
-            TaskExecutor::record_cleanup_warning(&seen, Uuid::new_v4(), "no repository").await,
-            "suppression must be per task, not global"
-        );
-
-        // A success clears the record, so a condition that recurs is news.
-        seen.write().await.remove(&task_id);
-        assert!(
-            TaskExecutor::record_cleanup_warning(&seen, task_id, "directory is locked").await,
-            "a failure recurring after a success must be reported again"
-        );
-    }
-
     /// Make the next `save_project_tasks` fail deterministically by putting a
     /// regular file where the tasks directory has to be, so `create_dir_all`
     /// inside the atomic write fails with `NotADirectory`. No permission bits,
@@ -2627,164 +2765,5 @@ mod tests {
         let _ = std::fs::remove_dir_all(&blocker);
         std::fs::write(&blocker, b"not a directory").expect("place persistence blocker");
         blocker
-    }
-
-    /// A manager and repository directory for which every git removal fails
-    /// but the worktree directory is genuinely absent — the exact shape of a
-    /// cleanup retry, where `remove` correctly reports `Ok`.
-    fn cleanup_fixture() -> (WorktreeManager, tempfile::TempDir, String) {
-        let repo_temp = tempfile::TempDir::new().expect("repo temp dir");
-        let wt_mgr = WorktreeManager::new(
-            Arc::new(crate::config::paths::AppPaths::with_roots(
-                repo_temp.path().join("config"),
-                repo_temp.path().join("data"),
-                repo_temp.path().join("cache"),
-                repo_temp.path().join("runtime"),
-            )),
-            crate::config::paths::WorktreePlacement::Managed,
-        );
-        let wt_path = repo_temp
-            .path()
-            .join("already-gone")
-            .to_str()
-            .unwrap()
-            .to_string();
-        (wt_mgr, repo_temp, wt_path)
-    }
-
-    #[tokio::test]
-    async fn attempt_worktree_cleanup_fails_and_retains_the_path_when_the_board_cannot_be_saved() {
-        // The worktree is physically gone but the task file cannot be written.
-        // Reporting success here would strand the task: disk would still name
-        // a worktree that no longer exists, and the retry pass selects on the
-        // in-memory value, so nothing would ever revisit it.
-        let (storage, _storage_temp) = test_storage();
-        let (wt_mgr, repo_temp, wt_path) = cleanup_fixture();
-        let repo_path = repo_temp.path().to_str().unwrap().to_string();
-
-        let mut task = create_test_task_full("blocked save", Uuid::new_v4(), TaskStatus::Done, 0);
-        task.worktree_path = Some(wt_path.clone());
-        let project_id = task.project_id;
-        let task_id = task.id;
-        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
-
-        let blocker = block_task_persistence(&storage);
-
-        let result = TaskExecutor::attempt_worktree_cleanup(
-            &wt_mgr, &tasks, &storage, task_id, &wt_path, &repo_path,
-        )
-        .await;
-
-        assert!(
-            result.is_err(),
-            "cleanup must not report success when the cleared record could not be persisted"
-        );
-        assert_eq!(
-            tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
-            Some(wt_path.as_str()),
-            "memory must keep the reference so the retry pass still selects the task"
-        );
-        assert!(
-            TaskExecutor::tasks_eligible_for_cleanup_retry(
-                &*tasks.read().await,
-                &std::collections::HashSet::new(),
-            )
-            .iter()
-            .any(|(id, _)| *id == task_id),
-            "the task must remain eligible for a later retry"
-        );
-
-        // Once persistence works again, the retry converges: `remove` on an
-        // already-absent directory is still `Ok`, so the record is cleared.
-        std::fs::remove_file(&blocker).expect("unblock persistence");
-
-        TaskExecutor::attempt_worktree_cleanup(
-            &wt_mgr, &tasks, &storage, task_id, &wt_path, &repo_path,
-        )
-        .await
-        .expect("the retry must succeed once the board can be saved");
-
-        assert_eq!(
-            tasks.read().await.get(&task_id).unwrap().worktree_path,
-            None
-        );
-        let persisted = storage.load_project_tasks(project_id).expect("load tasks");
-        assert_eq!(
-            persisted.iter().find(|t| t.id == task_id).unwrap().worktree_path,
-            None,
-            "disk must agree with memory once cleanup reports success"
-        );
-    }
-
-    #[tokio::test]
-    async fn attempt_worktree_cleanup_keeps_sibling_tasks_when_it_clears_one() {
-        // The staged snapshot is the whole project, so it must carry sibling
-        // tasks through unchanged rather than writing only the cleaned task.
-        let (storage, _storage_temp) = test_storage();
-        let (wt_mgr, repo_temp, wt_path) = cleanup_fixture();
-        let repo_path = repo_temp.path().to_str().unwrap().to_string();
-
-        let project_id = Uuid::new_v4();
-        let mut target = create_test_task_full("cleaned", project_id, TaskStatus::Done, 0);
-        target.worktree_path = Some(wt_path.clone());
-        let target_id = target.id;
-
-        let mut sibling = create_test_task_full("untouched", project_id, TaskStatus::InProgress, 1);
-        sibling.worktree_path = Some("/some/other/worktree".to_string());
-        let sibling_id = sibling.id;
-
-        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([
-            (target_id, target),
-            (sibling_id, sibling),
-        ])));
-
-        TaskExecutor::attempt_worktree_cleanup(
-            &wt_mgr, &tasks, &storage, target_id, &wt_path, &repo_path,
-        )
-        .await
-        .expect("cleanup should succeed");
-
-        let persisted = storage.load_project_tasks(project_id).expect("load tasks");
-        assert_eq!(persisted.len(), 2, "both tasks must survive the write");
-        assert_eq!(
-            persisted.iter().find(|t| t.id == target_id).unwrap().worktree_path,
-            None
-        );
-        assert_eq!(
-            persisted
-                .iter()
-                .find(|t| t.id == sibling_id)
-                .unwrap()
-                .worktree_path
-                .as_deref(),
-            Some("/some/other/worktree"),
-            "a sibling's worktree reference must not be collateral damage"
-        );
-    }
-
-    #[tokio::test]
-    async fn attempt_worktree_cleanup_does_not_clear_a_newer_worktree_path() {
-        // A cleanup for an old path can still be in flight when the task is
-        // re-run and records a new worktree. It must not erase the new one.
-        let (storage, _storage_temp) = test_storage();
-        let (wt_mgr, repo_temp, wt_path) = cleanup_fixture();
-        let repo_path = repo_temp.path().to_str().unwrap().to_string();
-
-        let mut task = create_test_task_full("re-run", Uuid::new_v4(), TaskStatus::Done, 0);
-        task.worktree_path = Some("/a/newer/worktree".to_string());
-        let task_id = task.id;
-        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
-
-        TaskExecutor::attempt_worktree_cleanup(
-            &wt_mgr, &tasks, &storage, task_id, &wt_path, &repo_path,
-        )
-        .await
-        .expect("the stale cleanup itself is not a failure");
-
-        assert_eq!(
-            tasks.read().await.get(&task_id).unwrap().worktree_path.as_deref(),
-            Some("/a/newer/worktree"),
-            "an older cleanup must not clear a replacement worktree reference"
-        );
     }
 }

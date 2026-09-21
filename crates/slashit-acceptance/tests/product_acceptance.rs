@@ -2034,14 +2034,255 @@ async fn assert_card_absent_from_board(driver: &WebDriver, title: &str) -> Resul
     Ok(())
 }
 
-/// How long the retry pass gets to collect a worktree whose first cleanup
-/// failed.
+/// How long a refused cleanup is watched for a destructive attempt nobody
+/// asked for.
 ///
-/// The pass runs once every ten ticks of the executor's three-second loop, so
-/// a full cycle is thirty seconds. Two cycles plus the tick the failure landed
-/// in is what this allows; it is derived from that cadence rather than picked,
-/// and a value below one cycle could not observe the behaviour at all.
-const CLEANUP_RETRY_DEADLINE: Duration = Duration::from_secs(75);
+/// The product used to carry a pass that re-attempted failed cleanups on a
+/// timer, running once every ten ticks of the executor's three-second loop —
+/// a full cycle of thirty seconds. That pass is gone, and its absence is part
+/// of the contract now, so this window has to be long enough that the pass
+/// would certainly have acted inside it: one whole cycle plus the tick a
+/// refusal would have landed in. Anything shorter could not tell "nothing
+/// retried" apart from "the retry has not come round yet".
+const NO_RETRY_WINDOW: Duration = Duration::from_secs(35);
+
+/// The status the product reports for a task right now, read back through the
+/// frontend's own `list_tasks`.
+///
+/// A refused cleanup has to leave the status it found rather than the status a
+/// journey assumed it would find, so the journeys read it before they ask for
+/// anything instead of naming it themselves.
+async fn current_status(driver: &WebDriver, executed: &ExecutedTask) -> Result<String> {
+    let listed = ui::invoke(
+        driver,
+        "list_tasks",
+        json!({ "projectId": executed.project_id }),
+    )
+    .await?;
+    let task = find_task(&listed, &executed.id)
+        .with_context(|| format!("the product no longer lists task {}", executed.id))?;
+    let status = status_of(&task)
+        .with_context(|| format!("the product lists task {} with no status", executed.id))?;
+    Ok(status.to_string())
+}
+
+/// Spend the window the deleted retry pass ran on, twice, and prove nothing in
+/// the product moved during either half.
+///
+/// Both journeys that end in a kept worktree hold the product to the same
+/// contract: a refused cleanup stays refused until a person asks again, and the
+/// obstacle going away by itself is not a person asking. Spelling that out
+/// twice meant two copies of the same pair of multi-line diagnostics, where an
+/// edit to one silently weakened the other journey's.
+///
+/// `release_obstacle` is the only thing that genuinely differs -- each journey
+/// blocks the removal its own way -- so it is the only thing passed in. The
+/// window itself is unchanged: still `NO_RETRY_WINDOW` before the release and
+/// `NO_RETRY_WINDOW` after it, with a full `assert_worktree_kept` at each end
+/// rather than a cheaper check.
+async fn assert_nothing_retried_the_removal(
+    driver: &WebDriver,
+    repository: &GitFixture,
+    executed: &ExecutedTask,
+    before: &str,
+    work: &EstablishedWork,
+    release_obstacle: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // The window the deleted retry pass ran on, spent doing nothing at all.
+    // Everything the caller asserted has to still hold afterwards, because a
+    // refused cleanup stays refused until a person asks again.
+    tokio::time::sleep(NO_RETRY_WINDOW).await;
+
+    assert_worktree_kept(
+        driver,
+        repository,
+        executed,
+        before,
+        work,
+        &format!(
+            "{}s later, with nobody having asked for anything in between",
+            NO_RETRY_WINDOW.as_secs()
+        ),
+    )
+    .await
+    .context(
+        "something inside the product re-attempted a destructive cleanup that nobody asked \
+         for. No user action happened between the refusal and this read, so whatever changed \
+         was a worktree removal running on a timer — the one thing this contract says must \
+         not exist.",
+    )?;
+
+    // Releasing the obstacle is not an event the product may act on. The
+    // removal would succeed now, and that is precisely why this is worth
+    // waiting out: nothing in SlashIt watches a kept worktree for its obstacle
+    // going away, so the only thing that may change here is nothing.
+    release_obstacle()?;
+    tokio::time::sleep(NO_RETRY_WINDOW).await;
+
+    assert_worktree_kept(
+        driver,
+        repository,
+        executed,
+        before,
+        work,
+        "after the obstacle was released and still nobody had asked for anything",
+    )
+    .await
+    .context(
+        "the worktree went away by itself once it became removable, so some pass is watching \
+         refused cleanups and finishing them unprompted. A removal the product was told to \
+         keep may only happen when a person asks for it again.",
+    )?;
+
+    Ok(())
+}
+
+/// Assert that a task whose cleanup the product refused still holds everything
+/// the refusal promised to keep, and hand back the worktree path it records.
+///
+/// `when` names the moment being read, so a failure distinguishes a product
+/// that gave the worktree away in the refusal itself from one that gave it
+/// away later, with nobody having asked for anything in between.
+async fn assert_worktree_kept(
+    driver: &WebDriver,
+    repository: &GitFixture,
+    executed: &ExecutedTask,
+    expected_status: &str,
+    work: &EstablishedWork,
+    when: &str,
+) -> Result<String> {
+    let listed = ui::invoke(
+        driver,
+        "list_tasks",
+        json!({ "projectId": executed.project_id }),
+    )
+    .await?;
+    let task = find_task(&listed, &executed.id)
+        .with_context(|| format!("the task is no longer listed {when}"))?;
+
+    let status = status_of(&task);
+    if status != Some(expected_status) {
+        bail!(
+            "the task reads {status:?} {when}, and a cleanup the product refused has to leave \
+             the status it found, which was {expected_status:?}. A task that reached its \
+             terminal status anyway tells the user the checkout is gone while it is still on \
+             disk."
+        );
+    }
+
+    let Some(recorded) = task.get("worktree_path").and_then(Value::as_str) else {
+        bail!(
+            "the task records no worktree at all {when}, although the product was not able to \
+             remove the one at {}. That field is the only persisted record of the directory, \
+             so clearing it leaves nothing in the product able to find it again.",
+            executed.worktree_path.display()
+        );
+    };
+    if resolve(Path::new(recorded)) != resolve(&executed.worktree_path) {
+        bail!(
+            "the task records the worktree {recorded:?} {when}, which is not the {} whose \
+             removal was refused — the record now points somewhere else entirely",
+            executed.worktree_path.display()
+        );
+    }
+
+    match task.get("error_message").and_then(Value::as_str) {
+        None => bail!(
+            "the task carries no error_message {when}, so the product kept the worktree at \
+             {recorded} without recording anywhere a user can read why it is still there"
+        ),
+        Some(reason) if !reason.contains(recorded) => bail!(
+            "the task explains itself with {reason:?} {when}, and that never names {recorded} \
+             — the user is told the task could not be finished without being told which \
+             directory is holding it back"
+        ),
+        Some(_) => {}
+    }
+
+    if !executed.worktree_path.exists() {
+        bail!(
+            "{} is gone {when}, so a removal the product declined to make happened anyway",
+            executed.worktree_path.display()
+        );
+    }
+    if !repository.has_branch(&work.branch)? {
+        bail!(
+            "branch {} no longer exists {when}, although the cleanup that owns its worktree \
+             never ran",
+            work.branch
+        );
+    }
+    assert_work_survives(
+        repository,
+        work,
+        &format!("the cleanup the product refused, read {when},"),
+    )?;
+
+    Ok(recorded.to_string())
+}
+
+/// Assert the task really is finished and its worktree really is gone, which
+/// is the only state an explicit retry is allowed to leave behind.
+async fn assert_cleanly_finished(
+    driver: &WebDriver,
+    repository: &GitFixture,
+    executed: &ExecutedTask,
+    work: &EstablishedWork,
+) -> Result<()> {
+    let listed = ui::invoke(
+        driver,
+        "list_tasks",
+        json!({ "projectId": executed.project_id }),
+    )
+    .await?;
+    let task = find_task(&listed, &executed.id)
+        .context("the task is no longer listed after the retry it was explicitly asked for")?;
+
+    let status = status_of(&task);
+    if status != Some("done") {
+        bail!(
+            "the retry removed the worktree but left the task reading {status:?}. Removing the \
+             checkout and recording the task as finished are one operation, so a card still in \
+             its old column with its worktree gone is a state nobody asked for and nothing \
+             will correct."
+        );
+    }
+    if let Some(still) = task.get("worktree_path").and_then(Value::as_str) {
+        bail!(
+            "the task still records worktree {still:?} although the retry removed it, so the \
+             board names a checkout that no longer exists"
+        );
+    }
+    if let Some(stale) = task.get("error_message").and_then(Value::as_str) {
+        bail!(
+            "the finished task still explains itself with {stale:?}, so it goes on telling the \
+             user its worktree was kept after the worktree was removed"
+        );
+    }
+    if executed.worktree_path.exists() {
+        bail!(
+            "the product reported the task finished, but {} is still on disk — the terminal \
+             status is only allowed to be committed once the removal has actually happened",
+            executed.worktree_path.display()
+        );
+    }
+    if repository.registers_worktree(&executed.worktree_path)? {
+        bail!(
+            "git still registers a worktree at {} after the retry reported it removed. The \
+             directory is gone and the record is not, so this branch can never be given a \
+             worktree again.",
+            executed.worktree_path.display()
+        );
+    }
+    if !repository.has_branch(&work.branch)? {
+        bail!(
+            "branch {} was deleted along with the worktree it belonged to, and it is the only \
+             thing naming the work the agent committed",
+            work.branch
+        );
+    }
+    Ok(())
+}
 
 /// Makes a directory unreachable for as long as it is held, and puts it back
 /// afterwards however the journey ends.
@@ -2062,8 +2303,8 @@ impl Unreachable {
     /// directory it may not enter, so it refuses before deleting a single
     /// file, `--force` refuses the same way, and `prune` leaves a record whose
     /// directory is plainly still there. The worktree is exactly as it was, so
-    /// a later attempt has something to succeed at — which is the whole point
-    /// of a retry contract.
+    /// the attempt a user makes later has something to succeed at — which is
+    /// what a refusal is supposed to leave behind.
     fn hold(path: &Path) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         let restore = std::fs::metadata(path)
@@ -2100,34 +2341,41 @@ impl Drop for Unreachable {
     }
 }
 
-/// Prove that a `Done` cleanup which could not remove the worktree keeps the
-/// task recoverable, and that the product's own retry pass finishes the job
-/// once the obstacle is gone.
+/// Prove that a `Done` whose worktree cleanup fails is not a `Done` at all,
+/// and that nothing but a person asking again ever finishes it.
 ///
-/// This is the contract the source claims and nothing had exercised end to
-/// end: `worktree_path` is described as the only persisted record of the
-/// directory, it is deliberately retained when removal fails, and the periodic
-/// pass selects `Done` tasks that still hold one. A journey is what turns
-/// those three statements into a single proven behaviour.
+/// Moving a task to `Done` removes its worktree first and commits the terminal
+/// status only if that removal succeeded, so a removal git will not make has
+/// to leave the task exactly as it was found: the status it had, the worktree
+/// it had, the branch it had and every byte in the checkout. The one thing it
+/// gains is a reason a user can read.
+///
+/// The second half is what used to be a retry pass. Nothing in the product
+/// re-attempts a destructive cleanup on a timer any more, so this journey
+/// spends the window that pass ran on and requires that nothing moved, then
+/// releases the obstacle and requires that nothing moved then either — because
+/// no part of SlashIt is watching for the obstacle to go away. Only when the
+/// journey asks a second time, with the same command the board sends when a
+/// card is dragged onto Done, is the worktree allowed to go.
 ///
 /// The obstacle is a permission the journey takes away and gives back. It is
 /// not a simulated failure: the product runs its real `git worktree remove`
 /// against a directory it genuinely cannot remove, and later against the same
 /// directory once it can.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_done_cleanup_that_fails_keeps_the_worktree_and_is_retried_until_it_succeeds() {
+async fn a_done_cleanup_that_fails_keeps_everything_and_only_an_explicit_retry_finishes_it() {
     if unsafe { libc::geteuid() } == 0 {
         // Root ignores the permission bits the obstacle is made of, so the
         // first cleanup would succeed and the journey would prove nothing.
         eprintln!("skipped: running as root, where the obstacle has no effect");
         return;
     }
-    let context = TestContext::new("queue_task_done_retry").expect("harness setup");
-    let outcome = done_retry_journey(&context).await;
+    let context = TestContext::new("queue_task_done_refused").expect("harness setup");
+    let outcome = done_refusal_journey(&context).await;
     context.finish(outcome);
 }
 
-async fn done_retry_journey(context: &TestContext) -> Result<()> {
+async fn done_refusal_journey(context: &TestContext) -> Result<()> {
     let root = context.state().path().to_path_buf();
 
     let agent = FakeAgent::install(&root)?;
@@ -2138,27 +2386,40 @@ async fn done_retry_journey(context: &TestContext) -> Result<()> {
     pin_worktree_placement(&context.state().config_file())?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
 
-    let session = context.start_session("done-retry").await?;
-    let outcome = retry_a_failed_cleanup(session.driver(), &agent, &repository).await;
+    let session = context.start_session("done-refused").await?;
+    let outcome = finish_a_refused_cleanup_by_asking_again(
+        session.driver(),
+        &agent,
+        &repository,
+    )
+    .await;
     context
-        .close_session(session, "done-retry", &outcome)
+        .close_session(session, "done-refused", &outcome)
         .await?;
     outcome
 }
 
-async fn retry_a_failed_cleanup(
+async fn finish_a_refused_cleanup_by_asking_again(
     driver: &WebDriver,
     agent: &FakeAgent,
     repository: &GitFixture,
 ) -> Result<()> {
     let executed = execute_one_task(driver, agent, repository).await?;
     let work = establish_work(driver, repository, &executed).await?;
+    // Read rather than assumed, so the assertion below is that the refusal
+    // left the status the product itself was in.
+    let before = current_status(driver, &executed).await?;
 
     // The obstacle goes up before the task is finished, so the product's very
     // first removal attempt is the one that fails.
     let obstacle = Unreachable::hold(&executed.worktree_path)?;
 
-    ui::invoke(
+    // --- The move onto Done has to be refused, not reported ----------------
+    //
+    // Exactly what the board sends when a card is dragged into the last
+    // column. Answering success here would tell the user their checkout had
+    // been dealt with while it is still sitting on disk.
+    let refusal = ui::invoke_expecting_refusal(
         driver,
         "reorder_task",
         json!({
@@ -2169,90 +2430,71 @@ async fn retry_a_failed_cleanup(
     )
     .await?;
 
-    let settled = await_status(driver, &executed.project_id, &executed.id, &["done"]).await?;
-
-    // --- What a failed cleanup has to leave behind -------------------------
-    //
-    // Read after a full retry cycle, so this is not merely the state before
-    // the first attempt got as far as failing.
-    tokio::time::sleep(Duration::from_secs(35)).await;
-
-    let during = ui::invoke(
+    let recorded = assert_worktree_kept(
         driver,
-        "list_tasks",
-        json!({ "projectId": executed.project_id }),
+        repository,
+        &executed,
+        &before,
+        &work,
+        "as soon as the refusal came back",
     )
     .await?;
-    let during = find_task(&during, &executed.id)
-        .context("the task disappeared while its cleanup was failing")?;
 
-    let retained = during.get("worktree_path").and_then(Value::as_str);
-    if retained.map(|path| resolve(Path::new(path))) != Some(resolve(&executed.worktree_path)) {
+    if !refusal.contains(&recorded) {
         bail!(
-            "a cleanup that could not remove the worktree cleared {retained:?} anyway — the only \
-             persisted record of {} is gone and nothing can find it again",
-            executed.worktree_path.display()
-        );
-    }
-    if !executed.worktree_path.exists() {
-        bail!(
-            "the product reported nothing but {} is gone, so the removal it could not do \
-             happened anyway",
-            executed.worktree_path.display()
-        );
-    }
-    if !repository.has_branch(&work.branch)? {
-        bail!(
-            "branch {} was deleted by a cleanup that never removed the worktree it belongs to",
-            work.branch
-        );
-    }
-    if status_of(&settled) != Some("done") {
-        bail!("a task whose cleanup failed should still be done, found {settled}");
-    }
-
-    // --- And the product's own retry has to finish it ----------------------
-    obstacle.release()?;
-
-    let started = Instant::now();
-    loop {
-        let listed = ui::invoke(
-            driver,
-            "list_tasks",
-            json!({ "projectId": executed.project_id }),
-        )
-        .await?;
-        let task = find_task(&listed, &executed.id)
-            .context("the task disappeared while its cleanup was being retried")?;
-        let cleared = task
-            .get("worktree_path")
-            .map(|value| value.is_null())
-            .unwrap_or(true);
-        if cleared && !executed.worktree_path.exists() {
-            break;
-        }
-        if started.elapsed() > CLEANUP_RETRY_DEADLINE {
-            bail!(
-                "the worktree was still not cleaned up {}s after the obstacle was removed: \
-                 directory present = {}, task still records {:?} — the retry the source \
-                 promises never converged",
-                CLEANUP_RETRY_DEADLINE.as_secs(),
-                executed.worktree_path.exists(),
-                task.get("worktree_path")
-            );
-        }
-        tokio::time::sleep(POLL).await;
-    }
-
-    if repository.registers_worktree(&executed.worktree_path)? {
-        bail!(
-            "git still registers a worktree at {} after the retry reported it cleaned up",
-            executed.worktree_path.display()
+            "the product refused with {refusal:?}, which never names the worktree at {recorded} \
+             it kept. The user is told the card cannot be moved without being told which \
+             directory to deal with, and dealing with it is the only way forward."
         );
     }
 
-    Ok(())
+    assert_nothing_retried_the_removal(driver, repository, &executed, &before, &work, || {
+        obstacle.release()
+    })
+    .await?;
+
+    // The checkout is readable again, and what the agent left in it is still
+    // exactly what it left: a refusal keeps the directory, not merely a record
+    // of where it used to be.
+    let surviving = std::fs::read_to_string(executed.worktree_path.join(WORK_FILE))
+        .with_context(|| {
+            format!(
+                "{WORK_FILE} can no longer be read in the worktree the product kept at {}, so \
+                 the refused cleanup reached into a checkout it was supposed to leave whole",
+                executed.worktree_path.display()
+            )
+        })?;
+    if surviving != fake_agent::WORK_CONTENT {
+        bail!(
+            "{WORK_FILE} in the kept worktree holds {surviving:?}, which is not what the agent \
+             wrote — a cleanup that was refused still changed the contents of the checkout"
+        );
+    }
+
+    // --- Only an explicit second attempt is allowed to finish it -----------
+    //
+    // The same command again, which is the product's stated way out of a kept
+    // worktree: the user deals with whatever git objected to and drags the
+    // card onto Done once more.
+    ui::invoke(
+        driver,
+        "reorder_task",
+        json!({
+            "taskId": executed.id,
+            "newStatus": "done",
+            "newPosition": 0,
+        }),
+    )
+    .await
+    .context(
+        "asking a second time, with the obstacle gone, was refused as well. Asking again is \
+         the only route out of a kept worktree, so a task that cannot take it is stranded with \
+         a checkout nothing will ever remove.",
+    )?;
+
+    assert_cleanly_finished(driver, repository, &executed, &work).await
 }
+
 /// An obstacle git walks into rather than one it refuses at.
 ///
 /// [`Unreachable`] closes off the worktree directory itself, so git cannot
@@ -2267,6 +2509,13 @@ async fn retry_a_failed_cleanup(
 /// there is something inside to delete, so that it fails on the unlink and not
 /// on the listing; a directory it may not even open is the *other* obstacle,
 /// and it produces the other outcome.
+///
+/// The planted content is committed rather than left untracked, and that is
+/// load-bearing. `git worktree remove` checks the checkout is clean before it
+/// deletes anything and refuses outright when it is not, so an untracked file
+/// would make git decline at validation — the *other* obstacle's outcome
+/// again, reached by a different route. Committing it is what leaves the
+/// permission as the only thing git can trip over.
 struct Undeletable {
     directory: PathBuf,
     restore: u32,
@@ -2281,6 +2530,14 @@ impl Undeletable {
             .with_context(|| format!("could not create {}", directory.display()))?;
         std::fs::write(directory.join("held.txt"), b"held by the obstacle\n")
             .context("could not put anything inside the obstacle")?;
+        // Committed before the permission goes on, so the checkout git is
+        // asked to remove is clean and the only thing standing in its way is
+        // the directory it may not write to. See the note on the type.
+        git(worktree, &["add", "blocked"])?;
+        git(
+            worktree,
+            &["commit", "--quiet", "-m", "content the obstacle holds"],
+        )?;
         let restore = std::fs::metadata(&directory)
             .with_context(|| format!("could not read the mode of {}", directory.display()))?
             .permissions()
@@ -2300,8 +2557,8 @@ impl Undeletable {
     fn restore_mode(directory: &Path, mode: u32) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         if !directory.exists() {
-            // The removal this obstacle was blocking finally happened, which
-            // is the outcome every journey using it is waiting for.
+            // The removal this obstacle was blocking finally happened, so
+            // there is nothing left to reopen.
             return Ok(());
         }
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
@@ -2315,10 +2572,11 @@ impl Drop for Undeletable {
     }
 }
 
-/// Prove that a cleanup git gives up on halfway through is still a cleanup the
-/// product can finish.
+/// Prove that a cleanup git gives up on halfway through keeps everything too,
+/// and that it is still a cleanup a user can finish by asking again.
 ///
-/// The retry contract [`a_done_cleanup_that_fails_keeps_the_worktree_and_is_retried_until_it_succeeds`]
+/// The contract
+/// [`a_done_cleanup_that_fails_keeps_everything_and_only_an_explicit_retry_finishes_it`]
 /// establishes is only worth having if it holds for the removals that actually
 /// fail. That journey uses an obstacle git refuses at, which leaves the
 /// checkout whole and the record intact, so a later attempt has something to
@@ -2328,10 +2586,20 @@ impl Drop for Undeletable {
 /// registration on its way out whether or not the checkout it was deleting is
 /// still there.
 ///
-/// Nothing in this journey knows that. It asks the product the same question
-/// the other one does: the obstacle is gone, so is the worktree gone too.
+/// That registration is what the journey is really about. A path git no longer
+/// registers is one no `git worktree` command will act on again, so a product
+/// that let the record go would leave the task holding a directory that can
+/// never be removed by asking, however thoroughly the user deals with what git
+/// objected to. The product saves the record before it starts and puts it back
+/// when the removal did not finish, which is what makes the later attempt an
+/// ordinary removal rather than an impossible one — and the later attempt
+/// succeeding is how this journey proves it.
+///
+/// What changed is only who triggers that later attempt. Nothing retries on a
+/// timer any more, so the journey waits out the window in which the deleted
+/// pass would have acted, requires that nothing moved, and then asks itself.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cleanup_git_abandons_partway_is_still_retried_until_it_succeeds() {
+async fn a_cleanup_git_abandons_partway_keeps_everything_and_only_an_explicit_retry_finishes_it() {
     if unsafe { libc::geteuid() } == 0 {
         // Root ignores the permission bits the obstacle is made of, so the
         // first cleanup would succeed and the journey would prove nothing.
@@ -2355,26 +2623,29 @@ async fn partial_cleanup_journey(context: &TestContext) -> Result<()> {
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
 
     let session = context.start_session("partial-cleanup").await?;
-    let outcome = retry_a_cleanup_git_abandoned(session.driver(), &agent, &repository).await;
+    let outcome =
+        finish_a_cleanup_git_abandoned_by_asking_again(session.driver(), &agent, &repository).await;
     context
         .close_session(session, "partial-cleanup", &outcome)
         .await?;
     outcome
 }
 
-async fn retry_a_cleanup_git_abandoned(
+async fn finish_a_cleanup_git_abandoned_by_asking_again(
     driver: &WebDriver,
     agent: &FakeAgent,
     repository: &GitFixture,
 ) -> Result<()> {
     let executed = execute_one_task(driver, agent, repository).await?;
     let work = establish_work(driver, repository, &executed).await?;
+    let before = current_status(driver, &executed).await?;
 
     // Planted before the task is finished, so the product's very first removal
     // is the one git abandons.
     let obstacle = Undeletable::plant(&executed.worktree_path)?;
 
-    ui::invoke(
+    // --- The move onto Done has to be refused, not reported ----------------
+    let refusal = ui::invoke_expecting_refusal(
         driver,
         "reorder_task",
         json!({
@@ -2385,90 +2656,75 @@ async fn retry_a_cleanup_git_abandoned(
     )
     .await?;
 
-    let settled = await_status(driver, &executed.project_id, &executed.id, &["done"]).await?;
-
-    // Read after a full retry cycle, so these are the facts a task is left
-    // with rather than the ones it had before the first attempt failed.
-    tokio::time::sleep(Duration::from_secs(35)).await;
-
-    let during = ui::invoke(
+    let recorded = assert_worktree_kept(
         driver,
-        "list_tasks",
-        json!({ "projectId": executed.project_id }),
+        repository,
+        &executed,
+        &before,
+        &work,
+        "as soon as the refusal came back",
     )
     .await?;
-    let during = find_task(&during, &executed.id)
-        .context("the task disappeared while its cleanup was failing")?;
 
-    let retained = during.get("worktree_path").and_then(Value::as_str);
-    if retained.map(|path| resolve(Path::new(path))) != Some(resolve(&executed.worktree_path)) {
+    if !refusal.contains(&recorded) {
         bail!(
-            "a cleanup that could not remove the worktree cleared {retained:?} anyway — the only \
-             persisted record of {} is gone and nothing can find it again",
+            "the product refused with {refusal:?}, which never names the worktree at {recorded} \
+             it kept. The user is told the card cannot be moved without being told which \
+             directory to deal with, and dealing with it is the only way forward."
+        );
+    }
+
+    // The record git tore down on its way out of the removal has to be back.
+    // Without it every later attempt answers "is not a working tree", so the
+    // task would hold a checkout that no amount of asking could ever remove.
+    if !repository.registers_worktree(&executed.worktree_path)? {
+        bail!(
+            "git no longer registers a worktree at {} after abandoning its removal, and the \
+             product kept the task pointing at it anyway. Nothing can remove a path git does \
+             not register, so this task is holding a directory that will never come out.",
             executed.worktree_path.display()
         );
     }
-    if !executed.worktree_path.exists() {
-        bail!(
-            "the product reported nothing but {} is gone, so the removal it could not do \
-             happened anyway",
-            executed.worktree_path.display()
-        );
-    }
-    if !repository.has_branch(&work.branch)? {
-        bail!(
-            "branch {} was deleted by a cleanup that never removed the worktree it belongs to",
-            work.branch
-        );
-    }
-    if status_of(&settled) != Some("done") {
-        bail!("a task whose cleanup failed should still be done, found {settled}");
-    }
 
-    // --- And the retry has to finish once the obstacle is gone -------------
-    obstacle.release()?;
+    assert_nothing_retried_the_removal(driver, repository, &executed, &before, &work, || {
+        obstacle.release()
+    })
+    .await?;
 
-    let started = Instant::now();
-    loop {
-        let listed = ui::invoke(
-            driver,
-            "list_tasks",
-            json!({ "projectId": executed.project_id }),
-        )
-        .await?;
-        let task = find_task(&listed, &executed.id)
-            .context("the task disappeared while its cleanup was being retried")?;
-        let cleared = task
-            .get("worktree_path")
-            .map(|value| value.is_null())
-            .unwrap_or(true);
-        if cleared && !executed.worktree_path.exists() {
-            break;
-        }
-        if started.elapsed() > CLEANUP_RETRY_DEADLINE {
-            bail!(
-                "the worktree was still not cleaned up {}s after the obstacle was removed: \
-                 directory present = {}, git still registers it = {}, task still records {:?} — \
-                 a removal git gave up on partway is one the product can never finish",
-                CLEANUP_RETRY_DEADLINE.as_secs(),
-                executed.worktree_path.exists(),
-                repository.registers_worktree(&executed.worktree_path)?,
-                task.get("worktree_path")
-            );
-        }
-        tokio::time::sleep(POLL).await;
-    }
+    // What a user has to put right before asking again. Git abandons the
+    // removal partway through the checkout, so some of the files it had
+    // already deleted are tracked ones, and a checkout missing them is dirty —
+    // which the safe removal refuses, exactly as it refuses any other dirt.
+    // Restoring them is the user's own `git checkout`, run here through the
+    // fixture's git rather than through the product.
+    git(&executed.worktree_path, &["checkout", "--", "."]).context(
+        "the worktree the product kept could not be put back in order with git, which means \
+         the checkout it left behind is not one a user could deal with either",
+    )?;
 
-    if repository.registers_worktree(&executed.worktree_path)? {
-        bail!(
-            "git still registers a worktree at {} after the retry reported it cleaned up",
-            executed.worktree_path.display()
-        );
-    }
+    // --- Only an explicit second attempt is allowed to finish it -----------
+    ui::invoke(
+        driver,
+        "reorder_task",
+        json!({
+            "taskId": executed.id,
+            "newStatus": "done",
+            "newPosition": 0,
+        }),
+    )
+    .await
+    .context(
+        "asking a second time, with the obstacle gone and the checkout back in order, was \
+         refused as well. This is the attempt the restored registration exists to make \
+         possible, so a task that cannot take it is stranded with a checkout nothing will \
+         ever remove.",
+    )?;
+
+    assert_cleanly_finished(driver, repository, &executed, &work).await?;
     assert_work_survives(
         repository,
         &work,
-        "a cleanup git abandoned partway and the retry pass then finished",
+        "a cleanup git abandoned partway and an explicit retry then finished",
     )?;
 
     Ok(())
@@ -2512,21 +2768,26 @@ impl Bystander {
 
 /// Prove that cleaning up one task's worktree does not reach into another's.
 ///
-/// The product's git cleanup ends in a repository-wide `git worktree prune`,
-/// which takes no path and decides what is stale by whether it can read each
-/// registered worktree's `.git`. A worktree it is not allowed to look at reads
-/// the same as one that is gone, so a second worktree that is entirely present
-/// — merely unreadable at the moment, as one on an unmounted drive or behind a
-/// permission would be — loses the registration it needs, while its files sit
-/// untouched on disk and its branch stays exactly where it was. Nothing about
-/// that worktree took part in the cleanup that destroyed it.
+/// Cleaning up a task is an operation on that task's worktree. It used to end
+/// in a repository-wide `git worktree prune`, which takes no path and decides
+/// what is stale by whether it can read each registered worktree's `.git`. A
+/// worktree it may not look inside reads exactly like one that is gone, so a
+/// second worktree that is entirely present — merely unreadable at the moment,
+/// as one on an unmounted drive or behind a permission would be — lost the
+/// registration it needs while its files sat untouched on disk and its branch
+/// stayed exactly where it was. Nothing about that worktree took part in the
+/// cleanup that destroyed it.
 ///
-/// The route into that prune is the defect
-/// [`a_cleanup_git_abandons_partway_is_still_retried_until_it_succeeds`]
-/// describes: once git has abandoned a removal it has also forgotten the
-/// worktree, so every later attempt reports that there is no working tree
-/// there, and if the leftover directory is then cleared the product falls
-/// through to the one step that is not about this task at all.
+/// The state that reached that prune is the one this journey builds: git
+/// abandons a removal, as in
+/// [`a_cleanup_git_abandons_partway_keeps_everything_and_only_an_explicit_retry_finishes_it`],
+/// the leftover directory is then cleared by hand, and the task is finished
+/// afterwards with nothing of its own left to remove. What the product does at
+/// that point must still be about this task alone.
+///
+/// The assertions are about the bystander keeping its registration, its files
+/// and its branch, not about which step might take them, so they go on holding
+/// whatever the cleanup is made of.
 #[tokio::test(flavor = "multi_thread")]
 async fn cleaning_up_one_task_leaves_another_worktree_registered() {
     if unsafe { libc::geteuid() } == 0 {
@@ -2561,7 +2822,8 @@ async fn clean_up_beside_a_bystander(
     repository: &GitFixture,
 ) -> Result<()> {
     let executed = execute_one_task(driver, agent, repository).await?;
-    establish_work(driver, repository, &executed).await?;
+    let work = establish_work(driver, repository, &executed).await?;
+    let before = current_status(driver, &executed).await?;
 
     let bystander = Bystander::register(repository)?;
     // Unreadable, not absent. Everything it holds is still on disk, and the
@@ -2572,7 +2834,10 @@ async fn clean_up_beside_a_bystander(
 
     let obstacle = Undeletable::plant(&executed.worktree_path)?;
 
-    ui::invoke(
+    // The first move onto Done is refused: git abandons the removal when it
+    // reaches the obstacle, and the product keeps the task, its status and its
+    // worktree rather than reporting a cleanup that did not happen.
+    ui::invoke_expecting_refusal(
         driver,
         "reorder_task",
         json!({
@@ -2582,11 +2847,15 @@ async fn clean_up_beside_a_bystander(
         }),
     )
     .await?;
-    await_status(driver, &executed.project_id, &executed.id, &["done"]).await?;
-
-    // One full retry cycle, so the removal has been attempted and abandoned
-    // before anything else happens.
-    tokio::time::sleep(Duration::from_secs(35)).await;
+    assert_worktree_kept(
+        driver,
+        repository,
+        &executed,
+        &before,
+        &work,
+        "as soon as the refusal came back",
+    )
+    .await?;
 
     // The leftover directory is cleared the way a user clearing it would: the
     // obstacle goes, then the directory goes. What the product does next is
@@ -2601,34 +2870,43 @@ async fn clean_up_beside_a_bystander(
         })?;
     }
 
-    // The shared helper allows one cleanup's worth of time; this waits for the
-    // retry pass, which is the same deadline the other retry journey derives
-    // from the executor's thirty-second cadence.
-    let started = Instant::now();
-    loop {
-        let listed = ui::invoke(
-            driver,
-            "list_tasks",
-            json!({ "projectId": executed.project_id }),
-        )
-        .await?;
-        let task = find_task(&listed, &executed.id)
-            .context("the task disappeared while its cleanup was being retried")?;
-        let cleared = task
-            .get("worktree_path")
-            .map(|value| value.is_null())
-            .unwrap_or(true);
-        if cleared {
-            break;
-        }
-        if started.elapsed() > CLEANUP_RETRY_DEADLINE {
-            bail!(
-                "the task still records {:?} {}s after its worktree was cleared away",
-                task.get("worktree_path"),
-                CLEANUP_RETRY_DEADLINE.as_secs()
-            );
-        }
-        tokio::time::sleep(POLL).await;
+    // And the task is finished by asking again, which is the only thing that
+    // finishes a refused cleanup now. Nothing has run on its own in between.
+    ui::invoke(
+        driver,
+        "reorder_task",
+        json!({
+            "taskId": executed.id,
+            "newStatus": "done",
+            "newPosition": 0,
+        }),
+    )
+    .await
+    .context(
+        "moving the card onto Done again, with the task's worktree already cleared away, was \
+         refused — a task with nothing left to remove has to be able to finish",
+    )?;
+
+    let listed = ui::invoke(
+        driver,
+        "list_tasks",
+        json!({ "projectId": executed.project_id }),
+    )
+    .await?;
+    let task = find_task(&listed, &executed.id)
+        .context("the task is no longer listed after the cleanup it was asked for a second time")?;
+    if let Some(still) = task.get("worktree_path").and_then(Value::as_str) {
+        bail!(
+            "the task still records worktree {still:?} after its directory was cleared away and \
+             it was explicitly finished, so the board goes on naming a checkout that is gone"
+        );
+    }
+    let status = status_of(&task);
+    if status != Some("done") {
+        bail!(
+            "the task reads {status:?} after a cleanup that had nothing left to remove, so \
+             finishing it succeeded without the task ever becoming finished"
+        );
     }
 
     // --- What the bystander must still have --------------------------------

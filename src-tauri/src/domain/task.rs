@@ -107,6 +107,32 @@ pub struct Task {
     #[serde(default)]
     pub branch_name: Option<String>,
 
+    /// A destructive worktree cleanup was started for this task and this
+    /// process has not yet durably recorded its outcome.
+    ///
+    /// Deliberately not a `TaskStatus`: it says nothing about how far the work
+    /// got, only that `worktree_path` may name a directory a removal is in the
+    /// middle of taking apart. The distinction matters because the two facts
+    /// have different lifetimes -- a task can be interrupted mid-cleanup out of
+    /// any status -- and because a public status would have to be rendered,
+    /// filtered and dragged like the others.
+    ///
+    /// It exists because nothing else on disk can tell the two cases apart. A
+    /// removal deletes the checkout's contents depth-first and takes git's
+    /// registration down last, so a crash partway through leaves `status`,
+    /// `worktree_path`, the directory and the registration all exactly as a
+    /// healthy task's would be. The only remaining difference is which files
+    /// inside are already gone, and that is unattributable: an agent that ran
+    /// `rm -rf` on its own checkout produces the same shape. Writing the
+    /// intent down before the subprocess exists is what makes the interrupted
+    /// case observable at all.
+    ///
+    /// `true` at startup means the recorded worktree is untrusted: see
+    /// `app_core::build_state_with_paths`, which quarantines the task rather
+    /// than adopting or re-removing it.
+    #[serde(default)]
+    pub cleanup_in_flight: bool,
+
     /// Last triage of PR review comments. Cached so reopening the modal does
     /// not re-run the LLM, and so post-apply state survives reloads.
     #[serde(default)]
@@ -483,6 +509,23 @@ mod tests {
         let task: Task = toml::from_str(&toml_str)
             .expect("record with no worktree reference at all must still deserialize");
         assert_eq!(task.worktree_id, None);
+    }
+
+    /// A board written by a build that predates `cleanup_in_flight` loads with
+    /// no interrupted cleanup recorded.
+    ///
+    /// The default has to be `false` and not merely present: `true` is the
+    /// quarantine, so a default that leaned the other way would hold back every
+    /// task on every existing installation the first time it started.
+    #[test]
+    fn a_task_written_before_the_field_existed_has_no_cleanup_in_flight() {
+        assert!(
+            !LEGACY_TASK_TOML.contains("cleanup_in_flight"),
+            "this fixture only proves anything while it predates the field"
+        );
+        let task: Task = toml::from_str(LEGACY_TASK_TOML)
+            .expect("a record written before the field existed must still deserialize");
+        assert!(!task.cleanup_in_flight);
     }
 }
 
