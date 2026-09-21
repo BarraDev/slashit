@@ -135,14 +135,197 @@ pub async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String
 /// Deliberately only looks at `path/.git`: a nested repository under an
 /// ancestor repository is still a valid, independent repository for this
 /// check, and walking up to an ancestor would make an intentional nested
-/// checkout look uninitialized.
+/// checkout look uninitialized. `.exists()` (not `.is_dir()`) is required
+/// because a linked git worktree's `.git` is a *file* pointing at the real
+/// gitdir, not a directory.
 pub(crate) fn is_git_repo_root(path: &Path) -> bool {
     path.join(".git").exists()
 }
 
+/// Where `path` sits relative to git's own notion of repository boundaries.
+///
+/// Uses `git rev-parse --show-toplevel` instead of walking `.git` ourselves:
+/// git already knows how to find the real root from any subdirectory, and
+/// already treats a worktree's `.git` file the same as an ordinary `.git`
+/// directory. Re-deriving that logic by hand (e.g. via `.git.is_dir()`)
+/// would get the linked-worktree case wrong.
+pub(crate) enum GitLocation {
+    /// `path` is itself the toplevel of a repository (ordinary root, an
+    /// intentional nested repo, or a linked worktree root).
+    RepoRoot,
+    /// `path` is a plain subdirectory of `root`, with no `.git` of its own.
+    InsideRepo { root: PathBuf },
+    /// `path` is not inside any git repository.
+    NotARepo,
+}
+
+pub(crate) async fn git_location(path: &Path) -> Result<GitLocation, String> {
+    let output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+
+    if !output.status.success() {
+        // git exits non-zero both for "not a repository" and for edge cases
+        // (e.g. a bare repository) that this feature does not need to
+        // distinguish: neither should be treated as an existing root.
+        return Ok(GitLocation::NotARepo);
+    }
+
+    let toplevel = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical_toplevel = toplevel.canonicalize().unwrap_or(toplevel);
+
+    if canonical_path == canonical_toplevel {
+        Ok(GitLocation::RepoRoot)
+    } else {
+        Ok(GitLocation::InsideRepo { root: canonical_toplevel })
+    }
+}
+
+/// What the frontend should tell the user about a picked folder, before they
+/// submit the create-project form.
+///
+/// This is UX only, not a safety boundary: `create_repository` re-derives
+/// the same classification at execution time, because this result can be
+/// stale by the time the user submits (see `ensure_git_initialized`).
+#[derive(serde::Serialize)]
+pub struct GitDetection {
+    /// True if `path` is already backed by git in any sense (its own root,
+    /// or inside an ancestor repository) — used to hide the "Initialize git
+    /// repository" checkbox, since offering to `git init` here is either
+    /// redundant or, for the ancestor case, the accidental-nested-repo bug
+    /// this type exists to prevent.
+    pub is_git_repo: bool,
+    /// Set when `path` is inside an ancestor repository rather than being a
+    /// root itself, so the UI can name the real root instead of implying
+    /// `path` will become one.
+    pub ancestor_root: Option<String>,
+}
+
 #[tauri::command]
-pub async fn check_is_git_repo(path: String) -> Result<bool, String> {
-    Ok(is_git_repo_root(&PathBuf::from(&path)))
+pub async fn check_is_git_repo(path: String) -> Result<GitDetection, String> {
+    match git_location(&PathBuf::from(&path)).await? {
+        GitLocation::RepoRoot => Ok(GitDetection { is_git_repo: true, ancestor_root: None }),
+        GitLocation::InsideRepo { root } => Ok(GitDetection {
+            is_git_repo: true,
+            ancestor_root: Some(root.to_string_lossy().to_string()),
+        }),
+        GitLocation::NotARepo => Ok(GitDetection { is_git_repo: false, ancestor_root: None }),
+    }
+}
+
+#[cfg(test)]
+mod git_location_tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git must be on PATH for these tests")
+    }
+
+    fn init_committed_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        assert!(git(dir, &["init", "-q"]).status.success());
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("f"), "hi").unwrap();
+        git(dir, &["add", "f"]);
+        assert!(git(dir, &["commit", "-q", "-m", "init"]).status.success());
+    }
+
+    #[tokio::test]
+    async fn repo_root_is_recognized_as_its_own_root() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        init_committed_repo(&repo);
+
+        assert!(matches!(git_location(&repo).await.unwrap(), GitLocation::RepoRoot));
+    }
+
+    #[tokio::test]
+    async fn child_with_no_own_git_is_inside_ancestor_repo() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        init_committed_repo(&repo);
+        let child = repo.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        match git_location(&child).await.unwrap() {
+            GitLocation::InsideRepo { root } => {
+                assert_eq!(root, repo.canonicalize().unwrap());
+            }
+            GitLocation::RepoRoot => panic!("child must not be classified as a repo root"),
+            GitLocation::NotARepo => panic!("child must not be classified as outside any repo"),
+        }
+    }
+
+    #[tokio::test]
+    async fn path_outside_any_repository_is_not_a_repo() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        assert!(matches!(git_location(&outside).await.unwrap(), GitLocation::NotARepo));
+    }
+
+    #[tokio::test]
+    async fn explicit_nested_repository_is_recognized_as_its_own_root() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        init_committed_repo(&repo);
+        let nested = repo.join("nested");
+        init_committed_repo(&nested);
+
+        assert!(matches!(git_location(&nested).await.unwrap(), GitLocation::RepoRoot));
+    }
+
+    #[tokio::test]
+    async fn linked_worktree_with_git_file_is_recognized_as_its_own_root() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        init_committed_repo(&repo);
+        let worktree = temp.path().join("worktree");
+        assert!(
+            git(&repo, &["worktree", "add", "-b", "wt-branch", worktree.to_str().unwrap()])
+                .status
+                .success()
+        );
+
+        assert!(
+            worktree.join(".git").is_file(),
+            "a linked worktree's .git must be a file, not a directory, for this test to be meaningful"
+        );
+        assert!(matches!(git_location(&worktree).await.unwrap(), GitLocation::RepoRoot));
+    }
+
+    #[tokio::test]
+    async fn check_is_git_repo_reports_truthful_ancestor_root_for_a_child_path() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        init_committed_repo(&repo);
+        let child = repo.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let detection = check_is_git_repo(child.to_string_lossy().to_string()).await.unwrap();
+        assert!(detection.is_git_repo, "a child of a repository is still git-backed");
+        assert_eq!(
+            detection.ancestor_root.as_deref(),
+            Some(repo.canonicalize().unwrap().to_string_lossy().as_ref()),
+            "the detection must name the real root, not silently claim the child is one"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_is_git_repo_on_nonexistent_path_returns_err_not_panic() {
+        let result = check_is_git_repo("/nonexistent/path/that/does/not/exist".to_string()).await;
+        assert!(result.is_err(), "an inaccessible path must be reported as an error, not silently classified");
+    }
 }
 
 #[tauri::command]

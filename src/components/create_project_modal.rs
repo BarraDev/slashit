@@ -21,6 +21,7 @@ pub fn CreateProjectModal(
     let (name, set_name) = signal(String::new());
     let (folder_path, set_folder_path) = signal(String::new());
     let (is_git_repo, set_is_git_repo) = signal(false);
+    let (ancestor_repo_root, set_ancestor_repo_root) = signal(Option::<String>::None);
     let (init_git, set_init_git) = signal(true);
     let (selected_repository_id, set_selected_repository_id) = signal(Option::<String>::None);
     let (repositories, set_repositories) = signal(Vec::<Repository>::new());
@@ -46,6 +47,7 @@ pub fn CreateProjectModal(
             set_name.set(String::new());
             set_folder_path.set(String::new());
             set_is_git_repo.set(false);
+            set_ancestor_repo_root.set(None);
             set_init_git.set(true);
             set_selected_repository_id.set(None);
             set_error_msg.set(None);
@@ -116,15 +118,22 @@ pub fn CreateProjectModal(
                             set_name.set(folder_name.to_string());
                         }
                     }
-                    // Check if it's a git repo
+                    // Check if it's a git repo (or lives inside one) — this is
+                    // UX only; `create_repository` re-derives the same
+                    // classification authoritatively at submit time, since
+                    // this result can be stale by then.
                     match check_is_git_repo(path).await {
-                        Ok(is_git) => {
-                            set_is_git_repo.set(is_git);
-                            if is_git {
-                                set_init_git.set(false); // Don't init if already a git repo
+                        Ok(detection) => {
+                            set_is_git_repo.set(detection.is_git_repo);
+                            set_ancestor_repo_root.set(detection.ancestor_root);
+                            if detection.is_git_repo {
+                                set_init_git.set(false); // Don't init if already git-backed
                             }
                         }
-                        Err(_) => set_is_git_repo.set(false),
+                        Err(_) => {
+                            set_is_git_repo.set(false);
+                            set_ancestor_repo_root.set(None);
+                        }
                     }
                 }
                 Ok(None) => {} // User cancelled
@@ -414,14 +423,27 @@ pub fn CreateProjectModal(
                                         "Browse"
                                     </button>
                                 </div>
-                                {move || is_git_repo.get().then(|| view! {
-                                    <div class="mt-2 flex items-center gap-2 text-xs text-green-400">
-                                        <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                        </svg>
-                                        "Git repository detected"
-                                    </div>
-                                })}
+                                {move || if let Some(root) = ancestor_repo_root.get() {
+                                    view! {
+                                        <div class="mt-2 flex items-center gap-2 text-xs text-amber-400">
+                                            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                                            </svg>
+                                            {format!("This folder is inside an existing repository at '{}'. Select that folder instead.", root)}
+                                        </div>
+                                    }.into_any()
+                                } else if is_git_repo.get() {
+                                    view! {
+                                        <div class="mt-2 flex items-center gap-2 text-xs text-green-400">
+                                            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+                                            </svg>
+                                            "Git repository detected"
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    ().into_any()
+                                }}
                             </div>
 
                             // Initialize Git Checkbox

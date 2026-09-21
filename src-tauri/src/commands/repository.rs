@@ -1,6 +1,6 @@
 use crate::domain::Repository;
 use crate::config::Storage;
-use crate::commands::file::is_git_repo_root;
+use crate::commands::file::{is_git_repo_root, git_location, GitLocation};
 use uuid::Uuid;
 use std::collections::HashMap;
 use std::path::Path;
@@ -59,50 +59,70 @@ impl Default for RepositoryState {
     }
 }
 
-/// Initialize a git repository at `path` if the caller asked for it and the
-/// folder is not already a git repository at the moment of execution.
+/// Classify `path` against real git semantics and, if the caller asked for
+/// git initialization, act on that classification.
 ///
 /// The frontend's own git-detection runs when the folder is picked, which
 /// can be stale by the time the user submits the form (the folder could have
-/// been git-init'd externally, or a `.git` could have appeared or vanished
-/// in between). Re-checking here — right before acting — is what makes the
+/// been git-init'd externally, a `.git` could have appeared or vanished in
+/// between, or the frontend's detection simply never resolved ancestor
+/// membership). Re-checking here — right before acting — is what makes the
 /// check authoritative instead of decorative.
 ///
-/// Deliberately does not force an initial branch name: that would override
-/// the user's own `init.defaultBranch` git config, which this feature has no
-/// reason to second-guess.
+/// A path inside an ancestor repository (no `.git` of its own) is refused
+/// outright, whether or not `initialize_git` was requested: `local_path` is
+/// used downstream as the working directory for every git/jj operation, PR
+/// action, and task execution, so silently registering a subdirectory would
+/// make those operations quietly diverge from what git itself reports as the
+/// repository root. Refusing keeps the contract that `Repository.local_path`
+/// is always a real git root, rather than inventing a "project root distinct
+/// from repository root" concept the rest of the codebase has no support
+/// for.
+///
+/// Deliberately does not force an initial branch name when running `git
+/// init`: that would override the user's own `init.defaultBranch` git
+/// config, which this feature has no reason to second-guess.
 ///
 /// Returns whether `git init` actually ran, so the caller can tell a fresh
 /// initialization apart from a folder that was already a repository — the
 /// two need different error framing if persistence fails afterward.
-async fn ensure_git_initialized(path: &Path) -> Result<bool, String> {
-    if is_git_repo_root(path) {
-        // Already a repo — leave its history/config untouched.
-        return Ok(false);
+async fn ensure_git_initialized(path: &Path, initialize_git: bool) -> Result<bool, String> {
+    match git_location(path).await? {
+        GitLocation::RepoRoot => Ok(false),
+        GitLocation::InsideRepo { root } => Err(format!(
+            "'{}' is already inside git repository '{}'. Select that folder directly, or choose a location that is not part of an existing repository.",
+            path.display(),
+            root.display()
+        )),
+        GitLocation::NotARepo => {
+            if !initialize_git {
+                return Ok(false);
+            }
+
+            let output = tokio::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(path)
+                .output()
+                .await
+                .map_err(|e| format!("Failed to run git init: {e}"))?;
+
+            if !output.status.success() {
+                return Err(format!(
+                    "git init failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+
+            if !is_git_repo_root(path) {
+                return Err(format!(
+                    "git init reported success but '{}' is still not a git repository",
+                    path.display()
+                ));
+            }
+
+            Ok(true)
+        }
     }
-
-    let output = tokio::process::Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(path)
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run git init: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "git init failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    if !is_git_repo_root(path) {
-        return Err(format!(
-            "git init reported success but '{}' is still not a git repository",
-            path.display()
-        ));
-    }
-
-    Ok(true)
 }
 
 #[tauri::command]
@@ -140,11 +160,7 @@ async fn create_repository_core(
         return Err(format!("'{}' is not a directory", local_path));
     }
 
-    let git_freshly_initialized = if initialize_git {
-        ensure_git_initialized(&path).await?
-    } else {
-        false
-    };
+    let git_freshly_initialized = ensure_git_initialized(&path, initialize_git).await?;
 
     let id = Uuid::new_v4();
     let remote_type = remote_url.as_ref().and_then(|url| {
@@ -413,6 +429,163 @@ mod tests {
         assert!(result.is_ok(), "expected success, got {:?}", result.err());
         let head_after = git(&folder, &["rev-parse", "HEAD"]).stdout;
         assert_eq!(head_before, head_after, "existing repository history must survive untouched");
+    }
+
+    fn init_committed_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        assert!(git(dir, &["init", "-q"]).status.success());
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("f"), "hi").unwrap();
+        git(dir, &["add", "f"]);
+        assert!(git(dir, &["commit", "-q", "-m", "init"]).status.success());
+    }
+
+    /// RED-case regression: before the fix, `is_git_repo_root` only checked
+    /// `child/.git` directly, so a plain subdirectory of a real repository
+    /// looked identical to a brand new folder — and with the checkbox
+    /// defaulting to checked, submitting created an accidental nested
+    /// repository. See the file-level docs for `git_location` in
+    /// `commands::file` for why `git rev-parse --show-toplevel` fixes this.
+    #[tokio::test]
+    async fn child_of_ancestor_repo_is_refused_when_git_init_is_requested() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        init_committed_repo(&repo);
+        let child = repo.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let result = create_repository_core(
+            &repositories,
+            &storage,
+            child.to_string_lossy().to_string(),
+            None,
+            true,
+        )
+        .await;
+
+        let err = result.expect_err("a subdirectory of an existing repository must not be initialized as its own repository");
+        assert!(
+            err.contains("already inside git repository"),
+            "error must actionably explain the folder is already part of a repository: {err}"
+        );
+        assert!(!child.join(".git").exists(), "no nested .git may be created under the child");
+        assert!(
+            repositories.read().await.is_empty(),
+            "a refused path must never be registered as a repository"
+        );
+    }
+
+    /// Same refusal even without the checkbox: `local_path` must always be a
+    /// real git root downstream (worktree creation, PR ops, task execution,
+    /// state-location keying all key off it directly), so silently
+    /// registering a subdirectory would be unsafe even when no `git init`
+    /// was requested.
+    #[tokio::test]
+    async fn child_of_ancestor_repo_is_refused_even_when_git_init_is_not_requested() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        init_committed_repo(&repo);
+        let child = repo.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let result = create_repository_core(
+            &repositories,
+            &storage,
+            child.to_string_lossy().to_string(),
+            None,
+            false,
+        )
+        .await;
+
+        assert!(result.is_err(), "an unchecked subdirectory selection must still be refused");
+        assert!(
+            repositories.read().await.is_empty(),
+            "a refused path must never be registered as a repository"
+        );
+    }
+
+    /// Demonstrates that the backend does not trust a stale/naive frontend
+    /// signal: the old, purely-local `is_git_repo_root` check says this
+    /// child folder is not a repository, yet the backend must still refuse
+    /// it based on real git semantics.
+    #[tokio::test]
+    async fn backend_refuses_even_when_naive_local_check_says_not_a_repo() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        init_committed_repo(&repo);
+        let child = repo.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        assert!(
+            !is_git_repo_root(&child),
+            "the naive check is expected to be fooled — that's the bug this fix closes"
+        );
+
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let result = create_repository_core(
+            &repositories,
+            &storage,
+            child.to_string_lossy().to_string(),
+            None,
+            true,
+        )
+        .await;
+
+        assert!(result.is_err(), "the authoritative backend check must override the stale signal");
+    }
+
+    #[tokio::test]
+    async fn explicit_nested_repository_is_recognized_and_not_reinitialized() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        init_committed_repo(&repo);
+        let nested = repo.join("nested");
+        init_committed_repo(&nested);
+        let head_before = git(&nested, &["rev-parse", "HEAD"]).stdout;
+
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let result = create_repository_core(
+            &repositories,
+            &storage,
+            nested.to_string_lossy().to_string(),
+            None,
+            true,
+        )
+        .await;
+
+        assert!(result.is_ok(), "an intentional nested repository must be accepted: {:?}", result.err());
+        let head_after = git(&nested, &["rev-parse", "HEAD"]).stdout;
+        assert_eq!(head_before, head_after, "the nested repository's own history must survive untouched");
+    }
+
+    #[tokio::test]
+    async fn linked_worktree_is_recognized_as_its_own_root_and_not_reinitialized() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        init_committed_repo(&repo);
+        let worktree = temp.path().join("worktree");
+        assert!(
+            git(&repo, &["worktree", "add", "-b", "wt-branch", worktree.to_str().unwrap()])
+                .status
+                .success()
+        );
+        assert!(worktree.join(".git").is_file(), "sanity check: worktree .git must be a file");
+
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let result = create_repository_core(
+            &repositories,
+            &storage,
+            worktree.to_string_lossy().to_string(),
+            None,
+            true,
+        )
+        .await;
+
+        assert!(result.is_ok(), "a linked worktree must be accepted as its own root: {:?}", result.err());
+        assert!(worktree.join(".git").is_file(), "the worktree's .git file must not be replaced by a real git init");
     }
 
     #[cfg(unix)]
