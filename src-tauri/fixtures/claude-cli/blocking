@@ -1,0 +1,4 @@
+#!/bin/sh
+printf '{"type":"system","subtype":"init","session_id":"s-block","model":"fixture-model"}\n'
+printf '%s\n' "$$" > blocked.pid
+exec sleep 300

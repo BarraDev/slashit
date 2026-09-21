@@ -1,0 +1,10 @@
+#!/bin/sh
+sleep 0.2
+printf '{"type":"system","subtype":"init","session_id":"s-stream","model":"fixture-model"}\n'
+sleep 0.1
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"alpha"}]}}\n'
+sleep 0.1
+printf '{"type":"content_block_delta","delta":{"type":"text_delta","text":"beta"}}\n'
+sleep 0.1
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-stream","result":"gamma"}\n'
+exit 0
