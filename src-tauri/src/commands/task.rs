@@ -55,13 +55,13 @@ struct WorktreeCleanupCtx<'a> {
 /// What that recovery is depends on the caller, so the failure messages below
 /// deliberately do not promise a retry. A transition into `Done` is revisited
 /// by the executor's pass, which filters on `status == Done`; `delete_task`
-/// leaves no task at all, and there the retained branch and git's own worktree
-/// registration are the only records, which is why `remove_with_git` keeps the
-/// branch when it did not own the removal.
+/// leaves no task at all, and there the retained branch is the only record of
+/// what the task produced, which is one of the reasons removal never touches
+/// it.
 ///
 /// Re-queuing a task does not reach here at all — see
 /// [`StatusTransitionEffect::ResetExecutionState`].
-async fn cleanup_worktree(ctx: WorktreeCleanupCtx<'_>, task_id: Uuid, project_id: Uuid, wt_path: &str, branch: &str) {
+async fn cleanup_worktree(ctx: WorktreeCleanupCtx<'_>, task_id: Uuid, project_id: Uuid, wt_path: &str) {
     let repo_path = match resolve_repo_path(ctx.projects, ctx.repositories, project_id).await {
         Ok(p) => p,
         Err(e) => {
@@ -72,7 +72,7 @@ async fn cleanup_worktree(ctx: WorktreeCleanupCtx<'_>, task_id: Uuid, project_id
         }
     };
 
-    if let Err(e) = ctx.worktree_manager.remove(wt_path, branch, &repo_path).await {
+    if let Err(e) = ctx.worktree_manager.remove(wt_path, &repo_path).await {
         eprintln!(
             "Warning: failed to remove worktree {wt_path} for task {task_id}: {e}. This call cleared no reference to it."
         );
@@ -151,13 +151,7 @@ pub(crate) async fn clear_worktree_path_durably(
 
 /// Remove a task's worktree in the background; see [`cleanup_worktree`] for
 /// the retain-on-failure invariant this preserves.
-fn spawn_worktree_cleanup(
-    state: &crate::AppState,
-    task_id: Uuid,
-    project_id: Uuid,
-    wt_path: String,
-    branch: String,
-) {
+fn spawn_worktree_cleanup(state: &crate::AppState, task_id: Uuid, project_id: Uuid, wt_path: String) {
     let wt_mgr = state.worktree_manager.clone();
     let projects = state.project.projects.clone();
     let repositories = state.repository.repositories.clone();
@@ -176,7 +170,6 @@ fn spawn_worktree_cleanup(
             task_id,
             project_id,
             &wt_path,
-            &branch,
         )
         .await;
     });
@@ -392,10 +385,10 @@ pub async fn update_task_status(
                 task.reset_execution_state();
             }
             StatusTransitionEffect::CleanUpWorktree => {
-                // Keep branch_name for PR creation.
+                // Keep branch_name for PR creation. Removal leaves the
+                // branch alone, so it still names something afterwards.
                 if let Some(wt_path) = task.worktree_path.clone() {
-                    let branch = task.branch_name.clone().unwrap_or_default();
-                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+                    spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path);
                 }
             }
             StatusTransitionEffect::None => {}
@@ -775,14 +768,15 @@ pub async fn delete_task(
     // Get project_id before removal for persistence
     let project_id = tasks.get(&task_id).map(|t| t.project_id);
 
-    // Cleanup worktree and branch before removing. The task record itself is
-    // about to be deleted, so a failure here has no persisted task left to
+    // Cleanup the worktree before removing the task. The task record itself
+    // is about to be deleted, so a failure here has no persisted task left to
     // retain the path on — the failure is logged so the orphaned directory
     // is at least discoverable, per `spawn_worktree_cleanup`'s own logging.
+    // The branch survives either way, so the commits the task produced stay
+    // reachable even when the record that named them does not.
     if let Some(task) = tasks.get(&task_id) {
         if let Some(wt_path) = task.worktree_path.clone() {
-            let branch = task.branch_name.clone().unwrap_or_default();
-            spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+            spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path);
         }
     }
 
@@ -855,10 +849,10 @@ pub async fn reorder_task(
                     task.reset_execution_state();
                 }
                 StatusTransitionEffect::CleanUpWorktree => {
-                    // Keep branch_name for PR creation.
+                    // Keep branch_name for PR creation. Removal leaves the
+                    // branch alone, so it still names something afterwards.
                     if let Some(wt_path) = task.worktree_path.clone() {
-                        let branch = task.branch_name.clone().unwrap_or_default();
-                        spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path, branch);
+                        spawn_worktree_cleanup(&state, task_id, task.project_id, wt_path);
                     }
                 }
                 StatusTransitionEffect::None => {}
@@ -1177,7 +1171,6 @@ mod tests {
             task_id,
             project_id,
             &info.path,
-            "cleanup-success",
         )
         .await;
 
@@ -1243,7 +1236,6 @@ mod tests {
             task_id,
             project_id,
             &info.path,
-            "cleanup-unsaveable",
         )
         .await;
 
@@ -1462,7 +1454,6 @@ mod tests {
             task_id,
             project_id,
             "/tmp/does-not-matter",
-            "some-branch",
         )
         .await;
 
@@ -1510,7 +1501,6 @@ mod tests {
             task_id,
             project_id,
             "/tmp/some-worktree-path",
-            "some-branch",
         )
         .await;
 
