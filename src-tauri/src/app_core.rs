@@ -213,11 +213,7 @@ pub async fn build_state_with_paths(
                     repo_for_project.get(&task.project_id),
                 ) {
                     (Some(branch), Some(repo)) => {
-                        let porcelain = porcelain_cache
-                            .entry(repo.clone())
-                            .or_insert_with(|| {
-                                worktree::WorktreeManager::worktree_list_porcelain(repo)
-                            });
+                        let porcelain = cached_porcelain(&mut porcelain_cache, repo).await;
                         // `None` here is git failing to answer, not git saying
                         // nothing is registered, so it stays quarantined.
                         porcelain.as_deref().map(|p| {
@@ -276,9 +272,7 @@ pub async fn build_state_with_paths(
                 repo_for_project.get(&task.project_id),
             ) {
                 (Some(branch), Some(repo)) => {
-                    let porcelain = porcelain_cache
-                        .entry(repo.clone())
-                        .or_insert_with(|| worktree::WorktreeManager::worktree_list_porcelain(repo));
+                    let porcelain = cached_porcelain(&mut porcelain_cache, repo).await;
                     app_state
                         .worktree_manager
                         .classify_missing_worktree(repo, branch, porcelain.as_deref())
@@ -366,6 +360,39 @@ pub async fn build_state_with_paths(
     report.migrated_projects = migrated_projects.len();
 
     Ok((app_state, report))
+}
+
+/// `git worktree list --porcelain` for `repo`, from `cache` if this loop has
+/// already asked, off the runtime thread if it has not.
+///
+/// `WorktreeManager::worktree_list_porcelain` shells out synchronously, and
+/// `build_state_with_paths` is on the Tokio runtime by the time it runs
+/// (see the module doc comment on why this file exists at all), so a cache
+/// miss blocked the current worker until git exited. Wrapping the one
+/// blocking call site rather than the whole loop keeps every other line here
+/// -- including the `tasks` write guard held across it -- exactly as it was.
+async fn cached_porcelain(cache: &mut HashMap<String, Option<String>>, repo: &str) -> Option<String> {
+    if !cache.contains_key(repo) {
+        let repo_owned = repo.to_string();
+        let listed = match tokio::task::spawn_blocking(move || {
+            worktree::WorktreeManager::worktree_list_porcelain(&repo_owned)
+        })
+        .await
+        {
+            Ok(listed) => listed,
+            // The blocking closure panicked, or the runtime is shutting down
+            // mid-task. Neither proves the worktree registration is gone, so
+            // this stays the same "git could not be consulted" case as any
+            // other failed lookup below -- said explicitly rather than
+            // quietly reusing `None`'s other meaning.
+            Err(e) => {
+                eprintln!("Warning: worktree listing for {repo} did not complete: {e}");
+                None
+            }
+        };
+        cache.insert(repo.to_string(), listed);
+    }
+    cache[repo].clone()
 }
 
 /// Map each project to the filesystem path of the repository backing it.
@@ -1182,5 +1209,94 @@ mod tests {
             "worktree_path is the only record of the worktree; a lookup that never \
              happened must not be allowed to spend it"
         );
+    }
+
+    /// Proves the mechanism `cached_porcelain` relies on -- `tokio::task::
+    /// spawn_blocking` around a synchronous call -- genuinely frees the
+    /// runtime while that call is in flight, rather than merely reading as
+    /// though it does.
+    ///
+    /// This does not shell out to a real `git`: an earlier version of this
+    /// test used a fake `git` installed on `PATH` to slow down the real
+    /// `worktree_list_porcelain` call, but `PATH` is a single process-global
+    /// value and mutating it raced with every other test's own `git`/`jj`
+    /// subprocess spawns, causing intermittent, unrelated test failures
+    /// under the default parallel test runner (reproduced: two different
+    /// `commands::repository::tests` failures across four `cargo test --lib`
+    /// runs, neither reproducible in isolation). `cached_porcelain`'s own
+    /// body is two lines -- `spawn_blocking(move || worktree_list_porcelain(...))
+    /// .await` -- so which synchronous call sits inside `spawn_blocking` does
+    /// not change whether the wrapping actually yields the runtime; a
+    /// synthetic blocking closure proves the same thing this same way,
+    /// without touching global process state.
+    mod spawn_blocking_off_runtime_thread {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        /// Counts how many times another task actually got to run while the
+        /// blocking work was in flight. A current-thread runtime can only
+        /// interleave this loop's `yield_now` points with other work if its
+        /// one worker thread is free to schedule them -- a synchronous
+        /// blocking call on that same thread starves it completely, so the
+        /// final count is a direct measurement of scheduler interleaving, not
+        /// a timing guess.
+        fn spawn_progress_counter() -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>, Arc<AtomicBool>) {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (counter_clone, stop_clone) = (counter.clone(), stop.clone());
+            let handle = tokio::spawn(async move {
+                while !stop_clone.load(Ordering::Relaxed) {
+                    counter_clone.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            });
+            (handle, counter, stop)
+        }
+
+        const BLOCKING_WORK: Duration = Duration::from_millis(50);
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn spawn_blocking_lets_another_task_make_progress_while_it_runs() {
+            let (handle, counter, stop) = spawn_progress_counter();
+
+            // The exact shape `cached_porcelain` uses: a synchronous call
+            // wrapped in `spawn_blocking` and awaited.
+            tokio::task::spawn_blocking(|| std::thread::sleep(BLOCKING_WORK))
+                .await
+                .unwrap();
+
+            stop.store(true, Ordering::Relaxed);
+            handle.await.unwrap();
+
+            assert!(
+                counter.load(Ordering::Relaxed) > 0,
+                "another task must be able to run while spawn_blocking's work is in \
+                 flight -- a count of zero means the runtime's single worker thread was \
+                 starved for the whole call"
+            );
+        }
+
+        /// The RED case: the same blocking work called directly on the
+        /// runtime thread, the way `cached_porcelain` called
+        /// `worktree_list_porcelain` before this fix.
+        #[tokio::test(flavor = "current_thread")]
+        async fn calling_the_same_blocking_work_directly_starves_the_runtime() {
+            let (handle, counter, stop) = spawn_progress_counter();
+
+            std::thread::sleep(BLOCKING_WORK);
+
+            stop.store(true, Ordering::Relaxed);
+            handle.await.unwrap();
+
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                0,
+                "a synchronous call made directly on a current-thread runtime must starve \
+                 every other task -- this is the failure mode cached_porcelain exists to \
+                 avoid, reproduced here to prove the progress-counter technique above \
+                 actually distinguishes the two cases rather than always passing"
+            );
+        }
     }
 }
