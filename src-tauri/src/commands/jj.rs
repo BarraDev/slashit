@@ -86,25 +86,18 @@ pub async fn git_export(
         .map_err(|e| e.to_string())
 }
 
-/// Resolve working directory for a task (task → project → repository → local_path).
-async fn resolve_task_working_dir(
-    app_state: &crate::AppState,
-    task_id: &str,
-) -> Result<String, String> {
-    let task_uuid = Uuid::parse_str(task_id).map_err(|e| e.to_string())?;
-    let tasks = app_state.task.tasks.read().await;
-    let task = tasks.get(&task_uuid).ok_or("Task not found")?;
-    let project_id = task.project_id;
-    drop(tasks);
-
-    let projects = app_state.project.projects.read().await;
-    let project = projects.get(&project_id).ok_or("Project not found")?;
-    let repo_id = project.repository_id.ok_or("No repository linked")?;
-    drop(projects);
-
-    let repos = app_state.repository.repositories.read().await;
-    let repo = repos.get(&repo_id).ok_or("Repository not found")?;
-    Ok(repo.local_path.clone())
+/// A task with no worktree has no diff of its own.
+///
+/// This used to resolve the project's repository and diff that instead, so the
+/// UI showed the user's own uncommitted work under the task's name -- a
+/// finished task, whose `worktree_path` [`crate::lifecycle::terminalize`]
+/// clears, showed whatever the user happened to be editing. Nothing here
+/// writes, but a diff that belongs to someone else is still the wrong answer.
+fn no_worktree_diff(task_id: Uuid) -> String {
+    format!(
+        "Task {task_id} has no worktree of its own, so there is no diff to show. Its commits are \
+         still on its branch."
+    )
 }
 
 #[tauri::command]
@@ -120,13 +113,9 @@ pub async fn get_task_diff(
         tasks.get(&task_uuid).and_then(|t| t.worktree_path.clone())
     };
 
-    if let Some(wt_path) = worktree_path {
-        state.worktree_manager.get_diff(&wt_path).await
-    } else {
-        let working_dir = resolve_task_working_dir(&state, &task_id).await?;
-        state.jj.jj_manager
-            .diff(PathBuf::from(&working_dir).as_path())
-            .map_err(|e| e.to_string())
+    match worktree_path {
+        Some(wt_path) => state.worktree_manager.get_diff(&wt_path).await,
+        None => Err(no_worktree_diff(task_uuid)),
     }
 }
 
@@ -142,13 +131,9 @@ pub async fn get_task_diff_stat(
         tasks.get(&task_uuid).and_then(|t| t.worktree_path.clone())
     };
 
-    if let Some(wt_path) = worktree_path {
-        state.worktree_manager.get_diff_stat(&wt_path).await
-    } else {
-        let working_dir = resolve_task_working_dir(&state, &task_id).await?;
-        state.jj.jj_manager
-            .diff_stat(PathBuf::from(&working_dir).as_path())
-            .map_err(|e| e.to_string())
+    match worktree_path {
+        Some(wt_path) => state.worktree_manager.get_diff_stat(&wt_path).await,
+        None => Err(no_worktree_diff(task_uuid)),
     }
 }
 

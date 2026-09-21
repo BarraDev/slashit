@@ -48,28 +48,73 @@ fn parse_pr_url(pr_url: &str) -> Result<(String, String), String> {
     Ok((format!("{}/{}", parts[repo_idx + 1], parts[repo_idx + 2]), number.to_string()))
 }
 
-/// Resolve working directory for a task via project → repository chain.
-/// Prefers worktree_path if set on the task, otherwise falls back to repo root.
-async fn resolve_working_dir(
+/// The task's own worktree, or a refusal.
+///
+/// There is deliberately no fallback to the repository. This resolver used to
+/// answer with `repository.local_path` whenever a task had no checkout of its
+/// own, and [`crate::lifecycle::terminalize`] clears `worktree_path` in the
+/// same write that commits `Done` -- so the fallback was not an edge case, it
+/// was the steady state for exactly the tasks that have pull requests. What
+/// then ran in the user's own checkout was `claude` with `Edit`, `Write` and
+/// `Bash` and `--dangerously-skip-permissions`, followed by `jj describe`
+/// against whatever change they had open.
+///
+/// The queue already answers this question the same way, twice, and says why:
+/// see the worktree acquisition in [`crate::queue::executor`]. A task without a
+/// checkout of its own has nowhere to work, and saying so is the only safe
+/// answer.
+async fn resolve_task_workspace(tasks: &Tasks, task_id: Uuid) -> Result<String, String> {
+    let tasks = tasks.read().await;
+    let task = tasks.get(&task_id).ok_or("Task not found")?;
+
+    match task.worktree_path {
+        Some(ref wt_path) => Ok(wt_path.clone()),
+        None => Err(no_workspace_refusal(task.branch_name.as_deref())),
+    }
+}
+
+/// Why a task-scoped operation cannot run, and what the user can do about it.
+///
+/// Names the supported remedy rather than performing it: attaching a worktree
+/// is its own lifecycle operation, under its own lease, and doing it silently
+/// on the user's behalf inside a pull-request command is how a checkout appears
+/// that nobody asked for.
+fn no_workspace_refusal(branch: Option<&str>) -> String {
+    match branch {
+        Some(branch) => format!(
+            "This task has no worktree of its own, so there is nowhere to run this. Its work is \
+             still on branch `{branch}`: attach a worktree to the task first and then try again. \
+             Running this in the repository would put the changes in your own checkout."
+        ),
+        None => "This task has no worktree and no branch, so there is nothing to work on and \
+                 nowhere to do it. Running this in the repository would put the changes in your \
+                 own checkout."
+            .to_string(),
+    }
+}
+
+/// The repository a task belongs to, for asking GitHub about it.
+///
+/// Separate from [`resolve_task_workspace`] on purpose, and deliberately never
+/// interchangeable with it. The two callers of this ask `gh` which pull request
+/// exists for a branch; they write nothing, spawn no agent, and are precisely
+/// the operations a finished task -- which by construction no longer has a
+/// worktree -- still needs. The directory here identifies a repository; it is
+/// never a place work happens.
+async fn resolve_repository_dir(
     state: &crate::AppState,
     task_id: Uuid,
 ) -> Result<String, String> {
-    let tasks = state.task.tasks.read().await;
-    let task = tasks.get(&task_id).ok_or("Task not found")?;
+    let project_id = {
+        let tasks = state.task.tasks.read().await;
+        tasks.get(&task_id).ok_or("Task not found")?.project_id
+    };
 
-    // Use worktree path if available
-    if let Some(ref wt_path) = task.worktree_path {
-        return Ok(wt_path.clone());
-    }
-
-    // Fall back to repository path
-    let project_id = task.project_id;
-    drop(tasks);
-
-    let projects = state.project.projects.read().await;
-    let project = projects.get(&project_id).ok_or("Project not found")?;
-    let repo_id = project.repository_id.ok_or("No repository linked to project")?;
-    drop(projects);
+    let repo_id = {
+        let projects = state.project.projects.read().await;
+        let project = projects.get(&project_id).ok_or("Project not found")?;
+        project.repository_id.ok_or("No repository linked to project")?
+    };
 
     let repos = state.repository.repositories.read().await;
     let repo = repos.get(&repo_id).ok_or("Repository not found")?;
@@ -317,7 +362,7 @@ pub async fn sync_existing_pr(
     task_id: String,
 ) -> Result<Option<Task>, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_working_dir(&state, task_uuid).await?;
+    let working_dir = resolve_repository_dir(&state, task_uuid).await?;
     let branch = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_uuid).ok_or("Task not found")?;
@@ -360,7 +405,7 @@ pub async fn find_pr_candidates(
     task_id: String,
 ) -> Result<Vec<PrCandidate>, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_working_dir(&state, task_uuid).await?;
+    let working_dir = resolve_repository_dir(&state, task_uuid).await?;
     let task = {
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
@@ -465,7 +510,7 @@ pub async fn get_pr_push_recovery(
     task_id: String,
 ) -> Result<PrPushRecoveryPlan, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_working_dir(&state, task_uuid).await?;
+    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let branch = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_uuid).ok_or("Task not found")?;
@@ -482,7 +527,7 @@ pub async fn recover_private_email_and_create_pr(
     author_email: String,
 ) -> Result<String, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_working_dir(&state, task_uuid).await?;
+    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let branch = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_uuid).ok_or("Task not found")?;
@@ -528,7 +573,7 @@ pub async fn analyze_pr_comments(
     task_id: String,
 ) -> Result<PrReviewPlan, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_working_dir(&state, task_uuid).await?;
+    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let task = {
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
@@ -668,7 +713,7 @@ pub async fn discuss_pr_review_questions(
     plan: PrReviewPlan,
 ) -> Result<PrReviewPlan, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_working_dir(&state, task_uuid).await?;
+    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let task = {
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
@@ -769,7 +814,7 @@ pub async fn address_pr_review(
 ) -> Result<PrReviewApplyResult, String> {
     use tauri::Emitter;
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_working_dir(&state, task_uuid).await?;
+    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let task = {
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
@@ -1047,8 +1092,10 @@ pub async fn address_pr_review_inner(
                 comment_id: None,
                 message: None,
             });
-            let branch = task.branch_name.clone();
-            match push_branch(&working_dir, branch.as_deref()).await {
+            let branch = task.branch_name.clone().ok_or_else(|| {
+                "This task has no branch recorded, so there is nothing to push.".to_string()
+            })?;
+            match push_branch(&working_dir, &branch).await {
                 Ok(b) => {
                     pushed = true;
                     push_branch_name = Some(b.clone());
@@ -1973,7 +2020,7 @@ async fn create_pr_inner(
     task_id: &str,
 ) -> Result<String, String> {
     let task_uuid = Uuid::parse_str(task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_working_dir(state, task_uuid).await?;
+    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
 
     let (pr_title, pr_body, task_branch_name) = {
         let tasks = state.task.tasks.read().await;
@@ -1981,26 +2028,33 @@ async fn create_pr_inner(
         (task.title.clone(), build_pr_body(task), task.branch_name.clone())
     };
 
-    if let Some(branch) = task_branch_name.as_deref() {
-        if let Some(existing_pr_url) = find_existing_pr_for_branch(&working_dir, branch).await? {
-            // Classified rather than flattened. A cleanup this refused is a task that
-            // is simply not finished, and the refusal is already persisted onto its
-            // card as `error_message`; the pull request is real either way and the
-            // caller is owed its URL. A link that never reached the disk, and a
-            // terminal state that never reached the disk, are the other thing
-            // entirely: what SlashIt holds does not match what happened, so the URL
-            // travels back inside the error and asking again rediscovers this same
-            // PR rather than opening a second one.
-            if let Err(failure) = link_pr_to_task(state, task_uuid, &existing_pr_url).await {
-                if let Some(message) = pr_link_error(&failure, &existing_pr_url) {
-                    return Err(message);
-                }
+    // A task with no branch has produced nothing to open a pull request for.
+    // Refusing here, before anything runs, is what stops the push below from
+    // falling back to whatever the working directory happens to have checked
+    // out and opening a pull request for it under this task's title.
+    let task_branch_name = task_branch_name.ok_or_else(|| {
+        "This task has no branch recorded, so there is nothing to open a pull request for."
+            .to_string()
+    })?;
+
+    if let Some(existing_pr_url) = find_existing_pr_for_branch(&working_dir, &task_branch_name).await? {
+        // Classified rather than flattened. A cleanup this refused is a task that
+        // is simply not finished, and the refusal is already persisted onto its
+        // card as `error_message`; the pull request is real either way and the
+        // caller is owed its URL. A link that never reached the disk, and a
+        // terminal state that never reached the disk, are the other thing
+        // entirely: what SlashIt holds does not match what happened, so the URL
+        // travels back inside the error and asking again rediscovers this same
+        // PR rather than opening a second one.
+        if let Err(failure) = link_pr_to_task(state, task_uuid, &existing_pr_url).await {
+            if let Some(message) = pr_link_error(&failure, &existing_pr_url) {
+                return Err(message);
             }
-            return Ok(existing_pr_url);
         }
+        return Ok(existing_pr_url);
     }
 
-    let branch = push_branch(&working_dir, task_branch_name.as_deref())
+    let branch = push_branch(&working_dir, &task_branch_name)
         .await
         .map_err(friendly_pr_error)?;
 
@@ -2515,39 +2569,30 @@ fn build_pr_body(task: &Task) -> String {
     body
 }
 
-async fn push_branch(working_dir: &str, known_branch: Option<&str>) -> Result<String, String> {
-    if let Some(branch) = known_branch {
-        if is_jj_repo(working_dir).await {
-            run_cmd("jj", &["git", "export"], working_dir).await
-                .map_err(|e| format!("jj git export failed: {}", e))?;
-            if let Err(jj_err) = run_cmd("jj", &["git", "push", "--allow-new", "--bookmark", branch], working_dir).await {
-                run_cmd("git", &["push", "-u", "origin", branch], working_dir).await
-                    .map_err(|git_err| format!("Push failed. jj: {}. git: {}", jj_err, git_err))?;
-            }
-            return Ok(branch.to_string());
+/// Push the task's own branch, and only ever that branch.
+///
+/// The branch is required rather than optional. This used to accept `None` and
+/// answer it by running `git branch --show-current` in the working directory
+/// and pushing whatever that returned -- which, for a task with no recorded
+/// branch, meant pushing the branch the user happened to have checked out and
+/// opening a pull request for it under the task's title. The `None` arm also
+/// reached `jj git push --allow-new` with no `--bookmark`, which pushes every
+/// bookmark rather than one. There is no caller that legitimately does not know
+/// which branch it means, so the parameter that allowed it is gone.
+async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> {
+    if is_jj_repo(working_dir).await {
+        run_cmd("jj", &["git", "export"], working_dir).await
+            .map_err(|e| format!("jj git export failed: {}", e))?;
+        if let Err(jj_err) = run_cmd("jj", &["git", "push", "--allow-new", "--bookmark", branch], working_dir).await {
+            run_cmd("git", &["push", "-u", "origin", branch], working_dir).await
+                .map_err(|git_err| format!("Push failed. jj: {}. git: {}", jj_err, git_err))?;
         }
-
-        run_cmd("git", &["push", "-u", "origin", branch], working_dir).await
-            .map_err(|e| format!("git push failed: {}", e))?;
         return Ok(branch.to_string());
     }
 
-    run_cmd("jj", &["git", "export"], working_dir).await
-        .map_err(|e| format!("jj git export failed: {}", e))?;
-
-    let branch = run_cmd("git", &["branch", "--show-current"], working_dir).await
-        .map_err(|e| format!("Could not determine branch: {}", e))?;
-
-    if branch.is_empty() {
-        return Err("No branch name found. Create a jj bookmark first.".to_string());
-    }
-
-    if let Err(jj_err) = run_cmd("jj", &["git", "push", "--allow-new"], working_dir).await {
-        run_cmd("git", &["push", "-u", "origin", &branch], working_dir).await
-            .map_err(|git_err| format!("Push failed. jj: {}. git: {}", jj_err, git_err))?;
-    }
-
-    Ok(branch)
+    run_cmd("git", &["push", "-u", "origin", branch], working_dir).await
+        .map_err(|e| format!("git push failed: {}", e))?;
+    Ok(branch.to_string())
 }
 
 #[tauri::command]
@@ -2556,7 +2601,7 @@ pub async fn submit_stack(
     task_id: String,
 ) -> Result<Vec<String>, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_working_dir(&state, task_uuid).await?;
+    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
 
     if !state.worktree_manager.gs_available {
         return Err("git-spice not available".to_string());
@@ -2729,6 +2774,83 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    /// The refusal that keeps an editing agent out of the user's own checkout.
+    ///
+    /// This resolver used to answer a task with no worktree by walking
+    /// task -> project -> repository and handing back `repository.local_path`.
+    /// `terminalize` clears `worktree_path` in the same write that commits
+    /// `Done`, so that fallback fired for every finished task -- which is
+    /// exactly the set of tasks that have pull requests, and therefore exactly
+    /// the set this file's commands act on. What ran there was `claude` with
+    /// `Edit`, `Write` and `Bash` and `--dangerously-skip-permissions`,
+    /// followed by `jj describe` against whatever change the user had open.
+    #[tokio::test]
+    async fn a_task_with_no_worktree_has_nowhere_to_work() {
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("finished", project_id, TaskStatus::Done, 0);
+        task.branch_name = Some("task-abcd1234".to_string());
+        task.worktree_path = None;
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(
+            vec![(task_id, task)].into_iter().collect::<HashMap<_, _>>(),
+        ));
+
+        let refusal = resolve_task_workspace(&tasks, task_id)
+            .await
+            .expect_err("a task with no checkout of its own must not be given another one");
+
+        assert!(
+            refusal.contains("task-abcd1234"),
+            "the refusal must name the branch the work is still on, so the user knows \
+             nothing was lost: {refusal}"
+        );
+        assert!(
+            refusal.contains("attach a worktree") || refusal.contains("Attach a worktree"),
+            "the refusal must name the supported remedy rather than performing it: {refusal}"
+        );
+    }
+
+    /// The resolver consults the task and nothing else.
+    ///
+    /// Stated as a test because the defect was not a missing check -- it was a
+    /// second source of answers. A resolver that cannot see the repository
+    /// cannot accidentally return it.
+    #[tokio::test]
+    async fn a_task_with_a_worktree_is_given_its_own() {
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("running", project_id, TaskStatus::InProgress, 0);
+        task.worktree_path = Some("/somewhere/task-abcd1234".to_string());
+        task.branch_name = Some("task-abcd1234".to_string());
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(
+            vec![(task_id, task)].into_iter().collect::<HashMap<_, _>>(),
+        ));
+
+        assert_eq!(
+            resolve_task_workspace(&tasks, task_id).await.as_deref(),
+            Ok("/somewhere/task-abcd1234"),
+        );
+    }
+
+    /// A task with neither says so, rather than naming a branch that is not there.
+    #[tokio::test]
+    async fn a_task_with_no_branch_either_is_told_so() {
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("never ran", project_id, TaskStatus::Backlog, 0);
+        task.worktree_path = None;
+        task.branch_name = None;
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(
+            vec![(task_id, task)].into_iter().collect::<HashMap<_, _>>(),
+        ));
+
+        let refusal = resolve_task_workspace(&tasks, task_id).await.expect_err("no worktree");
+        assert!(
+            refusal.contains("no worktree and no branch"),
+            "a task that never ran has nothing to work on either: {refusal}"
+        );
+    }
 
     fn review_plan_storage() -> (Storage, tempfile::TempDir) {
         let temp = tempfile::TempDir::new().expect("tempdir");

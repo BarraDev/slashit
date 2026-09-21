@@ -57,8 +57,31 @@ pub async fn start_agent(
     state.agent.executions.write().await.insert(id, execution.clone());
     state.agent.logs.write().await.insert(id, Vec::new());
 
-    let client = AcpClient::start("claude", &["--stdio"], &[])
-        .map_err(|e| format!("Failed to start agent: {}", e))?;
+    // The agent runs in the task's own checkout or it does not run. Passing no
+    // directory at all -- which is what this did -- left it in whatever
+    // directory SlashIt was launched from, so the agent read and wrote
+    // somewhere nobody chose. The queue answers this same question the same
+    // way for its own runs; see the worktree acquisition in
+    // `crate::queue::executor`.
+    let working_dir = {
+        let task_id = task_id.ok_or(
+            "An agent needs a task to work on, so it has a checkout of its own to work in.",
+        )?;
+        let tasks = state.task.tasks.read().await;
+        let task = tasks.get(&task_id).ok_or("Task not found")?;
+        task.worktree_path.clone().ok_or(
+            "This task has no worktree of its own, so there is nowhere to run an agent. \
+             Attach a worktree to the task first.",
+        )?
+    };
+
+    let client = AcpClient::start(
+        "claude",
+        &["--stdio"],
+        &[],
+        std::path::Path::new(&working_dir),
+    )
+    .map_err(|e| format!("Failed to start agent: {}", e))?;
 
     let client = Arc::new(client);
 

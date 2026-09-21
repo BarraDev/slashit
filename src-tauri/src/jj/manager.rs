@@ -69,57 +69,6 @@ impl JjManager {
         Ok(())
     }
 
-    pub fn diff(&self, workspace_path: &Path) -> Result<String> {
-        Self::run_with_fallback(
-            workspace_path,
-            &["diff", "--git"],
-            &["diff", "HEAD"],
-            &["show", "HEAD", "--format=", "--patch"],
-        )
-    }
-
-    pub fn diff_stat(&self, workspace_path: &Path) -> Result<String> {
-        Self::run_with_fallback(
-            workspace_path,
-            &["diff", "--stat"],
-            &["diff", "--stat", "HEAD"],
-            &["show", "HEAD", "--format=", "--stat"],
-        )
-    }
-
-    /// Try jj first, then git uncommitted, then git last commit.
-    /// Returns the first non-empty successful output, or empty string.
-    fn run_with_fallback(
-        workspace_path: &Path,
-        jj_args: &[&str],
-        git_uncommitted_args: &[&str],
-        git_show_args: &[&str],
-    ) -> Result<String> {
-        let commands: &[(&str, &[&str])] = &[
-            ("jj", jj_args),
-            ("git", git_uncommitted_args),
-            ("git", git_show_args),
-        ];
-
-        for (cmd, args) in commands {
-            if let Ok(output) = std::process::Command::new(cmd)
-                .args(*args)
-                .current_dir(workspace_path)
-                .output()
-            {
-                if output.status.success() {
-                    let text = String::from_utf8(output.stdout)
-                        .context("Failed to parse command output")?;
-                    if !text.trim().is_empty() {
-                        return Ok(text);
-                    }
-                }
-            }
-        }
-
-        Ok(String::new())
-    }
-
     pub fn git_export(&self, workspace_path: &Path) -> Result<()> {
         let output = std::process::Command::new("jj")
             .args(["git", "export"])
