@@ -130,10 +130,19 @@ pub async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String
     }
 }
 
+/// Whether `path` is itself the root of a git repository.
+///
+/// Deliberately only looks at `path/.git`: a nested repository under an
+/// ancestor repository is still a valid, independent repository for this
+/// check, and walking up to an ancestor would make an intentional nested
+/// checkout look uninitialized.
+pub(crate) fn is_git_repo_root(path: &Path) -> bool {
+    path.join(".git").exists()
+}
+
 #[tauri::command]
 pub async fn check_is_git_repo(path: String) -> Result<bool, String> {
-    let git_path = PathBuf::from(&path).join(".git");
-    Ok(git_path.exists())
+    Ok(is_git_repo_root(&PathBuf::from(&path)))
 }
 
 #[tauri::command]

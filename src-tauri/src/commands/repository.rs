@@ -1,7 +1,9 @@
 use crate::domain::Repository;
 use crate::config::Storage;
+use crate::commands::file::is_git_repo_root;
 use uuid::Uuid;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -57,12 +59,93 @@ impl Default for RepositoryState {
     }
 }
 
+/// Initialize a git repository at `path` if the caller asked for it and the
+/// folder is not already a git repository at the moment of execution.
+///
+/// The frontend's own git-detection runs when the folder is picked, which
+/// can be stale by the time the user submits the form (the folder could have
+/// been git-init'd externally, or a `.git` could have appeared or vanished
+/// in between). Re-checking here — right before acting — is what makes the
+/// check authoritative instead of decorative.
+///
+/// Deliberately does not force an initial branch name: that would override
+/// the user's own `init.defaultBranch` git config, which this feature has no
+/// reason to second-guess.
+///
+/// Returns whether `git init` actually ran, so the caller can tell a fresh
+/// initialization apart from a folder that was already a repository — the
+/// two need different error framing if persistence fails afterward.
+async fn ensure_git_initialized(path: &Path) -> Result<bool, String> {
+    if is_git_repo_root(path) {
+        // Already a repo — leave its history/config untouched.
+        return Ok(false);
+    }
+
+    let output = tokio::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(path)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run git init: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    if !is_git_repo_root(path) {
+        return Err(format!(
+            "git init reported success but '{}' is still not a git repository",
+            path.display()
+        ));
+    }
+
+    Ok(true)
+}
+
 #[tauri::command]
 pub async fn create_repository(
     state: tauri::State<'_, crate::AppState>,
     local_path: String,
     remote_url: Option<String>,
+    initialize_git: bool,
 ) -> Result<Repository, String> {
+    create_repository_core(
+        &state.repository.repositories,
+        &state.storage,
+        local_path,
+        remote_url,
+        initialize_git,
+    )
+    .await
+}
+
+/// Core of [`create_repository`], taking the raw map and storage so tests
+/// can call it without a `tauri::State`.
+///
+/// Ordering is deliberate: validate the path, then (if asked) initialize
+/// git, then verify git actually took, then persist — only after all of
+/// that succeeds is anything reported to the caller as done.
+async fn create_repository_core(
+    repositories: &RwLock<HashMap<Uuid, Repository>>,
+    storage: &Storage,
+    local_path: String,
+    remote_url: Option<String>,
+    initialize_git: bool,
+) -> Result<Repository, String> {
+    let path = std::path::PathBuf::from(&local_path);
+    if !path.is_dir() {
+        return Err(format!("'{}' is not a directory", local_path));
+    }
+
+    let git_freshly_initialized = if initialize_git {
+        ensure_git_initialized(&path).await?
+    } else {
+        false
+    };
+
     let id = Uuid::new_v4();
     let remote_type = remote_url.as_ref().and_then(|url| {
         if url.contains("github.com") {
@@ -78,17 +161,31 @@ pub async fn create_repository(
 
     let repository = Repository {
         id,
-        local_path,
+        local_path: local_path.clone(),
         remote_url,
         remote_type,
         created_at: chrono::Utc::now(),
     };
 
-    create_repository_committed(&state.repository.repositories, &state.storage, repository).await
+    create_repository_committed(repositories, storage, repository)
+        .await
+        .map_err(|e| {
+            if git_freshly_initialized {
+                // The filesystem side effect already happened and is not
+                // undone here: deleting `.git` on a persistence failure
+                // would destroy real repository state to manufacture a
+                // rollback that was never atomic to begin with.
+                format!(
+                    "Git repository was initialized at '{local_path}', but registering the project failed: {e}"
+                )
+            } else {
+                e
+            }
+        })
 }
 
-/// Core of [`create_repository`], taking the raw map and storage so tests
-/// can call it without a `tauri::State`.
+/// Persists a fully-built [`Repository`], called by [`create_repository_core`]
+/// after any requested git initialization has already succeeded.
 ///
 /// Inserts into a cloned map, persists the clone, and only replaces the
 /// shared map on success — a failed persist never leaves memory holding a
@@ -234,6 +331,158 @@ mod tests {
         let result = create_repository_committed(&repositories, &storage, new_repo).await;
 
         assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
+        assert!(
+            repositories.read().await.is_empty(),
+            "memory must not contain a repository disk never recorded"
+        );
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git must be on PATH for these tests")
+    }
+
+    #[tokio::test]
+    async fn checked_on_a_non_git_folder_creates_a_real_git_repository() {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+
+        let result = create_repository_core(
+            &repositories,
+            &storage,
+            folder.to_string_lossy().to_string(),
+            None,
+            true,
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        assert!(is_git_repo_root(&folder), "folder must be a real git repository");
+        let toplevel = git(&folder, &["rev-parse", "--is-inside-work-tree"]);
+        assert!(toplevel.status.success(), "git must recognize the folder as a work tree");
+    }
+
+    #[tokio::test]
+    async fn unchecked_on_a_non_git_folder_never_touches_git() {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+
+        let result = create_repository_core(
+            &repositories,
+            &storage,
+            folder.to_string_lossy().to_string(),
+            None,
+            false,
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        assert!(!folder.join(".git").exists(), "no git initialization must occur when unchecked");
+    }
+
+    #[tokio::test]
+    async fn checked_on_an_existing_git_repo_does_not_reinitialize_it() {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(git(&folder, &["init", "-q"]).status.success());
+        git(&folder, &["config", "user.email", "test@example.com"]);
+        git(&folder, &["config", "user.name", "Test"]);
+        std::fs::write(folder.join("README.md"), "hello").unwrap();
+        git(&folder, &["add", "README.md"]);
+        assert!(git(&folder, &["commit", "-q", "-m", "init"]).status.success());
+        let head_before = git(&folder, &["rev-parse", "HEAD"]).stdout;
+
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let result = create_repository_core(
+            &repositories,
+            &storage,
+            folder.to_string_lossy().to_string(),
+            None,
+            true,
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        let head_after = git(&folder, &["rev-parse", "HEAD"]).stdout;
+        assert_eq!(head_before, head_after, "existing repository history must survive untouched");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_init_failure_is_not_reported_as_project_creation_success() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::ipc::server::current_uid() == 0 {
+            return; // root ignores permission bits
+        }
+
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        // A directory git cannot write into makes `git init` fail deterministically.
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let result = create_repository_core(
+            &repositories,
+            &storage,
+            folder.to_string_lossy().to_string(),
+            None,
+            true,
+        )
+        .await;
+
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err(), "a failed git init must not be reported as success");
+        assert!(
+            repositories.read().await.is_empty(),
+            "no repository must be registered when git init failed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistence_failure_after_successful_git_init_reports_partial_result_and_keeps_git() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::ipc::server::current_uid() == 0 {
+            return;
+        }
+
+        let (storage, temp) = create_test_storage();
+        storage.save_config(&AppConfig::default()).expect("seed config");
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::set_permissions(storage.paths().config_file(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+        let result = create_repository_core(
+            &repositories,
+            &storage,
+            folder.to_string_lossy().to_string(),
+            None,
+            true,
+        )
+        .await;
+
+        std::fs::set_permissions(storage.paths().config_file(), std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let err = result.expect_err("persistence failure must be reported, not swallowed as success");
+        assert!(
+            err.contains("Git repository was initialized"),
+            "error must make clear git init already happened: {err}"
+        );
+        assert!(
+            is_git_repo_root(&folder),
+            "a failed registration must not delete the git repository it cannot undo"
+        );
         assert!(
             repositories.read().await.is_empty(),
             "memory must not contain a repository disk never recorded"

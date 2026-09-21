@@ -67,8 +67,9 @@ pub fn CreateProjectModal(
                             .unwrap_or("New Project")
                             .to_string();
 
-                        // Create repository from folder
-                        match create_repository(path, None).await {
+                        // Create repository from folder. "Open Folder" has no
+                        // init-git affordance — it always opens the folder as-is.
+                        match create_repository(path, None, false).await {
                             Ok(repo) => {
                                 // Create project with the new repository
                                 match create_project(project_name.clone(), Some(repo.id.to_string()), AgentType::ClaudeCode).await {
@@ -154,10 +155,11 @@ pub fn CreateProjectModal(
 
             let on_created = on_project_created;
             let set_show_clone = set_show;
+            let init_git_val = init_git.get();
 
             spawn_local(async move {
                 // Create repository from folder path
-                let repository_id = match create_repository(folder_path_val, None).await {
+                let repository_id = match create_repository(folder_path_val, None, init_git_val).await {
                     Ok(repo) => Some(repo.id.to_string()),
                     Err(e) => {
                         set_error_msg.set(Some(format!("Failed to create repository: {}", e)));
