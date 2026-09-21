@@ -111,12 +111,13 @@ async fn handle_status(ctx: &IpcContext) -> IpcResponse {
 
 async fn handle_list_projects(ctx: &IpcContext) -> IpcResponse {
     let projects = ctx.projects.read().await;
+    let repositories = ctx.repositories.read().await;
     let summaries: Vec<ProjectSummary> = projects
         .values()
         .map(|p| ProjectSummary {
             id: p.id.to_string(),
             name: p.name.clone(),
-            path: None,
+            path: p.repository_path(&repositories),
         })
         .collect();
 
@@ -717,6 +718,89 @@ mod tests {
         assert!(
             !Path::new(&checkout).exists(),
             "the checkout goes with the record it belonged to"
+        );
+    }
+
+    /// Front-door parity: `ListProjects` used to hardcode `path: None` for
+    /// every project, even one with a resolvable repository. Both this
+    /// handler and desktop's `get_project_path` command now resolve through
+    /// `Project::repository_path`, so the CLI reports the same fact the app
+    /// does -- truthfully absent for a project with no repository, not
+    /// invented for one that has one.
+    #[tokio::test]
+    async fn ipc_list_projects_reports_the_same_path_facts_as_the_desktop_command() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+
+        let repository_id = Uuid::new_v4();
+        ctx.repositories.write().await.insert(
+            repository_id,
+            Repository {
+                id: repository_id,
+                local_path: "/repo/with-a-path".to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+
+        let with_repo_id = Uuid::new_v4();
+        let without_repo_id = Uuid::new_v4();
+        let mk_project = |id: Uuid, name: &str, repository_id: Option<Uuid>| Project {
+            id,
+            name: name.to_string(),
+            repository_id,
+            scope: crate::domain::project::ProjectScope::Standalone,
+            state_location: crate::config::paths::StateLocation::External,
+            agent_type: crate::domain::AgentType::ClaudeCode,
+            agent_config: crate::domain::project::AgentConfig {
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        ctx.projects.write().await.insert(
+            with_repo_id,
+            mk_project(with_repo_id, "has-a-repo", Some(repository_id)),
+        );
+        ctx.projects
+            .write()
+            .await
+            .insert(without_repo_id, mk_project(without_repo_id, "standalone", None));
+
+        let answer = dispatch(IpcRequest::ListProjects, &ctx, &peer()).await.response;
+        assert!(answer.ok, "{answer:?}");
+        let summaries: Vec<slashit_ipc::ProjectSummary> =
+            serde_json::from_value(answer.data).expect("valid summaries");
+
+        let with_repo = summaries
+            .iter()
+            .find(|s| s.id == with_repo_id.to_string())
+            .expect("the repo-backed project must be listed");
+        assert_eq!(
+            with_repo.path.as_deref(),
+            Some("/repo/with-a-path"),
+            "a project with a resolvable repository must report its real path"
+        );
+
+        let without_repo = summaries
+            .iter()
+            .find(|s| s.id == without_repo_id.to_string())
+            .expect("the standalone project must be listed");
+        assert_eq!(
+            without_repo.path, None,
+            "a project with no repository must report an honest absence, not an invented path"
         );
     }
 }
