@@ -28,6 +28,17 @@ on:
   # CI; what it happens to be based on is not the workflow's business.
   pull_request:
 
+# One in-flight run per pull request, keyed by PR number so two different PRs
+# never cancel each other regardless of what branch either is based on; a push
+# event carries no PR number, so pushes fall back to `github.ref`, which is
+# `refs/heads/main` for every push here since that is the only branch this
+# workflow's `push` trigger watches — newer runs there cancel a stale one too,
+# which is correct because only the latest commit on `main` needs a green
+# build. `github.workflow` keeps the group unique to this workflow file.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: ubuntu-22.04
