@@ -170,55 +170,59 @@ async fn handle_create_task(
 
     let priority = parse_priority(priority.as_deref());
     let now = chrono::Utc::now();
-    let task = crate::domain::Task {
-        id: Uuid::new_v4(),
-        project_id: project_uuid,
-        title,
-        description,
-        status: TaskStatus::Backlog,
-        model: "default".to_string(),
-        planning_mode: false,
-        dependencies: Vec::new(),
-        worktree_id: None,
-        jj_change_id: None,
-        category: Default::default(),
-        priority,
-        complexity: Default::default(),
-        impact: Default::default(),
-        security_severity: Default::default(),
-        phase: Default::default(),
-        phase_progress: 0,
-        overall_progress: 0,
-        subtasks: Vec::new(),
-        sequence_number: 0,
-        position: 0,
-        github_issue_url: None,
-        gitlab_issue_url: None,
-        linear_ticket_id: None,
-        jira_issue_key: None,
-        pr_url: None,
-        external_refs: Vec::new(),
-        qa_signoff: None,
-        human_review: None,
-        stuck_since: None,
-        error_message: None,
-        worktree_path: None,
-        branch_name: None,
-        cleanup_in_flight: false,
-        pr_review_plan: None,
-        created_at: now,
-        updated_at: now,
-    };
+    let id = Uuid::new_v4();
 
-    let summary = task_to_summary(&task, &project_name);
+    let result = crate::lifecycle::create(&ctx.tasks, &ctx.storage, project_uuid, move |existing| {
+        let position = crate::domain::Task::next_backlog_position(existing, project_uuid);
+        crate::domain::Task {
+            id,
+            project_id: project_uuid,
+            title,
+            description,
+            status: TaskStatus::Backlog,
+            model: "default".to_string(),
+            planning_mode: false,
+            dependencies: Vec::new(),
+            worktree_id: None,
+            jj_change_id: None,
+            category: Default::default(),
+            priority,
+            complexity: Default::default(),
+            impact: Default::default(),
+            security_severity: Default::default(),
+            phase: Default::default(),
+            phase_progress: 0,
+            overall_progress: 0,
+            subtasks: Vec::new(),
+            sequence_number: 0,
+            position,
+            github_issue_url: None,
+            gitlab_issue_url: None,
+            linear_ticket_id: None,
+            jira_issue_key: None,
+            pr_url: None,
+            external_refs: Vec::new(),
+            qa_signoff: None,
+            human_review: None,
+            stuck_since: None,
+            error_message: None,
+            worktree_path: None,
+            branch_name: None,
+            cleanup_in_flight: false,
+            pr_review_plan: None,
+            created_at: now,
+            updated_at: now,
+        }
+    })
+    .await;
 
-    {
-        let mut tasks = ctx.tasks.write().await;
-        tasks.insert(task.id, task);
-        persist_project_tasks(&tasks, project_uuid, &ctx.storage);
+    match result {
+        Ok(task) => {
+            let summary = task_to_summary(&task, &project_name);
+            IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
+        }
+        Err(e) => IpcResponse::error(e),
     }
-
-    IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
 }
 
 /// Move a task to another column from the CLI.
@@ -274,21 +278,36 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         Err(e) => return IpcResponse::error(e),
     };
 
-    let projects = ctx.projects.read().await;
-    let mut tasks = ctx.tasks.write().await;
-    if let Some(task) = tasks.get_mut(&task_uuid) {
-        task.status = new_status;
-        task.updated_at = chrono::Utc::now();
-        let project_id = task.project_id;
-        let pname = projects
-            .get(&project_id)
-            .map(|p| p.name.as_str())
-            .unwrap_or("?");
-        let summary = task_to_summary(task, pname);
-        persist_project_tasks(&tasks, project_id, &ctx.storage);
-        IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
-    } else {
-        IpcResponse::error(format!("Task {task_id} not found"))
+    // The same classifier the desktop app uses, through the same
+    // stage/persist/publish primitive: this handler used to assign
+    // `task.status` directly, which left a task moved e.g. `Failed ->
+    // InProgress` with its stale `phase = Failed` and `error_message`
+    // intact, so it said "running" while failing every readiness check.
+    let new_status_for_amend = new_status.clone();
+    let amend = move |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>| {
+        if let Some(task) = staged.get_mut(&task_uuid) {
+            let old_status = task.status.clone();
+            task.status = new_status_for_amend.clone();
+            if let crate::lifecycle::StatusTransitionEffect::ResetExecutionState =
+                crate::lifecycle::classify_status_transition(&old_status, &new_status_for_amend)
+            {
+                task.reset_execution_state();
+            }
+        }
+    };
+
+    match crate::lifecycle::commit_task(&ctx.tasks, &ctx.storage, task_uuid, &amend).await {
+        Ok(Some(task)) => {
+            let projects = ctx.projects.read().await;
+            let pname = projects
+                .get(&task.project_id)
+                .map(|p| p.name.as_str())
+                .unwrap_or("?");
+            let summary = task_to_summary(&task, pname);
+            IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
+        }
+        Ok(None) => IpcResponse::error(format!("Task {task_id} not found")),
+        Err(e) => IpcResponse::error(e),
     }
 }
 
@@ -321,29 +340,32 @@ async fn handle_edit_task(
         Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
     };
 
-    let projects = ctx.projects.read().await;
-    let mut tasks = ctx.tasks.write().await;
-    if let Some(task) = tasks.get_mut(&task_uuid) {
-        if let Some(t) = title {
-            task.title = t;
+    let amend = move |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>| {
+        if let Some(task) = staged.get_mut(&task_uuid) {
+            if let Some(t) = title.clone() {
+                task.title = t;
+            }
+            if let Some(d) = description.clone() {
+                task.description = Some(d);
+            }
+            if let Some(p) = priority.clone() {
+                task.priority = parse_priority(Some(&p));
+            }
         }
-        if let Some(d) = description {
-            task.description = Some(d);
+    };
+
+    match crate::lifecycle::commit_task(&ctx.tasks, &ctx.storage, task_uuid, &amend).await {
+        Ok(Some(task)) => {
+            let projects = ctx.projects.read().await;
+            let pname = projects
+                .get(&task.project_id)
+                .map(|p| p.name.as_str())
+                .unwrap_or("?");
+            let summary = task_to_summary(&task, pname);
+            IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
         }
-        if let Some(p) = priority {
-            task.priority = parse_priority(Some(&p));
-        }
-        task.updated_at = chrono::Utc::now();
-        let project_id = task.project_id;
-        let pname = projects
-            .get(&project_id)
-            .map(|p| p.name.as_str())
-            .unwrap_or("?");
-        let summary = task_to_summary(task, pname);
-        persist_project_tasks(&tasks, project_id, &ctx.storage);
-        IpcResponse::success(serde_json::to_value(summary).unwrap_or_default())
-    } else {
-        IpcResponse::error(format!("Task {task_id} not found"))
+        Ok(None) => IpcResponse::error(format!("Task {task_id} not found")),
+        Err(e) => IpcResponse::error(e),
     }
 }
 
@@ -391,16 +413,19 @@ async fn handle_enqueue_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
         Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
     };
 
-    let queue_mgr = ctx.queue_manager.read().await;
-    match queue_mgr.enqueue_task(task_uuid).await {
-        Ok(()) => {
-            // Persist the task status change
-            let tasks = ctx.tasks.read().await;
-            if let Some(task) = tasks.get(&task_uuid) {
-                persist_project_tasks(&tasks, task.project_id, &ctx.storage);
-            }
-            IpcResponse::success(serde_json::json!({"enqueued": task_id}))
+    // Durable directly, rather than through `QueueManager::enqueue_task`
+    // (which only ever mutates the shared map) followed by a best-effort
+    // save: that ordering already published the status change in memory
+    // before persistence was attempted at all.
+    let amend = move |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>| {
+        if let Some(task) = staged.get_mut(&task_uuid) {
+            task.status = TaskStatus::Queue;
         }
+    };
+
+    match crate::lifecycle::commit_task(&ctx.tasks, &ctx.storage, task_uuid, &amend).await {
+        Ok(Some(_)) => IpcResponse::success(serde_json::json!({"enqueued": task_id})),
+        Ok(None) => IpcResponse::error(format!("Task {task_id} not found")),
         Err(e) => IpcResponse::error(e),
     }
 }
@@ -511,21 +536,6 @@ fn parse_status(s: &str) -> Option<TaskStatus> {
         "pr_created" => Some(TaskStatus::PrCreated),
         "error" => Some(TaskStatus::Error),
         _ => None,
-    }
-}
-
-fn persist_project_tasks(
-    tasks: &std::collections::HashMap<Uuid, crate::domain::Task>,
-    project_id: Uuid,
-    storage: &crate::config::Storage,
-) {
-    let project_tasks: Vec<_> = tasks
-        .values()
-        .filter(|t| t.project_id == project_id)
-        .cloned()
-        .collect();
-    if let Err(e) = storage.save_project_tasks(project_id, &project_tasks) {
-        eprintln!("Warning: Failed to persist tasks: {e}");
     }
 }
 
@@ -718,6 +728,175 @@ mod tests {
         assert!(
             !Path::new(&checkout).exists(),
             "the checkout goes with the record it belonged to"
+        );
+    }
+
+    /// Front-door parity: `MoveTask` used to write `task.status` directly for
+    /// every non-`Done` transition, so a card moved `Failed -> InProgress`
+    /// kept its stale `phase = Failed` and `error_message` -- the board said
+    /// "running" while the task failed its own readiness check. This drives
+    /// the real handler, not a copy of its logic, and checks the same
+    /// production predicate the executor gates on.
+    #[tokio::test]
+    async fn ipc_move_task_out_of_failed_resets_stale_execution_state_not_just_the_status() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+
+        let project_id = Uuid::new_v4();
+        ctx.projects.write().await.insert(
+            project_id,
+            Project {
+                id: project_id,
+                name: "ipc-move-test".to_string(),
+                repository_id: None,
+                scope: crate::domain::project::ProjectScope::Standalone,
+                state_location: crate::config::paths::StateLocation::External,
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                agent_config: crate::domain::project::AgentConfig {
+                    agent_type: crate::domain::AgentType::ClaudeCode,
+                    command: "claude".to_string(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                    model: None,
+                    api_key: None,
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        );
+
+        let mut task = create_test_task_full("subject", project_id, TaskStatus::Error, 0);
+        task.phase = crate::domain::TaskPhase::Failed;
+        task.phase_progress = 40;
+        task.overall_progress = 30;
+        task.error_message = Some("the agent reported a failure".to_string());
+        let task_id = task.id;
+        ctx.tasks.write().await.insert(task_id, task.clone());
+        ctx.storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
+
+        let answer = dispatch(
+            IpcRequest::MoveTask {
+                task_id: task_id.to_string(),
+                status: "in_progress".to_string(),
+            },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+
+        assert!(answer.ok, "the move must succeed: {answer:?}");
+
+        let updated = ctx
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .cloned()
+            .expect("the task is still on the board");
+        assert_eq!(updated.status, TaskStatus::InProgress);
+        assert_eq!(
+            updated.phase,
+            crate::domain::TaskPhase::Idle,
+            "a stale Failed phase must not survive a move out of Error"
+        );
+        assert!(updated.error_message.is_none(), "the old failure must not linger");
+        assert!(
+            updated.is_ready_to_execute(),
+            "the production readiness predicate must agree this task can run"
+        );
+
+        // Durability: the disk must agree with memory, not just the reply.
+        let persisted = ctx
+            .storage
+            .load_project_tasks(project_id)
+            .expect("read the board back");
+        let persisted_task = persisted
+            .iter()
+            .find(|t| t.id == task_id)
+            .expect("the task must still be recorded");
+        assert_eq!(persisted_task.status, TaskStatus::InProgress);
+        assert_eq!(persisted_task.phase, crate::domain::TaskPhase::Idle);
+        assert!(persisted_task.error_message.is_none());
+    }
+
+    /// Front-door parity: `CreateTask` used to hardcode `position: 0` for
+    /// every new task, so every task created through the CLI collided with
+    /// whatever else already sat at the top of Backlog. Desktop's
+    /// `create_task` command and this handler now share
+    /// `Task::next_backlog_position`, so a task created here lands at the end
+    /// of the column exactly like one created in the app.
+    #[tokio::test]
+    async fn ipc_create_task_places_each_new_task_at_the_end_of_the_backlog_column() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+
+        let project_id = Uuid::new_v4();
+        ctx.projects.write().await.insert(
+            project_id,
+            Project {
+                id: project_id,
+                name: "ipc-create-position-test".to_string(),
+                repository_id: None,
+                scope: crate::domain::project::ProjectScope::Standalone,
+                state_location: crate::config::paths::StateLocation::External,
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                agent_config: crate::domain::project::AgentConfig {
+                    agent_type: crate::domain::AgentType::ClaudeCode,
+                    command: "claude".to_string(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                    model: None,
+                    api_key: None,
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        );
+
+        for i in 0..3 {
+            let answer = dispatch(
+                IpcRequest::CreateTask {
+                    project_id: project_id.to_string(),
+                    title: format!("task {i}"),
+                    description: None,
+                    priority: None,
+                },
+                &ctx,
+                &peer(),
+            )
+            .await
+            .response;
+            assert!(answer.ok, "create {i} must succeed: {answer:?}");
+        }
+
+        let mut positions: Vec<i32> = ctx
+            .tasks
+            .read()
+            .await
+            .values()
+            .filter(|t| t.project_id == project_id)
+            .map(|t| t.position)
+            .collect();
+        positions.sort();
+        assert_eq!(
+            positions,
+            vec![0, 1, 2],
+            "each task must land after the ones already there, not all collapse onto position 0"
         );
     }
 

@@ -3,7 +3,7 @@ use crate::domain::{
     TaskImpact, SecuritySeverity, TaskPhase, Subtask,
 };
 use crate::domain::task::ExternalRef;
-use crate::config::Storage;
+use crate::lifecycle::{classify_status_transition, StatusTransitionEffect};
 use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,68 +32,7 @@ pub(crate) fn terminalize_ctx(state: &crate::AppState) -> crate::lifecycle::Term
     }
 }
 
-/// How a status transition affects a task's execution state and its worktree.
-///
-/// Resetting execution state and destroying a worktree are different
-/// operations, and these variants keep them apart. One variant used to do
-/// both, which made re-queuing a failed task also delete the work that task
-/// had produced. Worse, a task's branch and worktree path are derived from its
-/// id, which a retry does not change, so that asynchronous deletion raced the
-/// retry recreating them at the very same path: the cleanup could remove the
-/// *successful* second attempt's directory, branch and commits, then clear
-/// `worktree_path`, leaving a task reporting completion with nothing on disk
-/// behind it.
-///
-/// Every transition maps to exactly one variant, so no call site can spawn
-/// cleanup twice by evaluating overlapping conditions in the wrong order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatusTransitionEffect {
-    /// Moving back into the workflow: out of `Error`, or back to an early
-    /// column. Clears phase, progress and the error message, which is what
-    /// makes the task eligible to be picked up and run again.
-    ///
-    /// Deliberately preserves `worktree_path` and `branch_name`: the next
-    /// execution reattaches to that branch and continues from the work already
-    /// there. Discarding a worktree is an explicit destructive action, not a
-    /// side effect of moving a card back into a column.
-    ResetExecutionState,
-    /// Moving to `Done`: the task is finished with its worktree, so remove it.
-    /// Everything else — `branch_name` included, for PR creation — is left
-    /// untouched.
-    CleanUpWorktree,
-    /// No effect on execution state or worktree.
-    None,
-}
-
-/// `Done` is tested first so a task finishing *out of* `Error` still gets its
-/// terminal cleanup. Calling a task done is an explicit statement that its
-/// worktree is no longer needed; re-queuing that same task is the opposite.
-fn classify_status_transition(old_status: &TaskStatus, new_status: &TaskStatus) -> StatusTransitionEffect {
-    if matches!(new_status, TaskStatus::Done) {
-        StatusTransitionEffect::CleanUpWorktree
-    } else if *old_status == TaskStatus::Error
-        || matches!(new_status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
-    {
-        StatusTransitionEffect::ResetExecutionState
-    } else {
-        StatusTransitionEffect::None
-    }
-}
-
 pub type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
-
-/// Helper function to persist tasks for a project after mutation
-fn persist_project_tasks(storage: &Storage, tasks: &HashMap<Uuid, Task>, project_id: Uuid) {
-    let project_tasks: Vec<Task> = tasks
-        .values()
-        .filter(|t| t.project_id == project_id)
-        .cloned()
-        .collect();
-    
-    if let Err(e) = storage.save_project_tasks(project_id, &project_tasks) {
-        eprintln!("Warning: Failed to persist tasks for project {}: {}", project_id, e);
-    }
-}
 
 #[derive(Clone)]
 pub struct TaskState {
@@ -146,65 +85,50 @@ pub async fn create_task(
         .collect();
 
     let now = chrono::Utc::now();
-    let mut tasks = state.task.tasks.write().await;
 
-    // Calculate position for new task (at the end of backlog)
-    let position = {
-        let max_pos = tasks
-            .values()
-            .filter(|t| t.project_id == project_id && t.status == TaskStatus::Backlog)
-            .map(|t| t.position)
-            .max()
-            .unwrap_or(-1);
-        max_pos + 1
-    };
-
-    let task = Task {
-        id,
-        project_id,
-        title: params.title,
-        description: params.description,
-        status: TaskStatus::Backlog,
-        model: params.model,
-        planning_mode: params.planning_mode,
-        dependencies,
-        worktree_id: None,
-        jj_change_id: None,
-        category: params.category.unwrap_or_default(),
-        priority: params.priority.unwrap_or_default(),
-        complexity: params.complexity.unwrap_or_default(),
-        impact: params.impact.unwrap_or_default(),
-        security_severity: params.security_severity.unwrap_or_default(),
-        phase: TaskPhase::Idle,
-        phase_progress: 0,
-        overall_progress: 0,
-        subtasks: Vec::new(),
-        sequence_number: 0,
-        position,
-        github_issue_url: params.github_issue_url,
-        gitlab_issue_url: params.gitlab_issue_url,
-        linear_ticket_id: params.linear_ticket_id,
-        jira_issue_key: None,
-        pr_url: None,
-        external_refs: Vec::new(),
-        qa_signoff: None,
-        human_review: None,
-        stuck_since: None,
-        error_message: None,
-        worktree_path: None,
-        branch_name: None,
-        cleanup_in_flight: false,
-        pr_review_plan: None,
-        created_at: now,
-        updated_at: now,
-    };
-
-    tasks.insert(id, task.clone());
-    
-    // Persist to disk
-    persist_project_tasks(&state.storage, &tasks, project_id);
-    
-    Ok(task)
+    crate::lifecycle::create(&state.task.tasks, &state.storage, project_id, move |existing| {
+        let position = Task::next_backlog_position(existing, project_id);
+        Task {
+            id,
+            project_id,
+            title: params.title,
+            description: params.description,
+            status: TaskStatus::Backlog,
+            model: params.model,
+            planning_mode: params.planning_mode,
+            dependencies,
+            worktree_id: None,
+            jj_change_id: None,
+            category: params.category.unwrap_or_default(),
+            priority: params.priority.unwrap_or_default(),
+            complexity: params.complexity.unwrap_or_default(),
+            impact: params.impact.unwrap_or_default(),
+            security_severity: params.security_severity.unwrap_or_default(),
+            phase: TaskPhase::Idle,
+            phase_progress: 0,
+            overall_progress: 0,
+            subtasks: Vec::new(),
+            sequence_number: 0,
+            position,
+            github_issue_url: params.github_issue_url,
+            gitlab_issue_url: params.gitlab_issue_url,
+            linear_ticket_id: params.linear_ticket_id,
+            jira_issue_key: None,
+            pr_url: None,
+            external_refs: Vec::new(),
+            qa_signoff: None,
+            human_review: None,
+            stuck_since: None,
+            error_message: None,
+            worktree_path: None,
+            branch_name: None,
+            cleanup_in_flight: false,
+            pr_review_plan: None,
+            created_at: now,
+            updated_at: now,
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -262,39 +186,31 @@ pub async fn update_task_status(
     }
 
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
-    let mut tasks = state.task.tasks.write().await;
 
-    if let Some(task) = tasks.get_mut(&task_id) {
-        let old_status = task.status.clone();
-        task.status = status.clone();
-        task.updated_at = chrono::Utc::now();
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            let old_status = task.status.clone();
+            task.status = status.clone();
 
-        match classify_status_transition(&old_status, &status) {
-            StatusTransitionEffect::ResetExecutionState => {
-                // `worktree_path` and `branch_name` survive on purpose: the
-                // next execution reattaches to them. See
-                // `StatusTransitionEffect`.
-                task.reset_execution_state();
+            match classify_status_transition(&old_status, &status) {
+                StatusTransitionEffect::ResetExecutionState => {
+                    // `worktree_path` and `branch_name` survive on purpose: the
+                    // next execution reattaches to them. See
+                    // `StatusTransitionEffect`.
+                    task.reset_execution_state();
+                }
+                // Unreachable: `CleanUpWorktree` is exactly the `Done` case, and
+                // that returned above. Left as an explicit arm rather than a
+                // catch-all so a future classifier that starts returning it from
+                // somewhere else fails to compile here instead of silently
+                // skipping the cleanup.
+                StatusTransitionEffect::CleanUpWorktree => {}
+                StatusTransitionEffect::None => {}
             }
-            // Unreachable: `CleanUpWorktree` is exactly the `Done` case, and
-            // that returned above. Left as an explicit arm rather than a
-            // catch-all so a future classifier that starts returning it from
-            // somewhere else fails to compile here instead of silently
-            // skipping the cleanup.
-            StatusTransitionEffect::CleanUpWorktree => {}
-            StatusTransitionEffect::None => {}
         }
+    };
 
-        let updated_task = task.clone();
-        let project_id = task.project_id;
-
-        // Persist to disk
-        persist_project_tasks(&state.storage, &tasks, project_id);
-
-        Ok(Some(updated_task))
-    } else {
-        Ok(None)
-    }
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -304,24 +220,16 @@ pub async fn set_task_dependencies(
     dependencies: Vec<String>,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
-
-    if let Some(task) = tasks.get_mut(&task_id) {
-        task.dependencies = dependencies
-            .into_iter()
-            .filter_map(|d| Uuid::parse_str(&d).ok())
-            .collect();
-        task.updated_at = chrono::Utc::now();
-        let updated_task = task.clone();
-        let project_id = task.project_id;
-        
-        // Persist to disk
-        persist_project_tasks(&state.storage, &tasks, project_id);
-        
-        Ok(Some(updated_task))
-    } else {
-        Ok(None)
-    }
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            task.dependencies = dependencies
+                .clone()
+                .into_iter()
+                .filter_map(|d| Uuid::parse_str(&d).ok())
+                .collect();
+        }
+    };
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -335,35 +243,26 @@ pub async fn update_task_metadata(
     security_severity: Option<SecuritySeverity>,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
-
-    if let Some(task) = tasks.get_mut(&task_id) {
-        if let Some(cat) = category {
-            task.category = cat;
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            if let Some(cat) = category.clone() {
+                task.category = cat;
+            }
+            if let Some(pri) = priority.clone() {
+                task.priority = pri;
+            }
+            if let Some(comp) = complexity.clone() {
+                task.complexity = comp;
+            }
+            if let Some(imp) = impact.clone() {
+                task.impact = imp;
+            }
+            if let Some(sec) = security_severity.clone() {
+                task.security_severity = sec;
+            }
         }
-        if let Some(pri) = priority {
-            task.priority = pri;
-        }
-        if let Some(comp) = complexity {
-            task.complexity = comp;
-        }
-        if let Some(imp) = impact {
-            task.impact = imp;
-        }
-        if let Some(sec) = security_severity {
-            task.security_severity = sec;
-        }
-        task.updated_at = chrono::Utc::now();
-        let updated_task = task.clone();
-        let project_id = task.project_id;
-        
-        // Persist to disk
-        persist_project_tasks(&state.storage, &tasks, project_id);
-        
-        Ok(Some(updated_task))
-    } else {
-        Ok(None)
-    }
+    };
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -376,24 +275,15 @@ pub async fn update_task_progress(
     sequence_number: u32,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
-
-    if let Some(task) = tasks.get_mut(&task_id) {
-        task.phase = phase;
-        task.phase_progress = phase_progress.min(100);
-        task.overall_progress = overall_progress.min(100);
-        task.sequence_number = sequence_number;
-        task.updated_at = chrono::Utc::now();
-        let updated_task = task.clone();
-        let project_id = task.project_id;
-        
-        // Persist to disk
-        persist_project_tasks(&state.storage, &tasks, project_id);
-        
-        Ok(Some(updated_task))
-    } else {
-        Ok(None)
-    }
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            task.phase = phase.clone();
+            task.phase_progress = phase_progress.min(100);
+            task.overall_progress = overall_progress.min(100);
+            task.sequence_number = sequence_number;
+        }
+    };
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -403,24 +293,20 @@ pub async fn add_subtask(
     title: String,
 ) -> Result<Option<Subtask>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
-
-    if let Some(task) = tasks.get_mut(&task_id) {
-        let subtask = Subtask {
-            id: Uuid::new_v4(),
-            title,
-            completed: false,
-        };
-        task.subtasks.push(subtask.clone());
-        task.updated_at = chrono::Utc::now();
-        let project_id = task.project_id;
-        
-        // Persist to disk
-        persist_project_tasks(&state.storage, &tasks, project_id);
-        
-        Ok(Some(subtask))
-    } else {
-        Ok(None)
+    let subtask = Subtask {
+        id: Uuid::new_v4(),
+        title,
+        completed: false,
+    };
+    let subtask_for_amend = subtask.clone();
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            task.subtasks.push(subtask_for_amend.clone());
+        }
+    };
+    match crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await? {
+        Some(_) => Ok(Some(subtask)),
+        None => Ok(None),
     }
 }
 
@@ -432,22 +318,30 @@ pub async fn toggle_subtask(
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
     let subtask_id = Uuid::parse_str(&subtask_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
 
-    if let Some(task) = tasks.get_mut(&task_id) {
-        if let Some(subtask) = task.subtasks.iter_mut().find(|s| s.id == subtask_id) {
-            subtask.completed = !subtask.completed;
-            task.updated_at = chrono::Utc::now();
-            let updated_task = task.clone();
-            let project_id = task.project_id;
-            
-            // Persist to disk
-            persist_project_tasks(&state.storage, &tasks, project_id);
-            
-            return Ok(Some(updated_task));
-        }
+    // Checked before staging so a subtask that does not exist never triggers
+    // a write: `commit_task` cannot itself tell "nothing to change" apart
+    // from "changed", and every ordinary command has always answered a
+    // missing subtask with `Ok(None)` and no side effect, not a no-op save.
+    let has_subtask = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .is_some_and(|t| t.subtasks.iter().any(|s| s.id == subtask_id));
+    if !has_subtask {
+        return Ok(None);
     }
-    Ok(None)
+
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            if let Some(subtask) = task.subtasks.iter_mut().find(|s| s.id == subtask_id) {
+                subtask.completed = !subtask.completed;
+            }
+        }
+    };
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -457,41 +351,32 @@ pub async fn link_github_issue(
     issue_url: String,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
-
-    if let Some(task) = tasks.get_mut(&task_id) {
-        task.github_issue_url = Some(issue_url.clone());
-        // Also add to external_refs if not already there
-        if !task.external_refs.iter().any(|r| matches!(r, ExternalRef::GithubIssue { url, .. } if url == &issue_url)) {
-            // Parse: https://github.com/{owner}/{repo}/issues/{number}
-            let parts: Vec<&str> = issue_url.trim_end_matches('/').split('/').collect();
-            if let Some(issues_idx) = parts.iter().position(|&p| p == "issues") {
-                if let Some(gh_idx) = parts.iter().position(|&p| p == "github.com") {
-                    if let (Some(number_str), true) = (parts.get(issues_idx + 1), gh_idx + 2 < issues_idx) {
-                        if let Ok(number) = number_str.parse::<u32>() {
-                            let repo = format!("{}/{}", parts[gh_idx + 1], parts[gh_idx + 2]);
-                            task.external_refs.push(ExternalRef::GithubIssue {
-                                url: issue_url.clone(),
-                                number,
-                                repo,
-                                state: Some("OPEN".to_string()),
-                            });
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            task.github_issue_url = Some(issue_url.clone());
+            // Also add to external_refs if not already there
+            if !task.external_refs.iter().any(|r| matches!(r, ExternalRef::GithubIssue { url, .. } if url == &issue_url)) {
+                // Parse: https://github.com/{owner}/{repo}/issues/{number}
+                let parts: Vec<&str> = issue_url.trim_end_matches('/').split('/').collect();
+                if let Some(issues_idx) = parts.iter().position(|&p| p == "issues") {
+                    if let Some(gh_idx) = parts.iter().position(|&p| p == "github.com") {
+                        if let (Some(number_str), true) = (parts.get(issues_idx + 1), gh_idx + 2 < issues_idx) {
+                            if let Ok(number) = number_str.parse::<u32>() {
+                                let repo = format!("{}/{}", parts[gh_idx + 1], parts[gh_idx + 2]);
+                                task.external_refs.push(ExternalRef::GithubIssue {
+                                    url: issue_url.clone(),
+                                    number,
+                                    repo,
+                                    state: Some("OPEN".to_string()),
+                                });
+                            }
                         }
                     }
                 }
             }
         }
-        task.updated_at = chrono::Utc::now();
-        let updated_task = task.clone();
-        let project_id = task.project_id;
-
-        // Persist to disk
-        persist_project_tasks(&state.storage, &tasks, project_id);
-
-        Ok(Some(updated_task))
-    } else {
-        Ok(None)
-    }
+    };
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -501,41 +386,32 @@ pub async fn link_pr(
     pr_url: String,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
-
-    if let Some(task) = tasks.get_mut(&task_id) {
-        task.pr_url = Some(pr_url.clone());
-        // Also add to external_refs if not already there
-        if !task.external_refs.iter().any(|r| matches!(r, ExternalRef::GithubPr { url, .. } if url == &pr_url)) {
-            // Parse: https://github.com/{owner}/{repo}/pull/{number}
-            let parts: Vec<&str> = pr_url.trim_end_matches('/').split('/').collect();
-            if let Some(pull_idx) = parts.iter().position(|&p| p == "pull") {
-                if let Some(gh_idx) = parts.iter().position(|&p| p == "github.com") {
-                    if let (Some(number_str), true) = (parts.get(pull_idx + 1), gh_idx + 2 < pull_idx) {
-                        if let Ok(number) = number_str.parse::<u32>() {
-                            let repo = format!("{}/{}", parts[gh_idx + 1], parts[gh_idx + 2]);
-                            task.external_refs.push(ExternalRef::GithubPr {
-                                url: pr_url.clone(),
-                                number,
-                                repo,
-                                state: Some("OPEN".to_string()),
-                            });
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            task.pr_url = Some(pr_url.clone());
+            // Also add to external_refs if not already there
+            if !task.external_refs.iter().any(|r| matches!(r, ExternalRef::GithubPr { url, .. } if url == &pr_url)) {
+                // Parse: https://github.com/{owner}/{repo}/pull/{number}
+                let parts: Vec<&str> = pr_url.trim_end_matches('/').split('/').collect();
+                if let Some(pull_idx) = parts.iter().position(|&p| p == "pull") {
+                    if let Some(gh_idx) = parts.iter().position(|&p| p == "github.com") {
+                        if let (Some(number_str), true) = (parts.get(pull_idx + 1), gh_idx + 2 < pull_idx) {
+                            if let Ok(number) = number_str.parse::<u32>() {
+                                let repo = format!("{}/{}", parts[gh_idx + 1], parts[gh_idx + 2]);
+                                task.external_refs.push(ExternalRef::GithubPr {
+                                    url: pr_url.clone(),
+                                    number,
+                                    repo,
+                                    state: Some("OPEN".to_string()),
+                                });
+                            }
                         }
                     }
                 }
             }
         }
-        task.updated_at = chrono::Utc::now();
-        let updated_task = task.clone();
-        let project_id = task.project_id;
-
-        // Persist to disk
-        persist_project_tasks(&state.storage, &tasks, project_id);
-
-        Ok(Some(updated_task))
-    } else {
-        Ok(None)
-    }
+    };
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -544,21 +420,12 @@ pub async fn mark_task_stuck(
     task_id: String,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
-
-    if let Some(task) = tasks.get_mut(&task_id) {
-        task.stuck_since = Some(chrono::Utc::now());
-        task.updated_at = chrono::Utc::now();
-        let updated_task = task.clone();
-        let project_id = task.project_id;
-        
-        // Persist to disk
-        persist_project_tasks(&state.storage, &tasks, project_id);
-        
-        Ok(Some(updated_task))
-    } else {
-        Ok(None)
-    }
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            task.stuck_since = Some(chrono::Utc::now());
+        }
+    };
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -567,21 +434,12 @@ pub async fn unstick_task(
     task_id: String,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
-
-    if let Some(task) = tasks.get_mut(&task_id) {
-        task.stuck_since = None;
-        task.updated_at = chrono::Utc::now();
-        let updated_task = task.clone();
-        let project_id = task.project_id;
-        
-        // Persist to disk
-        persist_project_tasks(&state.storage, &tasks, project_id);
-        
-        Ok(Some(updated_task))
-    } else {
-        Ok(None)
-    }
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            task.stuck_since = None;
+        }
+    };
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[derive(serde::Deserialize)]
@@ -605,47 +463,38 @@ pub async fn update_task(
     params: UpdateTaskParams,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&params.task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
-
-    if let Some(task) = tasks.get_mut(&task_id) {
-        if let Some(t) = params.title {
-            task.title = t;
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            if let Some(t) = params.title.clone() {
+                task.title = t;
+            }
+            if let Some(d) = params.description.clone() {
+                task.description = d;
+            }
+            if let Some(c) = params.category.clone() {
+                task.category = c;
+            }
+            if let Some(p) = params.priority.clone() {
+                task.priority = p;
+            }
+            if let Some(c) = params.complexity.clone() {
+                task.complexity = c;
+            }
+            if let Some(i) = params.impact.clone() {
+                task.impact = i;
+            }
+            if let Some(s) = params.security_severity.clone() {
+                task.security_severity = s;
+            }
+            if let Some(m) = params.model.clone() {
+                task.model = m;
+            }
+            if let Some(p) = params.planning_mode {
+                task.planning_mode = p;
+            }
         }
-        if let Some(d) = params.description {
-            task.description = d;
-        }
-        if let Some(c) = params.category {
-            task.category = c;
-        }
-        if let Some(p) = params.priority {
-            task.priority = p;
-        }
-        if let Some(c) = params.complexity {
-            task.complexity = c;
-        }
-        if let Some(i) = params.impact {
-            task.impact = i;
-        }
-        if let Some(s) = params.security_severity {
-            task.security_severity = s;
-        }
-        if let Some(m) = params.model {
-            task.model = m;
-        }
-        if let Some(p) = params.planning_mode {
-            task.planning_mode = p;
-        }
-        task.updated_at = chrono::Utc::now();
-        let updated_task = task.clone();
-        let project_id = task.project_id;
-        
-        // Persist to disk
-        persist_project_tasks(&state.storage, &tasks, project_id);
-        
-        Ok(Some(updated_task))
-    } else {
-        Ok(None)
-    }
+    };
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -770,24 +619,22 @@ pub async fn reorder_task(
         };
     }
 
-    let mut tasks = state.task.tasks.write().await;
-
-    if effect != StatusTransitionEffect::None || old_status != target_status {
-        if let Some(task) = tasks.get_mut(&task_id) {
-            task.status = target_status.clone();
-            if effect == StatusTransitionEffect::ResetExecutionState {
-                // Worktree and branch preserved; see `StatusTransitionEffect`.
-                task.reset_execution_state();
+    let status_changed = old_status != target_status;
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if effect != StatusTransitionEffect::None || status_changed {
+            if let Some(task) = staged.get_mut(&task_id) {
+                task.status = target_status.clone();
+                if effect == StatusTransitionEffect::ResetExecutionState {
+                    // Worktree and branch preserved; see `StatusTransitionEffect`.
+                    task.reset_execution_state();
+                }
             }
         }
-    }
 
-    renumber_column(&mut tasks, project_id, task_id, &target_status, new_position);
+        renumber_column(staged, project_id, task_id, &target_status, new_position);
+    };
 
-    let updated_task = tasks.get(&task_id).cloned();
-    persist_project_tasks(&state.storage, &tasks, project_id);
-
-    Ok(updated_task)
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -797,17 +644,12 @@ pub async fn add_external_ref(
     external_ref: ExternalRef,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
-    if let Some(task) = tasks.get_mut(&task_id) {
-        task.external_refs.push(external_ref);
-        task.updated_at = chrono::Utc::now();
-        let updated = task.clone();
-        let project_id = task.project_id;
-        persist_project_tasks(&state.storage, &tasks, project_id);
-        Ok(Some(updated))
-    } else {
-        Ok(None)
-    }
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            task.external_refs.push(external_ref.clone());
+        }
+    };
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 #[tauri::command]
@@ -817,19 +659,14 @@ pub async fn remove_external_ref(
     ref_index: usize,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let mut tasks = state.task.tasks.write().await;
-    if let Some(task) = tasks.get_mut(&task_id) {
-        if ref_index < task.external_refs.len() {
-            task.external_refs.remove(ref_index);
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
+            if ref_index < task.external_refs.len() {
+                task.external_refs.remove(ref_index);
+            }
         }
-        task.updated_at = chrono::Utc::now();
-        let updated = task.clone();
-        let project_id = task.project_id;
-        persist_project_tasks(&state.storage, &tasks, project_id);
-        Ok(Some(updated))
-    } else {
-        Ok(None)
-    }
+    };
+    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
 }
 
 /// Core update_task_status logic extracted for testability.
