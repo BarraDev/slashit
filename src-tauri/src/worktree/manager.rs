@@ -1,4 +1,5 @@
 use crate::config::paths::{AppPaths, ProjectKey, WorktreePlacement};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -13,6 +14,31 @@ pub struct WorktreeManager {
 pub struct WorktreeInfo {
     pub path: String,
     pub branch: String,
+}
+
+/// The result of asking the filesystem whether a path is there, keeping the
+/// distinction [`Path::exists`] collapses: "definitely not there" and
+/// "could not be asked" are different answers, and every gate that decides
+/// something destructive or something irreversible on the strength of a
+/// path's presence needs to tell them apart rather than treat both as
+/// `false`.
+enum Presence {
+    Present,
+    Absent,
+    Unverified(std::io::Error),
+}
+
+impl Presence {
+    /// `metadata` follows symlinks, as [`Path::exists`] does: a link
+    /// pointing at nothing is `Absent`, not `Present`, and a live link is
+    /// `Present` regardless of what kind of file it names.
+    fn of(path: &Path) -> Self {
+        match std::fs::metadata(path) {
+            Ok(_) => Presence::Present,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Absent,
+            Err(error) => Presence::Unverified(error),
+        }
+    }
 }
 
 /// The outcome of checking git for a task whose recorded worktree directory
@@ -512,27 +538,39 @@ impl WorktreeManager {
         Path::new(worktree_path).exists()
     }
 
-    /// Whether `path` is *proven* not to be there.
+    /// Whether `path` is proven gone, as opposed to merely unreadable.
     ///
-    /// Narrower than `!exists`, deliberately. [`Path::exists`] discards the
-    /// error it got, so it answers `false` both for a path that is not there
-    /// and for one it was not allowed to look at. Discarding git's record of
-    /// a worktree needs positive evidence of absence rather than an absence
-    /// of evidence, so only the first of those answers `true` here.
+    /// [`Self::exists`] answers `false` for two different things: a path
+    /// that genuinely is not there, and a path `metadata` could not be asked
+    /// about at all (a parent directory closed off, a transient I/O error).
+    /// A removal's success gate needs positive evidence of absence rather
+    /// than an absence of evidence, so only the first of those answers
+    /// `true` here.
     ///
     /// `metadata` follows symlinks, as [`Path::exists`] does, and the two
     /// have to agree: a link pointing at nothing is a path with no worktree
-    /// at it, and refusing to call that absent would withhold the prune from
-    /// a record that really is stale while `exists` went on reporting the
-    /// removal as done -- leaving a registration nothing would ever clear.
+    /// at it, and refusing to call that absent would withhold convergence
+    /// from a removal that really did finish, leaving a caller retrying a
+    /// worktree that is already gone.
     fn proven_absent(path: &str) -> bool {
-        matches!(
-            std::fs::metadata(path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        )
+        matches!(Presence::of(Path::new(path)), Presence::Absent)
     }
 
     // --- Private: wt-based operations ---
+
+    /// The exact `wt remove` invocation this backend runs for every real
+    /// removal. Kept as a named constant, rather than inlined at the one
+    /// call site, so the branch-preservation and synchronicity contract it
+    /// encodes -- `--foreground`, `--no-delete-branch` -- can be asserted
+    /// deterministically (see
+    /// [`tests::wt_remove_args_run_in_the_foreground_and_keep_the_branch`])
+    /// without spawning `wt` at all.
+    ///
+    /// `--no-hooks` is the current spelling for what used to be
+    /// `--no-verify`; `wt` still accepts the old name but warns it is
+    /// deprecated.
+    const WT_REMOVE_ARGS: [&'static str; 5] =
+        ["remove", "-y", "--no-hooks", "--foreground", "--no-delete-branch"];
 
     async fn create_with_wt(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
         let output = tokio::process::Command::new("wt")
@@ -550,6 +588,50 @@ impl WorktreeManager {
         // wt creates worktree as sibling: ../repo.branch
         // Find it via git worktree list
         self.find_worktree_path(repo_path, branch).await
+    }
+
+    /// Decide a removal's outcome on positive proof of absence, never on
+    /// whatever exit status the attempt itself reported, and put git's own
+    /// registration back if the attempt cost the worktree its record without
+    /// actually removing it.
+    ///
+    /// Both backends share this contract exactly: `git worktree remove`
+    /// (and `--force`) can fail with a non-zero exit without the directory
+    /// actually being gone, and can also exit zero while leaving it behind;
+    /// `wt remove` runs its own removal in the background and exits zero
+    /// even when the directory survives, and its documented sequence --
+    /// rename into its own trash, prune git's registration, delete the
+    /// branch, a detached `rm -rf` -- can have the registration-pruning step
+    /// land before an earlier or later step in that same sequence fails,
+    /// whatever exit status that failure surfaces as. Neither tool's exit
+    /// code is the signal to decide on; `Self::proven_absent` is.
+    ///
+    /// `record` is `None` when [`WorktreeRecord::save`] found nothing to
+    /// preserve, which is not itself a failure -- a removal that never had a
+    /// record to lose behaves exactly as it did before this existed.
+    /// `failure` is the caller's own backend-specific description of what
+    /// went wrong, used only when the worktree could not be proven gone; the
+    /// wording stays entirely with each backend so this never has to guess
+    /// which tool ran or why.
+    fn finish_removal(
+        worktree_path: &str,
+        record: Option<WorktreeRecord>,
+        mut failure: String,
+    ) -> Result<(), String> {
+        if Self::proven_absent(worktree_path) {
+            return Ok(());
+        }
+
+        // A removal that cost the worktree its record without finishing has
+        // also cost the retry this `Err` schedules any way to act: putting
+        // it back is what makes the next attempt an ordinary removal rather
+        // than an impossible one.
+        if let Some(record) = &record {
+            if let Err(error) = record.restore() {
+                failure.push_str(&format!("; its git record could not be put back: {error}"));
+            }
+        }
+        Err(failure)
     }
 
     async fn remove_with_wt(&self, worktree_path: &str, repo_path: &str) -> Result<(), String> {
@@ -570,39 +652,60 @@ impl WorktreeManager {
             // and a prunable registration is not inert: `wt switch <branch>`
             // then refuses with "Worktree directory missing", and
             // `wt switch -c <branch>` refuses because the branch still exists,
-            // so the task could never get a worktree again. Nothing else in
-            // SlashIt runs `git worktree prune`. `remove_with_git` prunes the
-            // stale record, and like this backend it leaves the branch alone.
+            // so the task could never get a worktree again. `git worktree
+            // remove` clears a record whose directory is gone by itself, which
+            // is what `remove_with_git` is being handed this case for, and
+            // like this backend it leaves the branch alone.
             return self.remove_with_git(worktree_path, repo_path).await;
         }
 
+        // Saved before anything runs, for the same reason `remove_with_git`
+        // saves one: confirmed by hand against a real `wt`, its "Worktree
+        // directory missing; pruned" is not proof the directory is gone --
+        // only that `wt` could not stat it -- and it prunes git's
+        // registration on that basis regardless.
+        let record = WorktreeRecord::save(worktree_path, repo_path).await;
+
         let output = tokio::process::Command::new("wt")
-            .args(["remove", "-y", "--no-verify"])
+            .args(Self::WT_REMOVE_ARGS)
             .current_dir(worktree_path)
             .output()
             .await
             .map_err(|e| format!("Failed to run wt remove: {}", e))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("wt remove failed: {}", stderr));
-        }
+        // `stderr` is kept only to explain a failure in the message below,
+        // never to decide one -- see `finish_removal` for why exit status
+        // is not that signal for this backend either.
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
-        // A zero exit is not proof of removal. `wt remove` reports the removal
-        // as happening in the background, and it exits zero even when the
-        // directory survives -- an unwritable parent is enough to reproduce
-        // it. The only trustworthy signal is the directory itself, which is
-        // exactly why `remove_with_git` decides on `exists()` rather than on
-        // git's exit status. Without this check the caller would durably clear
-        // `worktree_path`, discarding the only handle back to a worktree that
-        // still holds the user's work.
-        if self.exists(worktree_path) {
-            return Err(format!(
-                "wt remove reported success but {worktree_path} is still on disk"
-            ));
-        }
-
-        Ok(())
+        // `wt remove` defaults to deleting the actual worktree in a detached
+        // background job and returning as soon as that job is launched, but
+        // `--foreground` opts this call out of that: confirmed by hand
+        // against a real, installed `wt`, the checkout is already gone --
+        // no sleep needed to observe it -- immediately after a `--foreground`
+        // call returns, including through the cross-filesystem fallback to
+        // plain `git worktree remove` `wt` documents for that mode. There is
+        // therefore nothing to wait out here; `proven_absent` below is
+        // evaluated exactly once, right after this call returns.
+        //
+        // That still is not the same as trusting the exit status itself: a
+        // pre-remove hook failing, or `wt` hitting trouble partway through
+        // its own removal (the scenario
+        // `remove_with_wt_preserves_and_restores_the_registration_when_its_own_removal_cannot_finish`
+        // exercises), can each surface as success or failure independently
+        // of whether the checkout actually survived. `finish_removal` (via
+        // `proven_absent`) is still the only thing that decides.
+        let failure = if output.status.success() {
+            format!("wt remove reported success but {worktree_path} could not be proven gone")
+        } else if stderr.is_empty() {
+            format!(
+                "wt remove failed and {worktree_path} could not be proven gone, which gave no \
+                 reason"
+            )
+        } else {
+            format!("wt remove failed and {worktree_path} could not be proven gone: {stderr}")
+        };
+        Self::finish_removal(worktree_path, record, failure)
     }
 
     // --- Private: git-based fallback ---
@@ -614,6 +717,12 @@ impl WorktreeManager {
     }
 
     async fn remove_with_git(&self, worktree_path: &str, repo_path: &str) -> Result<(), String> {
+        // Saved before anything runs, because there is no asking for it back
+        // afterwards: git tears its own record down at the end of a removal it
+        // could not finish, and a checkout it no longer registers is one no
+        // `git worktree` command will touch again.
+        let record = WorktreeRecord::save(worktree_path, repo_path).await;
+
         // Try normal remove first
         let output = tokio::process::Command::new("git")
             .args(["worktree", "remove", worktree_path])
@@ -623,79 +732,22 @@ impl WorktreeManager {
             .map_err(|e| format!("Failed to remove worktree: {}", e))?;
 
         if !output.status.success() {
-            // Fallback to force if normal remove fails (e.g., uncommitted changes)
-            let force_output = tokio::process::Command::new("git")
+            // Fallback to force if normal remove fails (e.g. uncommitted
+            // changes). Its exit status decides nothing on its own; the
+            // directory below is the only trustworthy signal either way.
+            tokio::process::Command::new("git")
                 .args(["worktree", "remove", "--force", worktree_path])
                 .current_dir(repo_path)
                 .output()
                 .await
                 .map_err(|e| format!("Failed to force-remove worktree: {}", e))?;
-
-            // Last resort, and only for a registration whose directory is
-            // already gone: prune clears the record so nothing is left
-            // pointing at a checkout that no longer exists. That state is
-            // real rather than theoretical -- `wt remove` leaves exactly it
-            // behind and delegates here to have it cleared -- and prune is
-            // the only thing in SlashIt that clears it.
-            //
-            // The `exists` condition is what makes this safe, and it used to
-            // be missing. Prune decides a registration is stale by whether it
-            // can read the worktree's `.git`, not by whether the directory is
-            // there, so a directory git may not enter reads as gone: prune
-            // dropped the registration for a worktree still fully present on
-            // disk. That is unrecoverable rather than merely untidy. Both
-            // removes above had already failed on the same unreadable `.git`,
-            // and once the registration was gone they could never do anything
-            // else -- `git worktree remove` answers "is not a working tree"
-            // for a path git no longer knows about, whatever is at it and
-            // whatever permissions it later regains. `exists` stayed true, so
-            // this returned `Err`, so the executor's ~30s pass scheduled
-            // another attempt on the same task, and every one of them was
-            // already impossible.
-            //
-            // Leaving the record alone costs nothing while the directory is
-            // still there: `git worktree remove` remains meaningful for it,
-            // so the attempt that runs after the obstacle clears is an
-            // ordinary removal that simply succeeds. Convergence is the
-            // point; a retry contract the product cannot ever satisfy is not
-            // a retry contract.
-            //
-            // The condition is [`Self::proven_absent`] rather than
-            // [`Self::exists`] because `exists` answers the same way for "not
-            // there" and "could not look", and mistaking the second for the
-            // first is the whole defect. Reusing it here would rebuild it a
-            // level up.
-            //
-            // Scope, so the guarantee is not read wider than it is: this
-            // restores convergence for a removal that git refused before
-            // acting, which is the state the prune used to destroy. A removal
-            // that fails *after* git has already dropped the registration
-            // itself -- `git worktree remove` unlinks the record before the
-            // recursive delete and does not put it back when that delete
-            // fails partway -- lands in the same terminal state by a door
-            // this does not reach. That is its own defect and wants its own
-            // change.
-            if !force_output.status.success() && Self::proven_absent(worktree_path) {
-                let _ = tokio::process::Command::new("git")
-                    .args(["worktree", "prune"])
-                    .current_dir(repo_path)
-                    .output()
-                    .await;
-            }
         }
 
-        // Every attempt above can fail with a non-zero exit — which is not a
-        // Rust `Err` — without the directory actually being gone. The only
-        // trustworthy signal that removal worked is checking for the
-        // directory itself; reporting success otherwise would let a caller
-        // clear `worktree_path` for a worktree that is still on disk, losing
-        // the only handle back to it.
-        if self.exists(worktree_path) {
-            return Err(format!(
-                "worktree at {} still exists after worktree remove and --force both ran",
-                worktree_path
-            ));
-        }
+        let failure = format!(
+            "worktree at {} could not be proven gone after worktree remove and --force both ran",
+            worktree_path
+        );
+        Self::finish_removal(worktree_path, record, failure)?;
 
         // The branch is not touched here, and that is the whole point of this
         // function's contract.
@@ -784,6 +836,260 @@ impl WorktreeManager {
     }
 }
 
+/// The record git keeps for a linked worktree, saved so that a removal git
+/// abandons partway can still be retried.
+///
+/// `git worktree remove` deletes the checkout's contents first and tears down
+/// `<git dir>/worktrees/<id>` afterwards, and it does the second part whether
+/// or not the first one finished. What that leaves behind, when it did not, is
+/// a directory that is plainly still there and that git no longer knows
+/// anything about -- and git has no way back to it. `remove` answers "is not a
+/// working tree" however the path is spelled, `repair` declines because the
+/// `.git` file now points at nothing, and `add` refuses a path that exists.
+/// The record is the only thing that makes a checkout removable, so losing it
+/// turns an unfinished removal into an impossible one, and the executor's
+/// periodic pass then retries a task that no attempt can ever complete.
+///
+/// What keeps this from reaching a worktree it has no business in is the
+/// record's own absence, checked at the moment of putting it back rather than
+/// assumed from the path. Something can take the path in the meantime -- a
+/// removal that empties a directory but cannot delete the directory itself
+/// leaves an empty one behind, and `git worktree add` accepts an empty
+/// directory -- but a worktree created there gets its record under this same
+/// name, so the name is occupied and nothing is put back. Only a name git
+/// holds nothing under is filled in, and only with the bytes git itself had
+/// under it moments earlier in this same call.
+///
+/// Nothing here decides anything about deleting the directory. That was git's
+/// to do and still is; the next attempt is an ordinary `git worktree remove`
+/// that succeeds once whatever blocked the deletion is gone.
+struct WorktreeRecord {
+    /// `<git common dir>/worktrees/<id>`, where git keeps the record.
+    admin: PathBuf,
+    /// A copy of it, beside it rather than in system temp so that putting it
+    /// back is a rename on one filesystem, and outside `worktrees/` so that
+    /// git does not read the copy as a worktree of its own.
+    saved: PathBuf,
+    /// `<worktree>/.git`, the file pointing back at `admin`, with what it
+    /// held. It lives in the checkout, so it is one of the things git deletes
+    /// on its way through, and a record whose worktree has no `.git` file
+    /// fails validation just as an absent record does.
+    gitlink: PathBuf,
+    gitlink_contents: Vec<u8>,
+    /// Whether the copy has to outlive this call. It does exactly when it
+    /// could not be put back, because a call that finds no record has nothing
+    /// to copy and this is then the only way back there is.
+    keep: Cell<bool>,
+}
+
+impl WorktreeRecord {
+    /// Save the record for `worktree_path`, or nothing if there is not one to
+    /// save.
+    ///
+    /// Returning `None` is not a failure. A path git does not register is one
+    /// this cannot restore anything for, and a removal then behaves exactly
+    /// as it did before.
+    ///
+    /// The worktree-side pointer at `<worktree_path>/.git` is tried first: it
+    /// holds the exact bytes git itself wrote, and preserving those verbatim
+    /// is worth doing whenever they can be read. [`Self::locate_admin`] is
+    /// not a lesser fallback for when they can't -- it is what still answers
+    /// in exactly the case that matters here, a worktree whose own parent has
+    /// closed off, because it never reads anything under `worktree_path` at
+    /// all.
+    async fn save(worktree_path: &str, repo_path: &str) -> Option<Self> {
+        let common = Self::common_dir(repo_path).await?;
+        let worktrees_dir = common.join("worktrees");
+        let gitlink = Path::new(worktree_path).join(".git");
+
+        let (admin, gitlink_contents) = match std::fs::read(&gitlink) {
+            Ok(contents) => {
+                let admin = PathBuf::from(
+                    std::str::from_utf8(&contents).ok()?.strip_prefix("gitdir:")?.trim(),
+                );
+                (admin, contents)
+            }
+            Err(_) => {
+                let admin = Self::locate_admin(&worktrees_dir, worktree_path)?;
+                // Git's own record format for the reverse pointer -- proven
+                // against a real `git worktree add` in
+                // `synthesized_gitlink_matches_what_git_itself_writes` below.
+                let gitlink_contents = format!("gitdir: {}\n", admin.display()).into_bytes();
+                (admin, gitlink_contents)
+            }
+        };
+
+        // Wherever the pointer came from, where it leads is checked against
+        // what git says about this repository rather than taken on trust:
+        // only this repository's own worktree records are ever copied.
+        if admin.parent() != Some(worktrees_dir.as_path()) {
+            return None;
+        }
+
+        // Named after the record rather than at random, so that a copy an
+        // earlier attempt could not put back is the one this attempt finds.
+        let saved = common.join(format!(
+            "slashit-saved-worktree-record-{}",
+            admin.file_name()?.to_str()?
+        ));
+
+        if admin.is_dir() {
+            // Any copy still lying about is from an attempt that has since
+            // been overtaken by git's own record.
+            let _ = std::fs::remove_dir_all(&saved);
+            copy_tree(&admin, &saved).ok()?;
+        } else if !saved.is_dir() {
+            // No record, and no copy of one: there is nothing to put back.
+            return None;
+        }
+
+        Some(Self {
+            admin,
+            saved,
+            gitlink,
+            gitlink_contents,
+            keep: Cell::new(false),
+        })
+    }
+
+    /// Find `worktree_path`'s administrative record directly under
+    /// `worktrees_dir`, without reading anything under `worktree_path`
+    /// itself.
+    ///
+    /// Git's own reverse pointer -- `<worktrees_dir>/<id>/gitdir` -- holds
+    /// exactly `<worktree_path>/.git\n` and nothing else (confirmed against a
+    /// real `git worktree add` in
+    /// `synthesized_gitlink_matches_what_git_itself_writes` below), so the
+    /// record whose `gitdir` names this exact path is this worktree's, and
+    /// the only place that pointer has to be read from is the repository
+    /// side -- which a blocked worktree parent never affects.
+    ///
+    /// Fails closed on anything it cannot be sure of: a record whose
+    /// `gitdir` cannot be read is skipped rather than guessed at, and this
+    /// reports nothing at all, rather than pick one, if more than one record
+    /// claims the same path -- restoring the wrong one would be worse than
+    /// restoring none.
+    fn locate_admin(worktrees_dir: &Path, worktree_path: &str) -> Option<PathBuf> {
+        let wanted = Path::new(worktree_path).join(".git");
+        let mut found: Option<PathBuf> = None;
+
+        for entry in std::fs::read_dir(worktrees_dir).ok()?.flatten() {
+            let admin = entry.path();
+            if !admin.is_dir() {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(admin.join("gitdir")) else {
+                continue;
+            };
+            if Path::new(contents.trim()) != wanted {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(admin);
+        }
+
+        found
+    }
+
+    /// Put the record back, if git dropped one it did not finish acting on.
+    fn restore(&self) -> Result<(), String> {
+        let outcome = self.put_back();
+        self.keep.set(outcome.is_err());
+        outcome
+    }
+
+    fn put_back(&self) -> Result<(), String> {
+        match Presence::of(&self.admin) {
+            Presence::Present => {}
+            Presence::Absent => {
+                // Git deletes `worktrees/` itself once it holds nothing.
+                if let Some(parent) = self.admin.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("could not recreate {}: {e}", parent.display()))?;
+                }
+                std::fs::rename(&self.saved, &self.admin)
+                    .map_err(|e| format!("could not put {} back: {e}", self.admin.display()))?;
+            }
+            // Not knowing is not license to overwrite: the record could
+            // still be exactly where it belongs, and blindly renaming over
+            // it would be destructive on a guess. Reported as failure so the
+            // caller keeps the saved copy for a later attempt instead.
+            Presence::Unverified(error) => {
+                return Err(format!(
+                    "could not tell whether {} still exists: {error}",
+                    self.admin.display()
+                ));
+            }
+        }
+
+        // Asked separately, because the record and the file pointing at it are
+        // two things git deletes separately, and a worktree with no `.git`
+        // file fails validation exactly as a missing record does. A worktree
+        // that is really there always has one, so this cannot reach a live
+        // checkout.
+        match Presence::of(&self.gitlink) {
+            Presence::Present => {}
+            Presence::Absent => {
+                std::fs::write(&self.gitlink, &self.gitlink_contents)
+                    .map_err(|e| format!("could not put {} back: {e}", self.gitlink.display()))?;
+            }
+            Presence::Unverified(error) => {
+                return Err(format!(
+                    "could not tell whether {} still exists: {error}",
+                    self.gitlink.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn common_dir(repo_path: &str) -> Option<PathBuf> {
+        let output = tokio::process::Command::new("git")
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    }
+}
+
+impl Drop for WorktreeRecord {
+    fn drop(&mut self) {
+        if self.keep.get() {
+            // Deleting it here would take away the only way back: the record
+            // is gone, so the next attempt has nothing of its own to copy.
+            return;
+        }
+        // Restored, and so renamed away already; or never needed.
+        let _ = std::fs::remove_dir_all(&self.saved);
+    }
+}
+
+/// Copy `from` to `to`, contents and all.
+///
+/// Only ever used on a worktree record, which holds git's own bookkeeping and
+/// no user content.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,13 +1160,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integration_remove_under_worktrunk_delegation_prunes_a_stale_registration() {
+    async fn integration_remove_under_worktrunk_delegation_clears_a_stale_registration() {
         // Converging is not enough on its own: `wt` leaves the registration
-        // behind when the directory goes missing, and a prunable registration
+        // behind when the directory goes missing, and a stale registration
         // blocks `wt switch <branch>` ("Worktree directory missing") while the
         // surviving branch blocks `wt switch -c <branch>`, so the task could
-        // never get a worktree again. Nothing else in SlashIt prunes. Needs no
-        // `wt` binary: the delegation happens before anything is spawned.
+        // never get a worktree again. `git worktree remove` clears a record
+        // whose directory is gone, which is the whole reason this case is
+        // handed to the git backend. Needs no `wt` binary: the delegation
+        // happens before anything is spawned.
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
 
@@ -890,7 +1198,8 @@ mod tests {
         let after = WorktreeManager::worktree_list_porcelain(&repo_path).expect("git listing");
         assert!(
             !after.contains(&info.path),
-            "the stale registration must be pruned, or the branch can never be checked out again"
+            "the stale registration must be cleared, or the branch can never be checked out \
+             again"
         );
         assert!(
             branch_exists(&repo_path, "task-abcd1234"),
@@ -1789,7 +2098,16 @@ branch refs/heads/some-other-branch
     }
 
     /// The distinction [`WorktreeManager::exists`] cannot make, and the
-    /// reason the prune is gated on `proven_absent` instead of on it.
+    /// reason a removal's success gate is decided on `proven_absent` instead
+    /// of on it.
+    ///
+    /// The tests above chmod something *inside* the worktree -- a
+    /// subdirectory, or the worktree directory itself -- which still lets
+    /// `metadata` on the worktree path resolve (or answer `NotFound` once
+    /// the whole thing is gone). This targets the worktree's *parent*
+    /// instead, so `metadata(worktree_path)` itself fails with a permission
+    /// error rather than `NotFound` -- the one case `exists()` cannot tell
+    /// apart from genuine absence.
     #[cfg(unix)]
     #[test]
     fn proven_absent_separates_not_there_from_could_not_look() {
@@ -1818,22 +2136,23 @@ branch refs/heads/some-other-branch
         assert!(
             !exists_says,
             "`exists` reports a path it was not allowed to look at as absent -- that is the \
-             answer the prune guard must not inherit"
+             answer a removal's success gate must not inherit"
         );
         assert!(
             !proven_says,
-            "a path that could not be looked at is not proven absent, and git's record of a \
-             worktree must not be discarded on that basis"
+            "a path that could not be looked at is not proven absent, and a removal must not \
+             report success on that basis"
         );
         assert!(
             WorktreeManager::proven_absent(&never),
-            "a path that is genuinely not there is the case the prune exists for"
+            "a path that is genuinely not there is the case the success gate exists for"
         );
 
         // A link pointing at nothing has no worktree at it, and `exists`
-        // already says so. Disagreeing here would strand the registration:
-        // the prune would be withheld while the removal was still reported
-        // as done, so nothing would ever clear the record again.
+        // already says so. Disagreeing here would strand every caller of a
+        // removal that really did finish: the success gate would report
+        // `Err` for a worktree that is already gone, and no retry could ever
+        // converge on it.
         let dangling = tmp.path().join("dangling");
         std::os::unix::fs::symlink(tmp.path().join("nothing-here"), &dangling)
             .expect("create the dangling link");
@@ -1844,9 +2163,601 @@ branch refs/heads/some-other-branch
         );
         assert!(
             WorktreeManager::proven_absent(&dangling),
-            "and this must agree with it, or a stale registration outlives the only pass that \
-             would have pruned it"
+            "and this must agree with it, or a removal that really finished would be reported \
+             as one that did not"
         );
+    }
+
+    /// The branch-preservation and synchronicity contract `remove_with_wt`
+    /// depends on, proven against the exact argument list it spawns rather
+    /// than against real `wt` output -- so it runs on every machine, with or
+    /// without the `wt` binary on `PATH`, and needs no process at all.
+    ///
+    /// `remove_with_wt_preserves_and_restores_the_registration_when_its_own_removal_cannot_finish`
+    /// is the real-`wt` counterpart that exercises what these flags actually
+    /// do; this test is what keeps that contract from silently regressing on
+    /// every other run, since that one is `#[ignore]`d.
+    #[test]
+    fn wt_remove_args_run_in_the_foreground_and_keep_the_branch() {
+        let args = WorktreeManager::WT_REMOVE_ARGS;
+        assert!(
+            args.contains(&"--foreground"),
+            "without this, `wt remove` returns before the removal it started has finished, and \
+             the caller has nothing to evaluate `proven_absent` against yet: {args:?}"
+        );
+        assert!(
+            args.contains(&"--no-delete-branch"),
+            "without this, Worktrunk decides for itself whether the task's branch survives \
+             removal -- SlashIt must be the one requiring that it does: {args:?}"
+        );
+    }
+
+    /// The exact parent-blocked scenario the `exists()`-gated success check
+    /// this module used to have could misclassify as removed: both `git
+    /// worktree remove` and the caller's own filesystem check answer "not
+    /// there" for a directory the caller was simply never allowed to look
+    /// at.
+    ///
+    /// `git worktree remove` itself exits `0` here without touching the
+    /// directory at all -- it cannot even stat the path through a
+    /// closed-off parent, and answers that the same way it would answer a
+    /// worktree that is genuinely gone. That is `?`-mapped to a spawn/exit
+    /// failure in the tests above, where the obstacle is inside the
+    /// worktree rather than in its parent; here it is git's own exit status
+    /// that is misleading, which is exactly why the success gate this test
+    /// is about does not trust it either. The gate itself is proven
+    /// directly against `proven_absent` in the unit test above; this is the
+    /// same scenario at the level `remove()` callers observe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_reports_err_rather_than_false_success_when_the_worktree_cannot_be_looked_at() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::ipc::server::current_uid() == 0 {
+            return; // root ignores the permission bits this test relies on
+        }
+
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        let mgr = test_manager();
+        let info = mgr
+            .create(repo_path, "task-parent-blocked")
+            .await
+            .expect("create failed");
+
+        let parent = Path::new(&info.path)
+            .parent()
+            .expect("a worktree path has a parent")
+            .to_path_buf();
+        let restore_mode = std::fs::metadata(&parent)
+            .expect("read the parent's mode")
+            .permissions()
+            .mode();
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
+            .expect("close off the parent");
+        let result = mgr.remove(&info.path, repo_path).await;
+        // Reopened before asserting, so a failure still leaves a removable
+        // temp dir behind and so the worktree can be confirmed still present
+        // below.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(restore_mode))
+            .expect("reopen the parent");
+
+        assert!(
+            result.is_err(),
+            "a removal that could not prove the worktree gone must report Err, not silently \
+             `Ok(())`, which would let the caller discard the only handle back to a worktree \
+             that may still be fully present: {result:?}"
+        );
+        assert!(
+            Path::new(&info.path).exists(),
+            "the worktree was never actually touched by this removal attempt, so it must still \
+             be there once its parent is reopened"
+        );
+    }
+
+    /// `WorktreeRecord`'s own reverse lookup, proven directly rather than
+    /// only through a full `remove()` call.
+    ///
+    /// A synthetic `worktrees_dir` is built by hand so the ambiguous and
+    /// malformed cases can be constructed at all -- git itself would never
+    /// produce them, which is exactly why the lookup has to fail closed on
+    /// them rather than assume they cannot occur.
+    #[test]
+    fn locate_admin_matches_the_exact_gitdir_pointer_and_nothing_else() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let worktrees_dir = tmp.path().join("worktrees");
+        std::fs::create_dir(&worktrees_dir).expect("create worktrees dir");
+
+        let mine = tmp.path().join("checkouts").join("mine");
+        let theirs = tmp.path().join("checkouts").join("theirs");
+
+        let mine_admin = worktrees_dir.join("mine");
+        std::fs::create_dir(&mine_admin).expect("create mine's record");
+        std::fs::write(mine_admin.join("gitdir"), format!("{}\n", mine.join(".git").display()))
+            .expect("write mine's gitdir");
+
+        let theirs_admin = worktrees_dir.join("theirs");
+        std::fs::create_dir(&theirs_admin).expect("create theirs' record");
+        std::fs::write(theirs_admin.join("gitdir"), format!("{}\n", theirs.join(".git").display()))
+            .expect("write theirs' gitdir");
+
+        assert_eq!(
+            WorktreeRecord::locate_admin(&worktrees_dir, mine.to_str().unwrap()),
+            Some(mine_admin),
+            "must find the record whose gitdir names exactly this path"
+        );
+        assert_eq!(
+            WorktreeRecord::locate_admin(&worktrees_dir, theirs.to_str().unwrap()),
+            Some(theirs_admin),
+            "an unrelated record must resolve to itself, not to whichever one is listed first"
+        );
+
+        let never_registered = tmp.path().join("checkouts").join("never-registered");
+        assert_eq!(
+            WorktreeRecord::locate_admin(&worktrees_dir, never_registered.to_str().unwrap()),
+            None,
+            "no record names this path, so there is nothing to find"
+        );
+    }
+
+    #[test]
+    fn locate_admin_fails_closed_on_an_ambiguous_match() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let worktrees_dir = tmp.path().join("worktrees");
+        std::fs::create_dir(&worktrees_dir).expect("create worktrees dir");
+
+        let shared = tmp.path().join("checkouts").join("shared");
+        for name in ["a", "b"] {
+            let admin = worktrees_dir.join(name);
+            std::fs::create_dir(&admin).expect("create a record");
+            std::fs::write(admin.join("gitdir"), format!("{}\n", shared.join(".git").display()))
+                .expect("write its gitdir");
+        }
+
+        assert_eq!(
+            WorktreeRecord::locate_admin(&worktrees_dir, shared.to_str().unwrap()),
+            None,
+            "two records claiming the same worktree path cannot be arbitrated -- restoring the \
+             wrong one is worse than restoring none"
+        );
+    }
+
+    #[test]
+    fn locate_admin_skips_a_record_it_cannot_read() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let worktrees_dir = tmp.path().join("worktrees");
+        std::fs::create_dir(&worktrees_dir).expect("create worktrees dir");
+
+        // No `gitdir` file at all: not something git itself would leave, but
+        // exactly the shape a record this cannot make sense of takes.
+        std::fs::create_dir(worktrees_dir.join("malformed")).expect("create the bad record");
+
+        let mine = tmp.path().join("checkouts").join("mine");
+        let mine_admin = worktrees_dir.join("mine");
+        std::fs::create_dir(&mine_admin).expect("create mine's record");
+        std::fs::write(mine_admin.join("gitdir"), format!("{}\n", mine.join(".git").display()))
+            .expect("write mine's gitdir");
+
+        assert_eq!(
+            WorktreeRecord::locate_admin(&worktrees_dir, mine.to_str().unwrap()),
+            Some(mine_admin),
+            "a record this cannot read must be skipped, not treated as a match or as fatal"
+        );
+    }
+
+    /// The exact bytes [`WorktreeRecord::save`] synthesizes for a `.git`
+    /// pointer it could not read must be indistinguishable from what git
+    /// itself writes -- a restore that handed git a file in the wrong shape
+    /// would just trade a lost registration for a corrupted one.
+    #[tokio::test]
+    async fn synthesized_gitlink_matches_what_git_itself_writes() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        let mgr = test_manager();
+        let info = mgr
+            .create(repo_path, "task-gitlink-format")
+            .await
+            .expect("create failed");
+
+        let real_gitlink =
+            std::fs::read(Path::new(&info.path).join(".git")).expect("read the real .git file");
+        let admin = admin_record_of(&info.path);
+        let synthesized = format!("gitdir: {}\n", admin.display()).into_bytes();
+
+        assert_eq!(
+            real_gitlink, synthesized,
+            "the reconstructed pointer must match byte-for-byte what git itself writes, or a \
+             restore would hand git a file in a shape it does not recognize"
+        );
+    }
+
+    /// The full failure-and-recovery sequence for the worktree-parent-blocked
+    /// scenario, not just the immediate `Err`: a removal that could not look
+    /// at the worktree at all must leave enough behind -- both the directory
+    /// and git's own registration for it -- that a later, unobstructed
+    /// removal can still finish the job.
+    ///
+    /// A real `git worktree remove` against this exact obstacle exits `0`
+    /// and deletes `<common>/worktrees/<id>` for a path it cannot stat at
+    /// all, without ever touching the directory (confirmed by hand against a
+    /// real repository before writing this test). `WorktreeRecord::save`'s
+    /// repository-side lookup is what survives that: it never reads anything
+    /// under the worktree's own blocked parent, so it can copy the record
+    /// before git's own attempt destroys it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_preserves_and_restores_the_registration_when_the_worktree_cannot_be_looked_at()
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::ipc::server::current_uid() == 0 {
+            return; // root ignores the permission bits this test relies on
+        }
+
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        let mgr = test_manager();
+        let info = mgr
+            .create(repo_path, "task-registration-blocked")
+            .await
+            .expect("create failed");
+
+        let registered_before =
+            WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        assert!(
+            registered_before.contains(&info.path),
+            "the worktree must be registered before anything happens to it"
+        );
+
+        let parent = Path::new(&info.path)
+            .parent()
+            .expect("a worktree path has a parent")
+            .to_path_buf();
+        let restore_mode = std::fs::metadata(&parent)
+            .expect("read the parent's mode")
+            .permissions()
+            .mode();
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
+            .expect("close off the parent");
+        let blocked = mgr.remove(&info.path, repo_path).await;
+        // Reopened before asserting, so the outcome can actually be inspected
+        // and so a later attempt in this same test has something to act on.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(restore_mode))
+            .expect("reopen the parent");
+
+        assert!(
+            blocked.is_err(),
+            "a removal that could not prove the worktree gone must report Err: {blocked:?}"
+        );
+        assert!(
+            Path::new(&info.path).exists(),
+            "the worktree was never actually touched by this removal attempt"
+        );
+
+        let registered_after =
+            WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        assert!(
+            registered_after.contains(&info.path),
+            "git's own registration must survive or be restored, not be discarded alongside the \
+             wrongly-assumed removal -- without it nothing can ever act on this worktree again"
+        );
+
+        // Git's registration surviving is only useful if a real removal can
+        // still use it: a later legitimate cleanup, once access is restored,
+        // has to actually converge.
+        mgr.remove(&info.path, repo_path)
+            .await
+            .expect("the attempt made once the obstacle is gone is the one that has to converge");
+        assert!(
+            !Path::new(&info.path).exists(),
+            "the retry has to actually remove the worktree, not merely stop failing"
+        );
+        assert!(
+            branch_exists(repo_path, "task-registration-blocked"),
+            "the branch must survive cleanup, as it does for every other removal path"
+        );
+        assert!(
+            saved_records(repo_path).is_empty(),
+            "no saved-record debris should remain once the worktree has actually converged"
+        );
+    }
+
+    /// The same parent-blocked scenario, reached through `remove_with_wt`'s
+    /// delegation rather than by calling the git backend directly.
+    ///
+    /// `remove_with_wt`'s own entry guard treats a worktree it cannot see as
+    /// one to hand to `remove_with_git` -- that guard is `!self.exists(...)`,
+    /// which is `true` for a blocked parent exactly as it is for a genuinely
+    /// missing directory, so this case reaches the same repository-side
+    /// preservation mechanism proven directly above rather than a separate,
+    /// unprotected path. Needs no `wt` binary: the delegation happens before
+    /// anything is spawned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_with_wt_delegation_reaches_the_same_registration_preservation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::ipc::server::current_uid() == 0 {
+            return; // root ignores the permission bits this test relies on
+        }
+
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        let mut mgr = test_manager();
+        mgr.placement = WorktreePlacement::Managed;
+        let info = mgr
+            .create(repo_path, "task-wt-registration-blocked")
+            .await
+            .expect("create failed");
+
+        let parent = Path::new(&info.path)
+            .parent()
+            .expect("a worktree path has a parent")
+            .to_path_buf();
+        let restore_mode = std::fs::metadata(&parent)
+            .expect("read the parent's mode")
+            .permissions()
+            .mode();
+
+        mgr.wt_available = true;
+        mgr.placement = WorktreePlacement::Auto;
+        assert!(mgr.delegates_to_wt(), "this test must exercise the wt backend's delegation");
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
+            .expect("close off the parent");
+        let blocked = mgr.remove(&info.path, repo_path).await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(restore_mode))
+            .expect("reopen the parent");
+
+        assert!(
+            blocked.is_err(),
+            "delegation must not turn a blocked-parent removal into a false success: {blocked:?}"
+        );
+        let registered_after =
+            WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        assert!(
+            registered_after.contains(&info.path),
+            "the registration must survive delegation through remove_with_wt exactly as it does \
+             for the git backend called directly"
+        );
+
+        // The retry converging is already proven, in full, against the git
+        // backend directly above. Routing it back through real `wt` here
+        // would test worktrunk's own ability to act on a worktree it never
+        // created (this one came from `mgr.create`, not `wt switch`), which
+        // is a different, unrelated concern -- so the retry is pointed at
+        // the git backend, the same one that actually did the preserving.
+        mgr.placement = WorktreePlacement::Managed;
+        mgr.remove(&info.path, repo_path)
+            .await
+            .expect("the retry once access is restored has to converge");
+        assert!(!Path::new(&info.path).exists(), "the retry has to actually remove the worktree");
+    }
+
+    /// The shared decision point both backends funnel through
+    /// (`WorktreeManager::finish_removal`), exercised directly against the
+    /// exact post-state a removal tool that could not finish leaves: the
+    /// checkout is still there, but the registration it pointed at is
+    /// already gone.
+    ///
+    /// This is the deterministic seam for a scenario `remove_with_wt`'s real
+    /// invocation cannot be driven through without either a timing race or
+    /// the real `wt` binary. `remove_with_wt_preserves_and_restores_the_registration_when_its_own_removal_cannot_finish`
+    /// below proves the identical scenario against real `wt`, gated behind
+    /// `#[ignore]` for the same reason every other real-`wt` test in this
+    /// file is; this test proves the recovery logic itself, unconditionally,
+    /// on every run.
+    #[tokio::test]
+    async fn finish_removal_restores_a_registration_the_removal_tool_pruned() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        let mgr = test_manager();
+        let info = mgr
+            .create(repo_path, "task-tool-pruned-registration")
+            .await
+            .expect("create failed");
+
+        // Saved exactly as both backends save it: before anything
+        // destructive runs.
+        let record = WorktreeRecord::save(&info.path, repo_path).await;
+        assert!(record.is_some(), "a real, freshly created worktree always has a record to save");
+
+        // Exactly the state a removal tool leaves when it prunes git's own
+        // registration without finishing the physical removal -- confirmed
+        // by hand against both a bare `git worktree remove` and a real `wt
+        // remove` whose parent directory could not be written to.
+        forget_worktree_record(repo_path, &info.path);
+        assert!(
+            Path::new(&info.path).exists(),
+            "precondition: the checkout itself is untouched"
+        );
+        assert!(
+            !WorktreeManager::worktree_list_porcelain(repo_path)
+                .unwrap()
+                .contains(&info.path),
+            "precondition: git no longer registers it"
+        );
+
+        let outcome = WorktreeManager::finish_removal(
+            &info.path,
+            record,
+            "the removal tool reported success but left the checkout behind".to_string(),
+        );
+
+        assert!(
+            outcome.is_err(),
+            "a checkout that is not proven gone must report Err: {outcome:?}"
+        );
+        let registered_after =
+            WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        assert!(
+            registered_after.contains(&info.path),
+            "the registration must be restored, not left pruned alongside a checkout that is \
+             still fully present"
+        );
+
+        // A later legitimate cleanup, once whatever tool ran has nothing
+        // left to stand in its way, still has to converge.
+        mgr.remove(&info.path, repo_path)
+            .await
+            .expect("the retry has to actually finish once the registration is back");
+        assert!(!Path::new(&info.path).exists(), "the retry has to actually remove the worktree");
+        assert!(
+            branch_exists(repo_path, "task-tool-pruned-registration"),
+            "the branch must survive, as it does for every other removal path"
+        );
+        assert!(
+            saved_records(repo_path).is_empty(),
+            "no saved-record debris should remain once the worktree has actually converged"
+        );
+    }
+
+    /// The real-`wt` counterpart to
+    /// `finish_removal_restores_a_registration_the_removal_tool_pruned`
+    /// above: the same scenario, but driven through `remove_with_wt`'s
+    /// actual invocation of the installed `wt` binary rather than
+    /// fabricated by hand.
+    ///
+    /// The obstacle is the worktree's *parent* directory losing write
+    /// permission (not read or execute, which stay intact) before `remove`
+    /// is called -- a static precondition set once, not a race.
+    /// `Path::exists` only needs execute permission on the parent to
+    /// succeed, so the entry guard above still sees the worktree as present
+    /// and lets `wt remove` actually run; `wt`'s own internal rename then
+    /// needs *write* permission on that same parent and cannot get it,
+    /// deleting the worktree's `.git` pointer and pruning git's
+    /// registration before failing on the directory itself. Confirmed by
+    /// hand against a real, installed `wt` before writing this test, and
+    /// stable immediately after the `--foreground` call returns -- checked
+    /// with no sleep, and again a second later, with the same result both
+    /// times.
+    ///
+    /// The retry is not asserted to fully remove the checkout, and that is
+    /// deliberate, not a weaker test. `wt`'s own partial-removal attempt here
+    /// deletes tracked file content on its way to failing (confirmed by
+    /// hand: the checkout comes back from this obstacle missing files
+    /// `git worktree add` had put there, not merely missing its `.git`
+    /// pointer), and [`WorktreeRecord`] was never meant to cover that -- its
+    /// own doc comment scopes it to git's bookkeeping, not user content. A
+    /// forceless retry against a checkout git now considers dirty correctly
+    /// keeps refusing, exactly as `remove_with_git` does for real
+    /// uncommitted changes and exactly as this project's own removal of a
+    /// destructive `--force` fallback intends: this pass does not add one to
+    /// the `wt` backend either. So the only thing asserted about the retry
+    /// is the same invariant proven above -- it is never a silent `Ok(())`
+    /// while the checkout is still there.
+    ///
+    /// The checkout is made with plain `git worktree add` rather than
+    /// through `mgr.create` or `wt switch`: `wt switch` is the only
+    /// worktrunk subcommand that consults the `worktree-path` template, and
+    /// creating through it would drop a worktree into whichever global root
+    /// the developer running this test has configured -- for a real user, a
+    /// directory full of their own work. The branch is created at the same
+    /// commit as `main` (no commits follow `git worktree add`), which is
+    /// exactly the case Worktrunk's own merge-detection considers safe to
+    /// delete on an ordinary `wt remove` -- so the branch surviving below is
+    /// proof of `--no-delete-branch` overriding that heuristic, not an
+    /// accident of the branch already being unmerged.
+    ///
+    /// Ignored by default because it is the only other test in this file
+    /// that needs the `wt` binary on `PATH`. Run it with
+    /// `cargo test -- --ignored`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore] // Ignore by default as it requires the `wt` binary on PATH
+    async fn remove_with_wt_preserves_and_restores_the_registration_when_its_own_removal_cannot_finish()
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::ipc::server::current_uid() == 0 {
+            return; // root ignores the permission bits this test relies on
+        }
+
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap().to_string();
+        let checkout_root = tempfile::TempDir::new().expect("tempdir");
+        let checkout = checkout_root
+            .path()
+            .join("task-checkout")
+            .to_string_lossy()
+            .to_string();
+
+        run_git(
+            &repo_path,
+            &["worktree", "add", "-b", "task-wt-parent-blocked", checkout.as_str(), "main"],
+        );
+
+        let mut mgr = test_manager();
+        mgr.wt_available = true;
+        mgr.placement = WorktreePlacement::Auto;
+        assert!(mgr.delegates_to_wt(), "this test must exercise the wt backend");
+
+        let parent = checkout_root.path().to_path_buf();
+        let restore_mode = std::fs::metadata(&parent)
+            .expect("read the parent's mode")
+            .permissions()
+            .mode();
+
+        // Read and traverse survive; write does not -- `Path::exists` needs
+        // only the former, so the entry guard still lets `wt remove` run.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500))
+            .expect("close write access to the parent");
+        let blocked = mgr.remove(&checkout, &repo_path).await;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(restore_mode))
+            .expect("reopen the parent");
+
+        assert!(
+            blocked.is_err(),
+            "a removal wt could not finish must report Err, not silently Ok(()): {blocked:?}"
+        );
+        assert!(Path::new(&checkout).exists(), "the checkout was never actually removed");
+        let registered_after =
+            WorktreeManager::worktree_list_porcelain(&repo_path).expect("git listing");
+        assert!(
+            registered_after.contains(&checkout),
+            "git's own registration must survive or be restored, not be discarded alongside \
+             wt's own partial removal"
+        );
+
+        // `--foreground` makes this deterministic rather than a race to
+        // catch a background job before it lands, so a single retry, not
+        // several spaced by sleeps, is enough to observe the stable outcome.
+        // It is not asserted to converge: `wt`'s own partial-removal attempt
+        // above deletes tracked file content on its way to failing (see the
+        // doc comment above), leaving the checkout dirty, and a forceless
+        // retry against a dirty checkout correctly keeps refusing.
+        let retried = mgr.remove(&checkout, &repo_path).await;
+        let converged = !Path::new(&checkout).exists();
+        assert!(
+            retried.is_ok() == converged,
+            "remove() must never report Ok(()) while the checkout is still present, nor Err \
+             once it is actually gone: {retried:?}, converged={converged}"
+        );
+
+        // Branch preservation is unconditional here, unlike the checkout
+        // itself: `--no-delete-branch` is on every `wt remove` call this
+        // backend makes, including the blocked one above, so Worktrunk never
+        // reaches its own merge-detection for this branch regardless of
+        // whether the retry actually converged.
+        assert!(
+            branch_exists(&repo_path, "task-wt-parent-blocked"),
+            "SlashIt requires --no-delete-branch on every wt remove call, so the branch must \
+             survive whether or not the checkout itself converged"
+        );
+
+        if converged {
+            assert!(
+                saved_records(&repo_path).is_empty(),
+                "no saved-record debris should remain once the worktree has actually converged"
+            );
+        }
     }
 
     /// The retry contract, at the layer that has to honour it: a removal that
@@ -1859,13 +2770,15 @@ branch refs/heads/some-other-branch
     /// for, since the worktree is still whole and a later attempt has
     /// something to succeed at.
     ///
-    /// The registration assertion is the regression. `git worktree prune`
-    /// decides a record is stale by whether it can read that same `.git`, so
-    /// it read this worktree as gone and dropped the record for a directory
-    /// still fully present. Nothing can remove a path git no longer
-    /// registers: every later attempt then failed with "is not a working
-    /// tree", `exists` stayed true, and the executor's ~30s pass re-scheduled
-    /// a task that no attempt could ever finish.
+    /// The registration assertion is the regression. A repository-wide `git
+    /// worktree prune` used to run here, and it decides a record is stale by
+    /// whether it can read that same `.git`, so it read this worktree as gone
+    /// and dropped the record for a directory still fully present. Nothing
+    /// can remove a path git no longer registers: every later attempt then
+    /// failed with "is not a working tree", `exists` stayed true, and the
+    /// executor's ~30s pass re-scheduled a task that no attempt could ever
+    /// finish. The prune is gone now, and the assertion holds all the same --
+    /// it is about the record surviving, not about what might destroy it.
     ///
     /// Unix-only for the same reason as the test above.
     #[cfg(unix)]
@@ -1916,6 +2829,272 @@ branch refs/heads/some-other-branch
             !Path::new(&info.path).exists(),
             "the retry has to actually remove the worktree, not merely stop failing"
         );
+    }
+
+    /// The other way a removal fails, and the one git does not walk away
+    /// from cleanly.
+    ///
+    /// The obstacle here is inside the worktree rather than the worktree
+    /// itself, so git can read `<path>/.git`, validates the checkout, accepts
+    /// the removal and starts deleting -- and only then reaches a directory
+    /// whose entries it may not unlink. Git tears the worktree's record down
+    /// on its way out regardless, which is documented behaviour rather than an
+    /// accident, so what is left is a directory that is still there and that
+    /// git no longer registers.
+    ///
+    /// That state is terminal on its own: `git worktree remove` answers "is
+    /// not a working tree" however the path is spelled, `git worktree repair`
+    /// declines because the `.git` file points at a record that is gone, and
+    /// `git worktree add` refuses a path that exists. The record has to be put
+    /// back, or the removal is not merely unfinished but impossible, and the
+    /// executor's ~30s pass retries a task no attempt can ever complete.
+    ///
+    /// Unix-only for the same reason as the tests above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn integration_a_removal_git_abandons_partway_can_still_be_retried() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::ipc::server::current_uid() == 0 {
+            return; // root ignores the permission bits the obstacle is made of
+        }
+
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        let mgr = test_manager();
+        let info = mgr
+            .create(repo_path, "task-abandoned")
+            .await
+            .expect("create failed");
+
+        // Mode 0o500, not 0o000: git has to be able to see that there is
+        // something inside to delete, so that it fails on the unlink rather
+        // than refusing at validation the way the test above arranges.
+        let blocked = Path::new(&info.path).join("blocked");
+        std::fs::create_dir(&blocked).expect("create the obstacle");
+        std::fs::write(blocked.join("held.txt"), b"held").expect("fill the obstacle");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o500))
+            .expect("close off the obstacle");
+
+        let abandoned = mgr.remove(&info.path, repo_path).await;
+        let registered = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        // Reopened before asserting, so a failure still leaves a removable
+        // temp dir behind.
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755))
+            .expect("reopen the obstacle");
+
+        assert!(
+            abandoned.is_err(),
+            "a removal that could not delete the directory must report Err: {abandoned:?}"
+        );
+        assert!(
+            Path::new(&info.path).exists(),
+            "the worktree directory must still be there when removal is reported as failed"
+        );
+        assert!(
+            registered.contains(&info.path),
+            "git drops the record of a worktree whose removal it abandoned, and nothing can \
+             remove a checkout git no longer registers: the record has to survive the attempt \
+             or every later one is already impossible"
+        );
+
+        assert!(
+            saved_records(repo_path).is_empty(),
+            "a record that was put back has been renamed into place, not left lying beside it"
+        );
+
+        mgr.remove(&info.path, repo_path)
+            .await
+            .expect("the attempt made once the obstacle is gone is the one that has to converge");
+        assert!(
+            !Path::new(&info.path).exists(),
+            "the retry has to actually remove the worktree, not merely stop failing"
+        );
+        assert!(
+            branch_exists(repo_path, "task-abandoned"),
+            "and it must not take the branch, and the work on it, with it"
+        );
+        assert!(
+            saved_records(repo_path).is_empty(),
+            "and a removal that finished leaves nothing of its own behind"
+        );
+    }
+
+    /// The other half of that: an attempt that could not put the record back.
+    ///
+    /// Putting it back is two filesystem operations against `.git`, and either
+    /// can fail -- a read-only remount, a full disk. If the copy were thrown
+    /// away when that happened the task would be stuck exactly as it was
+    /// before this existed, because an attempt that finds no record has
+    /// nothing of its own to copy. So the copy outlives an attempt that could
+    /// not use it, under a name derived from the record rather than a fresh
+    /// one, and the next attempt is the one that puts it back.
+    ///
+    /// The state is built here rather than provoked, because provoking it
+    /// means taking write access to `.git` away between two operations inside
+    /// a single call, and git would not have got as far as dropping the record
+    /// without it either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn integration_a_record_an_attempt_could_not_put_back_is_used_by_the_next_one() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        let mgr = test_manager();
+        let info = mgr
+            .create(repo_path, "task-stranded")
+            .await
+            .expect("create failed");
+
+        let admin = admin_record_of(&info.path);
+        let saved = Path::new(repo_path).join(".git").join(format!(
+            "slashit-saved-worktree-record-{}",
+            admin.file_name().unwrap().to_str().unwrap()
+        ));
+        copy_tree(&admin, &saved).expect("copy the record aside");
+        std::fs::remove_dir_all(&admin).expect("drop the record the way git does");
+
+        let listing = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        assert!(
+            !listing.contains(&info.path),
+            "the worktree must start out unregistered, or this proves nothing"
+        );
+
+        let stuck = mgr.remove(&info.path, repo_path).await;
+        assert!(
+            stuck.is_err(),
+            "nothing can remove a checkout git does not register: {stuck:?}"
+        );
+        let listing = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        assert!(
+            listing.contains(&info.path),
+            "the copy left behind by an attempt that could not put the record back has to be              found by the next attempt, or the task is stuck for good"
+        );
+
+        mgr.remove(&info.path, repo_path)
+            .await
+            .expect("and with the record back, an ordinary removal has to converge");
+        assert!(
+            !Path::new(&info.path).exists(),
+            "the worktree has to actually go"
+        );
+        assert!(
+            branch_exists(repo_path, "task-stranded"),
+            "and the branch has to stay"
+        );
+    }
+
+    /// The record git keeps for the worktree at `worktree_path`.
+    fn admin_record_of(worktree_path: &str) -> PathBuf {
+        let gitlink = std::fs::read_to_string(Path::new(worktree_path).join(".git"))
+            .expect("the worktree has a .git file");
+        PathBuf::from(
+            gitlink
+                .strip_prefix("gitdir:")
+                .expect("the .git file points at a record")
+                .trim(),
+        )
+    }
+
+    /// Copies of worktree records left beside git's own.
+    fn saved_records(repo_path: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(Path::new(repo_path).join(".git"))
+            .expect("read the git directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("slashit-saved-worktree-record-"))
+            })
+            .collect()
+    }
+
+    /// Cleaning up one task is an operation on that task's worktree.
+    ///
+    /// It used to end in a repository-wide `git worktree prune`, which takes
+    /// no path and decides what is stale by whether it can read each
+    /// registered worktree's `.git`. A worktree it may not look inside reads
+    /// exactly like one that is gone, so a second worktree that is entirely
+    /// present -- on an unmounted drive, or behind a permission, as here --
+    /// lost the record it needs while its files sat untouched on disk. Nothing
+    /// about it took part in the cleanup that destroyed it.
+    ///
+    /// The state that reached that prune is the one git leaves behind when it
+    /// abandons a removal and the leftover directory is cleared afterwards:
+    /// the path is gone and unregistered, so both removes answer "is not a
+    /// working tree" and there is nothing of this task's left to clear.
+    ///
+    /// Unix-only for the same reason as the tests above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn integration_a_cleanup_leaves_another_worktree_registered() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::ipc::server::current_uid() == 0 {
+            return; // root ignores the permission bits this test relies on
+        }
+
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+
+        let mgr = test_manager();
+        let bystander = mgr
+            .create(repo_path, "task-bystander")
+            .await
+            .expect("create failed");
+        let cleaned = mgr
+            .create(repo_path, "task-cleaned")
+            .await
+            .expect("create failed");
+
+        // Exactly what git leaves when it abandons a removal and the leftover
+        // is cleared away afterwards: no directory, and no record either.
+        forget_worktree_record(repo_path, &cleaned.path);
+        std::fs::remove_dir_all(&cleaned.path).expect("clear the leftover directory");
+
+        // Unreadable, not absent: everything it holds is still on disk.
+        let restore = std::fs::metadata(&bystander.path)
+            .expect("read the bystander's mode")
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&bystander.path, std::fs::Permissions::from_mode(0o000))
+            .expect("close off the bystander");
+
+        let converged = mgr.remove(&cleaned.path, repo_path).await;
+        let registered = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        std::fs::set_permissions(&bystander.path, std::fs::Permissions::from_mode(restore))
+            .expect("reopen the bystander");
+
+        assert!(
+            converged.is_ok(),
+            "a worktree that is not there is a converged removal: {converged:?}"
+        );
+        assert!(
+            registered.contains(&bystander.path),
+            "cleaning up {} destroyed the record of {}, which took no part in it -- the \
+             directory is still there, so nothing can remove it and nothing can check its \
+             branch out again",
+            cleaned.path,
+            bystander.path
+        );
+        assert!(
+            Path::new(&bystander.path).join("README.md").is_file(),
+            "and the bystander must still hold what it held"
+        );
+    }
+
+    /// Delete the record git keeps for the worktree at `worktree_path`,
+    /// leaving the checkout unregistered exactly as an abandoned removal does.
+    fn forget_worktree_record(repo_path: &str, worktree_path: &str) {
+        let admin = admin_record_of(worktree_path);
+        assert!(
+            admin.starts_with(Path::new(repo_path).join(".git").join("worktrees")),
+            "the record must be this repository's own, found {}",
+            admin.display()
+        );
+        std::fs::remove_dir_all(&admin).expect("delete the record");
     }
 
     #[tokio::test]
