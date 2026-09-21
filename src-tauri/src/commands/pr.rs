@@ -2020,7 +2020,17 @@ async fn create_pr_inner(
     task_id: &str,
 ) -> Result<String, String> {
     let task_uuid = Uuid::parse_str(task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
+    // Repository-level, not task-workspace: every command below names its
+    // branch explicitly (the task's recorded `branch_name`, never the
+    // directory's checked-out branch) and never reads or writes the working
+    // tree at `working_dir`. A `Done` task has no worktree by construction --
+    // see `resolve_task_workspace` -- and its branch is preserved specifically
+    // so it can still be delivered without recreating a checkout nobody asked
+    // for. See `push_branch` for why its jj path passes
+    // `--ignore-working-copy`: without it, this directory being the user's
+    // own primary checkout would silently fold whatever the user has dirty
+    // into their own current change.
+    let working_dir = resolve_repository_dir(state, task_uuid).await?;
 
     let (pr_title, pr_body, task_branch_name) = {
         let tasks = state.task.tasks.read().await;
@@ -2579,11 +2589,25 @@ fn build_pr_body(task: &Task) -> String {
 /// reached `jj git push --allow-new` with no `--bookmark`, which pushes every
 /// bookmark rather than one. There is no caller that legitimately does not know
 /// which branch it means, so the parameter that allowed it is gone.
+///
+/// Both jj invocations pass `--ignore-working-copy`. `jj`'s default behavior is
+/// to snapshot the working copy at the start of nearly every command -- including
+/// `git export` and `git push` -- folding whatever is dirty in `working_dir` into
+/// the current change. That is fine when `working_dir` is a task's own worktree,
+/// but this function is also reached with the repository root as `working_dir`
+/// (a `Done` task has no worktree of its own), where that same default would
+/// silently mutate the user's own primary checkout as a side effect of pushing a
+/// named branch that has nothing to do with it. `--ignore-working-copy` makes
+/// both commands operate purely on refs, which is all a push ever needs.
 async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> {
     if is_jj_repo(working_dir).await {
-        run_cmd("jj", &["git", "export"], working_dir).await
+        run_cmd("jj", &["--ignore-working-copy", "git", "export"], working_dir).await
             .map_err(|e| format!("jj git export failed: {}", e))?;
-        if let Err(jj_err) = run_cmd("jj", &["git", "push", "--allow-new", "--bookmark", branch], working_dir).await {
+        if let Err(jj_err) = run_cmd(
+            "jj",
+            &["--ignore-working-copy", "git", "push", "--allow-new", "--bookmark", branch],
+            working_dir,
+        ).await {
             run_cmd("git", &["push", "-u", "origin", branch], working_dir).await
                 .map_err(|git_err| format!("Push failed. jj: {}. git: {}", jj_err, git_err))?;
         }
@@ -3690,5 +3714,530 @@ mod tests {
 {"type":"user","message":{"content":[]}}
 {"type":"result","result":"done"}"#;
         assert_eq!(extract_text_from_stream_json(stream), "done");
+    }
+
+    // ──────────────────────────────────────────────
+    // PR creation as a repository-level, explicit-ref operation.
+    //
+    // `create_pr_inner` used to require a task worktree via
+    // `resolve_task_workspace`, which a `Done` task never has: `terminalize`
+    // clears `worktree_path` in the same write that commits `Done`, and the
+    // task's branch is preserved specifically so it can still be delivered.
+    // Every command on this path -- `git push`, `jj git export`/`git push`,
+    // `gh pr list`/`pr create` -- names the task's own branch explicitly and
+    // never reads or writes the working tree, so the directory only has to
+    // identify the repository, not host a checkout. These tests prove that
+    // with real temporary Git/jj repositories and no network: a `Done` task
+    // with no worktree can still open its PR, and doing so never touches
+    // whatever the user's own primary checkout happens to have checked out
+    // or left dirty.
+    // ──────────────────────────────────────────────
+    mod repo_level_pr_creation {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{Path, PathBuf};
+        use std::process::Command as StdCommand;
+        use std::sync::LazyLock;
+
+        // PATH is process-global; serialize the tests in this module that
+        // mutate it for the fake `gh`.
+        static PATH_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+            LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+        fn git(dir: &Path, args: &[&str]) -> String {
+            let output = StdCommand::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        fn jj(dir: &Path, args: &[&str]) -> String {
+            let output = StdCommand::new("jj")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("run jj");
+            assert!(
+                output.status.success(),
+                "jj {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        /// A bare "remote" plus a checkout with one commit on `main`, already
+        /// pushed -- no network, just a second local repository standing in
+        /// for GitHub's copy.
+        struct RepoFixture {
+            _tmp: tempfile::TempDir,
+            remote: PathBuf,
+            checkout: PathBuf,
+        }
+
+        impl RepoFixture {
+            fn new() -> Self {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let remote = tmp.path().join("remote.git");
+                let checkout = tmp.path().join("checkout");
+                git(tmp.path(), &["init", "-q", "--bare", remote.to_str().unwrap()]);
+                git(tmp.path(), &["init", "-q", "-b", "main", checkout.to_str().unwrap()]);
+                git(&checkout, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+                git(&checkout, &["remote", "add", "origin", remote.to_str().unwrap()]);
+                git(&checkout, &["push", "-q", "-u", "origin", "main"]);
+                RepoFixture { _tmp: tmp, remote, checkout }
+            }
+
+            /// Create `branch` off `main` with a real commit, without checking
+            /// it out, then leave the checkout itself on an unrelated branch
+            /// with dirty tracked and untracked changes -- the exact shape of a
+            /// `Done` task's repository sitting next to whatever the user has
+            /// open.
+            fn seed_task_branch_and_dirty_unrelated_checkout(&self, branch: &str) -> String {
+                git(&self.checkout, &["checkout", "-q", "-b", branch]);
+                std::fs::write(self.checkout.join("taskfile.txt"), "task work").unwrap();
+                git(&self.checkout, &["add", "taskfile.txt"]);
+                git(&self.checkout, &["commit", "-q", "-m", "task commit"]);
+                let task_sha = git(&self.checkout, &["rev-parse", branch]);
+
+                git(&self.checkout, &["checkout", "-q", "main"]);
+                git(&self.checkout, &["checkout", "-q", "-b", "unrelated-branch"]);
+                std::fs::write(self.checkout.join("tracked.txt"), "orig").unwrap();
+                git(&self.checkout, &["add", "tracked.txt"]);
+                git(&self.checkout, &["commit", "-q", "-m", "tracked base"]);
+                std::fs::write(self.checkout.join("tracked.txt"), "dirty tracked change").unwrap();
+                std::fs::write(self.checkout.join("dirty.txt"), "untracked dirty").unwrap();
+
+                task_sha
+            }
+
+            fn colocate_jj(&self) {
+                jj(&self.checkout, &["git", "init", "--colocate"]);
+            }
+
+            fn checked_out_branch(&self) -> String {
+                git(&self.checkout, &["rev-parse", "--abbrev-ref", "HEAD"])
+            }
+
+            fn dirty_status(&self) -> String {
+                git(&self.checkout, &["status", "--short"])
+            }
+
+            fn remote_has_branch(&self, branch: &str) -> Option<String> {
+                let out = StdCommand::new("git")
+                    .args([
+                        "--git-dir",
+                        self.remote.to_str().unwrap(),
+                        "for-each-ref",
+                        &format!("refs/heads/{branch}"),
+                    ])
+                    .output()
+                    .expect("for-each-ref");
+                String::from_utf8_lossy(&out.stdout)
+                    .split_whitespace()
+                    .next()
+                    .map(|s| s.to_string())
+            }
+
+            fn worktree_count(&self) -> usize {
+                git(&self.checkout, &["worktree", "list"]).lines().count()
+            }
+        }
+
+        /// Phase 5 (plain git): `push_branch` pushes only the named branch, run
+        /// from the repository root with an unrelated branch checked out and
+        /// dirty.
+        #[tokio::test]
+        async fn push_branch_targets_only_the_named_branch_git() {
+            let repo = RepoFixture::new();
+            let task_sha = repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+            let before_branch = repo.checked_out_branch();
+            let before_dirty = repo.dirty_status();
+
+            let pushed = push_branch(repo.checkout.to_str().unwrap(), "task-branch")
+                .await
+                .expect("push must succeed");
+
+            assert_eq!(pushed, "task-branch");
+            assert_eq!(
+                repo.remote_has_branch("task-branch").as_deref(),
+                Some(task_sha.as_str()),
+                "the remote must receive exactly the task's own commit"
+            );
+            assert!(
+                repo.remote_has_branch("unrelated-branch").is_none(),
+                "the branch the user happened to have checked out must never be pushed"
+            );
+            assert_eq!(
+                repo.checked_out_branch(), before_branch,
+                "pushing a named branch must not touch what the user has checked out"
+            );
+            assert_eq!(
+                repo.dirty_status(), before_dirty,
+                "pushing a named branch must not touch the user's dirty working tree"
+            );
+            assert_eq!(repo.worktree_count(), 1, "no worktree may be created merely to push");
+        }
+
+        /// Same proof for the jj-colocated path, plus the defect this closure
+        /// found by source inspection: `jj git export`/`jj git push` snapshot
+        /// the working copy by default (nearly every jj command does), which
+        /// would fold the user's own dirty state into their own current change
+        /// if this ran without `--ignore-working-copy` -- exactly the failure
+        /// mode this whole unit exists to close, reached through the fix
+        /// itself rather than around it.
+        #[tokio::test]
+        async fn push_branch_targets_only_the_named_branch_jj_without_snapshotting_the_dirty_primary_checkout()
+        {
+            let repo = RepoFixture::new();
+            repo.colocate_jj();
+            git(&repo.checkout, &["checkout", "-q", "-b", "task-branch"]);
+            std::fs::write(repo.checkout.join("taskfile.txt"), "task work").unwrap();
+            git(&repo.checkout, &["add", "taskfile.txt"]);
+            git(&repo.checkout, &["commit", "-q", "-m", "task commit"]);
+            let task_sha = git(&repo.checkout, &["rev-parse", "task-branch"]);
+            git(&repo.checkout, &["checkout", "-q", "main"]);
+            jj(&repo.checkout, &["--ignore-working-copy", "git", "import"]);
+
+            std::fs::write(repo.checkout.join("jjdirty.txt"), "dirty untracked").unwrap();
+            let before_at = jj(
+                &repo.checkout,
+                &["log", "--ignore-working-copy", "--no-graph", "-T", "commit_id", "-r", "@"],
+            );
+
+            let pushed = push_branch(repo.checkout.to_str().unwrap(), "task-branch")
+                .await
+                .expect("push must succeed");
+
+            assert_eq!(pushed, "task-branch");
+            assert_eq!(repo.remote_has_branch("task-branch").as_deref(), Some(task_sha.as_str()));
+
+            let after_at = jj(
+                &repo.checkout,
+                &["log", "--ignore-working-copy", "--no-graph", "-T", "commit_id", "-r", "@"],
+            );
+            assert_eq!(
+                before_at, after_at,
+                "pushing the task's bookmark must not snapshot -- and thereby mutate -- \
+                 the user's own current jj change"
+            );
+            assert_eq!(
+                std::fs::read_to_string(repo.checkout.join("jjdirty.txt")).unwrap(),
+                "dirty untracked",
+                "the dirty file must still be exactly what the user left, not folded into a commit"
+            );
+        }
+
+        struct MockGh {
+            _tmp: tempfile::TempDir,
+            log: PathBuf,
+            saved_path: Option<String>,
+        }
+
+        impl MockGh {
+            /// Answers `pr list` with no matches, `pr create` with `pr_url`, and
+            /// `pr view` with `state_json` -- the three `gh` calls on
+            /// `create_pr_inner`'s path for a task with no existing PR.
+            fn setup(pr_url: &str, state_json: &str) -> Self {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let bin_dir = tmp.path().join("bin");
+                std::fs::create_dir_all(&bin_dir).unwrap();
+                let log = tmp.path().join("gh.log");
+
+                let script = format!(
+                    "#!/bin/sh\nprintf 'PWD=%s\\n' \"$PWD\" >> {log:?}\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '[]' ;;\n  *'pr create'*) printf '%s' {pr_url:?} ;;\n  *'pr view'*) printf '%s' {state_json:?} ;;\n  *) printf '{{}}' ;;\nesac\n",
+                    log = log,
+                    pr_url = pr_url,
+                    state_json = state_json,
+                );
+                write_executable(&bin_dir.join("gh"), &script);
+
+                let saved_path = std::env::var("PATH").ok();
+                let new_path = match &saved_path {
+                    Some(p) => format!("{}:{}", bin_dir.display(), p),
+                    None => bin_dir.display().to_string(),
+                };
+                // Safety: serialized via PATH_LOCK; restored on Drop.
+                unsafe {
+                    std::env::set_var("PATH", new_path);
+                }
+
+                MockGh { _tmp: tmp, log, saved_path }
+            }
+
+            fn read_log(&self) -> String {
+                std::fs::read_to_string(&self.log).unwrap_or_default()
+            }
+        }
+
+        impl Drop for MockGh {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.saved_path {
+                        Some(p) => std::env::set_var("PATH", p),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+
+        fn write_executable(path: &Path, body: &str) {
+            std::fs::write(path, body).expect("write script");
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("chmod");
+        }
+
+        async fn build_test_state() -> (crate::AppState, tempfile::TempDir) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+                tmp.path().join("config"),
+                tmp.path().join("data"),
+                tmp.path().join("cache"),
+                tmp.path().join("runtime"),
+            ));
+            let (state, _report) = crate::app_core::build_state_with_paths(paths)
+                .await
+                .expect("build empty state");
+            (state, tmp)
+        }
+
+        async fn seed_task(
+            state: &crate::AppState,
+            repo_local_path: &str,
+            branch_name: Option<&str>,
+            status: TaskStatus,
+        ) -> Uuid {
+            let repository = crate::domain::Repository {
+                id: Uuid::new_v4(),
+                local_path: repo_local_path.to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            };
+            let repo_id = repository.id;
+            state.repository.repositories.write().await.insert(repo_id, repository);
+
+            let project = crate::domain::Project {
+                id: Uuid::new_v4(),
+                name: "test-project".to_string(),
+                repository_id: Some(repo_id),
+                scope: crate::domain::ProjectScope::Standalone,
+                state_location: crate::config::paths::StateLocation::External,
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                agent_config: crate::domain::AgentConfig {
+                    agent_type: crate::domain::AgentType::ClaudeCode,
+                    command: "claude".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    model: None,
+                    api_key: None,
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            let project_id = project.id;
+            state.project.projects.write().await.insert(project_id, project);
+
+            let mut task = create_test_task_full("pr-creation-test", project_id, status, 0);
+            task.branch_name = branch_name.map(|s| s.to_string());
+            task.worktree_path = None;
+            let task_id = task.id;
+            state.task.tasks.write().await.insert(task_id, task);
+
+            task_id
+        }
+
+        /// Phase 4 + Phase 5, combined at the level that matters to a caller:
+        /// a `Done` task with no worktree can still get its PR, the branch
+        /// pushed and the `--head` given to `gh` are both the task's own
+        /// recorded branch, and none of it touches the primary checkout's
+        /// checked-out branch, its dirty files, or creates a worktree.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn create_pr_inner_succeeds_for_a_done_task_with_no_worktree_and_leaves_the_primary_checkout_alone(
+        ) {
+            let _guard = PATH_LOCK.lock().await;
+            let repo = RepoFixture::new();
+            let task_sha = repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+            let before_branch = repo.checked_out_branch();
+            let before_dirty = repo.dirty_status();
+
+            let mock = MockGh::setup("https://github.com/testorg/testrepo/pull/99", r#"{"state":"OPEN"}"#);
+
+            let (state, _tmp) = build_test_state().await;
+            let task_id =
+                seed_task(&state, repo.checkout.to_str().unwrap(), Some("task-branch"), TaskStatus::Done)
+                    .await;
+
+            let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+            assert_eq!(
+                result.as_deref(),
+                Ok("https://github.com/testorg/testrepo/pull/99"),
+                "a Done task with no worktree must still be able to open its PR: {result:?}"
+            );
+
+            assert_eq!(
+                repo.remote_has_branch("task-branch").as_deref(),
+                Some(task_sha.as_str()),
+                "the pushed branch must be exactly the task's own commit"
+            );
+
+            let log = mock.read_log();
+            assert!(
+                log.contains("--head\ntask-branch"),
+                "gh pr create must receive the task's recorded branch as --head: {log}"
+            );
+            assert!(
+                !log.contains("unrelated-branch"),
+                "gh must never see the branch the user happens to have checked out: {log}"
+            );
+
+            assert_eq!(
+                repo.checked_out_branch(), before_branch,
+                "creating the PR must not touch what the user has checked out"
+            );
+            assert_eq!(
+                repo.dirty_status(), before_dirty,
+                "creating the PR must not touch the user's dirty working tree"
+            );
+            assert_eq!(
+                repo.worktree_count(), 1,
+                "no task worktree may be created merely to open a PR"
+            );
+
+            let tasks = state.task.tasks.read().await;
+            let task = tasks.get(&task_id).unwrap();
+            assert_eq!(task.status, TaskStatus::PrCreated);
+            assert_eq!(
+                task.pr_url.as_deref(),
+                Some("https://github.com/testorg/testrepo/pull/99")
+            );
+        }
+
+        /// Phase 6: a task with no recorded branch is refused before anything
+        /// runs, and the refusal names the actual defect rather than a generic
+        /// failure.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn create_pr_inner_refuses_a_task_with_no_recorded_branch() {
+            let _guard = PATH_LOCK.lock().await;
+            let repo = RepoFixture::new();
+            let mock = MockGh::setup("https://github.com/testorg/testrepo/pull/1", r#"{"state":"OPEN"}"#);
+
+            let (state, _tmp) = build_test_state().await;
+            let task_id =
+                seed_task(&state, repo.checkout.to_str().unwrap(), None, TaskStatus::Done).await;
+
+            let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+            let err = result.expect_err("a task with no branch has nothing to open a PR for");
+            assert!(
+                err.contains("no branch recorded"),
+                "the refusal must name the actual defect: {err}"
+            );
+            assert!(
+                mock.read_log().is_empty(),
+                "refusing before anything runs means gh must never be invoked: {}",
+                mock.read_log()
+            );
+        }
+
+        /// Phase 6: a branch recorded on the task but not actually present in
+        /// the repository fails truthfully, and no PR state is published.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn create_pr_inner_fails_truthfully_for_a_nonexistent_branch() {
+            let _guard = PATH_LOCK.lock().await;
+            let repo = RepoFixture::new();
+            let mock = MockGh::setup("https://github.com/testorg/testrepo/pull/1", r#"{"state":"OPEN"}"#);
+
+            let (state, _tmp) = build_test_state().await;
+            let task_id = seed_task(
+                &state,
+                repo.checkout.to_str().unwrap(),
+                Some("branch-that-does-not-exist"),
+                TaskStatus::Done,
+            )
+            .await;
+
+            let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+            assert!(result.is_err(), "a branch that was never created cannot be pushed: {result:?}");
+            assert!(
+                !mock.read_log().contains("pr\ncreate"),
+                "a failed push must never reach gh pr create: {}",
+                mock.read_log()
+            );
+
+            let tasks = state.task.tasks.read().await;
+            let task = tasks.get(&task_id).unwrap();
+            assert_eq!(
+                task.status, TaskStatus::Done,
+                "a failed push must not publish a PrCreated state that never happened"
+            );
+            assert!(task.pr_url.is_none());
+        }
+
+        /// Phase 7: `bulk_create_prs` is `create_pr_inner` called once per task
+        /// id with no divergent resolution logic of its own (confirmed by
+        /// reading its body: a loop over `create_pr_inner`, nothing else that
+        /// touches a workspace or a branch) -- `#[tauri::command]` is the only
+        /// thing standing between it and this test, so this drives its exact
+        /// loop body directly and proves two Done, worktree-less tasks in
+        /// different repositories both get the same repository-level
+        /// treatment as the single-task path, with no shared mutable state
+        /// leaking between them.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn bulk_create_prs_applies_the_same_contract_as_create_pr() {
+            let _guard = PATH_LOCK.lock().await;
+            let repo_a = RepoFixture::new();
+            let sha_a = repo_a.seed_task_branch_and_dirty_unrelated_checkout("task-a");
+            let repo_b = RepoFixture::new();
+            let sha_b = repo_b.seed_task_branch_and_dirty_unrelated_checkout("task-b");
+
+            let mock = MockGh::setup("https://github.com/testorg/testrepo/pull/7", r#"{"state":"OPEN"}"#);
+
+            let (state, _tmp) = build_test_state().await;
+            let task_a =
+                seed_task(&state, repo_a.checkout.to_str().unwrap(), Some("task-a"), TaskStatus::Done)
+                    .await;
+            let task_b =
+                seed_task(&state, repo_b.checkout.to_str().unwrap(), Some("task-b"), TaskStatus::Done)
+                    .await;
+
+            // `bulk_create_prs`'s own body, verbatim: loop, call
+            // `create_pr_inner`, format success/failure. Nothing else.
+            let mut results = Vec::new();
+            for task_id in [task_a.to_string(), task_b.to_string()] {
+                match create_pr_inner(&state, &task_id).await {
+                    Ok(url) => results.push(format!("Created PR for {}: {}", task_id, url)),
+                    Err(e) => results.push(format!("Failed for {}: {}", task_id, e)),
+                }
+            }
+
+            assert_eq!(results.len(), 2);
+            assert!(
+                results.iter().all(|r| r.starts_with("Created PR for")),
+                "both Done, worktree-less tasks must succeed under the repository-level contract: {results:?}"
+            );
+
+            assert_eq!(repo_a.remote_has_branch("task-a").as_deref(), Some(sha_a.as_str()));
+            assert_eq!(repo_b.remote_has_branch("task-b").as_deref(), Some(sha_b.as_str()));
+
+            let log = mock.read_log();
+            let create_calls = log.matches("pr\ncreate").count();
+            assert_eq!(create_calls, 2, "each task must reach exactly one gh pr create: {log}");
+        }
     }
 }
