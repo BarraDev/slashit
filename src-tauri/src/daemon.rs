@@ -216,10 +216,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     // reach it and no operator can stop it short of a signal. Logging and
     // carrying on would leave exactly that, so it is fatal.
     let outcome = tokio::select! {
-        reason = wait_for_signal() => {
-            println!("slashitd: {reason}, shutting down");
-            Ok(())
-        }
+        reason = wait_for_signal() => signal_outcome(reason),
         _ = shutdown_rx.changed() => {
             println!("slashitd: quit requested over IPC, shutting down");
             Ok(())
@@ -293,40 +290,74 @@ async fn shutdown(executor: &Arc<queue::TaskExecutor>) {
     );
 }
 
+/// Turn a `wait_for_signal` result into the daemon's overall outcome.
+///
+/// Pulled out of the `tokio::select!` arm so the one decision that matters --
+/// a registration failure must never read as a normal shutdown -- is testable
+/// on its own, without needing to actually exhaust the OS's signal-handler
+/// slots to exercise it.
+fn signal_outcome(reason: Result<&'static str, &'static str>) -> anyhow::Result<()> {
+    match reason {
+        Ok(reason) => {
+            println!("slashitd: {reason}, shutting down");
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("slashitd: {e}, cannot be stopped cleanly")),
+    }
+}
+
+/// Wait for the operator to ask the daemon to stop.
+///
+/// A registration failure is not a stop request, and treating it as one
+/// silently shut the daemon down seconds after start: the caller's
+/// `tokio::select!` arm printed whatever string came back and returned
+/// `Ok(())`, so a supervisor that only restarts on failure saw a clean exit
+/// and never tried again. `Err` here means the opposite of "asked to
+/// stop" -- it means stopping was never something an operator could ask
+/// for -- and the caller now propagates it as a real startup failure
+/// instead.
 #[cfg(unix)]
-async fn wait_for_signal() -> &'static str {
+async fn wait_for_signal() -> Result<&'static str, &'static str> {
     use tokio::signal::unix::{signal, SignalKind};
 
     // A daemon under systemd gets SIGTERM; one started from a shell gets
-    // SIGINT. Both mean stop.
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("slashitd: cannot listen for SIGTERM: {e}");
-            return "signal handling unavailable";
-        }
-    };
-    let mut int = match signal(SignalKind::interrupt()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("slashitd: cannot listen for SIGINT: {e}");
-            return "signal handling unavailable";
-        }
-    };
+    // SIGINT. Both mean stop. One failing to register is not fatal on its
+    // own -- the other still works -- so registration failure and "no signal
+    // can ever be waited on" are kept distinct below.
+    let mut term = signal(SignalKind::terminate())
+        .inspect_err(|e| eprintln!("slashitd: cannot listen for SIGTERM: {e}"))
+        .ok();
+    let mut int = signal(SignalKind::interrupt())
+        .inspect_err(|e| eprintln!("slashitd: cannot listen for SIGINT: {e}"))
+        .ok();
 
+    if term.is_none() && int.is_none() {
+        return Err("neither SIGTERM nor SIGINT could be registered");
+    }
+
+    // A stream that never yields keeps its arm pending rather than ready, so
+    // whichever registration failed cannot masquerade as an operator asking
+    // the daemon to stop.
     tokio::select! {
-        _ = term.recv() => "received SIGTERM",
-        _ = int.recv() => "received SIGINT",
+        Some(_) = async { match term.as_mut() {
+            Some(s) => s.recv().await,
+            None => std::future::pending().await,
+        } } => Ok("received SIGTERM"),
+        Some(_) = async { match int.as_mut() {
+            Some(s) => s.recv().await,
+            None => std::future::pending().await,
+        } } => Ok("received SIGINT"),
+        else => Err("both signal streams ended without delivering a signal"),
     }
 }
 
 #[cfg(not(unix))]
-async fn wait_for_signal() -> &'static str {
+async fn wait_for_signal() -> Result<&'static str, &'static str> {
     match tokio::signal::ctrl_c().await {
-        Ok(()) => "received Ctrl-C",
+        Ok(()) => Ok("received Ctrl-C"),
         Err(e) => {
             eprintln!("slashitd: cannot listen for Ctrl-C: {e}");
-            "signal handling unavailable"
+            Err("Ctrl-C could not be registered")
         }
     }
 }
@@ -345,6 +376,27 @@ mod tests {
         assert!(
             err.contains("headless"),
             "message should explain why: {err}"
+        );
+    }
+
+    #[test]
+    fn a_genuine_signal_is_a_clean_shutdown() {
+        assert!(signal_outcome(Ok("received SIGTERM")).is_ok());
+        assert!(signal_outcome(Ok("received SIGINT")).is_ok());
+    }
+
+    #[test]
+    fn a_registration_failure_cannot_masquerade_as_a_clean_shutdown() {
+        let err = signal_outcome(Err("neither SIGTERM nor SIGINT could be registered"))
+            .expect_err("registration failure must not collapse into Ok(())");
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot be stopped cleanly"),
+            "error should say the daemon could not be stopped cleanly, got: {message}"
+        );
+        assert!(
+            message.contains("neither SIGTERM nor SIGINT could be registered"),
+            "error should carry the original reason, got: {message}"
         );
     }
 
