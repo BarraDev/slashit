@@ -528,74 +528,6 @@ impl WorktreeManager {
         }
     }
 
-    /// Get the diff for a worktree (all changes since branching from main).
-    pub async fn get_diff(&self, worktree_path: &str) -> Result<String, String> {
-        // Find the merge-base with main, then diff from there
-        let merge_base = tokio::process::Command::new("git")
-            .args(["merge-base", "main", "HEAD"])
-            .current_dir(worktree_path)
-            .output()
-            .await
-            .map_err(|e| format!("Failed to find merge-base: {}", e))?;
-
-        let base = if merge_base.status.success() {
-            String::from_utf8_lossy(&merge_base.stdout).trim().to_string()
-        } else {
-            // If main doesn't exist, try master
-            let master_base = tokio::process::Command::new("git")
-                .args(["merge-base", "master", "HEAD"])
-                .current_dir(worktree_path)
-                .output()
-                .await
-                .map_err(|e| format!("Failed to find merge-base: {}", e))?;
-
-            if master_base.status.success() {
-                String::from_utf8_lossy(&master_base.stdout).trim().to_string()
-            } else {
-                // Fallback: diff against HEAD~1
-                "HEAD~1".to_string()
-            }
-        };
-
-        let output = tokio::process::Command::new("git")
-            .args(["diff", &format!("{}..HEAD", base)])
-            .current_dir(worktree_path)
-            .output()
-            .await
-            .map_err(|e| format!("Failed to get diff: {}", e))?;
-
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Err(format!("git diff failed: {}", String::from_utf8_lossy(&output.stderr)))
-        }
-    }
-
-    /// Get the diff stat for a worktree.
-    pub async fn get_diff_stat(&self, worktree_path: &str) -> Result<String, String> {
-        let merge_base = tokio::process::Command::new("git")
-            .args(["merge-base", "main", "HEAD"])
-            .current_dir(worktree_path)
-            .output()
-            .await
-            .map_err(|e| format!("Failed to find merge-base: {}", e))?;
-
-        let base = if merge_base.status.success() {
-            String::from_utf8_lossy(&merge_base.stdout).trim().to_string()
-        } else {
-            "HEAD~1".to_string()
-        };
-
-        let output = tokio::process::Command::new("git")
-            .args(["diff", "--stat", &format!("{}..HEAD", base)])
-            .current_dir(worktree_path)
-            .output()
-            .await
-            .map_err(|e| format!("Failed to get diff stat: {}", e))?;
-
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
-
     /// Check if a worktree directory exists on disk.
     pub fn exists(&self, worktree_path: &str) -> bool {
         Path::new(worktree_path).exists()
@@ -3919,25 +3851,42 @@ branch refs/heads/some-other-branch
         let _ = mgr.remove("/tmp/slashit_no_such_wt", "/tmp").await;
     }
 
+    /// `WorktreeManager` no longer owns diff computation itself --
+    /// `crate::worktree::task_diff` is the one canonical implementation, used
+    /// by both the UI and the AI reviewer (see `worktree::diff`'s own test
+    /// suite for its unit coverage). These integration tests confirm the
+    /// canonical diff produces a correct, real result against a worktree
+    /// this manager actually created, not just a bare temp repo.
     #[tokio::test]
-    async fn integration_get_diff_clean_worktree() {
+    async fn integration_task_diff_clean_worktree() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
 
         let mgr = test_manager();
+        let base = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        let base = String::from_utf8_lossy(&base.stdout).trim().to_string();
         let info = mgr.create(repo_path, "diff-clean").await.expect("create failed");
 
-        let diff = mgr.get_diff(&info.path).await.expect("get_diff failed");
-        // No changes committed on the new branch beyond what main has -> empty diff
-        assert!(diff.is_empty(), "expected empty diff on clean worktree, got: {}", diff);
+        let diff = crate::worktree::task_diff(&info.path, Some(&base)).await.expect("task_diff failed");
+        assert!(diff.patch.is_empty(), "expected empty diff on clean worktree, got: {}", diff.patch);
     }
 
     #[tokio::test]
-    async fn integration_get_diff_with_changes() {
+    async fn integration_task_diff_with_changes() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
 
         let mgr = test_manager();
+        let base = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        let base = String::from_utf8_lossy(&base.stdout).trim().to_string();
         let info = mgr.create(repo_path, "diff-change").await.expect("create failed");
 
         // Make a change and commit it in the worktree
@@ -3953,32 +3902,21 @@ branch refs/heads/some-other-branch
             .output()
             .unwrap();
 
-        let diff = mgr.get_diff(&info.path).await.expect("get_diff failed");
-        assert!(diff.contains("new_file.txt"), "diff should mention the new file");
+        let diff = crate::worktree::task_diff(&info.path, Some(&base)).await.expect("task_diff failed");
+        assert!(diff.patch.contains("new_file.txt"), "diff should mention the new file");
+        assert!(diff.stat.contains("new_file.txt"), "stat should mention the new file");
     }
 
     #[tokio::test]
-    async fn integration_get_diff_stat() {
+    async fn integration_task_diff_unknown_boundary_for_worktree_with_no_recorded_base() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
 
         let mgr = test_manager();
         let info = mgr.create(repo_path, "stat-branch").await.expect("create failed");
 
-        std::fs::write(Path::new(&info.path).join("stat_file.txt"), "data").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "stat_file.txt"])
-            .current_dir(&info.path)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "add stat file"])
-            .current_dir(&info.path)
-            .output()
-            .unwrap();
-
-        let stat = mgr.get_diff_stat(&info.path).await.expect("get_diff_stat failed");
-        assert!(stat.contains("stat_file.txt"), "stat should mention the file");
+        let result = crate::worktree::task_diff(&info.path, None).await;
+        assert_eq!(result, Err(crate::worktree::TaskDiffError::UnknownBoundary));
     }
 
     #[tokio::test]

@@ -714,18 +714,34 @@ impl TaskExecutor {
         // uncommitted file in that repository under a task title. A task
         // without its own worktree has nowhere to work, and saying so is the
         // only safe answer.
+        // A freshly-created worktree's `base_commit` is captured here, once,
+        // by reading `HEAD` back out of the new worktree itself right after
+        // `git worktree add` creates it -- not by re-resolving the parent
+        // branch name (or `repo_path`'s `HEAD`) in a separate call
+        // afterward. `git worktree add -b <branch> [<start-point>]` points
+        // the new worktree's `HEAD` at exactly the commit it forked from,
+        // with no commits of its own yet, so this is race-free: nothing else
+        // can move the *new* worktree's `HEAD` before this line runs,
+        // whereas re-querying the parent branch's (or `main`'s) ref after
+        // the fact could observe it having moved in the meantime -- exactly
+        // the kind of attribution drift this field exists to prevent.
+        // `None` on reattach: retry must keep comparing against the original
+        // starting point, not wherever the branch has moved to since.
         let acquired = if existing_branch.is_some() {
             self.worktree_manager
                 .reattach(&repo_path, &branch_name)
                 .await
-                .map(|info| (info, "Reattached worktree"))
+                .map(|info| (info, "Reattached worktree", None))
         } else if let Some(parent_branch) = base_branch.as_deref() {
             match self
                 .worktree_manager
                 .create_stacked_branch(&repo_path, &branch_name, parent_branch)
                 .await
             {
-                Ok(info) => Ok((info, "Created stacked worktree")),
+                Ok(info) => {
+                    let base_commit = Self::resolve_commit(&info.path, "HEAD").await;
+                    Ok((info, "Created stacked worktree", base_commit))
+                }
                 Err(e) => {
                     // Stacking is an optimisation, so losing it is not fatal:
                     // an ordinary branch off the default base still gives the
@@ -737,20 +753,26 @@ impl TaskExecutor {
                             "Stacked branch failed ({e}), falling back to normal create"
                         ),
                     });
-                    self.worktree_manager
-                        .create(&repo_path, &branch_name)
-                        .await
-                        .map(|info| (info, "Created worktree (fallback)"))
+                    match self.worktree_manager.create(&repo_path, &branch_name).await {
+                        Ok(info) => {
+                            let base_commit = Self::resolve_commit(&info.path, "HEAD").await;
+                            Ok((info, "Created worktree (fallback)", base_commit))
+                        }
+                        Err(e2) => Err(e2),
+                    }
                 }
             }
         } else {
-            self.worktree_manager
-                .create(&repo_path, &branch_name)
-                .await
-                .map(|info| (info, "Created worktree"))
+            match self.worktree_manager.create(&repo_path, &branch_name).await {
+                Ok(info) => {
+                    let base_commit = Self::resolve_commit(&info.path, "HEAD").await;
+                    Ok((info, "Created worktree", base_commit))
+                }
+                Err(e) => Err(e),
+            }
         };
 
-        let (info, what_happened) = match acquired {
+        let (info, what_happened, resolved_base_commit) = match acquired {
             Ok(acquired) => acquired,
             Err(e) => {
                 let message = format!(
@@ -772,11 +794,23 @@ impl TaskExecutor {
             level: LogLevel::Info,
             message: format!("{}: {}", what_happened, info.path),
         });
+        if existing_branch.is_none() && resolved_base_commit.is_none() {
+            self.events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message: "Could not resolve a starting commit for this task's worktree; \
+                          its diff boundary will be reported as unknown rather than guessed"
+                    .to_string(),
+            });
+        }
         {
             let mut tasks_w = self.tasks.write().await;
             if let Some(t) = tasks_w.get_mut(&task_id) {
                 t.worktree_path = Some(info.path.clone());
                 t.branch_name = Some(info.branch.clone());
+                if let Some(base_commit) = resolved_base_commit {
+                    t.base_commit = Some(base_commit);
+                }
             }
         }
         Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
@@ -1248,9 +1282,9 @@ impl TaskExecutor {
         // user's own checkout that rewrites their current change description
         // under a task title. A task with no worktree has nothing of its own to
         // review, and saying so is the only safe answer.
-        let Some(working_dir) = ({
+        let Some((working_dir, base_commit)) = ({
             let tasks_r = self.tasks.read().await;
-            tasks_r.get(&task_id).and_then(|t| t.worktree_path.clone())
+            tasks_r.get(&task_id).and_then(|t| t.worktree_path.clone().map(|w| (w, t.base_commit.clone())))
         }) else {
             let reason = "this task has no worktree of its own, so there is nothing to \
                           review and reviewing the repository itself would put the fix \
@@ -1295,18 +1329,22 @@ impl TaskExecutor {
                 message: "Starting AI review...".to_string(),
             });
 
-            // Get diff — try jj first, fallback to git
-            let diff = match Self::get_diff(&working_dir).await {
-                Some(d) => d,
-                None => {
+            // The one canonical task diff -- same boundary the UI's diff
+            // modal uses. An unknown boundary or a computation failure are
+            // both real problems, distinct from "nothing changed": either
+            // one gets an explicit `Rejected` signoff naming the reason,
+            // never a silent "no changes" skip.
+            let diff = match crate::worktree::task_diff(&working_dir, base_commit.as_deref()).await {
+                Ok(d) => d,
+                Err(e) => {
                     events.agent_event(AgentEvent::Log {
                         task_id: task_id_str.clone(),
                         level: LogLevel::Warn,
-                        message: "Could not get diff (jj/git), skipping AI review".to_string(),
+                        message: format!("Could not compute task diff, skipping AI review: {e}"),
                     });
                     let signoff = QaSignoff {
                         status: QaStatus::Rejected,
-                        issues_found: vec!["AI review skipped: diff failed".to_string()],
+                        issues_found: vec![format!("AI review skipped: {e}")],
                         timestamp: chrono::Utc::now(),
                         session_id: Uuid::new_v4(),
                     };
@@ -1315,6 +1353,7 @@ impl TaskExecutor {
                     return;
                 }
             };
+            let diff = diff.patch;
 
             if diff.trim().is_empty() {
                 events.agent_event(AgentEvent::Log {
@@ -1680,6 +1719,25 @@ impl TaskExecutor {
         Ok(repo.local_path.clone())
     }
 
+    /// Resolve `rev` to a commit hash in `dir`, for durably recording a
+    /// task's starting point at the moment its worktree is first created.
+    /// `None` on any failure (detached/empty repo, unknown rev, etc.) -- the
+    /// task still gets its worktree; its diff boundary is just truthfully
+    /// unknown rather than guessed.
+    async fn resolve_commit(dir: &str, rev: &str) -> Option<String> {
+        let output = tokio::process::Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(dir)
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if sha.is_empty() { None } else { Some(sha) }
+    }
+
     /// Commit agent changes in the worktree/working directory.
     async fn commit_changes(
         tasks: &Tasks,
@@ -1803,33 +1861,6 @@ impl TaskExecutor {
                 ),
             });
         }
-    }
-
-    /// Get diff from jj or git (whichever is available).
-    async fn get_diff(working_dir: &str) -> Option<String> {
-        // Try jj first
-        if let Ok(output) = tokio::process::Command::new("jj")
-            .args(["diff", "--git"])
-            .current_dir(working_dir)
-            .output()
-            .await
-        {
-            if output.status.success() {
-                return Some(String::from_utf8_lossy(&output.stdout).to_string());
-            }
-        }
-        // Fallback to git
-        if let Ok(output) = tokio::process::Command::new("git")
-            .args(["diff", "HEAD"])
-            .current_dir(working_dir)
-            .output()
-            .await
-        {
-            if output.status.success() {
-                return Some(String::from_utf8_lossy(&output.stdout).to_string());
-            }
-        }
-        None
     }
 
     async fn persist_task_static(tasks: &Tasks, storage: &crate::config::Storage, task_id: Uuid) {
@@ -3469,5 +3500,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&blocker);
         std::fs::write(&blocker, b"not a directory").expect("place persistence blocker");
         blocker
+    }
+
+    /// RED before the canonical task diff existed: `commit_changes` committed
+    /// the agent's work, and the old `spawn_review` diff (`jj diff` / `git
+    /// diff HEAD`) fell back to `git diff HEAD`, which is empty once
+    /// everything is already committed -- so the reviewer silently never saw
+    /// the change at all. This proves the real production commit step
+    /// (`TaskExecutor::commit_changes`) plus the canonical diff
+    /// (`crate::worktree::task_diff`) together still show the reviewer the
+    /// task's own change afterward.
+    #[tokio::test]
+    async fn the_ai_reviewer_still_sees_a_task_s_change_after_commit_changes_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git").args(args).current_dir(path).status().unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(path.join("seed.txt"), "seed\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "seed"]);
+
+        let base_commit = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(path)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // The agent's uncommitted change, exactly as `spawn_task_execution`
+        // leaves the worktree right before calling `commit_changes`.
+        std::fs::write(path.join("agent_change.txt"), "the agent's work\n").unwrap();
+
+        let task = create_test_task_full("t", Uuid::new_v4(), TaskStatus::InProgress, 0);
+        let task_id = task.id;
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+        let events = crate::events::null_sink();
+
+        // The real production commit step -- this is what made the old
+        // `git diff HEAD` fallback empty.
+        TaskExecutor::commit_changes(&tasks, task_id, path.to_str().unwrap(), &events).await;
+
+        let status_after = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status_after.stdout).trim().is_empty(),
+            "commit_changes should leave a clean tree"
+        );
+
+        let diff = crate::worktree::task_diff(path.to_str().unwrap(), Some(&base_commit))
+            .await
+            .expect("task_diff should succeed against a real base commit");
+        assert!(
+            !diff.patch.trim().is_empty(),
+            "the AI reviewer must still see the task's committed change, got an empty diff"
+        );
+        assert!(diff.patch.contains("agent_change.txt"));
     }
 }

@@ -177,6 +177,7 @@ mod tests {
                 error_message: None,
                 worktree_path: None,
                 branch_name: None,
+                base_commit: None,
                 cleanup_in_flight: false,
                 position: 0,
                 pr_review_plan: None,
