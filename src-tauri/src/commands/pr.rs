@@ -3734,13 +3734,19 @@ mod tests {
     // ──────────────────────────────────────────────
     mod repo_level_pr_creation {
         use super::*;
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
         use std::process::Command as StdCommand;
+        #[cfg(unix)]
         use std::sync::LazyLock;
 
         // PATH is process-global; serialize the tests in this module that
         // mutate it for the fake `gh`.
+        //
+        // Unix-only: the mock `gh` is a `#!/bin/sh` script made executable
+        // via `PermissionsExt`, which has no Windows equivalent.
+        #[cfg(unix)]
         static PATH_LOCK: LazyLock<tokio::sync::Mutex<()>> =
             LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -3940,12 +3946,16 @@ mod tests {
             );
         }
 
+        /// Unix-only: the mock `gh` is a `#!/bin/sh` script made executable
+        /// via `PermissionsExt`, which has no Windows equivalent.
+        #[cfg(unix)]
         struct MockGh {
             _tmp: tempfile::TempDir,
             log: PathBuf,
             saved_path: Option<String>,
         }
 
+        #[cfg(unix)]
         impl MockGh {
             /// Answers `pr list` with no matches, `pr create` with `pr_url`, and
             /// `pr view` with `state_json` -- the three `gh` calls on
@@ -3982,6 +3992,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         impl Drop for MockGh {
             fn drop(&mut self) {
                 unsafe {
@@ -3993,6 +4004,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn write_executable(path: &Path, body: &str) {
             std::fs::write(path, body).expect("write script");
             let mut perms = std::fs::metadata(path).unwrap().permissions();
@@ -4000,6 +4012,7 @@ mod tests {
             std::fs::set_permissions(path, perms).expect("chmod");
         }
 
+        #[cfg(unix)]
         async fn build_test_state() -> (crate::AppState, tempfile::TempDir) {
             let tmp = tempfile::tempdir().expect("tempdir");
             let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
@@ -4014,6 +4027,7 @@ mod tests {
             (state, tmp)
         }
 
+        #[cfg(unix)]
         async fn seed_task(
             state: &crate::AppState,
             repo_local_path: &str,
@@ -4065,6 +4079,7 @@ mod tests {
         /// pushed and the `--head` given to `gh` are both the task's own
         /// recorded branch, and none of it touches the primary checkout's
         /// checked-out branch, its dirty files, or creates a worktree.
+        #[cfg(unix)]
         #[tokio::test(flavor = "multi_thread")]
         async fn create_pr_inner_succeeds_for_a_done_task_with_no_worktree_and_leaves_the_primary_checkout_alone(
         ) {
@@ -4130,6 +4145,7 @@ mod tests {
         /// Phase 6: a task with no recorded branch is refused before anything
         /// runs, and the refusal names the actual defect rather than a generic
         /// failure.
+        #[cfg(unix)]
         #[tokio::test(flavor = "multi_thread")]
         async fn create_pr_inner_refuses_a_task_with_no_recorded_branch() {
             let _guard = PATH_LOCK.lock().await;
@@ -4156,6 +4172,7 @@ mod tests {
 
         /// Phase 6: a branch recorded on the task but not actually present in
         /// the repository fails truthfully, and no PR state is published.
+        #[cfg(unix)]
         #[tokio::test(flavor = "multi_thread")]
         async fn create_pr_inner_fails_truthfully_for_a_nonexistent_branch() {
             let _guard = PATH_LOCK.lock().await;
@@ -4198,6 +4215,7 @@ mod tests {
         /// different repositories both get the same repository-level
         /// treatment as the single-task path, with no shared mutable state
         /// leaking between them.
+        #[cfg(unix)]
         #[tokio::test(flavor = "multi_thread")]
         async fn bulk_create_prs_applies_the_same_contract_as_create_pr() {
             let _guard = PATH_LOCK.lock().await;

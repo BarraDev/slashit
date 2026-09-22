@@ -11,12 +11,18 @@
 //! describe/export, so missing/failing jj is silently tolerated. We do not
 //! assert on jj behavior here.
 
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::LazyLock;
+#[cfg(unix)]
 use tokio::sync::Mutex;
 
+#[cfg(unix)]
 use slashit_ui_lib::commands::pr::{
     address_pr_review_inner, discuss_pr_review_questions_inner, no_progress,
     AddressPrReviewOptions, PrReviewProgress, ProgressSink,
@@ -24,13 +30,19 @@ use slashit_ui_lib::commands::pr::{
 use slashit_ui_lib::domain::task::{
     PrCommentKind, PrReviewComment, PrReviewDecision, PrReviewItem, PrReviewPlan,
 };
+#[cfg(unix)]
 use slashit_ui_lib::test_helpers::{create_test_pr_review_setup, create_test_task};
 
 // PATH is process-global; serialize tests that mutate it.
 // `tokio::sync::Mutex` is await-safe so clippy doesn't flag the guard being
 // held across the async work inside each test.
+//
+// Unix-only from here down: the mocks are `#!/bin/sh` scripts made
+// executable via `PermissionsExt`, which has no Windows equivalent.
+#[cfg(unix)]
 static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+#[cfg(unix)]
 struct MockEnv {
     _tmp: tempfile::TempDir,
     bin_dir: std::path::PathBuf,
@@ -40,6 +52,7 @@ struct MockEnv {
     saved_path: Option<String>,
 }
 
+#[cfg(unix)]
 impl MockEnv {
     fn setup(claude_result: &str) -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -109,6 +122,7 @@ impl MockEnv {
     }
 }
 
+#[cfg(unix)]
 impl Drop for MockEnv {
     fn drop(&mut self) {
         // Restore PATH so other test binaries are unaffected.
@@ -122,6 +136,7 @@ impl Drop for MockEnv {
     }
 }
 
+#[cfg(unix)]
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, body).expect("write script");
     let mut perms = fs::metadata(path).unwrap().permissions();
@@ -129,6 +144,7 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, perms).expect("chmod");
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn dry_run_invokes_claude_only_no_gh_no_push() {
     let _guard = PATH_LOCK.lock().await;
@@ -189,6 +205,7 @@ async fn dry_run_invokes_claude_only_no_gh_no_push() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
     let _guard = PATH_LOCK.lock().await;
@@ -252,6 +269,7 @@ async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
 
 /// Build a plan with three items keyed to comment ids 201/202/203:
 /// two Question items (with notes) plus a Skip item that must survive untouched.
+#[cfg(unix)]
 fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
     let mut task = create_test_task("Discuss PR review questions");
     task.pr_url = Some("https://github.com/test-org/test-repo/pull/42".to_string());
@@ -354,6 +372,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
     (task, plan)
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn discuss_round_merges_updates_without_reordering_or_touching_skip() {
     let _guard = PATH_LOCK.lock().await;
@@ -416,6 +435,7 @@ async fn discuss_round_merges_updates_without_reordering_or_touching_skip() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn discuss_without_pending_questions_errors_before_calling_claude() {
     let _guard = PATH_LOCK.lock().await;
@@ -431,6 +451,7 @@ async fn discuss_without_pending_questions_errors_before_calling_claude() {
     assert_eq!(env.gh_invocations(), 0);
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_approved_set_returns_error_and_does_not_call_claude() {
     let _guard = PATH_LOCK.lock().await;
@@ -534,6 +555,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
     (task, plan)
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
     use std::sync::Mutex as StdMutex;
@@ -595,6 +617,7 @@ async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
     assert_eq!(events[2].total, Some(2));
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pending() {
     // Round 1: apply both items normally — both get fix_done + reply_posted.
@@ -650,6 +673,7 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
     }
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn rerunning_apply_with_only_replies_pending_skips_claude() {
     // Manually stage a plan where item 1 has fix_done=true but reply_posted=false
@@ -690,6 +714,7 @@ async fn rerunning_apply_with_only_replies_pending_skips_claude() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
     use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
@@ -726,6 +751,7 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
     assert!(updated_plan.items[1].reply_posted, "untouched item stays posted");
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_pr_review_replies_discovers_and_rewrites_a_legacy_reply() {
     use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
@@ -771,6 +797,7 @@ async fn sync_pr_review_replies_discovers_and_rewrites_a_legacy_reply() {
     assert!(updated_plan.items[0].pr_reply_text.is_some(), "rewrite records the body it wrote");
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
     use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;

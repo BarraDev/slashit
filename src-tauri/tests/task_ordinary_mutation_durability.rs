@@ -11,6 +11,10 @@
 //! unwritable directory, not a production-only test hook -- through one
 //! desktop command and one IPC handler, and prove the fix: `Err`, unchanged
 //! memory, unchanged disk, and a freshly restarted `AppState` that agrees.
+//!
+//! Unix-only: the durable-write failure is forced by chmod-locking a
+//! directory, which has no portable equivalent.
+#![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;

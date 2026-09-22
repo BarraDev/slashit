@@ -81,6 +81,17 @@ jobs:
       - name: Tests (backend + harness units)
         run: cargo test -p slashit-ui -p slashit-ipc -p slashit-acceptance
 
+      # `slashit-frontend` is the root package (Leptos/WASM), not `slashit-ui`
+      # -- see that crate's own Cargo.toml comment. Its unit tests run on the
+      # host target, not wasm32: `#[wasm_bindgen_test]` compiles to a plain
+      # `#[test]` off wasm32, and the handful of tests that need a real
+      # browser (`wasm_input_tests`, `kanban_tests`) are already scoped behind
+      # `#[cfg(target_arch = "wasm32")]`/`wasm_bindgen_test_configure!(run_in_browser)`
+      # in their own source, so this step runs only the portable subset --
+      # it does not need the wasm32 target this job already adds for `trunk build`.
+      - name: Tests (frontend components/models)
+        run: cargo test -p slashit-frontend
+
       # The embedded WebDriver server can drive the webview and evaluate
       # arbitrary JavaScript. Asserting it stays out of a default build is
       # cheaper than trusting that nobody adds it to `default` by accident.
@@ -218,5 +229,18 @@ jobs:
       # `/proc` read, a `libc::kill` or an XDG assumption escapes its
       # `#[cfg(target_os = "linux")]`, this job fails instead of the platform
       # quietly becoming unbuildable.
-      - name: Check (backend + CLI + IPC + acceptance harness)
-        run: cargo check -p slashit-ui -p slashit -p slashit-ipc -p slashit-acceptance
+      #
+      # `--tests` compiles (not runs) every unit and integration test target
+      # in these four packages, not just their production code. It is safe
+      # here specifically because: `slashit-acceptance`'s Linux-only runtime
+      # (`context`/`driver`/`fake_agent`/`process`/`state`) is gated
+      # `#[cfg(target_os = "linux")]` at the `pub mod` declaration, and its
+      # `acceptance`/`product_acceptance` integration-test binaries both
+      # declare `required-features = ["run-acceptance"]`, which this command
+      # does not pass -- so cargo skips compiling those binaries here
+      # entirely, on any platform. It does *not* prove they compile with that
+      # feature enabled off Linux; nothing in this job claims that. Every
+      # `std::os::unix`/`PermissionsExt`-using test in the other three
+      # packages is individually `#[cfg(unix)]`-gated at its own definition.
+      - name: Check (backend + CLI + IPC + acceptance harness, including test code)
+        run: cargo check --tests -p slashit-ui -p slashit -p slashit-ipc -p slashit-acceptance

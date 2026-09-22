@@ -9,6 +9,10 @@
 //! production-only test hook -- through each of the three desktop commands
 //! that reach those paths, and prove the fix: `Err`, unchanged memory,
 //! unchanged disk.
+//!
+//! Unix-only: the durable-write failure is forced by chmod-locking a
+//! directory, which has no portable equivalent.
+#![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
