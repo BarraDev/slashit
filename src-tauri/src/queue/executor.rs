@@ -2693,6 +2693,46 @@ impl TaskExecutor {
         cleaned_up
     }
 
+    /// Same as [`Self::register_fake_running_execution_for_test`], except a
+    /// caller-supplied probe runs synchronously the instant cancellation is
+    /// observed, strictly before the "cleaned up" flag is set and therefore
+    /// strictly before whatever `.await` is waiting on that flag (here,
+    /// [`Self::end_task_owners_under_lease`]'s join of this owner's handle)
+    /// can return.
+    ///
+    /// For a cross-module ordering regression: the probe can read some piece
+    /// of external state (a git branch's tip commit, say) at the exact moment
+    /// this module considers the owner ended, without teaching this module
+    /// anything about git. If the probe observes the *post*-mutation state,
+    /// the caller ended ownership too late (after the mutation, not before
+    /// it) -- a defect no amount of asserting "the owner is gone by the time
+    /// the command returns" can distinguish from the correct ordering, since
+    /// both leave the owner gone by then.
+    ///
+    /// `#[cfg(unix)]`: its callers live in `commands::pr`'s unix-only
+    /// `pr_command_ownership` test module, for the same reason every other
+    /// real-subprocess/real-git fixture there is.
+    #[cfg(unix)]
+    pub(crate) async fn register_fake_running_execution_with_probe_for_test(
+        &self,
+        task_id: Uuid,
+        probe: impl FnOnce() + Send + 'static,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let cleaned_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let flag = cleaned_up.clone();
+        let handle = tokio::spawn(async move {
+            let _ = cancelled.changed().await;
+            probe();
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        self.running_handles
+            .write()
+            .await
+            .insert(task_id, RunningTask { handle, cancel });
+        cleaned_up
+    }
+
     pub(crate) async fn register_unkillable_running_execution_for_test(&self, task_id: Uuid) {
         let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(async move {

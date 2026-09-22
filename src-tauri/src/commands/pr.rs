@@ -4971,6 +4971,619 @@ mod tests {
                 assert!(cleaned_up.load(std::sync::atomic::Ordering::SeqCst));
                 assert_eq!(updated.unwrap().status, TaskStatus::PrCreated);
             }
+
+            // ──────────────────────────────────────────────
+            // Unit 5C3 evidence-closure pass (final): the three gaps this
+            // unit's own report recorded and left open in §24 items 4/5/6 --
+            // `recover_private_email_and_create_pr`'s early ownership guard,
+            // `address_pr_review`'s full-command stale-write safety, and
+            // retry-after-partial-success not creating a duplicate PR.
+            // ──────────────────────────────────────────────
+
+            /// Group-2 item 4, case A: `recover_private_email_and_create_pr`'s
+            /// own early `end_active_ownership_before_pr_side_effect` call
+            /// ends a live owner strictly *before* `rewrite_branch_tip_author`
+            /// -- not merely "by the time the whole command returns", which
+            /// `create_pr_inner`'s own (later, structurally too-late-to-
+            /// protect-this-rewrite) guard would already guarantee on its
+            /// own. Proven structurally: the fake owner's cancellation probe
+            /// reads the branch tip's author email synchronously, inside the
+            /// same `tokio::spawn`ed future `end_task_owners_under_lease`
+            /// joins to completion -- so whatever it observes is guaranteed
+            /// to have happened before `end_active_ownership_before_pr_
+            /// side_effect(...).await` can return, which is strictly before
+            /// this function's next statement can run. If the probe ever saw
+            /// the *rewritten* email, ownership would have been ended too
+            /// late (or not by this function's own guard at all).
+            #[tokio::test(flavor = "multi_thread")]
+            async fn recover_private_email_ends_a_live_owner_before_rewriting_the_branch_tip_author() {
+                use tauri::Manager;
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let task_sha = repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+                let mock = MockGh::setup(
+                    "https://github.com/testorg/testrepo/pull/77",
+                    r#"{"state":"OPEN"}"#,
+                );
+
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-branch"),
+                    TaskStatus::InProgress,
+                )
+                .await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    tasks.get_mut(&task_id).unwrap().worktree_path =
+                        Some(repo.checkout.to_str().unwrap().to_string());
+                }
+
+                let observed_author_at_cleanup: Arc<std::sync::Mutex<Option<String>>> =
+                    Arc::new(std::sync::Mutex::new(None));
+                let probe_checkout = repo.checkout.clone();
+                let probe_slot = observed_author_at_cleanup.clone();
+                let cleaned_up = executor
+                    .register_fake_running_execution_with_probe_for_test(task_id, move || {
+                        let output = StdCommand::new("git")
+                            .args(["show", "-s", "--format=%ae", "refs/heads/task-branch"])
+                            .current_dir(&probe_checkout)
+                            .output()
+                            .expect("probe: read the branch tip author while cleanup runs");
+                        *probe_slot.lock().unwrap() =
+                            Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+                    })
+                    .await;
+
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let result = recover_private_email_and_create_pr(
+                    app.state(),
+                    task_id.to_string(),
+                    "recovered+12345@users.noreply.github.com".to_string(),
+                )
+                .await;
+
+                assert_eq!(
+                    result.as_deref(),
+                    Ok("https://github.com/testorg/testrepo/pull/77"),
+                    "recovery must still succeed once the live owner is safely ended: {result:?}"
+                );
+                assert!(
+                    cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+                    "the active owner must actually have been ended, not merely raced"
+                );
+                assert_eq!(
+                    observed_author_at_cleanup.lock().unwrap().as_deref(),
+                    Some("test@example.com"),
+                    "at the moment ownership-ending completed, the branch tip author must \
+                     still be the ORIGINAL author -- proving the rewrite had not happened \
+                     yet, not merely that the owner is gone by the time the whole command \
+                     returns"
+                );
+
+                let after_sha = git(&repo.checkout, &["rev-parse", "refs/heads/task-branch"]);
+                assert_ne!(after_sha, task_sha, "the branch tip must have been rewritten");
+                let after_author =
+                    git(&repo.checkout, &["show", "-s", "--format=%ae", "refs/heads/task-branch"]);
+                assert_eq!(
+                    after_author, "recovered+12345@users.noreply.github.com",
+                    "the rewrite must land only after ownership was confirmed ended"
+                );
+                assert_eq!(
+                    mock.read_log().matches("pr\ncreate").count(), 1,
+                    "exactly one gh pr create, after the rewrite: {}", mock.read_log()
+                );
+            }
+
+            /// Group-2 item 4, case B: when the active owner cannot be ended
+            /// within the bounded shutdown window, recovery must refuse
+            /// outright -- the branch tip must never move, its author must
+            /// never be rewritten, and `gh` must never be invoked. This is
+            /// also the vehicle for this unit's own required mutation proof
+            /// (recorded in the evidence-closure report, not committed here):
+            /// temporarily replacing this function's own early
+            /// `end_active_ownership_before_pr_side_effect(&state,
+            /// task_uuid).await?;` call with a no-op (leaving
+            /// `create_pr_inner`'s independent guard at this function's tail
+            /// untouched) lets execution reach `rewrite_branch_tip_author`
+            /// despite the unkillable owner -- `create_pr_inner`'s own later
+            /// guard still refuses the overall call, so `result` stays `Err`,
+            /// but the branch-untouched assertions below fail, which is
+            /// exactly the discriminating power this test exists to prove.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn recover_private_email_refuses_when_ownership_cannot_be_ended_in_time_and_never_mutates_the_branch(
+            ) {
+                use tauri::Manager;
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let task_sha = repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+                let mock = MockGh::setup(
+                    "https://github.com/testorg/testrepo/pull/78",
+                    r#"{"state":"OPEN"}"#,
+                );
+
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-branch"),
+                    TaskStatus::InProgress,
+                )
+                .await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    tasks.get_mut(&task_id).unwrap().worktree_path =
+                        Some(repo.checkout.to_str().unwrap().to_string());
+                }
+
+                executor.register_unkillable_running_execution_for_test(task_id).await;
+
+                let before_author =
+                    git(&repo.checkout, &["show", "-s", "--format=%ae", "refs/heads/task-branch"]);
+
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let result = recover_private_email_and_create_pr(
+                    app.state(),
+                    task_id.to_string(),
+                    "recovered+99999@users.noreply.github.com".to_string(),
+                )
+                .await;
+
+                let err = result
+                    .expect_err("an owner that cannot be ended in time must refuse recovery outright");
+                assert!(
+                    err.contains("still finishing up"),
+                    "the refusal must be actionable, not generic: {err}"
+                );
+
+                let after_sha = git(&repo.checkout, &["rev-parse", "refs/heads/task-branch"]);
+                assert_eq!(
+                    after_sha, task_sha,
+                    "the branch tip must never move when ownership could not be safely ended"
+                );
+                let after_author =
+                    git(&repo.checkout, &["show", "-s", "--format=%ae", "refs/heads/task-branch"]);
+                assert_eq!(
+                    after_author, before_author,
+                    "the branch author must never be rewritten when ownership could not be \
+                     safely ended"
+                );
+                assert!(
+                    repo.remote_has_branch("task-branch").is_none(),
+                    "the branch must never be pushed when ownership could not be safely ended"
+                );
+                assert_eq!(
+                    mock.read_log(), "",
+                    "gh must never be invoked when ownership could not be safely ended"
+                );
+
+                let live: &crate::AppState = app.state::<crate::AppState>().inner();
+                let tasks = live.task.tasks.read().await;
+                assert_eq!(
+                    tasks.get(&task_id).unwrap().status,
+                    TaskStatus::InProgress,
+                    "the task's prior status must remain authoritative after a refusal"
+                );
+            }
+
+            /// Group-2 item 5: the full `address_pr_review` Tauri command --
+            /// not merely `address_pr_review_inner` -- through cancellation by
+            /// a real, independent lifecycle operation
+            /// (`crate::lifecycle::end_active_ownership`, the exact call every
+            /// lifecycle front door already makes; see e.g.
+            /// `commands::task`'s own `update_task_status_ends_a_running_
+            /// execution_before_moving_the_task`), to `save_review_plan_on_
+            /// task`'s actual write.
+            ///
+            /// **FULL COMMAND HARNESS BLOCKED, partially**: `address_pr_review`'s
+            /// own signature is `app: tauri::AppHandle` -- not generic over the
+            /// runtime -- so `tauri::test::mock_app()`'s `AppHandle<MockRuntime>`
+            /// does not typecheck against it (`E0308: expected struct
+            /// AppHandle<tauri_runtime_wry::Wry<EventLoopMessage>>, found struct
+            /// AppHandle<MockRuntime>`, confirmed by actually trying it before
+            /// writing this test the current way). The literal outer
+            /// `#[tauri::command]` wrapper -- one `use tauri::Emitter;` and one
+            /// `app_handle.emit("pr-review-progress", &ev)` closure -- therefore
+            /// cannot be invoked from this test binary at all, by any
+            /// currently-available API in this crate; no other test in this
+            /// codebase invokes an `AppHandle`-taking command either (checked
+            /// by grep). Everything else in `address_pr_review`'s body --
+            /// `resolve_task_workspace`, reading the task, `plan.backfill_
+            /// lifecycle_from_last_apply()`, `begin_pr_helper` (the real
+            /// `PrHelperLease`/admission path), `address_pr_review_inner` (the
+            /// real per-item loop, the real `run_claude_pr_helper`, the real
+            /// cancellation race), and -- the specific gap this item exists to
+            /// close -- the real, final `save_review_plan_on_task` call, is
+            /// reproduced here verbatim, in the same order, with the only
+            /// substitution being a `ProgressSink` backed by a `Vec` collector
+            /// instead of `app_handle.emit(...)`. That is the closest this
+            /// pass can get to the real command boundary without a production
+            /// change to `address_pr_review`'s signature, which this pass does
+            /// not make.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn address_pr_review_command_never_lands_a_fabricated_success_after_another_lifecycle_operation_cancels_it(
+            ) {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = BlockingClaude::install();
+
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let state = Arc::new(state);
+                let workdir = tempfile::tempdir().expect("workdir");
+                let task_id =
+                    seed_task(&state, "/tmp/unused-repo-for-this-test", Some("task-branch"), TaskStatus::InProgress)
+                        .await;
+                let project_id = {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.worktree_path = Some(workdir.path().display().to_string());
+                    task.pr_url = Some("https://github.com/testorg/testrepo/pull/321".to_string());
+                    task.project_id
+                };
+
+                let plan = PrReviewPlan {
+                    generated_at: chrono::Utc::now(),
+                    pr_url: "https://github.com/testorg/testrepo/pull/321".to_string(),
+                    review_decision: None,
+                    comments: vec![PrReviewComment {
+                        id: Some(1),
+                        kind: crate::domain::task::PrCommentKind::Inline,
+                        author: "reviewer".to_string(),
+                        body: "please fix this".to_string(),
+                        path: None,
+                        line: None,
+                        url: None,
+                        created_at: None,
+                        updated_at: None,
+                    }],
+                    items: vec![PrReviewItem {
+                        comment_id: Some(1),
+                        summary: "fix the thing".to_string(),
+                        decision: PrReviewDecision::Fix,
+                        reasoning: String::new(),
+                        proposed_change: String::new(),
+                        approved: true,
+                        user_note: String::new(),
+                        fix_done: false,
+                        reply_posted: false,
+                        last_agent_summary: None,
+                        last_error: None,
+                        pr_reply_text: None,
+                        reply_comment_id: None,
+                    }],
+                    raw_plan: "durable-marker-before-apply".to_string(),
+                    last_apply: None,
+                };
+                let options =
+                    AddressPrReviewOptions { auto_push: false, auto_reply: false, dry_run: false };
+
+                // `address_pr_review`'s own body, verbatim, with the one
+                // substitution the AppHandle blocker above forces: a `Vec`-
+                // backed `ProgressSink` in place of `app_handle.emit(...)`.
+                let events: Arc<std::sync::Mutex<Vec<PrReviewProgress>>> =
+                    Arc::new(std::sync::Mutex::new(Vec::new()));
+                let events_for_sink = events.clone();
+                let progress: ProgressSink = Arc::new(move |ev: PrReviewProgress| {
+                    events_for_sink.lock().unwrap().push(ev);
+                });
+
+                let state_for_task = state.clone();
+                let apply_handle = tokio::spawn(async move {
+                    let task_uuid = task_id;
+                    let working_dir = resolve_task_workspace(&state_for_task.task.tasks, task_uuid).await?;
+                    let task = {
+                        let tasks = state_for_task.task.tasks.read().await;
+                        tasks.get(&task_uuid).cloned().ok_or("Task not found")?
+                    };
+                    let mut plan = plan;
+                    plan.backfill_lifecycle_from_last_apply();
+                    let (_lease, cancel_rx) = begin_pr_helper(&state_for_task, task_uuid).await?;
+                    let (result, updated_plan) =
+                        address_pr_review_inner(task, working_dir, plan, options, progress, cancel_rx).await?;
+                    save_review_plan_on_task(
+                        &state_for_task.task.tasks,
+                        &state_for_task.storage,
+                        task_uuid,
+                        updated_plan,
+                    )
+                    .await?;
+                    Ok::<PrReviewApplyResult, String>(result)
+                });
+
+                let leader_pid = wait_for_pid(|| mock.leader_pid()).await;
+                let descendant_pid = wait_for_pid(|| mock.descendant_pid()).await;
+                assert!(pid_is_alive(leader_pid), "the fake claude leader must be running");
+                assert!(pid_is_alive(descendant_pid), "the fake claude's descendant must be running");
+
+                // Step 3: another, independent lifecycle operation ends this
+                // PR-helper flow through the real product mechanism -- the
+                // exact call `update_task_status`/`reorder_task`/
+                // `link_pr_to_task` all make. Bounded by `AGENT_SHUTDOWN_
+                // TIMEOUT`; succeeding here means `address_pr_review`'s own
+                // `PrHelperLease` has already been dropped, which only
+                // happens after `address_pr_review`'s own `save_review_plan_
+                // on_task` call has already run and returned.
+                let running: Option<&dyn crate::lifecycle::ExecutionOwnership> =
+                    Some(executor.as_ref());
+                crate::lifecycle::end_active_ownership(running, task_id)
+                    .await
+                    .expect("ending the live PR helper must succeed within the bounded window");
+
+                // Step 4: the lifecycle-changing operation completes its own,
+                // independent durable write -- `Backlog` is the same status a
+                // real Stop moves a task to (see `lifecycle.rs`'s own doc for
+                // `end_task_owners_under_lease`). This is the "newer
+                // lifecycle result" that must remain authoritative.
+                crate::lifecycle::record(
+                    &state.task.tasks,
+                    &state.storage,
+                    task_id,
+                    &|staged: &mut std::collections::HashMap<Uuid, Task>| {
+                        if let Some(t) = staged.get_mut(&task_id) {
+                            t.status = TaskStatus::Backlog;
+                        }
+                    },
+                )
+                .await
+                .expect("the newer lifecycle write must succeed");
+
+                // Step 5/6: let the cancelled command's own future actually
+                // settle, then read both in-memory and on-disk state.
+                let apply_result = tokio::time::timeout(std::time::Duration::from_secs(5), apply_handle)
+                    .await
+                    .expect("address_pr_review must settle promptly once its lease has dropped")
+                    .expect("the command task must not panic");
+                let result = apply_result.expect(
+                    "a per-item cancellation is reported as a failed item, not a hard command error",
+                );
+                assert!(result.fixed_ids.is_empty(), "the cancelled item must not be reported fixed");
+                assert_eq!(
+                    result.failed_ids, vec![1],
+                    "the cancelled item must be reported failed, not silently dropped"
+                );
+                assert!(
+                    result.fix_errors.iter().any(|e| e.contains("cancelled")),
+                    "the failure reason must say why: {:?}", result.fix_errors
+                );
+                assert!(
+                    events.lock().unwrap().iter().any(|e| e.kind == "item_failed"),
+                    "the real progress channel must have reported the cancelled item as \
+                     failed, not silently skipped it: {:?}", events.lock().unwrap()
+                );
+                assert!(
+                    !events.lock().unwrap().iter().any(|e| e.kind == "item_succeeded"),
+                    "no 'item succeeded' progress event may land for an item that was \
+                     actually killed mid-flight: {:?}", events.lock().unwrap()
+                );
+
+                wait_until(|| !pid_is_alive(leader_pid)).await;
+                wait_until(|| !pid_is_alive(descendant_pid)).await;
+
+                let live: &crate::AppState = &state;
+                let tasks = live.task.tasks.read().await;
+                let final_task = tasks.get(&task_id).unwrap();
+                assert_eq!(
+                    final_task.status, TaskStatus::Backlog,
+                    "the newer, independent lifecycle write must remain authoritative -- a \
+                     stale save from the cancelled helper must not have landed after it and \
+                     reverted it"
+                );
+                let plan = final_task.pr_review_plan.as_ref().expect("the plan must have been saved");
+                assert!(
+                    !plan.items[0].fix_done,
+                    "the cancelled item must not be recorded as fixed on the task"
+                );
+                assert!(
+                    plan.items[0].last_error.as_deref().is_some_and(|e| e.contains("cancelled")),
+                    "the cancelled item's own last_error must say so: {:?}", plan.items[0].last_error
+                );
+                let last_apply = plan.last_apply.as_ref().expect("a real apply always records last_apply");
+                assert!(last_apply.fixed_ids.is_empty());
+                assert_eq!(last_apply.failed_ids, vec![1]);
+                drop(tasks);
+
+                let persisted = live.storage.load_project_tasks(project_id).expect("reload tasks");
+                let stored = persisted.iter().find(|t| t.id == task_id).expect("task on disk");
+                assert_eq!(
+                    stored.status, TaskStatus::Backlog,
+                    "the newer lifecycle status must also be what is durable on disk"
+                );
+                let stored_plan = stored.pr_review_plan.as_ref().expect("the plan must be durable");
+                assert!(!stored_plan.items[0].fix_done);
+            }
+
+            /// Group-2 item 6: `create_pr_inner`'s retry path -- not
+            /// `find_existing_pr_for_branch` in isolation -- through a real
+            /// partial-success shape: `gh pr create` genuinely ran and
+            /// returned a real PR URL, but this process's own durable link
+            /// write failed immediately after (the same deterministic
+            /// mechanism `save_review_plan_on_task`'s own failure tests use,
+            /// `block_task_persistence`: a regular file where the tasks
+            /// directory has to be). A retry, once the local condition alone
+            /// is fixed, must rediscover the PR `gh pr list` now reports and
+            /// must not call `gh pr create` a second time.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn create_pr_retries_after_a_local_link_failure_without_creating_a_duplicate_pr() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let task_sha = repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+                let gh = RetryAwareGh::install("https://github.com/testorg/testrepo/pull/501");
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-branch"),
+                    TaskStatus::InProgress,
+                )
+                .await;
+
+                // Force the local durable link write to fail, after the
+                // remote side effects (push, `gh pr create`) have already
+                // genuinely happened. `build_test_state` has not yet had any
+                // reason to create its own `config` directory (unlike
+                // `review_plan_storage`'s fixture, which does this itself),
+                // so it is created here first -- `block_task_persistence`
+                // only replaces the `tasks` subdirectory within it.
+                std::fs::create_dir_all(state.storage.paths().config_dir())
+                    .expect("create the config dir before blocking its tasks subdirectory");
+                block_task_persistence(&state.storage);
+
+                let first = create_pr_inner(&state, &task_id.to_string()).await;
+                let first_err = first.expect_err(
+                    "a local link failure after a real remote create must be reported, not \
+                     swallowed as success",
+                );
+                assert!(
+                    first_err.contains("https://github.com/testorg/testrepo/pull/501"),
+                    "the PR is real; the caller must be able to rediscover it from the \
+                     error text: {first_err}"
+                );
+                assert!(
+                    !first_err.to_lowercase().contains("open a new pull request")
+                        && !first_err.to_lowercase().contains("create a new pr"),
+                    "recovery text must not encourage creating another PR: {first_err}"
+                );
+
+                assert_eq!(
+                    gh.read_log().matches("pr\ncreate").count(), 1,
+                    "the first invocation must reach gh pr create exactly once: {}",
+                    gh.read_log()
+                );
+                assert_eq!(
+                    repo.remote_has_branch("task-branch").as_deref(),
+                    Some(task_sha.as_str()),
+                    "the branch must have been pushed for real before the local link failed"
+                );
+                {
+                    let tasks = state.task.tasks.read().await;
+                    let task = tasks.get(&task_id).unwrap();
+                    assert!(
+                        task.pr_url.is_none(),
+                        "a failed local write must not leave a half-applied pr_url in memory"
+                    );
+                    assert_eq!(
+                        task.status, TaskStatus::InProgress,
+                        "a failed local write must not leave a half-applied status in memory"
+                    );
+                }
+
+                // Remove ONLY the local failure condition -- GitHub's state
+                // (the PR the first invocation genuinely created) is
+                // untouched.
+                let blocker = state.storage.paths().config_dir().join("tasks");
+                std::fs::remove_file(&blocker).expect("remove the persistence blocker");
+
+                let second = create_pr_inner(&state, &task_id.to_string()).await;
+                let second_url = second.expect(
+                    "the retry must rediscover the PR gh pr list now reports, not fail again",
+                );
+                assert_eq!(second_url, "https://github.com/testorg/testrepo/pull/501");
+
+                assert_eq!(
+                    gh.read_log().matches("pr\ncreate").count(), 1,
+                    "the retry must rediscover the existing PR rather than creating a \
+                     second one: {}",
+                    gh.read_log()
+                );
+
+                let tasks = state.task.tasks.read().await;
+                let task = tasks.get(&task_id).unwrap();
+                assert_eq!(
+                    task.pr_url.as_deref(),
+                    Some("https://github.com/testorg/testrepo/pull/501")
+                );
+                assert_eq!(task.status, TaskStatus::PrCreated);
+                let project_id = task.project_id;
+                drop(tasks);
+
+                let persisted = state.storage.load_project_tasks(project_id).expect("reload tasks");
+                let stored = persisted.iter().find(|t| t.id == task_id).expect("task on disk");
+                assert_eq!(
+                    stored.pr_url.as_deref(),
+                    Some("https://github.com/testorg/testrepo/pull/501")
+                );
+                assert_eq!(stored.status, TaskStatus::PrCreated);
+            }
+
+            /// A fake `gh` for the retry-without-duplicate proof above:
+            /// `pr list` answers `[]` until `pr create` has genuinely run
+            /// once (a `created.flag` file the `pr create` branch writes,
+            /// the `pr list` branch reads), then reports the created PR from
+            /// then on -- truthfully simulating GitHub's real state across
+            /// two independent `create_pr_inner` calls in the same test,
+            /// since the flag lives in this fixture's own tempdir, kept alive
+            /// for the test's whole body (unlike `MockGh`, whose tempdir a
+            /// caller cannot keep past its own `Drop`).
+            struct RetryAwareGh {
+                _tmp: tempfile::TempDir,
+                call_log: PathBuf,
+                saved_path: Option<String>,
+            }
+
+            impl RetryAwareGh {
+                fn install(pr_url: &str) -> Self {
+                    let tmp = tempfile::tempdir().expect("tempdir");
+                    let bin_dir = tmp.path().join("bin");
+                    std::fs::create_dir_all(&bin_dir).unwrap();
+                    let call_log = tmp.path().join("gh-calls.log");
+                    let created_flag = tmp.path().join("created.flag");
+                    let empty_json = tmp.path().join("empty.json");
+                    let existing_json = tmp.path().join("existing.json");
+                    let view_json = tmp.path().join("view.json");
+                    let pr_url_file = tmp.path().join("pr_url.txt");
+
+                    std::fs::write(&empty_json, "[]").unwrap();
+                    std::fs::write(&existing_json, format!(r#"[{{"url":"{pr_url}"}}]"#)).unwrap();
+                    std::fs::write(&view_json, r#"{"state":"OPEN"}"#).unwrap();
+                    std::fs::write(&pr_url_file, pr_url).unwrap();
+
+                    let script = format!(
+                        "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {call_log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {call_log:?}\ncase \"$*\" in\n  *'pr list'*) if [ -f {created_flag:?} ]; then cat {existing_json:?}; else cat {empty_json:?}; fi ;;\n  *'pr create'*) touch {created_flag:?}; printf '%s' \"$(cat {pr_url_file:?})\" ;;\n  *'pr view'*) cat {view_json:?} ;;\n  *) printf '{{}}' ;;\nesac\n",
+                        call_log = call_log,
+                        created_flag = created_flag,
+                        existing_json = existing_json,
+                        empty_json = empty_json,
+                        pr_url_file = pr_url_file,
+                        view_json = view_json,
+                    );
+                    let bin = bin_dir.join("gh");
+                    write_executable(&bin, &script);
+
+                    let saved_path = std::env::var("PATH").ok();
+                    let new_path = match &saved_path {
+                        Some(p) => format!("{}:{}", bin_dir.display(), p),
+                        None => bin_dir.display().to_string(),
+                    };
+                    // Safety: serialized via PATH_LOCK; restored on Drop.
+                    unsafe {
+                        std::env::set_var("PATH", new_path);
+                    }
+
+                    RetryAwareGh { _tmp: tmp, call_log, saved_path }
+                }
+
+                fn read_log(&self) -> String {
+                    std::fs::read_to_string(&self.call_log).unwrap_or_default()
+                }
+            }
+
+            impl Drop for RetryAwareGh {
+                fn drop(&mut self) {
+                    unsafe {
+                        match &self.saved_path {
+                            Some(p) => std::env::set_var("PATH", p),
+                            None => std::env::remove_var("PATH"),
+                        }
+                    }
+                }
+            }
+
         }
     }
 }
