@@ -45,6 +45,20 @@ struct RunningTask {
     cancel: tokio::sync::watch::Sender<bool>,
 }
 
+/// How long [`TaskExecutor::stop_task`] waits for a cancelled execution's
+/// future to finish joining before giving up on this attempt.
+///
+/// The future itself is not what can run long on the direct process: `cancel`
+/// asks it to stop waiting on `runner.wait()` and fall straight to
+/// `runner.kill()`, and `SIGKILL` cannot be blocked by the process it targets.
+/// What is not bounded by that is a process wedged in an uninterruptible
+/// syscall (blocked disk/NFS I/O), which no signal can shorten -- and the
+/// caller is holding the task's lifecycle lease for every moment of this
+/// wait, so an unbounded one hangs a Stop with no way out. Same order of
+/// magnitude as [`crate::lifecycle::ACQUIRE_TIMEOUT`], and the same shape of
+/// answer: a timeout here is not a failed stop, it is nothing attempted yet.
+const AGENT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Emit an `AgentEvent` through any sink.
 ///
 /// The executor produces exactly one event name, so the conversion lives here
@@ -1093,21 +1107,43 @@ impl TaskExecutor {
         // registered the run, and the execution future itself never asks for
         // it -- everything it does on the way out (killing the process,
         // removing its `running_handles` entry, recording the execution) uses
-        // its own locks. So the longest this can wait is the tail of another
-        // lifecycle operation, never the lifetime of an agent.
+        // its own locks. So the longest this holds the lease for is the tail
+        // of another lifecycle operation, or one agent's own bounded shutdown
+        // -- never its unbounded lifetime; see [`AGENT_SHUTDOWN_TIMEOUT`].
         let _lease = self.lifecycle.acquire(task_id).await?;
 
         // Taken out of the map before awaiting anything, so the guard is
         // released before the future below tries to remove itself.
         let running = self.running_handles.write().await.remove(&task_id);
 
-        if let Some(running) = running {
-            let _ = running.cancel.send(true);
+        if let Some(mut owner) = running {
+            let _ = owner.cancel.send(true);
             // A run that finished on its own between the removal and here has
             // already recorded its own outcome; joining it is still correct,
             // it simply returns at once. A panicked run returns an error,
             // which the settling below is what covers.
-            let _ = running.handle.await;
+            //
+            // `&mut owner.handle` rather than `owner.handle`: a `timeout` that
+            // elapses drops the future it was given, and a `JoinHandle`
+            // dropped without being polled to completion does not abort the
+            // task it names -- it only forgets about it. Borrowing keeps
+            // `owner` intact so it can be put back exactly as if this call
+            // had never reached in.
+            match tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, &mut owner.handle).await {
+                Ok(_) => {}
+                Err(_) => {
+                    // Still live, so still owning the checkout: put it back
+                    // exactly where it was found rather than leave the map
+                    // disagreeing with reality, and refuse the transition
+                    // instead of settling a task whose agent has not actually
+                    // ended.
+                    self.running_handles.write().await.insert(task_id, owner);
+                    return Err(format!(
+                        "the agent for task {task_id} is still finishing up; nothing was \
+                         changed, so this can simply be asked for again shortly"
+                    ));
+                }
+            }
         }
 
         Self::settle_stopped_static(&self.tasks, &self.storage, task_id).await
@@ -3031,6 +3067,153 @@ mod tests {
         assert!(
             !TaskExecutor::is_pending(stopped),
             "a stopped task must not satisfy the predicate the poller starts work from"
+        );
+    }
+
+    // ---- The lease-hold bound --------------------------------------------------
+
+    /// Register an execution the way [`register_cancellable_execution`] does,
+    /// except the future never finishes even once it observes cancellation --
+    /// the shape of a process wedged in an uninterruptible syscall, or any
+    /// other tail a `SIGKILL` cannot shorten. Proves `stop_task` bounds the
+    /// join rather than trusting the future to end.
+    async fn register_execution_that_ignores_cancellation(
+        executor: &TaskExecutor,
+        task_id: Uuid,
+    ) -> tokio::sync::watch::Receiver<bool> {
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let observed = cancelled.clone();
+        let handle = tokio::spawn(async move {
+            let _ = cancelled.changed().await;
+            std::future::pending::<()>().await;
+        });
+        executor
+            .running_handles
+            .write()
+            .await
+            .insert(task_id, RunningTask { handle, cancel });
+        observed
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_gives_up_after_a_bound_rather_than_hold_the_lease_forever() {
+        // With time paused and no timer anywhere in the stuck future, tokio
+        // has nothing to auto-advance past -- so without a bound this test
+        // does not fail an assertion, it hangs until the harness kills it.
+        // That is the regression, reproduced.
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        register_execution_that_ignores_cancellation(&executor, task_id).await;
+
+        let result = tokio::time::timeout(
+            AGENT_SHUTDOWN_TIMEOUT + std::time::Duration::from_secs(1),
+            executor.stop_task(task_id),
+        )
+        .await
+        .expect("stop_task itself must be what gives up, not this outer bound");
+
+        assert!(
+            result.is_err(),
+            "a stop that could not confirm the agent ended must not report success"
+        );
+        assert!(
+            executor.running_handles.read().await.contains_key(&task_id),
+            "still live, so still owning the checkout: the entry must be put back \
+             rather than left removed, or a concurrent read of is_task_running would \
+             answer falsely that nothing is running"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_that_times_out_does_not_settle_the_task_as_stopped() {
+        // The caller-facing half: a stop that could not confirm the agent
+        // ended must not move the task to `Backlog` -- that would tell the
+        // person the run is over while the checkout is still owned by
+        // something still writing to it.
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        register_execution_that_ignores_cancellation(&executor, task_id).await;
+
+        let result = executor.stop_task(task_id).await;
+        assert!(result.is_err());
+
+        let tasks = executor.tasks.read().await;
+        assert_eq!(
+            tasks.get(&task_id).expect("the task survives").status,
+            TaskStatus::InProgress,
+            "nothing was confirmed ended, so nothing about the task may change"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_stop_still_asked_the_execution_to_end() {
+        // The bound is on the join, not on cancellation itself: a stop that
+        // times out must still have signalled the future to end, so it is
+        // not stuck waiting on a cancellation nobody ever asked for.
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+        let observed = register_execution_that_ignores_cancellation(&executor, task_id).await;
+
+        let _ = executor.stop_task(task_id).await;
+
+        assert!(
+            *observed.borrow(),
+            "the stuck future must have observed the cancellation signal, even \
+             though it then chose to ignore it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn once_a_stuck_agent_actually_finishes_a_later_stop_ends_it_normally() {
+        // The recovery half: the bound is a retry signal, not a permanent
+        // refusal. The task that timed out and was put back is still the
+        // live fact -- once it actually finishes, the very next call joins
+        // it and reports it as ended.
+        let (executor, _temps) = test_executor();
+        let task = running_task(Uuid::new_v4());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let _ = cancelled.changed().await;
+            let _ = release_rx.await;
+        });
+        executor
+            .running_handles
+            .write()
+            .await
+            .insert(task_id, RunningTask { handle, cancel });
+
+        let first = executor.stop_task(task_id).await;
+        assert!(first.is_err(), "setup: must still be stuck here");
+        assert!(executor.running_handles.read().await.contains_key(&task_id));
+
+        // Now let it actually finish.
+        let _ = release_tx.send(());
+
+        let second = executor.stop_task(task_id).await;
+        assert!(
+            second.is_ok(),
+            "a future that has now finished must be reported as ended, not as still \
+             going: {second:?}"
+        );
+        assert!(
+            executor.running_handles.read().await.is_empty(),
+            "joined and gone: nothing left pointing at it"
+        );
+        let tasks = executor.tasks.read().await;
+        assert_eq!(
+            tasks.get(&task_id).expect("the task survives").status,
+            TaskStatus::Backlog,
+            "the second, successful stop must settle the task"
         );
     }
 

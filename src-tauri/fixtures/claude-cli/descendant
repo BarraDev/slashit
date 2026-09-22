@@ -1,0 +1,8 @@
+#!/bin/sh
+printf '{"type":"system","subtype":"init","session_id":"s-descendant","model":"fixture-model"}\n'
+# A background descendant the leader does not wait for, in the same process
+# group (nothing here calls setpgid/setsid) -- and with its own stdio, so it
+# does not hold the leader's stdout pipe open past the leader's own exit.
+sh -c 'printf "%s\n" "$$" > descendant.pid; exec sleep 300' </dev/null >/dev/null 2>&1 &
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-descendant","result":"done"}\n'
+exit 0

@@ -49,6 +49,16 @@ clap = { version = "4", features = ["derive"] }
 # feature below.
 tauri-plugin-wdio-webdriver = { version = "1.4", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# `waitid`'s `WNOWAIT` (see `agents::runner::ClaudeRunner::wait`) needs the raw
+# syscall constants and `siginfo_t` layout, which differ between Linux and
+# macOS; hand-declaring them the way `geteuid` is declared in `ipc::server`
+# would mean getting that per-platform ABI right from memory. Also used
+# directly for `killpg`/`process_group`/`kill(pid, 0)` in `agents::runner`,
+# one bound syscall source instead of several hand-rolled `extern "C"`
+# declarations.
+libc = "0.2"
+
 [features]
 # ACCEPTANCE BUILDS ONLY. Never enable this for a release.
 #
