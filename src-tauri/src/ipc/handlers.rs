@@ -279,19 +279,38 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         Err(e) => return IpcResponse::error(e),
     };
 
+    let old_status = match ctx.tasks.read().await.get(&task_uuid).map(|t| t.status.clone()) {
+        Some(s) => s,
+        None => return IpcResponse::error(format!("Task {task_id} not found")),
+    };
+
+    // Same rule as the desktop `update_task_status`: any status this handler
+    // reaches actually changes the task's lifecycle column (`Done` returned
+    // above, through the same `terminalize` that already refuses under an
+    // active owner), so a previous owner must be ended before the durable
+    // write below, under the lease this handler already holds -- or the
+    // whole move is refused, exactly like a durable-write failure is.
+    if old_status != new_status {
+        let running = ctx
+            .executor
+            .get()
+            .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+        if let Err(e) = crate::lifecycle::end_active_ownership(running, task_uuid).await {
+            return IpcResponse::error(e);
+        }
+    }
+
     // The same classifier the desktop app uses, through the same
     // stage/persist/publish primitive: this handler used to assign
     // `task.status` directly, which left a task moved e.g. `Failed ->
     // InProgress` with its stale `phase = Failed` and `error_message`
     // intact, so it said "running" while failing every readiness check.
     let new_status_for_amend = new_status.clone();
+    let effect = crate::lifecycle::classify_status_transition(&old_status, &new_status_for_amend);
     let amend = move |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
-            let old_status = task.status.clone();
             task.status = new_status_for_amend.clone();
-            if let crate::lifecycle::StatusTransitionEffect::ResetExecutionState =
-                crate::lifecycle::classify_status_transition(&old_status, &new_status_for_amend)
-            {
+            if let crate::lifecycle::StatusTransitionEffect::ResetExecutionState = effect {
                 task.reset_execution_state();
             }
         }
@@ -413,6 +432,26 @@ async fn handle_enqueue_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
         Ok(id) => id,
         Err(_) => return IpcResponse::error(format!("Invalid task_id: {task_id}")),
     };
+
+    // Same contract as the desktop `enqueue_durably`: `slashit enqueue` is not
+    // restricted to a task with no active owner, so the lease and the
+    // ownership-ending guard below come first.
+    let _lease = match ctx.task_lifecycle_locks.acquire(task_uuid).await {
+        Ok(lease) => lease,
+        Err(e) => return IpcResponse::error(e),
+    };
+
+    let old_status = ctx.tasks.read().await.get(&task_uuid).map(|t| t.status.clone());
+
+    if !matches!(&old_status, None | Some(TaskStatus::Queue)) {
+        let running = ctx
+            .executor
+            .get()
+            .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+        if let Err(e) = crate::lifecycle::end_active_ownership(running, task_uuid).await {
+            return IpcResponse::error(e);
+        }
+    }
 
     // Durable directly, rather than through `QueueManager::enqueue_task`
     // (which only ever mutates the shared map) followed by a best-effort
@@ -981,6 +1020,173 @@ mod tests {
         assert_eq!(
             without_repo.path, None,
             "a project with no repository must report an honest absence, not an invented path"
+        );
+    }
+}
+
+/// The IPC-side half of Unit 5C2's corrective-pass front-door parity: every
+/// scenario here is the exact one pinned against the desktop command in
+/// `crate::commands::task::lifecycle_ownership`, over the same test-only fake
+/// owners, driven through the real `handle_move_task`/`dispatch` -- not a
+/// copy of its logic -- so `slashit move` and dragging a card in the app are
+/// held to the same ownership contract rather than each trusted separately.
+#[cfg(test)]
+mod lifecycle_ownership {
+    use super::*;
+    use crate::test_helpers::{attach_test_executor_ipc, create_test_task_full, ipc_test_context};
+    use slashit_ipc::Endpoint;
+    use std::sync::Arc;
+
+    fn peer() -> PeerContext {
+        PeerContext {
+            endpoint: Endpoint::Unix {
+                path: std::path::PathBuf::from("/nonexistent-for-tests"),
+            },
+            os_verified: true,
+        }
+    }
+
+    async fn test_ctx() -> (tempfile::TempDir, IpcContext) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        (tmp, ipc_test_context(paths))
+    }
+
+    async fn seed(ctx: &IpcContext, status: TaskStatus) -> Uuid {
+        let project_id = Uuid::new_v4();
+        let task = create_test_task_full("under test", project_id, status, 0);
+        let task_id = task.id;
+        ctx.tasks.write().await.insert(task_id, task.clone());
+        ctx.storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
+        task_id
+    }
+
+    #[tokio::test]
+    async fn ipc_move_task_ends_a_running_execution_before_moving_the_task() {
+        let (_tmp, ctx) = test_ctx().await;
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let task_id = seed(&ctx, TaskStatus::InProgress).await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let answer = dispatch(
+            IpcRequest::MoveTask { task_id: task_id.to_string(), status: "backlog".to_string() },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+
+        assert!(answer.ok, "{answer:?}");
+        assert!(
+            cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "the previous execution owner must be driven to its own cleanup before the \
+             IPC move is reported as done"
+        );
+        assert_eq!(executor.running_task_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn ipc_move_task_ends_a_running_review_before_moving_the_task() {
+        let (_tmp, ctx) = test_ctx().await;
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let task_id = seed(&ctx, TaskStatus::AiReview).await;
+        let cleaned_up = executor.register_fake_reviewing_owner_for_test(task_id).await;
+
+        let answer = dispatch(
+            IpcRequest::MoveTask { task_id: task_id.to_string(), status: "backlog".to_string() },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+
+        assert!(answer.ok, "{answer:?}");
+        assert!(cleaned_up.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(executor.running_task_count().await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ipc_move_task_refuses_when_ownership_cannot_be_ended_in_time() {
+        let (_tmp, ctx) = test_ctx().await;
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let task_id = seed(&ctx, TaskStatus::InProgress).await;
+        executor.register_unkillable_running_execution_for_test(task_id).await;
+
+        let answer = dispatch(
+            IpcRequest::MoveTask { task_id: task_id.to_string(), status: "backlog".to_string() },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+
+        assert!(
+            !answer.ok,
+            "an owner that cannot be ended within the bounded shutdown must refuse the \
+             move, not silently proceed: {answer:?}"
+        );
+        assert_eq!(
+            ctx.tasks.read().await.get(&task_id).unwrap().status,
+            TaskStatus::InProgress,
+            "the previous durable status must survive a refused move"
+        );
+        assert!(executor.is_task_running(task_id).await);
+    }
+
+    #[tokio::test]
+    async fn ipc_move_task_same_status_does_not_touch_a_running_execution() {
+        // The IPC protocol has no positional reorder, so its analogue of
+        // "same-column reorder" is a move whose requested status is the
+        // status the task already has.
+        let (_tmp, ctx) = test_ctx().await;
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let task_id = seed(&ctx, TaskStatus::InProgress).await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let answer = dispatch(
+            IpcRequest::MoveTask { task_id: task_id.to_string(), status: "in_progress".to_string() },
+            &ctx,
+            &peer(),
+        )
+        .await
+        .response;
+
+        assert!(answer.ok, "{answer:?}");
+        assert!(
+            !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "a move that does not change the task's status must never touch the agent \
+             working on it"
+        );
+        assert!(executor.is_task_running(task_id).await);
+    }
+
+    #[tokio::test]
+    async fn ipc_enqueue_task_ends_a_running_execution_before_requeuing_the_task() {
+        let (_tmp, ctx) = test_ctx().await;
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let task_id = seed(&ctx, TaskStatus::InProgress).await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let answer = dispatch(IpcRequest::EnqueueTask { task_id: task_id.to_string() }, &ctx, &peer())
+            .await
+            .response;
+
+        assert!(answer.ok, "{answer:?}");
+        assert!(
+            cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "`slashit enqueue` must end a task's previous owner before overwriting its \
+             status with Queue"
+        );
+        assert_eq!(
+            ctx.tasks.read().await.get(&task_id).unwrap().status,
+            TaskStatus::Queue
         );
     }
 }

@@ -135,6 +135,52 @@ pub struct TerminalizeCtx<'a> {
 #[async_trait::async_trait]
 pub trait ExecutionOwnership: Send + Sync {
     async fn is_task_running(&self, task_id: Uuid) -> bool;
+
+    /// End whatever execution or AI review/fix ownership currently exists
+    /// for `task_id`, killing and reaping the underlying process before
+    /// returning -- the same bounded shutdown [`crate::queue::TaskExecutor::
+    /// stop_task`] performs, made reachable to a caller that is not asking
+    /// for a stop but is about to durably change the task's status.
+    ///
+    /// The caller must already hold `task_id`'s lifecycle lease
+    /// ([`TaskLifecycleLocks::acquire`]/`try_acquire`). This does not take
+    /// it itself: it is called from inside the same critical section a
+    /// lifecycle-changing command already opened, and taking the lease again
+    /// here would deadlock against the caller's own held guard.
+    ///
+    /// `Ok(())` means ownership is now clear -- whether because something
+    /// was owning the task and was safely ended, or because nothing was.
+    /// `Err` means owned work could not be ended within the bounded shutdown
+    /// window: nothing was changed, the owner is left exactly as it was, and
+    /// the caller must refuse its own transition rather than publish a
+    /// status the old owner might still act on.
+    ///
+    /// Defaulted to a no-op success for implementors -- test doubles that
+    /// only ever answer `is_task_running` -- that have no ownership of their
+    /// own to end.
+    async fn end_ownership_under_lease(&self, _task_id: Uuid) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// End active ownership before a lifecycle-changing status transition
+/// commits, through whatever [`ExecutionOwnership`] handle the caller has.
+///
+/// Shared by every front door that can move a task's status outside
+/// [`terminalize`] -- `update_task_status`, `reorder_task` and their IPC/CLI
+/// equivalents, the queue's enqueue/requeue commands -- so "end the previous
+/// owner before committing a new status" is one call reused everywhere,
+/// rather than a conditional re-derived per command. `None` where no
+/// executor exists yet (startup, or a test that builds no queue), which is
+/// also exactly when nothing could be running.
+pub async fn end_active_ownership(
+    running: Option<&dyn ExecutionOwnership>,
+    task_id: Uuid,
+) -> Result<(), String> {
+    match running {
+        Some(owner) => owner.end_ownership_under_lease(task_id).await,
+        None => Ok(()),
+    }
 }
 
 /// Who asked, which decides how hard this tries and what it refuses.

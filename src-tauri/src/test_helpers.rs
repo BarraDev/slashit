@@ -104,6 +104,76 @@ pub fn ipc_test_context(paths: std::sync::Arc<crate::config::paths::AppPaths>) -
     }
 }
 
+/// A real [`crate::queue::TaskExecutor`], wired to an already-built
+/// [`crate::AppState`]'s own handles the same way `lib.rs`'s `setup()` wires
+/// the production one -- sharing its `tasks`, `storage`, `task_lifecycle_locks`
+/// and friends rather than building fresh ones -- and installed into
+/// `state.executor`.
+///
+/// For a lifecycle-front-door test that needs a live execution/review owner
+/// registered (see `TaskExecutor::register_fake_running_execution_for_test`
+/// and its `reviewing_handles` sibling) to prove a command like
+/// `update_task_status` or `reorder_task` ends that owner before committing
+/// its own status write. A command reached through `tauri::State` sees
+/// exactly this executor via `state.executor.get()`, the same as it would in
+/// the running app.
+pub fn attach_test_executor(state: &crate::AppState) -> std::sync::Arc<crate::queue::TaskExecutor> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let executor = Arc::new(crate::queue::TaskExecutor::new(
+        crate::queue::executor::TaskExecutorConfig {
+            tasks: state.task.tasks.clone(),
+            queue_manager: state.queue.manager.clone(),
+            executions: Arc::new(RwLock::new(HashMap::new())),
+            logs: Arc::new(RwLock::new(HashMap::new())),
+            projects: state.project.projects.clone(),
+            repositories: state.repository.repositories.clone(),
+            workspace_registry: state.workspace.registry.clone(),
+            storage: state.storage.clone(),
+            worktree_manager: state.worktree_manager.clone(),
+            events: state.events(),
+            lifecycle: state.task_lifecycle_locks.clone(),
+        },
+    ));
+    let _ = state.executor.set(executor.clone());
+    executor
+}
+
+/// Same as [`attach_test_executor`], for an [`IpcContext`] rather than an
+/// [`crate::AppState`] -- the daemon's own handles, so an IPC handler test
+/// can prove the same thing through `ctx.executor` that the desktop test
+/// proves through `state.executor`.
+pub async fn attach_test_executor_ipc(ctx: &IpcContext) -> std::sync::Arc<crate::queue::TaskExecutor> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let executor = Arc::new(crate::queue::TaskExecutor::new(
+        crate::queue::executor::TaskExecutorConfig {
+            tasks: ctx.tasks.clone(),
+            queue_manager: ctx.queue_manager.clone(),
+            executions: Arc::new(RwLock::new(HashMap::new())),
+            logs: Arc::new(RwLock::new(HashMap::new())),
+            projects: ctx.projects.clone(),
+            repositories: ctx.repositories.clone(),
+            workspace_registry: Arc::new(RwLock::new(
+                crate::config::WorkspaceRegistry::load_from(
+                    ctx.paths.config_dir().join("workspaces.toml"),
+                )
+                .expect("a nonexistent workspaces file loads as an empty registry"),
+            )),
+            storage: ctx.storage.clone(),
+            worktree_manager: ctx.worktree_manager.clone(),
+            events: ctx.events.clone(),
+            lifecycle: ctx.task_lifecycle_locks.clone(),
+        },
+    ));
+    let _ = ctx.executor.set(executor.clone());
+    executor
+}
+
 /// Create a test task with default values
 pub fn create_test_task(title: &str) -> Task {
     Task {

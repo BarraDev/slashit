@@ -1300,6 +1300,47 @@ impl TaskExecutor {
         // [`AGENT_SHUTDOWN_TIMEOUT`].
         let _lease = self.lifecycle.acquire(task_id).await?;
 
+        let ended = self.end_task_owners_under_lease(task_id).await?;
+
+        // `ended` names which map actually held (and joined) a live owner,
+        // which is the status the caller provably found the task in a moment
+        // ago -- not necessarily the task's status right now. See
+        // `settle_stopped_static`'s own doc for why that distinction is the
+        // whole safety argument against a stale write: an owner found in
+        // `running_handles` may have already finished on its own and
+        // recorded `AiReview` by the time the join above returns, and the
+        // guard below is what stops this from clobbering that. Nothing found
+        // to end (`None`) is the same `InProgress` guard `stop_task` always
+        // used for "neither map owned it" -- a crash or an unrecorded
+        // outcome may have left the task stranded `InProgress` with no live
+        // owner, and that is the one case this settles to `Backlog`.
+        let from_status = ended.unwrap_or(TaskStatus::InProgress);
+        Self::settle_stopped_static(&self.tasks, &self.storage, task_id, from_status).await
+    }
+
+    /// End whatever execution or AI review/fix ownership currently exists for
+    /// `task_id`, killing and reaping the underlying process before
+    /// returning, and leave the task's persisted status untouched.
+    ///
+    /// This is [`stop_task`](Self::stop_task)'s ownership-ending mechanics on
+    /// their own, without the "settle to `Backlog`" opinion `stop_task`
+    /// forms about what an ended run means -- a caller that is about to
+    /// write its *own* new status (a lifecycle transition, not a stop) wants
+    /// the process gone, not `Backlog`. **The caller must already hold
+    /// `task_id`'s lifecycle lease**; this never asks for it, or it would
+    /// deadlock against a caller that is calling it from inside one.
+    ///
+    /// `Ok(Some(status))` names which map a live owner was joined out of
+    /// (`InProgress` for an execution, `AiReview` for a review/fix) -- the
+    /// status the task provably had the moment ownership was taken, useful to
+    /// a caller (`stop_task`) that needs to guard a later write against a
+    /// race with the owner's own completion. `Ok(None)` means neither map had
+    /// a live entry, so there was nothing to end. `Err` means an owner was
+    /// found but did not finish within [`AGENT_SHUTDOWN_TIMEOUT`]: it has
+    /// been put back exactly where it was found, and the caller must refuse
+    /// whatever it was about to do rather than proceed as if ownership had
+    /// ended.
+    async fn end_task_owners_under_lease(&self, task_id: Uuid) -> Result<Option<TaskStatus>, String> {
         // Taken out of the map before awaiting anything, so the guard is
         // released before the future below tries to remove itself.
         let running = self.running_handles.write().await.remove(&task_id);
@@ -1309,7 +1350,7 @@ impl TaskExecutor {
             // A run that finished on its own between the removal and here has
             // already recorded its own outcome; joining it is still correct,
             // it simply returns at once. A panicked run returns an error,
-            // which the settling below is what covers.
+            // which the caller's own settling is what covers.
             //
             // `&mut owner.handle` rather than `owner.handle`: a `timeout` that
             // elapses drops the future it was given, and a `JoinHandle`
@@ -1322,9 +1363,9 @@ impl TaskExecutor {
                 Err(_) => {
                     // Still live, so still owning the checkout: put it back
                     // exactly where it was found rather than leave the map
-                    // disagreeing with reality, and refuse the transition
-                    // instead of settling a task whose agent has not actually
-                    // ended.
+                    // disagreeing with reality, and refuse instead of telling
+                    // a caller ownership ended when the agent has not
+                    // actually stopped.
                     self.running_handles.write().await.insert(task_id, owner);
                     return Err(format!(
                         "the agent for task {task_id} is still finishing up; nothing was \
@@ -1332,30 +1373,19 @@ impl TaskExecutor {
                     ));
                 }
             }
-            // Guarded on `InProgress`: joining an owner found in
-            // `running_handles` proves an execution *was* live, but by the
-            // time the join above returns, that same execution's own
-            // completion path may have already run to the end and durably
-            // recorded `AiReview` -- self-removing from this very map is one
-            // of its last steps, after the status write, so a race that
-            // finds the entry a moment before that self-removal still needs
-            // this to check the status this future actually settled on, not
-            // assume its own cancellation won.
-            return Self::settle_stopped_static(&self.tasks, &self.storage, task_id, TaskStatus::InProgress).await;
+            return Ok(Some(TaskStatus::InProgress));
         }
 
         // No execution owns it; an AI review/fix might. Same shape, same
-        // bound, same map-then-settle ordering -- and that ordering is the
+        // bound, same map-then-return ordering -- and that ordering is the
         // whole safety argument against a stale write: whatever this join
         // waits for (including any durable write the review future itself
         // makes on its way out, such as `transition_to_human_review`) always
-        // finishes *before* `settle_stopped_static` runs, never after. A
-        // review that wins the race and legitimately publishes `HumanReview`
-        // is therefore never overwritten by the settle below, which only
-        // ever touches a task still `AiReview` once it actually runs -- the
-        // same "check what actually happened, not what was asked for" reason
-        // the execution arm above guards on `InProgress` rather than
-        // assuming its own cancellation won.
+        // finishes *before* this returns, never after. A caller that commits
+        // its own status write only once this has returned therefore never
+        // races a review that is still mid-flight -- it either sees the
+        // review's own completed result already durable (nothing left to
+        // end) or ends it before it can publish anything further.
         let reviewing = self.reviewing_handles.write().await.remove(&task_id);
 
         if let Some(mut owner) = reviewing {
@@ -1370,19 +1400,13 @@ impl TaskExecutor {
                     ));
                 }
             }
-            return Self::settle_stopped_static(&self.tasks, &self.storage, task_id, TaskStatus::AiReview).await;
+            return Ok(Some(TaskStatus::AiReview));
         }
 
         // Neither map owned it: either nothing was ever running for this
         // task, or an execution already finished and moved status off
-        // `InProgress` entirely on its own (see the guard above -- this is
-        // that same case, just observed after this future's self-removal
-        // instead of during the race with it). `InProgress` is the right
-        // guard here for the same reason: only a task a crash or an
-        // unrecorded outcome left stranded `InProgress` with no live owner
-        // should be cleaned up to `Backlog` by a stop that found nothing to
-        // cancel.
-        Self::settle_stopped_static(&self.tasks, &self.storage, task_id, TaskStatus::InProgress).await
+        // `InProgress`/`AiReview` entirely on its own.
+        Ok(None)
     }
 
     /// Record a stopped task as work that is waiting for a person again.
@@ -2266,6 +2290,139 @@ impl TaskExecutor {
 impl crate::lifecycle::ExecutionOwnership for TaskExecutor {
     async fn is_task_running(&self, task_id: Uuid) -> bool {
         TaskExecutor::is_task_running(self, task_id).await
+    }
+
+    /// The queue is also what owns `running_handles`/`reviewing_handles`, so
+    /// it is what a lifecycle-changing status transition asks to end
+    /// ownership before it commits -- see
+    /// [`Self::end_task_owners_under_lease`], which this simply discards the
+    /// `from_status` of: a caller reached through this trait is about to
+    /// write its own new status, not settle one derived from which map an
+    /// owner was found in.
+    async fn end_ownership_under_lease(&self, task_id: Uuid) -> Result<(), String> {
+        self.end_task_owners_under_lease(task_id).await?;
+        Ok(())
+    }
+}
+
+/// TEST-ONLY registration helpers, `pub(crate)` so the lifecycle-front-door
+/// tests in `commands::task` and `ipc::handlers` can put a live owner into
+/// this module's private handle maps without a real worktree, a real
+/// subprocess or a real admission permit.
+///
+/// What those front-door tests need to prove is ordering and refusal --
+/// "ownership is ended (or the transition is refused) before the new status
+/// commits" -- not "a real process is actually killed", which this module's
+/// own `stop_task` tests already prove against real fixture subprocesses
+/// (`review_lifecycle::a_running_reviewer_agent_can_be_stopped_safely` and
+/// siblings) over the exact same `end_task_owners_under_lease` mechanics
+/// `end_ownership_under_lease` now shares with `stop_task`. Duplicating that
+/// subprocess proof at every call site would prove the same fact five times
+/// instead of once.
+#[cfg(test)]
+impl TaskExecutor {
+    /// Register a live execution owner the way
+    /// [`Self::spawn_task_execution`] does, over a future that ends only
+    /// once it is cancelled. Returns a flag the fake owner sets after
+    /// observing cancellation, the same "cleanup actually ran" proof
+    /// `register_cancellable_execution` gives this module's own tests.
+    pub(crate) async fn register_fake_running_execution_for_test(
+        &self,
+        task_id: Uuid,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let cleaned_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let flag = cleaned_up.clone();
+        let handle = tokio::spawn(async move {
+            let _ = cancelled.changed().await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        self.running_handles
+            .write()
+            .await
+            .insert(task_id, RunningTask { handle, cancel });
+        cleaned_up
+    }
+
+    /// Same as [`Self::register_fake_running_execution_for_test`], for
+    /// `reviewing_handles`.
+    pub(crate) async fn register_fake_reviewing_owner_for_test(
+        &self,
+        task_id: Uuid,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let cleaned_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let flag = cleaned_up.clone();
+        let handle = tokio::spawn(async move {
+            let _ = cancelled.changed().await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        self.reviewing_handles
+            .write()
+            .await
+            .insert(task_id, ReviewOwner { handle, cancel });
+        cleaned_up
+    }
+
+    /// Register a live execution owner whose cleanup, once cancelled, makes
+    /// its own durable write to the task -- the shape a real completion path
+    /// takes (`spawn_task_execution`'s own status write,
+    /// `spawn_review`'s `transition_to_human_review`) before it returns.
+    ///
+    /// For a front-door-level stale-write regression: the whole safety
+    /// argument in [`Self::end_task_owners_under_lease`]'s doc is that this
+    /// write happens-before the caller's own commit, because the caller
+    /// joins the owner's future to completion first. Given `tasks`/`storage`
+    /// directly rather than reached through `self`, because the point is to
+    /// write into the very same shared map and file the calling test's
+    /// `AppState`/`IpcContext` and the command under test both use.
+    pub(crate) async fn register_fake_running_execution_with_writeback_for_test(
+        &self,
+        task_id: Uuid,
+        tasks: Tasks,
+        storage: crate::config::Storage,
+    ) {
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let _ = cancelled.changed().await;
+            let mut tasks_w = tasks.write().await;
+            if let Some(t) = tasks_w.get_mut(&task_id) {
+                // `title` on purpose: a lifecycle transition's own
+                // `reset_execution_state()` legitimately clears
+                // `phase`/`error_message` as part of the very move under
+                // test, which would make this indistinguishable from the
+                // stale write it exists to catch. `title` is untouched by
+                // every status transition, so it can only carry the value
+                // this closure wrote, from whenever this closure wrote it.
+                t.title = "owner's own cleanup ran".to_string();
+                let project_id = t.project_id;
+                let snapshot: Vec<Task> = tasks_w.values().cloned().collect();
+                drop(tasks_w);
+                let _ = storage.save_project_tasks(project_id, &snapshot);
+            }
+        });
+        self.running_handles
+            .write()
+            .await
+            .insert(task_id, RunningTask { handle, cancel });
+    }
+
+    /// Register a running-execution owner whose future never finishes even
+    /// once it observes cancellation -- the shape of a process wedged in an
+    /// uninterruptible syscall, mirroring this module's own
+    /// `register_execution_that_ignores_cancellation`. For proving a
+    /// caller's timeout/refusal path restores the owner and refuses the
+    /// transition rather than proceeding as though ownership had ended.
+    pub(crate) async fn register_unkillable_running_execution_for_test(&self, task_id: Uuid) {
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let _ = cancelled.changed().await;
+            std::future::pending::<()>().await;
+        });
+        self.running_handles
+            .write()
+            .await
+            .insert(task_id, RunningTask { handle, cancel });
     }
 }
 
