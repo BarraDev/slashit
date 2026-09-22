@@ -5,6 +5,47 @@ use crate::domain::{Task, TaskStatus, TaskCategory, TaskPriority, TaskComplexity
 pub use uuid::Uuid;
 use chrono::Utc;
 
+/// The one process-global lock for every `--lib` unit test that mutates
+/// process-wide `PATH` to install a fake command shim (a fixture `claude` or
+/// `gh` binary at the front of `PATH`).
+///
+/// `PATH` belongs to the whole test *process*, not to any one module. Before
+/// this lock existed, `queue::executor`'s review-lifecycle tests and
+/// `commands::pr`'s repo-level PR-creation tests each guarded their own PATH
+/// mutation with a private, module-local `static PATH_LOCK` of the same
+/// name. Two distinct `Mutex`es do not serialize against each other, so
+/// under default `cargo test` thread parallelism a thread running one
+/// module's fixture install/restore could interleave with the other
+/// module's, corrupting whichever one restored `PATH` last.
+///
+/// Concretely reproduced (see the Unit 5C2 corrective report): with both
+/// suites running in the same default-parallel `cargo test -p slashit-ui
+/// --lib` process,
+/// `commands::pr::tests::repo_level_pr_creation::bulk_create_prs_applies_the_same_contract_as_create_pr`
+/// escaped its own `MockGh` and reached the developer's real `gh` binary
+/// (observed failure: `gh failed: none of the git remotes configured for
+/// this repository point to a known GitHub host`), and
+/// `queue::executor::tests::review_lifecycle::a_running_fix_agent_can_be_stopped_safely`
+/// spawned something other than its own fixture script and never observed
+/// its pidfile being written (`fixture never wrote its pid file; the
+/// blocking role was never reached`).
+///
+/// Every test in this crate that mutates process-global `PATH` (or removes
+/// it) to install a fake command must acquire this lock -- not a private
+/// one -- before saving/mutating `PATH`, and must not release it until
+/// `PATH` has been fully restored to what it was before the mutation
+/// (typically by holding the guard for the test's whole body, so an owning
+/// fixture's `Drop` impl runs and restores `PATH` before the lock itself is
+/// released).
+///
+/// `#[cfg(test)]`: this is compiled only when building the crate's own unit
+/// test binary (`cargo test -p slashit-ui --lib`), never into the release
+/// artifact -- unlike the rest of this module, which stays uncfg'd so the
+/// separate integration-test binaries under `tests/` can link it too.
+#[cfg(test)]
+pub static PATH_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// The IPC server, reachable from the integration tests.
 ///
 /// `tests/ipc_integration.rs` is a separate crate, so it can only name items

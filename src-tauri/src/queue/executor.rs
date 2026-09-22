@@ -3948,16 +3948,17 @@ mod tests {
     //
     // Real fake `claude` subprocesses (never the user's real Claude config),
     // installed on `PATH` and torn down on `Drop`. `PATH` is process-global,
-    // so every test in this module that installs one serializes on
-    // `PATH_LOCK` -- the same pattern `commands::pr`'s `MockGh` already uses
-    // for the same reason.
+    // so every test in this module that installs one serializes on the one
+    // shared `crate::test_helpers::PATH_LOCK` -- the same lock
+    // `commands::pr`'s `MockGh` tests use, for the same reason. A private,
+    // module-local lock here would not serialize against that module's own
+    // PATH mutations under default parallel `cargo test`; see
+    // `test_helpers::PATH_LOCK`'s doc comment for the corrective-pass
+    // evidence that this actually raced.
     #[cfg(target_os = "linux")]
     mod review_lifecycle {
         use super::*;
-        use std::sync::LazyLock;
-
-        static PATH_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-            LazyLock::new(|| tokio::sync::Mutex::new(()));
+        use crate::test_helpers::PATH_LOCK;
 
         /// A stand-in `claude` binary that plays either the reviewer role
         /// (its `--allowedTools` has neither `Edit` nor `Bash`) or the fix

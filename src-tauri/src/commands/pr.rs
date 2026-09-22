@@ -3738,17 +3738,21 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
         use std::process::Command as StdCommand;
-        #[cfg(unix)]
-        use std::sync::LazyLock;
 
         // PATH is process-global; serialize the tests in this module that
-        // mutate it for the fake `gh`.
+        // mutate it for the fake `gh` on the one shared
+        // `crate::test_helpers::PATH_LOCK` -- the same lock
+        // `queue::executor`'s review-lifecycle tests use for their fake
+        // `claude`, for the same reason. A private, module-local lock here
+        // would not serialize against that module's own PATH mutations
+        // under default parallel `cargo test`; see `test_helpers::PATH_LOCK`'s
+        // doc comment for the corrective-pass evidence that this actually
+        // raced.
         //
         // Unix-only: the mock `gh` is a `#!/bin/sh` script made executable
         // via `PermissionsExt`, which has no Windows equivalent.
         #[cfg(unix)]
-        static PATH_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-            LazyLock::new(|| tokio::sync::Mutex::new(()));
+        use crate::test_helpers::PATH_LOCK;
 
         fn git(dir: &Path, args: &[&str]) -> String {
             let output = StdCommand::new("git")
