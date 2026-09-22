@@ -1,3 +1,4 @@
+pub mod admission;
 pub mod manager;
 pub mod executor;
 pub mod prompt;
