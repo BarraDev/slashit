@@ -527,6 +527,14 @@ pub async fn recover_private_email_and_create_pr(
     author_email: String,
 ) -> Result<String, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+
+    // This function's own first irreversible side effect is
+    // `rewrite_branch_tip_author` below, rewriting the branch's tip commit --
+    // strictly earlier than `create_pr_inner`'s own guard at its tail, which
+    // is too late to protect that rewrite. An active editing agent must not
+    // be allowed to race it.
+    end_active_ownership_before_pr_side_effect(&state, task_uuid).await?;
+
     let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
     let branch = {
         let tasks = state.task.tasks.read().await;
@@ -607,8 +615,9 @@ pub async fn analyze_pr_comments(
         });
     }
 
+    let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid).await?;
     let prompt = build_review_analysis_prompt(&task, &pr_url, &comments);
-    let raw_output = run_claude_pr_helper(prompt, working_dir, false).await?;
+    let raw_output = run_claude_pr_helper(prompt, working_dir, false, cancel_rx).await?;
     eprintln!(
         "[pr-review] triage output: {} chars",
         raw_output.len(),
@@ -719,18 +728,22 @@ pub async fn discuss_pr_review_questions(
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
 
-    let merged = discuss_pr_review_questions_inner(task, working_dir, plan).await?;
+    let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid).await?;
+    let merged = discuss_pr_review_questions_inner(task, working_dir, plan, cancel_rx).await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, merged.clone()).await?;
     Ok(merged)
 }
 
 /// Core logic of `discuss_pr_review_questions` extracted for testability. Owns
-/// no `AppState`; the caller resolves the task + working directory and persists
-/// the returned plan.
+/// no `AppState`; the caller resolves the task + working directory, acquires
+/// the [`crate::queue::PrHelperLease`] (whose cancel receiver is `cancel_rx`)
+/// and persists the returned plan. A test that has no executor to acquire a
+/// lease from passes a receiver that never fires (`watch::channel(false).1`).
 pub async fn discuss_pr_review_questions_inner(
     task: Task,
     working_dir: String,
     plan: PrReviewPlan,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<PrReviewPlan, String> {
     let pending: Vec<&PrReviewItem> = plan.items.iter()
         .filter(|i| matches!(i.decision, PrReviewDecision::Question) && !i.user_note.trim().is_empty())
@@ -741,7 +754,7 @@ pub async fn discuss_pr_review_questions_inner(
     eprintln!("[pr-review] discussing {} question items", pending.len());
 
     let prompt = build_discuss_prompt(&task, &plan.pr_url, &plan.comments, &pending);
-    let raw_output = run_claude_pr_helper(prompt, working_dir, false).await?;
+    let raw_output = run_claude_pr_helper(prompt, working_dir, false, cancel_rx).await?;
     eprintln!("[pr-review] discuss output: {} chars", raw_output.len());
     if raw_output.trim().is_empty() {
         return Err("Discuss helper finished without producing output.".to_string());
@@ -832,14 +845,20 @@ pub async fn address_pr_review(
     // the prior last_apply so the apply loop respects what's already on disk.
     let mut plan = plan;
     plan.backfill_lifecycle_from_last_apply();
-    let (result, updated_plan) = address_pr_review_inner(task, working_dir, plan, options, progress).await?;
+    let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid).await?;
+    let (result, updated_plan) =
+        address_pr_review_inner(task, working_dir, plan, options, progress, cancel_rx).await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
     Ok(result)
 }
 
 /// Core logic of `address_pr_review` extracted for testability. Owns no
 /// `AppState`; the caller is responsible for fetching the `Task` + working
-/// directory and persisting the returned plan.
+/// directory, acquiring the [`crate::queue::PrHelperLease`] this whole
+/// per-item loop runs under (`cancel_rx` is that lease's receiver — one PR-
+/// helper ownership flow for the whole apply loop, not one per item, since
+/// the product model is one active agent-owning flow per task, not per
+/// Claude invocation) and persisting the returned plan.
 ///
 /// Each approved Fix item is sent to claude in its own invocation, so a single
 /// max-turns blowout no longer wipes the whole batch. Failures are recorded
@@ -851,6 +870,7 @@ pub async fn address_pr_review_inner(
     plan: PrReviewPlan,
     options: AddressPrReviewOptions,
     progress: ProgressSink,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(PrReviewApplyResult, PrReviewPlan), String> {
     let pr_url = pr_url_for_task(&task)?;
     let task_id_str = task.id.to_string();
@@ -887,6 +907,16 @@ pub async fn address_pr_review_inner(
     let mut reply_errors: Vec<String> = Vec::new();
 
     for (loop_idx, &orig_idx) in approved_indices.iter().enumerate() {
+        // A lifecycle transition may have asked this whole apply flow to end
+        // since the previous item finished (each `run_claude_pr_helper` call
+        // only races cancellation for its own duration). Checked between
+        // items, not just inside each call, so a cancellation that arrives
+        // between two already-fast items still stops the loop from starting
+        // a new one rather than only cancelling whichever happened to be
+        // in flight.
+        if *cancel_rx.borrow() {
+            break;
+        }
         let item = updated_plan.items[orig_idx].clone();
         let current = loop_idx + 1;
         let label = item.comment_id
@@ -906,7 +936,7 @@ pub async fn address_pr_review_inner(
         if options.dry_run {
             let single = vec![&item];
             let prompt = build_review_fix_prompt(&task, &pr_url, &updated_plan.comments, &single, true);
-            match run_claude_pr_helper(prompt, working_dir.clone(), false).await {
+            match run_claude_pr_helper(prompt, working_dir.clone(), false, cancel_rx.clone()).await {
                 Ok(summary) => {
                     if let Some(id) = item.comment_id { fixed_ids.push(id); }
                     per_item_summaries.push(format!(
@@ -963,7 +993,7 @@ pub async fn address_pr_review_inner(
         if !item.fix_done {
             let single = vec![&item];
             let prompt = build_review_fix_prompt(&task, &pr_url, &updated_plan.comments, &single, false);
-            match run_claude_pr_helper(prompt, working_dir.clone(), true).await {
+            match run_claude_pr_helper(prompt, working_dir.clone(), true, cancel_rx.clone()).await {
                 Ok(summary) => {
                     if let Some(id) = item.comment_id { fixed_ids.push(id); }
                     let reply_text = extract_pr_reply(&summary);
@@ -1832,7 +1862,56 @@ async fn patch_pr_inline_reply(repo: &str, comment_id: u64, body: &str) -> Resul
         .map_err(|e| format!("gh PATCH failed: {}", e))
 }
 
-async fn run_claude_pr_helper(prompt: String, working_dir: String, can_edit: bool) -> Result<String, String> {
+/// Resolve once a `watch` channel is genuinely asked to cancel (`true`
+/// observed), and never otherwise.
+///
+/// `Receiver::changed()` also resolves — with `Err` — the moment every
+/// `Sender` is dropped, which is not a cancellation request: it is simply
+/// "nothing will ever ask again". A caller racing that directly in a
+/// `select!` (as an earlier version of this function did) would misread a
+/// sender with no live owner as an immediate cancel — exactly what a lease-
+/// free caller (a test with no `TaskExecutor`/`PrHelperLease` to draw a
+/// sender from) produces. Treating that case as "never resolves" instead is
+/// what makes it safe for `run_claude_pr_helper` to always race this
+/// unconditionally, whether or not a real lease is backing the receiver.
+async fn wait_for_cancel(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        match rx.changed().await {
+            Ok(_) => {
+                if *rx.borrow() {
+                    return;
+                }
+                // Spurious `false -> false`/re-send of the initial value;
+                // keep waiting for a genuine cancel.
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Run one PR-helper Claude invocation, owned the same way execution/AI
+/// review own theirs: [`crate::agents::runner::ClaudeRunner`] is the process
+/// (process-group leader, `kill()` signals the whole group, `wait()` reaps
+/// before returning), and `cancel_rx` is raced against its `wait()` exactly
+/// the way [`crate::queue::executor::TaskExecutor::run_cancellable_agent`]
+/// races execution/review's own runs — the smallest reuse of that ownership
+/// primitive, not a second `killpg` implementation. `cancel_rx` comes from
+/// the caller's [`crate::queue::PrHelperLease`] (see each of this function's
+/// callers), which is what a lifecycle transition can fire through
+/// [`crate::lifecycle::end_active_ownership`].
+///
+/// The extraction/error-classification contract below (`extract_failure_reason`,
+/// `write_pr_helper_log`, `extract_text_from_stream_json`, gating on the raw
+/// process exit code rather than `ClaudeRunner::wait`'s own blended
+/// success/`result_error` verdict) is unchanged from before this unit —
+/// still read from the runner's raw stdout/stderr/exit-status accessors
+/// rather than a second subprocess capture.
+async fn run_claude_pr_helper(
+    prompt: String,
+    working_dir: String,
+    can_edit: bool,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<String, String> {
     let allowed_tools = if can_edit {
         "Read,Edit,Write,Bash,Glob,Grep"
     } else {
@@ -1845,28 +1924,62 @@ async fn run_claude_pr_helper(prompt: String, working_dir: String, can_edit: boo
         can_edit, prompt.len(),
     );
 
-    let mut cmd = tokio::process::Command::new("claude");
-    cmd.arg("-p").arg(&prompt)
-        .arg("--output-format").arg("stream-json")
-        .arg("--verbose")
-        .arg("--allowedTools").arg(allowed_tools)
-        .arg("--dangerously-skip-permissions")
-        .arg("--max-turns").arg("30")
-        .arg("--session-id").arg(&session_id)
-        .arg("--strict-mcp-config")
-        .current_dir(&working_dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    if *cancel_rx.borrow() {
+        return Err("PR helper cancelled before it could start: task ownership changed".into());
+    }
 
-    let output = cmd.output().await
+    let config = crate::agents::runner::ClaudeRunConfig {
+        prompt,
+        working_dir,
+        allowed_tools: allowed_tools.split(',').map(str::to_string).collect(),
+        max_turns: Some(30),
+        max_budget_usd: None,
+        session_id: Some(session_id),
+        resume_session: None,
+        model: None,
+        system_prompt: None,
+        // `None` makes `ClaudeRunner` pass `--dangerously-skip-permissions`,
+        // the same flag this function passed directly before this unit.
+        permission_mode: None,
+        // `--strict-mcp-config`, unconditionally, matching the prior direct
+        // `tokio::process::Command` construction.
+        disable_mcp: true,
+        additional_dirs: Vec::new(),
+    };
+
+    let runner = crate::agents::runner::ClaudeRunner::start(config).await
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let exit_label = output.status.code()
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "signal".into());
+    // Never raced against `ClaudeRunner::start` itself -- only `wait()`, for
+    // the same reason `run_cancellable_agent`'s own doc gives: an outer
+    // `select!` around a future still mid-spawn could drop a just-spawned
+    // child with nothing left pointing at it.
+    let wait_result = tokio::select! {
+        biased;
+        r = runner.wait() => Some(r),
+        _ = wait_for_cancel(&mut cancel_rx) => None,
+    };
+
+    let Some(wait_result) = wait_result else {
+        let _ = runner.kill().await;
+        return Err(
+            "PR helper cancelled: task ownership changed before the run finished".into(),
+        );
+    };
+
+    let Some((success, exit_code)) = runner.exit_status().await else {
+        // `wait()` itself failed before an exit status was ever observed
+        // (a genuine `child.wait()` I/O error, not a Claude-level failure) --
+        // nothing to extract from stdout in that case.
+        return Err(format!(
+            "claude wait failed: {}",
+            wait_result.err().unwrap_or_else(|| "process ended abnormally".to_string())
+        ));
+    };
+    let exit_label = exit_code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+
+    let stdout = runner.raw_stdout().await;
+    let stderr = runner.raw_stderr().await;
     eprintln!(
         "[pr-review] claude exit={} stdout={}B stderr={}B",
         exit_label, stdout.len(), stderr.len(),
@@ -1875,13 +1988,13 @@ async fn run_claude_pr_helper(prompt: String, working_dir: String, can_edit: boo
     // Always persist stdout when it's substantial or when claude failed, so the
     // 200 KB transcript that exposes the real error isn't lost. The path is
     // surfaced in the error message and printed to stderr.
-    let log_path = if !output.status.success() || stdout.len() > 4096 {
+    let log_path = if !success || stdout.len() > 4096 {
         write_pr_helper_log(&stdout, &stderr, can_edit).ok()
     } else {
         None
     };
 
-    if !output.status.success() {
+    if !success {
         let reason = extract_failure_reason(&stdout)
             .or_else(|| {
                 let tail: Vec<&str> = stderr.lines().rev().take(5).collect();
@@ -1913,6 +2026,67 @@ async fn run_claude_pr_helper(prompt: String, working_dir: String, can_edit: boo
         );
     }
     Ok(extracted)
+}
+
+/// Acquire a [`crate::queue::PrHelperLease`] for `task_id` through
+/// `state.executor`, or a never-cancelled receiver when no executor is wired
+/// (startup, or a test that builds no queue) — mirroring
+/// [`crate::lifecycle::end_active_ownership`]'s own `None`-means-nothing-
+/// could-be-running contract, so PR-helper admission degrades the same way
+/// every other executor-gated check in this codebase already does rather
+/// than inventing a second "no executor" behavior.
+///
+/// Returns the lease alongside a cloned cancel receiver, since the lease
+/// itself is what the caller must hold for the run's whole lifetime (so its
+/// `Drop` cannot fire early) while the receiver is what gets threaded into
+/// `run_claude_pr_helper`/the `_inner` apply loop.
+async fn begin_pr_helper(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<(Option<crate::queue::PrHelperLease>, tokio::sync::watch::Receiver<bool>), String> {
+    match state.executor.get() {
+        Some(executor) => {
+            let lease = executor
+                .try_begin_pr_helper(task_id)
+                .await
+                .map_err(|refusal| refusal.to_string())?;
+            let cancel_rx = lease.cancel_receiver();
+            Ok((Some(lease), cancel_rx))
+        }
+        None => Ok((None, tokio::sync::watch::channel(false).1)),
+    }
+}
+
+/// End whatever execution, AI review/fix, or PR-helper flow currently owns
+/// `task_id`, before this command performs its first irreversible or
+/// externally-visible PR side effect (a branch rewrite, a push, `gh pr
+/// create`, or a durable `PrCreated` write).
+///
+/// Takes and releases the task's lifecycle lease itself -- unlike
+/// [`crate::lifecycle::end_active_ownership`], which requires the caller to
+/// already hold it, because every caller of *this* function is a top-level
+/// command that has not taken the lease yet (`link_pr_to_task` is the one
+/// exception: it already holds its own lease by the time it needs this, so
+/// it calls `end_active_ownership` directly instead of going through here --
+/// see its own body). Mirrors exactly what `commands::task::update_task_status`
+/// already does before writing a new status: acquire, end, release -- so a
+/// PR command's admission story is the same lifecycle abstraction every
+/// other lifecycle-changing front door in this codebase uses, not a second
+/// one invented for `commands::pr`.
+///
+/// `Err` means an owner was found but did not finish within the bounded
+/// shutdown window: nothing was changed, and the caller must refuse the PR
+/// side effect it was about to perform rather than race it.
+async fn end_active_ownership_before_pr_side_effect(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<(), String> {
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    let running = state
+        .executor
+        .get()
+        .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+    crate::lifecycle::end_active_ownership(running, task_id).await
 }
 
 /// Pull a human-readable failure reason out of the stream-json stdout. Prefers
@@ -2020,6 +2194,17 @@ async fn create_pr_inner(
     task_id: &str,
 ) -> Result<String, String> {
     let task_uuid = Uuid::parse_str(task_id).map_err(|e| e.to_string())?;
+
+    // Before anything below reads a branch name, pushes it, or asks GitHub
+    // to open a pull request against it: end whatever execution, AI review/
+    // fix, or PR-helper flow currently owns this task, or refuse outright.
+    // Every path this function can take next -- rediscovering an existing PR
+    // and linking it, pushing and creating a new one -- either mutates the
+    // task's branch or durably writes `PrCreated`, and none of that may
+    // race an owner that can still mutate the same checkout/branch. See
+    // `end_active_ownership_before_pr_side_effect`'s own doc.
+    end_active_ownership_before_pr_side_effect(state, task_uuid).await?;
+
     // Repository-level, not task-workspace: every command below names its
     // branch explicitly (the task's recorded `branch_name`, never the
     // directory's checked-out branch) and never reads or writes the working
@@ -2310,6 +2495,29 @@ async fn link_pr_to_task(
         return Ok(());
     }
 
+    // Every caller of this function is expected to have already ended active
+    // ownership before its own first irreversible side effect (see
+    // `end_active_ownership_before_pr_side_effect`, called from
+    // `create_pr_inner`/`recover_private_email_and_create_pr` before either
+    // of them reaches here). This is the same check anyway, under the same
+    // lease already held above rather than a second acquire/release: a
+    // defence this function's own contract deserves on its own terms (it is
+    // the one place that actually writes `PrCreated`), not one that should
+    // depend on every present and future caller remembering to guard
+    // upstream. Idempotent when nothing owns the task, which is the ordinary
+    // case here. Unconditional on `merged`: the merged path's own
+    // `terminalize_leased` call below already refuses rather than ends when
+    // something is still attached, but ending it here first gives that
+    // terminalization a clean shot at succeeding instead of needlessly
+    // refusing a merge that arrived while an owner was still winding down.
+    let running = state
+        .executor
+        .get()
+        .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+    crate::lifecycle::end_active_ownership(running, task_uuid)
+        .await
+        .map_err(PrLinkFailure::NotRecorded)?;
+
     let remote = remote_state.clone();
     let apply = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
@@ -2450,6 +2658,21 @@ pub async fn refresh_task_pr_state(
     let _lease = state
         .task_lifecycle_locks
         .acquire(task_uuid)
+        .await
+        .map_err(|e| format!("recording the pull request state failed: {e}"))?;
+
+    // Same live hole `link_pr_to_task` had before this unit, and the same
+    // fix: this is a second, independent place that can write
+    // `TaskStatus::PrCreated` (see the `apply` closure below), reachable from
+    // the frontend (`kanban.rs`'s poll/refresh call sites) for any task that
+    // already has a `pr_url` -- including one still `InProgress`/`AiReview`
+    // with a live owner, since nothing above checks that. Ended under the
+    // lease already held, before the write, not a second acquire.
+    let running = state
+        .executor
+        .get()
+        .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+    crate::lifecycle::end_active_ownership(running, task_uuid)
         .await
         .map_err(|e| format!("recording the pull request state failed: {e}"))?;
 
@@ -4260,6 +4483,494 @@ mod tests {
             let log = mock.read_log();
             let create_calls = log.matches("pr\ncreate").count();
             assert_eq!(create_calls, 2, "each task must reach exactly one gh pr create: {log}");
+        }
+
+        // ──────────────────────────────────────────────
+        // Unit 5C3: PR command ownership.
+        //
+        // `run_claude_pr_helper` used to spawn a real `claude` subprocess with
+        // no admission permit, no cancellation owner and no same-task
+        // exclusivity, and `link_pr_to_task`/`refresh_task_pr_state` could
+        // write `TaskStatus::PrCreated` over a task whose execution/review/
+        // PR-helper flow was still alive. These tests prove the fixes: a
+        // real fake `claude` (leader + a genuine descendant `sleep`,
+        // process-group owned exactly like `ClaudeRunner`'s execution/review
+        // callers), a real fake `gh`, and the shared
+        // `crate::test_helpers::PATH_LOCK` this whole file already
+        // serializes PATH mutation on. Nested inside `repo_level_pr_creation`
+        // to reuse its fixtures (`RepoFixture`, `MockGh`, `build_test_state`,
+        // `seed_task`, `PATH_LOCK`, `write_executable`) rather than
+        // duplicating them.
+        // ──────────────────────────────────────────────
+        #[cfg(unix)]
+        mod pr_command_ownership {
+            use super::*;
+            use crate::test_helpers::attach_test_executor;
+
+            /// A stand-in `claude` for the PR-helper path: prints one valid
+            /// `stream-json` init line (so `ClaudeRunner`'s reader has
+            /// something to parse), then backgrounds a real `sleep 300` and
+            /// waits on it -- a genuine leader-plus-descendant process tree in
+            /// the same process group (`ClaudeRunner::start` sets
+            /// `process_group(0)` on the command before spawning it), for
+            /// proving `kill()`'s `killpg` reaches the descendant too, not
+            /// just the direct child. Never produces a terminal `result`
+            /// event on its own: it only ever exits by being killed.
+            struct BlockingClaude {
+                _tmp: tempfile::TempDir,
+                leader_pidfile: PathBuf,
+                descendant_pidfile: PathBuf,
+                saved_path: Option<String>,
+            }
+
+            impl BlockingClaude {
+                fn install() -> Self {
+                    let tmp = tempfile::tempdir().expect("tempdir");
+                    let bin_dir = tmp.path().join("bin");
+                    std::fs::create_dir_all(&bin_dir).unwrap();
+                    let leader_pidfile = tmp.path().join("leader.pid");
+                    let descendant_pidfile = tmp.path().join("descendant.pid");
+
+                    let script = format!(
+                        "#!/bin/sh\n\
+                         printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-fixture\",\"model\":\"fixture-model\"}}\\n'\n\
+                         sleep 300 &\n\
+                         printf '%s\\n' \"$$\" > {leader:?}\n\
+                         printf '%s\\n' \"$!\" > {descendant:?}\n\
+                         wait\n",
+                        leader = leader_pidfile,
+                        descendant = descendant_pidfile,
+                    );
+                    let bin = bin_dir.join("claude");
+                    write_executable(&bin, &script);
+
+                    let saved_path = std::env::var("PATH").ok();
+                    let new_path = match &saved_path {
+                        Some(p) => format!("{}:{}", bin_dir.display(), p),
+                        None => bin_dir.display().to_string(),
+                    };
+                    // Safety: serialized via PATH_LOCK; restored on Drop.
+                    unsafe {
+                        std::env::set_var("PATH", new_path);
+                    }
+
+                    BlockingClaude { _tmp: tmp, leader_pidfile, descendant_pidfile, saved_path }
+                }
+
+                fn leader_pid(&self) -> Option<i32> {
+                    std::fs::read_to_string(&self.leader_pidfile).ok()?.trim().parse().ok()
+                }
+
+                fn descendant_pid(&self) -> Option<i32> {
+                    std::fs::read_to_string(&self.descendant_pidfile).ok()?.trim().parse().ok()
+                }
+            }
+
+            impl Drop for BlockingClaude {
+                fn drop(&mut self) {
+                    unsafe {
+                        match &self.saved_path {
+                            Some(p) => std::env::set_var("PATH", p),
+                            None => std::env::remove_var("PATH"),
+                        }
+                    }
+                }
+            }
+
+            fn pid_is_alive(pid: i32) -> bool {
+                std::path::Path::new(&format!("/proc/{pid}")).exists()
+            }
+
+            async fn wait_for_pid(get: impl Fn() -> Option<i32>) -> i32 {
+                for _ in 0..400 {
+                    if let Some(pid) = get() {
+                        return pid;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("fixture never wrote its pid file");
+            }
+
+            /// `PrHelperLease` intentionally implements neither `Debug` nor
+            /// `PartialEq` (it owns a live admission permit and cancellation
+            /// wiring; comparing/printing it is not a thing any real caller
+            /// does), so `expect_err`/`assert_eq!` cannot be used on the
+            /// `Result` `try_begin_pr_helper` returns directly. This pulls
+            /// just the refusal reason out for those macros to work with.
+            fn expect_refusal(
+                r: Result<crate::queue::PrHelperLease, crate::queue::PrHelperRefusal>,
+            ) -> crate::queue::PrHelperRefusal {
+                match r {
+                    Ok(_) => panic!("expected a refusal, got an admitted PR-helper lease"),
+                    Err(e) => e,
+                }
+            }
+
+            async fn wait_until(mut cond: impl FnMut() -> bool) {
+                for _ in 0..400 {
+                    if cond() {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("condition never became true within the poll budget");
+            }
+
+            /// RED (pre-unit): `run_claude_pr_helper` drew no admission
+            /// permit at all, so this decline never happened -- an arbitrary
+            /// number of PR-review helpers could run outside
+            /// `parallel_task_limit`. GREEN: `try_begin_pr_helper` -- the
+            /// exact function every PR-helper caller (`analyze_pr_comments`,
+            /// `discuss_pr_review_questions`, `address_pr_review`) goes
+            /// through via `begin_pr_helper` -- declines while the one slot
+            /// this limit allows is held by ordinary execution work, and
+            /// admits again once that execution's permit is actually
+            /// released (not merely removed from `running_handles`).
+            #[tokio::test(flavor = "multi_thread")]
+            async fn pr_helper_admission_declines_while_executions_own_capacity() {
+                let (state, _tmp) = build_test_state().await;
+                state.queue.manager.write().await.set_config(
+                    crate::config::queue::QueueConfig { parallel_task_limit: 1, ..Default::default() },
+                ).await;
+                let executor = attach_test_executor(&state);
+
+                let holder_task = Uuid::new_v4();
+                let helper_task = Uuid::new_v4();
+
+                let cleaned_up = executor
+                    .register_fake_running_execution_holding_permit_for_test(holder_task)
+                    .await;
+
+                let refusal = expect_refusal(executor.try_begin_pr_helper(helper_task).await);
+                assert_eq!(refusal, crate::queue::PrHelperRefusal::NoCapacity);
+
+                // End the execution owner (the same mechanism a lifecycle
+                // transition uses) and confirm capacity actually returns --
+                // proving the refusal above was a real admission decline, not
+                // an unrelated failure that happened to also return `Err`.
+                let running: Option<&dyn crate::lifecycle::ExecutionOwnership> =
+                    Some(executor.as_ref());
+                crate::lifecycle::end_active_ownership(running, holder_task)
+                    .await
+                    .expect("ending the fake execution must succeed");
+                assert!(
+                    cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+                    "the fake execution's own cleanup must have run"
+                );
+
+                let lease = executor
+                    .try_begin_pr_helper(helper_task)
+                    .await
+                    .expect("capacity must be free once the execution's permit is released");
+                drop(lease);
+            }
+
+            /// GREEN: the product model is one active agent-owning flow per
+            /// task. A second PR-helper flow for a task that already has one
+            /// alive is refused through the same command-level gate every PR
+            /// command uses, not a generic multi-agent scheduler.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn same_task_pr_helper_flows_cannot_overlap() {
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id = Uuid::new_v4();
+
+                let first = executor
+                    .try_begin_pr_helper(task_id)
+                    .await
+                    .expect("first flow must be admitted");
+
+                let refusal = expect_refusal(executor.try_begin_pr_helper(task_id).await);
+                assert_eq!(refusal, crate::queue::PrHelperRefusal::TaskAlreadyOwned);
+
+                drop(first);
+                let second = executor
+                    .try_begin_pr_helper(task_id)
+                    .await
+                    .expect("once the first flow ends, a new one for the same task must be admitted");
+                drop(second);
+            }
+
+            /// RED (pre-unit): `run_claude_pr_helper` had no cancellation
+            /// owner at all -- nothing could stop it, and nothing killed its
+            /// process group, so a descendant it started (a real shell
+            /// command the agent ran) would survive. GREEN: cancelling
+            /// through the real, product-level mechanism every lifecycle
+            /// front door now goes through (`crate::lifecycle::
+            /// end_active_ownership`, which `update_task_status`/
+            /// `reorder_task`/`link_pr_to_task`/`refresh_task_pr_state` all
+            /// call -- see `commands::task`'s own `lifecycle_ownership` tests
+            /// for that front-door wiring proven independently) kills the
+            /// leader *and* its descendant, reaps the direct child, and frees
+            /// the admission permit only once that cleanup is actually done.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_edit_capable_pr_helper_is_cancelled_through_the_real_ownership_path_descendant_included() {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = BlockingClaude::install();
+
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id = Uuid::new_v4();
+
+                let lease = executor
+                    .try_begin_pr_helper(task_id)
+                    .await
+                    .expect("first PR-helper flow for this task must be admitted");
+                let cancel_rx = lease.cancel_receiver();
+
+                // The exact call every `run_claude_pr_helper` caller makes,
+                // holding the lease across the whole subprocess lifetime --
+                // the same "permit dropped only once the owning flow
+                // actually finishes" contract `AdmissionPermit` documents for
+                // execution/review.
+                let handle = tokio::spawn(async move {
+                    let _lease = lease; // held for this future's whole life
+                    run_claude_pr_helper(
+                        "fix it".to_string(),
+                        std::env::temp_dir().display().to_string(),
+                        true,
+                        cancel_rx,
+                    )
+                    .await
+                });
+
+                let leader_pid = wait_for_pid(|| mock.leader_pid()).await;
+                let descendant_pid = wait_for_pid(|| mock.descendant_pid()).await;
+                assert!(pid_is_alive(leader_pid), "the fake claude leader must be running");
+                assert!(pid_is_alive(descendant_pid), "the fake claude's descendant must be running");
+
+                // Capacity is genuinely held while the helper is alive: a
+                // fresh task cannot draw the one slot this limit allows.
+                state.queue.manager.write().await.set_config(
+                    crate::config::queue::QueueConfig { parallel_task_limit: 1, ..Default::default() },
+                ).await;
+                assert_eq!(
+                    expect_refusal(executor.try_begin_pr_helper(Uuid::new_v4()).await),
+                    crate::queue::PrHelperRefusal::NoCapacity,
+                    "capacity must be held while the PR helper is alive"
+                );
+
+                // The real ownership-ending call every lifecycle front door
+                // makes before it commits its own new status.
+                let running: Option<&dyn crate::lifecycle::ExecutionOwnership> =
+                    Some(executor.as_ref());
+                crate::lifecycle::end_active_ownership(running, task_id)
+                    .await
+                    .expect("ending a live PR helper must succeed within the bounded shutdown window");
+
+                wait_until(|| !pid_is_alive(leader_pid)).await;
+                wait_until(|| !pid_is_alive(descendant_pid)).await;
+
+                let outcome = handle.await.expect("the PR-helper task must not panic");
+                let err = outcome.expect_err("a cancelled run must report cancellation, not a fabricated success");
+                assert!(
+                    err.contains("cancelled"),
+                    "the error must say why, not just that it failed: {err}"
+                );
+
+                assert!(
+                    executor.try_begin_pr_helper(Uuid::new_v4()).await.is_ok(),
+                    "capacity must be free again once the cancelled helper's cleanup finished"
+                );
+            }
+
+            /// Same-task exclusivity, at the level a command actually calls
+            /// it: while an edit-capable helper for a task is alive, a
+            /// second PR-helper flow for the *same* task is refused before
+            /// it ever spawns a second `claude`, proven by the fixture's own
+            /// invocation count staying at one descendant tree.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_second_pr_helper_for_the_same_task_cannot_overlap_a_running_one() {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = BlockingClaude::install();
+
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id = Uuid::new_v4();
+
+                let first = executor
+                    .try_begin_pr_helper(task_id)
+                    .await
+                    .expect("first flow must be admitted");
+                let cancel_rx = first.cancel_receiver();
+                let handle = tokio::spawn(async move {
+                    let _lease = first;
+                    run_claude_pr_helper(
+                        "fix it".to_string(),
+                        std::env::temp_dir().display().to_string(),
+                        true,
+                        cancel_rx,
+                    )
+                    .await
+                });
+                wait_for_pid(|| mock.leader_pid()).await;
+
+                let refusal = expect_refusal(executor.try_begin_pr_helper(task_id).await);
+                assert_eq!(refusal, crate::queue::PrHelperRefusal::TaskAlreadyOwned);
+
+                let running: Option<&dyn crate::lifecycle::ExecutionOwnership> =
+                    Some(executor.as_ref());
+                crate::lifecycle::end_active_ownership(running, task_id).await.expect("end the first flow");
+                let _ = handle.await;
+            }
+
+            /// Spec §"REQUIRED ACTIVE-TASK PR REGRESSION": a task whose
+            /// branch an active owner can still mutate must not have its PR
+            /// pushed/created out from under that owner. Chosen behaviour
+            /// (Option A, per `end_active_ownership_before_pr_side_effect`'s
+            /// own doc): the owner is safely ended first, then the push/
+            /// `gh pr create` proceeds. Proven with a real disposable Git
+            /// repository and a real fake `gh` (no network, no real PR).
+            #[tokio::test(flavor = "multi_thread")]
+            async fn active_task_pr_creation_ends_a_live_owner_before_pushing_and_creating_the_pr() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let task_sha = repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+                let mock = MockGh::setup("https://github.com/testorg/testrepo/pull/55", r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-branch"),
+                    TaskStatus::InProgress,
+                )
+                .await;
+
+                let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(
+                    result.as_deref(),
+                    Ok("https://github.com/testorg/testrepo/pull/55"),
+                    "the PR must still be created once the active owner is safely ended: {result:?}"
+                );
+                assert!(
+                    cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+                    "the active owner must have actually been ended before the push/create ran"
+                );
+                assert_eq!(
+                    repo.remote_has_branch("task-branch").as_deref(),
+                    Some(task_sha.as_str()),
+                    "the branch must be pushed only after ownership was safely ended"
+                );
+                let log = mock.read_log();
+                assert_eq!(
+                    log.matches("pr\ncreate").count(),
+                    1,
+                    "exactly one gh pr create, after ownership ended: {log}"
+                );
+            }
+
+            /// The refusal half of the same contract: when the active owner
+            /// cannot be ended within the bounded shutdown window, PR
+            /// creation must refuse outright -- zero pushes, zero
+            /// `gh pr create` calls, and the task's prior status left
+            /// authoritative.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn active_task_pr_creation_refuses_when_ownership_cannot_be_ended_in_time() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+                let mock = MockGh::setup("https://github.com/testorg/testrepo/pull/55", r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-branch"),
+                    TaskStatus::InProgress,
+                )
+                .await;
+
+                executor.register_unkillable_running_execution_for_test(task_id).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                let err = result.expect_err("an owner that cannot be ended in time must refuse PR creation");
+                assert!(
+                    err.contains("still finishing up"),
+                    "the refusal must be actionable, not generic: {err}"
+                );
+                assert!(
+                    repo.remote_has_branch("task-branch").is_none(),
+                    "the branch must never be pushed when ownership could not be safely ended"
+                );
+                assert_eq!(
+                    mock.read_log(),
+                    "",
+                    "gh must never be invoked when ownership could not be safely ended"
+                );
+
+                let tasks = state.task.tasks.read().await;
+                assert_eq!(
+                    tasks.get(&task_id).unwrap().status,
+                    TaskStatus::InProgress,
+                    "the task's prior status must remain authoritative after a refusal"
+                );
+            }
+
+            /// `link_pr_to_task`'s own guard, exercised directly (it is
+            /// reachable from `create_pr_inner`, `sync_existing_pr` and
+            /// `recover_private_email_and_create_pr`, and is the one place
+            /// that actually writes `TaskStatus::PrCreated`): it must not
+            /// publish that status over a live owner.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn link_pr_to_task_ends_a_live_owner_before_writing_pr_created() {
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id = seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::InProgress).await;
+                let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+                link_pr_to_task(&state, task_id, "https://github.com/testorg/testrepo/pull/9")
+                    .await
+                    .expect("linking must succeed once the live owner is safely ended");
+
+                assert!(cleaned_up.load(std::sync::atomic::Ordering::SeqCst));
+                let tasks = state.task.tasks.read().await;
+                assert_eq!(tasks.get(&task_id).unwrap().status, TaskStatus::PrCreated);
+            }
+
+            /// `refresh_task_pr_state` had the same unconditional
+            /// `PrCreated` write as `link_pr_to_task` (Unit 5C2's corrective
+            /// pass, §M item 4) -- live and reachable from the frontend's
+            /// poll/refresh call sites (`kanban.rs`) for any task with a
+            /// `pr_url`, including one still `InProgress` with a live owner.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refresh_task_pr_state_ends_a_live_owner_before_writing_pr_created() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id = seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::InProgress).await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    tasks.get_mut(&task_id).unwrap().pr_url =
+                        Some("https://github.com/testorg/testrepo/pull/9".to_string());
+                }
+                let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+                // `refresh_task_pr_state`'s public signature takes
+                // `tauri::State`, the same as `commands::task`'s own
+                // `lifecycle_ownership` tests build with `tauri::test::
+                // mock_app()` + `app.manage(state)` + `app.state()`.
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let updated = refresh_task_pr_state(app.state(), task_id.to_string())
+                    .await
+                    .expect("refreshing must succeed once the live owner is safely ended");
+
+                assert!(cleaned_up.load(std::sync::atomic::Ordering::SeqCst));
+                assert_eq!(updated.unwrap().status, TaskStatus::PrCreated);
+            }
         }
     }
 }

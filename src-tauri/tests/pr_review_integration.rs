@@ -33,6 +33,18 @@ use slashit_ui_lib::domain::task::{
 #[cfg(unix)]
 use slashit_ui_lib::test_helpers::{create_test_pr_review_setup, create_test_task};
 
+/// A cancel receiver that never fires, standing in for the
+/// `crate::queue::PrHelperLease` a real `AppState`-backed caller acquires
+/// before calling `address_pr_review_inner`/`discuss_pr_review_questions_inner`.
+/// These integration tests build no `AppState`/`TaskExecutor` at all (see the
+/// module doc), so there is no lease to draw one from; the ownership/
+/// admission/cancellation contract itself is proven separately, against a
+/// real `TaskExecutor`, in `commands::pr`'s own `#[cfg(test)]` module.
+#[cfg(unix)]
+fn never_cancelled() -> tokio::sync::watch::Receiver<bool> {
+    tokio::sync::watch::channel(false).1
+}
+
 // PATH is process-global; serialize tests that mutate it.
 // `tokio::sync::Mutex` is await-safe so clippy doesn't flag the guard being
 // held across the async work inside each test.
@@ -158,7 +170,7 @@ async fn dry_run_invokes_claude_only_no_gh_no_push() {
     };
 
     let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress())
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
             .await
             .expect("dry-run apply succeeds");
 
@@ -219,7 +231,7 @@ async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
     };
 
     let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress())
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
             .await
             .expect("full apply succeeds");
     // Real applies (dry_run=false) must persist on the plan so the next modal
@@ -382,7 +394,7 @@ async fn discuss_round_merges_updates_without_reordering_or_touching_skip() {
     let env = MockEnv::setup(claude_json);
     let (task, plan) = create_test_discuss_setup();
 
-    let merged = discuss_pr_review_questions_inner(task, env.working_dir_str(), plan)
+    let merged = discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
         .await
         .expect("discuss merges successfully");
 
@@ -443,7 +455,7 @@ async fn discuss_without_pending_questions_errors_before_calling_claude() {
     // Default 2-item plan has 1 Fix + 1 Skip — no Question items with notes.
     let (task, plan) = create_test_pr_review_setup();
 
-    let err = discuss_pr_review_questions_inner(task, env.working_dir_str(), plan)
+    let err = discuss_pr_review_questions_inner(task, env.working_dir_str(), plan, never_cancelled())
         .await
         .expect_err("should error when nothing to discuss");
     assert!(err.contains("No Question items with notes"), "got: {err}");
@@ -468,7 +480,7 @@ async fn empty_approved_set_returns_error_and_does_not_call_claude() {
         dry_run: false,
     };
 
-    let err = address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress())
+    let err = address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
         .await
         .expect_err("should error when no items are approved");
     assert!(err.contains("No approved fix items"), "got: {err}");
@@ -576,7 +588,7 @@ async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
         captured_clone.lock().unwrap().push(ev);
     });
 
-    let (result, _plan) = address_pr_review_inner(task, env.working_dir_str(), plan, opts, sink)
+    let (result, _plan) = address_pr_review_inner(task, env.working_dir_str(), plan, opts, sink, never_cancelled())
         .await
         .expect("two-fix apply succeeds");
 
@@ -635,7 +647,7 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
 
     // Round 1
     let (round1, plan_after_round1) =
-        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts.clone(), no_progress())
+        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts.clone(), no_progress(), never_cancelled())
             .await
             .expect("round 1 succeeds");
     assert_eq!(round1.fixed_ids, vec![301, 302]);
@@ -653,7 +665,7 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
 
     // Round 2 — same task, the now-stamped plan
     let (round2, plan_after_round2) =
-        address_pr_review_inner(task, env.working_dir_str(), plan_after_round1, opts, no_progress())
+        address_pr_review_inner(task, env.working_dir_str(), plan_after_round1, opts, no_progress(), never_cancelled())
             .await
             .expect("round 2 succeeds");
     assert_eq!(env.claude_invocations(), claude_calls_round1,
@@ -697,7 +709,7 @@ async fn rerunning_apply_with_only_replies_pending_skips_claude() {
     };
 
     let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress())
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
             .await
             .expect("recovery apply succeeds");
 

@@ -4,6 +4,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
+/// `(exit_success, exit_code)`, as [`ClaudeRunner::exit_status`] exposes it.
+type ExitStatusInfo = Option<(bool, Option<i32>)>;
+
 /// Configuration for a Claude Code CLI run.
 #[derive(Debug, Clone)]
 pub struct ClaudeRunConfig {
@@ -65,6 +68,25 @@ pub struct ClaudeRunner {
     /// there. Started at spawn, like the stdout reader; `wait()` joins it once
     /// the child has been reaped.
     stderr_handle: Mutex<Option<tauri::async_runtime::JoinHandle<String>>>,
+    /// Every stdout line verbatim, newline-joined, alongside the parsed/
+    /// accumulated text `get_output()` exposes.
+    ///
+    /// A caller that needs to reparse the raw `stream-json` transcript itself
+    /// (a different extraction/error-classification contract than this
+    /// runner's own `accumulated_output`, e.g. `commands::pr`'s PR-helper
+    /// invocations) can do so without a second subprocess/reader of its own.
+    raw_stdout: Arc<RwLock<String>>,
+    /// The full stderr text, populated once [`Self::wait`] has collected it.
+    /// Empty until then.
+    raw_stderr: Arc<RwLock<String>>,
+    /// `(exit_success, exit_code)`, populated by [`Self::wait`] as soon as the
+    /// child's exit status is known -- before this decides whether that status
+    /// or a `result_error` makes `wait()` itself return `Err`. A caller that
+    /// wants the raw exit code independently of that blended verdict (see
+    /// `commands::pr::run_claude_pr_helper`, which gates its own error path on
+    /// exit-code success only, not on `result_error`) reads this instead of
+    /// `wait()`'s return value.
+    exit_status: Arc<RwLock<ExitStatusInfo>>,
 }
 
 impl ClaudeRunner {
@@ -192,6 +214,9 @@ impl ClaudeRunner {
             result_error: Arc::new(RwLock::new(None)),
             reader_handle: Mutex::new(None),
             stderr_handle: Mutex::new(None),
+            raw_stdout: Arc::new(RwLock::new(String::new())),
+            raw_stderr: Arc::new(RwLock::new(String::new())),
+            exit_status: Arc::new(RwLock::new(None)),
         };
 
         let handle = runner.start_reader(stdout);
@@ -209,6 +234,30 @@ impl ClaudeRunner {
     /// Get the accumulated text output from all TextDelta and Result events.
     pub async fn get_output(&self) -> String {
         self.accumulated_output.read().await.clone()
+    }
+
+    /// The verbatim stdout transcript (every line, newline-joined), for a
+    /// caller that needs to reparse the raw `stream-json` stream under its
+    /// own extraction/error-classification rules rather than this runner's
+    /// own [`Self::get_output`] accumulation. Safe to call at any point;
+    /// reflects whatever the reader has drained so far, complete once
+    /// [`Self::wait`] has returned.
+    pub async fn raw_stdout(&self) -> String {
+        self.raw_stdout.read().await.clone()
+    }
+
+    /// The full stderr text. Empty until [`Self::wait`] has returned.
+    pub async fn raw_stderr(&self) -> String {
+        self.raw_stderr.read().await.clone()
+    }
+
+    /// `(exit_success, exit_code)` from the child's real exit status, as
+    /// opposed to [`Self::wait`]'s own `Result`, which also folds in a
+    /// `result_error` from the stream-json `result` event. `None` until
+    /// [`Self::wait`] has observed an exit status (i.e. before it is called,
+    /// or if it is cancelled/dropped before the child actually exits).
+    pub async fn exit_status(&self) -> ExitStatusInfo {
+        *self.exit_status.read().await
     }
 
     /// End the run, and everything it started.
@@ -320,11 +369,18 @@ impl ClaudeRunner {
 
         let status = child.wait().await.map_err(|e| format!("Wait failed: {}", e))?;
 
+        // Recorded before either of the two `Err` returns below so a caller
+        // that only wants the raw exit outcome (not this method's own blend
+        // of exit status and `result_error`) can always read it once this
+        // point is reached, regardless of which branch this takes next.
+        *self.exit_status.write().await = Some((status.success(), status.code()));
+
         // Collect stderr now that process has exited
         let stderr_text = match stderr_handle {
             Some(handle) => handle.await.unwrap_or_default(),
             None => String::new(),
         };
+        *self.raw_stderr.write().await = stderr_text.clone();
 
         // The child has exited and nothing below needs it, so release it rather
         // than hold it through the join. Draining can outlast the process when a
@@ -390,6 +446,7 @@ impl ClaudeRunner {
         let session_id = self.session_id.clone();
         let accumulated_output = self.accumulated_output.clone();
         let result_error = self.result_error.clone();
+        let raw_stdout = self.raw_stdout.clone();
 
         tauri::async_runtime::spawn(async move {
             // Read stdout (NDJSON stream)
@@ -400,6 +457,14 @@ impl ClaudeRunner {
                 while let Ok(Some(line)) = lines.next_line().await {
                     if line.trim().is_empty() {
                         continue;
+                    }
+
+                    {
+                        let mut raw = raw_stdout.write().await;
+                        if !raw.is_empty() {
+                            raw.push('\n');
+                        }
+                        raw.push_str(&line);
                     }
 
                     let parsed: Result<serde_json::Value, _> = serde_json::from_str(&line);
