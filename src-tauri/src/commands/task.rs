@@ -188,12 +188,34 @@ pub async fn update_task_status(
 
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
+    let Some(old_status) = ({
+        let tasks = state.task.tasks.read().await;
+        tasks.get(&task_id).map(|t| t.status.clone())
+    }) else {
+        return Ok(None);
+    };
+
+    // Any status this branch can be asked for actually changes the task's
+    // lifecycle column (`Done` returned above, through `terminalize`, which
+    // has its own dedicated refuse-rather-than-end contract). A previous
+    // owner left alive by this write is exactly the hole this closes: end it
+    // *before* the durable write below, under the lease already held, or
+    // refuse the whole transition rather than publish a status the old owner
+    // might still act on afterward.
+    if old_status != status {
+        let running = state
+            .executor
+            .get()
+            .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+        crate::lifecycle::end_active_ownership(running, task_id).await?;
+    }
+
+    let effect = classify_status_transition(&old_status, &status);
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
-            let old_status = task.status.clone();
             task.status = status.clone();
 
-            match classify_status_transition(&old_status, &status) {
+            match effect {
                 StatusTransitionEffect::ResetExecutionState => {
                     // `worktree_path` and `branch_name` survive on purpose: the
                     // next execution reattaches to them. See
@@ -621,6 +643,21 @@ pub async fn reorder_task(
     }
 
     let status_changed = old_status != target_status;
+
+    // Same rule as `update_task_status`: a move that actually leaves the
+    // task's current lifecycle column must end whatever owns it first.
+    // Reordering within the same column (`status_changed == false`) is
+    // deliberately exempt -- see this function's own doc -- so dragging a
+    // running task's card to a new position inside its own column never
+    // touches the agent working on it.
+    if status_changed {
+        let running = state
+            .executor
+            .get()
+            .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+        crate::lifecycle::end_active_ownership(running, task_id).await?;
+    }
+
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if effect != StatusTransitionEffect::None || status_changed {
             if let Some(task) = staged.get_mut(&task_id) {
@@ -1596,5 +1633,218 @@ mod tests {
         let fake_id = Uuid::new_v4();
         let result = reorder_task_logic(&mut tasks, fake_id, Some(TaskStatus::Queue), 0);
         assert!(result.is_none());
+    }
+}
+
+/// Unit 5C2's corrective pass: a lifecycle-changing status transition must
+/// end whatever execution/review ownership a task has *before* it commits a
+/// new status, or refuse the transition outright.
+///
+/// Driven through the real `#[tauri::command]` bodies -- `update_task_status`
+/// and `reorder_task`, not a copy of their logic -- against a real `AppState`
+/// with a real `TaskExecutor` wired into `state.executor`, the same way
+/// `crate::test_helpers::attach_test_executor`'s own doc explains. The IPC
+/// equivalent of every scenario here (`handle_move_task`) is pinned in
+/// `crate::ipc::handlers::lifecycle_ownership`, over the same fake owners, so
+/// the two front doors are proven against the same conditions rather than
+/// each trusted on its own telling.
+#[cfg(test)]
+mod lifecycle_ownership {
+    use super::*;
+    use crate::test_helpers::{attach_test_executor, create_test_task_full};
+    use tauri::Manager;
+
+    async fn test_state() -> (tempfile::TempDir, crate::AppState) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _report) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state should build under a fresh tempdir");
+        (tmp, state)
+    }
+
+    async fn seed(state: &crate::AppState, status: TaskStatus) -> Uuid {
+        let project_id = Uuid::new_v4();
+        let task = create_test_task_full("under test", project_id, status, 0);
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .expect("seed the board");
+        task_id
+    }
+
+    #[tokio::test]
+    async fn update_task_status_ends_a_running_execution_before_moving_the_task() {
+        let (_tmp, state) = test_state().await;
+        let executor = attach_test_executor(&state);
+        let task_id = seed(&state, TaskStatus::InProgress).await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog).await;
+
+        assert!(result.is_ok(), "the transition must succeed: {result:?}");
+        assert!(
+            cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "the previous execution owner must be driven to its own cleanup, not merely \
+             forgotten about, before the move is reported as done"
+        );
+        assert!(
+            executor.running_task_count().await == 0,
+            "no owner may still be tracked once the move has committed"
+        );
+        let live: &crate::AppState = app.state::<crate::AppState>().inner();
+        assert_eq!(
+            live.task.tasks.read().await.get(&task_id).unwrap().status,
+            TaskStatus::Backlog,
+            "the requested status must be the one that actually commits"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_task_status_ends_a_running_review_before_moving_the_task() {
+        let (_tmp, state) = test_state().await;
+        let executor = attach_test_executor(&state);
+        let task_id = seed(&state, TaskStatus::AiReview).await;
+        let cleaned_up = executor.register_fake_reviewing_owner_for_test(task_id).await;
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog).await;
+
+        assert!(result.is_ok(), "the transition must succeed: {result:?}");
+        assert!(
+            cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "the previous review/fix owner must be driven to its own cleanup before the \
+             move is reported as done"
+        );
+        assert!(executor.running_task_count().await == 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_task_status_refuses_when_ownership_cannot_be_ended_in_time() {
+        let (_tmp, state) = test_state().await;
+        let executor = attach_test_executor(&state);
+        let task_id = seed(&state, TaskStatus::InProgress).await;
+        executor.register_unkillable_running_execution_for_test(task_id).await;
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog).await;
+
+        assert!(
+            result.is_err(),
+            "an owner that cannot be ended within the bounded shutdown must refuse the \
+             transition, not silently proceed: {result:?}"
+        );
+        let live: &crate::AppState = app.state::<crate::AppState>().inner();
+        assert_eq!(
+            live.task.tasks.read().await.get(&task_id).unwrap().status,
+            TaskStatus::InProgress,
+            "the previous durable status must survive a refused transition"
+        );
+        assert!(
+            executor.is_task_running(task_id).await,
+            "the unended owner must still be tracked as owning the task -- nothing about a \
+             refused transition may make it disappear from ownership bookkeeping"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_task_status_never_lands_a_write_behind_the_owner_it_ended() {
+        // The stale-write guarantee, exercised at the front door rather than
+        // only at `end_task_owners_under_lease` itself: an owner that does
+        // something durable on its way out (a real review writes
+        // `transition_to_human_review` before returning) must be fully
+        // finished -- including that write -- before this command's own
+        // commit runs, so the two can never be observed out of order and the
+        // owner's work can never land *after* the front door's answer.
+        let (_tmp, state) = test_state().await;
+        let executor = attach_test_executor(&state);
+        let task_id = seed(&state, TaskStatus::InProgress).await;
+        executor
+            .register_fake_running_execution_with_writeback_for_test(
+                task_id,
+                state.task.tasks.clone(),
+                state.storage.clone(),
+            )
+            .await;
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let live: &crate::AppState = app.state::<crate::AppState>().inner();
+        let after = live.task.tasks.read().await.get(&task_id).cloned().unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Backlog,
+            "the front door's own status must be the final word"
+        );
+        assert_eq!(
+            after.title,
+            "owner's own cleanup ran",
+            "the owner's own write, made on its way out while this command held the lease, \
+             must have already landed -- proving it ran fully before the front door's commit \
+             rather than racing or following it"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_task_same_column_move_does_not_touch_a_running_execution() {
+        let (_tmp, state) = test_state().await;
+        let executor = attach_test_executor(&state);
+        let task_id = seed(&state, TaskStatus::InProgress).await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        // Same column: `new_status` names the column the task is already in.
+        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "a reorder that does not change the task's lifecycle column must never touch \
+             the agent working on it"
+        );
+        assert!(
+            executor.is_task_running(task_id).await,
+            "the running execution must still be tracked as owning the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_task_column_change_ends_a_running_execution_first() {
+        let (_tmp, state) = test_state().await;
+        let executor = attach_test_executor(&state);
+        let task_id = seed(&state, TaskStatus::InProgress).await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::Backlog), 0).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "moving a task out of its column must end its previous owner first"
+        );
+        assert!(!executor.is_task_running(task_id).await);
     }
 }
