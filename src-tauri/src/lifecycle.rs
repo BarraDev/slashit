@@ -379,6 +379,47 @@ pub async fn create(
     Ok(task)
 }
 
+/// Select, amend and durably commit a task the caller does not yet have the id
+/// of, under one write-lock hold.
+///
+/// [`commit_task`] serves every ordinary mutation, which already knows which
+/// task it means. Queue promotion does not: "which task becomes `InProgress`
+/// next" is itself the decision, made from capacity and ordering rules that
+/// have to see the same map the mutation then commits, or a second caller
+/// racing the first could select the very same task. `select` and `amend`
+/// therefore share the write guard `create` already holds across staging and
+/// publish, rather than `select` taking its own read lock first and handing
+/// back an id that may no longer be the right answer by the time `amend`
+/// runs.
+///
+/// `None` from `select` means there was nothing to do, which is not a failure
+/// -- an empty queue is not an error, just like [`commit_task`] finding no
+/// such task is not one.
+pub async fn commit_selected(
+    tasks: &Tasks,
+    storage: &Storage,
+    select: impl FnOnce(&HashMap<Uuid, Task>) -> Option<Uuid>,
+    amend: impl FnOnce(&mut HashMap<Uuid, Task>, Uuid),
+) -> Result<Option<Task>, String> {
+    let mut tasks_w = tasks.write().await;
+    let Some(task_id) = select(&tasks_w) else {
+        return Ok(None);
+    };
+    let project_id = tasks_w
+        .get(&task_id)
+        .map(|t| t.project_id)
+        .expect("select must return an id present in the map it was given");
+
+    let mut staged = stage_project(&tasks_w, project_id);
+    amend(&mut staged, task_id);
+    if let Some(task) = staged.get_mut(&task_id) {
+        task.updated_at = chrono::Utc::now();
+    }
+
+    publish(&mut tasks_w, storage, project_id, staged)?;
+    Ok(tasks_w.get(&task_id).cloned())
+}
+
 /// How a status transition affects a task's execution state and its worktree.
 ///
 /// Resetting execution state and destroying a worktree are different
