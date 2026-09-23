@@ -1,5 +1,6 @@
 use crate::agents::runner::{ClaudeRunner, ClaudeRunConfig, ClaudeEvent};
 use crate::domain::{Task, TaskStatus, TaskPhase, AgentExecution, AgentStatus, AgentLogEntry, LogLevel, QaSignoff, QaStatus};
+use crate::queue::admission::{Admission, AdmissionPermit};
 use crate::queue::prompt::{build_task_prompt, build_review_prompt, build_fix_prompt};
 use crate::queue::QueueManager;
 use crate::worktree::WorktreeManager;
@@ -45,6 +46,23 @@ struct RunningTask {
     cancel: tokio::sync::watch::Sender<bool>,
 }
 
+/// A review/fix flow the executor can still reach, on exactly the same
+/// footing as [`RunningTask`] and for the same reason: `reviewing_handles`
+/// used to store a bare `JoinHandle<()>`, which nothing could stop -- an
+/// abort would drop the future at whatever `ClaudeRunner` await it was
+/// parked on and leave that agent process running with nothing pointing at
+/// it, exactly as [`RunningTask`]'s doc explains for execution. `cancel`
+/// asks the owning future to end instead, and every subprocess it owns
+/// (reviewer agent, fix agent, the CodeRabbit call) is killed by the code
+/// that already has it in hand before the future returns -- never by an
+/// outer `select!` racing the whole future, which is exactly the shape a
+/// process could be dropped-but-not-killed under if a cancellation won
+/// between a child spawning and this struct's own bookkeeping catching up.
+struct ReviewOwner {
+    handle: JoinHandle<()>,
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
 /// How long [`TaskExecutor::stop_task`] waits for a cancelled execution's
 /// future to finish joining before giving up on this attempt.
 ///
@@ -81,7 +99,23 @@ pub struct TaskExecutor {
     queue_manager: Arc<RwLock<QueueManager>>,
     executions: Arc<RwLock<HashMap<Uuid, AgentExecution>>>,
     running_handles: Arc<RwLock<HashMap<Uuid, RunningTask>>>,
-    reviewing_handles: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
+    reviewing_handles: Arc<RwLock<HashMap<Uuid, ReviewOwner>>>,
+    /// The one admission gate ordinary execution and AI review/fix share.
+    ///
+    /// See [`crate::queue::admission`] for why this is a semaphore-backed
+    /// permit rather than a count derived from the handle maps after the
+    /// fact.
+    admission: Admission,
+    /// Capacity reserved for a task at `Queue -> InProgress` promotion time,
+    /// held until that task's execution actually starts and takes ownership
+    /// of it (see [`Self::spawn_task_execution`]).
+    ///
+    /// Reserve-then-promote is what stops auto-promotion from publishing more
+    /// `InProgress` work than capacity can actually start once AI review also
+    /// draws on [`Self::admission`]: the reservation is taken *before* the
+    /// durable promotion write, so a promoted task is provably backed by real
+    /// capacity the moment the board can show it, not merely hoped to be.
+    reserved_permits: Arc<RwLock<HashMap<Uuid, AdmissionPermit>>>,
     /// The per-task lifecycle lease, shared with the desktop commands and the
     /// IPC handlers.
     ///
@@ -117,12 +151,26 @@ pub struct TaskExecutorConfig {
 
 impl TaskExecutor {
     pub fn new(config: TaskExecutorConfig) -> Self {
+        // Not async, so this cannot `.await` the lock -- but nothing else can
+        // hold it yet either: `config.queue_manager` is freshly constructed
+        // by every caller (see `lib.rs`/`daemon.rs`) and handed straight
+        // here, so an uncontended `try_read` always succeeds. `reconcile`
+        // (called at the top of every `check_and_execute` pass, and before
+        // every manual `execute_task`) is what keeps this current from then
+        // on; this is only ever a starting point.
+        let initial_limit = config
+            .queue_manager
+            .try_read()
+            .map(|mgr| mgr.config().parallel_task_limit as usize)
+            .unwrap_or(2);
         Self {
             tasks: config.tasks,
             queue_manager: config.queue_manager,
             executions: config.executions,
             running_handles: Arc::new(RwLock::new(HashMap::new())),
             reviewing_handles: Arc::new(RwLock::new(HashMap::new())),
+            admission: Admission::new(initial_limit),
+            reserved_permits: Arc::new(RwLock::new(HashMap::new())),
             lifecycle: config.lifecycle,
             logs: config.logs,
             projects: config.projects,
@@ -206,6 +254,18 @@ impl TaskExecutor {
         self.running_handles.read().await.len() + self.reviewing_handles.read().await.len()
     }
 
+    /// Bring [`Self::admission`]'s capacity in line with the current runtime
+    /// `parallel_task_limit`.
+    ///
+    /// Called before every place that acquires a permit -- the top of every
+    /// poll pass, and every manual `execute_task` -- rather than once at
+    /// startup, so a config change the user makes mid-run is respected by the
+    /// very next admission decision instead of only the next restart.
+    async fn reconcile_admission(&self) {
+        let limit = self.queue_manager.read().await.config().parallel_task_limit as usize;
+        self.admission.reconcile(limit).await;
+    }
+
     /// Whether the poller should start this task on this pass.
     ///
     /// Delegates to [`Task::is_ready_to_execute`] rather than keeping its own
@@ -246,21 +306,79 @@ impl TaskExecutor {
                 .read()
                 .await
                 .get(&task_id)
-                .is_some_and(|h| !h.is_finished())
+                .is_some_and(|r| !r.handle.is_finished())
     }
 
     async fn check_and_execute(&self) {
+        // One authoritative capacity reading for this whole pass. Every
+        // `try_acquire` below -- review admission, promotion reservation,
+        // execution admission -- draws on this same reconciled gate, which is
+        // what makes "coding + AI review/fix share one limit" a fact about
+        // this pass rather than three independent guesses that happened to
+        // agree.
+        self.reconcile_admission().await;
+
+        // A panic inside a spawned task's future skips its own cleanup code
+        // entirely (unwinding runs no further statements in that task), so it
+        // cannot be relied on to remove its own entry. Pruning finished
+        // handles here — reachable on every poll tick — is the backstop that
+        // catches that case regardless of which future code path forgets to
+        // clean up after itself.
+        self.running_handles
+            .write()
+            .await
+            .retain(|_, r| !r.handle.is_finished());
+        self.reviewing_handles
+            .write()
+            .await
+            .retain(|_, r| !r.handle.is_finished());
+
+        // Review-ready work is admitted *before* any new coding execution
+        // this pass. Otherwise a queue that never empties keeps handing every
+        // freed slot to the next coding task, and a task that finished coding
+        // and is waiting for review starves behind it forever — completed
+        // work piling up with nothing reaching `HumanReview`. `spawn_review`
+        // declines gracefully (leaving the task in `AiReview`, retried next
+        // pass) if admission has nothing left, so this loop never needs its
+        // own capacity bookkeeping.
+        let review_pending: Vec<Uuid> = {
+            let tasks = self.tasks.read().await;
+            let reviewing = self.reviewing_handles.read().await;
+            tasks.values()
+                .filter(|t| t.status == TaskStatus::AiReview && t.phase == TaskPhase::QaReview)
+                .filter(|t| !reviewing.contains_key(&t.id))
+                .map(|t| t.id)
+                .collect()
+        };
+        for task_id in review_pending {
+            self.spawn_review(task_id).await;
+        }
+
         // Auto-promote tasks from Queue → InProgress when capacity is available.
         //
-        // Durably: a promotion this loop makes has to survive a restart just
-        // as surely as one a person triggers through `commands::queue`, or an
-        // auto-promoted task that crashed before its next explicit save would
-        // come back `Queue` on disk while every other part of the running
-        // process still believed it was `InProgress`. See
-        // `lifecycle::commit_selected`.
+        // Reserve-then-promote: a permit is taken from the same shared gate
+        // *before* the durable promotion write, and transferred (via
+        // `reserved_permits`) to whichever execution actually starts the
+        // task. A promotion that is not backed by a reservation is exactly
+        // how `InProgress` cards used to pile up with nothing running behind
+        // them once review started drawing on the same capacity as
+        // execution — `select_promotable`'s own `parallel_task_limit` check
+        // only ever counted `TaskStatus::InProgress`, which is blind to a
+        // review holding a slot.
+        //
+        // Durably, for the promotion write itself: a promotion this loop
+        // makes has to survive a restart just as surely as one a person
+        // triggers through `commands::queue`, or an auto-promoted task that
+        // crashed before its next explicit save would come back `Queue` on
+        // disk while every other part of the running process still believed
+        // it was `InProgress`. See `lifecycle::commit_selected`.
         let auto_promote = self.queue_manager.read().await.config().auto_promote;
         if auto_promote {
             loop {
+                let Some(permit) = self.admission.try_acquire() else {
+                    break; // no capacity left to reserve; try again next pass
+                };
+
                 let manager = self.queue_manager.read().await;
                 let select = |tasks: &HashMap<Uuid, Task>| manager.select_promotable(tasks);
                 let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {
@@ -279,21 +397,31 @@ impl TaskExecutor {
 
                 match promoted {
                     Ok(Some(task)) => {
+                        // Transferred, not dropped: the reservation now
+                        // belongs to this task until its execution starts
+                        // and takes it over (`spawn_task_execution`) or the
+                        // task is pruned from `pending` below without ever
+                        // starting.
+                        self.reserved_permits.write().await.insert(task.id, permit);
                         self.events.agent_event(AgentEvent::Log {
                             task_id: task.id.to_string(),
                             level: LogLevel::Info,
                             message: "Auto-promoted from queue".to_string(),
                         });
                     }
+                    // Nothing eligible: the reservation is rescinded simply
+                    // by letting `permit` drop here, cleanly returning the
+                    // capacity nothing used.
                     Ok(None) => break,
                     Err(e) => {
                         // Nothing was promoted: `commit_selected` never
                         // publishes to the shared map unless the disk write
-                        // it depends on already succeeded. Stopping here
-                        // rather than retrying immediately avoids spinning
-                        // against a durably broken write on every poll tick;
-                        // the next tick tries again from the same truthful
-                        // state.
+                        // it depends on already succeeded, so `permit`
+                        // dropping here is the same clean rescission as the
+                        // `Ok(None)` arm. Stopping here rather than retrying
+                        // immediately avoids spinning against a durably
+                        // broken write on every poll tick; the next tick
+                        // tries again from the same truthful state.
                         eprintln!("[executor] auto-promotion did not persist: {e}");
                         break;
                     }
@@ -301,7 +429,7 @@ impl TaskExecutor {
             }
         }
 
-        // Find InProgress tasks that haven't started execution yet
+        // Find InProgress tasks that haven't started execution yet.
         let pending: Vec<Uuid> = {
             let tasks = self.tasks.read().await;
             tasks.values()
@@ -310,48 +438,27 @@ impl TaskExecutor {
                 .collect()
         };
 
-        // A panic inside a spawned task's future skips its own cleanup code
-        // entirely (unwinding runs no further statements in that task), so it
-        // cannot be relied on to remove its own entry. Pruning finished
-        // handles here — reachable on every poll tick — is the backstop that
-        // catches that case regardless of which future code path forgets to
-        // clean up after itself.
-        self.running_handles
-            .write()
-            .await
-            .retain(|_, r| !r.handle.is_finished());
-        let running = self.running_handles.read().await.len();
-        let limit = {
-            let mgr = self.queue_manager.read().await;
-            mgr.config().parallel_task_limit as usize
-        };
-        let available = limit.saturating_sub(running);
-
-        for task_id in pending.into_iter().take(available) {
-            // Declining is ordinary here: the task keeps its state and the next
-            // pass, three seconds later, tries again.
-            let _started = self.spawn_task_execution(task_id).await;
+        // Any reservation whose task is no longer pending (deleted, moved
+        // again, or otherwise never going to start) is returned here rather
+        // than held forever: dropping the removed permit is what gives its
+        // capacity back.
+        {
+            let pending_set: std::collections::HashSet<Uuid> = pending.iter().copied().collect();
+            self.reserved_permits
+                .write()
+                .await
+                .retain(|task_id, _| pending_set.contains(task_id));
         }
 
-        // Same backstop as `running_handles` above: a panicked review task
-        // cannot be relied on to remove its own entry, and a leaked one here
-        // holds `running_task_count()` above zero forever, which is what
-        // daemon shutdown waits on.
-        self.reviewing_handles.write().await.retain(|_, h| !h.is_finished());
-
-        // Find AiReview tasks that need automated review
-        let review_pending: Vec<Uuid> = {
-            let tasks = self.tasks.read().await;
-            let reviewing = self.reviewing_handles.read().await;
-            tasks.values()
-                .filter(|t| t.status == TaskStatus::AiReview && t.phase == TaskPhase::QaReview)
-                .filter(|t| !reviewing.contains_key(&t.id))
-                .map(|t| t.id)
-                .collect()
-        };
-
-        for task_id in review_pending {
-            self.spawn_review(task_id).await;
+        for task_id in pending {
+            // A reservation taken at promotion time is transferred straight
+            // in; anything else (a task that was already `InProgress` before
+            // this pass — reattached via drag, or a retry) draws a fresh
+            // permit inside `spawn_task_execution` itself. Declining is
+            // ordinary either way: the task keeps its state and the next
+            // pass, three seconds later, tries again.
+            let reserved = self.reserved_permits.write().await.remove(&task_id);
+            let _started = self.spawn_task_execution(task_id, reserved).await;
         }
 
         // Poll PR status every ~30s (10 cycles at 3s each)
@@ -629,9 +736,18 @@ impl TaskExecutor {
     ///
     /// Declining the lease is not a failure: the task keeps whatever state it
     /// had and the next poll, three seconds later, tries again.
-    /// Returns whether an execution was actually registered, so a caller that
-    /// answers a person can say what happened rather than assume it worked.
-    async fn spawn_task_execution(&self, task_id: Uuid) -> bool {
+    ///
+    /// `external_permit` is a reservation already taken by the caller --
+    /// `check_and_execute`'s reserve-then-promote loop, transferring a
+    /// permit straight from promotion into the execution it was reserved
+    /// for. `None` means no such reservation exists (a manual `execute_task`
+    /// call, or a task that was already `InProgress` before this poll pass),
+    /// in which case a fresh permit is drawn from [`Self::admission`] here,
+    /// so every path that can start an agent -- the poller and a direct
+    /// command alike -- goes through the same gate. Returns whether an
+    /// execution was actually registered, so a caller that answers a person
+    /// can say what happened rather than assume it worked.
+    async fn spawn_task_execution(&self, task_id: Uuid, external_permit: Option<AdmissionPermit>) -> bool {
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
             return false; // another lifecycle operation owns this task right now
         };
@@ -649,6 +765,20 @@ impl TaskExecutor {
         if self.is_task_running(task_id).await {
             return false; // one agent per task
         }
+
+        // Capacity, before any of the worktree/prompt work below runs: a
+        // reservation already made for this exact task is honored outright;
+        // otherwise this call draws its own fresh permit, and declines --
+        // same as every other refusal in this function -- if none is free.
+        // Dropping an unused `external_permit` on any decline path below
+        // returns its capacity immediately; nothing here can lose it.
+        let permit = match external_permit {
+            Some(p) => p,
+            None => match self.admission.try_acquire() {
+                Some(p) => p,
+                None => return false, // no capacity right now; the next pass tries again
+            },
+        };
 
         // Resolve repo path from task → project → repository chain
         let repo_path = match Self::resolve_working_dir_for_task(
@@ -858,6 +988,15 @@ impl TaskExecutor {
         let mut handles = self.running_handles.write().await;
 
         let handle = tokio::spawn(async move {
+            // Held for the whole life of this future, not just the
+            // synchronous call that started it: capacity is returned when
+            // `_permit` drops, which is exactly when this future -- the
+            // owner of the real agent process -- returns, on every path
+            // including the early-return failure arms below. Removing this
+            // task's `running_handles` entry does not by itself free
+            // anything; see `crate::queue::admission`.
+            let _permit = permit;
+
             let execution_id = Uuid::new_v4();
             let now = chrono::Utc::now();
 
@@ -1104,7 +1243,12 @@ impl TaskExecutor {
                 t.updated_at = chrono::Utc::now();
             }
         }
-        if !self.spawn_task_execution(task_id).await {
+        // A direct call, same as the poller: no pre-existing reservation, so
+        // this draws its own fresh permit from the shared gate inside
+        // `spawn_task_execution`. A frontend pre-check believing capacity is
+        // free is not authority here -- this is.
+        self.reconcile_admission().await;
+        if !self.spawn_task_execution(task_id, None).await {
             // The task is left where it is, which is what the three-second
             // poll looks for, so this is a deferral rather than a loss. Saying
             // `Ok` would tell the caller an agent is running when none is.
@@ -1134,16 +1278,26 @@ impl TaskExecutor {
     /// Stopping is not discarding: the worktree, the branch and the commits
     /// the run had already made all survive, and a later explicit move back
     /// into a working column reattaches to them.
+    ///
+    /// Reaches whichever of an execution or an AI review/fix currently owns
+    /// the task -- the task-exclusivity contract (see
+    /// [`crate::queue::admission`]) means at most one of `running_handles`
+    /// and `reviewing_handles` can have a live entry for it at once, so this
+    /// tries the execution map first and only falls through to the review
+    /// map if that found nothing. A review's reviewer-then-fix sequence is
+    /// one future behind one [`ReviewOwner`]; cancelling it ends whichever
+    /// `ClaudeRunner` it currently owns, the same as [`RunningTask`].
     pub async fn stop_task(&self, task_id: Uuid) -> Result<(), String> {
         // Stopping is an ownership change, so it takes the task's lifecycle
         // lease like every other one. It cannot deadlock against the run it is
-        // ending: `spawn_task_execution` releases the lease as soon as it has
-        // registered the run, and the execution future itself never asks for
-        // it -- everything it does on the way out (killing the process,
-        // removing its `running_handles` entry, recording the execution) uses
-        // its own locks. So the longest this holds the lease for is the tail
-        // of another lifecycle operation, or one agent's own bounded shutdown
-        // -- never its unbounded lifetime; see [`AGENT_SHUTDOWN_TIMEOUT`].
+        // ending: `spawn_task_execution`/`spawn_review` release the lease as
+        // soon as they have registered the run, and neither future itself
+        // ever asks for it -- everything each does on the way out (killing
+        // the process, removing its handle-map entry, recording the
+        // execution) uses its own locks. So the longest this holds the lease
+        // for is the tail of another lifecycle operation, or one agent's own
+        // bounded shutdown -- never its unbounded lifetime; see
+        // [`AGENT_SHUTDOWN_TIMEOUT`].
         let _lease = self.lifecycle.acquire(task_id).await?;
 
         // Taken out of the map before awaiting anything, so the guard is
@@ -1178,9 +1332,57 @@ impl TaskExecutor {
                     ));
                 }
             }
+            // Guarded on `InProgress`: joining an owner found in
+            // `running_handles` proves an execution *was* live, but by the
+            // time the join above returns, that same execution's own
+            // completion path may have already run to the end and durably
+            // recorded `AiReview` -- self-removing from this very map is one
+            // of its last steps, after the status write, so a race that
+            // finds the entry a moment before that self-removal still needs
+            // this to check the status this future actually settled on, not
+            // assume its own cancellation won.
+            return Self::settle_stopped_static(&self.tasks, &self.storage, task_id, TaskStatus::InProgress).await;
         }
 
-        Self::settle_stopped_static(&self.tasks, &self.storage, task_id).await
+        // No execution owns it; an AI review/fix might. Same shape, same
+        // bound, same map-then-settle ordering -- and that ordering is the
+        // whole safety argument against a stale write: whatever this join
+        // waits for (including any durable write the review future itself
+        // makes on its way out, such as `transition_to_human_review`) always
+        // finishes *before* `settle_stopped_static` runs, never after. A
+        // review that wins the race and legitimately publishes `HumanReview`
+        // is therefore never overwritten by the settle below, which only
+        // ever touches a task still `AiReview` once it actually runs -- the
+        // same "check what actually happened, not what was asked for" reason
+        // the execution arm above guards on `InProgress` rather than
+        // assuming its own cancellation won.
+        let reviewing = self.reviewing_handles.write().await.remove(&task_id);
+
+        if let Some(mut owner) = reviewing {
+            let _ = owner.cancel.send(true);
+            match tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, &mut owner.handle).await {
+                Ok(_) => {}
+                Err(_) => {
+                    self.reviewing_handles.write().await.insert(task_id, owner);
+                    return Err(format!(
+                        "the AI review for task {task_id} is still finishing up; nothing was \
+                         changed, so this can simply be asked for again shortly"
+                    ));
+                }
+            }
+            return Self::settle_stopped_static(&self.tasks, &self.storage, task_id, TaskStatus::AiReview).await;
+        }
+
+        // Neither map owned it: either nothing was ever running for this
+        // task, or an execution already finished and moved status off
+        // `InProgress` entirely on its own (see the guard above -- this is
+        // that same case, just observed after this future's self-removal
+        // instead of during the race with it). `InProgress` is the right
+        // guard here for the same reason: only a task a crash or an
+        // unrecorded outcome left stranded `InProgress` with no live owner
+        // should be cleaned up to `Backlog` by a stop that found nothing to
+        // cancel.
+        Self::settle_stopped_static(&self.tasks, &self.storage, task_id, TaskStatus::InProgress).await
     }
 
     /// Record a stopped task as work that is waiting for a person again.
@@ -1193,10 +1395,10 @@ impl TaskExecutor {
     /// into a working column resets execution state and reattaches to the
     /// preserved branch, which is the same route a retry already takes.
     ///
-    /// Guarded on `InProgress` so a stop that arrives after the run finished
-    /// on its own does not pull a task back out of the review it had already
-    /// reached. That is the honest resolution of that race: the run was over
-    /// before the stop got there.
+    /// Guarded on `from_status` (see below) so a stop that arrives after the
+    /// owned work finished on its own does not pull a task back out of a
+    /// state it had already durably reached. That is the honest resolution
+    /// of that race: the run was over before the stop got there.
     ///
     /// Persists before publishing, the same contract every durable write in
     /// [`crate::lifecycle`] holds, and for a sharper reason. What survives a failed write is the
@@ -1222,17 +1424,28 @@ impl TaskExecutor {
     /// above would then send the user's next stop straight to `Ok`, for a
     /// task the file still has as running -- the exact answer this returns a
     /// `Result` to stop giving.
+    /// `from_status` is the status the caller actually joined an owner out
+    /// of (`InProgress` for an execution, `AiReview` for a review/fix, or
+    /// `InProgress` again for "nothing was found to join at all" -- see the
+    /// three call sites in [`Self::stop_task`]). It is deliberately not
+    /// inferred from the task's current status: the whole point of this
+    /// guard is to compare what actually happened (this exact status, at the
+    /// moment ownership was last provably held) against what the task shows
+    /// now, so a stop that arrived after the owned work already finished and
+    /// moved on -- to `AiReview` from an execution, to `HumanReview` from a
+    /// review -- settles nothing rather than overwriting that result.
     async fn settle_stopped_static(
         tasks: &Tasks,
         storage: &crate::config::Storage,
         task_id: Uuid,
+        from_status: TaskStatus,
     ) -> Result<(), String> {
         let mut tasks_w = tasks.write().await;
 
         let Some(task) = tasks_w.get(&task_id) else {
             return Ok(()); // deleted while its agent was being stopped
         };
-        if task.status != TaskStatus::InProgress {
+        if task.status != from_status {
             return Ok(());
         }
         let project_id = task.project_id;
@@ -1273,7 +1486,115 @@ impl TaskExecutor {
         Ok(())
     }
 
+    /// Run one `ClaudeRunner` (the reviewer agent, or the fix agent) to
+    /// completion, or kill it and return early if `cancelled` fires first.
+    ///
+    /// This is the one place a `ClaudeRunner` spawned inside a review/fix
+    /// flow is owned: `ClaudeRunner::start` is never itself raced against
+    /// cancellation (an outer `select!` around a future still mid-spawn is
+    /// exactly the unsafe shape that can drop a just-spawned child with
+    /// nothing left pointing at it), so a cancellation arriving before this
+    /// call is checked up front and a cancellation arriving during `wait()`
+    /// is met with this function's own `kill()` before it returns -- never a
+    /// caller racing the whole call from outside.
+    ///
+    /// `Ok(Some(output))` is a normal completion; `Ok(None)` is a graceful
+    /// decline (cancelled before start, or cancelled during `wait()` and
+    /// killed); `Err` is a real failure to start.
+    async fn run_cancellable_agent(
+        config: ClaudeRunConfig,
+        cancelled: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Option<String>, String> {
+        if *cancelled.borrow() {
+            return Ok(None);
+        }
+        let runner = ClaudeRunner::start(config).await?;
+        tokio::select! {
+            biased;
+            result = runner.wait() => {
+                let _success = result.unwrap_or(false);
+                let output = runner.get_output().await;
+                let _ = runner.kill().await;
+                Ok(Some(output))
+            }
+            _ = cancelled.changed() => {
+                let _ = runner.kill().await;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Same contract as [`Self::run_cancellable_agent`], for the CodeRabbit
+    /// subprocess: owned by the code that spawned it for its whole life, so a
+    /// cancellation arriving while it is running kills and reaps it rather
+    /// than leaving `tokio::join!` (see [`Self::spawn_review`]) parked on a
+    /// branch nothing will ever signal again -- the exact way a parked
+    /// joined branch could make a stop hang forever.
+    async fn run_cancellable_coderabbit(
+        working_dir: &str,
+        cancelled: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> String {
+        if *cancelled.borrow() {
+            return String::new();
+        }
+        let mut child = match tokio::process::Command::new("coderabbit")
+            .args(["review", "--prompt-only", "--type", "uncommitted", "--cwd", working_dir, "--no-color"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return format!("CodeRabbit error: {}", e),
+        };
+
+        let status = tokio::select! {
+            biased;
+            status = child.wait() => Some(status),
+            _ = cancelled.changed() => None,
+        };
+
+        let Some(status) = status else {
+            let _ = child.kill().await;
+            let _ = child.wait().await; // reap; no zombie left behind
+            return String::new();
+        };
+
+        use tokio::io::AsyncReadExt;
+        let mut stdout_buf = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            let _ = out.read_to_string(&mut stdout_buf).await;
+        }
+        let mut stderr_buf = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            let _ = err.read_to_string(&mut stderr_buf).await;
+        }
+
+        match status {
+            Ok(s) if s.success() => stdout_buf,
+            Ok(_) => format!("CodeRabbit warning: {}", stderr_buf),
+            Err(e) => format!("CodeRabbit error: {}", e),
+        }
+    }
+
     async fn spawn_review(&self, task_id: Uuid) {
+        // Acquiring the task's worktree path is an ownership question, so it
+        // happens under the task's lifecycle lease -- exactly the reason
+        // `spawn_task_execution` takes it (see that function's doc). Without
+        // this, a `terminalize`/delete reachable directly from `commands::
+        // task`/the IPC handlers (independent of the poll loop that calls
+        // this) could see `is_task_running() == false` a moment before this
+        // registers into `reviewing_handles`, remove the checkout, and leave
+        // this function's already-scheduled future to run its diff/reviewer/
+        // fix-agent/`jj describe` sequence against a directory that is gone.
+        // Released as soon as the run is registered (this lease is a local
+        // of this synchronous portion of the function, not moved into the
+        // spawned future), the same trade `spawn_task_execution` makes:
+        // holding it for the review's whole lifetime would make `stop_task`
+        // -- which needs this same lease -- wait for the run it is ending.
+        let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
+            return; // another lifecycle operation owns this task right now
+        };
+
         // The task's own worktree, or no review at all.
         //
         // This used to fall back to the repository path, and a review is not a
@@ -1282,6 +1603,13 @@ impl TaskExecutor {
         // user's own checkout that rewrites their current change description
         // under a task title. A task with no worktree has nothing of its own to
         // review, and saying so is the only safe answer.
+        //
+        // No admission permit is needed for this path: nothing here spawns a
+        // process, so there is no capacity to hold.
+        //
+        // Read under the lease, not from whatever `check_and_execute`
+        // sampled before waiting for it: a task that has since lost its
+        // worktree (or been deleted) must not be started off a stale read.
         let Some((working_dir, base_commit)) = ({
             let tasks_r = self.tasks.read().await;
             tasks_r.get(&task_id).and_then(|t| t.worktree_path.clone().map(|w| (w, t.base_commit.clone())))
@@ -1311,16 +1639,40 @@ impl TaskExecutor {
             return;
         };
 
+        // Capacity, from the same gate execution draws on -- acquired only
+        // now that this is actually about to spawn a process. Declining is
+        // ordinary here too: the task stays `AiReview`, untouched, and the
+        // next pass's `review_pending` scan picks it right back up.
+        let Some(permit) = self.admission.try_acquire() else {
+            return;
+        };
+
         let tasks = self.tasks.clone();
         let reviewing_handles = self.reviewing_handles.clone();
         let events = self.events.clone();
         let storage = self.storage.clone();
         let queue_manager = self.queue_manager.clone();
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
 
         // Mark phase as actively reviewing
         Self::update_task_phase_static(&tasks, task_id, TaskPhase::QaReview, 85).await;
 
+        // Same reasoning as `spawn_task_execution`: the lock is taken before
+        // the spawn and held across the insert, so there is no instant in
+        // which a review is running and `stop_task` can find nothing to
+        // cancel. A future that raced in ahead of the insert would only be
+        // able to observe that by trying to acquire this exact same lock to
+        // remove itself, which blocks until the insert below releases it.
+        let mut handles = self.reviewing_handles.write().await;
+
         let handle = tokio::spawn(async move {
+            // Held for the whole life of this future -- the reviewer agent,
+            // the fix agent, and everything between them are one continuous
+            // ownership flow, and it does not release or reacquire this
+            // permit when it moves from one `ClaudeRunner` to the next. See
+            // `crate::queue::admission`.
+            let _permit = permit;
+
             let task_id_str = task_id.to_string();
 
             events.agent_event(AgentEvent::Log {
@@ -1333,10 +1685,17 @@ impl TaskExecutor {
             // modal uses. An unknown boundary or a computation failure are
             // both real problems, distinct from "nothing changed": either
             // one gets an explicit `Rejected` signoff naming the reason,
-            // never a silent "no changes" skip.
+            // never a silent "no changes" skip. Not raced against
+            // cancellation: this is a bounded git subprocess (see
+            // `worktree::diff`), not an open-ended agent, so there is
+            // nothing here a `select!` would usefully shorten.
             let diff = match crate::worktree::task_diff(&working_dir, base_commit.as_deref()).await {
                 Ok(d) => d,
                 Err(e) => {
+                    if *cancelled.borrow() {
+                        reviewing_handles.write().await.remove(&task_id);
+                        return;
+                    }
                     events.agent_event(AgentEvent::Log {
                         task_id: task_id_str.clone(),
                         level: LogLevel::Warn,
@@ -1356,6 +1715,10 @@ impl TaskExecutor {
             let diff = diff.patch;
 
             if diff.trim().is_empty() {
+                if *cancelled.borrow() {
+                    reviewing_handles.write().await.remove(&task_id);
+                    return;
+                }
                 events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
@@ -1378,96 +1741,93 @@ impl TaskExecutor {
                 }
             };
 
-            // A) Claude review
-            let claude_review = async {
-                let runner = ClaudeRunner::start(ClaudeRunConfig {
-                    prompt: review_prompt,
-                    working_dir: working_dir.clone(),
-                    allowed_tools: vec![
-                        "Read".to_string(), "Glob".to_string(), "Grep".to_string(),
-                    ],
-                    max_turns: Some(10),
-                    max_budget_usd: None,
-                    session_id: Some(Uuid::new_v4().to_string()),
-                    resume_session: None,
-                    model: None,
-                    system_prompt: None,
-                    permission_mode: None,
-                    disable_mcp: false,
-            additional_dirs: Vec::new(),
-                }).await;
-
-                match runner {
-                    Ok(r) => {
-                        let _success = r.wait().await.unwrap_or(false);
-                        let output = r.get_output().await;
-                        let _ = r.kill().await;
-                        output
-                    }
-                    Err(e) => format!("Claude review error: {}", e),
-                }
-            };
-
-            // B) CodeRabbit review (if available)
             let use_coderabbit = {
                 let mgr = queue_manager.read().await;
                 mgr.config().use_coderabbit
             };
 
-            let coderabbit_review = async {
+            // A) Claude review — cancellable via `run_cancellable_agent`,
+            // which owns its `ClaudeRunner` for its whole life. Each leg
+            // gets its own `Receiver` clone (a `watch::Receiver` cannot be
+            // shared, mutably, across two futures polled at once, and these
+            // run concurrently in the `tokio::join!` below) and its own
+            // clone of everything else it needs, since `working_dir`,
+            // `events` and `task_id_str` are all still needed afterward —
+            // by the fix-agent stage and by the final signoff writes.
+            let mut cancelled_for_claude = cancelled.clone();
+            let working_dir_for_claude = working_dir.clone();
+            let claude_review = async move {
+                match Self::run_cancellable_agent(
+                    ClaudeRunConfig {
+                        prompt: review_prompt,
+                        working_dir: working_dir_for_claude,
+                        allowed_tools: vec![
+                            "Read".to_string(), "Glob".to_string(), "Grep".to_string(),
+                        ],
+                        max_turns: Some(10),
+                        max_budget_usd: None,
+                        session_id: Some(Uuid::new_v4().to_string()),
+                        resume_session: None,
+                        model: None,
+                        system_prompt: None,
+                        permission_mode: None,
+                        disable_mcp: false,
+                        additional_dirs: Vec::new(),
+                    },
+                    &mut cancelled_for_claude,
+                )
+                .await
+                {
+                    Ok(Some(output)) => output,
+                    Ok(None) => String::new(), // cancelled; the outer check below stops this flow
+                    Err(e) => format!("Claude review error: {}", e),
+                }
+            };
+
+            // B) CodeRabbit review (if available) — same cancellable shape.
+            let mut cancelled_for_coderabbit = cancelled.clone();
+            let working_dir_for_coderabbit = working_dir.clone();
+            let events_for_coderabbit = events.clone();
+            let task_id_str_for_coderabbit = task_id_str.clone();
+            let coderabbit_review = async move {
                 if !use_coderabbit {
                     return String::new();
                 }
-
-                // Check if coderabbit binary exists
-                match tokio::process::Command::new("which")
-                    .arg("coderabbit")
-                    .output()
-                    .await
-                {
+                match tokio::process::Command::new("which").arg("coderabbit").output().await {
                     Ok(output) if output.status.success() => {}
                     _ => {
-                        events.agent_event(AgentEvent::Log {
-                            task_id: task_id_str.clone(),
+                        events_for_coderabbit.agent_event(AgentEvent::Log {
+                            task_id: task_id_str_for_coderabbit.clone(),
                             level: LogLevel::Warn,
                             message: "CodeRabbit enabled but CLI not found. Install it or disable in Queue Settings.".to_string(),
                         });
                         return String::new();
                     }
                 }
-
-                events.agent_event(AgentEvent::Log {
-                    task_id: task_id_str.clone(),
+                events_for_coderabbit.agent_event(AgentEvent::Log {
+                    task_id: task_id_str_for_coderabbit.clone(),
                     level: LogLevel::Info,
                     message: "Running CodeRabbit review...".to_string(),
                 });
-
-                match tokio::process::Command::new("coderabbit")
-                    .args([
-                        "review",
-                        "--prompt-only",
-                        "--type", "uncommitted",
-                        "--cwd", &working_dir,
-                        "--no-color",
-                    ])
-                    .output()
-                    .await
-                {
-                    Ok(output) if output.status.success() => {
-                        String::from_utf8_lossy(&output.stdout).to_string()
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        format!("CodeRabbit warning: {}", stderr)
-                    }
-                    Err(e) => {
-                        format!("CodeRabbit error: {}", e)
-                    }
-                }
+                Self::run_cancellable_coderabbit(&working_dir_for_coderabbit, &mut cancelled_for_coderabbit).await
             };
 
-            // Run both reviews in parallel
+            // Run both reviews in parallel. Each leg above already killed and
+            // reaped its own subprocess on cancellation, so this always
+            // returns promptly once cancelled -- never a parked branch
+            // waiting on a process nothing will end.
             let (claude_result, coderabbit_result) = tokio::join!(claude_review, coderabbit_review);
+
+            // The review's outcome is only ever recorded from here on, and
+            // every remaining write below is guarded the same way: a
+            // cancellation observed here means whatever partial findings
+            // exist are not this run's business to publish. `stop_task`
+            // owns telling the user it ended; this future's only job past
+            // this point is to get out of the way.
+            if *cancelled.borrow() {
+                reviewing_handles.write().await.remove(&task_id);
+                return;
+            }
 
             // Merge findings
             let has_claude_issues = claude_result.contains("CHANGES_REQUESTED");
@@ -1507,26 +1867,30 @@ impl TaskExecutor {
                     }
                 };
 
-                let fix_result = match ClaudeRunner::start(ClaudeRunConfig {
-                    prompt: fix_prompt,
-                    working_dir: working_dir.clone(),
-                    allowed_tools: vec![
-                        "Read".to_string(), "Edit".to_string(), "Write".to_string(),
-                        "Glob".to_string(), "Grep".to_string(),
-                    ],
-                    max_turns: Some(20),
-                    max_budget_usd: None,
-                    session_id: Some(Uuid::new_v4().to_string()),
-                    resume_session: None,
-                    model: None,
-                    system_prompt: None,
-                    permission_mode: None,
-                    disable_mcp: false,
-            additional_dirs: Vec::new(),
-                }).await {
-                    Ok(r) => {
-                        let _success = r.wait().await.unwrap_or(false);
-                        let _ = r.kill().await;
+                let fix_outcome = Self::run_cancellable_agent(
+                    ClaudeRunConfig {
+                        prompt: fix_prompt,
+                        working_dir: working_dir.clone(),
+                        allowed_tools: vec![
+                            "Read".to_string(), "Edit".to_string(), "Write".to_string(),
+                            "Glob".to_string(), "Grep".to_string(),
+                        ],
+                        max_turns: Some(20),
+                        max_budget_usd: None,
+                        session_id: Some(Uuid::new_v4().to_string()),
+                        resume_session: None,
+                        model: None,
+                        system_prompt: None,
+                        permission_mode: None,
+                        disable_mcp: false,
+                        additional_dirs: Vec::new(),
+                    },
+                    &mut cancelled,
+                )
+                .await;
+
+                let fix_result = match fix_outcome {
+                    Ok(Some(_output)) => {
                         // Re-describe in jj after fixes
                         let _ = tokio::process::Command::new("jj")
                             .args(["describe", "-m", &format!("task: {} (with review fixes)", {
@@ -1543,6 +1907,13 @@ impl TaskExecutor {
                             .await;
                         true
                     }
+                    Ok(None) => {
+                        // Cancelled during the fix agent's run: it has
+                        // already been killed by `run_cancellable_agent`.
+                        // Nothing durable is recorded on this path either.
+                        reviewing_handles.write().await.remove(&task_id);
+                        return;
+                    }
                     Err(e) => {
                         events.agent_event(AgentEvent::Log {
                             task_id: task_id_str.clone(),
@@ -1552,6 +1923,11 @@ impl TaskExecutor {
                         false
                     }
                 };
+
+                if *cancelled.borrow() {
+                    reviewing_handles.write().await.remove(&task_id);
+                    return;
+                }
 
                 let issues: Vec<String> = findings.lines()
                     .filter(|l| l.starts_with("- ISSUE:") || l.starts_with("ISSUE:"))
@@ -1587,7 +1963,7 @@ impl TaskExecutor {
             reviewing_handles.write().await.remove(&task_id);
         });
 
-        self.reviewing_handles.write().await.insert(task_id, handle);
+        handles.insert(task_id, ReviewOwner { handle, cancel });
     }
 
     /// Move a task to `HumanReview`/`Complete`, durably before the board can
@@ -2797,11 +3173,12 @@ mod tests {
         while !handle.is_finished() {
             tokio::task::yield_now().await;
         }
+        let (cancel, _cancelled) = tokio::sync::watch::channel(false);
         executor
             .reviewing_handles
             .write()
             .await
-            .insert(task_id, handle);
+            .insert(task_id, ReviewOwner { handle, cancel });
 
         executor.check_and_execute().await;
 
@@ -2900,7 +3277,7 @@ mod tests {
         let task_id = task.id;
         executor.tasks.write().await.insert(task_id, task);
 
-        executor.spawn_task_execution(task_id).await;
+        executor.spawn_task_execution(task_id, None).await;
 
         assert!(
             executor.running_handles.read().await.is_empty(),
@@ -3565,5 +3942,533 @@ mod tests {
             "the AI reviewer must still see the task's committed change, got an empty diff"
         );
         assert!(diff.patch.contains("agent_change.txt"));
+    }
+
+    // ---- Unit 5C2: review/fix lifecycle ownership and shared capacity ----
+    //
+    // Real fake `claude` subprocesses (never the user's real Claude config),
+    // installed on `PATH` and torn down on `Drop`. `PATH` is process-global,
+    // so every test in this module that installs one serializes on the one
+    // shared `crate::test_helpers::PATH_LOCK` -- the same lock
+    // `commands::pr`'s `MockGh` tests use, for the same reason. A private,
+    // module-local lock here would not serialize against that module's own
+    // PATH mutations under default parallel `cargo test`; see
+    // `test_helpers::PATH_LOCK`'s doc comment for the corrective-pass
+    // evidence that this actually raced.
+    #[cfg(target_os = "linux")]
+    mod review_lifecycle {
+        use super::*;
+        use crate::test_helpers::PATH_LOCK;
+
+        /// A stand-in `claude` binary that plays either the reviewer role
+        /// (its `--allowedTools` has neither `Edit` nor `Bash`) or the fix
+        /// role (`--allowedTools` has `Edit`). Whichever role equals
+        /// `block_role` blocks until killed, recording its own pid; every
+        /// other invocation exits immediately reporting an issue, which is
+        /// what drives the flow from the reviewer into the fix agent.
+        struct MockClaude {
+            _tmp: tempfile::TempDir,
+            pidfile: std::path::PathBuf,
+            saved_path: Option<String>,
+        }
+
+        impl MockClaude {
+            fn install(block_role: &str) -> Self {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let bin_dir = tmp.path().join("bin");
+                std::fs::create_dir_all(&bin_dir).unwrap();
+                let pidfile = tmp.path().join("blocked.pid");
+
+                let script = format!(
+                    "#!/bin/sh\n\
+                     printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-fixture\",\"model\":\"fixture-model\"}}\\n'\n\
+                     role=review\n\
+                     case \"$*\" in\n\
+                     \x20 *Edit*) role=fix ;;\n\
+                     esac\n\
+                     if [ \"$role\" = {block_role:?} ]; then\n\
+                     \x20 printf '%s\\n' \"$$\" > {pidfile:?}\n\
+                     \x20 exec sleep 300\n\
+                     fi\n\
+                     printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s-fixture\",\"result\":\"CHANGES_REQUESTED: fixture wants changes\"}}\\n'\n\
+                     exit 0\n",
+                    block_role = block_role,
+                    pidfile = pidfile,
+                );
+                let bin = bin_dir.join("claude");
+                std::fs::write(&bin, &script).expect("write fixture script");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+                        .expect("chmod fixture script");
+                }
+
+                let saved_path = std::env::var("PATH").ok();
+                let new_path = match &saved_path {
+                    Some(p) => format!("{}:{}", bin_dir.display(), p),
+                    None => bin_dir.display().to_string(),
+                };
+                // Safety: serialized via PATH_LOCK; restored on Drop.
+                unsafe {
+                    std::env::set_var("PATH", new_path);
+                }
+
+                MockClaude { _tmp: tmp, pidfile, saved_path }
+            }
+
+            fn blocked_pid(&self) -> Option<i32> {
+                std::fs::read_to_string(&self.pidfile).ok()?.trim().parse().ok()
+            }
+        }
+
+        impl Drop for MockClaude {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.saved_path {
+                        Some(p) => std::env::set_var("PATH", p),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+
+        fn pid_is_alive(pid: i32) -> bool {
+            std::path::Path::new(&format!("/proc/{pid}")).exists()
+        }
+
+        async fn wait_for_pidfile(mock: &MockClaude) -> i32 {
+            for _ in 0..400 {
+                if let Some(pid) = mock.blocked_pid() {
+                    return pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            panic!("fixture never wrote its pid file; the blocking role was never reached");
+        }
+
+        /// A real git repo with an uncommitted change, exactly what
+        /// `spawn_review` needs to compute a non-empty canonical diff.
+        fn git_repo_with_change() -> (tempfile::TempDir, String) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path();
+            let git = |args: &[&str]| {
+                let status =
+                    std::process::Command::new("git").args(args).current_dir(path).status().unwrap();
+                assert!(status.success(), "git {args:?} failed");
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.email", "t@example.com"]);
+            git(&["config", "user.name", "T"]);
+            std::fs::write(path.join("seed.txt"), "seed\n").unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", "seed"]);
+            let base_commit = {
+                let out = std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(path)
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            std::fs::write(path.join("agent_change.txt"), "the agent's work\n").unwrap();
+            (dir, base_commit)
+        }
+
+        fn reviewing_task(project_id: Uuid, worktree_path: &str, base_commit: &str) -> Task {
+            let mut task = create_test_task_full("under review", project_id, TaskStatus::AiReview, 0);
+            task.phase = TaskPhase::QaReview;
+            task.worktree_path = Some(worktree_path.to_string());
+            task.base_commit = Some(base_commit.to_string());
+            task
+        }
+
+        /// RED: today, `stop_task` only ever looks at `running_handles`.
+        /// Calling it while a task is under AI review touches nothing, so a
+        /// real reviewer subprocess is left running with the checkout still
+        /// open underneath it, and the call still reports success.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_running_reviewer_agent_can_be_stopped_safely() {
+            let _path_guard = PATH_LOCK.lock().await;
+            let mock = MockClaude::install("review");
+
+            let (executor, _temps) = test_executor();
+            let (repo, base_commit) = git_repo_with_change();
+            let task = reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+
+            executor.spawn_review(task_id).await;
+
+            let pid = wait_for_pidfile(&mock).await;
+            assert!(pid_is_alive(pid), "setup: the fixture reviewer must actually be running");
+
+            let result = tokio::time::timeout(
+                AGENT_SHUTDOWN_TIMEOUT + std::time::Duration::from_secs(5),
+                executor.stop_task(task_id),
+            )
+            .await
+            .expect("stop_task itself must bound the wait, not this outer timeout");
+
+            assert!(result.is_ok(), "stopping a running review must succeed: {result:?}");
+            assert!(
+                !pid_is_alive(pid),
+                "the reviewer process must be gone once stop_task reports success"
+            );
+            assert!(
+                executor.reviewing_handles.read().await.is_empty(),
+                "a stopped review must not still be tracked as in flight"
+            );
+        }
+
+        /// RED: same defect, one step deeper into the flow -- a fix agent
+        /// spawned *after* the reviewer found issues is exactly as
+        /// unreachable from `stop_task` as the reviewer itself.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_running_fix_agent_can_be_stopped_safely() {
+            let _path_guard = PATH_LOCK.lock().await;
+            let mock = MockClaude::install("fix");
+
+            let (executor, _temps) = test_executor();
+            let (repo, base_commit) = git_repo_with_change();
+            let task = reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+
+            executor.spawn_review(task_id).await;
+
+            let pid = wait_for_pidfile(&mock).await;
+            assert!(pid_is_alive(pid), "setup: the fixture fix agent must actually be running");
+
+            let result = tokio::time::timeout(
+                AGENT_SHUTDOWN_TIMEOUT + std::time::Duration::from_secs(5),
+                executor.stop_task(task_id),
+            )
+            .await
+            .expect("stop_task itself must bound the wait, not this outer timeout");
+
+            assert!(result.is_ok(), "stopping a running fix agent must succeed: {result:?}");
+            assert!(
+                !pid_is_alive(pid),
+                "the fix agent process must be gone once stop_task reports success"
+            );
+            assert!(
+                executor.reviewing_handles.read().await.is_empty(),
+                "a stopped review must not still be tracked as in flight"
+            );
+        }
+
+        /// GREEN-pinning (see report §5): before this unit, `reviewing_handles`
+        /// carried no cancellation channel at all, so there is no pre-fix
+        /// shape of this test that both compiles and exercises real
+        /// production types -- the guarantee itself is new. Proves a stop
+        /// landing exactly as a review finishes on its own does not clobber
+        /// the genuine completion it raced: the completed `HumanReview` write
+        /// always happens-before `stop_task`'s own settle step, because
+        /// `stop_task` joins the review future in full before touching the
+        /// task's status itself.
+        #[tokio::test(start_paused = true)]
+        async fn a_completion_that_wins_the_race_with_stop_is_not_overwritten() {
+            let (executor, _temps) = test_executor();
+            let project_id = Uuid::new_v4();
+            let task = reviewing_task(project_id, "/tmp/worktree-under-test", "deadbeef");
+            let task_id = task.id;
+            let storage_tasks: Tasks = executor.tasks.clone();
+            storage_tasks.write().await.insert(task_id, task.clone());
+            executor
+                .storage
+                .save_project_tasks(project_id, &[task])
+                .expect("seed the board");
+
+            let tasks = executor.tasks.clone();
+            let storage = executor.storage.clone();
+            let events = executor.events.clone();
+            let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+            let handle = tokio::spawn(async move {
+                // Simulate "already past the point of no return": by the
+                // time cancellation is observed, the review has already
+                // decided its outcome and is committed to recording it.
+                let _ = cancelled.changed().await;
+                let signoff = QaSignoff {
+                    status: QaStatus::Approved,
+                    issues_found: Vec::new(),
+                    timestamp: chrono::Utc::now(),
+                    session_id: Uuid::new_v4(),
+                };
+                TaskExecutor::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff))
+                    .await;
+            });
+            executor
+                .reviewing_handles
+                .write()
+                .await
+                .insert(task_id, ReviewOwner { handle, cancel });
+
+            let result = executor.stop_task(task_id).await;
+            assert!(result.is_ok(), "joining a review that finished must be a successful stop: {result:?}");
+
+            let tasks_r = executor.tasks.read().await;
+            let after = tasks_r.get(&task_id).expect("task survives");
+            assert_eq!(
+                after.status,
+                TaskStatus::HumanReview,
+                "the review's own completion must stand, not be clobbered back to Backlog"
+            );
+            assert!(after.qa_signoff.is_some());
+        }
+
+        /// GREEN-pinning (see report §5), same reason as above: cancellation
+        /// arriving after a `ClaudeRunner` has been started but before this
+        /// review's ownership record exists in `reviewing_handles` must still
+        /// reach and kill that process, not orphan it. Proven by holding the
+        /// registration lock across spawn *and* insert -- mirroring
+        /// `running_handles` -- so no external caller can observe the task as
+        /// "not tracked" while its process is alive.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cancellation_between_process_spawn_and_registration_does_not_orphan_it() {
+            let _path_guard = PATH_LOCK.lock().await;
+            let mock = MockClaude::install("review");
+
+            let (executor, _temps) = test_executor();
+            let (repo, base_commit) = git_repo_with_change();
+            let task = reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+
+            // No synchronization between the spawn and the stop attempt other
+            // than the pidfile: this drives the race as tightly as the real
+            // production call sites (the poller's `spawn_review` and a
+            // concurrent `stop_task`) can, rather than proving only the
+            // already-registered case tests 1/2 above cover.
+            executor.spawn_review(task_id).await;
+            let pid = wait_for_pidfile(&mock).await;
+
+            let result = executor.stop_task(task_id).await;
+            assert!(result.is_ok());
+            assert!(
+                !pid_is_alive(pid),
+                "a process that had already spawned by the time it was cancelled must \
+                 still be killed, not orphaned because registration raced it"
+            );
+        }
+
+        // ---- Part 3: shared admission / capacity truth --------------------
+
+        /// Execution and AI review/fix draw on the exact same gate: a permit
+        /// already held (standing in here for "an execution is running")
+        /// makes a review decline outright, rather than spawning past a
+        /// limit that was only ever checked against `running_handles`.
+        #[tokio::test]
+        async fn a_review_declines_when_the_only_slot_is_already_held() {
+            let (executor, _temps) = test_executor();
+            executor
+                .queue_manager
+                .write()
+                .await
+                .set_config(crate::config::queue::QueueConfig { parallel_task_limit: 1, ..Default::default() })
+                .await;
+            executor.reconcile_admission().await;
+            let _held = executor.admission.try_acquire().expect("setup: the one slot must be free");
+
+            let (repo, base_commit) = git_repo_with_change();
+            let task = reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+
+            executor.spawn_review(task_id).await;
+
+            assert!(
+                executor.reviewing_handles.read().await.is_empty(),
+                "a review must not be admitted while the shared gate has nothing free"
+            );
+            let tasks = executor.tasks.read().await;
+            assert_eq!(
+                tasks.get(&task_id).unwrap().status,
+                TaskStatus::AiReview,
+                "declining is free: the task stays exactly where it was, retried next pass"
+            );
+        }
+
+        /// A manual `execute_task` call is not exempt from the gate a
+        /// frontend pre-check believes is free -- backend admission is the
+        /// authority, not the caller's own belief about capacity.
+        #[tokio::test]
+        async fn direct_execute_task_cannot_bypass_admission() {
+            let (executor, _temps) = test_executor();
+            executor
+                .queue_manager
+                .write()
+                .await
+                .set_config(crate::config::queue::QueueConfig { parallel_task_limit: 1, ..Default::default() })
+                .await;
+            executor.reconcile_admission().await;
+            let _held = executor.admission.try_acquire().expect("setup: the one slot must be free");
+
+            let mut task = create_test_task_full("manual", Uuid::new_v4(), TaskStatus::Queue, 0);
+            task.phase = TaskPhase::Idle;
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+
+            let result = executor.execute_task(task_id).await;
+            assert!(
+                result.is_err(),
+                "a manual start must be refused, not silently exceed the shared limit: {result:?}"
+            );
+            assert!(executor.running_handles.read().await.is_empty());
+            // Declined at the admission check specifically, before ever
+            // reaching repo/worktree resolution (this task has no project or
+            // repository configured, so reaching that far would instead
+            // record a distinct "cannot resolve working directory" error).
+            // A test that only checked `result.is_err()` could not tell
+            // admission being bypassed apart from this unrelated failure.
+            let tasks = executor.tasks.read().await;
+            assert_eq!(
+                tasks.get(&task_id).unwrap().error_message,
+                None,
+                "a capacity decline must be silent, not recorded as though \
+                 something else about the task failed"
+            );
+        }
+
+        /// The starvation regression: with capacity for exactly one active
+        /// flow, a review-ready task and a queued coding task both eligible
+        /// on the same pass, the review must be the one that gets the slot
+        /// -- not because coding is disallowed, but because review is
+        /// admitted first each pass. Persistent queued work must not starve
+        /// review forever.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_review_ready_task_is_admitted_before_a_new_queued_execution() {
+            let _path_guard = PATH_LOCK.lock().await;
+            let _mock = MockClaude::install("review"); // blocks, so the permit is still held when we check
+
+            let (executor, _temps) = test_executor();
+            executor
+                .queue_manager
+                .write()
+                .await
+                .set_config(crate::config::queue::QueueConfig {
+                    parallel_task_limit: 1,
+                    auto_promote: true,
+                    ..Default::default()
+                })
+                .await;
+
+            let (repo, base_commit) = git_repo_with_change();
+            let review_task = reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+            let review_task_id = review_task.id;
+            let project_id = review_task.project_id;
+            executor.tasks.write().await.insert(review_task_id, review_task.clone());
+            executor
+                .storage
+                .save_project_tasks(project_id, &[review_task])
+                .expect("seed the board");
+
+            let mut queued = create_test_task_full("queued coding work", project_id, TaskStatus::Queue, 1);
+            queued.phase = TaskPhase::Idle;
+            let queued_id = queued.id;
+            executor.tasks.write().await.insert(queued_id, queued.clone());
+            {
+                let tasks_r = executor.tasks.read().await;
+                let staged: Vec<Task> = tasks_r.values().filter(|t| t.project_id == project_id).cloned().collect();
+                executor.storage.save_project_tasks(project_id, &staged).expect("seed the board");
+            }
+
+            executor.check_and_execute().await;
+
+            assert!(
+                executor.reviewing_handles.read().await.contains_key(&review_task_id),
+                "the review-ready task must be admitted this pass"
+            );
+            let tasks = executor.tasks.read().await;
+            assert_eq!(
+                tasks.get(&queued_id).unwrap().status,
+                TaskStatus::Queue,
+                "with no capacity left after the review was admitted, the queued task must \
+                 not be promoted this pass -- promotion must not visibly exceed what is \
+                 actually available"
+            );
+        }
+
+        /// Permit lifetime is the whole point of `crate::queue::admission`:
+        /// capacity stays occupied for as long as the real agent process
+        /// does, proven here with a real fixture rather than only the
+        /// synthetic proof in `admission`'s own unit tests.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_permit_stays_held_until_the_review_future_actually_finishes() {
+            let _path_guard = PATH_LOCK.lock().await;
+            let mock = MockClaude::install("review");
+
+            let (executor, _temps) = test_executor();
+            executor
+                .queue_manager
+                .write()
+                .await
+                .set_config(crate::config::queue::QueueConfig { parallel_task_limit: 1, ..Default::default() })
+                .await;
+            executor.reconcile_admission().await;
+
+            let (repo, base_commit) = git_repo_with_change();
+            let task = reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+
+            executor.spawn_review(task_id).await;
+            wait_for_pidfile(&mock).await;
+
+            assert!(
+                executor.admission.try_acquire().is_none(),
+                "the one slot must still be held while the reviewer process is alive, \
+                 not returned merely because the process has been registered"
+            );
+
+            executor.stop_task(task_id).await.expect("stop must succeed");
+
+            assert!(
+                executor.admission.try_acquire().is_some(),
+                "once the owning future has actually finished, its permit must be free again"
+            );
+        }
+
+        /// Adversarial-review finding: `spawn_review` used to acquire no
+        /// lifecycle lease at all, unlike `spawn_task_execution`. A
+        /// concurrent `terminalize`/delete (reachable directly from
+        /// `commands::task`/the IPC handlers, independent of the poller)
+        /// could therefore see `is_task_running() == false`, remove the
+        /// checkout, and leave an already-scheduled review to run its
+        /// diff/reviewer/fix-agent sequence against a directory that is
+        /// gone. Proven here at the lease level directly, without needing a
+        /// full `terminalize` call: whoever holds the lease first wins, and
+        /// a review that could not get it declines cleanly rather than
+        /// racing ahead.
+        #[tokio::test]
+        async fn spawn_review_declines_while_another_lifecycle_operation_holds_the_lease() {
+            let (executor, _temps) = test_executor();
+            let (repo, base_commit) = git_repo_with_change();
+            let task = reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+
+            // Stands in for a concurrent terminalize/delete already holding
+            // the task's lease.
+            let _held_lease = executor
+                .lifecycle
+                .acquire(task_id)
+                .await
+                .expect("test setup: the lease must be free to take");
+
+            executor.spawn_review(task_id).await;
+
+            assert!(
+                executor.reviewing_handles.read().await.is_empty(),
+                "a review must not start against a task another lifecycle operation \
+                 currently owns"
+            );
+            let tasks = executor.tasks.read().await;
+            assert_eq!(
+                tasks.get(&task_id).unwrap().status,
+                TaskStatus::AiReview,
+                "declining is free: the task is untouched and the next pass retries it"
+            );
+        }
     }
 }
