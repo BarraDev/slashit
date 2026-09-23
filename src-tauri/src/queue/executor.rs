@@ -73,9 +73,26 @@ struct ReviewOwner {
 /// [`TaskExecutor::run_claude_pr_helper`]-adjacent code returns by any path
 /// (success, error, or cancellation), so ending this owner can still block
 /// on real completion instead of merely on having asked.
+///
+/// The same map also holds a PR *side-effect* reservation (see
+/// [`TaskExecutor::begin_pr_side_effect_under_lease`]): a PR-creation flow
+/// that runs no agent but rewrites, pushes and opens a pull request for the
+/// task's branch. It is ended and waited on exactly like a helper; `kind`
+/// only decides what beginning a new one refuses.
 struct PrHelperOwner {
     cancel: tokio::sync::watch::Sender<bool>,
     done: tokio::sync::watch::Receiver<bool>,
+    kind: PrOwnerKind,
+}
+
+/// Which PR flow a [`PrHelperOwner`] entry stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrOwnerKind {
+    /// A PR-helper Claude invocation, holding an admission permit.
+    Helper,
+    /// A PR side-effect flow (branch rewrite, push, `gh pr create`, the
+    /// durable link), holding no admission permit because it runs no agent.
+    SideEffect,
 }
 
 /// Proof that a PR-helper Claude invocation for `task_id` may run: capacity
@@ -92,6 +109,10 @@ struct PrHelperOwner {
 /// -- start, race against cancellation, kill-if-cancelled, reap -- exactly
 /// the same "permit dropped only once the owning flow actually finishes"
 /// contract [`AdmissionPermit`] already documents for execution and review.
+///
+/// A PR side-effect reservation is the same type without a permit: it proves
+/// the task is owned by that PR-creation flow, from before its first side
+/// effect until its durable link, and is retired on drop the same way.
 pub struct PrHelperLease {
     task_id: Uuid,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -443,7 +464,10 @@ impl TaskExecutor {
             // narrowed to `can_edit`: a read-only helper's checkout still
             // disappears out from under it exactly the same way, and
             // terminalize's whole contract is "refuse if anything is
-            // attached", not "refuse only if that thing writes".
+            // attached", not "refuse only if that thing writes". The same
+            // map holds a PR side-effect reservation, which is rewriting,
+            // pushing or opening a pull request for this task's branch, and
+            // counts for the same reason.
             || self.pr_helper_handles.lock().unwrap().contains_key(&task_id)
     }
 
@@ -1587,6 +1611,60 @@ impl TaskExecutor {
             return Err(PrHelperRefusal::NoCapacity);
         };
 
+        Ok(self.register_pr_owner(task_id, PrOwnerKind::Helper, Some(permit)))
+    }
+
+    /// Reserve `task_id` for a PR side-effect flow: a branch-tip rewrite, a
+    /// push, `gh pr create`, and the durable link that follows them. **The
+    /// caller must already hold `task_id`'s lifecycle lease**, and may release
+    /// it as soon as this returns: from then on the returned reservation is
+    /// the ownership fact, exactly as a registered execution or review is.
+    ///
+    /// Ends whatever execution, AI review/fix or PR helper owns the task
+    /// first (bounded, like every other front door), then registers the
+    /// reservation before the lease is given back, so no other owner can be
+    /// admitted in between. While it is held, execution and review decline
+    /// the task, a PR helper is refused, and a second PR side-effect flow is
+    /// refused rather than cancelling this one. A lifecycle transition ends it
+    /// the way it ends a PR helper: it asks it to stop and waits, bounded, for
+    /// the flow to let go -- which the flow does at its next step boundary,
+    /// never in the middle of a push or a `gh` call.
+    ///
+    /// No admission permit: this runs no agent, so it draws on no agent
+    /// capacity, and a busy queue never refuses a pull request.
+    pub async fn begin_pr_side_effect_under_lease(
+        self: &Arc<Self>,
+        task_id: Uuid,
+    ) -> Result<PrHelperLease, String> {
+        let in_progress = self
+            .pr_helper_handles
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .is_some_and(|owner| owner.kind == PrOwnerKind::SideEffect);
+        if in_progress {
+            return Err(
+                "a pull request operation for this task is already in progress; wait for it \
+                 to finish before starting another"
+                    .to_string(),
+            );
+        }
+
+        crate::lifecycle::ExecutionOwnership::end_ownership_under_lease(self.as_ref(), task_id)
+            .await?;
+
+        Ok(self.register_pr_owner(task_id, PrOwnerKind::SideEffect, None))
+    }
+
+    /// Insert a PR owner into `pr_helper_handles` and hand back the lease
+    /// that retires it. Only called with the task's lifecycle lease held and
+    /// the map known to have no entry for the task.
+    fn register_pr_owner(
+        self: &Arc<Self>,
+        task_id: Uuid,
+        kind: PrOwnerKind,
+        permit: Option<AdmissionPermit>,
+    ) -> PrHelperLease {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
         self.pr_helper_handles.lock().unwrap().insert(
@@ -1594,16 +1672,17 @@ impl TaskExecutor {
             PrHelperOwner {
                 cancel: cancel_tx,
                 done: done_rx,
+                kind,
             },
         );
 
-        Ok(PrHelperLease {
+        PrHelperLease {
             task_id,
             cancel_rx,
             done_tx: Some(done_tx),
-            _permit: Some(permit),
+            _permit: permit,
             handles: self.pr_helper_handles.clone(),
-        })
+        }
     }
 
     /// End whatever PR-helper Claude invocation currently owns `task_id`,
@@ -1638,8 +1717,8 @@ impl TaskExecutor {
         match tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, done.changed()).await {
             Ok(_) => Ok(true),
             Err(_) => Err(format!(
-                "the PR helper for task {task_id} is still finishing up; nothing was \
-                 changed, so this can simply be asked for again shortly"
+                "the pull request helper or operation for task {task_id} is still finishing \
+                 up; nothing was changed, so this can simply be asked for again shortly"
             )),
         }
     }
@@ -1853,6 +1932,16 @@ impl TaskExecutor {
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
             return; // another lifecycle operation owns this task right now
         };
+
+        // One owner per task, in this direction too: a PR helper or PR
+        // side-effect flow that owns the task keeps it until it lets go, and
+        // `try_begin_pr_helper` refuses a live review the same way. Checked
+        // under the lease, which both sides register under, so neither can
+        // slip in between the other's check and its registration. Declining
+        // leaves the task in `AiReview`, and the next pass retries it.
+        if self.pr_helper_handles.lock().unwrap().contains_key(&task_id) {
+            return;
+        }
 
         // The task's own worktree, or no review at all.
         //
@@ -4946,6 +5035,76 @@ mod tests {
                 TaskStatus::AiReview,
                 "declining is free: the task is untouched and the next pass retries it"
             );
+        }
+
+        /// Try to start a review of `task_id` and prove it declined: nothing
+        /// registered, no reviewer agent spawned, the task untouched.
+        async fn review_declines(
+            executor: &Arc<TaskExecutor>,
+            mock: &MockClaude,
+            task_id: Uuid,
+            label: &str,
+        ) {
+            executor.spawn_review(task_id).await;
+            assert!(
+                executor.reviewing_handles.read().await.is_empty(),
+                "{label}: no review may be registered while a PR flow owns the task"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(
+                mock.blocked_pid().is_none(),
+                "{label}: no reviewer agent may have been spawned"
+            );
+            let tasks = executor.tasks.read().await;
+            let task = tasks.get(&task_id).unwrap();
+            assert_eq!(task.status, TaskStatus::AiReview, "{label}: declining leaves the task as it was");
+            assert_eq!(task.phase, TaskPhase::QaReview, "{label}: declining leaves the task as it was");
+        }
+
+        /// One owner per task, in both directions. `try_begin_pr_helper`
+        /// already refuses a task under review; a review must equally not
+        /// start while a PR helper -- or a PR side-effect operation -- owns
+        /// the task: no reviewer agent is spawned and the task is left in
+        /// `AiReview` for the next pass. Once the PR flow lets go, the same
+        /// review starts normally.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_review_does_not_start_while_a_pr_flow_owns_the_task() {
+            let _path_guard = PATH_LOCK.lock().await;
+            let mock = MockClaude::install("review");
+
+            let (executor, _temps) = test_executor();
+            let (repo, base_commit) = git_repo_with_change();
+            let task = reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+
+            let helper = executor
+                .try_begin_pr_helper(task_id)
+                .await
+                .expect("setup: the PR helper is admitted");
+            review_declines(&executor, &mock, task_id, "PR helper").await;
+            drop(helper);
+
+            let reservation = {
+                let _lease = executor.lifecycle.acquire(task_id).await.expect("setup: lease");
+                executor
+                    .begin_pr_side_effect_under_lease(task_id)
+                    .await
+                    .expect("setup: the PR operation reserves the task")
+            };
+            review_declines(&executor, &mock, task_id, "PR operation").await;
+            drop(reservation);
+
+            executor.spawn_review(task_id).await;
+            assert!(
+                executor.reviewing_handles.read().await.contains_key(&task_id),
+                "once the PR flow has let go, the review starts normally"
+            );
+            let pid = wait_for_pidfile(&mock).await;
+            assert!(pid_is_alive(pid), "the reviewer agent is running");
+
+            executor.stop_task(task_id).await.expect("stop the review");
+            assert!(!pid_is_alive(pid));
         }
     }
 }
