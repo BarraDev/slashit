@@ -354,22 +354,46 @@ impl TaskExecutor {
                             if state == "MERGED" {
                                 self.complete_merged_task(task_id, number, state).await;
                             } else if !state.is_empty() {
-                                let mut tasks_w = self.tasks.write().await;
-                                if let Some(t) = tasks_w.get_mut(&task_id) {
-                                    Self::record_pr_state(t, number, state);
-                                    if state == "CLOSED" {
-                                        t.error_message =
-                                            Some("PR was closed without merge".to_string());
-                                    }
-                                    t.updated_at = chrono::Utc::now();
-                                }
-                                drop(tasks_w);
-                                Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
+                                self.record_pr_poll_state(task_id, number, state).await;
                             }
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// Record a non-`MERGED` pull request state observed by the poll above.
+    ///
+    /// `CLOSED` is exactly what removes this ref from the poll's own filter
+    /// above (`state != Some("CLOSED")`), so it must never be visible in
+    /// memory before it is durable: a lost write here would otherwise be a
+    /// permanent, silent stop to polling a PR that is not actually recorded
+    /// as closed anywhere the next start can see -- see issue #8. Any other
+    /// state (`OPEN`, ...) is not selector-terminal and would self-heal on
+    /// the next poll regardless; it is persisted the same way here only
+    /// because it shares this call site, not because it shares the hazard.
+    async fn record_pr_poll_state(&self, task_id: Uuid, number: u32, state: &str) {
+        let state_owned = state.to_string();
+        let amend = move |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
+                Self::record_pr_state(t, number, &state_owned);
+                if state_owned == "CLOSED" {
+                    t.error_message = Some("PR was closed without merge".to_string());
+                }
+            }
+        };
+        if let Err(e) =
+            crate::lifecycle::record(&self.tasks, &self.storage, task_id, &amend).await
+        {
+            self.events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message: format!(
+                    "Observed pull request state {state:?} for task {task_id}, but recording \
+                     it failed, so it was not applied and will be retried: {e}"
+                ),
+            });
         }
     }
 
@@ -593,7 +617,7 @@ impl TaskExecutor {
                     task_id: task_id.to_string(),
                     message: format!("Cannot resolve working directory: {}", e),
                 });
-                Self::set_task_error_static(&self.tasks, &self.storage, task_id, &e).await;
+                Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &e).await;
                 return false;
             }
         };
@@ -695,7 +719,7 @@ impl TaskExecutor {
                     task_id: task_id.to_string(),
                     message: message.clone(),
                 });
-                Self::set_task_error_static(&self.tasks, &self.storage, task_id, &message).await;
+                Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &message).await;
                 return false;
             }
         };
@@ -804,7 +828,7 @@ impl TaskExecutor {
                         task_id: task_id.to_string(),
                         message: msg.clone(),
                     });
-                    Self::set_task_error_static(&tasks, &storage, task_id, &msg).await;
+                    Self::set_task_error_static(&tasks, &storage, &events, task_id, &msg).await;
                     // This early return skips the removal after `runner.wait()`
                     // below, so it must remove itself here or this slot never
                     // frees up.
@@ -935,7 +959,7 @@ impl TaskExecutor {
                                 task_id: task_id.to_string(),
                                 message: full_msg.clone(),
                             });
-                            Self::set_task_error_static(&tasks, &storage, task_id, &full_msg).await;
+                            Self::set_task_error_static(&tasks, &storage, &events, task_id, &full_msg).await;
                         }
                     }
                     false
@@ -1177,8 +1201,14 @@ impl TaskExecutor {
                 timestamp: chrono::Utc::now(),
                 session_id: Uuid::new_v4(),
             };
-            Self::transition_to_human_review(&self.tasks, &self.storage, task_id, Some(signoff))
-                .await;
+            Self::transition_to_human_review(
+                &self.tasks,
+                &self.storage,
+                &self.events,
+                task_id,
+                Some(signoff),
+            )
+            .await;
             return;
         };
 
@@ -1215,7 +1245,7 @@ impl TaskExecutor {
                         timestamp: chrono::Utc::now(),
                         session_id: Uuid::new_v4(),
                     };
-                    Self::transition_to_human_review(&tasks, &storage, task_id, Some(signoff)).await;
+                    Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff)).await;
                     reviewing_handles.write().await.remove(&task_id);
                     return;
                 }
@@ -1227,7 +1257,7 @@ impl TaskExecutor {
                     level: LogLevel::Info,
                     message: "No changes detected, skipping review".to_string(),
                 });
-                Self::transition_to_human_review(&tasks, &storage, task_id, None).await;
+                Self::transition_to_human_review(&tasks, &storage, &events, task_id, None).await;
                 reviewing_handles.write().await.remove(&task_id);
                 return;
             }
@@ -1431,7 +1461,7 @@ impl TaskExecutor {
                     session_id: Uuid::new_v4(),
                 };
 
-                Self::transition_to_human_review(&tasks, &storage, task_id, Some(signoff)).await;
+                Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff)).await;
             } else {
                 // All clear — no issues
                 events.agent_event(AgentEvent::Log {
@@ -1447,7 +1477,7 @@ impl TaskExecutor {
                     session_id: Uuid::new_v4(),
                 };
 
-                Self::transition_to_human_review(&tasks, &storage, task_id, Some(signoff)).await;
+                Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff)).await;
             }
 
             reviewing_handles.write().await.remove(&task_id);
@@ -1456,26 +1486,45 @@ impl TaskExecutor {
         self.reviewing_handles.write().await.insert(task_id, handle);
     }
 
+    /// Move a task to `HumanReview`/`Complete`, durably before the board can
+    /// show it.
+    ///
+    /// `HumanReview` is exactly what removes a task from the AI-review
+    /// selector in [`Self::check_and_execute`]: nothing else ever re-selects
+    /// it for review, so a publish that outran the disk here would be a
+    /// permanent loss of a QA outcome the fix agent had already acted on --
+    /// see issue #8. Staging and persisting under one write guard, via
+    /// [`crate::lifecycle::record`], is what makes that impossible: the board
+    /// can only ever show the state the file already has.
     async fn transition_to_human_review(
         tasks: &Tasks,
         storage: &crate::config::Storage,
+        events: &SharedEventSink,
         task_id: Uuid,
         signoff: Option<QaSignoff>,
     ) {
-        {
-            let mut tasks_w = tasks.write().await;
-            if let Some(t) = tasks_w.get_mut(&task_id) {
+        let amend = move |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
                 t.status = TaskStatus::HumanReview;
                 t.phase = TaskPhase::Complete;
                 t.phase_progress = 95;
                 t.overall_progress = 90;
-                t.updated_at = chrono::Utc::now();
-                if let Some(s) = signoff {
+                if let Some(s) = signoff.clone() {
                     t.qa_signoff = Some(s);
                 }
             }
+        };
+        if let Err(e) = crate::lifecycle::record(tasks, storage, task_id, &amend).await {
+            events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message: format!(
+                    "Task {task_id} finished review, but recording it as ready for human \
+                     review failed, so it was not published and will be re-reviewed rather \
+                     than silently skipped: {e}"
+                ),
+            });
         }
-        Self::persist_task_static(tasks, storage, task_id).await;
     }
 
     pub async fn get_task_output(&self, task_id: Uuid) -> Vec<AgentLogEntry> {
@@ -1656,17 +1705,39 @@ impl TaskExecutor {
         }
     }
 
-    async fn set_task_error_static(tasks: &Tasks, storage: &crate::config::Storage, task_id: Uuid, msg: &str) {
-        {
-            let mut tasks = tasks.write().await;
-            if let Some(t) = tasks.get_mut(&task_id) {
+    /// Move a task to `Error`/`Failed`, durably before the board can show it.
+    ///
+    /// `Error` matches no executor selector, so the same persist-before-publish
+    /// obligation applies as [`Self::transition_to_human_review`] -- see issue
+    /// #8. The payload here is only a diagnostic rather than a record of
+    /// irreversible work, but a lost write would still silently strand the
+    /// task off every automatic path with nothing on disk explaining why.
+    async fn set_task_error_static(
+        tasks: &Tasks,
+        storage: &crate::config::Storage,
+        events: &SharedEventSink,
+        task_id: Uuid,
+        msg: &str,
+    ) {
+        let msg_owned = msg.to_string();
+        let amend = move |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
                 t.status = TaskStatus::Error;
                 t.phase = TaskPhase::Failed;
-                t.error_message = Some(msg.to_string());
-                t.updated_at = chrono::Utc::now();
+                t.error_message = Some(msg_owned.clone());
             }
+        };
+        if let Err(e) = crate::lifecycle::record(tasks, storage, task_id, &amend).await {
+            events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message: format!(
+                    "Task {task_id} failed ({msg}), and recording that failure durably also \
+                     failed, so the task was not published as errored and remains eligible to \
+                     be picked up again: {e}"
+                ),
+            });
         }
-        Self::persist_task_static(tasks, storage, task_id).await;
     }
 
     /// Get diff from jj or git (whichever is available).
@@ -1969,6 +2040,294 @@ mod tests {
         drop(held);
     }
 
+    // ===== issue #8: selector-terminal task-state persistence =====
+    //
+    // `transition_to_human_review`, `record_pr_poll_state`'s `CLOSED` case, and
+    // `set_task_error_static` each publish a status that removes the task from
+    // every executor selector that would otherwise write it again. Each pair
+    // of tests below proves both halves of the contract: a persistence
+    // failure must leave memory exactly as it was (so the task stays eligible
+    // for whatever would normally repair it), and a persistence success must
+    // make memory and disk agree on the new state.
+
+    /// Make every `save_project_tasks` call against `storage_temp` fail
+    /// deterministically, by putting a regular file where the legacy tasks
+    /// directory has to be -- so the `create_dir_all` inside the atomic write
+    /// fails with `AlreadyExists`. No permission bits, so this behaves
+    /// identically for every user including root, unlike a read-only
+    /// directory.
+    fn block_persistence(storage_temp: &tempfile::TempDir) {
+        let blocker = storage_temp.path().join("config").join("tasks");
+        let _ = std::fs::remove_dir_all(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("place persistence blocker");
+    }
+
+    /// Seed one task (plus an untouched sibling in the same project, which
+    /// every whole-project rewrite must carry through unchanged) directly on
+    /// `executor`'s board and disk.
+    async fn seed_task(executor: &TaskExecutor, status: TaskStatus) -> (Uuid, Uuid) {
+        let project_id = Uuid::new_v4();
+        let task = crate::test_helpers::create_test_task_full("subject", project_id, status, 0);
+        let sibling =
+            crate::test_helpers::create_test_task_full("sibling", project_id, TaskStatus::Backlog, 1);
+        let (id, sibling_id) = (task.id, sibling.id);
+        {
+            let mut tasks_w = executor.tasks.write().await;
+            tasks_w.insert(id, task.clone());
+            tasks_w.insert(sibling_id, sibling.clone());
+        }
+        executor
+            .storage
+            .save_project_tasks(project_id, &[task, sibling])
+            .expect("seed the board");
+        (id, project_id)
+    }
+
+    fn on_disk_task(executor: &TaskExecutor, project_id: Uuid, task_id: Uuid) -> Task {
+        executor
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task must be on disk")
+    }
+
+    /// Whether any recorded event is a `Warn`-level `agent-event` log whose
+    /// message contains `needle`, proving a persistence failure was actually
+    /// surfaced rather than silently swallowed.
+    fn warn_message_containing(recording: &crate::events::RecordingEventSink, needle: &str) -> bool {
+        recording.recorded().iter().any(|(name, payload)| {
+            name == "agent-event"
+                && payload.get("type").and_then(|v| v.as_str()) == Some("log")
+                && payload.get("level").and_then(|v| v.as_str()) == Some("warn")
+                && payload
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|m| m.contains(needle))
+        })
+    }
+
+    // --- record_pr_poll_state("CLOSED") ---
+
+    #[tokio::test]
+    async fn a_closed_pr_that_cannot_be_recorded_is_not_exposed_and_stays_pollable() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, temps) = test_executor_with_events(recording.clone());
+        let (id, _project_id) = task_with_open_pr(&executor, None).await;
+        block_persistence(&temps[0]);
+
+        executor.record_pr_poll_state(id, 7, "CLOSED").await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            recorded_pr_state(&after),
+            None,
+            "a write that did not reach disk must not be visible in memory, or the next poll \
+             would treat an un-recorded closure as already recorded and never ask again"
+        );
+        assert!(
+            after.error_message.is_none(),
+            "the closed-without-merge explanation is part of the same fact and must not appear \
+             alone"
+        );
+        assert_eq!(after.status, TaskStatus::PrCreated);
+
+        assert!(
+            warn_message_containing(&recording, "was not applied and will be retried"),
+            "the failure must be surfaced, not silently swallowed; recorded events: {:?}",
+            recording.recorded()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_pr_that_is_recorded_is_durable_before_it_is_published() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = task_with_open_pr(&executor, None).await;
+
+        executor.record_pr_poll_state(id, 7, "CLOSED").await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(recorded_pr_state(&after).as_deref(), Some("CLOSED"));
+        assert_eq!(
+            after.error_message.as_deref(),
+            Some("PR was closed without merge")
+        );
+
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(
+            recorded_pr_state(&on_disk).as_deref(),
+            Some("CLOSED"),
+            "the file is what the next start reads, so a latch only in memory is no latch"
+        );
+        assert_eq!(
+            on_disk.error_message.as_deref(),
+            Some("PR was closed without merge")
+        );
+    }
+
+    // --- transition_to_human_review ---
+
+    #[tokio::test]
+    async fn a_human_review_transition_that_cannot_be_recorded_is_not_exposed() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, temps) = test_executor_with_events(recording.clone());
+        let (id, _project_id) = seed_task(&executor, TaskStatus::AiReview).await;
+        {
+            let mut tasks_w = executor.tasks.write().await;
+            let t = tasks_w.get_mut(&id).unwrap();
+            t.phase = TaskPhase::QaReview;
+        }
+        block_persistence(&temps[0]);
+
+        let signoff = QaSignoff {
+            status: QaStatus::FixesApplied,
+            issues_found: vec!["found one".to_string()],
+            timestamp: chrono::Utc::now(),
+            session_id: Uuid::new_v4(),
+        };
+        TaskExecutor::transition_to_human_review(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            Some(signoff),
+        )
+        .await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            after.status,
+            TaskStatus::AiReview,
+            "a lost write must leave the task exactly where the AI-review selector still finds \
+             it, not silently moved to a status nothing else ever re-selects"
+        );
+        assert_eq!(after.phase, TaskPhase::QaReview);
+        assert!(
+            after.qa_signoff.is_none(),
+            "the fix agent's outcome must not be exposed as read unless it is durable, or the \
+             next start re-runs the review over a tree that already contains the fix"
+        );
+
+        assert!(
+            warn_message_containing(&recording, "will be re-reviewed rather than silently skipped"),
+            "the failure must be surfaced, not silently swallowed; recorded events: {:?}",
+            recording.recorded()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_human_review_transition_that_is_recorded_is_durable_before_it_is_published() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_task(&executor, TaskStatus::AiReview).await;
+
+        let signoff = QaSignoff {
+            status: QaStatus::Approved,
+            issues_found: Vec::new(),
+            timestamp: chrono::Utc::now(),
+            session_id: Uuid::new_v4(),
+        };
+        TaskExecutor::transition_to_human_review(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            Some(signoff),
+        )
+        .await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(after.status, TaskStatus::HumanReview);
+        assert_eq!(after.phase, TaskPhase::Complete);
+        assert!(after.qa_signoff.is_some());
+
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(
+            on_disk.status,
+            TaskStatus::HumanReview,
+            "the file is what the next start reads, so a transition only in memory is no \
+             transition"
+        );
+        assert_eq!(on_disk.phase, TaskPhase::Complete);
+        assert!(on_disk.qa_signoff.is_some());
+
+        // The untouched sibling seeded alongside this task must survive the
+        // whole-project rewrite unchanged, proving the staged snapshot carried
+        // every task in the project and not just the one being amended.
+        let siblings = executor
+            .storage
+            .load_project_tasks(project_id)
+            .expect("board must be readable");
+        assert_eq!(
+            siblings.len(),
+            2,
+            "the sibling seeded alongside this task must still be on disk"
+        );
+    }
+
+    // --- set_task_error_static ---
+
+    #[tokio::test]
+    async fn a_task_error_that_cannot_be_recorded_is_not_exposed_and_stays_eligible() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, temps) = test_executor_with_events(recording.clone());
+        let (id, _project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        block_persistence(&temps[0]);
+
+        TaskExecutor::set_task_error_static(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            "agent could not start",
+        )
+        .await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            after.status,
+            TaskStatus::InProgress,
+            "a lost write must not fabricate a second durable state nothing wrote either -- the \
+             task must remain exactly as reachable as it was before this call"
+        );
+        assert!(after.error_message.is_none());
+
+        assert!(
+            warn_message_containing(&recording, "remains eligible to be picked up again"),
+            "the failure must be surfaced, not silently swallowed; recorded events: {:?}",
+            recording.recorded()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_error_that_is_recorded_is_durable_before_it_is_published() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+
+        TaskExecutor::set_task_error_static(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            "agent could not start",
+        )
+        .await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(after.status, TaskStatus::Error);
+        assert_eq!(after.phase, TaskPhase::Failed);
+        assert_eq!(after.error_message.as_deref(), Some("agent could not start"));
+
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(on_disk.status, TaskStatus::Error);
+        assert_eq!(on_disk.phase, TaskPhase::Failed);
+        assert_eq!(
+            on_disk.error_message.as_deref(),
+            Some("agent could not start"),
+            "the file is what the next start reads, so an error only in memory is no error"
+        );
+    }
+
     /// A `TaskExecutor` over nothing but temporary directories.
     ///
     /// Deliberately synchronous and runtime-free, because
@@ -1976,6 +2335,14 @@ mod tests {
     /// able to build one from a plain `#[test]`. The returned temp dirs must
     /// be kept alive for as long as the executor is used.
     fn test_executor() -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {
+        test_executor_with_events(crate::events::null_sink())
+    }
+
+    /// Same as [`test_executor`], but with a caller-supplied sink so a test can
+    /// inspect what the executor reported instead of discarding it.
+    fn test_executor_with_events(
+        events: SharedEventSink,
+    ) -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {
         let (storage, storage_temp) = test_storage();
         let (registry, reg_temp) = test_registry();
         let paths_temp = tempfile::TempDir::new().expect("paths temp dir");
@@ -2002,7 +2369,7 @@ mod tests {
                 )),
                 crate::config::paths::WorktreePlacement::Managed,
             )),
-            events: crate::events::null_sink(),
+            events,
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
         }));
         (executor, vec![storage_temp, reg_temp, paths_temp])
