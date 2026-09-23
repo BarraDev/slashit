@@ -1,0 +1,11 @@
+#!/bin/sh
+printf '{"type":"system","subtype":"init","session_id":"s-blocking-descendant","model":"fixture-model"}\n'
+# Same shape as `descendant`: a background child in the leader's own process
+# group, with its own stdio so it cannot hold the leader's pipes open. The
+# leader itself then blocks instead of exiting, so a test can exercise
+# cancellation (kill()) while both the leader and the descendant are still
+# alive -- the `descendant` fixture's leader exits immediately, which only
+# exercises the normal-completion path.
+sh -c 'printf "%s\n" "$$" > descendant.pid; exec sleep 300' </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$$" > blocked.pid
+exec sleep 300

@@ -5377,6 +5377,7 @@ dependencies = [
  "dirs",
  "futures",
  "hex",
+ "libc",
  "mockall",
  "portable-pty",
  "serde",

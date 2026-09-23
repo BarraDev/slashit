@@ -61,6 +61,10 @@ pub struct ClaudeRunner {
     /// Handle to the stdout reader task. `wait()` joins this before returning so
     /// callers can read the full accumulated output without racing the reader.
     reader_handle: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// Handle to the stderr drain, which yields everything the child wrote
+    /// there. Started at spawn, like the stdout reader; `wait()` joins it once
+    /// the child has been reaped.
+    stderr_handle: Mutex<Option<tauri::async_runtime::JoinHandle<String>>>,
 }
 
 impl ClaudeRunner {
@@ -132,6 +136,23 @@ impl ClaudeRunner {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
+        // The agent leads its own process group, so ending a run can end the
+        // whole tree it built. The agent is spawned with `Bash` allowed and
+        // routinely starts children of its own -- a dev server, a watcher, a
+        // test runner -- and without this, killing only the direct pid
+        // reparents those to init with the task's checkout still as their
+        // working directory, invisible to everything that tracks this run.
+        //
+        // Unix only. Windows has no process groups in this sense; a Job
+        // Object is the equivalent and is a separate piece of work, so this
+        // is `cfg`'d rather than faked.
+        #[cfg(unix)]
+        {
+            // `tokio::process::Command` re-exports the unix extension trait's
+            // method directly.
+            cmd.process_group(0);
+        }
+
         // A backstop, not the way runs are ended. Cancellation is cooperative
         // and kills explicitly, because only the code that owns the run can
         // also record what happened to it. But nothing here is dropped while
@@ -153,6 +174,14 @@ impl ClaudeRunner {
         // currently waiting for the process to exit.
         let stdout = child.stdout.take();
 
+        // Stderr for the same reason, and it matters as much: a child that
+        // fills its stderr pipe blocks in `write()` and never exits, and
+        // `wait()` blocks until the leader exits before it reaps (see there).
+        // A drain that only started inside `wait()` would start too late for
+        // a child that had already filled the pipe, and one that started after
+        // the exit wait would never start at all.
+        let stderr = child.stderr.take();
+
         let (event_tx, _) = broadcast::channel(512);
 
         let runner = Self {
@@ -162,10 +191,12 @@ impl ClaudeRunner {
             accumulated_output: Arc::new(RwLock::new(String::new())),
             result_error: Arc::new(RwLock::new(None)),
             reader_handle: Mutex::new(None),
+            stderr_handle: Mutex::new(None),
         };
 
         let handle = runner.start_reader(stdout);
         *runner.reader_handle.lock().await = Some(handle);
+        *runner.stderr_handle.lock().await = stderr.map(Self::start_stderr_drain);
 
         Ok(runner)
     }
@@ -180,10 +211,84 @@ impl ClaudeRunner {
         self.accumulated_output.read().await.clone()
     }
 
-    /// Kill the running process.
+    /// End the run, and everything it started.
+    ///
+    /// The agent leads its own process group (see `start_program`), so the
+    /// signal goes to the group. Killing the direct pid alone leaves whatever
+    /// the agent had spawned running, reparented, with the task's checkout as
+    /// its working directory -- and nothing left pointing at it.
+    ///
+    /// The group signal is best-effort and the direct kill still runs: the
+    /// group may already be gone, and the child is the thing this owns.
+    ///
+    /// This covers the cancellation path, where [`wait`](Self::wait) was
+    /// never entered and the child -- so `child.id()` -- is still unreaped. A
+    /// run that *completes normally* takes a different path to the same
+    /// place: `wait()` does its own group cleanup before it reaps the child,
+    /// for the reason documented there, so by the time this runs on that path
+    /// there is nothing left for the group signal below to do.
     pub async fn kill(&self) -> Result<(), String> {
         let mut child = self.child.lock().await;
+
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            Self::kill_process_group(pid);
+        }
+
         child.kill().await.map_err(|e| format!("Failed to kill claude: {}", e))
+    }
+
+    /// Signal the whole group a spawned agent leads.
+    ///
+    /// Best-effort by design: the only failure is a group that has already
+    /// gone, which is the outcome being asked for.
+    #[cfg(unix)]
+    fn kill_process_group(pid: u32) {
+        // Safety: `pid` was returned by a child this process spawned as the
+        // leader of its own group (see `start_program`'s `process_group(0)`),
+        // so the group id equals the pid.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+
+    /// Block until the leader has exited, without reaping it.
+    ///
+    /// An ordinary wait reaps as part of reporting the exit, and once that
+    /// happens the pid -- which doubles as the process group id, see
+    /// `start_program` -- can be reissued to an unrelated process. `WNOWAIT`
+    /// leaves the zombie in place instead, so whatever runs immediately after
+    /// this call still owns that number: the kernel cannot have handed it to
+    /// anyone else while a member of this process's own group -- even just
+    /// its own unreaped zombie -- still holds it. The real reap still has to
+    /// happen; this only buys the caller a safe window to act before it does.
+    ///
+    /// A blocking syscall, so this runs on a blocking-pool thread rather than
+    /// tying up the async runtime for however long the run takes.
+    ///
+    /// Best-effort like `kill_process_group`: the only failure this can see
+    /// is the child having already gone (`ECHILD`), which only happens if
+    /// something else reaped it first, and there is nothing safer to do about
+    /// that than to move on -- the reap that follows this call will report
+    /// that outcome on its own.
+    #[cfg(unix)]
+    async fn wait_for_exit_without_reaping(pid: u32) {
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            loop {
+                // Safety: `info` is a correctly sized out-parameter the
+                // kernel only ever writes into.
+                let ret = unsafe {
+                    libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT)
+                };
+                if ret == 0
+                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    break;
+                }
+            }
+        })
+        .await;
     }
 
     /// Wait for the process to complete and return exit status.
@@ -191,15 +296,27 @@ impl ClaudeRunner {
     pub async fn wait(&self) -> Result<bool, String> {
         let mut child = self.child.lock().await;
 
-        // Take stderr handle and read it concurrently with wait
-        let stderr_handle = child.stderr.take().map(|stderr| {
-            tokio::spawn(async move {
-                let mut reader = tokio::io::BufReader::new(stderr);
-                let mut buf = String::new();
-                let _ = tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf).await;
-                buf
-            })
-        });
+        // The leader may have started descendants of its own (see
+        // `start_program`'s `process_group`), and a normal exit is the one
+        // path that used to leave them running: the reap below is what makes
+        // `child.id()` answer `None`, and `kill()` -- the only place that
+        // otherwise signals the group -- has nothing left to signal *safely*
+        // once that happens, because the id it would cache can by then have
+        // been handed to an unrelated process. Cleaning the group up here,
+        // before that reap, is what keeps the id meaningful: waiting for the
+        // exit without reaping it first (`WNOWAIT`) learns the leader is done
+        // without letting the kernel forget it, so the group this signals is
+        // still provably the one this process spawned, whatever else it
+        // still contains.
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            Self::wait_for_exit_without_reaping(pid).await;
+            Self::kill_process_group(pid);
+        }
+
+        // Stderr has been draining since spawn (see `start_program`), so a
+        // child with a lot to say can still reach the exit waited for above.
+        let stderr_handle = self.stderr_handle.lock().await.take();
 
         let status = child.wait().await.map_err(|e| format!("Wait failed: {}", e))?;
 
@@ -242,6 +359,21 @@ impl ClaudeRunner {
         }
 
         Ok(true)
+    }
+
+    /// Spawn the task that collects everything the child writes to stderr.
+    ///
+    /// Owns the pipe outright, like the stdout reader, so it keeps the pipe
+    /// empty whether or not anyone has reached `wait()` yet.
+    fn start_stderr_drain(
+        stderr: tokio::process::ChildStderr,
+    ) -> tauri::async_runtime::JoinHandle<String> {
+        tauri::async_runtime::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut buf = String::new();
+            let _ = tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf).await;
+            buf
+        })
     }
 
     /// Spawn the task that turns the child's stdout into events.
@@ -507,6 +639,19 @@ mod tests {
 
     const CRASHING: &str = "crashing";
 
+    /// Writes far more to stderr than a pipe can hold, then fails.
+    ///
+    /// The stderr twin of `chatty`. Two MiB is well past the 64 KiB a pipe
+    /// holds by default, and past the 1 MiB an unprivileged process can raise
+    /// one to, so the child blocks in `write()` unless something is draining
+    /// stderr while it runs -- and a wait that only starts draining once the
+    /// process has exited is waiting for an exit it is preventing.
+    const STDERR_FLOOD: &str = "stderr_flood";
+
+    /// The `pad` in the `stderr_flood` fixture, plus its newline.
+    const STDERR_FLOOD_LINE: usize = 16 * 4 * 4 * 4 + 1;
+    const STDERR_FLOOD_LINES: usize = 2048;
+
     /// Announces itself and then stays alive until something ends it.
     ///
     /// `exec` on purpose: the process that waits is the same process the
@@ -670,6 +815,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_process_that_floods_stderr_can_still_exit_and_be_waited_on() {
+        let fixture = Fixture::new(STDERR_FLOOD);
+        let runner = fixture.start().await;
+
+        let error = bounded("stderr flood", &runner)
+            .await
+            .expect_err("the fixture exits non-zero");
+        assert_eq!(error, "Exit code 4 — the flood is over");
+
+        // All of it, not just the tail the error line quotes: a drain that
+        // stopped early would still let the child exit once it had room.
+        let output = runner.get_output().await;
+        let (_, stderr) = output
+            .split_once("\n--- STDERR ---\n")
+            .expect("stderr should be appended to the accumulated output");
+        assert_eq!(
+            stderr.len(),
+            STDERR_FLOOD_LINE * STDERR_FLOOD_LINES + "the flood is over\n".len(),
+            "every byte the fixture wrote to stderr should have been collected"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_non_zero_exit_reports_the_exit_code_and_stderr() {
         let fixture = Fixture::new(CRASHING);
         for attempt in 0..10 {
@@ -793,6 +961,134 @@ mod tests {
             assert!(
                 started.elapsed() < DEADLINE,
                 "dropping the runner left process {pid} running"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // ---- Process-tree ownership (descendants) --------------------------------
+    //
+    // Unlike `is_alive` above, these use `kill(pid, 0)` rather than `/proc`:
+    // the descendant here is never this process's own child (the leader forked
+    // it, and once the leader exits or is killed it is reparented to init/a
+    // subreaper, never to us), so there is no zombie-under-us window to worry
+    // about the way there is for the leader pid `is_alive` reads. `kill(pid, 0)`
+    // is POSIX and correct on both Linux and macOS, where `/proc` is not.
+
+    /// A background descendant the leader spawned, forked into the leader's
+    /// own process group and never waited on. `descendant.pid` is written by
+    /// the descendant itself, not the leader.
+    const DESCENDANT: &str = "descendant";
+
+    /// The same shape as [`BLOCKING`], but with a background descendant
+    /// forked before the leader blocks. `BLOCKING`'s own fixture exits the
+    /// instant it is killed, with nothing left behind to prove group
+    /// cleanup; this fixture exists so a cancellation test can prove the
+    /// descendant specifically, the same way [`DESCENDANT`] proves it for
+    /// normal completion.
+    const BLOCKING_WITH_DESCENDANT: &str = "blocking_with_descendant";
+
+    /// Whether `pid` still answers to a null signal -- alive (including a
+    /// zombie still holding the pid/pgid slot) if so, gone if the kernel
+    /// answers `ESRCH`.
+    #[cfg(unix)]
+    fn unix_pid_is_alive(pid: u32) -> bool {
+        // Safety: a null signal (0) performs no signal delivery, only the
+        // permission/existence check `kill(2)` documents; `pid` is a plain
+        // integer, not a pointer, so there is nothing here for the kernel to
+        // dereference incorrectly.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// The pid a fixture announced by writing it to `name` in its own
+    /// directory, once it has done so.
+    ///
+    /// Generalizes [`blocked_pid`] (which is pinned to `/proc` and to
+    /// `blocked.pid` specifically) to any announcement file, for the
+    /// cfg(unix)-broad descendant tests below.
+    #[cfg(unix)]
+    async fn unix_announced_pid(fixture: &Fixture, name: &str) -> u32 {
+        let path = fixture.dir.path().join(name);
+        let started = std::time::Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+            }
+            assert!(
+                started.elapsed() < DEADLINE,
+                "the fixture never announced its process in {name}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The defect this unit closes, half one: a leader that exits
+    /// *successfully*, having spawned something in its group that outlives
+    /// it. Before the fix, `wait()` reaps the leader without ever signalling
+    /// the group, so `child.id()` is already `None` by the time anything
+    /// downstream could try -- the descendant is orphaned into the task's
+    /// checkout.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_normal_exit_does_not_leave_a_descendant_running() {
+        let fixture = Fixture::new(DESCENDANT);
+        let runner = fixture.start().await;
+        let descendant_pid = unix_announced_pid(&fixture, "descendant.pid").await;
+        assert!(
+            unix_pid_is_alive(descendant_pid),
+            "the descendant must be running before the leader exits"
+        );
+
+        assert_eq!(
+            bounded("descendant", &runner).await,
+            Ok(true),
+            "the leader itself exits cleanly; only the descendant is at issue"
+        );
+
+        let started = std::time::Instant::now();
+        while unix_pid_is_alive(descendant_pid) {
+            assert!(
+                started.elapsed() < DEADLINE,
+                "a descendant left behind by a leader that exited normally must not \
+                 survive it -- by now the leader itself is already reaped and \
+                 kill()'s own group signal has nothing left to act on"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The defect this unit closes, other half: cancellation ends the direct
+    /// child but, before the fix, never reaches anything the leader started.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_run_does_not_leave_a_descendant_running() {
+        let fixture = Fixture::new(BLOCKING_WITH_DESCENDANT);
+        let runner = fixture.start().await;
+        let leader_pid = unix_announced_pid(&fixture, "blocked.pid").await;
+        let descendant_pid = unix_announced_pid(&fixture, "descendant.pid").await;
+        assert!(unix_pid_is_alive(leader_pid), "the leader must still be running");
+        assert!(
+            unix_pid_is_alive(descendant_pid),
+            "the descendant must be running before cancellation"
+        );
+
+        // The shape `queue::executor`'s cancellation branch uses: drop the
+        // `wait()` future (never entered here at all) and kill instead.
+        tokio::time::timeout(DEADLINE, runner.kill())
+            .await
+            .expect("kill must not hang")
+            .expect("kill must succeed");
+
+        let started = std::time::Instant::now();
+        while unix_pid_is_alive(leader_pid) || unix_pid_is_alive(descendant_pid) {
+            assert!(
+                started.elapsed() < DEADLINE,
+                "cancellation must end the whole tree the leader built, not just the \
+                 direct child -- leader alive: {}, descendant alive: {}",
+                unix_pid_is_alive(leader_pid),
+                unix_pid_is_alive(descendant_pid)
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
