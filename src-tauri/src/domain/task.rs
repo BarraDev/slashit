@@ -109,6 +109,19 @@ pub struct Task {
     #[serde(default)]
     pub branch_name: Option<String>,
 
+    /// The commit the task's worktree started from: `git rev-parse HEAD`
+    /// (or the parent branch's tip, for a stacked task) resolved once, at
+    /// the moment the worktree/branch is first created, and never
+    /// re-derived afterward -- a retry reattaches to the same branch and
+    /// must keep comparing against the same starting point, not wherever
+    /// the branch tip has since moved to. `None` for a task persisted
+    /// before this field existed, or one attached to a branch SlashIt
+    /// didn't create: there is no reliable way to recover a boundary for
+    /// those after the fact, so their task diff is truthfully "unknown",
+    /// never guessed via `merge-base`/`HEAD~1`.
+    #[serde(default)]
+    pub base_commit: Option<String>,
+
     /// A destructive worktree cleanup was started for this task and this
     /// process has not yet durably recorded its outcome.
     ///

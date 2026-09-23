@@ -54,10 +54,29 @@ pub async fn create_worktree(
 
     let branch_name = existing_branch.clone().unwrap_or_else(|| WorktreeManager::branch_for_task(task_id));
 
+    let is_fresh = existing_branch.is_none();
     let info = if existing_branch.is_some() {
         state.worktree_manager.reattach(&repo_path, &branch_name).await?
     } else {
         state.worktree_manager.create(&repo_path, &branch_name).await?
+    };
+    // Captured once, only for a fresh worktree, matching
+    // `queue::executor::spawn_task_execution`'s canonical-diff boundary
+    // contract: a reattach must keep comparing against the task's original
+    // starting point, not wherever `HEAD` is now. Read from the *new*
+    // worktree's own `HEAD` (not `repo_path`'s) so nothing else can move it
+    // out from under this call between creation and here.
+    let fresh_base_commit = if is_fresh {
+        tokio::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&info.path)
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    } else {
+        None
     };
 
     // Update task
@@ -66,6 +85,9 @@ pub async fn create_worktree(
         if let Some(task) = tasks.get_mut(&task_id) {
             task.worktree_path = Some(info.path.clone());
             task.branch_name = Some(info.branch.clone());
+            if let Some(base_commit) = fresh_base_commit {
+                task.base_commit = Some(base_commit);
+            }
             task.updated_at = chrono::Utc::now();
 
             // Persist

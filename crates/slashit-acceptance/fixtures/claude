@@ -9,6 +9,20 @@ if [ -z "$SLASHIT_FAKE_AGENT_MARKERS" ]; then
     exit 97
 fi
 
+# Claim this invocation's place in the order invocations started, before
+# anything else happens. `mkdir` refuses an existing directory and creates a
+# missing one in a single indivisible step, so two invocations starting at the
+# same moment can never be handed the same number, and the numbers are handed
+# out in the order invocations reach this line. That order is what the record's
+# name carries; a name made up by `mktemp` would be unique but say nothing
+# about when the run happened.
+sequence="$SLASHIT_FAKE_AGENT_MARKERS/.sequence"
+mkdir -p "$sequence"
+position=1
+while ! mkdir "$sequence/$position" 2>/dev/null; do
+    position=$((position + 1))
+done
+
 # Written in a staging directory and moved into place, because the test polls
 # this directory while the agent is running: `mktemp` creates the file before
 # anything is in it, so a reader could otherwise see a record that exists but
@@ -18,7 +32,7 @@ staging="$SLASHIT_FAKE_AGENT_MARKERS/.staging"
 mkdir -p "$staging"
 record=$(mktemp "$staging/XXXXXX")
 printf '%s\0' "$PWD" "$@" > "$record"
-mv "$record" "$SLASHIT_FAKE_AGENT_MARKERS/invocation-${record##*/}"
+mv "$record" "$SLASHIT_FAKE_AGENT_MARKERS/invocation-$position"
 
 # Echo the session id back, so the caller can tie this run to the one it asked
 # for rather than to any run at all.

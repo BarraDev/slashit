@@ -554,9 +554,8 @@ async fn fail_then_retry(
 
     let first_run = await_agent_runs(agent, 1).await?;
     // The executor gives every execution a fresh session id, so this is what
-    // tells the two runs apart later. Records are named by `mktemp` and read
-    // back in name order, which is unique but not chronological, so position
-    // in that list proves nothing about which run came first.
+    // tells the two runs apart later. Records come back in start order, but
+    // identity is what the selection below relies on, not position.
     // An empty value is as unusable here as a missing one: it identifies no
     // execution, and taking it would make every later comparison against it
     // meaningless while still looking like a session.
@@ -911,10 +910,13 @@ async fn execute_one_task(
 
     // --- Proof B: the product carried the task to its reviewable state -----
     //
-    // `AiReview` is what the executor sets the moment the agent succeeds, and
-    // the review it then schedules finds no diff to review (the fixture
-    // changes nothing), so the settled state is `HumanReview`. Both are read
-    // back through the frontend's own `list_tasks`.
+    // `AiReview` is what the executor sets the moment the agent succeeds.
+    // What happens next depends on whether the fixture wrote anything: with
+    // no `WRITE_FILE_VAR`, the scheduled review finds an empty diff and skips
+    // straight to `HumanReview`; with it set, the diff is real and a review
+    // agent actually runs (see `assert_agent_roles`) before the same
+    // `HumanReview` settling. Either way the terminal state is read back
+    // through the frontend's own `list_tasks`.
     let final_task =
         await_status(driver, &project_id, &task_id, &["human_review", "error"]).await?;
     if status_of(&final_task) == Some("error") {
@@ -1316,13 +1318,72 @@ fn agent_runs(agent: &FakeAgent) -> Result<Vec<fake_agent::Invocation>> {
         .collect())
 }
 
+/// Which of the executor's three agent roles produced a run, told apart by
+/// the exact `--allowedTools` set the executor gives each one
+/// (`queue::executor`): the coding agent is the only one with `Bash`; the fix
+/// agent is the only other one with `Edit`; the review agent has neither.
+/// There is no role marker to read directly -- this is the one durable,
+/// external difference between them a fixture that only echoes a fixed
+/// string back can still be told apart by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentRole {
+    Execution,
+    Review,
+    Fix,
+}
+
+fn agent_role(invocation: &fake_agent::Invocation) -> Result<AgentRole> {
+    let tools = invocation
+        .flag("--allowedTools")
+        .context("an agent run had no --allowedTools flag")?
+        .to_string_lossy();
+    Ok(if tools.contains("Bash") {
+        AgentRole::Execution
+    } else if tools.contains("Edit") {
+        AgentRole::Fix
+    } else {
+        AgentRole::Review
+    })
+}
+
+/// Assert the whole journey ran exactly `execution` coding runs, `review`
+/// review runs and `fix` fix runs, in that role order by when each run started
+/// (the fixture's own start sequence, see `FakeAgent::invocations`) -- not merely a total
+/// count, which would pass just as well if a review silently never ran at
+/// all. Fixed instead of `>= 1` checks on purpose: this is exactly the
+/// assertion strength that let the diff-boundary bug (AI review never firing
+/// for a real git-backed change) hide behind a passing "ran once" check.
+fn assert_agent_roles(
+    agent: &FakeAgent,
+    journey: &str,
+    execution: usize,
+    review: usize,
+    fix: usize,
+) -> Result<()> {
+    let runs = agent_runs(agent)?;
+    let roles = runs.iter().map(agent_role).collect::<Result<Vec<_>>>()?;
+
+    let expected: Vec<AgentRole> = std::iter::repeat_n(AgentRole::Execution, execution)
+        .chain(std::iter::repeat_n(AgentRole::Review, review))
+        .chain(std::iter::repeat_n(AgentRole::Fix, fix))
+        .collect();
+
+    if roles != expected {
+        bail!(
+            "{journey}: expected agent roles {expected:?} ({execution} execution, {review} \
+             review, {fix} fix), got {roles:?} ({} total runs)",
+            roles.len()
+        );
+    }
+    Ok(())
+}
+
 /// The run that is not the one `failed_session` identifies.
 ///
-/// Records are read back in file-name order, and the fixture names them with
-/// `mktemp`, which is unique but not monotonic — so the position of a record in
-/// `runs` says nothing about when it ran. Both attempts of a retried task also
-/// share a worktree and a set of flags, which is what makes picking the wrong
-/// one dangerous rather than merely wrong: every assertion the journey makes
+/// Records come back in the order the runs started, but this selects by
+/// identity rather than by position: both attempts of a retried task share a
+/// worktree and a set of flags, which is what makes picking the wrong one
+/// dangerous rather than merely wrong: every assertion the journey makes
 /// about the retry would still pass while describing the attempt it retried.
 ///
 /// The executor gives each execution a fresh session id, so that is the one
@@ -1811,10 +1872,12 @@ async fn done_journey(context: &TestContext) -> Result<()> {
     }
     assert_work_survives(&repository, &work, "moving the task to Done")?;
 
-    let invocations = agent_runs(&agent)?.len();
-    if invocations != 1 {
-        bail!("the agent ran {invocations} times over the whole journey, expected exactly once");
-    }
+    // The fixture writes a real file, so the task's canonical diff is real
+    // and non-empty by the time it reaches `AiReview` -- a review agent must
+    // actually run, not just the one coding run. The fixture's fixed
+    // response never contains `CHANGES_REQUESTED`, so review approves and no
+    // fix run follows.
+    assert_agent_roles(&agent, "done_journey", 1, 1, 0)?;
 
     Ok(())
 }
@@ -2004,10 +2067,11 @@ async fn delete_a_task(
     open_board(driver, &executed.project_id).await?;
     assert_card_absent_from_board(driver, &executed.title).await?;
 
-    let invocations = agent_runs(agent)?.len();
-    if invocations != 1 {
-        bail!("the agent ran {invocations} times over the whole journey, expected exactly once");
-    }
+    // Same reasoning as `done_journey`: the fixture wrote real work before
+    // the delete, so the task's real diff must have gone through an actual
+    // review agent, not just the coding run, before it ever reached the
+    // point where this journey deletes it.
+    assert_agent_roles(agent, "delete_journey", 1, 1, 0)?;
 
     Ok((executed, work))
 }

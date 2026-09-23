@@ -21,6 +21,10 @@ use std::path::{Path, PathBuf};
 /// The name the product looks up on `PATH`.
 const EXECUTABLE: &str = "claude";
 
+/// What every invocation record's name starts with. The rest of the name is
+/// the invocation's position in start order.
+const RECORD_PREFIX: &str = "invocation-";
+
 /// The variable the script writes its invocation records into. Set on the
 /// application process tree alongside `PATH`, and inherited by the agent
 /// because the runner does not clear the environment it passes on.
@@ -243,23 +247,43 @@ impl FakeAgent {
         }
     }
 
-    /// Every completed invocation, ordered by file name.
+    /// Every completed invocation, in the order the invocations started.
     ///
     /// Only finished records are visible: the fixture stages each one in a
     /// subdirectory and renames it in, and the `is_file` filter below skips
-    /// that subdirectory. Ordering is by name, which `mktemp` makes unique but
-    /// not monotonic; no journey so far needs more than "how many, and what
-    /// was in them".
+    /// that subdirectory.
+    ///
+    /// The order is the number each invocation claimed on entry (see the
+    /// fixture), which is a real sequence rather than a property of the file
+    /// name's spelling: it is parsed and compared as a number, so
+    /// `invocation-10` comes after `invocation-9`, and a record whose name
+    /// carries no position is an error rather than something to guess at.
     pub fn invocations(&self) -> Result<Vec<Invocation>> {
-        let mut names: Vec<PathBuf> = std::fs::read_dir(&self.marker_dir)
+        let mut records: Vec<(u64, PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(&self.marker_dir)
             .with_context(|| format!("could not read {}", self.marker_dir.display()))?
             .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file())
-            .collect();
-        names.sort();
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let position = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(RECORD_PREFIX))
+                .and_then(|position| position.parse::<u64>().ok())
+                .with_context(|| {
+                    format!(
+                        "{} is not an invocation record the fixture could have written",
+                        path.display()
+                    )
+                })?;
+            records.push((position, path));
+        }
+        records.sort_by_key(|(position, _)| *position);
 
-        names.iter().map(|path| read_invocation(path)).collect()
+        records.iter().map(|(_, path)| read_invocation(path)).collect()
     }
 
     /// How many times the fixture has run.
@@ -604,6 +628,110 @@ mod tests {
         }
 
         assert_eq!(agent.invocation_count().expect("count"), 3);
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The session ids of `agent`'s recorded runs, in the order it reports them.
+    fn recorded_sessions(agent: &FakeAgent) -> Vec<String> {
+        agent
+            .invocations()
+            .expect("read the records")
+            .iter()
+            .map(|invocation| {
+                invocation
+                    .flag("--session-id")
+                    .expect("every run here passes a session id")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    /// A journey that asserts which role ran first is only as good as the
+    /// order the records come back in. Twelve runs, one after another: more
+    /// than nine on purpose, because the tenth is where ordering by the
+    /// spelling of a name rather than by position would put `10` before `2`.
+    #[test]
+    fn records_come_back_in_the_order_the_runs_started() {
+        let root = scratch("order");
+        let agent = FakeAgent::install(&root).expect("install");
+
+        let sessions: Vec<String> = (1..=12).map(|n| format!("run-{n}")).collect();
+        for session in &sessions {
+            let run = std::process::Command::new(agent.executable())
+                .args(["-p", "do the work", "--session-id", session])
+                .env(MARKER_DIR_VAR, agent.marker_dir())
+                .output()
+                .expect("run the fixture");
+            assert!(run.status.success());
+        }
+
+        assert_eq!(recorded_sessions(&agent), sessions);
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// The order is when a run started, not when it finished. A run that is
+    /// still going when a later one completes is still first -- the shape of
+    /// a review that must come after the execution it reviews, whatever else
+    /// overlaps it.
+    #[test]
+    fn a_run_that_started_first_stays_first_when_it_finishes_last() {
+        let root = scratch("order-overlap");
+        let agent = FakeAgent::install(&root).expect("install");
+        let releases = agent
+            .block_agent_runs()
+            .expect("create the release directory");
+
+        let mut first = blocking_run(&agent, &releases, "first");
+        until(
+            || agent.blocked_pids().expect("read the pid records").len() == 1,
+            "the first run never announced itself as blocked",
+        );
+
+        let second = std::process::Command::new(agent.executable())
+            .args(["-p", "do the work", "--session-id", "second"])
+            .env(MARKER_DIR_VAR, agent.marker_dir())
+            .output()
+            .expect("run the fixture");
+        assert!(second.status.success());
+
+        assert_eq!(agent.release_blocked_runs().expect("release"), 1);
+        assert!(first.wait().expect("wait for the released run").success());
+
+        assert_eq!(recorded_sessions(&agent), ["first", "second"]);
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// Runs that start at the same moment each get a place of their own.
+    /// Two runs handed the same position would be named the same, and the
+    /// second rename would silently replace the first record.
+    #[test]
+    fn runs_starting_together_each_claim_their_own_position() {
+        let root = scratch("order-concurrent");
+        let agent = FakeAgent::install(&root).expect("install");
+
+        let runs: Vec<std::process::Child> = (1..=8)
+            .map(|n| {
+                std::process::Command::new(agent.executable())
+                    .args(["-p", "do the work", "--session-id", &format!("together-{n}")])
+                    .env(MARKER_DIR_VAR, agent.marker_dir())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .expect("start the fixture")
+            })
+            .collect();
+        for mut run in runs {
+            assert!(run.wait().expect("wait for the run").success());
+        }
+
+        let mut sessions = recorded_sessions(&agent);
+        sessions.sort();
+        let mut expected: Vec<String> = (1..=8).map(|n| format!("together-{n}")).collect();
+        expected.sort();
+        assert_eq!(sessions, expected, "every run keeps its own record");
 
         std::fs::remove_dir_all(&root).expect("clean up");
     }

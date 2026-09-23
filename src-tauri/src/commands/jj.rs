@@ -100,23 +100,45 @@ fn no_worktree_diff(task_id: Uuid) -> String {
     )
 }
 
+/// The one canonical task diff, shared by both `get_task_diff` and
+/// `get_task_diff_stat` -- neither IPC command computes its own range; both
+/// read the same [`crate::worktree::task_diff`] result the AI reviewer uses.
+async fn fetch_task_diff(
+    state: &tauri::State<'_, crate::AppState>,
+    task_uuid: Uuid,
+) -> Result<crate::worktree::TaskDiff, String> {
+    let (worktree_path, base_commit) = {
+        let tasks = state.task.tasks.read().await;
+        match tasks.get(&task_uuid) {
+            Some(t) => (t.worktree_path.clone(), t.base_commit.clone()),
+            None => (None, None),
+        }
+    };
+
+    let Some(wt_path) = worktree_path else {
+        return Err(no_worktree_diff(task_uuid));
+    };
+
+    crate::worktree::task_diff(&wt_path, base_commit.as_deref())
+        .await
+        .map_err(|e| match e {
+            crate::worktree::TaskDiffError::UnknownBoundary => format!(
+                "Task {task_uuid}'s diff boundary is unknown: it has no recorded starting \
+                 commit, so there is nothing reliable to compare its worktree against."
+            ),
+            crate::worktree::TaskDiffError::Failed(msg) => {
+                format!("Failed to compute the diff for task {task_uuid}: {msg}")
+            }
+        })
+}
+
 #[tauri::command]
 pub async fn get_task_diff(
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<String, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-
-    // Use worktree-aware diff if task has a worktree
-    let worktree_path = {
-        let tasks = state.task.tasks.read().await;
-        tasks.get(&task_uuid).and_then(|t| t.worktree_path.clone())
-    };
-
-    match worktree_path {
-        Some(wt_path) => state.worktree_manager.get_diff(&wt_path).await,
-        None => Err(no_worktree_diff(task_uuid)),
-    }
+    Ok(fetch_task_diff(&state, task_uuid).await?.patch)
 }
 
 #[tauri::command]
@@ -125,16 +147,7 @@ pub async fn get_task_diff_stat(
     task_id: String,
 ) -> Result<String, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-
-    let worktree_path = {
-        let tasks = state.task.tasks.read().await;
-        tasks.get(&task_uuid).and_then(|t| t.worktree_path.clone())
-    };
-
-    match worktree_path {
-        Some(wt_path) => state.worktree_manager.get_diff_stat(&wt_path).await,
-        None => Err(no_worktree_diff(task_uuid)),
-    }
+    Ok(fetch_task_diff(&state, task_uuid).await?.stat)
 }
 
 #[cfg(test)]

@@ -208,6 +208,7 @@ async fn handle_create_task(
             error_message: None,
             worktree_path: None,
             branch_name: None,
+            base_commit: None,
             cleanup_in_flight: false,
             pr_review_plan: None,
             created_at: now,
