@@ -512,6 +512,7 @@ mod tests {
     /// `exec` on purpose: the process that waits is the same process the
     /// runner spawned, so the pid recorded here is the one the runner owns and
     /// the fixture has no descendant of its own to confuse the question.
+    #[cfg(target_os = "linux")]
     const BLOCKING: &str = "blocking";
 
     const CLAUDE_LEVEL_ERROR: &str = "claude-level-error";

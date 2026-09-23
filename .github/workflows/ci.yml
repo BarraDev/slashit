@@ -241,6 +241,10 @@ jobs:
       # entirely, on any platform. It does *not* prove they compile with that
       # feature enabled off Linux; nothing in this job claims that. Every
       # `std::os::unix`/`PermissionsExt`-using test in the other three
-      # packages is individually `#[cfg(unix)]`-gated at its own definition.
+      # packages is individually `#[cfg(unix)]`-gated at its own definition,
+      # and test code that needs a Linux-only API (tokio's read-write FIFO
+      # open in `task_terminal_cleanup_lifecycle.rs`, and runner fixtures that
+      # only Linux tests use) is gated `#[cfg(target_os = "linux")]` instead,
+      # so the macOS leg compiles it out rather than failing on it.
       - name: Check (backend + CLI + IPC + acceptance harness, including test code)
         run: cargo check --tests -p slashit-ui -p slashit -p slashit-ipc -p slashit-acceptance
