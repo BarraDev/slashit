@@ -287,6 +287,7 @@ async fn rewrite_git_branch_tip_author(
     let tree = run_cmd("git", &["show", "-s", "--format=%T", &rev], working_dir).await?;
     let parent_output = run_cmd("git", &["show", "-s", "--format=%P", &rev], working_dir).await?;
     let message = run_cmd("git", &["show", "-s", "--format=%B", &rev], working_dir).await?;
+    let committer_name = run_cmd("git", &["show", "-s", "--format=%cn", &rev], working_dir).await?;
 
     let mut args = vec!["commit-tree".to_string(), tree];
     for parent in parent_output.split_whitespace() {
@@ -294,11 +295,18 @@ async fn rewrite_git_branch_tip_author(
         args.push(parent.to_string());
     }
 
+    // The committer is spelled out as well, not left to whatever identity the
+    // machine happens to have: the rewritten tip keeps its original committer
+    // name, and takes the recovered email there too, so the private address
+    // survives in neither field and recovery works with no `user.name`
+    // configured anywhere.
     let mut child = tokio::process::Command::new("git")
         .args(args.iter().map(|s| s.as_str()))
         .current_dir(working_dir)
         .env("GIT_AUTHOR_NAME", &plan.author_name)
         .env("GIT_AUTHOR_EMAIL", new_email)
+        .env("GIT_COMMITTER_NAME", &committer_name)
+        .env("GIT_COMMITTER_EMAIL", new_email)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -5071,6 +5079,94 @@ mod tests {
                 assert_eq!(
                     after_author, "recovered+12345@users.noreply.github.com",
                     "the rewrite must land only after ownership was confirmed ended"
+                );
+                assert_eq!(
+                    mock.read_log().matches("pr\ncreate").count(), 1,
+                    "exactly one gh pr create, after the rewrite: {}", mock.read_log()
+                );
+            }
+
+            /// Recovery supplies the whole identity of the commit it rewrites
+            /// rather than borrowing a committer name from the machine. The
+            /// checkout's own `user.name` is set empty, which shadows any
+            /// global or system name on the host running this test -- the
+            /// same "no identity at all" a fresh CI runner or a new machine
+            /// has -- so this fails anywhere recovery once again leans on
+            /// ambient Git identity, not only where none happens to exist.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn recover_private_email_rewrites_the_tip_without_any_ambient_git_identity() {
+                use tauri::Manager;
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+
+                // A committer distinct from the author, both on the private
+                // address, so the assertions below can tell "kept the original
+                // committer name" apart from "copied the author".
+                let tree = git(&repo.checkout, &["rev-parse", "task-branch^{tree}"]);
+                let parent = git(&repo.checkout, &["rev-parse", "task-branch^"]);
+                let output = StdCommand::new("git")
+                    .args(["commit-tree", &tree, "-p", &parent, "-m", "task commit"])
+                    .current_dir(&repo.checkout)
+                    .env("GIT_AUTHOR_NAME", "Task Author")
+                    .env("GIT_AUTHOR_EMAIL", "private@example.com")
+                    .env("GIT_COMMITTER_NAME", "Task Committer")
+                    .env("GIT_COMMITTER_EMAIL", "private@example.com")
+                    .output()
+                    .expect("run git commit-tree");
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                let task_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                git(&repo.checkout, &["update-ref", "refs/heads/task-branch", &task_sha]);
+
+                git(&repo.checkout, &["config", "user.name", ""]);
+
+                let mock = MockGh::setup(
+                    "https://github.com/testorg/testrepo/pull/79",
+                    r#"{"state":"OPEN"}"#,
+                );
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-branch"),
+                    TaskStatus::InProgress,
+                )
+                .await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    tasks.get_mut(&task_id).unwrap().worktree_path =
+                        Some(repo.checkout.to_str().unwrap().to_string());
+                }
+
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let result = recover_private_email_and_create_pr(
+                    app.state(),
+                    task_id.to_string(),
+                    "recovered+12345@users.noreply.github.com".to_string(),
+                )
+                .await;
+
+                assert_eq!(
+                    result.as_deref(),
+                    Ok("https://github.com/testorg/testrepo/pull/79"),
+                    "recovery must not depend on a configured Git user.name: {result:?}"
+                );
+                let after_sha = git(&repo.checkout, &["rev-parse", "refs/heads/task-branch"]);
+                assert_ne!(after_sha, task_sha, "the branch tip must have been rewritten");
+                assert_eq!(
+                    git(&repo.checkout, &["show", "-s", "--format=%an <%ae>", "refs/heads/task-branch"]),
+                    "Task Author <recovered+12345@users.noreply.github.com>",
+                );
+                assert_eq!(
+                    git(&repo.checkout, &["show", "-s", "--format=%cn <%ce>", "refs/heads/task-branch"]),
+                    "Task Committer <recovered+12345@users.noreply.github.com>",
+                    "the committer keeps its original name and loses the private address"
+                );
+                assert_eq!(
+                    repo.remote_has_branch("task-branch").as_deref(),
+                    Some(after_sha.as_str()),
+                    "the rewritten tip, not the original, is what gets pushed"
                 );
                 assert_eq!(
                     mock.read_log().matches("pr\ncreate").count(), 1,
