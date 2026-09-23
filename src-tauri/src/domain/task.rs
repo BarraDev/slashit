@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -157,6 +159,49 @@ impl Task {
         self.phase_progress = 0;
         self.overall_progress = 0;
         self.error_message = None;
+    }
+
+    /// The position a newly created task should take in `project_id`'s
+    /// Backlog column: one past the highest position already used there, or
+    /// the first slot if the column is empty.
+    ///
+    /// Shared by every front door that creates a task, so a task created
+    /// through the CLI lands at the end of the column like one created in the
+    /// app, rather than at a hardcoded position that collides with whatever
+    /// is already there.
+    pub fn next_backlog_position(existing: &HashMap<Uuid, Task>, project_id: Uuid) -> i32 {
+        existing
+            .values()
+            .filter(|t| t.project_id == project_id && t.status == TaskStatus::Backlog)
+            .map(|t| t.position)
+            .max()
+            .map_or(0, |max| max + 1)
+    }
+
+    /// Whether the poller should start this task on its next pass.
+    ///
+    /// `InProgress` alone does not mean "running": it is also what a task
+    /// promoted out of the queue looks like in the instant before an agent
+    /// exists for it. The idle phase is what distinguishes the two, because
+    /// spawning execution moves the task to a working phase before it spawns
+    /// anything.
+    ///
+    /// A cleanup this or an earlier process started and never recorded the
+    /// outcome of leaves the recorded checkout untrustworthy, and an agent
+    /// started against it would be working inside a directory a removal may
+    /// still be taking apart -- so a quarantined task is never ready, no
+    /// matter what its status and phase say.
+    ///
+    /// This is readiness, not capacity and not queue eligibility: it says
+    /// nothing about how many tasks may run at once, and nothing about
+    /// whether a `Queue` task may be promoted. The executor and the
+    /// regression tests that pin its behavior both call this rather than
+    /// each keeping their own copy of the condition, so the two cannot drift
+    /// the way they once did.
+    pub fn is_ready_to_execute(&self) -> bool {
+        self.status == TaskStatus::InProgress
+            && self.phase == TaskPhase::Idle
+            && !self.cleanup_in_flight
     }
 }
 
@@ -485,6 +530,63 @@ mod tests {
         created_at = "2024-01-01T00:00:00Z"
         updated_at = "2024-01-01T00:00:00Z"
     "#;
+
+    /// A task the poller may start: `InProgress`, idle phase, no cleanup
+    /// pending.
+    fn startable_task() -> Task {
+        let mut task = crate::test_helpers::create_test_task_full(
+            "Startable",
+            Uuid::new_v4(),
+            TaskStatus::InProgress,
+            0,
+        );
+        task.phase = TaskPhase::Idle;
+        task.cleanup_in_flight = false;
+        task
+    }
+
+    #[test]
+    fn is_ready_to_execute_is_true_for_an_ordinary_in_progress_idle_task() {
+        assert!(startable_task().is_ready_to_execute());
+    }
+
+    #[test]
+    fn is_ready_to_execute_is_false_for_a_queued_or_completed_task() {
+        let mut queued = startable_task();
+        queued.status = TaskStatus::Queue;
+        assert!(!queued.is_ready_to_execute());
+
+        let mut done = startable_task();
+        done.status = TaskStatus::Done;
+        assert!(!done.is_ready_to_execute());
+    }
+
+    #[test]
+    fn is_ready_to_execute_is_false_while_an_earlier_phase_has_not_reached_idle() {
+        let mut mid_run = startable_task();
+        mid_run.phase = TaskPhase::Coding;
+        assert!(!mid_run.is_ready_to_execute());
+    }
+
+    /// The mutation this unit closed: a task whose interrupted cleanup was
+    /// never resolved must never be reported ready, even though its status
+    /// and phase alone look exactly like an ordinary startable task. Before
+    /// this fix, the regression test that was supposed to pin this
+    /// (`executor_would_start` in `task_terminal_cleanup_lifecycle.rs`)
+    /// duplicated the condition by hand and had already drifted -- it omitted
+    /// this exact clause and so could not have caught its own removal. This
+    /// test calls the production predicate directly, so it cannot drift the
+    /// same way: deleting the `!cleanup_in_flight` clause from
+    /// `is_ready_to_execute` fails this test.
+    #[test]
+    fn is_ready_to_execute_is_false_for_a_quarantined_task_even_though_status_and_phase_say_go() {
+        let mut quarantined = startable_task();
+        quarantined.cleanup_in_flight = true;
+        assert!(
+            !quarantined.is_ready_to_execute(),
+            "a task with an unresolved cleanup must never be reported ready to execute"
+        );
+    }
 
     #[test]
     fn task_deserializes_legacy_workspace_id_into_worktree_id() {

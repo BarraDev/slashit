@@ -194,26 +194,17 @@ impl TaskExecutor {
 
     /// Whether the poller should start this task on this pass.
     ///
-    /// `InProgress` alone does not mean "running": it is also what a task
-    /// promoted out of the queue looks like in the instant before an agent
-    /// exists for it. The idle phase is what distinguishes the two, because
-    /// [`spawn_task_execution`](Self::spawn_task_execution) moves the task to
-    /// `Coding` before it spawns anything.
+    /// Delegates to [`Task::is_ready_to_execute`] rather than keeping its own
+    /// copy of the condition, so this and the regression tests that pin the
+    /// same contract cannot drift the way `is_ready_to_execute`'s own doc
+    /// records one of them already had.
     ///
-    /// The consequence is worth naming where the rule lives: anything that
-    /// writes this exact pair is asking for the task to be executed, whatever
-    /// it meant to say. That is why [`stop_task`](Self::stop_task) does not
-    /// leave a stopped task here.
+    /// The consequence is worth naming where the rule is used: anything that
+    /// writes `InProgress` + an idle phase is asking for the task to be
+    /// executed, whatever it meant to say. That is why
+    /// [`stop_task`](Self::stop_task) does not leave a stopped task here.
     fn is_pending(task: &Task) -> bool {
-        task.status == TaskStatus::InProgress
-            && task.phase == TaskPhase::Idle
-            // A cleanup this or an earlier process started and never recorded
-            // the outcome of leaves the recorded checkout untrustworthy, and an
-            // agent started against it would be working inside a directory a
-            // removal may still be taking apart. Startup quarantines such a
-            // task rather than adopting or re-removing it; this is the gate
-            // that keeps it out of the queue until someone resolves it.
-            && !task.cleanup_in_flight
+        task.is_ready_to_execute()
     }
 
     /// Whether an agent is attached to this task right now.

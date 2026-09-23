@@ -1,4 +1,5 @@
 use crate::config::paths::StateLocation;
+use crate::domain::Repository;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -45,6 +46,21 @@ pub struct Project {
     pub agent_config: AgentConfig,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Project {
+    /// This project's repository's local checkout path, if it has a
+    /// repository and that repository is still known.
+    ///
+    /// Shared by every front door that reports project facts, so a caller
+    /// asking through the CLI sees the same path the desktop app would --
+    /// and, for a project with no repository or a dangling `repository_id`,
+    /// the same honest absence rather than one front door inventing a value
+    /// the other correctly leaves unset.
+    pub fn repository_path(&self, repositories: &HashMap<Uuid, Repository>) -> Option<String> {
+        let repository_id = self.repository_id?;
+        repositories.get(&repository_id).map(|r| r.local_path.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

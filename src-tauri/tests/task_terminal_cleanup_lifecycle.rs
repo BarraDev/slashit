@@ -566,12 +566,17 @@ async fn build_fixture(name: &str) -> (Fixture, AppState) {
 /// The queue executor's own admission rule, restated where the property that
 /// depends on it is asserted.
 ///
-/// `TaskExecutor::is_pending` is private, and duplicating it here rather than
-/// reaching for it is deliberate: this is the definition of "the product will
-/// start running this task on its next pass", and a change to it has to be a
-/// visible change to this regression's meaning.
+/// `TaskExecutor::is_pending` is private, but it and this now both call
+/// [`Task::is_ready_to_execute`] rather than each keeping their own copy of
+/// the condition -- a hand-written copy here previously omitted
+/// `!cleanup_in_flight`, so it claimed a quarantined task would run when
+/// production correctly refused it. Calling the production predicate means a
+/// change to what "the product will start running this task on its next
+/// pass" means is still a visible change to this regression, without the
+/// second copy being able to silently stop meaning the same thing as the
+/// first.
 fn executor_would_start(task: &Task) -> bool {
-    task.status == TaskStatus::InProgress && task.phase == TaskPhase::Idle
+    task.is_ready_to_execute()
 }
 
 // ---------------------------------------------------------------------------

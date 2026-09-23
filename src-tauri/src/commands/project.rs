@@ -248,24 +248,13 @@ pub async fn get_project_path(
     project_id: String,
 ) -> Result<Option<String>, String> {
     let id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
-    
-    // Look up the project
-    let projects = state.project.projects.read().await;
-    let project = match projects.get(&id) {
-        Some(p) => p.clone(),
-        None => return Ok(None),
-    };
-    drop(projects);
-    
-    // If project has a repository_id, look up the repository's local_path
-    if let Some(repo_id) = project.repository_id {
-        let repositories = state.repository.repositories.read().await;
-        if let Some(repo) = repositories.get(&repo_id) {
-            return Ok(Some(repo.local_path.clone()));
-        }
-    }
 
-    Ok(None)
+    let projects = state.project.projects.read().await;
+    let Some(project) = projects.get(&id) else {
+        return Ok(None);
+    };
+    let repositories = state.repository.repositories.read().await;
+    Ok(project.repository_path(&repositories))
 }
 
 #[cfg(test)]
