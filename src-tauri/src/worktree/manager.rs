@@ -238,7 +238,7 @@ impl WorktreeManager {
         // and the only basis on which a reference may be discarded.
         match self
             .adopt_existing(repo_path, branch, porcelain)
-            .or_else(|| Self::adopt_any_registered(branch, porcelain))
+            .or_else(|| Self::adopt_any_registered(repo_path, branch, porcelain))
         {
             Some(path) => WorktreeRecovery::Adopt(path),
             None => WorktreeRecovery::ConfirmedAbsent,
@@ -299,11 +299,34 @@ impl WorktreeManager {
     /// only makes sense at a path the app would itself create at, which is
     /// why [`Self::adopt_existing`] stays scoped to those two conventions
     /// and this method is not used there.
-    pub fn adopt_any_registered(branch: &str, porcelain: &str) -> Option<String> {
+    ///
+    /// `repo_path` is never itself adoptable: the primary checkout is a
+    /// registered worktree for whatever branch it has checked out, and
+    /// without this check a task branch checked out there would get
+    /// repointed at the user's own working copy.
+    pub fn adopt_any_registered(repo_path: &str, branch: &str, porcelain: &str) -> Option<String> {
         let registered = PathBuf::from(Self::worktree_for_branch(porcelain, branch)?);
-        registered
-            .is_dir()
-            .then(|| registered.to_string_lossy().to_string())
+        if !registered.is_dir() {
+            return None;
+        }
+        // The primary checkout is itself a registered worktree for whatever
+        // branch it currently has checked out. Adopting it would repoint the
+        // task at the user's own working copy, and the executor would then run
+        // an agent there and target it for cleanup.
+        // `canonicalize` resolves symlinks so a `..`-relative or
+        // symlink-aliased primary path still compares equal; a canonicalize
+        // failure (a path git listed but that no longer resolves) falls back
+        // to the literal comparison rather than treating it as a match --
+        // failing closed, since an unresolvable primary path is not proof the
+        // candidate is a distinct, safe checkout either.
+        let same_as_primary = match (registered.canonicalize(), Path::new(repo_path).canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => registered == Path::new(repo_path),
+        };
+        if same_as_primary {
+            return None;
+        }
+        Some(registered.to_string_lossy().to_string())
     }
 
     /// Async counterpart of [`Self::adoptable_path`] for callers already
@@ -1508,8 +1531,67 @@ branch refs/heads/main
         );
 
         assert_eq!(
-            WorktreeManager::adopt_any_registered(branch, &porcelain),
+            WorktreeManager::adopt_any_registered(
+                tmp.path().to_str().unwrap(),
+                branch,
+                &porcelain
+            ),
             Some(registered_at.to_string_lossy().to_string())
+        );
+    }
+
+    /// The exact scenario a review traced: the user has the task branch
+    /// checked out in the repository's own primary checkout, and
+    /// `worktree_for_branch` matches that record as readily as any other.
+    /// Adopting it would repoint the task at the user's own working copy,
+    /// and the executor would then run an agent there.
+    #[test]
+    fn adopt_any_registered_refuses_the_primary_checkout() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path();
+        let branch = "task-abcd1234";
+
+        let porcelain = format!(
+            "worktree {}\nHEAD 9999999999999999999999999999999999999999\nbranch refs/heads/{}\n",
+            repo.display(),
+            branch
+        );
+
+        assert!(
+            WorktreeManager::adopt_any_registered(repo.to_str().unwrap(), branch, &porcelain)
+                .is_none(),
+            "the primary checkout must never be adopted as a task's worktree"
+        );
+    }
+
+    /// Adversarial: git can list the primary checkout's registration through
+    /// a symlinked or `..`-relative path spelling that differs byte-for-byte
+    /// from `repo_path`. A literal string comparison would miss this; the
+    /// canonicalizing comparison must not.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_any_registered_refuses_a_symlinked_alias_of_the_primary_checkout() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("primary-checkout");
+        std::fs::create_dir_all(&repo).expect("create primary checkout dir");
+        let alias = tmp.path().join("alias-to-primary");
+        std::os::unix::fs::symlink(&repo, &alias).expect("create symlink alias");
+        let branch = "task-abcd1234";
+
+        // git lists the worktree at the symlink path, not the canonical one --
+        // a realistic case, since git records whatever path the checkout was
+        // opened through.
+        let porcelain = format!(
+            "worktree {}\nHEAD 4444444444444444444444444444444444444444\nbranch refs/heads/{}\n",
+            alias.display(),
+            branch
+        );
+
+        assert!(
+            WorktreeManager::adopt_any_registered(repo.to_str().unwrap(), branch, &porcelain)
+                .is_none(),
+            "a symlinked alias of the primary checkout must resolve to the same canonical path \
+             and be refused just like the literal path"
         );
     }
 
@@ -1518,7 +1600,10 @@ branch refs/heads/main
         let branch = "task-abcd1234";
 
         // Nothing registered for this branch at all.
-        assert!(WorktreeManager::adopt_any_registered(branch, "").is_none());
+        assert!(
+            WorktreeManager::adopt_any_registered("/home/someone/code/other-repo", branch, "")
+                .is_none()
+        );
 
         // Registered, but for a different branch.
         let porcelain = "\
@@ -1526,7 +1611,12 @@ worktree /home/someone/code/my-app
 HEAD 7777777777777777777777777777777777777777
 branch refs/heads/some-other-branch
 ";
-        assert!(WorktreeManager::adopt_any_registered(branch, porcelain).is_none());
+        assert!(WorktreeManager::adopt_any_registered(
+            "/home/someone/code/other-repo",
+            branch,
+            porcelain
+        )
+        .is_none());
     }
 
     #[test]
@@ -1540,7 +1630,12 @@ branch refs/heads/some-other-branch
             Uuid::new_v4(),
             branch
         );
-        assert!(WorktreeManager::adopt_any_registered(branch, &porcelain).is_none());
+        assert!(WorktreeManager::adopt_any_registered(
+            "/home/someone/code/other-repo",
+            branch,
+            &porcelain
+        )
+        .is_none());
     }
 
     #[test]
@@ -2466,6 +2561,69 @@ branch refs/heads/some-other-branch
             result,
             WorktreeRecovery::Adopt(managed.to_string_lossy().to_string()),
             "a worktree git confirms at the managed path must be adopted"
+        );
+    }
+
+    /// Integration Scenario A: a task branch registered at an external,
+    /// non-managed worktree (e.g. one `wt` placed under its own convention)
+    /// is still adopted through the `adopt_any_registered` fallback.
+    #[test]
+    fn classify_missing_worktree_adopts_an_externally_placed_worktree() {
+        let mgr = test_manager();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("primary-checkout");
+        std::fs::create_dir_all(&repo).expect("create primary checkout dir");
+        let external = tmp.path().join("wherever-wt-put-it");
+        std::fs::create_dir_all(&external).expect("create external worktree dir");
+        let branch = "task-abcd1234";
+
+        let porcelain = format!(
+            "worktree {}\nHEAD 2222222222222222222222222222222222222222\nbranch refs/heads/{}\n",
+            external.display(),
+            branch
+        );
+
+        let result = mgr.classify_missing_worktree(
+            repo.to_str().unwrap(),
+            branch,
+            Some(&porcelain),
+        );
+
+        assert_eq!(
+            result,
+            WorktreeRecovery::Adopt(external.to_string_lossy().to_string()),
+            "a genuine external registered worktree must still be adoptable"
+        );
+    }
+
+    /// Integration Scenario B: the only registered worktree for the branch is
+    /// the primary checkout itself. Adoption must refuse it and report
+    /// confirmed absence rather than handing the primary path downstream to
+    /// an agent or VCS command.
+    #[test]
+    fn classify_missing_worktree_refuses_to_adopt_the_primary_checkout() {
+        let mgr = test_manager();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("primary-checkout");
+        std::fs::create_dir_all(&repo).expect("create primary checkout dir");
+        let branch = "task-abcd1234";
+
+        let porcelain = format!(
+            "worktree {}\nHEAD 3333333333333333333333333333333333333333\nbranch refs/heads/{}\n",
+            repo.display(),
+            branch
+        );
+
+        let result = mgr.classify_missing_worktree(
+            repo.to_str().unwrap(),
+            branch,
+            Some(&porcelain),
+        );
+
+        assert_eq!(
+            result,
+            WorktreeRecovery::ConfirmedAbsent,
+            "the primary checkout must never be handed back as an adoptable task worktree"
         );
     }
 

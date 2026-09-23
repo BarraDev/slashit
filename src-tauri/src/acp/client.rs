@@ -17,9 +17,23 @@ pub struct AcpClient {
 }
 
 impl AcpClient {
-    pub fn start(command: &str, args: &[&str], env: &[(&str, &str)]) -> Result<Self> {
+    /// Start an agent process in `working_dir`.
+    ///
+    /// The directory is a required argument rather than an inherited default.
+    /// This used to set none at all, so the agent ran in whatever directory
+    /// SlashIt itself had been launched from -- for a desktop application,
+    /// typically the user's home or `/`, and never anything the caller chose.
+    /// An agent's working directory decides what it can read and write, so it
+    /// is not something to leave to the process that happened to start the app.
+    pub fn start(
+        command: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        working_dir: &std::path::Path,
+    ) -> Result<Self> {
         let mut cmd = Command::new(command);
         cmd.args(args)
+            .current_dir(working_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -202,5 +216,51 @@ impl AcpClient {
         let mut child = self.child.lock().await;
         child.kill().context("Failed to kill agent process")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The spawned process's cwd is the directory the caller named, not
+    /// wherever SlashIt itself happened to be launched from.
+    ///
+    /// Writes to a file rather than reading captured stdout, because
+    /// `start_response_reader` (spawned inside `start`) takes ownership of
+    /// the child's stdout for the agent's own notification stream; racing it
+    /// for the same pipe would be a second bug layered on the one this test
+    /// is isolating.
+    #[tokio::test]
+    async fn start_spawns_the_process_in_the_given_working_dir() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let marker = tmp.path().join("cwd.txt");
+
+        let client = AcpClient::start(
+            "sh",
+            &["-c", "pwd > cwd.txt"],
+            &[],
+            tmp.path(),
+        )
+        .expect("failed to spawn");
+
+        // Wait for the child to exit so the write has landed.
+        let status = {
+            let mut child = client.child.lock().await;
+            child.wait().expect("child did not exit")
+        };
+        assert!(status.success());
+
+        let recorded = std::fs::read_to_string(&marker)
+            .expect("the child never wrote its cwd — it did not run in the given directory");
+        let recorded = Path::new(recorded.trim())
+            .canonicalize()
+            .expect("recorded cwd should resolve");
+        let expected = tmp.path().canonicalize().expect("tempdir should resolve");
+        assert_eq!(
+            recorded, expected,
+            "the spawned process's cwd must be exactly the directory passed to start()"
+        );
     }
 }

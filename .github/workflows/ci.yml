@@ -60,6 +60,13 @@ jobs:
       - name: Clippy (acceptance harness)
         run: cargo clippy -p slashit-acceptance --all-targets --features run-acceptance -- -D warnings
 
+      # `commands::pr::tests` exercises real `jj` behavior (not a mock), so
+      # the runner needs an actual `jj` binary on PATH before this step.
+      - name: Install jj
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          install_args: jj
+
       - name: Tests (backend + harness units)
         run: cargo test -p slashit-ui -p slashit-ipc -p slashit-acceptance
 
