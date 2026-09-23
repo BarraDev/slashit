@@ -327,6 +327,119 @@ pub async fn record(
     publish(&mut tasks_w, storage, project_id, staged)
 }
 
+/// Amend a task's own fields durably, or say there is no such task.
+///
+/// [`record`] cannot make the distinction an ordinary command needs: every
+/// command in `commands::task` and `ipc::handlers` has always answered an id
+/// that is not on the board with `Ok(None)`, not an error. Checking membership
+/// before staging gives that contract in the case that matters -- the id was
+/// never there -- but does not extend it across a race: a delete landing
+/// between the check and the write turns what should be `Ok(None)` into the
+/// `Err` [`record`] returns for a task it cannot find. The message is sane and
+/// nothing is written, so the failure is safe; a caller that reads "gone" as
+/// "failed" for one interleaving is a smaller problem than a mechanism
+/// invented to avoid saying so.
+pub async fn commit_task(
+    tasks: &Tasks,
+    storage: &Storage,
+    task_id: Uuid,
+    amend: Amend<'_>,
+) -> Result<Option<Task>, String> {
+    if !tasks.read().await.contains_key(&task_id) {
+        return Ok(None);
+    }
+
+    record(tasks, storage, task_id, amend).await?;
+
+    Ok(tasks.read().await.get(&task_id).cloned())
+}
+
+/// Insert a brand-new task durably.
+///
+/// The stage/persist/publish contract [`record`] gives an existing task,
+/// extended to the one case `record` cannot express: there is nothing yet at
+/// `task.id` for it to find. `build` sees the tasks already committed for
+/// `project_id` -- under the same lock the insert commits with, so a value it
+/// derives from that set (a board position, a sequence number) answers a
+/// question nothing racing this call could have already invalidated -- and
+/// returns the task to insert. A save failure leaves the shared map exactly as
+/// it was, so a caller told creation failed never goes on to see the task
+/// anyway.
+pub async fn create(
+    tasks: &Tasks,
+    storage: &Storage,
+    project_id: Uuid,
+    build: impl FnOnce(&HashMap<Uuid, Task>) -> Task,
+) -> Result<Task, String> {
+    let mut tasks_w = tasks.write().await;
+    let mut staged = stage_project(&tasks_w, project_id);
+    let task = build(&staged);
+    staged.insert(task.id, task.clone());
+    publish(&mut tasks_w, storage, project_id, staged)?;
+    Ok(task)
+}
+
+/// How a status transition affects a task's execution state and its worktree.
+///
+/// Resetting execution state and destroying a worktree are different
+/// operations, and these variants keep them apart. One variant used to do
+/// both, which made re-queuing a failed task also delete the work that task
+/// had produced. Worse, a task's branch and worktree path are derived from its
+/// id, which a retry does not change, so that asynchronous deletion raced the
+/// retry recreating them at the very same path: the cleanup could remove the
+/// *successful* second attempt's directory, branch and commits, then clear
+/// `worktree_path`, leaving a task reporting completion with nothing on disk
+/// behind it.
+///
+/// Every transition maps to exactly one variant, so no call site can spawn
+/// cleanup twice by evaluating overlapping conditions in the wrong order.
+///
+/// Shared by the desktop commands and the daemon's IPC handlers -- see
+/// [`classify_status_transition`] -- so a card dragged through the CLI and one
+/// dragged in the app resolve the same transition the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusTransitionEffect {
+    /// Moving back into the workflow: out of `Error`, or back to an early
+    /// column. Clears phase, progress and the error message, which is what
+    /// makes the task eligible to be picked up and run again.
+    ///
+    /// Deliberately preserves `worktree_path` and `branch_name`: the next
+    /// execution reattaches to that branch and continues from the work already
+    /// there. Discarding a worktree is an explicit destructive action, not a
+    /// side effect of moving a card back into a column.
+    ResetExecutionState,
+    /// Moving to `Done`: the task is finished with its worktree, so remove it.
+    /// Everything else — `branch_name` included, for PR creation — is left
+    /// untouched.
+    CleanUpWorktree,
+    /// No effect on execution state or worktree.
+    None,
+}
+
+/// `Done` is tested first so a task finishing *out of* `Error` still gets its
+/// terminal cleanup. Calling a task done is an explicit statement that its
+/// worktree is no longer needed; re-queuing that same task is the opposite.
+///
+/// The one classifier both front doors call. A front door that assigned
+/// `task.status` directly used to reach this task's board through a status
+/// write with none of the consequences above -- a `Failed -> InProgress` move
+/// that kept a stale `phase = Failed` and `error_message`, which then failed
+/// every readiness check even though the status said the task was running.
+pub(crate) fn classify_status_transition(
+    old_status: &TaskStatus,
+    new_status: &TaskStatus,
+) -> StatusTransitionEffect {
+    if matches!(new_status, TaskStatus::Done) {
+        StatusTransitionEffect::CleanUpWorktree
+    } else if *old_status == TaskStatus::Error
+        || matches!(new_status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
+    {
+        StatusTransitionEffect::ResetExecutionState
+    } else {
+        StatusTransitionEffect::None
+    }
+}
+
 /// Remove a task's record, once and only once nothing is owed on its behalf.
 ///
 /// Deleting is not a status change, so nothing here moves a task to a terminal
