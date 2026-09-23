@@ -84,6 +84,13 @@ This project uses [Jujutsu](https://github.com/martinvonz/jj) as its primary VCS
 
 If you'd like to use `jj`, see [the Jujutsu docs](https://jj-vcs.github.io/jj/latest/).
 
+### Maintainers and coding agents
+
+Maintainers and coding agents follow a JJ-workspace workflow with a pinned
+toolchain, described in [docs/development-workflow.md](docs/development-workflow.md).
+That workflow is not required for outside contributions: the fork-and-branch
+Git process above is all you need.
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE), the same license as the project.

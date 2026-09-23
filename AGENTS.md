@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents (Claude Code and others) when working with code in this repository.
 
 ## Project Overview
 
@@ -104,24 +104,85 @@ Per official [Tauri Leptos guide](https://tauri.app/start/frontend/leptos/):
 
 Frontend calls Tauri commands via `invoke()` through services in `src/services/`. Backend commands are registered in `src-tauri/src/lib.rs` with state managed through `AppState`.
 
-## Version Control with Jujutsu (JJ)
+## Development Workflow
 
-This project uses **Jujutsu (JJ)** as the primary version control system with Git colocated backend for compatibility.
+This project uses **Jujutsu (JJ)** as the primary version control system,
+colocated with Git. The rules below are the contract for maintainers and
+agents; [docs/development-workflow.md](docs/development-workflow.md) has the
+procedure, commands, and rationale. External contributors may use plain Git
+(see `CONTRIBUTING.md`).
 
-### Always Use JJ Over Git
+Paths below are relative to the canonical repository root. Its parent
+directory (the *project parent*) also holds developer workspaces and local
+private state.
 
-When working on this project, prefer JJ commands:
+### Repository and workspaces
 
-- `jj status` instead of `git status`
-- `jj log` instead of `git log`
-- `jj new` instead of `git commit`
-- `jj git push` instead of `git push`
+- The canonical repository root is the coordination checkout. Its `default`
+  JJ workspace stays an empty change on `main`; product edits do not happen
+  there.
+- Normal work happens in a JJ workspace at `../workspaces/<slug>`, created
+  from current `main` with the project-pinned `jj`.
+- One mutating owner per workspace. Read-only reviewers may share a workspace
+  but must not write to it or run builds that conflict with the owner's.
+- Never run `git worktree add` against the canonical `.git`. A task that
+  genuinely needs a real `.git` (for example exercising SlashIt's own Git
+  worktree backend, or `git bisect`) uses a disposable independent clone at
+  `../workspaces/<slug>-git`.
+- Each workspace keeps its own `target/`; do not share a Cargo target
+  directory between workspaces or set `CARGO_TARGET_DIR` globally.
+- JJ workspaces have no `.git`; run `gh` with `-R BarraDev/slashit` or from
+  the canonical root.
 
-### Why JJ?
+### Tooling
 
-- Better mental model for stacked changes
-- Safe change manipulation (rebase, edit, abandon)
-- Seamless Git interoperability via colocated backend
+- Use the toolchain pinned in the project `mise.toml`; run JJ as
+  `mise exec -- jj ...`. Do not rely on a globally installed or `latest` `jj`.
+- In the colocated canonical root, an ordinary `jj` command may snapshot the
+  working copy and import/export Git refs. For inspection there, use
+  `mise exec -- jj --ignore-working-copy ...` or read-only Git plumbing
+  (`git rev-parse`, `git cat-file`, `git ls-tree`, `git diff-tree`).
+
+### Agents
+
+- The main (orchestrating) agent owns decomposition, integration, the final
+  report, and every public mutation.
+- A subagent that writes gets its own workspace. Subagents do not spawn
+  further subagents.
+- Subagent output is evidence, not proof: the main agent re-verifies any
+  claim a decision depends on.
+
+### Reports and sessions
+
+- Each substantial unit of work produces one authoritative report in
+  `../slashit-private/reports/`, plus at most a bounded worklog.
+  `slashit-private` is local, untracked maintainer state, not part of the
+  repository. Do not store full chat transcripts.
+- Start a fresh session at substantial unit boundaries. Lessons that must
+  outlive a report are rewritten into project docs.
+
+### Pull requests and published text
+
+- A PR is a semantic delivery unit, not one PR per review finding. Stack PRs
+  only for real dependencies, and keep every PR in a stack independently
+  truthful.
+- PR titles and bodies, commit messages, and source comments must stay useful
+  to a future reader. They must not contain internal work-tracking labels,
+  session narration, temporary verification SHAs, private report paths, or AI
+  attribution (see below).
+- Do not post transient agent-status comments on PRs.
+
+### Authorization
+
+- Local work inside your own workspace (edits, `jj` changes, builds, tests)
+  is normal and needs no gate.
+- Public or destructive operations (push, creating or editing PRs and issues,
+  publication bookmarks, abandoning or deleting work or workspaces you do not
+  own) require an explicit authorization appropriate to their blast
+  radius.
+- Merging, repository or GitHub settings changes, force-pushes, and deleting
+  remote branches or tags require the repository owner's explicit approval
+  every time.
 
 ### No AI Attribution in Public Repository Artifacts
 

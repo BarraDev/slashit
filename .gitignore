@@ -34,3 +34,4 @@ Thumbs.db
 
 # Per-session handoff notes (kept locally, not part of the repo)
 HANDOFF_*.md
+/handoff-queue/
