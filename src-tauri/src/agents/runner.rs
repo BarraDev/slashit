@@ -61,6 +61,10 @@ pub struct ClaudeRunner {
     /// Handle to the stdout reader task. `wait()` joins this before returning so
     /// callers can read the full accumulated output without racing the reader.
     reader_handle: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// Handle to the stderr drain, which yields everything the child wrote
+    /// there. Started at spawn, like the stdout reader; `wait()` joins it once
+    /// the child has been reaped.
+    stderr_handle: Mutex<Option<tauri::async_runtime::JoinHandle<String>>>,
 }
 
 impl ClaudeRunner {
@@ -170,6 +174,14 @@ impl ClaudeRunner {
         // currently waiting for the process to exit.
         let stdout = child.stdout.take();
 
+        // Stderr for the same reason, and it matters as much: a child that
+        // fills its stderr pipe blocks in `write()` and never exits, and
+        // `wait()` blocks until the leader exits before it reaps (see there).
+        // A drain that only started inside `wait()` would start too late for
+        // a child that had already filled the pipe, and one that started after
+        // the exit wait would never start at all.
+        let stderr = child.stderr.take();
+
         let (event_tx, _) = broadcast::channel(512);
 
         let runner = Self {
@@ -179,10 +191,12 @@ impl ClaudeRunner {
             accumulated_output: Arc::new(RwLock::new(String::new())),
             result_error: Arc::new(RwLock::new(None)),
             reader_handle: Mutex::new(None),
+            stderr_handle: Mutex::new(None),
         };
 
         let handle = runner.start_reader(stdout);
         *runner.reader_handle.lock().await = Some(handle);
+        *runner.stderr_handle.lock().await = stderr.map(Self::start_stderr_drain);
 
         Ok(runner)
     }
@@ -300,15 +314,9 @@ impl ClaudeRunner {
             Self::kill_process_group(pid);
         }
 
-        // Take stderr handle and read it concurrently with wait
-        let stderr_handle = child.stderr.take().map(|stderr| {
-            tokio::spawn(async move {
-                let mut reader = tokio::io::BufReader::new(stderr);
-                let mut buf = String::new();
-                let _ = tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf).await;
-                buf
-            })
-        });
+        // Stderr has been draining since spawn (see `start_program`), so a
+        // child with a lot to say can still reach the exit waited for above.
+        let stderr_handle = self.stderr_handle.lock().await.take();
 
         let status = child.wait().await.map_err(|e| format!("Wait failed: {}", e))?;
 
@@ -351,6 +359,21 @@ impl ClaudeRunner {
         }
 
         Ok(true)
+    }
+
+    /// Spawn the task that collects everything the child writes to stderr.
+    ///
+    /// Owns the pipe outright, like the stdout reader, so it keeps the pipe
+    /// empty whether or not anyone has reached `wait()` yet.
+    fn start_stderr_drain(
+        stderr: tokio::process::ChildStderr,
+    ) -> tauri::async_runtime::JoinHandle<String> {
+        tauri::async_runtime::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut buf = String::new();
+            let _ = tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf).await;
+            buf
+        })
     }
 
     /// Spawn the task that turns the child's stdout into events.
@@ -616,6 +639,19 @@ mod tests {
 
     const CRASHING: &str = "crashing";
 
+    /// Writes far more to stderr than a pipe can hold, then fails.
+    ///
+    /// The stderr twin of `chatty`. Two MiB is well past the 64 KiB a pipe
+    /// holds by default, and past the 1 MiB an unprivileged process can raise
+    /// one to, so the child blocks in `write()` unless something is draining
+    /// stderr while it runs -- and a wait that only starts draining once the
+    /// process has exited is waiting for an exit it is preventing.
+    const STDERR_FLOOD: &str = "stderr_flood";
+
+    /// The `pad` in the `stderr_flood` fixture, plus its newline.
+    const STDERR_FLOOD_LINE: usize = 16 * 4 * 4 * 4 + 1;
+    const STDERR_FLOOD_LINES: usize = 2048;
+
     /// Announces itself and then stays alive until something ends it.
     ///
     /// `exec` on purpose: the process that waits is the same process the
@@ -776,6 +812,29 @@ mod tests {
                 "the result should still arrive last"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_process_that_floods_stderr_can_still_exit_and_be_waited_on() {
+        let fixture = Fixture::new(STDERR_FLOOD);
+        let runner = fixture.start().await;
+
+        let error = bounded("stderr flood", &runner)
+            .await
+            .expect_err("the fixture exits non-zero");
+        assert_eq!(error, "Exit code 4 — the flood is over");
+
+        // All of it, not just the tail the error line quotes: a drain that
+        // stopped early would still let the child exit once it had room.
+        let output = runner.get_output().await;
+        let (_, stderr) = output
+            .split_once("\n--- STDERR ---\n")
+            .expect("stderr should be appended to the accumulated output");
+        assert_eq!(
+            stderr.len(),
+            STDERR_FLOOD_LINE * STDERR_FLOOD_LINES + "the flood is over\n".len(),
+            "every byte the fixture wrote to stderr should have been collected"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1,0 +1,13 @@
+#!/bin/sh
+pad=xxxxxxxxxxxxxxxx
+pad=$pad$pad$pad$pad
+pad=$pad$pad$pad$pad
+pad=$pad$pad$pad$pad
+printf '{"type":"system","subtype":"init","session_id":"s-flood","model":"fixture-model"}\n'
+i=0
+while [ $i -lt 2048 ]; do
+    printf '%s\n' "$pad" >&2
+    i=$((i + 1))
+done
+echo "the flood is over" >&2
+exit 4
