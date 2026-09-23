@@ -13,16 +13,23 @@ pub async fn pick_folder() -> Result<Option<String>, String> {
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
-pub async fn check_is_git_repo(path: String) -> Result<bool, String> {
+#[derive(serde::Deserialize)]
+pub struct GitDetection {
+    pub is_git_repo: bool,
+    pub ancestor_root: Option<String>,
+}
+
+pub async fn check_is_git_repo(path: String) -> Result<GitDetection, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "path": path })).unwrap();
     let response = invoke("check_is_git_repo", args).await;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
 
-pub async fn create_repository(local_path: String, remote_url: Option<String>) -> Result<Repository, String> {
+pub async fn create_repository(local_path: String, remote_url: Option<String>, initialize_git: bool) -> Result<Repository, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "localPath": local_path,
         "remoteUrl": remote_url,
+        "initializeGit": initialize_git,
     })).unwrap();
 
     let response = invoke("create_repository", args).await;

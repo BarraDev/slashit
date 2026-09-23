@@ -1086,7 +1086,14 @@ async fn create_prerequisites(
         ui::invoke(
             driver,
             "create_repository",
-            json!({ "localPath": repository.path(), "remoteUrl": Value::Null }),
+            // `GitFixture::create` already ran `git init` and committed, so
+            // this is registering an existing repository root, not asking
+            // the product to create one.
+            json!({
+                "localPath": repository.path(),
+                "remoteUrl": Value::Null,
+                "initializeGit": false,
+            }),
         )
         .await?,
         "create_repository",

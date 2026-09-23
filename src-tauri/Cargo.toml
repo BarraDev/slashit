@@ -6,6 +6,7 @@ authors = ["Barradev Digital Services <admin@barradev.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/BarraDev/slashit"
 edition = "2021"
+default-run = "slashit-ui"
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
