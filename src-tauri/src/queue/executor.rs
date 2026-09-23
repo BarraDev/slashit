@@ -2422,8 +2422,9 @@ mod tests {
         runtime.block_on(async move {
             let handle = tokio::spawn(polling);
 
-            // `pr_check_counter` is bumped at the end of `check_and_execute`,
-            // so seeing it above zero proves a full pass ran — the loop is
+            // `pr_check_counter` is bumped partway through `check_and_execute`,
+            // just before the PR-status-polling section runs, so seeing it
+            // above zero proves a real pass reached that point — the loop is
             // genuinely polling, not merely spawned. Without this the test
             // would still pass if the loop observed shutdown before its first
             // pass, a strictly weaker claim.
@@ -2462,9 +2463,10 @@ mod tests {
         // to `check_and_execute` itself, which would be a change to
         // production code well beyond this fix. What this test does prove
         // deterministically, with no sleep-based guessing: the loop is
-        // allowed to run at least one real `check_and_execute` pass to
-        // completion first (tracked via `pr_check_counter`, incremented at
-        // the end of every pass), so this cannot degenerate into "shutdown
+        // allowed to run at least one real `check_and_execute` pass far
+        // enough to reach its PR-status-polling section first (tracked via
+        // `pr_check_counter`, incremented partway through every pass, just
+        // before that section runs), so this cannot degenerate into "shutdown
         // was already true before the loop was ever polled" — a strictly
         // weaker case an earlier version of this test collapsed into on a
         // single-threaded runtime, since sending on a `watch` channel before
@@ -2506,10 +2508,11 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(executor.polling_loop(Some(rx)));
 
-        // Let at least one full pass complete before signalling shutdown.
-        // `pr_check_counter` is incremented at the very end of
-        // `check_and_execute`, so observing it above zero is proof a pass
-        // ran to completion, not merely that the loop task was scheduled.
+        // Let at least one pass reach its PR-status-polling section before
+        // signalling shutdown. `pr_check_counter` is incremented partway
+        // through `check_and_execute`, just before that section runs, so
+        // observing it above zero is proof real work ran, not merely that
+        // the loop task was scheduled.
         while executor
             .pr_check_counter
             .load(std::sync::atomic::Ordering::Relaxed)

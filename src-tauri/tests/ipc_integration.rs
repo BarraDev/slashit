@@ -387,6 +387,16 @@ fn agent_spawning_requests() -> Vec<IpcRequest> {
         IpcRequest::EnqueueTask {
             task_id: uuid::Uuid::new_v4().to_string(),
         },
+        // `EditTask` can rewrite the title/description of a task already
+        // queued or in progress, so it reaches the same agent-spawning
+        // primitive one step later and must be denied identically — see
+        // `IpcRequest::spawns_agent`.
+        IpcRequest::EditTask {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            title: Some("from a remote peer".to_string()),
+            description: Some("rm -rf".to_string()),
+            priority: None,
+        },
     ]
 }
 
