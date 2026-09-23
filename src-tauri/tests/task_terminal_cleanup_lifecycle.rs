@@ -50,8 +50,12 @@
 //! exit path, panics included. A shim process therefore cannot outlive the
 //! test that armed it.
 //!
-//! Unix-only: FIFOs, `PATH` and `/bin/sh` are all load-bearing here.
-#![cfg(unix)]
+//! Linux-only: FIFOs, `PATH` and `/bin/sh` are all load-bearing here, and the
+//! barrier opens its FIFOs read-write through tokio's
+//! `pipe::OpenOptions::read_write`, which tokio provides only on Linux. Every
+//! test in this file runs under the same shimmed environment, so the gate is
+//! file-wide.
+#![cfg(target_os = "linux")]
 
 use std::fs;
 use std::io;

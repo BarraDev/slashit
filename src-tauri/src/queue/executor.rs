@@ -1957,8 +1957,15 @@ mod tests {
     /// Removes write permission on `dir` for the lifetime of the guard, and
     /// restores it on drop -- including on an unwinding panic -- so a failed
     /// assertion never leaves a directory `tempfile::TempDir` cannot clean up.
+    ///
+    /// Unix-only: the underlying assertion is that a chmod-locked directory
+    /// makes a durable write fail, which has no portable equivalent (a
+    /// Windows readonly attribute on a directory does not block file
+    /// creation inside it the way a Unix permission bit does).
+    #[cfg(unix)]
     struct Unwritable(std::path::PathBuf);
 
+    #[cfg(unix)]
     impl Unwritable {
         fn on(dir: &std::path::Path) -> Self {
             std::fs::create_dir_all(dir).expect("create the directory to lock down");
@@ -1971,6 +1978,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for Unwritable {
         fn drop(&mut self) {
             let _ = std::fs::set_permissions(
@@ -1990,6 +1998,7 @@ mod tests {
     /// failure and proves the fix: the poll leaves the task exactly as it
     /// found it, both in memory and on disk, rather than reporting nothing
     /// while quietly diverging from the file.
+    #[cfg(unix)]
     #[tokio::test]
     async fn auto_promotion_leaves_the_task_untouched_when_the_durable_write_fails() {
         let (storage, storage_temp) = test_storage();
