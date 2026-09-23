@@ -554,9 +554,8 @@ async fn fail_then_retry(
 
     let first_run = await_agent_runs(agent, 1).await?;
     // The executor gives every execution a fresh session id, so this is what
-    // tells the two runs apart later. Records are named by `mktemp` and read
-    // back in name order, which is unique but not chronological, so position
-    // in that list proves nothing about which run came first.
+    // tells the two runs apart later. Records come back in start order, but
+    // identity is what the selection below relies on, not position.
     // An empty value is as unusable here as a missing one: it identifies no
     // execution, and taking it would make every later comparison against it
     // meaningless while still looking like a session.
@@ -1348,7 +1347,8 @@ fn agent_role(invocation: &fake_agent::Invocation) -> Result<AgentRole> {
 }
 
 /// Assert the whole journey ran exactly `execution` coding runs, `review`
-/// review runs and `fix` fix runs, in that role order -- not merely a total
+/// review runs and `fix` fix runs, in that role order by when each run started
+/// (the fixture's own start sequence, see `FakeAgent::invocations`) -- not merely a total
 /// count, which would pass just as well if a review silently never ran at
 /// all. Fixed instead of `>= 1` checks on purpose: this is exactly the
 /// assertion strength that let the diff-boundary bug (AI review never firing
@@ -1380,11 +1380,10 @@ fn assert_agent_roles(
 
 /// The run that is not the one `failed_session` identifies.
 ///
-/// Records are read back in file-name order, and the fixture names them with
-/// `mktemp`, which is unique but not monotonic — so the position of a record in
-/// `runs` says nothing about when it ran. Both attempts of a retried task also
-/// share a worktree and a set of flags, which is what makes picking the wrong
-/// one dangerous rather than merely wrong: every assertion the journey makes
+/// Records come back in the order the runs started, but this selects by
+/// identity rather than by position: both attempts of a retried task share a
+/// worktree and a set of flags, which is what makes picking the wrong one
+/// dangerous rather than merely wrong: every assertion the journey makes
 /// about the retry would still pass while describing the attempt it retried.
 ///
 /// The executor gives each execution a fresh session id, so that is the one
