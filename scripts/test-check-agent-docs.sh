@@ -174,5 +174,143 @@ probe "retired terms in CHANGELOG.md" 0 'agent-docs: OK' \
 probe "retired terms outside the Former names section" 1 '\[F\] docs/architecture/product-model.md' \
   'printf "\n## Later\n\nThe meta folder is back.\n" >>docs/architecture/product-model.md'
 
+# Check G. Mutations that rename the production ClaudeRunner and then leave a
+# look-alike behind must still fail: only a real item counts.
+say() { printf '%s\n' "$2" | tr '@' '\140' >>"$1"; } # @ stands for a backtick
+edit() { sed "$1" "$2" >"$2.edit" && mv "$2.edit" "$2"; }
+export -f say edit
+runner=src-tauri/src/agents/runner.rs
+gone="edit 's/^pub struct ClaudeRunner {/pub struct ClaudeProcess {/' $runner"
+stale='\[G\] src-tauri/src/agents/AGENTS.md:[0-9]+: `ClaudeRunner` names nothing defined in crate slashit-ui'
+
+probe "cited symbol removed" 1 '\[G\] src-tauri/src/AGENTS.md:[0-9]+: `NullEventSink` names nothing defined' \
+  'edit "/^pub struct NullEventSink;$/d" src-tauri/src/events.rs'
+probe "cited symbol renamed" 1 "$stale" "$gone"
+probe "cited enum variant renamed in a dependency crate" 1 '`CreateTask` names nothing defined in crate slashit-ui or its dependency slashit-ipc' \
+  'edit "s/^    CreateTask {/    NewTask {/" crates/slashit-ipc/src/protocol.rs'
+probe "uncited symbol renamed" 0 'agent-docs: OK' \
+  'edit "s/^pub const PROTOCOL_VERSION/pub const WIRE_VERSION/" crates/slashit-ipc/src/protocol.rs'
+probe "uncited file removed" 0 'agent-docs: OK' 'rm crates/slashit-ipc/src/framing.rs'
+probe "new file in a documented module" 0 'agent-docs: OK' \
+  'printf "pub struct Helper;\n" >src-tauri/src/agents/helper.rs'
+probe "function body changed" 0 'agent-docs: OK' \
+  'edit "s/self.events.get().cloned().unwrap_or_else(events::null_sink)/events::null_sink()/" src-tauri/src/lib.rs'
+probe "function signature changed" 0 'agent-docs: OK' \
+  'edit "s/pub fn events(&self) -> events::SharedEventSink {/pub fn events(\&self, _verbose: bool) -> events::SharedEventSink {/" src-tauri/src/lib.rs'
+probe "cited symbol moved to another file" 0 'agent-docs: OK' \
+  "edit '/^pub struct ClaudeRunner {/,/^}/d' $runner; printf 'pub struct ClaudeRunner {}\n' >src-tauri/src/agents/process.rs; printf 'pub mod process;\n' >>src-tauri/src/agents/mod.rs"
+probe "stale citation corrected" 0 'agent-docs: OK' \
+  "$gone; edit 's/ClaudeRunner/ClaudeProcess/' src-tauri/src/agents/AGENTS.md"
+probe "same name defined twice" 1 '`ClaudeRunner` is ambiguous in crate slashit-ui.*agents/runner.rs:[0-9]+ \(agents::runner::ClaudeRunner\), src-tauri/src/queue/pool.rs:1 \(queue::pool::ClaudeRunner\); qualify' \
+  'printf "pub struct ClaudeRunner;\n" >src-tauri/src/queue/pool.rs; printf "mod pool;\n" >>src-tauri/src/queue/mod.rs'
+probe "ambiguous citation qualified" 0 'agent-docs: OK' \
+  'printf "pub struct ClaudeRunner;\n" >src-tauri/src/queue/pool.rs; printf "mod pool;\n" >>src-tauri/src/queue/mod.rs; edit "s/\`ClaudeRunner\`/\`runner::ClaudeRunner\`/" src-tauri/src/agents/AGENTS.md'
+probe "unqualified AgentRole is ambiguous" 1 '`AgentRole` is ambiguous.*agents::roles::AgentRole.*domain::mcp::AgentRole' \
+  'edit "s/roles::AgentRole/AgentRole/" src-tauri/src/agents/AGENTS.md'
+probe "qualified citation whose item is gone" 1 '`roles::AgentRole` names nothing defined' \
+  'edit "s/^pub enum AgentRole {/pub enum AgentKind {/" src-tauri/src/agents/roles.rs'
+probe "qualifier that is not the parent module" 1 '`agents::AgentRole` names nothing defined' \
+  'edit "s/roles::AgentRole/agents::AgentRole/" src-tauri/src/agents/AGENTS.md'
+probe "trait method removed from one impl while other impls keep it" 1 '`DaemonControl::show_window` names nothing defined' \
+  'edit "s/^    fn show_window(&self) -> Result<(), String> {/    fn show_window_gone(\&self) -> Result<(), String> {/" src-tauri/src/daemon.rs'
+probe "variant cited through the wrong enum" 1 '`ClaudeEvent::CreateTask` names nothing defined' \
+  'say src-tauri/src/AGENTS.md "See @ClaudeEvent::CreateTask@."'
+probe "fully qualified path from the wrong crate" 1 '`slashit_ui_lib::endpoint::runtime_dir\(\)` names nothing defined' \
+  'edit "s/slashit_ipc::endpoint::runtime_dir/slashit_ui_lib::endpoint::runtime_dir/" src-tauri/src/AGENTS.md'
+probe "same name only in an unrelated crate" 1 "$stale" \
+  "$gone; printf 'pub struct ClaudeRunner;\n' >>crates/slashit-cli/src/main.rs; printf 'pub struct ClaudeRunner;\n' >>src/app.rs"
+probe "root AGENTS.md resolves across every crate" 1 '\[G\] AGENTS.md:[0-9]+: `JjStatus` is ambiguous in any crate' \
+  'say AGENTS.md "See @JjStatus@."'
+probe "doc comments are not definitions" 1 "$stale" \
+  "$gone; printf '/// pub struct ClaudeRunner;\n//! pub struct ClaudeRunner {}\n' >>$runner"
+probe "line and nested block comments are not definitions" 1 "$stale" \
+  "$gone; printf '// pub struct ClaudeRunner;\n/* a /* nested */\npub struct ClaudeRunner;\n*/\n' >>$runner"
+probe "string and raw-string fixtures are not definitions" 1 "$stale" \
+  "$gone; printf 'const A: &str = \"\npub struct ClaudeRunner; \\\\\" }\n\";\nconst B: &str = r#\"\npub struct ClaudeRunner {} \"quoted\"\n\"#;\n' >>$runner"
+probe "a character literal does not hide a real definition" 0 'agent-docs: OK' \
+  "$gone; printf 'const Q: char = \047\"\047;\nconst B: char = \047{\047;\nfn f<\047a>(_: &\047a str) {}\npub struct ClaudeRunner;\n' >>$runner"
+probe "an inline cfg(test) module is not a definition" 1 "$stale" \
+  "$gone; printf '#[cfg(test)]\nmod tests {\n    pub struct ClaudeRunner;\n}\n' >>$runner"
+probe "a file module declared under cfg(test) is not a definition" 1 "$stale" \
+  "$gone; printf '#[cfg(all(test, unix))]\nmod fixtures;\n' >>src-tauri/src/agents/mod.rs; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/fixtures.rs"
+probe "tests.rs and tests/ are not definitions" 1 "$stale" \
+  "$gone; mkdir src-tauri/src/agents/tests; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/tests/fake.rs; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/tests.rs; printf 'pub struct ClaudeRunner;\n' >src-tauri/tests/fake.rs"
+probe "a file marked #![cfg(test)] is not a definition" 1 "$stale" \
+  "$gone; printf 'pub mod fixtures;\n' >>src-tauri/src/agents/mod.rs; printf '#![cfg(test)]\npub struct ClaudeRunner;\n' >src-tauri/src/agents/fixtures.rs"
+probe "tests.rs is not a definition even without cfg(test)" 1 "$stale" \
+  "$gone; printf 'mod tests;\n' >>src-tauri/src/agents/mod.rs; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/tests.rs"
+probe "a tests/ module is not a definition even without cfg(test)" 1 "$stale" \
+  "$gone; printf 'mod tests;\n' >>src-tauri/src/agents/mod.rs; mkdir src-tauri/src/agents/tests; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/tests/mod.rs"
+probe "items inside function bodies and macros are not definitions" 1 "$stale" \
+  "$gone; printf 'fn helper() {\n    struct ClaudeRunner;\n}\nmacro_rules! fake {\n    () => { pub struct ClaudeRunner; };\n}\n' >>$runner"
+probe "a source file with a space in its name is read and left out" 1 "$stale" \
+  "$gone; printf 'pub struct ClaudeRunner;\n' >'src-tauri/src/agents/a b.rs'"
+probe "unreadable Rust stops the check" 2 'cannot follow the Rust source of src-tauri/src/agents/runner.rs' \
+  "printf 'const BROKEN: &str = r#\"never closed;\n' >>$runner"
+probe "snake_case, constants and fenced code are not citations" 0 'agent-docs: OK' \
+  'say src/AGENTS.md "Calls @no_such_fn()@ with @NO_SUCH_CONST@."; printf "%s\n" "\`\`\`rust" "let x = NoSuchType::new();" "\`\`\`" >>src/AGENTS.md'
+probe "crate-relative citation" 1 '`crate::AppState`: crate, self and super are not supported' \
+  'say src-tauri/src/AGENTS.md "See @crate::AppState@."'
+probe "allowlisted external" 0 'agent-docs: OK' 'say src/AGENTS.md "Compare @TypeId@."'
+probe "external-looking citation not allowlisted" 1 '\[G\] src/AGENTS.md:[0-9]+: `HashMap<K, V>` names nothing defined in crate slashit-frontend' \
+  'say src/AGENTS.md "Use a @HashMap<K, V>@."'
+probe "allowlisted name that SlashIt defines" 1 '`AppState` is listed as external in docs/agent-docs.toml but SlashIt defines it' \
+  'edit "s/^external = \[/external = [\"AppState\", /" docs/agent-docs.toml'
+probe "allowlisted name nothing cites" 1 'external citation "HashMap" is not cited' \
+  'edit "s/^external = \[/external = [\"HashMap\", /" docs/agent-docs.toml'
+probe "duplicate external entry" 2 'duplicate value "TypeId"' \
+  'edit "s/^external = \[/external = [\"TypeId\", /" docs/agent-docs.toml'
+probe "wildcard external entry" 2 'external entries are exact names or paths' \
+  'edit "s/^external = \[/external = [\"tauri::*\", /" docs/agent-docs.toml'
+probe "unknown [citations] key" 2 'unknown key "externals"' \
+  'edit "s/^external = /externals = /" docs/agent-docs.toml'
+probe "documented command renamed in code" 1 '\[G\] src-tauri/src/jj/AGENTS.md:[0-9]+: Tauri command `git_export` is listed under "Tauri Commands Exposed" but is not registered' \
+  'edit "s/^            git_export,$/            git_export_all,/" src-tauri/src/lib.rs; edit "s/fn git_export(/fn git_export_all(/" src-tauri/src/commands/jj.rs'
+probe "command defined but no longer registered" 1 'Tauri command `abandon_change` is listed' \
+  'edit "/^            abandon_change,$/d" src-tauri/src/lib.rs'
+probe "registration commented out or mentioned elsewhere" 1 'Tauri command `abandon_change` is listed' \
+  'edit "s|^            abandon_change,$|            // abandon_change,|" src-tauri/src/lib.rs; printf "fn uses() { let _ = commands::jj::abandon_change; }\n" >>src-tauri/src/lib.rs'
+probe "unrelated command unregistered" 0 'agent-docs: OK' 'edit "/^            greet,$/d" src-tauri/src/lib.rs'
+probe "handler list reformatted" 0 'agent-docs: OK' \
+  'edit "/^            describe_change,$/d" src-tauri/src/lib.rs; edit "s/^            new_change,$/            new_change, commands::jj::describe_change,/" src-tauri/src/lib.rs'
+probe "second generate_handler! list" 2 'expected one tauri::generate_handler!\[...\] in src-tauri/src/lib.rs, found 2' \
+  'printf "fn more() { tauri::generate_handler![greet]; }\n" >>src-tauri/src/lib.rs'
+probe "a cfg(test) item is not a production definition" 1 '`ClaudeRunner` names only agents::runner::ClaudeRunner .*compiled only under cfg\(test\)' \
+  "$gone; printf '#[cfg(test)]\npub struct ClaudeRunner;\n' >>$runner"
+probe "a method in a cfg(test) impl is not a production definition" 1 '`AppState::events\(\)` names only AppState::events .*cfg\(test\)' \
+  'edit "s/pub fn events(&self)/pub fn events_now(\&self)/" src-tauri/src/lib.rs; printf "#[cfg(test)]\nimpl AppState {\n    pub fn events(&self) -> u8 { 0 }\n}\n" >>src-tauri/src/lib.rs'
+probe "a cfg(all(test, not(...))) module is not a definition" 1 "$stale" \
+  "$gone; printf '#[cfg(all(test, not(target_os = \"windows\")))]\nmod win_tests {\n    pub struct ClaudeRunner;\n}\n' >>$runner"
+probe "a cfg(any(test, ...)) item is a definition" 0 'agent-docs: OK' \
+  "$gone; printf '#[cfg(any(test, feature = \"x\"))]\npub struct ClaudeRunner;\n' >>$runner"
+probe "a cfg(test) module loaded through #[path] is not a definition" 1 "$stale" \
+  "$gone; printf '#[cfg(test)]\n#[path = \"runner_fixtures.rs\"]\nmod fixtures;\n' >>$runner; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/runner_fixtures.rs"
+probe "a file no crate root reaches is not a definition" 1 '`JjManager` names nothing defined' \
+  'edit "/^mod jj;$/d" src-tauri/src/lib.rs'
+probe "a binary is not part of the library crate" 1 '`JjStatus` names nothing defined' \
+  'edit "s/^pub struct JjStatus {/pub struct JjState {/" src-tauri/src/jj/manager.rs; printf "struct JjStatus;\n" >>src-tauri/src/bin/slashitd.rs'
+probe "a moved item still re-exported under its old path" 1 '`roles::AgentRole` names nothing defined .*items named AgentRole: .*agents::kinds::AgentRole.*re-exports do not count' \
+  'edit "s/^pub enum AgentRole {/pub enum AgentRoleOld {/" src-tauri/src/agents/roles.rs; printf "pub use super::kinds::AgentRole;\n" >>src-tauri/src/agents/roles.rs; printf "pub mod kinds;\n" >>src-tauri/src/agents/mod.rs; printf "pub enum AgentRole {}\n" >src-tauri/src/agents/kinds.rs'
+probe "a name inside generic arguments is checked" 1 '\[G\] src-tauri/src/AGENTS.md:[0-9]+: `RoadmapState` names nothing defined' \
+  'edit "s/^pub struct RoadmapState {/pub struct RoadmapStore {/" src-tauri/src/commands/roadmap.rs'
+probe "test_only citation" 1 '`RecordingEventSink` names only events::RecordingEventSink .*cfg\(test\)' \
+  'edit "s/^test_only = .*/test_only = []/" docs/agent-docs.toml'
+probe "test_only entry that names a production item" 1 '`NullEventSink` names events::NullEventSink .*which is not test-only' \
+  'edit "s/^test_only = \[/test_only = [\"NullEventSink\", /" docs/agent-docs.toml'
+probe "test_only entry nothing cites" 1 'test_only citation "HashMap" is not a cited test-only item' \
+  'edit "s/^test_only = \[/test_only = [\"HashMap\", /" docs/agent-docs.toml'
+probe "external entry rooted at a SlashIt crate" 1 'external citation "slashit_ipc::Gone" starts with the SlashIt crate slashit_ipc' \
+  'edit "s/^external = \[/external = [\"slashit_ipc::Gone\", /" docs/agent-docs.toml'
+probe "external name SlashIt now defines suggests the full path" 1 '`TypeId` is listed as external .*queue::Key::TypeId.*full path \(such as `std::any::TypeId`\)' \
+  'printf "enum Key {\n    TypeId,\n    Name,\n}\n" >>src-tauri/src/queue/mod.rs'
+probe "ambiguity hint lists every qualified form" 1 '`ClaudeRunner` is ambiguous.*qualify the citation as one of `runner::ClaudeRunner`, `pool::ClaudeRunner`' \
+  'printf "pub struct ClaudeRunner;\n" >src-tauri/src/queue/pool.rs; printf "mod pool;\n" >>src-tauri/src/queue/mod.rs'
+probe "commands heading in another case, with a subsection" 1 'Tauri command `abandon_change` is listed' \
+  'edit "s/^## Tauri Commands Exposed$/## Tauri commands exposed/" src-tauri/src/jj/AGENTS.md; edit "s/^- \`abandon_change\`/### Mutating\n\n- \`abandon_change\`/" src-tauri/src/jj/AGENTS.md; edit "/^            abandon_change,$/d" src-tauri/src/lib.rs'
+probe "prose in the commands section is not a command" 0 'agent-docs: OK' \
+  'say src-tauri/src/jj/AGENTS.md "These run @jj@ as a subprocess."; edit "/^## Pattern$/d" src-tauri/src/jj/AGENTS.md'
+probe "workspace and dotted-table path dependencies keep their scope" 0 'agent-docs: OK' \
+  'printf "\n[workspace.dependencies]\nslashit-ipc = { path = \"crates/slashit-ipc\" }\n" >>Cargo.toml; edit "s|^slashit-ipc = { path = \"../crates/slashit-ipc\" }$|slashit-ipc = { workspace = true }|" src-tauri/Cargo.toml; grep -q "workspace = true" src-tauri/Cargo.toml; edit "s|^slashit-ipc = { path = \"../slashit-ipc\" }$|[dependencies.slashit-ipc]\npath = \"../slashit-ipc\"|" crates/slashit-cli/Cargo.toml; grep -q "^\[dependencies.slashit-ipc\]" crates/slashit-cli/Cargo.toml'
+
 printf '%d/%d probes passed\n' "$((n - failures))" "$n"
 [ "$failures" -eq 0 ]

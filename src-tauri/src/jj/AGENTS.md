@@ -10,8 +10,9 @@ Jujutsu (jj) version control integration.
 ## Tauri Commands Exposed
 
 The JJ commands are defined in `commands/jj.rs`, not in this module. That
-file also holds `get_task_diff` and `get_task_diff_stat`, which diff a Task's
-Git worktree and do not use jj.
+file also holds `commands::jj::get_task_diff()` and
+`commands::jj::get_task_diff_stat()`, which diff a Task's Git worktree and do
+not use jj.
 
 - `new_change` - Create a new JJ change
 - `describe_change` - Add description to a change

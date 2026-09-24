@@ -5,7 +5,7 @@ Backend source for Tauri v2. This folder contains all Rust backend code organize
 ## Module Structure
 
 - **lib.rs** - App state definition, Tauri command registration, app entry point
-- **main.rs** - Backend entry point (calls `lib.rs::run()`)
+- **main.rs** - Backend entry point (calls `slashit_ui_lib::run()`)
 - **commands/** - Tauri IPC command handlers organized by domain
 - **domain/** - Shared domain models (Agent, Project, Repository, Session, Task, Workspace)
 - **agents/** - Claude Code agent execution (see `agents/AGENTS.md`)
@@ -34,7 +34,7 @@ submodule.
 
 Commands are registered in `lib.rs` using `tauri::generate_handler!`. All commands must:
 1. Accept parameters matching the frontend's `invoke()` call
-2. Return `Result<T, E>` where E implements `serde::Serialize`
+2. Return `std::result::Result<T, E>` where E implements `serde::Serialize`
 3. Use `AppState` via `tauri::State<AppState>` parameter if needed
 
 ## Two front ends, one backend
@@ -44,17 +44,17 @@ daemon. Almost everything is shared. Only three things differ, and each is
 behind an abstraction — code below the command layer must use the abstraction
 rather than reaching for Tauri:
 
-- **app_core.rs** — `build_state()` builds `AppState` from disk. Both entry
-  points call it. It is `async`: hydration takes tokio locks, and a
-  `blocking_write()` / `blocking_read()` panics on a runtime thread. Never
+- **app_core.rs** — `app_core::build_state()` builds `AppState` from disk.
+  Both entry points call it. It is `async`: hydration takes tokio locks, and
+  a `blocking_write()` / `blocking_read()` panics on a runtime thread. Never
   reintroduce a blocking lock acquisition on a startup path.
 - **events.rs** — `EventSink` replaces `AppHandle::emit`. The GUI installs
   `TauriEventSink`, the daemon installs `LoggingEventSink`, tests use
   `NullEventSink` or `RecordingEventSink`. `AppState::events()` returns the
   installed sink.
 - **instance.rs** — `InstanceControl` covers showing the window and requesting
-  a quit. The daemon returns an error from `show_window` rather than pretending
-  to succeed.
+  a quit. The daemon's `DaemonControl::show_window` returns an error rather
+  than pretending to succeed.
 - **daemon.rs** / **bin/slashitd.rs** — the headless entry point. See
   `docs/architecture/daemon.md`.
 
