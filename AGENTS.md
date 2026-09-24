@@ -104,10 +104,11 @@ private state.
 ### Repository and developer workspaces
 
 - The canonical repository root is the coordination checkout. Its `default`
-  JJ workspace stays an empty change on `main`; product edits do not happen
-  there.
-- Normal work happens in a JJ workspace at `../workspaces/<slug>`, created
-  from current `main` with the project-pinned `jj`.
+  JJ workspace (a workspace name, not a bookmark) stays an empty,
+  undescribed change on `main`; product edits do not happen there.
+- All product edits happen in a JJ developer workspace at
+  `../workspaces/<slug>`, created from current `main` with the
+  project-pinned `jj`; substantial work gets a dedicated one.
 - One mutating owner per workspace. Read-only reviewers may share a workspace
   but must not write to it or run builds that conflict with the owner's.
 - Never run `git worktree add` against the canonical `.git`. A task that
@@ -118,6 +119,26 @@ private state.
   directory between workspaces or set `CARGO_TARGET_DIR` globally.
 - JJ workspaces have no `.git`; run `gh` with `-R BarraDev/slashit` or from
   the canonical root.
+
+### Changes, checkpoints, and publication
+
+- Describe a meaningful active change early with `jj describe`.
+- When a change is complete and validated, run `jj new`. An idle or
+  review-waiting workspace has an empty, undescribed `@` above its completed
+  checkpoint.
+- A publication bookmark targets the completed checkpoint by explicit
+  revision (`-r <change>` or `--to <change>`). Bookmark commands default to
+  `@`; never rely on that for publication.
+- A published or reviewed checkpoint is preserved. Review fixes are child
+  changes (describe the existing empty `@`), and the bookmark advances by
+  fast-forward. This is project policy; `jj` does not enforce it.
+- Rewriting or force-pushing a published checkpoint is exceptional and needs
+  the repository owner's explicit approval.
+- JJ experiments run in a disposable repository with an absolute pinned `jj`
+  binary and a local remote; never `mise -C` or `mise exec --cd` into a
+  SlashIt checkout.
+- Retire a merged publication bookmark with `jj bookmark forget`, not
+  `jj bookmark delete`.
 
 ### Tooling
 
@@ -165,9 +186,9 @@ private state.
   publication bookmarks, abandoning or deleting work or workspaces you do not
   own) require an explicit authorization appropriate to their blast
   radius.
-- Merging, repository or GitHub settings changes, force-pushes, and deleting
-  remote branches or tags require the repository owner's explicit approval
-  every time.
+- Merging, repository or GitHub settings changes, force-pushes or other
+  rewrites of published checkpoints, and deleting remote branches or tags
+  require the repository owner's explicit approval every time.
 
 ### No AI Attribution in Public Repository Artifacts
 
