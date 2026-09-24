@@ -9,7 +9,7 @@ Domain models shared across backend modules. These types define the core data st
 - **repository.rs** - Repository configuration
 - **session.rs** - Chat session with agents
 - **task.rs** - Task definition with dependencies
-- **workspace.rs** - Workspace state
+- **workspace.rs** - Workspace: the Product Workspace that groups Projects (not a Task Checkout; see `docs/architecture/product-model.md`)
 
 ## Serialization
 
