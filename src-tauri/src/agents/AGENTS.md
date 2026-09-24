@@ -1,20 +1,12 @@
-# CLAUDE.md (src-tauri/src/agents)
+# AGENTS.md (src-tauri/src/agents)
 
-Claude Code Agent integration via ACP (Agent Communication Protocol).
+Claude Code agent execution.
 
 ## Architecture
 
-- **mod.rs** - Agent trait definition and factory
-- **claude_code.rs** - Claude Code agent implementation
+- **mod.rs** - Declares the `roles` and `runner` modules
+- **roles.rs** - `AgentRole`, `AgentSlot` and `AgentSlotStatus`
+- **runner.rs** - `ClaudeRunner`, which runs the Claude Code CLI as a child
+  process and streams its output as `ClaudeEvent`s
 
-## Agent Trait
-
-All agents implement the `Agent` trait from `async_trait`:
-- `start()` - Initialize the agent
-- `stop()` - Shutdown the agent
-- `send_message()` - Send a message to the agent
-- `get_status()` - Get current agent status
-
-## ACP Protocol
-
-The `acp/` module implements the Agent Communication Protocol for message passing between the app and external agents.
+The Agent Communication Protocol client lives in `acp/`, not here.

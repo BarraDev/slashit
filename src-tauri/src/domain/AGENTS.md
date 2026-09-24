@@ -1,4 +1,4 @@
-# CLAUDE.md (src-tauri/src/domain)
+# AGENTS.md (src-tauri/src/domain)
 
 Domain models shared across backend modules. These types define the core data structures.
 
@@ -17,4 +17,4 @@ All domain models use `serde::{Serialize, Deserialize}` for JSON serialization v
 
 ## Naming Convention
 
-Model files use singular form (e.g., `agent.rs` not `agents.rs`) to distinguish from the feature modules that implement behavior for those models.
+Model files use singular form (e.g., `agent.rs`) to distinguish them from the plural feature modules that implement behavior for those models (e.g., `agents/`).

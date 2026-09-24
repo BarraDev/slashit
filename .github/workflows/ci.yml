@@ -40,6 +40,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Structural checks on the agent documentation (AGENTS.md and CLAUDE.md):
+  # pairing, module coverage, cited paths, the nested-doc list, size budgets
+  # and product vocabulary. It needs only the checkout, so it finishes in
+  # seconds and does not wait on any Rust build. It never writes to the
+  # repository and uses no secrets, network access or model. Contributors run
+  # the same script locally.
+  agent-docs:
+    runs-on: ubuntu-22.04
+    name: Agent docs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Check agent documentation structure
+        run: scripts/check-agent-docs.sh
+
+      - name: Self-test the checker
+        run: scripts/test-check-agent-docs.sh
+
   check:
     runs-on: ubuntu-22.04
     name: Lint, test and build (ubuntu-22.04)
