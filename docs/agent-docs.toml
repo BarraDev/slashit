@@ -20,6 +20,12 @@ roots = ["crates", "src", "src-tauri/src"]
 [citations]
 # Paths AGENTS.md files may cite that are build output, not tracked files.
 untracked = ["target/"]
+# Code names AGENTS.md files may cite that SlashIt does not define, exactly as
+# cited once `()`, `<...>` and `::*` are dropped. A name SlashIt defines is an
+# error here; qualify the citation instead.
+external = ["AppHandle::emit", "ProjectDirs::from", "TypeId", "WebKitWebDriver", "leptos::prelude", "serde::Serialize", "std::result::Result", "tauri::AppHandle", "tauri::State"]
+# Code names AGENTS.md files may cite that are compiled only under cfg(test).
+test_only = ["RecordingEventSink"]
 
 [modules]
 "crates/slashit-acceptance" = "covered-by:AGENTS.md"
