@@ -17,7 +17,7 @@
 
 Delegating code to an AI agent works fine for one task. Doing it for five tasks across three repos, each in its own branch, with reviewer comments coming in on yesterday's PR, is where it falls apart.
 
-SlashIt is a desktop app that turns that into a workflow you can actually run. Stage tasks on a Kanban board, hand each one to an agent in its own isolated workspace, and queue several to run in parallel. Keep a terminal — or several — open next to each one for when you want to take over. When the agent comes back with a draft, review the diff, open a PR, and — when reviewers leave comments — triage them one by one, let the agent propose Fix / Skip / Question per comment, apply the approved fixes, and reply back on the PR without ever opening GitHub.
+SlashIt is a desktop app that turns that into a workflow you can actually run. Stage tasks on a Kanban board, hand each one to an agent in its own isolated Task Checkout, and queue several to run in parallel. Keep a terminal — or several — open next to each one for when you want to take over. When the agent comes back with a draft, review the diff, open a PR, and — when reviewers leave comments — triage them one by one, let the agent propose Fix / Skip / Question per comment, apply the approved fixes, and reply back on the PR without ever opening GitHub.
 
 It's built for people who've already outgrown a single terminal tab and a stack of disposable branches.
 
@@ -29,15 +29,15 @@ It's built for people who've already outgrown a single terminal tab and a stack 
 - Drop a card into the queue and an agent picks it up; configurable concurrency keeps things sane.
 
 **Run many things at once**
-- Every task gets its own isolated workspace — a real Git worktree (or a `jj` workspace, if you use Jujutsu) — so parallel agents never trample each other and you can keep reviewing one change while another keeps cooking.
-- Each workspace has its own set of PTY-backed terminals — split them, group them by task, drop into one when you need to take over.
+- Every task gets its own Task Checkout — today, a real Git worktree on its own branch — so parallel agents never trample each other and you can keep reviewing one change while another keeps cooking.
+- Each Task Checkout has its own set of PTY-backed terminals — split them, group them by task, drop into one when you need to take over.
 - A persistent session model is the long-term goal: close the window, the agents and terminals keep running in the background, reattach later and pick up exactly where you left off (think `tmux`, but for whole AI workflows).
 
-**Group projects into a meta-workspace** *(in progress)*
-- Bundle several related projects together and let an agent work across all of them at once — useful when a single change spans, say, a backend repo, a frontend repo, and a shared library.
-- The agent runs from the meta-workspace as its working root, with memory and instructions defined once, and treats the bundled projects as context it can reason about together.
-- AI-tooling artifacts (agent memory, prompts, scratch notes) live inside the meta-workspace instead of being scattered as `.claude/`, `.codex/`, etc. across every project repo — your project trees stay clean.
-- Tasks still execute in their own isolated workspaces under the hood; the meta-workspace adds grouping and shared context, not shared mutable state.
+**Coordinate related projects in a Workspace** *(in progress)*
+- A Workspace is meant to bring several related projects under one context — useful when your work spans, say, a backend repo, a frontend repo, and a shared library. Each project belongs to at most one Workspace.
+- A Workspace has its own root folder. The engine is ready to start a member project's task agent from that folder, so instructions and agent memory kept there are defined once and shared by every project in the Workspace, instead of being scattered as `.claude/`, `.codex/`, etc. across every project repo.
+- Tasks still execute in their own Task Checkouts; the Workspace adds shared context, not shared mutable state.
+- Not yet available: projects cannot be attached to a Workspace yet, so none of the above is reachable in the app today. Also planned: Workspace-wide defaults, an overview across its projects, and coordinated multi-project changes. See [`docs/architecture/product-model.md`](docs/architecture/product-model.md).
 
 **Close the loop on PRs**
 - Open pull requests directly from a finished task.
@@ -59,16 +59,16 @@ Triage every reviewer comment on a pull request, decide Fix / Skip / Question pe
   <img src="docs/assets/screenshots/pr-comment-review.png" alt="SlashIt PR Comment Review modal: per-comment Fix/Skip/Question dropdown, editable reasoning and proposed change, footer toggles for auto-push, auto-reply, and only-new filter, plus Re-discuss / Re-analyze / Apply actions" width="900">
 </p>
 
-### Workspace overview (in progress)
+### App overview (in progress)
 
-The screens below preview the broader workspace, parts of which are still being polished.
+The screens below preview the rest of the app, parts of which are still being polished.
 
 <p align="center">
   <img src="docs/assets/screenshots/dashboard-kanban.jpg" alt="SlashIt dashboard with Kanban task queue, agent queue, worktrees, and JJ status" width="900">
 </p>
 
 <p align="center">
-  <img src="docs/assets/screenshots/agent-workspace.jpg" alt="SlashIt agent execution workspace with terminal logs, task phases, and session context" width="900">
+  <img src="docs/assets/screenshots/agent-workspace.jpg" alt="SlashIt agent execution view with terminal logs, task phases, and session context" width="900">
 </p>
 
 <p align="center">
@@ -83,7 +83,7 @@ Near-term roadmap:
 
 - Publish the first release, with installation walkthroughs. The procedure is written down in [`docs/releasing.md`](docs/releasing.md).
 - Code-sign the installers, so a first launch stops triggering SmartScreen and Gatekeeper warnings.
-- Workspace layout cleanup (the root crate is both a package and a workspace).
+- Cargo workspace layout cleanup (the root crate is both a package and a workspace).
 - Continue hardening queue execution, agent recovery, and cross-platform packaging.
 
 ## Built with

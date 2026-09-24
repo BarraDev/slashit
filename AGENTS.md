@@ -4,7 +4,18 @@ This file provides guidance to coding agents (Claude Code and others) when worki
 
 ## Project Overview
 
-SlashIt is a Tauri v2 desktop application for AI agent workspace management. It integrates with Claude Code Agent and Jujutsu (jj) version control. The app is built entirely in Rust - Leptos/WASM for the frontend and pure Rust for the Tauri backend.
+SlashIt is a Tauri v2 desktop application for AI agent task orchestration across software projects. It integrates with Claude Code Agent and Jujutsu (jj) version control. The app is built entirely in Rust - Leptos/WASM for the frontend and pure Rust for the Tauri backend.
+
+## Product vocabulary
+
+- Unqualified "Workspace" means the Product Workspace: a container that
+  manages several Projects. Membership is stored on the Project (`ProjectScope`).
+- A Task Checkout is a Task's isolated working copy. Today it is always a Git
+  worktree; JJ workspaces are not a Task Checkout backend.
+- A JJ developer workspace used to develop SlashIt is unrelated to the Product
+  Workspace.
+
+Full model: [docs/architecture/product-model.md](docs/architecture/product-model.md).
 
 ## Development Commands
 
@@ -116,7 +127,7 @@ Paths below are relative to the canonical repository root. Its parent
 directory (the *project parent*) also holds developer workspaces and local
 private state.
 
-### Repository and workspaces
+### Repository and developer workspaces
 
 - The canonical repository root is the coordination checkout. Its `default`
   JJ workspace stays an empty change on `main`; product edits do not happen
