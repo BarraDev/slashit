@@ -1,4 +1,4 @@
-# CLAUDE.md (src-tauri/src)
+# AGENTS.md (src-tauri/src)
 
 Backend source for Tauri v2. This folder contains all Rust backend code organized by domain.
 
@@ -8,24 +8,27 @@ Backend source for Tauri v2. This folder contains all Rust backend code organize
 - **main.rs** - Backend entry point (calls `lib.rs::run()`)
 - **commands/** - Tauri IPC command handlers organized by domain
 - **domain/** - Shared domain models (Agent, Project, Repository, Session, Task, Workspace)
-- **agents/** - Claude Code agent implementation via ACP protocol
+- **agents/** - Claude Code agent execution (see `agents/AGENTS.md`)
 - **acp/** - Agent Communication Protocol implementation
-- **jj/** - Jujutsu version control integration (workspace, backend, manager)
+- **jj/** - Jujutsu version control integration (see `jj/AGENTS.md`)
 - **session/** - Session management
 - **config/** - Persistent storage using TOML files in system directories
+- **worktree/** - Git worktrees, the only Task Checkout backend, and task diffs
+- **queue/** - Task queue, admission and the executor that launches agent runs
+- **pty/** - Terminal (PTY) sessions
+- **ipc/** - Control channel server for the `slashit` CLI (see below)
+- **bin/** - The `slashitd` daemon entry point
 
 ## AppState Pattern
 
-All command handlers receive `AppState` via Tauri's `manage()` mechanism. State is organized by domain:
-- `repository: RepositoryState`
-- `project: ProjectState`
-- `workspace: WorkspaceState`
-- `task: TaskState`
-- `agent: AgentState`
-- `session: SessionState`
-- `jj: JjState`
+All command handlers receive `AppState` via Tauri's `manage()` mechanism. State
+is organized by domain: one field per feature area (`state.task`,
+`state.queue`, `state.jj`, ...), plus shared services such as the event sink
+and the resolved paths. The `AppState` struct in `lib.rs` is the authoritative
+field list; do not copy it here.
 
-Each state type is defined in its respective `commands/` submodule.
+Most per-domain state types are defined in their respective `commands/`
+submodule.
 
 ## Tauri Commands
 

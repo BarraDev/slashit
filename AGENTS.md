@@ -8,6 +8,7 @@ SlashIt is a Tauri v2 desktop application for AI agent task orchestration across
 
 ## Product vocabulary
 
+- A Project is one repository or root folder managed by SlashIt.
 - Unqualified "Workspace" means the Product Workspace: a container that
   manages several Projects. Membership is stored on the Project (`ProjectScope`).
 - A Task Checkout is a Task's isolated working copy. Today it is always a Git
@@ -36,8 +37,11 @@ cargo tauri build
 cargo check
 cargo clippy
 
-# Run backend directly
-cargo run
+# Run the backend (Tauri app binary) directly
+cargo run -p slashit-ui
+
+# Validate agent documentation structure (the same check CI runs)
+scripts/check-agent-docs.sh
 
 # Desktop acceptance against the real application (Linux; needs a display and
 # WebKitWebDriver). The build step is required: a plain `cargo build` binary
@@ -53,63 +57,33 @@ how to run it on Arch, which ships no `WebKitWebDriver`.
 
 ```
 slashit-app/
-├── src/              # Frontend (Leptos/WASM)
-│   ├── main.rs       # Frontend entry point
-│   ├── app.rs        # App router and layout
-│   ├── components/   # UI components
-│   ├── pages/        # Page views (Dashboard, Agent, Spec, Context, Settings)
-│   ├── services/     # Frontend Tauri IPC services
-│   └── models/       # Frontend domain models
-└── src-tauri/        # Backend (Rust - Tauri v2)
-    ├── src/
-    │   ├── main.rs       # Backend entry point
-    │   ├── lib.rs        # App state and Tauri command registration
-    │   ├── commands/     # Tauri IPC command handlers
-    │   ├── domain/       # Domain models (Agent, Project, Repository, Session, Task, Workspace)
-    │   ├── agents/       # Claude Code agent implementation via ACP
-    │   ├── acp/          # Agent Communication Protocol
-    │   ├── jj/           # Jujutsu version control integration
-    │   ├── session/      # Session management
-    │   └── config/       # Persistent storage (AppConfig, JjConfig, UiPreferences)
-    ├── Cargo.toml
+├── crates/
+│   ├── slashit-acceptance/  # Desktop acceptance harness
+│   ├── slashit-cli/         # The `slashit` command-line client
+│   └── slashit-ipc/         # CLI control-channel protocol and transports
+├── docs/             # Architecture and process docs
+├── scripts/          # Repository checks (agent docs)
+├── src/              # Frontend (Leptos 0.8 CSR, compiled to WASM)
+└── src-tauri/        # Backend (Rust, Tauri v2)
+    ├── src/          # Backend modules
     └── tauri.conf.json
 ```
 
-## Architecture
+Module layout and conventions live in the nested docs: `src/AGENTS.md` for
+the frontend, `src-tauri/src/AGENTS.md` for the backend (see the list at the
+end). Dependencies and versions are in the `Cargo.toml` files.
 
-### Frontend (Leptos 0.8 - CSR)
+## Tauri + Leptos Configuration
 
-- Router in `src/app.rs` uses signal-based page selection
-- Pages: Dashboard, Agent, Spec, Context, Settings
-- Components include: AppLayout, Sidebar, ProjectCard, TaskCard, Kanban board, WorkspacePanel, AgentPanel, LogViewer, JjStatus
+Follows the official [Tauri Leptos guide](https://tauri.app/start/frontend/leptos/):
 
-### Backend (Tauri v2)
-
-- **AppState**: Shared state container managing Repository, Project, Workspace, Task, Agent, Session, and Jj states
-- **Commands**: Tauri IPC handlers organized by domain (repository, project, workspace, task, agent, session, jj)
-- **ACP**: Custom Agent Communication Protocol for Claude Code integration
-- **JJ**: Jujutsu integration for version control operations (new_change, describe_change, abandon_change, git_export)
-- **Config**: TOML-based persistence using system directories (directories crate)
-
-## Key Dependencies
-
-- **Frontend**: leptos 0.8 (csr), wasm-bindgen, serde, chrono, uuid
-- **Backend**: tauri 2, tokio (full features), async-trait, chrono, uuid, anyhow, sysinfo, directories, toml
-
-## Build Configuration
-
-- Dev server: `http://localhost:1420` (Trunk)
-- Frontend dist: `../dist`
-- Global Tauri: enabled (`withGlobalTauri: true`)
-- WebSocket protocol: `ws` (for hot-reload during mobile development)
-
-## Tauri + Leptos Best Practices
-
-Per official [Tauri Leptos guide](https://tauri.app/start/frontend/leptos/):
-
-- Use **SSG** (Static Site Generation) - Tauri doesn't officially support server-based solutions
-- Ensure `ws_protocol = "ws"` in Trunk.toml for proper hot-reload websocket during mobile development
-- Keep `withGlobalTauri: true` in tauri.conf.json to expose `window.__TAURI__`
+- Client-side rendering only; Tauri does not officially support server-based
+  frontends.
+- Trunk serves `http://localhost:1420` in development (`Trunk.toml` keeps
+  `ws_protocol = "ws"` for hot reload). `src-tauri/tauri.conf.json` points
+  `devUrl` at that server and `frontendDist` at Trunk's build output.
+- Keep `withGlobalTauri: true` there; the frontend reaches the backend through
+  `window.__TAURI__`.
 
 ## IPC Pattern
 
@@ -225,6 +199,9 @@ This project has additional `AGENTS.md` files in subdirectories with module-spec
 - `src/AGENTS.md` -- Frontend (Leptos/WASM) patterns
 - `src-tauri/src/AGENTS.md` -- Backend (Tauri v2) overview
 - `src-tauri/src/domain/AGENTS.md` -- Domain models conventions
-- `src-tauri/src/agents/AGENTS.md` -- Claude Code agent integration via ACP
+- `src-tauri/src/agents/AGENTS.md` -- Claude Code agent execution
+- `src-tauri/src/jj/AGENTS.md` -- Jujutsu integration
 
-Each is also exposed as a `CLAUDE.md` stub for cross-agent compatibility.
+Each is also exposed as a `CLAUDE.md` stub containing only `@AGENTS.md`.
+`docs/agent-docs.toml` maps every other module directory to the parent
+`AGENTS.md` that covers it; `scripts/check-agent-docs.sh` enforces both.

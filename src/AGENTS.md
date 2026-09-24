@@ -1,4 +1,4 @@
-# CLAUDE.md (src)
+# AGENTS.md (src)
 
 Frontend source for Leptos 0.8 (CSR). This folder compiles to WASM and runs in the Tauri webview.
 
@@ -7,7 +7,7 @@ Frontend source for Leptos 0.8 (CSR). This folder compiles to WASM and runs in t
 - **main.rs** - Frontend WASM entry point (mounts App to DOM)
 - **app.rs** - App router with signal-based page selection
 - **components/** - Reusable UI components (AppLayout, Sidebar, cards, panels, viewers)
-- **pages/** - Page-level views (Dashboard, Agent, Spec, Context, Settings)
+- **pages/** - Page-level views, one module per view
 - **services/** - Tauri IPC wrappers for backend commands
 - **models/** - Frontend domain models mirroring backend domain
 

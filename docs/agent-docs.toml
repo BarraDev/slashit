@@ -1,0 +1,45 @@
+# Agent documentation coverage map, read by scripts/check-agent-docs.sh.
+#
+# Every directory directly under a coverage root must have exactly one entry
+# in [modules]. Only these roots are in scope; deeper directories and other
+# top-level directories (tests, fixtures, capabilities) are not tracked here.
+#
+#   "documented"               the directory has its own AGENTS.md
+#   "covered-by:<AGENTS.md>"   an AGENTS.md in an ancestor directory covers it
+#                              and names the directory (for example `queue/`)
+#
+# Adding a module directory means adding an entry here. Prefer covered-by;
+# give a module its own AGENTS.md only when a parent cannot say enough.
+#
+# The checker accepts only the TOML shapes used below: [section] headers,
+# one-line string arrays, and "key" = "value" pairs, one per line.
+
+[coverage]
+roots = ["crates", "src", "src-tauri/src"]
+
+[citations]
+# Paths AGENTS.md files may cite that are build output, not tracked files.
+untracked = ["target/"]
+
+[modules]
+"crates/slashit-acceptance" = "covered-by:AGENTS.md"
+"crates/slashit-cli" = "covered-by:AGENTS.md"
+"crates/slashit-ipc" = "covered-by:AGENTS.md"
+
+"src/components" = "covered-by:src/AGENTS.md"
+"src/models" = "covered-by:src/AGENTS.md"
+"src/pages" = "covered-by:src/AGENTS.md"
+"src/services" = "covered-by:src/AGENTS.md"
+
+"src-tauri/src/acp" = "covered-by:src-tauri/src/AGENTS.md"
+"src-tauri/src/agents" = "documented"
+"src-tauri/src/bin" = "covered-by:src-tauri/src/AGENTS.md"
+"src-tauri/src/commands" = "covered-by:src-tauri/src/AGENTS.md"
+"src-tauri/src/config" = "covered-by:src-tauri/src/AGENTS.md"
+"src-tauri/src/domain" = "documented"
+"src-tauri/src/ipc" = "covered-by:src-tauri/src/AGENTS.md"
+"src-tauri/src/jj" = "documented"
+"src-tauri/src/pty" = "covered-by:src-tauri/src/AGENTS.md"
+"src-tauri/src/queue" = "covered-by:src-tauri/src/AGENTS.md"
+"src-tauri/src/session" = "covered-by:src-tauri/src/AGENTS.md"
+"src-tauri/src/worktree" = "covered-by:src-tauri/src/AGENTS.md"
