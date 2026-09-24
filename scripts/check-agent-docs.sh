@@ -45,14 +45,17 @@
 #      when it is the tail of the item path at its definition (re-exports do
 #      not count): `roles::AgentRole` is agents::roles::AgentRole, never
 #      domain::mcp::AgentRole, and a name defined twice must be qualified.
-#      Only files a crate root reaches through `mod name;` count. Items in
-#      comments, strings, function bodies, macros, `tests/`, `tests.rs` and
-#      cfg(test) modules never count; an item compiled only under cfg(test)
-#      counts only for a citation listed under [citations] test_only, and
-#      names SlashIt does not define are listed exactly under [citations]
-#      external, both in docs/agent-docs.toml. Every command a list item
-#      names under a "Tauri Commands Exposed" heading must be registered in
-#      the tauri::generate_handler! list in src-tauri/src/lib.rs.
+#      Only files a crate root reaches through `mod name;` count; a
+#      production `#[path]` that points a module away from its default file
+#      is not modeled (a file left at the default path counts as that
+#      module). Items in comments, strings, function bodies, macros,
+#      `tests/`, `tests.rs` and cfg(test) modules never count; an item
+#      compiled only under cfg(test) counts only for a citation listed under
+#      [citations] test_only, and names SlashIt does not define are listed
+#      exactly under [citations] external, both in docs/agent-docs.toml.
+#      Every command a list item names under a "Tauri Commands Exposed"
+#      heading must be registered in the tauri::generate_handler! list in
+#      src-tauri/src/lib.rs.
 #
 # Exit status: 0 when every check passes, 1 when a check fails, 2 when the
 # inputs cannot be read or understood (the check never passes by default).
@@ -655,7 +658,12 @@ END {
     if (best == "") continue
     rel = substr(f, length(best) + 2)
     if (rel ~ /(^|\/)tests\// || rel ~ /(^|\/)tests\.rs$/) continue
-    sub(/\.rs$/, "", rel); sub(/(^|\/)(mod|lib|main)$/, "", rel)
+    # Only the crate root (src/lib.rs, src/main.rs) and a directory module
+    # (dir/mod.rs) add no path segment; a nested lib.rs or main.rs is a
+    # module named lib or main.
+    sub(/\.rs$/, "", rel)
+    if (rel == "lib" || rel == "main") rel = ""
+    else sub(/\/mod$/, "", rel)
     path = crate[best]
     if (rel != "") { gsub(/\//, "::", rel); path = path "::" rel }
     printf "%s\t%s\t%s\n", crate[best], path, f

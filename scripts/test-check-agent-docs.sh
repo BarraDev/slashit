@@ -177,8 +177,26 @@ probe "retired terms outside the Former names section" 1 '\[F\] docs/architectur
 # Check G. Mutations that rename the production ClaudeRunner and then leave a
 # look-alike behind must still fail: only a real item counts.
 say() { printf '%s\n' "$2" | tr '@' '\140' >>"$1"; } # @ stands for a backtick
-edit() { sed "$1" "$2" >"$2.edit" && mv "$2.edit" "$2"; }
+# edit <sed script> <file>: an edit that changes nothing fails the probe's
+# setup, so a probe cannot pass vacuously after the source drifts.
+edit() {
+  sed "$1" "$2" >"$2.edit" || return
+  if cmp -s "$2" "$2.edit"; then
+    rm -f "$2.edit"
+    printf 'edit: %s changed nothing in %s\n' "$1" "$2" >&2
+    return 1
+  fi
+  mv "$2.edit" "$2"
+}
 export -f say edit
+n=$((n + 1))
+if (cd "$tmp" && printf 'a\n' >edit-check && ! edit s/absent/b/ edit-check 2>/dev/null &&
+  edit s/a/b/ edit-check && grep -qx b edit-check); then
+  printf 'ok   %s\n' "an edit that changes nothing fails"
+else
+  printf 'FAIL %s\n' "an edit that changes nothing fails"
+  failures=$((failures + 1))
+fi
 runner=src-tauri/src/agents/runner.rs
 gone="edit 's/^pub struct ClaudeRunner {/pub struct ClaudeProcess {/' $runner"
 stale='\[G\] src-tauri/src/agents/AGENTS.md:[0-9]+: `ClaudeRunner` names nothing defined in crate slashit-ui'
@@ -287,6 +305,13 @@ probe "a cfg(test) module loaded through #[path] is not a definition" 1 "$stale"
   "$gone; printf '#[cfg(test)]\n#[path = \"runner_fixtures.rs\"]\nmod fixtures;\n' >>$runner; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/runner_fixtures.rs"
 probe "a file no crate root reaches is not a definition" 1 '`JjManager` names nothing defined' \
   'edit "/^mod jj;$/d" src-tauri/src/lib.rs'
+probe "a lib.rs or mod.rs no crate root declares is not a definition" 1 "$stale" \
+  "$gone; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/lib.rs; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/mod.rs"
+nested_main="$gone; printf 'pub mod main;\n' >>src-tauri/src/agents/mod.rs; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/main.rs"
+probe "a nested main.rs is a module named main" 0 'agent-docs: OK' \
+  "$nested_main; edit 's/^\(- \*\*runner\.rs\*\* - .\)ClaudeRunner/\1main::ClaudeRunner/' src-tauri/src/agents/AGENTS.md"
+probe "a nested main.rs does not name its parent module" 1 '`agents::ClaudeRunner` names nothing defined .*\(agents::main::ClaudeRunner\)' \
+  "$nested_main; edit 's/^\(- \*\*runner\.rs\*\* - .\)ClaudeRunner/\1agents::ClaudeRunner/' src-tauri/src/agents/AGENTS.md"
 probe "a binary is not part of the library crate" 1 '`JjStatus` names nothing defined' \
   'edit "s/^pub struct JjStatus {/pub struct JjState {/" src-tauri/src/jj/manager.rs; printf "struct JjStatus;\n" >>src-tauri/src/bin/slashitd.rs'
 probe "a moved item still re-exported under its old path" 1 '`roles::AgentRole` names nothing defined .*items named AgentRole: .*agents::kinds::AgentRole.*re-exports do not count' \
