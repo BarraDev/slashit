@@ -164,6 +164,60 @@ async fn run_cmd_no_cwd(cmd: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Refuses a task branch name that is not safe to hand to `git`, `jj` or `gh`.
+///
+/// `Task.branch_name` is read back from `tasks.toml`, and for a board stored in
+/// the project that file is whatever the last commit made it, so the value is
+/// untrusted even though SlashIt writes `task-<8 hex>` itself. Every function
+/// here that passes a branch to a process checks it first. A leading `-` would
+/// be parsed as an option (`git push -u origin --mirror` deletes every remote
+/// branch the local repository lacks), and revset or glob syntax would select
+/// commits or bookmarks other than the task's own. The accepted shape is a
+/// valid Git branch name made only of ASCII letters, digits, `.`, `_`, `/` and
+/// `-`: that covers every name SlashIt generates, and no such name contains
+/// quoting, revset operators or glob metacharacters. A refused value is
+/// reported, never rewritten into something else.
+fn checked_task_branch(branch: &str) -> Result<&str, String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "The task's recorded branch {branch:?} {why}, so SlashIt will not pass it to \
+             git, jj or gh. Check the task's board file for an unexpected change."
+        ))
+    };
+
+    if branch.is_empty() {
+        return refuse("is empty");
+    }
+    if branch.starts_with('-') {
+        return refuse("starts with `-`");
+    }
+    if !branch
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+    {
+        return refuse("contains characters other than letters, digits, `.`, `_`, `/` and `-`");
+    }
+    // The rules of `git check-ref-format --branch` that the character set
+    // above leaves open.
+    let bad_component = branch
+        .split('/')
+        .any(|c| c.is_empty() || c.starts_with('.') || c.ends_with(".lock"));
+    if branch == "HEAD" || branch.contains("..") || branch.ends_with('.') || bad_component {
+        return refuse("is not a valid Git branch name");
+    }
+    Ok(branch)
+}
+
+/// The jj revset naming exactly the local bookmark `branch`, and failing
+/// unless it resolves to exactly one commit. A bare name given to `-r` is
+/// itself a revset: `task-` means the parents of `task`, `mutable()` means
+/// every mutable commit, and a name that is not a bookmark falls back to
+/// matching a change or commit ID. Only for a branch that has passed
+/// [`checked_task_branch`], whose character set cannot close the quotes.
+fn jj_exact_bookmark_revset(branch: &str) -> String {
+    format!("exactly(bookmarks(exact:\"{branch}\"), 1)")
+}
+
 async fn is_jj_repo(working_dir: &str) -> bool {
     tokio::process::Command::new("jj")
         .args(["root"])
@@ -178,6 +232,7 @@ async fn build_pr_push_recovery_plan(
     working_dir: &str,
     branch: &str,
 ) -> Result<PrPushRecoveryPlan, String> {
+    let branch = checked_task_branch(branch)?;
     let plan = if is_jj_repo(working_dir).await {
         let template = "commit_id ++ \"\\0\" ++ author.name() ++ \"\\0\" ++ author.email() ++ \"\\0\" ++ description.first_line()";
         let output = run_cmd(
@@ -185,7 +240,7 @@ async fn build_pr_push_recovery_plan(
             &[
                 "--ignore-working-copy",
                 "log",
-                "-r", branch,
+                "-r", &jj_exact_bookmark_revset(branch),
                 "--no-graph",
                 "-T", template,
             ],
@@ -248,6 +303,7 @@ async fn rewrite_branch_tip_author(
     plan: &PrPushRecoveryPlan,
     new_email: &str,
 ) -> Result<(), String> {
+    let branch = checked_task_branch(branch)?;
     if is_jj_repo(working_dir).await {
         let author = format!("{} <{}>", plan.author_name, new_email);
         run_cmd(
@@ -257,7 +313,7 @@ async fn rewrite_branch_tip_author(
         ).await.map_err(|e| format!("Failed to set repo-local jj email: {}", e))?;
         run_cmd(
             "jj",
-            &["metaedit", "-r", branch, "--author", &author],
+            &["metaedit", "-r", &jj_exact_bookmark_revset(branch), "--author", &author],
             working_dir,
         ).await.map_err(|e| format!("Failed to rewrite jj author metadata: {}", e))?;
         run_cmd("jj", &["git", "export"], working_dir)
@@ -1088,7 +1144,7 @@ pub async fn address_pr_review_inner(
                 comment_id: item.comment_id,
                 message: None,
             });
-            match post_pr_reply(&reply_repo, &reply_number, &pr_url, item.comment_id, &body).await {
+            match post_pr_reply(&reply_repo, &reply_number, item.comment_id, &body).await {
                 Ok(reply_id) => {
                     replies_posted += 1;
                     updated_plan.items[orig_idx].reply_posted = true;
@@ -1329,7 +1385,7 @@ pub async fn sync_pr_review_replies_inner(
 
         // Case A: no reply on GitHub yet — POST a new one.
         if !item.reply_posted {
-            match post_pr_reply(&repo, &number, &pr_url, item.comment_id, &body).await {
+            match post_pr_reply(&repo, &number, item.comment_id, &body).await {
                 Ok(reply_id) => {
                     replied += 1;
                     updated_plan.items[orig_idx].reply_posted = true;
@@ -1834,7 +1890,6 @@ fn build_reply_body(item: &PrReviewItem) -> String {
 async fn post_pr_reply(
     repo: &str,
     number: &str,
-    pr_url: &str,
     comment_id: Option<u64>,
     body: &str,
 ) -> Result<Option<u64>, String> {
@@ -1851,7 +1906,12 @@ async fn post_pr_reply(
         // Inline reply failed (e.g. comment was on a Review, not an inline thread).
         // Fall through to a global PR comment so the reply is not lost.
     }
-    run_cmd_no_cwd("gh", &["pr", "comment", pr_url, "--body", body])
+    // The PR is named by the number and repository parsed out of `pr_url`,
+    // never by the URL itself: `pr_url` is read back from `tasks.toml` like
+    // `branch_name`, and as a bare argument a value such as
+    // `--repo=x/github.com/a/b/pull/1` both passes `parse_pr_url` and is
+    // parsed by `gh` as an option.
+    run_cmd_no_cwd("gh", &["pr", "comment", number, "--repo", repo, "--body", body])
         .await
         .map(|_| None)
 }
@@ -2374,6 +2434,7 @@ async fn find_existing_pr_for_branch(
     if branch.trim().is_empty() {
         return Ok(None);
     }
+    let branch = checked_task_branch(branch)?;
 
     let output = tokio::process::Command::new("gh")
         .args([
@@ -2409,6 +2470,7 @@ async fn find_existing_pr_for_branch_strict(
     if branch.trim().is_empty() {
         return Err("Task branch is empty".to_string());
     }
+    let branch = checked_task_branch(branch)?;
 
     let output = tokio::process::Command::new("gh")
         .args([
@@ -2929,22 +2991,31 @@ fn build_pr_body(task: &Task) -> String {
 /// silently mutate the user's own primary checkout as a side effect of pushing a
 /// named branch that has nothing to do with it. `--ignore-working-copy` makes
 /// both commands operate purely on refs, which is all a push ever needs.
+///
+/// The branch is checked by [`checked_task_branch`] and, separately, never
+/// reaches either program as a bare argument: `git` gets `--` and a fully
+/// qualified `refs/heads/<b>:refs/heads/<b>` refspec, and `jj` gets an
+/// `exact:` bookmark pattern (a bare `--bookmark` value is a glob).
 async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> {
+    let branch = checked_task_branch(branch)?;
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    let git_push = ["push", "-u", "--", "origin", refspec.as_str()];
     if is_jj_repo(working_dir).await {
         run_cmd("jj", &["--ignore-working-copy", "git", "export"], working_dir).await
             .map_err(|e| format!("jj git export failed: {}", e))?;
+        let bookmark = format!("exact:{branch}");
         if let Err(jj_err) = run_cmd(
             "jj",
-            &["--ignore-working-copy", "git", "push", "--allow-new", "--bookmark", branch],
+            &["--ignore-working-copy", "git", "push", "--allow-new", "--bookmark", &bookmark],
             working_dir,
         ).await {
-            run_cmd("git", &["push", "-u", "origin", branch], working_dir).await
+            run_cmd("git", &git_push, working_dir).await
                 .map_err(|git_err| format!("Push failed. jj: {}. git: {}", jj_err, git_err))?;
         }
         return Ok(branch.to_string());
     }
 
-    run_cmd("git", &["push", "-u", "origin", branch], working_dir).await
+    run_cmd("git", &git_push, working_dir).await
         .map_err(|e| format!("git push failed: {}", e))?;
     Ok(branch.to_string())
 }
@@ -3628,6 +3699,37 @@ mod tests {
     // ──────────────────────────────────────────────
 
     #[test]
+    fn checked_task_branch_accepts_the_names_slashit_generates() {
+        for _ in 0..64 {
+            let generated = crate::worktree::WorktreeManager::branch_for_task(Uuid::new_v4());
+            assert_eq!(checked_task_branch(&generated), Ok(generated.as_str()));
+        }
+        for branch in ["task-abcd1234", "feature/login", "fix_1.2-rc", "task-"] {
+            assert_eq!(checked_task_branch(branch), Ok(branch), "{branch}");
+        }
+    }
+
+    #[test]
+    fn checked_task_branch_refuses_options_revsets_globs_and_invalid_refs() {
+        for branch in [
+            "", "--mirror", "-f", "--receive-pack=touch x", "mutable()", "a|b", "glob:*",
+            "exact:main", "task*", "task?", "a b", "a\nb", "a\"b", "a\\b", "a~1", "a^",
+            "a@{1}", "a..b", "a//b", "/a", "a/", ".a", "a/.b", "a.lock", "a.lock/b", "a.",
+            "HEAD", "tâsk",
+        ] {
+            assert!(checked_task_branch(branch).is_err(), "{branch:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn jj_exact_bookmark_revset_names_one_bookmark() {
+        assert_eq!(
+            jj_exact_bookmark_revset("task-abcd1234"),
+            "exactly(bookmarks(exact:\"task-abcd1234\"), 1)"
+        );
+    }
+
+    #[test]
     fn parse_pr_url_valid() {
         let result = parse_pr_url_to_ref("https://github.com/acme/widgets/pull/42");
         assert!(result.is_some());
@@ -4277,6 +4379,284 @@ mod tests {
                 std::fs::read_to_string(repo.checkout.join("jjdirty.txt")).unwrap(),
                 "dirty untracked",
                 "the dirty file must still be exactly what the user left, not folded into a commit"
+            );
+        }
+
+        /// A task's `branch_name` is read back from `tasks.toml`, which for an
+        /// in-project board is a file anyone who can land a commit controls.
+        /// Handed to `git push -u origin <branch>` as a bare argument, the
+        /// value `--mirror` was parsed as an option: the push succeeded and
+        /// deleted every remote branch the local repository did not have.
+        /// The push must refuse the value before `git` ever sees it, and the
+        /// branch that only exists on the remote must survive.
+        #[tokio::test]
+        async fn push_branch_refuses_an_option_shaped_branch_and_leaves_remote_branches_alone() {
+            let repo = RepoFixture::new();
+            git(&repo.remote, &["branch", "teammate-work", "main"]);
+            let teammate_sha = repo.remote_has_branch("teammate-work").expect("seeded remote branch");
+
+            let result = push_branch(repo.checkout.to_str().unwrap(), "--mirror").await;
+
+            assert_eq!(
+                repo.remote_has_branch("teammate-work").as_deref(),
+                Some(teammate_sha.as_str()),
+                "a branch that only exists on the remote must survive"
+            );
+            assert!(result.is_err(), "an option-shaped branch must be refused, got {result:?}");
+        }
+
+        /// The same refusal through the jj-colocated path, whose `git push`
+        /// fallback is the one that actually runs.
+        #[tokio::test]
+        async fn push_branch_refuses_an_option_shaped_branch_in_a_jj_repository() {
+            let repo = RepoFixture::new();
+            repo.colocate_jj();
+            git(&repo.remote, &["branch", "teammate-work", "main"]);
+            let teammate_sha = repo.remote_has_branch("teammate-work").expect("seeded remote branch");
+
+            let result = push_branch(repo.checkout.to_str().unwrap(), "--mirror").await;
+
+            assert_eq!(
+                repo.remote_has_branch("teammate-work").as_deref(),
+                Some(teammate_sha.as_str()),
+                "a branch that only exists on the remote must survive"
+            );
+            assert!(result.is_err(), "an option-shaped branch must be refused, got {result:?}");
+        }
+
+        /// The same poisoned task through the Tauri command's own path: the
+        /// refusal comes before `gh` or `git` run at all.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn create_pr_inner_refuses_an_option_shaped_branch_before_running_anything() {
+            let _guard = PATH_LOCK.lock().await;
+            let repo = RepoFixture::new();
+            git(&repo.remote, &["branch", "teammate-work", "main"]);
+            let teammate_sha = repo.remote_has_branch("teammate-work").expect("seeded remote branch");
+            let mock = MockGh::setup("https://github.com/testorg/testrepo/pull/1", r#"{"state":"OPEN"}"#);
+
+            let (state, _tmp) = build_test_state().await;
+            let task_id = seed_task(
+                &state,
+                repo.checkout.to_str().unwrap(),
+                Some("--mirror"),
+                TaskStatus::Done,
+            )
+            .await;
+
+            let err = create_pr_inner(&state, &task_id.to_string())
+                .await
+                .expect_err("an option-shaped branch must be refused");
+
+            assert!(err.contains("will not pass it"), "the refusal must say why: {err}");
+            assert_eq!(
+                repo.remote_has_branch("teammate-work").as_deref(),
+                Some(teammate_sha.as_str()),
+                "a branch that only exists on the remote must survive"
+            );
+            assert!(mock.read_log().is_empty(), "gh must never run: {}", mock.read_log());
+        }
+
+        /// The names SlashIt generates still push, and the fully qualified
+        /// refspec still sets up upstream tracking the way the bare branch
+        /// name did.
+        #[tokio::test]
+        async fn push_branch_pushes_a_generated_branch_and_sets_its_upstream() {
+            let repo = RepoFixture::new();
+            let branch = crate::worktree::WorktreeManager::branch_for_task(Uuid::new_v4());
+            let task_sha = repo.seed_task_branch_and_dirty_unrelated_checkout(&branch);
+
+            let pushed = push_branch(repo.checkout.to_str().unwrap(), &branch)
+                .await
+                .expect("a generated branch must push");
+
+            assert_eq!(pushed, branch);
+            assert_eq!(repo.remote_has_branch(&branch).as_deref(), Some(task_sha.as_str()));
+            assert_eq!(git(&repo.checkout, &["config", &format!("branch.{branch}.remote")]), "origin");
+            assert_eq!(
+                git(&repo.checkout, &["config", &format!("branch.{branch}.merge")]),
+                format!("refs/heads/{branch}")
+            );
+        }
+
+        /// The branch check is one of two layers: `git push` must also never
+        /// see the branch as a bare argument, whatever the check lets through.
+        /// A fake `git` records exactly what `push_branch` hands it.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn push_branch_gives_git_a_separator_and_a_fully_qualified_refspec() {
+            let _guard = PATH_LOCK.lock().await;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let bin_dir = tmp.path().join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let log = tmp.path().join("git.log");
+            write_executable(
+                &bin_dir.join("git"),
+                &format!("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\n"),
+            );
+            let saved_path = std::env::var("PATH").ok();
+            // Safety: serialized via PATH_LOCK; restored below. `jj root`
+            // fails in the empty directory, so the plain-git path runs.
+            unsafe {
+                std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), saved_path.clone().unwrap_or_default()));
+            }
+
+            let result = push_branch(tmp.path().to_str().unwrap(), "task-abcd1234").await;
+
+            unsafe {
+                match &saved_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+            result.expect("the fake git succeeds");
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
+                ["push", "-u", "--", "origin", "refs/heads/task-abcd1234:refs/heads/task-abcd1234"],
+            );
+        }
+
+        /// A name that is not a valid Git branch is refused by the check with
+        /// its own explanation, not left for `git` to fail on.
+        #[tokio::test]
+        async fn push_branch_refuses_an_invalid_ref_shape() {
+            let repo = RepoFixture::new();
+
+            let err = push_branch(repo.checkout.to_str().unwrap(), "task-abcd1234.lock")
+                .await
+                .expect_err("an invalid ref must be refused");
+
+            assert!(err.contains("not a valid Git branch name"), "unexpected refusal: {err}");
+        }
+
+        /// Every commit in the jj repository with its author, and the current
+        /// operation: if either moves, something was rewritten.
+        fn jj_history(dir: &Path) -> (String, String) {
+            let commits = jj(
+                dir,
+                &[
+                    "--ignore-working-copy", "log", "--no-graph", "-r", "all()",
+                    "-T", "commit_id ++ \" \" ++ author.email() ++ \"\\n\"",
+                ],
+            );
+            let op = jj(
+                dir,
+                &["--ignore-working-copy", "op", "log", "--no-graph", "-n", "1", "-T", "id"],
+            );
+            (commits, op)
+        }
+
+        /// A jj repository with two mutable commits besides `main`.
+        fn jj_repo_with_mutable_commits() -> RepoFixture {
+            let repo = RepoFixture::new();
+            repo.colocate_jj();
+            jj(&repo.checkout, &["new", "main", "-m", "first"]);
+            jj(&repo.checkout, &["new", "-m", "second"]);
+            repo
+        }
+
+        /// `branch_name = "mutable()"` used to be handed to `jj log -r` and
+        /// `jj metaedit -r` as a revset, where it selects every mutable commit
+        /// and the recovery flow would rewrite the author of all of them. Both
+        /// are refused before jj runs, and no commit changes.
+        #[tokio::test]
+        async fn private_email_recovery_refuses_a_revset_shaped_branch_and_rewrites_nothing() {
+            let repo = jj_repo_with_mutable_commits();
+            let dir = repo.checkout.to_str().unwrap();
+            let before = jj_history(&repo.checkout);
+
+            let err = build_pr_push_recovery_plan(dir, "mutable()")
+                .await
+                .expect_err("a revset-shaped branch must be refused");
+            assert!(err.contains("will not pass it"), "unexpected refusal: {err}");
+
+            let plan = PrPushRecoveryPlan {
+                branch_name: "mutable()".to_string(),
+                commit_sha: String::new(),
+                commit_subject: String::new(),
+                author_name: "Attacker".to_string(),
+                author_email: "private@example.com".to_string(),
+                suggested_email: None,
+            };
+            let err = rewrite_branch_tip_author(dir, "mutable()", &plan, "new@example.com")
+                .await
+                .expect_err("a revset-shaped branch must be refused");
+            assert!(err.contains("will not pass it"), "unexpected refusal: {err}");
+
+            assert_eq!(jj_history(&repo.checkout), before, "no commit may be rewritten");
+        }
+
+        /// A Git-valid name can still be jj revset syntax: `task-` alone means
+        /// "the parents of `task`". Recovery resolves and rewrites exactly the
+        /// bookmark with that name and nothing else.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn private_email_recovery_targets_exactly_the_named_bookmark() {
+            let _guard = PATH_LOCK.lock().await;
+            let _mock = MockGh::setup("https://github.com/testorg/testrepo/pull/1", r#"{"state":"OPEN"}"#);
+            let repo = jj_repo_with_mutable_commits();
+            let dir = repo.checkout.to_str().unwrap();
+            // Read as a revset, `task-` would be `first`'s parent, `main`.
+            jj(&repo.checkout, &["bookmark", "create", "task", "-r", "@-"]);
+            // Quoted: even `jj bookmark create` parses a bare `task-` as syntax.
+            jj(&repo.checkout, &["bookmark", "create", "\"task-\"", "-r", "@"]);
+            let target = jj(
+                &repo.checkout,
+                &["--ignore-working-copy", "log", "--no-graph", "-r", "@", "-T", "commit_id"],
+            );
+
+            let plan = build_pr_push_recovery_plan(dir, "task-")
+                .await
+                .expect("the bookmark must resolve");
+            assert_eq!(plan.commit_sha, target, "must be the `task-` bookmark, not `task`'s parents");
+            assert_eq!(plan.commit_subject, "second");
+
+            rewrite_branch_tip_author(dir, "task-", &plan, "new@example.com")
+                .await
+                .expect("the rewrite must succeed");
+
+            let authors = jj(
+                &repo.checkout,
+                &[
+                    "--ignore-working-copy", "log", "--no-graph", "-r", "mutable()",
+                    "-T", "description.first_line() ++ \" \" ++ author.email() ++ \"\\n\"",
+                ],
+            );
+            let rewritten: Vec<&str> = authors.lines().filter(|l| l.contains("new@example.com")).collect();
+            assert_eq!(rewritten, vec!["second new@example.com"], "only `task-` may be rewritten: {authors}");
+        }
+
+        /// The review-reply fallback names the pull request by the number and
+        /// repository parsed from the stored URL. A well-formed URL still
+        /// reaches the same PR; a stored value that looks like an option never
+        /// reaches `gh` at all.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn pr_reply_fallback_passes_the_parsed_pr_never_the_stored_url() {
+            let _guard = PATH_LOCK.lock().await;
+            let mock = MockGh::setup("unused", "{}");
+
+            for (stored, number) in [
+                ("https://github.com/owner/repo/pull/42", "42"),
+                ("--repo=evil/other/github.com/owner/repo/pull/7", "7"),
+            ] {
+                let (repo, parsed_number) = parse_pr_url(stored).expect("parses");
+                assert_eq!((repo.as_str(), parsed_number.as_str()), ("owner/repo", number));
+                post_pr_reply(&repo, &parsed_number, None, "thanks").await.expect("reply posts");
+            }
+
+            let log = mock.read_log();
+            let calls: Vec<Vec<&str>> = log
+                .split("---END-ARGS---\n")
+                .filter(|c| !c.trim().is_empty())
+                .map(|c| c.lines().filter(|l| !l.starts_with("PWD=")).collect())
+                .collect();
+            assert_eq!(
+                calls,
+                vec![
+                    vec!["pr", "comment", "42", "--repo", "owner/repo", "--body", "thanks"],
+                    vec!["pr", "comment", "7", "--repo", "owner/repo", "--body", "thanks"],
+                ],
             );
         }
 
