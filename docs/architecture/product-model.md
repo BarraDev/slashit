@@ -81,10 +81,12 @@ Only part of that exists today.
 
 - A Workspace has an id, a name, and a root folder (`root_path`), and is
   kept in a registry outside any Project.
-- The Project model and its persistence support `InWorkspace` membership,
-  but nothing in the app can attach a Project to a Workspace yet: every
-  Project is created `Standalone`, and no command changes its scope. The
-  behavior below is implemented but unreachable until attaching exists.
+- Every Project is still created `Standalone`. A user can attach a
+  standalone Project to a Workspace, and detach a member Project back to
+  standalone, from the Workspaces page. Attaching a Project that already
+  belongs to a Workspace is refused; detach it first. There is no
+  aggregate view across a Workspace's member Projects yet beyond the
+  membership list itself.
 - When a member Project's Task is executed and the Workspace root exists on
   disk, the coding agent runs from the Workspace root, with the Task
   Checkout added as the directory it edits. Instruction files in the
@@ -148,7 +150,7 @@ The procedure is in [development-workflow.md](../development-workflow.md).
 | Term | Code |
 |---|---|
 | Workspace | `domain::Workspace`, `config::WorkspaceRegistry` (`workspaces.toml`), `commands/workspace.rs` |
-| Project, ProjectScope | `domain::Project`, `domain::ProjectScope` (`Project.scope`) |
+| Project, ProjectScope | `domain::Project`, `domain::ProjectScope` (`Project.scope`); attach/detach in `commands/project.rs` |
 | Task | `domain::Task` |
 | Task Checkout | `Task.worktree_path`, `branch_name`, `base_commit`; `worktree::WorktreeManager` |
 | Workspace root as agent context | `TaskExecutor::resolve_workspace_launch` in `queue/executor.rs` |
@@ -158,10 +160,7 @@ The procedure is in [development-workflow.md](../development-workflow.md).
 ## Former names and compatibility
 
 - **"Meta-workspace"** is retired. It referred to what is now simply a
-  Workspace. Some source comments, and the description on the Workspaces
-  page ("meta folder"), still use it; the `Workspace` doc comment also
-  mentions a `projects.toml` member list that does not exist. They are
-  corrected when those files are next changed.
+  Workspace.
 - **`workspace_id` on a Task** is a legacy name for its checkout reference.
   The field is now `worktree_id`, which current code no longer sets; the
   serde alias that still reads `workspace_id` must stay so older task

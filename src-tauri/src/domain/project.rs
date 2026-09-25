@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Whether a project is standalone or attached to a meta-workspace.
+/// Whether a project is standalone or attached to a workspace.
 ///
 /// Stored projects from before the workspace concept existed deserialize as
 /// `Standalone` via the `Default` impl + `#[serde(default)]` on the field.

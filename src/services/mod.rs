@@ -21,7 +21,7 @@ pub mod updater_service;
 
 pub use opener_service::open_url_external;
 pub use repository_service::{create_repository, list_repositories, pick_folder, check_is_git_repo};
-pub use project_service::{create_project, list_projects, get_project, get_project_path};
+pub use project_service::{create_project, list_projects, get_project, get_project_path, attach_project_to_workspace, detach_project_from_workspace};
 pub use task_service::{create_task, list_tasks, update_task_status, reorder_task, delete_task, toggle_subtask, update_task};
 pub use agent_service::*;
 pub use jj_service::*;

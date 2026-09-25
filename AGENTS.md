@@ -10,7 +10,8 @@ SlashIt is a Tauri v2 desktop application for AI agent task orchestration across
 
 - A Project is one repository or root folder managed by SlashIt.
 - Unqualified "Workspace" means the Product Workspace: a container that
-  manages several Projects. Membership is stored on the Project (`ProjectScope`).
+  manages several Projects. Membership is stored on the Project
+  (`domain::project::ProjectScope`).
 - A Task Checkout is a Task's isolated working copy. Today it is always a Git
   worktree; JJ workspaces are not a Task Checkout backend.
 - A JJ developer workspace used to develop SlashIt is unrelated to the Product
