@@ -1,3 +1,4 @@
+use super::checked_task_branch;
 use crate::config::paths::{AppPaths, ProjectKey, WorktreePlacement};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -349,7 +350,12 @@ impl WorktreeManager {
     }
 
     /// Create a worktree for a task. Returns the worktree path and branch name.
+    ///
+    /// Callers pass [`Self::branch_for_task`] here today, but the name is
+    /// checked all the same, so that every way of acquiring a worktree holds
+    /// its branch to the same contract before any process sees it.
     pub async fn create(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
+        let branch = checked_task_branch(branch)?;
         if let Some(existing) = self.adoptable_path_live(repo_path, branch).await {
             return Ok(WorktreeInfo {
                 path: existing.to_string_lossy().to_string(),
@@ -365,7 +371,12 @@ impl WorktreeManager {
 
     /// Reattach to an existing branch (no -c flag). Used when re-queuing a task
     /// that already has a branch from a previous execution.
+    ///
+    /// `branch` is the task's recorded `branch_name`, read back from a board
+    /// file that may be kept in the project and so may say anything; it is
+    /// refused, before `wt` or `git` is run, unless it is a plain branch name.
     pub async fn reattach(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
+        let branch = checked_task_branch(branch)?;
         if let Some(existing) = self.adoptable_path_live(repo_path, branch).await {
             return Ok(WorktreeInfo {
                 path: existing.to_string_lossy().to_string(),
@@ -416,14 +427,8 @@ impl WorktreeManager {
             .to_str()
             .ok_or_else(|| "Worktree path is not valid UTF-8".to_string())?;
 
-        let mut args = vec!["worktree", "add", dest];
-        if create_branch {
-            args.push("-b");
-        }
-        args.push(branch);
-
         let output = tokio::process::Command::new("git")
-            .args(&args)
+            .args(Self::git_worktree_add_args(dest, branch, create_branch))
             .current_dir(repo_path)
             .output()
             .await
@@ -442,14 +447,53 @@ impl WorktreeManager {
         })
     }
 
+    /// The arguments for `git worktree add`, with `--` before the positional
+    /// arguments so that neither the destination nor an attached branch can
+    /// be read as an option. `-b` has to come before the `--`; after it, git
+    /// would take `-b` as the path. A revision such as `HEAD~1` is still a
+    /// valid `<commit-ish>` after the `--`, which is why callers also check
+    /// the branch with [`checked_task_branch`].
+    fn git_worktree_add_args<'a>(dest: &'a str, branch: &'a str, create_branch: bool) -> Vec<&'a str> {
+        if create_branch {
+            vec!["worktree", "add", "-b", branch, "--", dest]
+        } else {
+            vec!["worktree", "add", "--", dest, branch]
+        }
+    }
+
+    /// Create `branch` at the tip of `start` in the primary repository, with
+    /// `--` so that neither name can be read as an option.
+    async fn git_branch_from(repo_path: &str, branch: &str, start: &str) -> Result<(), String> {
+        let output = tokio::process::Command::new("git")
+            .args(["branch", "--", branch, start])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git branch: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git branch {branch} {start} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a branch stacked on top of another branch.
     /// Uses git-spice when available, falls back to wt --base.
+    ///
+    /// `after_branch` is the dependency's recorded `branch_name`, which is as
+    /// untrusted as the task's own, so both names are checked before git-spice,
+    /// `wt` or `git` is run.
     pub async fn create_stacked_branch(
         &self,
         repo_path: &str,
         branch: &str,
         after_branch: &str,
     ) -> Result<WorktreeInfo, String> {
+        let branch = checked_task_branch(branch)?;
+        let after_branch = checked_task_branch(after_branch)
+            .map_err(|e| format!("Cannot stack on the dependency's branch: {e}"))?;
         if self.gs_available {
             // Use git-spice to create stacked branch
             let output = tokio::process::Command::new("git-spice")
@@ -498,12 +542,10 @@ impl WorktreeManager {
             // Git-only fallback: create the branch from its parent, then
             // attach a worktree to it. Attach, not `-b` (`create_with_git`
             // always passes `-b`): the branch already exists from the line
-            // above, so creating it again would fail.
-            let _ = tokio::process::Command::new("git")
-                .args(["branch", branch, after_branch])
-                .current_dir(repo_path)
-                .output()
-                .await;
+            // above, so creating it again would fail. A branch that could not
+            // be created stops here: attaching to whatever already has that
+            // name would report a stack that is not stacked on anything.
+            Self::git_branch_from(repo_path, branch, after_branch).await?;
             let worktree_path = self.managed_path(repo_path, branch);
             self.git_worktree_add(repo_path, &worktree_path, branch, false)
                 .await
@@ -3991,5 +4033,202 @@ branch refs/heads/some-other-branch
         let reattached = mgr.reattach(repo_path, "reattach-me").await.expect("reattach failed");
         assert!(Path::new(&reattached.path).exists(), "reattached worktree should exist");
         assert_eq!(reattached.branch, "reattach-me");
+    }
+
+    /// Every ref in the repository with the commit it names, so a test can
+    /// show a refused operation left all of them exactly as they were.
+    fn all_refs(repo_path: &str) -> String {
+        run_git(repo_path, &["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
+    /// The worktrees git has registered, the primary checkout included.
+    fn registered_worktrees(repo_path: &str) -> Vec<String> {
+        run_git(repo_path, &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree ").map(str::to_string))
+            .collect()
+    }
+
+    /// A repository whose `main` has moved one commit past an unrelated
+    /// branch `victim`, so resetting `victim` to `HEAD` is observable.
+    fn repo_with_victim_branch() -> tempfile::TempDir {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        run_git(repo_path, &["branch", "victim"]);
+        run_git(repo_path, &["commit", "--allow-empty", "-m", "second"]);
+        tmp
+    }
+
+    /// `task.branch_name` is read back from `tasks.toml`, which a board kept
+    /// in the project takes from whatever the last commit wrote. Reattaching
+    /// used to hand it to `git worktree add <dest> <branch>` as it was, and
+    /// `-Bvictim` there is the option that force-resets `victim` to `HEAD`.
+    #[tokio::test]
+    async fn reattach_refuses_an_option_shaped_branch_before_git_sees_it() {
+        let tmp = repo_with_victim_branch();
+        let repo_path = tmp.path().to_str().unwrap();
+        let refs_before = all_refs(repo_path);
+
+        let mgr = test_manager();
+        let result = mgr.reattach(repo_path, "-Bvictim").await;
+
+        assert_eq!(all_refs(repo_path), refs_before, "no ref may move, `victim` above all");
+        assert!(result.is_err(), "a branch shaped like an option must be refused");
+        assert_eq!(registered_worktrees(repo_path).len(), 1, "no worktree may be created");
+        assert_eq!(run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert!(!mgr.managed_path(repo_path, "-Bvictim").exists());
+    }
+
+    /// A revision is not a branch: `git worktree add <dest> HEAD~1` checks
+    /// out a detached worktree at whatever commit that names.
+    #[tokio::test]
+    async fn reattach_refuses_a_revision_shaped_branch() {
+        let tmp = repo_with_victim_branch();
+        let repo_path = tmp.path().to_str().unwrap();
+        let refs_before = all_refs(repo_path);
+
+        let mgr = test_manager();
+        let result = mgr.reattach(repo_path, "HEAD~1").await;
+
+        assert!(result.is_err(), "a revision must be refused where a branch is expected");
+        assert_eq!(registered_worktrees(repo_path).len(), 1, "no detached worktree may appear");
+        assert_eq!(all_refs(repo_path), refs_before);
+    }
+
+    /// The dependency's `branch_name` is persisted the same way as the
+    /// task's own. On the git-only stacked path it went to
+    /// `git branch <new> <dependency>`, where `-m` renames the branch the
+    /// user has checked out in their own repository.
+    #[tokio::test]
+    async fn stacked_git_fallback_refuses_an_option_shaped_dependency() {
+        let tmp = repo_with_victim_branch();
+        let repo_path = tmp.path().to_str().unwrap();
+        let refs_before = all_refs(repo_path);
+
+        let mgr = test_manager();
+        let result = mgr.create_stacked_branch(repo_path, "task-1234abcd", "-m").await;
+
+        assert_eq!(run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(all_refs(repo_path), refs_before, "no ref may be created, moved or renamed");
+        assert!(result.is_err(), "a dependency shaped like an option must be refused");
+        assert!(!branch_exists(repo_path, "task-1234abcd"));
+        assert_eq!(registered_worktrees(repo_path).len(), 1);
+    }
+
+    /// A revision-shaped dependency, or a poisoned name for the new branch,
+    /// is refused before any branch is created.
+    #[tokio::test]
+    async fn stacked_git_fallback_refuses_revision_or_option_shaped_names() {
+        let tmp = repo_with_victim_branch();
+        let repo_path = tmp.path().to_str().unwrap();
+        let refs_before = all_refs(repo_path);
+
+        let mgr = test_manager();
+        for (branch, after) in [
+            ("task-1234abcd", "HEAD~1"),
+            ("task-1234abcd", "victim@{1}"),
+            ("-Bvictim", "main"),
+            ("HEAD~1", "main"),
+        ] {
+            let result = mgr.create_stacked_branch(repo_path, branch, after).await;
+            assert!(result.is_err(), "{branch:?} on {after:?} must be refused");
+            assert_eq!(all_refs(repo_path), refs_before, "{branch:?} on {after:?}");
+            assert_eq!(registered_worktrees(repo_path).len(), 1, "{branch:?} on {after:?}");
+        }
+    }
+
+    /// The git-only stacked path used to ignore `git branch`'s exit status.
+    /// When the new branch could not be created from the dependency -- here
+    /// because a branch of that name already exists elsewhere -- it went on
+    /// to attach a worktree to whatever that name already was, and reported
+    /// a stacked branch that was not stacked on anything.
+    #[tokio::test]
+    async fn stacked_git_fallback_reports_a_branch_it_could_not_create() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        run_git(repo_path, &["branch", "task-1234abcd"]);
+        run_git(repo_path, &["checkout", "-q", "-b", "task-5678abcd"]);
+        run_git(repo_path, &["commit", "--allow-empty", "-m", "dependency work"]);
+        run_git(repo_path, &["checkout", "-q", "main"]);
+        let refs_before = all_refs(repo_path);
+
+        let mgr = test_manager();
+        let result = mgr
+            .create_stacked_branch(repo_path, "task-1234abcd", "task-5678abcd")
+            .await;
+
+        assert!(result.is_err(), "a branch that could not be created must not be reported as stacked");
+        assert_eq!(all_refs(repo_path), refs_before);
+        assert_eq!(registered_worktrees(repo_path).len(), 1);
+    }
+
+    #[test]
+    fn git_worktree_add_args_put_every_positional_after_the_terminator() {
+        assert_eq!(
+            WorktreeManager::git_worktree_add_args("/wt/dest", "task-1234abcd", true),
+            ["worktree", "add", "-b", "task-1234abcd", "--", "/wt/dest"]
+        );
+        assert_eq!(
+            WorktreeManager::git_worktree_add_args("/wt/dest", "task-1234abcd", false),
+            ["worktree", "add", "--", "/wt/dest", "task-1234abcd"]
+        );
+    }
+
+    /// The `--` holds on its own, without the check in front of it: git is
+    /// handed `-Bvictim` directly and still reads it as a (missing) branch,
+    /// not as the option that resets `victim`.
+    #[tokio::test]
+    async fn git_worktree_add_reads_an_option_shaped_branch_as_a_branch() {
+        let tmp = repo_with_victim_branch();
+        let repo_path = tmp.path().to_str().unwrap();
+        let refs_before = all_refs(repo_path);
+
+        let mgr = test_manager();
+        let dest = mgr.managed_path(repo_path, "unchecked");
+        let result = mgr.git_worktree_add(repo_path, &dest, "-Bvictim", false).await;
+
+        assert_eq!(all_refs(repo_path), refs_before, "`victim` must not be reset");
+        assert!(result.is_err());
+        assert_eq!(registered_worktrees(repo_path).len(), 1);
+    }
+
+    /// Likewise for the git-only stacked fallback's `git branch`: `-m` after
+    /// the `--` is a start point that does not exist, not a rename.
+    #[tokio::test]
+    async fn git_branch_from_reads_an_option_shaped_start_as_a_start_point() {
+        let tmp = repo_with_victim_branch();
+        let repo_path = tmp.path().to_str().unwrap();
+        let refs_before = all_refs(repo_path);
+
+        let result = WorktreeManager::git_branch_from(repo_path, "task-1234abcd", "-m").await;
+
+        assert!(result.is_err(), "a start point git cannot resolve must be reported");
+        assert_eq!(run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(all_refs(repo_path), refs_before);
+    }
+
+    /// The names SlashIt generates keep working on every git-only path.
+    #[tokio::test]
+    async fn generated_task_branches_create_reattach_and_stack_through_git() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+
+        let created = mgr.create(repo_path, "task-1234abcd").await.expect("create");
+        assert_eq!(run_git(&created.path, &["symbolic-ref", "--short", "HEAD"]), "task-1234abcd");
+        let dependency_tip = commit_work(&created.path, "dependency.txt");
+
+        run_git(repo_path, &["worktree", "remove", &created.path]);
+        let reattached = mgr.reattach(repo_path, "task-1234abcd").await.expect("reattach");
+        assert_eq!(run_git(&reattached.path, &["symbolic-ref", "--short", "HEAD"]), "task-1234abcd");
+        run_git(repo_path, &["worktree", "remove", &reattached.path]);
+
+        let stacked = mgr
+            .create_stacked_branch(repo_path, "task-5678abcd", "task-1234abcd")
+            .await
+            .expect("stacked");
+        assert_eq!(run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]), "task-5678abcd");
+        assert_eq!(run_git(&stacked.path, &["rev-parse", "HEAD"]), dependency_tip);
+        assert_eq!(run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]), "main");
     }
 }
