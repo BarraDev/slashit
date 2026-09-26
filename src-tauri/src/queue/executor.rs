@@ -1552,14 +1552,21 @@ impl TaskExecutor {
                             Self::persist_task_static(&tasks, &storage, task_id).await;
                         }
                         Err(err_msg) => {
-                            // Include accumulated stdout if stderr was empty
+                            // Nothing on stderr or in the result event said
+                            // why: quote the end of the output instead, cut to
+                            // one bounded line so a transcript never becomes
+                            // the error.
                             let full_msg = if err_msg.contains("no details") {
                                 let stdout_output = runner.get_output().await;
                                 let last_lines: String = stdout_output.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
                                 if last_lines.is_empty() {
                                     err_msg.clone()
                                 } else {
-                                    format!("{} — {}", err_msg, last_lines)
+                                    format!(
+                                        "{} — {}",
+                                        err_msg,
+                                        crate::agents::runner::truncate_one_line_tail(&last_lines, 400)
+                                    )
                                 }
                             } else {
                                 err_msg.clone()

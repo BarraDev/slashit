@@ -6,6 +6,7 @@ use crate::domain::task::{
 use crate::commands::task::Tasks;
 use crate::config::Storage;
 use crate::worktree::checked_task_branch;
+use crate::agents::runner::truncate_one_line;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -2609,11 +2610,14 @@ fn pr_helper_failure_reason(stdout: &str, stderr: &str) -> String {
 }
 
 /// Pull a human-readable failure reason out of the stream-json stdout. Prefers
-/// the terminal `result` event when its `is_error` flag is set (this is where
-/// the Claude CLI reports max-turns, sandbox denials, model errors, etc.).
+/// the last `result` event that reports an error (this is where the Claude
+/// CLI reports max-turns, sandbox denials, model errors, etc.), read and
+/// chosen the same way the runner does for every other agent run
+/// ([`crate::agents::runner::result_failure_reason`]).
 /// Falls back to the last `error` field on any event, or the last assistant
 /// text block before the truncation.
 fn extract_failure_reason(stdout: &str) -> Option<String> {
+    let mut last_result_failure: Option<String> = None;
     let mut last_error_text: Option<String> = None;
     let mut last_assistant_text: Option<String> = None;
     for line in stdout.lines() {
@@ -2621,15 +2625,9 @@ fn extract_failure_reason(stdout: &str) -> Option<String> {
         if line.is_empty() { continue; }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
         let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if msg_type == "result" {
-            let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
-            let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
-            let text = v.get("result").and_then(|r| r.as_str()).unwrap_or("").trim();
-            if is_error || subtype.contains("error") || subtype.contains("max_turns") {
-                let label = if subtype.is_empty() { "error".to_string() } else { subtype.to_string() };
-                let body = if text.is_empty() { "(empty result body)".to_string() } else { text.to_string() };
-                return Some(format!("{}: {}", label, truncate_one_line(&body, 400)));
-            }
+        if let Some(reason) = crate::agents::runner::result_failure_reason(&v) {
+            last_result_failure = Some(reason);
+            continue;
         }
         if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
             last_error_text = Some(err.to_string());
@@ -2646,19 +2644,9 @@ fn extract_failure_reason(stdout: &str) -> Option<String> {
             }
         }
     }
-    last_error_text
-        .map(|e| format!("stream error: {}", truncate_one_line(&e, 400)))
+    last_result_failure
+        .or_else(|| last_error_text.map(|e| format!("stream error: {}", truncate_one_line(&e, 400))))
         .or_else(|| last_assistant_text.map(|t| format!("last assistant text: {}", truncate_one_line(&t, 400))))
-}
-
-fn truncate_one_line(s: &str, max: usize) -> String {
-    let oneline: String = s.split('\n').filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" / ");
-    if oneline.chars().count() <= max {
-        oneline
-    } else {
-        let truncated: String = oneline.chars().take(max).collect();
-        format!("{}…", truncated)
-    }
 }
 
 fn write_pr_helper_log(stdout: &str, stderr: &str, can_edit: bool) -> std::io::Result<std::path::PathBuf> {
@@ -4691,6 +4679,31 @@ mod tests {
             pr_helper_failure_reason("", "boom\nerror: unknown option '--no-such-flag'\n"),
             "boom | error: unknown option '--no-such-flag'"
         );
+    }
+
+    /// A max-turns result carries its reason in `errors` and has no `result`
+    /// text, as Claude Code 2.1.283 writes it.
+    #[test]
+    fn a_pr_helper_out_of_turns_reports_the_result_errors() {
+        let stdout = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#, "\n",
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"terminal_reason":"max_turns","errors":["Reached maximum number of turns (1)"],"session_id":"s"}"#,
+        );
+        assert_eq!(
+            pr_helper_failure_reason(stdout, ""),
+            "error_max_turns: Reached maximum number of turns (1)"
+        );
+    }
+
+    /// Of several error results, the last is the reason, as in the runner.
+    #[test]
+    fn a_pr_helper_reports_the_last_error_result() {
+        let stdout = concat!(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["first"]}"#, "\n",
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"errors":["second"]}"#, "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+        );
+        assert_eq!(pr_helper_failure_reason(stdout, ""), "error_max_turns: second");
     }
 
     #[test]
