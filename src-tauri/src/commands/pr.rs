@@ -2472,25 +2472,30 @@ async fn run_claude_pr_helper(
     // Always persist stdout when it's substantial or when claude failed, so the
     // 200 KB transcript that exposes the real error isn't lost. The path is
     // surfaced in the error message and printed to stderr.
-    let log_path = if !success || stdout.len() > 4096 {
+    let prompt_failure = runner.prompt_failure().await;
+    let log_path = if !success || prompt_failure.is_some() || stdout.len() > 4096 {
         write_pr_helper_log(&stdout, &stderr, can_edit).ok()
     } else {
         None
     };
 
+    let log_hint = log_path
+        .as_ref()
+        .map(|p| format!(" (transcript: {})", p.display()))
+        .unwrap_or_default();
+
     if !success {
         let reason = pr_helper_failure_reason(&stdout, &stderr);
-        let log_hint = log_path
-            .as_ref()
-            .map(|p| format!(" (transcript: {})", p.display()))
-            .unwrap_or_default();
         return Err(format!("claude exited {} — {}{}", exit_label, reason, log_hint));
     }
 
-    // A zero exit is only a success if claude had the whole prompt: whatever
-    // it answered, it was not answering what this helper asked.
-    if let Some(reason) = runner.prompt_failure().await {
-        return Err(format!("claude exited {} without the whole prompt — {}", exit_label, reason));
+    // A zero exit is not a success when the prompt write failed: whatever
+    // claude answered, it was not answering what this helper asked.
+    if let Some(reason) = prompt_failure {
+        return Err(format!(
+            "claude exited {} without the whole prompt — {}{}",
+            exit_label, reason, log_hint
+        ));
     }
 
     let extracted = extract_text_from_stream_json(&stdout);
@@ -6297,6 +6302,17 @@ mod tests {
                     .await
                     .expect_err("an answer to a prompt claude never read is not a success");
                     assert!(error.contains("without the whole prompt"), "can_edit={can_edit}: {error}");
+
+                    // The transcript is kept and named in the error. It is
+                    // written to the real helper log directory, so it is
+                    // removed again here.
+                    let transcript = error
+                        .rsplit_once(" (transcript: ")
+                        .and_then(|(_, rest)| rest.strip_suffix(')'))
+                        .unwrap_or_else(|| panic!("can_edit={can_edit}: no transcript hint: {error}"));
+                    let logged = std::fs::read_to_string(transcript).expect("the transcript exists");
+                    assert!(logged.contains("all done"), "{logged}");
+                    std::fs::remove_file(transcript).expect("remove the test transcript");
                 }
             }
 

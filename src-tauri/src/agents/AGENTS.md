@@ -50,8 +50,11 @@ argv: SlashIt only passes a fixed rules text there.
 - The writer starts at spawn and runs alongside the stdout and stderr
   drains, so a large prompt cannot deadlock against a full output pipe. The
   CLI also stops waiting for stdin if no data arrives within a few seconds.
-- A prompt the child did not take in full fails the run, even on exit 0.
-  `wait()` reports a non-zero exit first, then the undelivered prompt, then a
+- A failed prompt write fails the run, even on exit 0: the write errored
+  (usually `EPIPE`), or was still unfinished when the child exited. A prompt
+  small enough to sit whole in the pipe buffer counts as delivered once
+  written, so a child that exits without reading it cannot be told apart.
+  `wait()` reports a non-zero exit first, then the prompt failure, then a
   `result` error. `prompt_failure()` exposes it to callers that judge by
   `exit_status()`, like the PR helper.
 - `kill()` and dropping the runner abort the writer, so a cancelled run

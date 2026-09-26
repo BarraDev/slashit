@@ -271,7 +271,17 @@ impl Drop for ClaudeRunner {
     /// The writer is a detached task holding the pipe's write end. It ends
     /// by itself when the child's end closes, but a process outside the
     /// child's group can hold that end open, so it is not left to chance.
+    ///
+    /// A live child is signalled first, in the same order as [`Self::kill`],
+    /// so it never sees the prompt cut short by an EOF. `kill_on_drop` would
+    /// only signal it after this returns, and only the leader.
     fn drop(&mut self) {
+        // Still unreaped while `id()` answers, so the group id is still the
+        // one this runner spawned (see `wait`).
+        #[cfg(unix)]
+        if let Some(pid) = self.child.try_lock().ok().and_then(|child| child.id()) {
+            Self::kill_process_group(pid);
+        }
         if let Some(writer) = self.prompt_writer.get_mut().take() {
             writer.abort();
         }
@@ -408,6 +418,14 @@ impl ClaudeRunner {
                 .write_all(prompt.as_bytes())
                 .await
                 .map_err(|e| format!("Failed to write the prompt to claude's stdin: {e}"))?;
+            // A no-op on Unix, where `write_all` returns only once the bytes
+            // are in the pipe. On Windows, tokio's `ChildStdin` hands each
+            // write to the blocking pool and reports it done at once, so a
+            // failed write only surfaces here.
+            stdin
+                .flush()
+                .await
+                .map_err(|e| format!("Failed to write the prompt to claude's stdin: {e}"))?;
             // Before the close, so it is set by the time the child can see
             // EOF. See `finish_prompt_writer`.
             written.store(true, Ordering::SeqCst);
@@ -444,6 +462,9 @@ impl ClaudeRunner {
         match writer.await {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(error),
+            Err(tauri::Error::JoinError(error)) if error.is_panic() => {
+                Some(format!("The task writing the prompt to claude's stdin panicked: {error}"))
+            }
             Err(_) => Some("claude exited before it read the whole prompt from stdin".to_string()),
         }
     }
@@ -591,7 +612,10 @@ impl ClaudeRunner {
 
     /// Wait for the process to complete and return exit status.
     /// On failure, includes stderr in the error message. A child that exits
-    /// 0 without having read the whole prompt is a failure too.
+    /// 0 is still a failure when the prompt writer saw it leave early: the
+    /// write failed, or had not finished when the child exited. A prompt
+    /// small enough to sit whole in the pipe buffer counts as delivered once
+    /// written, whether or not the child ever read it.
     pub async fn wait(&self) -> Result<bool, String> {
         let mut child = self.child.lock().await;
 

@@ -491,9 +491,9 @@ fn read_invocation(path: &Path, prompt_path: &Path) -> Result<Invocation> {
 
     let working_dir = PathBuf::from(fields.remove(0));
     let prompt = match std::fs::read(prompt_path) {
-        Ok(bytes) => Some(String::from_utf8(bytes).with_context(|| {
-            format!("the prompt {} is not UTF-8", prompt_path.display())
-        })?),
+        // Lossy: a run killed mid-read can leave a split character at the
+        // end, which must not hide every other record.
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(error)
