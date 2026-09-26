@@ -3153,8 +3153,10 @@ const GITHUB_PR_COMMIT_LIST_LIMIT: usize = 250;
 ///   branch (what it was moved to stays in `HEAD`'s reflog). An edit inside
 ///   a path the stop left unmerged cannot be told from its conflict markers
 ///   and is discarded with them, as is a nested repository created at such a
-///   path. Likewise a staged edit on a path the stopped commit itself
-///   changes cannot be told from git's clean merge there, and is discarded.
+///   path. During the restack itself, a staged edit on a path the stopped
+///   commit changes cannot be told from git's clean merge there, and is
+///   discarded; recovery refuses it instead (see
+///   [`recover_unfinished_restack`]).
 ///   Submodule checkouts are never moved by an undo, so one the rebase moved
 ///   stays where it is. Resetting the files after a stop never
 ///   refuses: an edit or untracked file made in the instant between the
@@ -3172,7 +3174,10 @@ const GITHUB_PR_COMMIT_LIST_LIMIT: usize = 250;
 ///   its conflict in the worktree, while a stale backup equal to the tip
 ///   exists, as SlashIt's own and undoes it. Nothing records which process
 ///   started a rebase, so one started by hand that matches all of that
-///   exactly would be undone as well.
+///   exactly would be undone as well. Recovery also refuses a clean merge git
+///   staged at a path both the new base and the stopped commit changed, since
+///   it cannot be told from a resolution the user staged there (failing
+///   closed).
 async fn restack_onto_landed_parent(
     state: &crate::AppState,
     task_uuid: Uuid,
@@ -3462,7 +3467,9 @@ fn restack_failure_message(
         RestackFailure::BranchMoved(what) => format!(
             "Restacking {branch} onto {default} ({onto}) failed: {what}. The branch or the \
              worktree's HEAD changed while SlashIt was operating on it (a commit, checkout or edit \
-             from the task's terminal, or another tool), so SlashIt deliberately did not write \
+             from the task's terminal, or another tool; a staged path named above may instead be \
+             one git's rename detection moved there because {default} renamed it), so SlashIt \
+             deliberately did not write \
              the branch, rather than undo someone else's work. {branch} may still hold the \
              restacked tip, which the task does not record; until you choose, creating the pull \
              request again refuses because of the backup. The branch's tip from before the \
@@ -3496,7 +3503,12 @@ fn restack_failure_message(
 ///   the conflict it stopped on
 ///   ([`crate::worktree::restack::changes_beyond_the_stop`]): a resolved
 ///   conflict, another changed path or an untracked file is refused as
-///   below. It is undone without writing the branch
+///   below. Since time has passed since the stop, a path the stopped commit
+///   changes must also be staged exactly as the new base or the stopped
+///   commit has it
+///   ([`crate::worktree::restack::staged_resolutions_in_the_stop`]), so a
+///   conflict resolved and staged while another is left is refused too;
+///   so, failing closed, is git's clean merge of a path both sides changed. It is undone without writing the branch
 ///   ([`crate::worktree::restack::undo_stopped_rebase`]), the worktree
 ///   verified back on the branch at that tip, and the backup deleted.
 /// - A backup equal to the branch's tip with no rebase in progress holds
@@ -3560,7 +3572,11 @@ async fn recover_unfinished_restack(
                     worktree.display()
                 )));
             };
-            if let Some(why) = restack::changes_beyond_the_stop(worktree).await? {
+            let beyond = match restack::changes_beyond_the_stop(worktree).await? {
+                Some(why) => Some(why),
+                None => restack::staged_resolutions_in_the_stop(worktree).await?,
+            };
+            if let Some(why) = beyond {
                 return Err(unfinished(format!(
                     ", with its rebase stopped in {}, where the worktree holds changes SlashIt did \
                      not make ({why})",
@@ -7479,6 +7495,9 @@ mod tests {
                 /// The task forked from the parent while the parent still had
                 /// no commits of its own, so the fork point is `main`'s commit.
                 child_forks_before_parent_commits: bool,
+                /// A1 also writes c.txt (c1) and A2 rewrites it (c2), so
+                /// replaying A1 onto what landed conflicts on a.txt and c.txt.
+                parent_touches_a_second_file: bool,
             }
 
             impl Spec {
@@ -7492,6 +7511,7 @@ mod tests {
                         main_has_first_child_change: false,
                         parent_commits_before_a1: 0,
                         child_forks_before_parent_commits: false,
+                        parent_touches_a_second_file: false,
                     }
                 }
             }
@@ -7554,8 +7574,14 @@ mod tests {
                     for n in 0..spec.parent_commits_before_a1 {
                         commit_file(co, "p.txt", &format!("{n}\n"), &format!("P{n}"));
                     }
+                    if spec.parent_touches_a_second_file {
+                        std::fs::write(co.join("c.txt"), "c1\n").unwrap();
+                    }
                     commit_file(co, "a.txt", "v1\n", "A1");
                     std::fs::write(co.join("a2.txt"), "x\n").unwrap();
+                    if spec.parent_touches_a_second_file {
+                        std::fs::write(co.join("c.txt"), "c2\n").unwrap();
+                    }
                     commit_file(co, "a.txt", "v2\n", "A2");
                 };
                 if !spec.child_forks_before_parent_commits {
@@ -8410,7 +8436,8 @@ mod tests {
             /// one restack's reflog marker. A rebase onto another commit, one
             /// without the marker, or one with a terminal commit on top is
             /// the user's, and so is a stop whose conflict was resolved or
-            /// beside which another file was edited or staged: undoing it would
+            /// beside which another file was edited or staged, or one conflict
+            /// of which was resolved and staged while another is left: undoing it would
             /// discard that work. The restack then runs again from the start. A backup
             /// that still equals the branch is reused. Anything else (a backup
             /// the branch no longer equals, with or without a rebase in
@@ -8433,6 +8460,7 @@ mod tests {
                     ResolvedStop,
                     EditBesidesTheStop,
                     StagedBesidesTheStop,
+                    PartlyResolvedStop,
                 }
                 for leftover in [
                     Leftover::OwnRebaseInProgress,
@@ -8446,8 +8474,12 @@ mod tests {
                     Leftover::ResolvedStop,
                     Leftover::EditBesidesTheStop,
                     Leftover::StagedBesidesTheStop,
+                    Leftover::PartlyResolvedStop,
                 ] {
-                    let landed = land(Spec::new(Landing::Squash));
+                    let landed = land(Spec {
+                        parent_touches_a_second_file: matches!(leftover, Leftover::PartlyResolvedStop),
+                        ..Spec::new(Landing::Squash)
+                    });
                     let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
                     let (state, _tmp) = build_test_state().await;
                     let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
@@ -8485,7 +8517,7 @@ mod tests {
                             .expect("run git");
                         assert!(!output.status.success(), "the rebase must stop part way");
                         assert!(mid_operation(wt));
-                        if own_onto {
+                        if own_onto && !matches!(leftover, Leftover::PartlyResolvedStop) {
                             assert_eq!(git(wt, &["diff", "--name-only", "--diff-filter=U"]), "a.txt");
                         }
                     };
@@ -8517,6 +8549,14 @@ mod tests {
                             git(wt, &["update-ref", &backup, &landed.child_tip, ""]);
                             start_marked_rebase("refs/remotes/origin/main");
                             std::fs::write(wt.join("m.txt"), "edited\n").unwrap();
+                        }
+                        Leftover::PartlyResolvedStop => {
+                            git(wt, &["update-ref", &backup, &landed.child_tip, ""]);
+                            start_marked_rebase("refs/remotes/origin/main");
+                            assert_eq!(git(wt, &["diff", "--name-only", "--diff-filter=U"]), "a.txt\nc.txt");
+                            std::fs::write(wt.join("a.txt"), "resolved\n").unwrap();
+                            git(wt, &["add", "a.txt"]);
+                            assert_eq!(git(wt, &["diff", "--name-only", "--diff-filter=U"]), "c.txt");
                         }
                         Leftover::StagedBesidesTheStop => {
                             git(wt, &["update-ref", &backup, &landed.child_tip, ""]);
@@ -8573,16 +8613,28 @@ mod tests {
                         | Leftover::UnmarkedRebase
                         | Leftover::ResolvedStop
                         | Leftover::EditBesidesTheStop
-                        | Leftover::StagedBesidesTheStop => {
+                        | Leftover::StagedBesidesTheStop
+                        | Leftover::PartlyResolvedStop => {
                             let error = result.expect_err("refused");
                             assert!(error.contains(&backup), "{leftover:?}: {error}");
                             if matches!(
                                 leftover,
-                                Leftover::ResolvedStop | Leftover::EditBesidesTheStop | Leftover::StagedBesidesTheStop
+                                Leftover::ResolvedStop
+                                    | Leftover::EditBesidesTheStop
+                                    | Leftover::StagedBesidesTheStop
+                                    | Leftover::PartlyResolvedStop
                             ) {
                                 assert!(error.contains("changes SlashIt did not make"), "{leftover:?}: {error}");
                             }
                             match leftover {
+                                Leftover::PartlyResolvedStop => {
+                                    assert!(error.contains("a.txt staged with content"), "{error}");
+                                    assert_eq!(
+                                        std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+                                        "resolved\n",
+                                        "the partial resolution is kept"
+                                    );
+                                }
                                 Leftover::ResolvedStop => assert_eq!(
                                     std::fs::read_to_string(wt.join("a.txt")).unwrap(),
                                     "resolved\n",

@@ -360,8 +360,9 @@ pub async fn head_moved_only_by_a_restack(dir: &Path) -> Result<Option<String>, 
 /// change, or an untracked file are someone else's work, which undoing the
 /// stop would discard. Without a `REBASE_HEAD` that has a parent, the stop
 /// cannot be checked, and is refused. A user's staged edit on a path the
-/// stopped commit does change cannot be told from git's clean merge there,
-/// and is discarded with it. The other way round, when `onto` renamed a path
+/// stopped commit does change cannot be told from git's clean merge there by
+/// this check, and would be discarded with it; recovery, where that can
+/// happen, adds [`staged_resolutions_in_the_stop`]. The other way round, when `onto` renamed a path
 /// the stopped commit changes, git stages that change at the new path, which
 /// the commit itself does not name, and the undo is refused though nothing
 /// is the user's (failing closed). What
@@ -419,7 +420,8 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
     let foreign: Vec<String> = staged.difference(&unmerged).filter(|p| !own.contains(*p)).cloned().collect();
     if !foreign.is_empty() {
         return Ok(Some(format!(
-            "{} staged, which the commit it stopped on does not change",
+            "{} staged, which the commit it stopped on does not change (or git staged its change \
+             there because the new base renamed the path)",
             foreign.join(", ")
         )));
     }
@@ -431,6 +433,92 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
         )));
     }
     Ok(None)
+}
+
+/// Why a stopped rebase's staged, no longer conflicted paths may hold a
+/// resolution someone made, or `None` when they cannot. For recovery after
+/// SlashIt stopped part way, where time has passed since the stop and the
+/// user may have resolved some conflicts and left others.
+///
+/// [`changes_beyond_the_stop`] accepts a staged path the stopped commit
+/// changes, since that is where git stages its clean merge. Here each such
+/// path must hold, in the index, exactly what `HEAD` or the stopped commit
+/// (`REBASE_HEAD`) holds there, mode and object alike, a missing entry
+/// counting as a value of its own. Anything else was resolved or edited and
+/// staged, and is refused. So is a clean merge of a path both sides changed,
+/// which git stages as a third version: recovery fails closed there.
+pub async fn staged_resolutions_in_the_stop(dir: &Path) -> Result<Option<String>, String> {
+    let paths = |listed: String| -> std::collections::BTreeSet<String> {
+        listed.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect()
+    };
+    let stopped = git(dir, &["rev-parse", "-q", "--verify", "REBASE_HEAD^{commit}"]).await;
+    let Some(stopped) = stopped.ok().filter(|oid| is_full_object_id(oid)) else {
+        return Ok(Some("git does not name the commit it stopped on (REBASE_HEAD)".to_string()));
+    };
+    let parent = run(dir, &["rev-parse", "-q", "--verify", &format!("{stopped}^1")], &[]).await?;
+    if parent.code != Some(0) || !is_full_object_id(&parent.stdout) {
+        return Ok(Some(format!("the commit it stopped on, {stopped}, has no parent to compare it with")));
+    }
+    let unmerged = paths(git(dir, &["diff", "-z", "--name-only", "--diff-filter=U"]).await?);
+    let own = paths(git(dir, &["diff-tree", "-r", "-z", "--name-only", "--no-renames", &parent.stdout, &stopped]).await?);
+    let staged = paths(
+        git(dir, &["diff", "--cached", "-z", "--name-only", "--no-renames", "--ignore-submodules=none", "HEAD"]).await?,
+    );
+    let candidates: Vec<&str> = staged
+        .iter()
+        .filter(|p| own.contains(*p) && !unmerged.contains(*p))
+        .map(String::as_str)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    // `<mode> <object>` per path, from `ls-files -s` (`<mode> <object>
+    // <stage>\t<path>`) or `ls-tree` (`<mode> <type> <object>\t<path>`).
+    // Paths are passed as literal pathspecs, never globs.
+    let entries = |listed: String, tree: bool| -> std::collections::BTreeMap<String, String> {
+        listed
+            .split('\0')
+            .filter_map(|entry| {
+                let (meta, path) = entry.split_once('\t')?;
+                let fields: Vec<&str> = meta.split(' ').collect();
+                let (mode, object) = match (tree, fields.as_slice()) {
+                    (false, [mode, object, _stage]) => (mode, object),
+                    (true, [mode, _type, object]) => (mode, object),
+                    _ => return None,
+                };
+                Some((path.to_string(), format!("{mode} {object}")))
+            })
+            .collect()
+    };
+    let listing = |args: Vec<&str>| {
+        let mut all = vec!["--literal-pathspecs"];
+        all.extend(args);
+        all.push("--");
+        all.extend(candidates.iter().copied());
+        all.into_iter().map(str::to_string).collect::<Vec<String>>()
+    };
+    let list = |args: Vec<String>| async move {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        git(dir, &args).await
+    };
+    let index = entries(list(listing(vec!["ls-files", "-s", "-z"])).await?, false);
+    let head = entries(list(listing(vec!["ls-tree", "-r", "-z", "--full-tree", "HEAD"])).await?, true);
+    let rebase_head = entries(list(listing(vec!["ls-tree", "-r", "-z", "--full-tree", &stopped])).await?, true);
+    let resolved: Vec<&str> = candidates
+        .into_iter()
+        .filter(|path| {
+            let at = |listed: &std::collections::BTreeMap<String, String>| listed.get(*path).cloned();
+            at(&index) != at(&head) && at(&index) != at(&rebase_head)
+        })
+        .collect();
+    if resolved.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{} staged with content that neither the new base nor the commit it stopped on has, as a \
+         resolved conflict is",
+        resolved.join(", ")
+    )))
 }
 
 /// Undo a rebase of `refs/heads/<branch>` stopped part way in the worktree
