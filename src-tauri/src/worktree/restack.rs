@@ -357,16 +357,22 @@ pub async fn head_moved_only_by_a_restack(dir: &Path) -> Result<Option<String>, 
 /// change to any other tracked path that is not staged, or an untracked file
 /// are someone else's work, which undoing the stop would discard. What
 /// cannot be told apart: an edit inside a path that is still unmerged looks
-/// the same as the conflict markers the stop wrote there. Neither can a file
+/// the same as the conflict markers the stop wrote there, and a nested
+/// repository created at an unmerged path is removed with it. Neither can a file
 /// ignored at the old tip that `onto`'s `.gitignore` no longer ignores: at
 /// the stop it shows as untracked, and the undo is refused, failing closed.
 ///
-/// Submodules are left out of the comparison (`--ignore-submodules=all`):
-/// the rebase moves a submodule's recorded commit without updating its
-/// checkout, so one that `onto` moved always shows as changed at the stop,
-/// and the undo never touches a submodule's checkout or anything in it, so
-/// nothing there can be lost. `=dirty` with a check of each gitlink would
-/// only separate cases that the undo treats alike.
+/// Changes inside submodules are left out of the comparison
+/// (`--ignore-submodules=all`): the rebase moves a submodule's recorded
+/// commit without updating its checkout, so one that `onto` moved always
+/// shows as changed at the stop, and the undo never recurses into a
+/// submodule's checkout (`--no-recurse-submodules`, whatever
+/// `submodule.recurse` says), so nothing in it can be lost. `=dirty` with a
+/// check of each gitlink would only separate cases that the undo treats
+/// alike. A type change is not left out: a submodule replaced by a file or a
+/// link, or the other way round, is listed on its own
+/// (`--diff-filter=T`), and refuses the undo, which would otherwise remove
+/// it.
 pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, String> {
     let paths = |listed: String| -> std::collections::BTreeSet<String> {
         listed.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect()
@@ -375,7 +381,8 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
     if unmerged.is_empty() {
         return Ok(Some("no conflicted paths are left, so they were resolved by hand".to_string()));
     }
-    let unstaged = paths(git(dir, &["diff", "-z", "--name-only", "--ignore-submodules=all"]).await?);
+    let mut unstaged = paths(git(dir, &["diff", "-z", "--name-only", "--ignore-submodules=all"]).await?);
+    unstaged.extend(paths(git(dir, &["diff", "-z", "--name-only", "--diff-filter=T"]).await?));
     let others: Vec<String> = unstaged.difference(&unmerged).cloned().collect();
     if !others.is_empty() {
         return Ok(Some(format!("{} changed besides the conflict", others.join(", "))));
@@ -398,7 +405,9 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
 /// `git rebase --quit` drops the rebase's state and leaves `HEAD` detached
 /// where it stopped, `git symbolic-ref` puts `HEAD` back on the branch
 /// (logged as `message`), and `git read-tree --reset -u <old tip>` makes the
-/// index and the files the old tip's, removing what the stop added.
+/// index and the files the old tip's, removing what the stop added. It never
+/// goes into a submodule's checkout (`--no-recurse-submodules`), whatever
+/// `submodule.recurse` says.
 /// Untracked files at paths the old tip does not track are left; ignored
 /// files at paths it does track are overwritten. The caller has checked
 /// that the rebase is the one it means to undo and that the worktree holds
@@ -411,7 +420,7 @@ pub async fn undo_stopped_rebase(dir: &Path, branch: &str, old_tip: &str, messag
     let branch_ref = format!("refs/heads/{branch}");
     git(dir, &["rebase", "--quit"]).await?;
     git(dir, &["symbolic-ref", "-m", message, "HEAD", &branch_ref]).await?;
-    git(dir, &["read-tree", "--reset", "-u", old_tip]).await?;
+    git(dir, &["read-tree", "--reset", "-u", "--no-recurse-submodules", old_tip]).await?;
     verify_restored(dir, branch, old_tip).await
 }
 
@@ -710,7 +719,8 @@ impl<'a> Restack<'a> {
     ///   nothing if it moved in the meantime; only then are the index and
     ///   the files brought back with `git read-tree -m -u`, which refuses
     ///   rather than overwrite local changes or untracked files (ignored
-    ///   files it does overwrite, as `git checkout` would). A commit
+    ///   files it does overwrite, as `git checkout` would), and never goes
+    ///   into a submodule's checkout. A commit
     ///   made in the instant between the swap and the read-tree is not
     ///   detected before it, and fails the verification after it.
     /// - A branch already at the old tip with no rebase in progress is
@@ -850,7 +860,12 @@ impl<'a> Restack<'a> {
             )));
         }
         run(self.worktree, &["update-index", "-q", "--refresh"], &[]).await?;
-        let files = run(self.worktree, &["read-tree", "-m", "-u", &produced, self.old_tip], &[]).await?;
+        let files = run(
+            self.worktree,
+            &["read-tree", "-m", "-u", "--no-recurse-submodules", &produced, self.old_tip],
+            &[],
+        )
+        .await?;
         if files.code != Some(0) {
             return Err(NotUndone::Failed(format!(
                 "{branch_ref} is back at {}, but the worktree's index and files still hold the \
@@ -1301,6 +1316,52 @@ mod tests {
 
         assert!(matches!(failure, RestackFailure::Restored(_)), "{}", describe(&failure));
         fixture.assert_restored("submodule");
+    }
+
+    /// Whatever `submodule.recurse` says, undoing a stop never goes into a
+    /// submodule's checkout: an edit made there during the stop is kept.
+    #[tokio::test]
+    async fn undoing_a_stop_keeps_an_edit_inside_a_submodule() {
+        let fixture = Fixture::with_submodule();
+        git_in(&fixture.worktree, &["config", "submodule.recurse", "true"]);
+        let restack = fixture.restack();
+        let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
+        assert_ne!(ran.code, Some(0));
+        let edited = fixture.worktree.join("sub").join("s.txt");
+        std::fs::write(&edited, "edited in the submodule\n").unwrap();
+
+        let failure = restack.settle(ran).await.expect_err("not restacked");
+
+        assert_eq!(
+            std::fs::read_to_string(&edited).unwrap(),
+            "edited in the submodule\n",
+            "{}",
+            describe(&failure)
+        );
+        assert_eq!(fixture.tip().as_deref(), Some(fixture.old_tip.as_str()));
+        fixture.assert_nothing_pushed();
+    }
+
+    /// A submodule the user replaced with a regular file during the stop is
+    /// a type change, not the rebase's moved pointer: the undo is refused
+    /// and the file is kept.
+    #[tokio::test]
+    async fn undoing_a_stop_refuses_a_submodule_replaced_by_a_file() {
+        let fixture = Fixture::with_submodule();
+        let restack = fixture.restack();
+        let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
+        assert_ne!(ran.code, Some(0));
+        let sub = fixture.worktree.join("sub");
+        std::fs::remove_dir_all(&sub).unwrap();
+        std::fs::write(&sub, "a file now\n").unwrap();
+
+        let failure = restack.settle(ran).await.expect_err("not restacked");
+
+        assert!(matches!(failure, RestackFailure::BranchMoved(_)), "{}", describe(&failure));
+        assert_eq!(std::fs::read_to_string(&sub).unwrap(), "a file now\n");
+        assert!(fixture.rebase_in_progress(), "the stop is left as it is");
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
+        fixture.assert_nothing_pushed();
     }
 
     /// When the rebase never started, SlashIt changed nothing, so it has

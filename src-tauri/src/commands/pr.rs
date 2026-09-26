@@ -3152,7 +3152,8 @@ const GITHUB_PR_COMMIT_LIST_LIMIT: usize = 250;
 ///   in the instant between the checks and the undo is put back on the
 ///   branch (what it was moved to stays in `HEAD`'s reflog). An edit inside
 ///   a path the stop left unmerged cannot be told from its conflict markers
-///   and is discarded with them. Resetting the files after a stop never
+///   and is discarded with them, as is a nested repository created at such a
+///   path. Resetting the files after a stop never
 ///   refuses: an edit or untracked file made in the instant between the
 ///   check and the reset is destroyed, and ignored files at paths the old
 ///   tip tracks are overwritten. A `.gitignore` that differs between the old
@@ -3512,7 +3513,8 @@ fn restack_failure_message(
 /// `slashit-restack/<uuid>` action, is taken as SlashIt's, however it was
 /// started. Nothing records which process started it. An edit inside a path
 /// that is still unmerged cannot be told from the conflict markers the stop
-/// wrote there, and is discarded with them.
+/// wrote there, and is discarded with them, as is a nested repository
+/// created at such a path.
 async fn recover_unfinished_restack(
     repo: &std::path::Path,
     worktree: Option<&std::path::Path>,
