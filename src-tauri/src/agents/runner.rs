@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
@@ -72,6 +73,8 @@ pub enum ToolAccess {
 /// Configuration for a Claude Code CLI run.
 #[derive(Debug, Clone)]
 pub struct ClaudeRunConfig {
+    /// Written to the child's stdin, never passed as an argument. See
+    /// [`ClaudeRunner::start_program`].
     pub prompt: String,
     pub working_dir: String,
     pub tools: ToolAccess,
@@ -99,12 +102,17 @@ pub struct ClaudeRunConfig {
 ///
 /// Separate from [`ClaudeRunner::start_program`] so the capability flags a
 /// configuration produces can be tested without spawning anything.
+///
+/// The prompt is not among them. `-p` with no prompt argument makes the CLI
+/// read the prompt from stdin, which is where `start_program` writes it: an
+/// argument is capped at `MAX_ARG_STRLEN` (128 KiB on Linux) and is readable
+/// by any local process through `/proc/<pid>/cmdline`, and a prompt carries
+/// review comments, diffs and task descriptions of any size.
 pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     let mut push = |a: &str| args.push(a.into());
 
     push("-p");
-    push(&config.prompt);
     push("--verbose");
     push("--output-format");
     push("stream-json");
@@ -245,6 +253,39 @@ pub struct ClaudeRunner {
     /// exit-code success only, not on `result_error`) reads this instead of
     /// `wait()`'s return value.
     exit_status: Arc<RwLock<ExitStatusInfo>>,
+    /// The task writing the prompt to the child's stdin. Started at spawn;
+    /// [`Self::wait`] joins it once the child has exited, and [`Self::kill`]
+    /// and `Drop` abort it.
+    prompt_writer: Mutex<Option<tauri::async_runtime::JoinHandle<Result<(), String>>>>,
+    /// Set by the writer once the whole prompt is in the pipe, before it
+    /// closes its end. A child cannot see EOF before this is set, so a child
+    /// that has exited while it is still unset left without the whole
+    /// prompt. See [`Self::finish_prompt_writer`].
+    prompt_written: Arc<AtomicBool>,
+    /// Why the prompt did not reach the child, once [`Self::wait`] has found
+    /// out. `None` until then, and after a run that received it.
+    prompt_failure: Arc<RwLock<Option<String>>>,
+}
+
+impl Drop for ClaudeRunner {
+    /// The writer is a detached task holding the pipe's write end. It ends
+    /// by itself when the child's end closes, but a process outside the
+    /// child's group can hold that end open, so it is not left to chance.
+    ///
+    /// A live child is signalled first, in the same order as [`Self::kill`],
+    /// so it never sees the prompt cut short by an EOF. `kill_on_drop` would
+    /// only signal it after this returns, and only the leader.
+    fn drop(&mut self) {
+        // Still unreaped while `id()` answers, so the group id is still the
+        // one this runner spawned (see `wait`).
+        #[cfg(unix)]
+        if let Some(pid) = self.child.try_lock().ok().and_then(|child| child.id()) {
+            Self::kill_process_group(pid);
+        }
+        if let Some(writer) = self.prompt_writer.get_mut().take() {
+            writer.abort();
+        }
+    }
 }
 
 impl ClaudeRunner {
@@ -256,8 +297,16 @@ impl ClaudeRunner {
     /// Start `program` with the Claude Code CLI argument set.
     ///
     /// Split out from [`start`] only so the tests can point the runner at a
-    /// stand-in process that follows the same stdout/exit contract. Production
-    /// has exactly one caller and it passes `"claude"`.
+    /// stand-in process that follows the same stdin/stdout/exit contract.
+    /// Production has exactly one caller and it passes `"claude"`.
+    ///
+    /// The prompt goes to the child's stdin (see [`claude_args`] for why).
+    /// The CLI reads stdin to EOF before it starts, so a separate task writes
+    /// the whole prompt and then closes the pipe, while the stdout and stderr
+    /// drains run alongside it: a prompt larger than the pipe buffer can then
+    /// never wait on a child that is itself waiting for room to write its
+    /// output. The writer starts at spawn, and it has to: a CLI that sees no
+    /// stdin data within its first few seconds gives up on stdin.
     async fn start_program(
         program: impl AsRef<std::ffi::OsStr>,
         config: ClaudeRunConfig,
@@ -267,6 +316,7 @@ impl ClaudeRunner {
         cmd.args(claude_args(&config));
 
         cmd.current_dir(&config.working_dir);
+        cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -316,7 +366,15 @@ impl ClaudeRunner {
         // the exit wait would never start at all.
         let stderr = child.stderr.take();
 
+        // Piped above, so always present. Returning here drops the child,
+        // and `kill_on_drop` ends it.
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Failed to open claude's stdin for the prompt".to_string())?;
+
         let (event_tx, _) = broadcast::channel(512);
+        let prompt_written = Arc::new(AtomicBool::new(false));
 
         let runner = Self {
             child: Arc::new(Mutex::new(child)),
@@ -329,13 +387,96 @@ impl ClaudeRunner {
             raw_stdout: Arc::new(RwLock::new(String::new())),
             raw_stderr: Arc::new(RwLock::new(String::new())),
             exit_status: Arc::new(RwLock::new(None)),
+            prompt_writer: Mutex::new(None),
+            prompt_written: prompt_written.clone(),
+            prompt_failure: Arc::new(RwLock::new(None)),
         };
 
         let handle = runner.start_reader(stdout);
         *runner.reader_handle.lock().await = Some(handle);
         *runner.stderr_handle.lock().await = stderr.map(Self::start_stderr_drain);
+        *runner.prompt_writer.lock().await =
+            Some(Self::start_prompt_writer(stdin, config.prompt, prompt_written));
 
         Ok(runner)
+    }
+
+    /// Spawn the task that writes `prompt` to the child's stdin and then
+    /// closes it, which is the EOF the CLI waits for before it starts.
+    ///
+    /// A write error is the task's result, for [`Self::wait`] to report. The
+    /// usual one is `EPIPE`: the child exited, or closed its stdin, before it
+    /// had read everything. Rust ignores `SIGPIPE`, so that arrives as an
+    /// error here rather than as a signal that ends this process.
+    fn start_prompt_writer(
+        mut stdin: tokio::process::ChildStdin,
+        prompt: String,
+        written: Arc<AtomicBool>,
+    ) -> tauri::async_runtime::JoinHandle<Result<(), String>> {
+        tauri::async_runtime::spawn(async move {
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .map_err(|e| format!("Failed to write the prompt to claude's stdin: {e}"))?;
+            // A no-op on Unix, where `write_all` returns only once the bytes
+            // are in the pipe. On Windows, tokio's `ChildStdin` hands each
+            // write to the blocking pool and reports it done at once, so a
+            // failed write only surfaces here.
+            stdin
+                .flush()
+                .await
+                .map_err(|e| format!("Failed to write the prompt to claude's stdin: {e}"))?;
+            // Before the close, so it is set by the time the child can see
+            // EOF. See `finish_prompt_writer`.
+            written.store(true, Ordering::SeqCst);
+            drop(stdin);
+            Ok(())
+        })
+    }
+
+    /// Why the prompt did not reach the child, if it did not. Only known once
+    /// [`Self::wait`] has seen the child exit; `None` before that.
+    ///
+    /// [`Self::wait`] already fails such a run. This is for a caller that
+    /// judges the run by [`Self::exit_status`] instead, as
+    /// `commands::pr::run_claude_pr_helper` does.
+    pub async fn prompt_failure(&self) -> Option<String> {
+        self.prompt_failure.read().await.clone()
+    }
+
+    /// Join the prompt writer once the child has exited, and say why the
+    /// prompt did not arrive if it did not.
+    ///
+    /// With the child gone, a writer that has not yet written everything
+    /// never will: whatever is left had no reader. It usually fails with
+    /// `EPIPE` by itself, but a descendant outside the child's process group
+    /// could still hold the read end open without reading it, and joining a
+    /// writer blocked on that would never return. So an unfinished writer
+    /// is aborted rather than awaited. One that has written everything only
+    /// has its close left to do, and is simply joined.
+    async fn finish_prompt_writer(&self) -> Option<String> {
+        let writer = self.prompt_writer.lock().await.take()?;
+        if !self.prompt_written.load(Ordering::SeqCst) {
+            writer.abort();
+        }
+        match writer.await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(tauri::Error::JoinError(error)) if error.is_panic() => {
+                Some(format!("The task writing the prompt to claude's stdin panicked: {error}"))
+            }
+            Err(_) => Some("claude exited before it read the whole prompt from stdin".to_string()),
+        }
+    }
+
+    /// Whether the prompt writer has ended, for the cancellation tests.
+    #[cfg(test)]
+    async fn prompt_writer_finished(&self) -> bool {
+        self.prompt_writer
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(|writer| writer.inner().is_finished())
     }
 
     /// Subscribe to events.
@@ -388,15 +529,32 @@ impl ClaudeRunner {
     /// place: `wait()` does its own group cleanup before it reaps the child,
     /// for the reason documented there, so by the time this runs on that path
     /// there is nothing left for the group signal below to do.
+    ///
+    /// The prompt writer is aborted too, after the child is gone so that the
+    /// child never sees a truncated prompt end in EOF. Killing the group
+    /// normally ends the writer anyway, with `EPIPE`, but not if a process
+    /// outside the group holds the pipe's read end. It is aborted rather than
+    /// taken, so a later [`wait`](Self::wait) still joins it and reports the
+    /// run as failed.
     pub async fn kill(&self) -> Result<(), String> {
-        let mut child = self.child.lock().await;
+        let killed = {
+            let mut child = self.child.lock().await;
 
-        #[cfg(unix)]
-        if let Some(pid) = child.id() {
-            Self::kill_process_group(pid);
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                Self::kill_process_group(pid);
+            }
+
+            child.kill().await.map_err(|e| format!("Failed to kill claude: {}", e))
+        };
+
+        // Taken only after the child lock is released: `wait()` holds that
+        // lock while it joins the writer.
+        if let Some(writer) = self.prompt_writer.lock().await.as_ref() {
+            writer.abort();
         }
 
-        child.kill().await.map_err(|e| format!("Failed to kill claude: {}", e))
+        killed
     }
 
     /// Signal the whole group a spawned agent leads.
@@ -453,7 +611,11 @@ impl ClaudeRunner {
     }
 
     /// Wait for the process to complete and return exit status.
-    /// On failure, includes stderr in the error message.
+    /// On failure, includes stderr in the error message. A child that exits
+    /// 0 is still a failure when the prompt writer saw it leave early: the
+    /// write failed, or had not finished when the child exited. A prompt
+    /// small enough to sit whole in the pipe buffer counts as delivered once
+    /// written, whether or not the child ever read it.
     pub async fn wait(&self) -> Result<bool, String> {
         let mut child = self.child.lock().await;
 
@@ -486,6 +648,12 @@ impl ClaudeRunner {
         // of exit status and `result_error`) can always read it once this
         // point is reached, regardless of which branch this takes next.
         *self.exit_status.write().await = Some((status.success(), status.code()));
+
+        // Recorded before the exit status is judged, like the exit status
+        // itself, so a caller that judges by `exit_status()` can still tell
+        // the prompt never arrived.
+        let prompt_failure = self.finish_prompt_writer().await;
+        *self.prompt_failure.write().await = prompt_failure.clone();
 
         // Collect stderr now that process has exited
         let stderr_text = match stderr_handle {
@@ -522,6 +690,13 @@ impl ClaudeRunner {
                 return Err(reason);
             }
             return Err(format!("Exit code {} — {}", code, stderr_summary));
+        }
+
+        // Checked after a failed exit, which has a reason of its own that
+        // says more than the broken pipe that followed from it, and before a
+        // result event, which answers a prompt the child never fully had.
+        if let Some(reason) = prompt_failure {
+            return Err(reason);
         }
 
         // Check for Claude-level errors (exit code 0 but is_error: true in result)
@@ -814,14 +989,24 @@ mod args_tests {
         assert!(!args.iter().any(|a| a == "--system-prompt"));
     }
 
+    /// The prompt goes to the child's stdin (see `ClaudeRunner::start_program`),
+    /// never into argv, whatever the tool access: `-p` takes no value, and no
+    /// argument carries any of the prompt's text.
     #[test]
-    fn the_prompt_is_a_single_argument_after_dash_p() {
-        let mut cfg = config(ToolAccess::ReadOnly);
-        cfg.prompt = "line one\n--tools Bash\n".into();
-        let args = args(&cfg);
-        assert_eq!(args[0], "-p");
-        assert_eq!(args[1], cfg.prompt);
-        assert_eq!(value_of(&args, "--tools"), Some("Read,Glob,Grep"));
+    fn the_prompt_is_not_passed_in_argv() {
+        let full = ToolAccess::Full { auto_approve: vec!["Read".into()], permission_mode: None };
+        for tools in [ToolAccess::ReadOnly, full] {
+            let mut cfg = config(tools);
+            cfg.prompt = "PROMPT-LINE-ONE\n--tools Bash\n".into();
+            let args = args(&cfg);
+            assert_eq!(args[0], "-p");
+            assert_eq!(args[1], "--verbose", "-p is a bare flag: {args:?}");
+            assert!(
+                !args.iter().any(|a| a.contains("PROMPT-LINE-ONE") || a.contains("--tools Bash")),
+                "the prompt leaked into argv: {args:?}"
+            );
+            assert_ne!(value_of(&args, "--tools"), Some("Bash"), "{args:?}");
+        }
     }
 }
 
@@ -959,6 +1144,71 @@ mod tests {
     /// A Claude Code older than `--restricted`: it rejects the flag the way
     /// the CLI rejects any unknown option, and otherwise runs normally.
     const NO_RESTRICTED: &str = "no-restricted";
+
+    /// Copies its stdin to `prompt` and its arguments, NUL-terminated, to
+    /// `argv`, and reports the number of bytes it read as its result. It
+    /// reads to EOF before answering, so a run that finishes has also seen
+    /// the prompt end.
+    const STDIN_ECHO: &str = "stdin_echo";
+
+    /// Reports success without reading its stdin.
+    const IGNORES_STDIN: &str = "ignores_stdin";
+
+    /// Blocks after handing its stdin to a process that the process-group
+    /// kill does not reach and that never reads. It announces that process
+    /// in `holder.pid` and itself in `blocked.pid`.
+    #[cfg(target_os = "linux")]
+    const STDIN_HELD_ELSEWHERE: &str = "stdin_held_elsewhere";
+
+    /// A prompt no pipe can buffer in full: four times the largest size an
+    /// unprivileged process can raise a pipe to (`/proc/sys/fs/pipe-max-size`,
+    /// 1 MiB by default). Writing it only finishes if the child reads it.
+    const UNBUFFERABLE_PROMPT: usize = 4 << 20;
+
+    /// Larger than `MAX_ARG_STRLEN` (32 pages, 128 KiB on Linux), the most a
+    /// single argv string may hold.
+    const OVER_ARG_LIMIT_PROMPT: usize = 300 << 10;
+
+    impl Fixture {
+        fn config_with_prompt(&self, prompt: &str, tools: ToolAccess) -> ClaudeRunConfig {
+            ClaudeRunConfig { prompt: prompt.to_string(), tools, ..self.config() }
+        }
+
+        async fn start_with(&self, config: ClaudeRunConfig) -> ClaudeRunner {
+            ClaudeRunner::start_program(&self.program, config)
+                .await
+                .expect("fixture should spawn")
+        }
+
+        /// What the `stdin_echo` fixture read from its stdin.
+        fn recorded_prompt(&self) -> Vec<u8> {
+            std::fs::read(self.dir.path().join("prompt")).expect("the fixture recorded its stdin")
+        }
+
+        /// The arguments the `stdin_echo` fixture was started with.
+        fn recorded_argv(&self) -> Vec<Vec<u8>> {
+            let raw = std::fs::read(self.dir.path().join("argv")).expect("the fixture recorded argv");
+            let mut fields: Vec<Vec<u8>> = raw.split(|b| *b == 0).map(<[u8]>::to_vec).collect();
+            // Every field is NUL-terminated, which leaves one empty piece.
+            assert_eq!(fields.pop().as_deref(), Some(&[][..]));
+            fields
+        }
+    }
+
+    fn read_only() -> ToolAccess {
+        ToolAccess::ReadOnly
+    }
+
+    fn full() -> ToolAccess {
+        ToolAccess::Full {
+            auto_approve: vec!["Read".to_string(), "Edit".to_string(), "Bash".to_string()],
+            permission_mode: None,
+        }
+    }
+
+    fn filler(len: usize) -> String {
+        "0123456789abcdef\n".chars().cycle().take(len).collect()
+    }
 
     async fn bounded(label: &str, runner: &ClaudeRunner) -> Result<bool, String> {
         match tokio::time::timeout(DEADLINE, runner.wait()).await {
@@ -1416,6 +1666,223 @@ mod tests {
                 unix_pid_is_alive(descendant_pid)
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // ---- Prompt transport ---------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_prompt_arrives_on_stdin_and_never_in_argv() {
+        for (label, tools) in [("read-only", read_only()), ("full", full())] {
+            let fixture = Fixture::new(STDIN_ECHO);
+            let prompt = "PROMPT-MARKER: review this change\n--tools Bash\n";
+            let config = fixture.config_with_prompt(prompt, tools);
+            let expected_argv: Vec<Vec<u8>> = claude_args(&config)
+                .into_iter()
+                .map(|a| a.into_encoded_bytes())
+                .collect();
+
+            let runner = fixture.start_with(config).await;
+            assert_eq!(bounded(label, &runner).await, Ok(true), "{label}");
+
+            let argv = fixture.recorded_argv();
+            assert_eq!(argv, expected_argv, "{label}: the child got exactly claude_args");
+            assert!(
+                !argv.iter().any(|a| a.windows(13).any(|w| w == b"PROMPT-MARKER")),
+                "{label}: the prompt leaked into argv"
+            );
+            assert_eq!(fixture.recorded_prompt(), prompt.as_bytes(), "{label}");
+            assert_eq!(runner.get_output().await, prompt.len().to_string(), "{label}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_prompt_arrives_byte_for_byte() {
+        let fixture = Fixture::new(STDIN_ECHO);
+        let mut prompt = String::new();
+        for line in 0..200 {
+            prompt.push_str(&format!("line {line}: ünïcødé ✓ 漢字 🦀 \t tab \r cr \x01\x1b[31m\x7f\n"));
+        }
+        prompt.push_str("\n\n-p --dangerously-skip-permissions\n$(echo not run) `x` 'q' \"dq\" \\ \n");
+        prompt.push_str("no trailing newline");
+
+        let runner = fixture.start_with(fixture.config_with_prompt(&prompt, read_only())).await;
+        assert_eq!(bounded("unicode prompt", &runner).await, Ok(true));
+        assert_eq!(fixture.recorded_prompt(), prompt.as_bytes());
+    }
+
+    /// The limit this transport exists to avoid, shown on the same program:
+    /// the prompt as one argument cannot even be spawned, and on stdin it
+    /// runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_larger_than_an_argument_may_be_still_runs() {
+        let fixture = Fixture::new(STDIN_ECHO);
+        let prompt = filler(OVER_ARG_LIMIT_PROMPT);
+
+        let as_argument = std::process::Command::new(&fixture.program)
+            .arg(&prompt)
+            .current_dir(fixture.dir.path())
+            .spawn();
+        assert_eq!(
+            as_argument.map(|_| ()).map_err(|e| e.raw_os_error()),
+            Err(Some(libc::E2BIG)),
+            "a {OVER_ARG_LIMIT_PROMPT}-byte argument should exceed MAX_ARG_STRLEN"
+        );
+
+        let runner = fixture.start_with(fixture.config_with_prompt(&prompt, full())).await;
+        assert_eq!(bounded("large prompt", &runner).await, Ok(true));
+        assert_eq!(fixture.recorded_prompt().len(), prompt.len());
+        assert_eq!(fixture.recorded_prompt(), prompt.as_bytes());
+    }
+
+    /// A child that reports success without taking its prompt did not do
+    /// what it was asked, so the run fails even though the exit status is 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_that_exits_without_reading_its_prompt_fails() {
+        let fixture = Fixture::new(IGNORES_STDIN);
+        for attempt in 0..5 {
+            let config = fixture.config_with_prompt(&filler(UNBUFFERABLE_PROMPT), full());
+            let runner = fixture.start_with(config).await;
+            let error = bounded(&format!("ignored prompt {attempt}"), &runner)
+                .await
+                .expect_err("an undelivered prompt must not be reported as success");
+            assert!(error.contains("prompt"), "attempt {attempt}: {error}");
+            assert_eq!(runner.exit_status().await, Some((true, Some(0))), "attempt {attempt}");
+            assert_eq!(runner.prompt_failure().await, Some(error), "attempt {attempt}");
+        }
+    }
+
+    /// When the child failed on its own account, that is the reason
+    /// reported: its exit code and stderr say more than the broken pipe the
+    /// prompt writer saw as a consequence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_exit_keeps_its_own_reason_over_an_undelivered_prompt() {
+        let fixture = Fixture::new(CRASHING);
+        let config = fixture.config_with_prompt(&filler(UNBUFFERABLE_PROMPT), full());
+        let runner = fixture.start_with(config).await;
+        let error = bounded("crash before reading", &runner)
+            .await
+            .expect_err("a non-zero exit is an error");
+        assert_eq!(error, "Exit code 3 — something went wrong in the CLI");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_program_that_cannot_start_is_still_a_spawn_failure() {
+        let fixture = Fixture::new(STDIN_ECHO);
+        let missing = fixture.dir.path().join("no-such-claude");
+        let error = match ClaudeRunner::start_program(&missing, fixture.config()).await {
+            Ok(_) => panic!("a missing program must not start"),
+            Err(error) => error,
+        };
+        assert!(error.starts_with("Failed to spawn claude"), "{error}");
+    }
+
+    /// Wait until the prompt writer has ended, or fail saying it did not.
+    async fn writer_ends(runner: &ClaudeRunner, label: &str) {
+        let started = std::time::Instant::now();
+        while !runner.prompt_writer_finished().await {
+            assert!(
+                started.elapsed() < DEADLINE,
+                "{label}: the prompt writer was still running {DEADLINE:?} after the kill"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Cancelled while the writer is blocked on a pipe the child never
+    /// reads: the kill ends the child, the writer ends with it, and a wait
+    /// afterwards reports a failure rather than hanging on the writer.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_run_that_has_not_read_its_prompt_ends_the_writer() {
+        let fixture = Fixture::new(BLOCKING);
+        let config = fixture.config_with_prompt(&filler(UNBUFFERABLE_PROMPT), full());
+        let runner = fixture.start_with(config).await;
+        let pid = blocked_pid(&fixture).await;
+        assert!(!runner.prompt_writer_finished().await, "setup: the writer must be blocked");
+
+        tokio::time::timeout(DEADLINE, runner.kill())
+            .await
+            .expect("kill must not wait for the prompt writer")
+            .expect("kill must succeed");
+        assert!(!is_alive(pid));
+        writer_ends(&runner, "blocked child").await;
+
+        let error = bounded("wait after kill", &runner).await.expect_err("a killed run failed");
+        assert!(!error.is_empty());
+    }
+
+    /// Kills whatever process it names when dropped, so a failed assertion
+    /// does not leave the fixture's session-escaped reader behind.
+    #[cfg(target_os = "linux")]
+    struct KillOnDrop(u32);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            // Safety: a plain signal to a pid this test's fixture announced.
+            unsafe {
+                libc::kill(self.0 as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// The same cancellation, where killing the child's process group does
+    /// not close the prompt pipe: a process outside that group still holds
+    /// its read end. The writer can then only end because `kill()` ends it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_ends_the_writer_even_when_another_process_holds_the_pipe() {
+        let fixture = Fixture::new(STDIN_HELD_ELSEWHERE);
+        let config = fixture.config_with_prompt(&filler(UNBUFFERABLE_PROMPT), full());
+        let runner = fixture.start_with(config).await;
+        let holder = KillOnDrop(unix_announced_pid(&fixture, "holder.pid").await);
+        let pid = blocked_pid(&fixture).await;
+        assert!(!runner.prompt_writer_finished().await, "setup: the writer must be blocked");
+
+        tokio::time::timeout(DEADLINE, runner.kill())
+            .await
+            .expect("kill must not wait for the prompt writer")
+            .expect("kill must succeed");
+        assert!(!is_alive(pid));
+        assert!(unix_pid_is_alive(holder.0), "setup: the pipe must still have a reader");
+        writer_ends(&runner, "pipe held elsewhere").await;
+
+        let error = bounded("wait after kill", &runner).await.expect_err("a killed run failed");
+        assert!(!error.is_empty());
+    }
+
+    /// Smoke test against the real Claude Code CLI on `PATH`, for checking a
+    /// CLI upgrade by hand: `cargo test -p slashit-ui --lib
+    /// real_cli_reads_the_prompt_from_stdin -- --ignored`. It needs a
+    /// logged-in CLI and spends a few tokens, so it never runs by default.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "runs the real Claude Code CLI, which needs a login and spends tokens"]
+    async fn real_cli_reads_the_prompt_from_stdin() {
+        for (label, tools) in [("read-only", read_only()), ("full", full())] {
+            let dir = TempDir::new().expect("temp dir");
+            let config = ClaudeRunConfig {
+                prompt: "Reply with exactly the word PONG and nothing else.\n".to_string(),
+                working_dir: dir.path().to_string_lossy().into_owned(),
+                tools,
+                max_turns: Some(1),
+                max_budget_usd: None,
+                session_id: None,
+                resume_session: None,
+                model: None,
+                system_prompt: None,
+                append_system_prompt: None,
+                disable_mcp: true,
+                additional_dirs: Vec::new(),
+            };
+            let runner = ClaudeRunner::start(config).await.expect("claude should start");
+            let result = tokio::time::timeout(Duration::from_secs(120), runner.wait())
+                .await
+                .unwrap_or_else(|_| panic!("{label}: the real CLI did not finish"));
+            assert_eq!(result, Ok(true), "{label}: {}", runner.get_output().await);
+            assert_eq!(runner.prompt_failure().await, None, "{label}");
+            assert!(runner.get_output().await.contains("PONG"), "{label}: {}", runner.get_output().await);
         }
     }
 }

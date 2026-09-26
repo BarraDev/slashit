@@ -5,6 +5,8 @@ for arg in "$@"; do
         exit 1
     fi
 done
+# Like the real CLI: options are parsed before the prompt is read.
+cat > /dev/null
 printf '{"type":"system","subtype":"init","session_id":"s-old","model":"fixture-model"}\n'
 printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-old","result":"done"}\n'
 exit 0

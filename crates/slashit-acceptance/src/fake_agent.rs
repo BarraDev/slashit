@@ -25,6 +25,10 @@ const EXECUTABLE: &str = "claude";
 /// the invocation's position in start order.
 const RECORD_PREFIX: &str = "invocation-";
 
+/// The directory, inside the marker directory, where an agent run keeps the
+/// prompt it read from stdin, under its position in start order.
+const PROMPT_DIR: &str = ".prompts";
+
 /// The variable the script writes its invocation records into. Set on the
 /// application process tree alongside `PATH`, and inherited by the agent
 /// because the runner does not clear the environment it passes on.
@@ -134,6 +138,10 @@ pub struct Invocation {
     pub working_dir: PathBuf,
     /// Everything after the program name, in order.
     pub args: Vec<OsString>,
+    /// What an agent run read from stdin, which is where the product passes
+    /// the prompt. `None` for an invocation that is not an agent run, such
+    /// as `claude --version`, which reads nothing.
+    pub prompt: Option<String>,
 }
 
 impl Invocation {
@@ -283,7 +291,12 @@ impl FakeAgent {
         }
         records.sort_by_key(|(position, _)| *position);
 
-        records.iter().map(|(_, path)| read_invocation(path)).collect()
+        records
+            .iter()
+            .map(|(position, path)| {
+                read_invocation(path, &self.marker_dir.join(PROMPT_DIR).join(position.to_string()))
+            })
+            .collect()
     }
 
     /// How many times the fixture has run.
@@ -452,7 +465,8 @@ impl FakeAgent {
 }
 
 /// Parse one NUL-separated record: the working directory, then the arguments.
-fn read_invocation(path: &Path) -> Result<Invocation> {
+/// The prompt, if the run read one, is the file at `prompt_path`.
+fn read_invocation(path: &Path, prompt_path: &Path) -> Result<Invocation> {
     use std::os::unix::ffi::OsStringExt;
 
     let raw = std::fs::read(path)
@@ -476,9 +490,20 @@ fn read_invocation(path: &Path) -> Result<Invocation> {
     }
 
     let working_dir = PathBuf::from(fields.remove(0));
+    let prompt = match std::fs::read(prompt_path) {
+        // Lossy: a run killed mid-read can leave a split character at the
+        // end, which must not hide every other record.
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("could not read the prompt {}", prompt_path.display()))
+        }
+    };
     Ok(Invocation {
         working_dir,
         args: fields,
+        prompt,
     })
 }
 
@@ -543,10 +568,9 @@ mod tests {
         let root = scratch("runs");
         let agent = FakeAgent::install(&root).expect("install");
 
-        let output = std::process::Command::new(agent.executable())
+        let mut child = std::process::Command::new(agent.executable())
             .args([
                 "-p",
-                "a prompt\nwith a newline in it",
                 "--verbose",
                 "--output-format",
                 "stream-json",
@@ -555,8 +579,21 @@ mod tests {
             ])
             .current_dir(&root)
             .env(MARKER_DIR_VAR, agent.marker_dir())
-            .output()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .expect("run the fixture");
+        {
+            use std::io::Write;
+            // Dropped at the end of the block, which is the EOF the fixture
+            // waits for.
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin
+                .write_all("a prompt\nwith a newline in it".as_bytes())
+                .expect("write the prompt");
+        }
+        let output = child.wait_with_output().expect("run the fixture");
 
         assert!(
             output.status.success(),
@@ -600,8 +637,8 @@ mod tests {
         assert!(invocation.has_flag("--verbose"));
         // The prompt survives the round trip intact, newline and all.
         assert_eq!(
-            invocation.flag("-p"),
-            Some(OsStr::new("a prompt\nwith a newline in it"))
+            invocation.prompt.as_deref(),
+            Some("a prompt\nwith a newline in it")
         );
 
         std::fs::remove_dir_all(&root).expect("clean up");
@@ -660,7 +697,7 @@ mod tests {
         let sessions: Vec<String> = (1..=12).map(|n| format!("run-{n}")).collect();
         for session in &sessions {
             let run = std::process::Command::new(agent.executable())
-                .args(["-p", "do the work", "--session-id", session])
+                .args(["-p", "--session-id", session])
                 .env(MARKER_DIR_VAR, agent.marker_dir())
                 .output()
                 .expect("run the fixture");
@@ -691,7 +728,7 @@ mod tests {
         );
 
         let second = std::process::Command::new(agent.executable())
-            .args(["-p", "do the work", "--session-id", "second"])
+            .args(["-p", "--session-id", "second"])
             .env(MARKER_DIR_VAR, agent.marker_dir())
             .output()
             .expect("run the fixture");
@@ -716,8 +753,9 @@ mod tests {
         let runs: Vec<std::process::Child> = (1..=8)
             .map(|n| {
                 std::process::Command::new(agent.executable())
-                    .args(["-p", "do the work", "--session-id", &format!("together-{n}")])
+                    .args(["-p", "--session-id", &format!("together-{n}")])
                     .env(MARKER_DIR_VAR, agent.marker_dir())
+                    .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .spawn()
                     .expect("start the fixture")
@@ -772,14 +810,14 @@ mod tests {
         let probe = run(&["--version"]);
         assert_eq!(probe["is_error"], false, "a version probe never fails");
 
-        let first = run(&["-p", "do the work", "--session-id", "one"]);
+        let first = run(&["-p", "--session-id", "one"]);
         assert_eq!(
             first["is_error"], true,
             "the first agent run is scripted to fail"
         );
         assert_eq!(first["result"], REPORTED_FAILURE);
 
-        let second = run(&["-p", "do the work", "--session-id", "two"]);
+        let second = run(&["-p", "--session-id", "two"]);
         assert_eq!(
             second["is_error"], false,
             "only the first run was scripted to fail"
@@ -829,9 +867,10 @@ mod tests {
     fn blocking_run(agent: &FakeAgent, releases: &Path, session: &str) -> OwnedRun {
         OwnedRun(
             std::process::Command::new(agent.executable())
-                .args(["-p", "do the work", "--session-id", session])
+                .args(["-p", "--session-id", session])
                 .env(MARKER_DIR_VAR, agent.marker_dir())
                 .env(BLOCK_DIR_VAR, releases)
+                .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .expect("start the fixture"),
@@ -1123,7 +1162,7 @@ mod tests {
         let agent = FakeAgent::install(&root).expect("install");
 
         let run = std::process::Command::new(agent.executable())
-            .args(["-p", "do the work", "--session-id", "free"])
+            .args(["-p", "--session-id", "free"])
             .env(MARKER_DIR_VAR, agent.marker_dir())
             .output()
             .expect("run the fixture");

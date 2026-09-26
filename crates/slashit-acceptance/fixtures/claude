@@ -1,7 +1,8 @@
 #!/bin/sh
 # A stand-in for the Claude Code CLI, used by the SlashIt acceptance journeys.
-# It never contacts a model. It records how it was called and emits the
-# smallest stream-json exchange the real runner treats as a success.
+# It never contacts a model. It records how it was called, including the prompt
+# an agent run reads from stdin, and emits the smallest stream-json exchange the
+# real runner treats as a success.
 set -e
 
 if [ -z "$SLASHIT_FAKE_AGENT_MARKERS" ]; then
@@ -23,21 +24,10 @@ while ! mkdir "$sequence/$position" 2>/dev/null; do
     position=$((position + 1))
 done
 
-# Written in a staging directory and moved into place, because the test polls
-# this directory while the agent is running: `mktemp` creates the file before
-# anything is in it, so a reader could otherwise see a record that exists but
-# is still empty. A rename within one filesystem is atomic, so only finished
-# records are ever visible.
-staging="$SLASHIT_FAKE_AGENT_MARKERS/.staging"
-mkdir -p "$staging"
-record=$(mktemp "$staging/XXXXXX")
-printf '%s\0' "$PWD" "$@" > "$record"
-mv "$record" "$SLASHIT_FAKE_AGENT_MARKERS/invocation-$position"
-
-# Echo the session id back, so the caller can tie this run to the one it asked
-# for rather than to any run at all.
-# The prompt flag is noted in the same pass: it is what separates an agent run
-# from `--version`, which a real CLI also answers without doing any work.
+# The session id is echoed back, so the caller can tie this run to the one it
+# asked for rather than to any run at all. The prompt flag is noted in the same
+# pass: it is what separates an agent run from `--version`, which a real CLI
+# also answers without doing any work.
 session=""
 take_next=""
 is_run=""
@@ -52,6 +42,26 @@ for arg in "$@"; do
         -p) is_run="yes" ;;
     esac
 done
+
+# An agent run reads its prompt from stdin to EOF before it answers, as
+# `claude -p` without a prompt argument does. It is kept under the same
+# position as the record, and written before the record appears, so a visible
+# record always has its prompt next to it.
+if [ -n "$is_run" ]; then
+    mkdir -p "$SLASHIT_FAKE_AGENT_MARKERS/.prompts"
+    cat > "$SLASHIT_FAKE_AGENT_MARKERS/.prompts/$position"
+fi
+
+# Written in a staging directory and moved into place, because the test polls
+# this directory while the agent is running: `mktemp` creates the file before
+# anything is in it, so a reader could otherwise see a record that exists but
+# is still empty. A rename within one filesystem is atomic, so only finished
+# records are ever visible.
+staging="$SLASHIT_FAKE_AGENT_MARKERS/.staging"
+mkdir -p "$staging"
+record=$(mktemp "$staging/XXXXXX")
+printf '%s\0' "$PWD" "$@" > "$record"
+mv "$record" "$SLASHIT_FAKE_AGENT_MARKERS/invocation-$position"
 
 printf '{"type":"system","subtype":"init","session_id":"%s","model":"slashit-fake-agent"}\n' "$session"
 

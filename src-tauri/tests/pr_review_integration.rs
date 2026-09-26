@@ -2,7 +2,8 @@
 //! exercised end-to-end against mock `claude` and `gh` binaries on PATH.
 //!
 //! No real PR, no real LLM, no network. The mocks are tiny shell scripts
-//! that record their argv to a log file and emit a canned response. Each
+//! that record their argv to a log file and emit a canned response; the
+//! `claude` mock also records the prompt it reads from stdin. Each
 //! test sets PATH to a temp directory containing those mocks (prepended),
 //! then runs the inner function.
 //!
@@ -59,10 +60,16 @@ struct MockEnv {
     _tmp: tempfile::TempDir,
     bin_dir: std::path::PathBuf,
     claude_log: std::path::PathBuf,
+    /// Every prompt `claude` read from its stdin, each followed by
+    /// [`END_PROMPT`] on a line of its own.
+    claude_prompts: std::path::PathBuf,
     gh_log: std::path::PathBuf,
     working_dir: std::path::PathBuf,
     saved_path: Option<String>,
 }
+
+#[cfg(unix)]
+const END_PROMPT: &str = "---END-PROMPT---";
 
 #[cfg(unix)]
 impl MockEnv {
@@ -74,13 +81,15 @@ impl MockEnv {
         fs::create_dir_all(&working_dir).unwrap();
 
         let claude_log = tmp.path().join("claude.log");
+        let claude_prompts = tmp.path().join("claude.prompts");
         let gh_log = tmp.path().join("gh.log");
 
-        // Mock `claude` — emits one stream-json `result` event so
+        // Mock `claude` — reads its prompt from stdin, as `claude -p` does,
+        // then emits one stream-json `result` event so
         // extract_text_from_stream_json picks it up.
         let claude_script = format!(
-            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\nprintf '%s\\n' '{{\"type\":\"result\",\"result\":{result:?}}}'\n",
-            log = claude_log,
+            "#!/bin/sh\n{record}printf '%s\\n' '{{\"type\":\"result\",\"result\":{result:?}}}'\n",
+            record = record_claude_run(&claude_log, &claude_prompts),
             result = claude_result,
         );
         write_executable(&bin_dir.join("claude"), &claude_script);
@@ -107,6 +116,7 @@ impl MockEnv {
             _tmp: tmp,
             bin_dir,
             claude_log,
+            claude_prompts,
             gh_log,
             working_dir,
             saved_path,
@@ -123,6 +133,16 @@ impl MockEnv {
 
     fn read_gh_log(&self) -> String {
         fs::read_to_string(&self.gh_log).unwrap_or_default()
+    }
+
+    /// The prompt of every `claude` run, in order.
+    fn claude_prompts(&self) -> Vec<String> {
+        let log = fs::read_to_string(&self.claude_prompts).unwrap_or_default();
+        let mut prompts: Vec<String> =
+            log.split(&format!("\n{END_PROMPT}\n")).map(str::to_string).collect();
+        // Every prompt is terminated, which leaves one empty piece.
+        assert_eq!(prompts.pop().as_deref(), Some(""), "a truncated prompt log:\n{log}");
+        prompts
     }
 
     fn claude_invocations(&self) -> usize {
@@ -146,6 +166,31 @@ impl Drop for MockEnv {
         }
         let _ = &self.bin_dir; // touch field to silence unused warnings
     }
+}
+
+/// The start of a mock `claude` script: record the arguments to `log`, one
+/// per line and then `---END-ARGS---`, and the prompt read from stdin to
+/// `prompts`, followed by [`END_PROMPT`]. The rest of the script finds this
+/// run's prompt alone in the file named by `$run_prompt`.
+#[cfg(unix)]
+fn record_claude_run(log: &Path, prompts: &Path) -> String {
+    let dir = prompts.parent().expect("the prompt log lives in a directory");
+    format!(
+        "for a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\n\
+         printf '%s\\n' '---END-ARGS---' >> {log:?}\n\
+         run_prompt=$(mktemp {template:?})\n\
+         cat > \"$run_prompt\"\n\
+         cat \"$run_prompt\" >> {prompts:?}\n\
+         printf '\\n%s\\n' '{END_PROMPT}' >> {prompts:?}\n",
+        template = dir.join("prompt.XXXXXX"),
+    )
+}
+
+/// Assert that no recorded `claude` argument carries `text`: prompts go to
+/// stdin.
+#[cfg(unix)]
+fn assert_not_in_argv(claude_log: &str, text: &str) {
+    assert!(!claude_log.contains(text), "{text:?} was passed in argv:\n{claude_log}");
 }
 
 /// Assert a single recorded `claude` invocation ran read-only: only Read,
@@ -240,6 +285,9 @@ async fn dry_run_invokes_claude_only_no_gh_no_push() {
         claude_log
     );
     assert_read_only_invocation(&claude_log, "the dry-run helper");
+    let prompts = env.claude_prompts();
+    assert!(prompts[0].contains("Delete the variable."), "the item reaches claude on stdin:\n{}", prompts[0]);
+    assert_not_in_argv(&claude_log, "Delete the variable.");
 }
 
 #[cfg(unix)]
@@ -307,6 +355,11 @@ async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
         "the approved apply agent keeps its full tool set, got:\n{}",
         claude_log
     );
+    // Its prompt reaches it on stdin, never in argv.
+    let prompts = env.claude_prompts();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("Delete the variable."), "the item reaches claude on stdin:\n{}", prompts[0]);
+    assert_not_in_argv(&claude_log, "Delete the variable.");
 }
 
 /// Build a plan with three items keyed to comment ids 201/202/203:
@@ -1076,10 +1129,10 @@ fn install_obedient_claude(env: &MockEnv, clean: &str, injected: &str) {
         json
     };
     let script = format!(
-        "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\n\
-         printf '%s\\n' '---END-ARGS---' >> {log:?}\n\
-         case \"$*\" in\n  *OUTSIDER-INJECTION*) printf '%s\\n' '{injected}' ;;\n  *) printf '%s\\n' '{clean}' ;;\nesac\n",
-        log = env.claude_log,
+        "#!/bin/sh\n{record}\
+         if grep -q OUTSIDER-INJECTION \"$run_prompt\"; then\n  printf '%s\\n' '{injected}'\n\
+         else\n  printf '%s\\n' '{clean}'\nfi\n",
+        record = record_claude_run(&env.claude_log, &env.claude_prompts),
         injected = line(injected),
         clean = line(clean),
     );
@@ -1139,13 +1192,18 @@ async fn an_outsider_cannot_steer_triage_into_a_pre_approved_fix() {
     let log = env.read_claude_log();
     let runs: Vec<&str> = log.split("---END-ARGS---").filter(|r| !r.trim().is_empty()).collect();
     assert_eq!(runs.len(), 2, "one run per trust group, got:\n{log}");
-    assert!(runs[0].contains(MEMBER_COMMENT) && !runs[0].contains("OUTSIDER-INJECTION"),
-        "the collaborator run sees only collaborator text:\n{}", runs[0]);
-    assert!(runs[1].contains("OUTSIDER-INJECTION") && !runs[1].contains(MEMBER_COMMENT),
-        "the other run sees only the other text:\n{}", runs[1]);
     for run in &runs {
         assert_read_only_invocation(run, "a triage run");
     }
+    // The comment text reaches each run on stdin, never in argv.
+    let prompts = env.claude_prompts();
+    assert_eq!(prompts.len(), 2, "one prompt per run");
+    assert!(prompts[0].contains(MEMBER_COMMENT) && !prompts[0].contains("OUTSIDER-INJECTION"),
+        "the collaborator run sees only collaborator text:\n{}", prompts[0]);
+    assert!(prompts[1].contains("OUTSIDER-INJECTION") && !prompts[1].contains(MEMBER_COMMENT),
+        "the other run sees only the other text:\n{}", prompts[1]);
+    assert_not_in_argv(&log, MEMBER_COMMENT);
+    assert_not_in_argv(&log, "OUTSIDER-INJECTION");
 
     let got: Vec<_> = items.iter()
         .map(|i| (i.comment_id, i.approved, i.proposed_change.as_str()))
@@ -1211,16 +1269,20 @@ async fn discuss_runs_once_per_trust_group_and_only_the_collaborator_run_grants(
     let log = env.read_claude_log();
     let runs: Vec<&str> = log.split("---END-ARGS---").filter(|r| !r.trim().is_empty()).collect();
     assert_eq!(runs.len(), 2, "one run per trust group, got:\n{log}");
-    let member_body = "Should we retry on failure?";
-    assert!(runs[0].contains(member_body) && !runs[0].contains("OUTSIDER-INJECTION"),
-        "the collaborator run sees only collaborator items:\n{}", runs[0]);
-    assert!(runs[1].contains("OUTSIDER-INJECTION") && !runs[1].contains(member_body),
-        "the other run sees only other items:\n{}", runs[1]);
-    assert!(!runs[1].contains("Unsure whether retry is desired."),
-        "nor the member item's reasoning:\n{}", runs[1]);
     for run in &runs {
         assert_read_only_invocation(run, "a discuss run");
     }
+    let prompts = env.claude_prompts();
+    assert_eq!(prompts.len(), 2, "one prompt per run");
+    let member_body = "Should we retry on failure?";
+    assert!(prompts[0].contains(member_body) && !prompts[0].contains("OUTSIDER-INJECTION"),
+        "the collaborator run sees only collaborator items:\n{}", prompts[0]);
+    assert!(prompts[1].contains("OUTSIDER-INJECTION") && !prompts[1].contains(member_body),
+        "the other run sees only other items:\n{}", prompts[1]);
+    assert!(!prompts[1].contains("Unsure whether retry is desired."),
+        "nor the member item's reasoning:\n{}", prompts[1]);
+    assert_not_in_argv(&log, member_body);
+    assert_not_in_argv(&log, "OUTSIDER-INJECTION");
 
     let member = &merged.items[0];
     assert!(member.approved, "the collaborator-only run may grant");

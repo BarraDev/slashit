@@ -1,0 +1,6 @@
+#!/bin/sh
+# Reports success without ever reading its stdin, so a prompt larger than the
+# pipe can hold is never delivered.
+printf '{"type":"system","subtype":"init","session_id":"s-ignores","model":"fixture-model"}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-ignores","result":"done"}\n'
+exit 0

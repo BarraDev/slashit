@@ -1,0 +1,12 @@
+#!/bin/sh
+# Hands its stdin to a process in a session of its own, which never reads it
+# and which killing the leader's process group does not reach, then blocks
+# with stdin closed. The prompt pipe keeps a reader for as long as that
+# process lives, so a writer blocked on it does not fail on its own when the
+# leader is killed.
+exec 3<&0
+setsid sh -c 'printf "%s\n" "$$" > holder.pid; exec sleep 300' <&3 >/dev/null 2>&1 3<&- &
+printf '{"type":"system","subtype":"init","session_id":"s-held","model":"fixture-model"}\n'
+while [ ! -s holder.pid ]; do sleep 0.01; done
+printf '%s\n' "$$" > blocked.pid
+exec sleep 300 </dev/null 3<&-
