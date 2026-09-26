@@ -20,6 +20,22 @@ pub const READ_ONLY_DENIED_TOOLS: &[&str] = &[
     "Task", "Agent", "Skill",
 ];
 
+/// The oldest Claude Code release that accepts `--restricted`.
+pub const RESTRICTED_MIN_VERSION: &str = "2.1.248";
+
+/// Why a run failed, when `stderr` shows the CLI rejected `--restricted` as
+/// an unknown option: the CLI is older than [`RESTRICTED_MIN_VERSION`].
+/// [`ToolAccess::ReadOnly`] runs need the flag and never fall back to running
+/// without it, so the only fix is updating Claude Code.
+pub fn restricted_unsupported_reason(stderr: &str) -> Option<String> {
+    stderr.contains("unknown option '--restricted'").then(|| {
+        format!(
+            "this Claude Code does not support --restricted, which SlashIt's read-only \
+             PR and review helpers require; update Claude Code to v{RESTRICTED_MIN_VERSION} or newer"
+        )
+    })
+}
+
 /// What a run may do with tools.
 ///
 /// The Claude CLI has two separate lists, and confusing them is how a
@@ -502,6 +518,9 @@ impl ClaudeRunner {
             if !stderr_text.is_empty() {
                 self.accumulated_output.write().await.push_str(&format!("\n--- STDERR ---\n{}", stderr_text));
             }
+            if let Some(reason) = restricted_unsupported_reason(&stderr_text) {
+                return Err(reason);
+            }
             return Err(format!("Exit code {} — {}", code, stderr_summary));
         }
 
@@ -937,6 +956,10 @@ mod tests {
 
     const CLAUDE_LEVEL_ERROR: &str = "claude-level-error";
 
+    /// A Claude Code older than `--restricted`: it rejects the flag the way
+    /// the CLI rejects any unknown option, and otherwise runs normally.
+    const NO_RESTRICTED: &str = "no-restricted";
+
     async fn bounded(label: &str, runner: &ClaudeRunner) -> Result<bool, String> {
         match tokio::time::timeout(DEADLINE, runner.wait()).await {
             Ok(result) => result,
@@ -1142,6 +1165,33 @@ mod tests {
                 .expect_err("is_error should surface as an error");
             assert_eq!(error, "the model refused");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cli_without_restricted_fails_a_read_only_run_with_an_actionable_reason() {
+        let fixture = Fixture::new(NO_RESTRICTED);
+        let config = ClaudeRunConfig { tools: ToolAccess::ReadOnly, ..fixture.config() };
+        let runner = ClaudeRunner::start_program(&fixture.program, config)
+            .await
+            .expect("fixture should spawn");
+        let error = bounded("read-only on an old CLI", &runner)
+            .await
+            .expect_err("a CLI that rejects --restricted must fail the run");
+        assert_eq!(Some(error), restricted_unsupported_reason("error: unknown option '--restricted'"));
+
+        let runner = fixture.start().await;
+        assert_eq!(bounded("full access on an old CLI", &runner).await, Ok(true));
+    }
+
+    #[test]
+    fn only_a_rejected_restricted_flag_is_explained_as_an_old_cli() {
+        let reason = restricted_unsupported_reason("error: unknown option '--restricted'\n")
+            .expect("the unknown-option error is recognised");
+        assert!(reason.contains("update Claude Code"), "{reason}");
+        assert!(reason.contains(RESTRICTED_MIN_VERSION), "{reason}");
+        assert_eq!(restricted_unsupported_reason("error: unknown option '--no-such-flag'"), None);
+        assert_eq!(restricted_unsupported_reason("something went wrong in the CLI"), None);
+        assert_eq!(restricted_unsupported_reason(""), None);
     }
 
     /// Whether `pid` is still a running process.

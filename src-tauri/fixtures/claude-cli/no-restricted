@@ -1,0 +1,10 @@
+#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "--restricted" ]; then
+        echo "error: unknown option '--restricted'" >&2
+        exit 1
+    fi
+done
+printf '{"type":"system","subtype":"init","session_id":"s-old","model":"fixture-model"}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-old","result":"done"}\n'
+exit 0

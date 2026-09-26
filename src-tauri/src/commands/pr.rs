@@ -2479,20 +2479,7 @@ async fn run_claude_pr_helper(
     };
 
     if !success {
-        let reason = extract_failure_reason(&stdout)
-            .or_else(|| {
-                let tail: Vec<&str> = stderr.lines().rev().take(5).collect();
-                if tail.is_empty() {
-                    None
-                } else {
-                    let mut joined: Vec<&str> = tail.into_iter().collect();
-                    joined.reverse();
-                    Some(joined.join(" | "))
-                }
-            })
-            .unwrap_or_else(|| {
-                "no error event in stream-json and no stderr — see log".to_string()
-            });
+        let reason = pr_helper_failure_reason(&stdout, &stderr);
         let log_hint = log_path
             .as_ref()
             .map(|p| format!(" (transcript: {})", p.display()))
@@ -2587,6 +2574,27 @@ fn refuse_if_pr_operation_cancelled(
         ));
     }
     Ok(())
+}
+
+/// Why a PR helper run that exited unsuccessfully failed. A CLI too old for
+/// `--restricted` gets the actionable explanation; otherwise the reason comes
+/// from the stream-json stdout, then the tail of stderr.
+fn pr_helper_failure_reason(stdout: &str, stderr: &str) -> String {
+    crate::agents::runner::restricted_unsupported_reason(stderr)
+        .or_else(|| extract_failure_reason(stdout))
+        .or_else(|| {
+            let tail: Vec<&str> = stderr.lines().rev().take(5).collect();
+            if tail.is_empty() {
+                None
+            } else {
+                let mut joined: Vec<&str> = tail.into_iter().collect();
+                joined.reverse();
+                Some(joined.join(" | "))
+            }
+        })
+        .unwrap_or_else(|| {
+            "no error event in stream-json and no stderr — see log".to_string()
+        })
 }
 
 /// Pull a human-readable failure reason out of the stream-json stdout. Prefers
@@ -4460,6 +4468,19 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"), "{args:?}");
         assert!(args.iter().any(|a| a == "--restricted"), "{args:?}");
         assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
+    }
+
+    #[test]
+    fn a_pr_helper_on_a_cli_without_restricted_says_to_update_claude_code() {
+        let reason = pr_helper_failure_reason("", "error: unknown option '--restricted'\n");
+        assert_eq!(
+            Some(reason),
+            crate::agents::runner::restricted_unsupported_reason("error: unknown option '--restricted'")
+        );
+        assert_eq!(
+            pr_helper_failure_reason("", "boom\nerror: unknown option '--no-such-flag'\n"),
+            "boom | error: unknown option '--no-such-flag'"
+        );
     }
 
     #[test]

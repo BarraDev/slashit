@@ -24,7 +24,10 @@ the security boundary of the run:
   (file tools confined to the working directory, no user, project or local
   settings files and so no hooks from them), `--strict-mcp-config`, and
   `--permission-mode dontAsk`, which denies instead of prompting, so a
-  headless `-p` run cannot hang.
+  headless `-p` run cannot hang. `--restricted` needs Claude Code 2.1.248 or
+  newer; an older CLI fails the run, which never falls back to running
+  without the flag. `restricted_unsupported_reason` turns that CLI error
+  into a message telling the user to update.
 - Use `ReadOnly` for every run whose prompt carries text SlashIt did not
   write (PR comments, review bodies, diffs) unless the run must edit files.
   Today that is the PR triage, discuss and dry-run helpers
