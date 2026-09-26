@@ -82,6 +82,33 @@ async fn run(dir: &Path, args: &[&str], envs: &[(&str, String)]) -> Result<Ran, 
     })
 }
 
+/// `git <args>` in `dir` for a NUL-separated listing (`-z`), its entries on
+/// success and its stderr otherwise. The output is not trimmed, since a
+/// path may start or end with whitespace; only the empty entry after the
+/// final NUL is dropped.
+async fn git_entries(dir: &Path, args: &[&str]) -> Result<Vec<String>, String> {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.first().unwrap_or(&""),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let listed = String::from_utf8_lossy(&output.stdout);
+    let mut entries: Vec<String> = listed.split('\0').map(str::to_string).collect();
+    if entries.last().is_some_and(String::is_empty) {
+        entries.pop();
+    }
+    Ok(entries)
+}
+
 /// `git <args>` in `dir`, its stdout on success and its stderr otherwise.
 async fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let ran = run(dir, args, &[]).await?;
@@ -384,16 +411,14 @@ pub async fn head_moved_only_by_a_restack(dir: &Path) -> Result<Option<String>, 
 /// (`--diff-filter=T`), and refuses the undo, which would otherwise remove
 /// it.
 pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, String> {
-    let paths = |listed: String| -> std::collections::BTreeSet<String> {
-        listed.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect()
-    };
-    let unmerged = paths(git(dir, &["diff", "-z", "--name-only", "--diff-filter=U"]).await?);
+    let paths = |listed: Vec<String>| -> std::collections::BTreeSet<String> { listed.into_iter().collect() };
+    let unmerged = paths(git_entries(dir, &["diff", "-z", "--name-only", "--diff-filter=U"]).await?);
     if unmerged.is_empty() {
         return Ok(Some("no conflicted paths are left, so they were resolved by hand".to_string()));
     }
-    let mut unstaged = paths(git(dir, &["diff", "-z", "--name-only", "--ignore-submodules=all"]).await?);
+    let mut unstaged = paths(git_entries(dir, &["diff", "-z", "--name-only", "--ignore-submodules=all"]).await?);
     unstaged.extend(paths(
-        git(dir, &["diff", "-z", "--name-only", "--diff-filter=T", "--ignore-submodules=none"]).await?,
+        git_entries(dir, &["diff", "-z", "--name-only", "--diff-filter=T", "--ignore-submodules=none"]).await?,
     ));
     let others: Vec<String> = unstaged.difference(&unmerged).cloned().collect();
     if !others.is_empty() {
@@ -413,9 +438,9 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
     if parent.code != Some(0) || !is_full_object_id(&parent.stdout) {
         return Ok(Some(format!("the commit it stopped on, {stopped}, has no parent to compare it with")));
     }
-    let own = paths(git(dir, &["diff-tree", "-r", "-z", "--name-only", "--no-renames", &parent.stdout, &stopped]).await?);
+    let own = paths(git_entries(dir, &["diff-tree", "-r", "-z", "--name-only", "--no-renames", &parent.stdout, &stopped]).await?);
     let staged = paths(
-        git(dir, &["diff", "--cached", "-z", "--name-only", "--no-renames", "--ignore-submodules=none", "HEAD"]).await?,
+        git_entries(dir, &["diff", "--cached", "-z", "--name-only", "--no-renames", "--ignore-submodules=none", "HEAD"]).await?,
     );
     let foreign: Vec<String> = staged.difference(&unmerged).filter(|p| !own.contains(*p)).cloned().collect();
     if !foreign.is_empty() {
@@ -425,7 +450,7 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
             foreign.join(", ")
         )));
     }
-    let untracked = paths(git(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).await?);
+    let untracked = paths(git_entries(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).await?);
     if !untracked.is_empty() {
         return Ok(Some(format!(
             "it has untracked files ({})",
@@ -448,9 +473,7 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
 /// staged, and is refused. So is a clean merge of a path both sides changed,
 /// which git stages as a third version: recovery fails closed there.
 pub async fn staged_resolutions_in_the_stop(dir: &Path) -> Result<Option<String>, String> {
-    let paths = |listed: String| -> std::collections::BTreeSet<String> {
-        listed.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect()
-    };
+    let paths = |listed: Vec<String>| -> std::collections::BTreeSet<String> { listed.into_iter().collect() };
     let stopped = git(dir, &["rev-parse", "-q", "--verify", "REBASE_HEAD^{commit}"]).await;
     let Some(stopped) = stopped.ok().filter(|oid| is_full_object_id(oid)) else {
         return Ok(Some("git does not name the commit it stopped on (REBASE_HEAD)".to_string()));
@@ -459,10 +482,10 @@ pub async fn staged_resolutions_in_the_stop(dir: &Path) -> Result<Option<String>
     if parent.code != Some(0) || !is_full_object_id(&parent.stdout) {
         return Ok(Some(format!("the commit it stopped on, {stopped}, has no parent to compare it with")));
     }
-    let unmerged = paths(git(dir, &["diff", "-z", "--name-only", "--diff-filter=U"]).await?);
-    let own = paths(git(dir, &["diff-tree", "-r", "-z", "--name-only", "--no-renames", &parent.stdout, &stopped]).await?);
+    let unmerged = paths(git_entries(dir, &["diff", "-z", "--name-only", "--diff-filter=U"]).await?);
+    let own = paths(git_entries(dir, &["diff-tree", "-r", "-z", "--name-only", "--no-renames", &parent.stdout, &stopped]).await?);
     let staged = paths(
-        git(dir, &["diff", "--cached", "-z", "--name-only", "--no-renames", "--ignore-submodules=none", "HEAD"]).await?,
+        git_entries(dir, &["diff", "--cached", "-z", "--name-only", "--no-renames", "--ignore-submodules=none", "HEAD"]).await?,
     );
     let candidates: Vec<&str> = staged
         .iter()
@@ -475,9 +498,9 @@ pub async fn staged_resolutions_in_the_stop(dir: &Path) -> Result<Option<String>
     // `<mode> <object>` per path, from `ls-files -s` (`<mode> <object>
     // <stage>\t<path>`) or `ls-tree` (`<mode> <type> <object>\t<path>`).
     // Paths are passed as literal pathspecs, never globs.
-    let entries = |listed: String, tree: bool| -> std::collections::BTreeMap<String, String> {
+    let entries = |listed: Vec<String>, tree: bool| -> std::collections::BTreeMap<String, String> {
         listed
-            .split('\0')
+            .iter()
             .filter_map(|entry| {
                 let (meta, path) = entry.split_once('\t')?;
                 let fields: Vec<&str> = meta.split(' ').collect();
@@ -499,7 +522,7 @@ pub async fn staged_resolutions_in_the_stop(dir: &Path) -> Result<Option<String>
     };
     let list = |args: Vec<String>| async move {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        git(dir, &args).await
+        git_entries(dir, &args).await
     };
     let index = entries(list(listing(vec!["ls-files", "-s", "-z"])).await?, false);
     let head = entries(list(listing(vec!["ls-tree", "-r", "-z", "--full-tree", "HEAD"])).await?, true);
@@ -1562,6 +1585,36 @@ mod tests {
             describe(&failure)
         );
         fixture.assert_restored("second commit");
+    }
+
+    /// NUL-separated listings are read as git writes them. A resolution
+    /// staged at a path whose name starts with a space, so that it comes
+    /// first in every listing, is still found.
+    #[tokio::test]
+    async fn a_staged_resolution_at_a_path_with_leading_space_is_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        let worktree = tmp.path().join("worktree");
+        git_in(tmp.path(), &["init", "-q", "-b", "main", repo.to_str().unwrap()]);
+        let fork_point = commit(&repo, "f.txt", "f\n", "F");
+        git_in(&repo, &["checkout", "-q", "-b", "task"]);
+        std::fs::write(repo.join(" lead.txt"), "task\n").unwrap();
+        let old_tip = commit(&repo, "z.txt", "task\n", "B1");
+        git_in(&repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join(" lead.txt"), "main\n").unwrap();
+        let onto = commit(&repo, "z.txt", "main\n", "M");
+        git_in(&repo, &["worktree", "add", "-q", worktree.to_str().unwrap(), "task"]);
+        let backup = backup_ref(Uuid::new_v4());
+        let restack = Restack::new(&worktree, "task", &fork_point, &old_tip, &onto, &backup);
+        let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
+        assert_ne!(ran.code, Some(0));
+        assert_eq!(git_in(&worktree, &["diff", "--name-only", "--diff-filter=U"]).lines().count(), 2, "both conflict");
+        std::fs::write(worktree.join(" lead.txt"), "resolved\n").unwrap();
+        git_in(&worktree, &["add", " lead.txt"]);
+
+        let found = staged_resolutions_in_the_stop(&worktree).await.unwrap();
+
+        assert!(found.as_deref().is_some_and(|why| why.contains(" lead.txt")), "{found:?}");
     }
 
     /// When the rebase never started, SlashIt changed nothing, so it has

@@ -3508,7 +3508,8 @@ fn restack_failure_message(
 ///   commit has it
 ///   ([`crate::worktree::restack::staged_resolutions_in_the_stop`]), so a
 ///   conflict resolved and staged while another is left is refused too;
-///   so, failing closed, is git's clean merge of a path both sides changed. It is undone without writing the branch
+///   so, failing closed, is git's clean merge of a path both sides changed.
+///   It is undone without writing the branch
 ///   ([`crate::worktree::restack::undo_stopped_rebase`]), the worktree
 ///   verified back on the branch at that tip, and the backup deleted.
 /// - A backup equal to the branch's tip with no rebase in progress holds
