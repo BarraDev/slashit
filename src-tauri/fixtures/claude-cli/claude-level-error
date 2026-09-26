@@ -1,4 +1,6 @@
 #!/bin/sh
+# Reads its prompt to EOF first, as `claude -p` does.
+cat > /dev/null
 printf '{"type":"system","subtype":"init","session_id":"s-err","model":"fixture-model"}\n'
 printf '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s-err","result":"the model refused"}\n'
 exit 0

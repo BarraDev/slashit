@@ -1,4 +1,6 @@
 #!/bin/sh
+# Reads its prompt to EOF first, as `claude -p` does.
+cat > /dev/null
 pad=xxxxxxxxxxxxxxxx
 pad=$pad$pad$pad$pad
 pad=$pad$pad$pad$pad
