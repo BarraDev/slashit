@@ -55,10 +55,34 @@ argv: SlashIt only passes a fixed rules text there.
   small enough to sit whole in the pipe buffer counts as delivered once
   written, so a child that exits without reading it cannot be told apart.
   `wait()` reports a non-zero exit first, then the prompt failure, then a
-  `result` error. `prompt_failure()` exposes it to callers that judge by
-  `exit_status()`, like the PR helper.
+  `result` error (see Failure reasons). `prompt_failure()` exposes it to
+  callers that judge by `exit_status()`, like the PR helper.
 - `kill()` and dropping the runner abort the writer, so a cancelled run
   never leaves it blocked on a pipe that a process outside the group still
   holds open.
 - A stand-in `claude` in a test must read its stdin to EOF before answering,
   as the real one does. One that exits 0 without reading can fail the run.
+
+## Failure reasons
+
+`wait()` gives the most specific reason the run left behind, and the PR
+helper reads the stream the same way through `result_failure_reason`.
+
+- The CLI reports some failures only in the stream-json `result` event,
+  with exit status 1 and nothing on stderr. Running out of turns is
+  `"subtype": "error_max_turns"` with `errors` and no `result` text. An API
+  error is `"is_error": true` with `"subtype": "success"`, a
+  `terminal_reason` and `api_error_status`; stderr then holds only a
+  diagnostic tag.
+- A non-zero exit reads `Exit code N — ` followed by the `result` event's
+  reason (with the last stderr line after it, when there is one), else the
+  last stderr line, else the prompt failure, else `no details`. A CLI too
+  old for `--restricted` gets `restricted_unsupported_reason` instead.
+- A child ended by a signal (a kill, including cancellation) reads
+  `Terminated by signal N — ` and quotes only stderr: an error result it
+  wrote before the kill is not why it ended.
+- An exit 0 fails when any `result` event had `"is_error": true`, even if a
+  later one succeeded. The reason is always the last `result` event that
+  reported a failure, in the runner and the PR helper alike.
+- Every quoted piece is cut to one bounded line. The `errors` list is
+  preferred over the `result` text, which is model-written in general.

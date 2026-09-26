@@ -1,0 +1,7 @@
+#!/bin/sh
+# Fails with nothing on stderr after output that is not stream-json, and a
+# `result` line cut off mid-object.
+cat > /dev/null
+printf 'this line is not json\n'
+printf '{"type":"result","subtype":"error_max_tu'
+exit 1

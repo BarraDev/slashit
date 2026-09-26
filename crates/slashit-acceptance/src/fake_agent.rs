@@ -59,11 +59,23 @@ pub const REPORTED_RESULT: &str = "fake agent completed without changing the rep
 pub const FAILING_RUNS_VAR: &str = "SLASHIT_FAKE_AGENT_FAILING_RUNS";
 
 /// The text the fixture returns for a run scripted to fail.
-///
-/// The runner copies the result text of a failed run onto the task as its
-/// error message, so a journey can read this back through the product's own
-/// API and know the failure it sees is the one this executable reported.
 pub const REPORTED_FAILURE: &str = "fake agent was scripted to fail this run";
+
+/// The `subtype` of the result event the fixture writes for a run scripted
+/// to fail.
+pub const REPORTED_FAILURE_SUBTYPE: &str = "error_during_execution";
+
+/// The error message the product records on a task whose run the fixture
+/// scripted to fail.
+///
+/// The fixture exits 0 with an `is_error` result event that carries no
+/// `errors` list, so the runner reports the event's subtype followed by its
+/// result text (`result_failure_reason` in `src-tauri/src/agents/runner.rs`).
+/// A journey reads this back through the product's own API and knows the
+/// failure it sees is the one this executable reported.
+pub fn recorded_failure() -> String {
+    format!("{REPORTED_FAILURE_SUBTYPE}: {REPORTED_FAILURE}")
+}
 
 /// The variable that makes an agent run leave a file behind in the working
 /// directory it was started in.
@@ -547,6 +559,7 @@ mod tests {
             REPORTED_MODEL,
             REPORTED_RESULT,
             REPORTED_FAILURE,
+            REPORTED_FAILURE_SUBTYPE,
             WORK_CONTENT,
             MARKER_DIR_VAR,
             FAILING_RUNS_VAR,
@@ -816,6 +829,8 @@ mod tests {
             "the first agent run is scripted to fail"
         );
         assert_eq!(first["result"], REPORTED_FAILURE);
+        assert_eq!(first["subtype"], REPORTED_FAILURE_SUBTYPE);
+        assert!(first.get("errors").is_none(), "recorded_failure() assumes no errors list");
 
         let second = run(&["-p", "--session-id", "two"]);
         assert_eq!(

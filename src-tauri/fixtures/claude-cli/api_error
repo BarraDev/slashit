@@ -1,0 +1,9 @@
+#!/bin/sh
+# Fails on an API error the way Claude Code 2.1.283 does for an unknown
+# model: a diagnostic tag on stderr, and the readable reason in a `result`
+# event whose subtype is still "success".
+cat > /dev/null
+printf '{"type":"system","subtype":"init","session_id":"s-api","model":"fixture-model"}\n'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":true,"api_error_status":404,"terminal_reason":"api_error","result":"There is an issue with the selected model (no-such-model).","session_id":"s-api"}'
+printf '%s\n' '[claude-code:unrecognized_model] {"model":"no-such-model"}' >&2
+exit 1
