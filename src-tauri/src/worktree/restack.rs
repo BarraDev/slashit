@@ -264,7 +264,10 @@ pub struct InterruptedRebase {
 /// A rebase of `refs/heads/<branch>` left in progress in the worktree at
 /// `dir`, or `None`. A rebase of anything else is not reported here. Both
 /// backends, `rebase-merge/` and `rebase-apply/`, keep `head-name`,
-/// `orig-head` and `onto` files.
+/// `orig-head` and `onto` files. A restack always runs the merge backend,
+/// but an apply-backend rebase left by anything else is still reported, so
+/// that it goes through the same ownership checks rather than being
+/// overlooked.
 pub async fn interrupted_rebase_of(dir: &Path, branch: &str) -> Result<Option<InterruptedRebase>, String> {
     let wanted = format!("refs/heads/{branch}");
     for name in ["rebase-merge", "rebase-apply"] {
@@ -689,6 +692,11 @@ impl<'a> Restack<'a> {
 
     /// Replay the task's commits onto `onto` and verify the result.
     ///
+    /// The rebase runs git's merge backend (`--merge`), whatever
+    /// `rebase.backend` says: what the undo checks (the marker's reflog
+    /// entries, `REBASE_HEAD`, the stop's state in `rebase-merge/`) is
+    /// written against it.
+    ///
     /// The rebase names every revision exactly: the new base and the fork
     /// point as object IDs, the branch by its exact name, and it turns off
     /// everything configuration could turn on behind the caller's back:
@@ -753,6 +761,7 @@ impl<'a> Restack<'a> {
             "-c",
             "rerere.enabled=false",
             "rebase",
+            "--merge",
             "--no-autostash",
         ];
         if knows_no_update_refs(&version) {
@@ -1615,6 +1624,62 @@ mod tests {
         let found = staged_resolutions_in_the_stop(&worktree).await.unwrap();
 
         assert!(found.as_deref().is_some_and(|why| why.contains(" lead.txt")), "{found:?}");
+    }
+
+    /// The restack runs git's merge backend whatever `rebase.backend` says:
+    /// the reflog and stopped-state checks are written against it. A stop
+    /// keeps its state in `rebase-merge/`, never `rebase-apply/`, and is
+    /// undone as the restack's own.
+    #[tokio::test]
+    async fn a_restack_stops_with_the_merge_backend_whatever_the_configuration() {
+        let fixture = Fixture::new(true);
+        git_in(&fixture.worktree, &["config", "rebase.backend", "apply"]);
+        let restack = fixture.restack();
+        let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
+        assert_ne!(ran.code, Some(0));
+        let state = |name: &str| fixture.worktree.join(git_in(&fixture.worktree, &["rev-parse", "--git-path", name]));
+        assert!(state("rebase-merge").is_dir(), "the stop is the merge backend's");
+        assert!(!state("rebase-apply").exists(), "not the apply backend's");
+
+        let failure = restack.settle(ran).await.expect_err("conflict");
+
+        assert!(matches!(failure, RestackFailure::Restored(_)), "{}", describe(&failure));
+        fixture.assert_restored("apply configured, conflict");
+    }
+
+    /// A clean restack under `rebase.backend=apply` still runs as the merge
+    /// backend, and verifies. The two backends log the same reflog messages
+    /// on current git, so a `post-rewrite` hook records which backend's
+    /// state directory the rebase is running with.
+    #[tokio::test]
+    async fn a_clean_restack_uses_the_merge_backend_whatever_the_configuration() {
+        let fixture = Fixture::new(false);
+        git_in(&fixture.worktree, &["config", "rebase.backend", "apply"]);
+        let hooks = fixture._tmp.path().join("hooks");
+        let seen = fixture._tmp.path().join("backend-seen");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("post-rewrite");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nif [ -d \"$(git rev-parse --git-path rebase-merge)\" ]; then echo merge; \
+                 else echo other; fi > {seen:?}\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        git_in(&fixture.worktree, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        let restack = fixture.restack();
+
+        let new_tip = restack.replay().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
+
+        assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "merge");
+        assert_eq!(fixture.tip().as_deref(), Some(new_tip.as_str()));
+        assert_ne!(new_tip, fixture.old_tip);
     }
 
     /// When the rebase never started, SlashIt changed nothing, so it has
