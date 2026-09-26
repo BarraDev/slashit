@@ -1875,8 +1875,9 @@ async fn done_journey(context: &TestContext) -> Result<()> {
     // The fixture writes a real file, so the task's canonical diff is real
     // and non-empty by the time it reaches `AiReview` -- a review agent must
     // actually run, not just the one coding run. The fixture's fixed
-    // response never contains `CHANGES_REQUESTED`, so review approves and no
-    // fix run follows.
+    // response never contains `CHANGES_REQUESTED`, so no fix run follows.
+    // (It carries no `VERDICT: APPROVED` either, so the review is recorded
+    // as failed rather than approved; this journey does not read it.)
     assert_agent_roles(&agent, "done_journey", 1, 1, 0)?;
 
     Ok(())

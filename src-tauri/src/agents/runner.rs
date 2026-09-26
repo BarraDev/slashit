@@ -7,26 +7,184 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 /// `(exit_success, exit_code)`, as [`ClaudeRunner::exit_status`] exposes it.
 type ExitStatusInfo = Option<(bool, Option<i32>)>;
 
+/// The tools a read-only run can use. Nothing here writes, runs code or
+/// reaches the network.
+pub const READ_ONLY_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
+
+/// Tools a read-only run denies by name, on top of leaving them out of
+/// `--tools`. Redundant while `--tools` behaves as documented; it keeps the
+/// run read-only if a later CLI adds one of these back to the default set.
+pub const READ_ONLY_DENIED_TOOLS: &[&str] = &[
+    "Bash", "PowerShell", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
+    // The subagent tool, under its older and current names.
+    "Task", "Agent", "Skill",
+];
+
+/// The oldest Claude Code release that accepts `--restricted`.
+pub const RESTRICTED_MIN_VERSION: &str = "2.1.248";
+
+/// Why a run failed, when `stderr` shows the CLI rejected `--restricted` as
+/// an unknown option: the CLI is older than [`RESTRICTED_MIN_VERSION`].
+/// [`ToolAccess::ReadOnly`] runs need the flag and never fall back to running
+/// without it, so the only fix is updating Claude Code.
+pub fn restricted_unsupported_reason(stderr: &str) -> Option<String> {
+    stderr.contains("unknown option '--restricted'").then(|| {
+        format!(
+            "this Claude Code does not support --restricted, which SlashIt's read-only \
+             PR and review helpers require; update Claude Code to v{RESTRICTED_MIN_VERSION} or newer"
+        )
+    })
+}
+
+/// What a run may do with tools.
+///
+/// The Claude CLI has two separate lists, and confusing them is how a
+/// "read-only" helper once ran with Bash: `--tools` decides which built-in
+/// tools exist in the session at all, while `--allowedTools` only decides
+/// which of the existing tools run without a permission prompt. An
+/// `--allowedTools` list restricts nothing, least of all under
+/// `--dangerously-skip-permissions`, where every tool is approved anyway.
+/// The two variants keep the lists apart so a caller has to pick one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolAccess {
+    /// Only [`READ_ONLY_TOOLS`] exist. The run also passes `--restricted`,
+    /// which confines the file tools to the working directory (plus
+    /// `--add-dir`) and skips user, project and local settings files (so
+    /// their hooks do not run), and `--strict-mcp-config`, so no MCP server
+    /// adds tools. The permission mode is `dontAsk`: a tool call that is not
+    /// pre-approved is denied rather than prompted, so a headless `-p` run
+    /// cannot hang waiting for an answer.
+    ///
+    /// Use this for every run whose prompt carries text SlashIt did not
+    /// write, unless the run genuinely has to edit files.
+    ReadOnly,
+    /// The CLI's full default tool set, for agents that edit code.
+    ///
+    /// `auto_approve` becomes `--allowedTools`: it is an approval list, not
+    /// a restriction. `permission_mode: None` passes
+    /// `--dangerously-skip-permissions`, which approves every tool.
+    Full {
+        auto_approve: Vec<String>,
+        permission_mode: Option<String>,
+    },
+}
+
 /// Configuration for a Claude Code CLI run.
 #[derive(Debug, Clone)]
 pub struct ClaudeRunConfig {
     pub prompt: String,
     pub working_dir: String,
-    pub allowed_tools: Vec<String>,
+    pub tools: ToolAccess,
     pub max_turns: Option<u32>,
     pub max_budget_usd: Option<f64>,
     pub session_id: Option<String>,
     pub resume_session: Option<String>,
     pub model: Option<String>,
+    /// Replaces the CLI's default system prompt (`--system-prompt`).
     pub system_prompt: Option<String>,
-    pub permission_mode: Option<String>,
+    /// Appended to the system prompt (`--append-system-prompt`). Rules that
+    /// must outrank anything in the user prompt go here.
+    pub append_system_prompt: Option<String>,
     /// When true, pass --strict-mcp-config without any --mcp-config files,
     /// effectively disabling all MCP servers (project + user) for this run.
+    /// [`ToolAccess::ReadOnly`] always does this.
     pub disable_mcp: bool,
     /// Extra directories to expose to Claude via repeated `--add-dir` flags.
     /// Used when running from a meta-workspace cwd so the agent can also
     /// read/write a specific project tree.
     pub additional_dirs: Vec<std::path::PathBuf>,
+}
+
+/// The Claude CLI arguments for `config`, in order, without the program.
+///
+/// Separate from [`ClaudeRunner::start_program`] so the capability flags a
+/// configuration produces can be tested without spawning anything.
+pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    let mut push = |a: &str| args.push(a.into());
+
+    push("-p");
+    push(&config.prompt);
+    push("--verbose");
+    push("--output-format");
+    push("stream-json");
+
+    let strict_mcp = match &config.tools {
+        ToolAccess::ReadOnly => {
+            let tools = READ_ONLY_TOOLS.join(",");
+            push("--tools");
+            push(&tools);
+            push("--allowedTools");
+            push(&tools);
+            push("--disallowedTools");
+            push(&READ_ONLY_DENIED_TOOLS.join(","));
+            push("--permission-mode");
+            push("dontAsk");
+            push("--restricted");
+            true
+        }
+        ToolAccess::Full { auto_approve, permission_mode } => {
+            if !auto_approve.is_empty() {
+                push("--allowedTools");
+                push(&auto_approve.join(","));
+            }
+            match permission_mode {
+                Some(mode) => {
+                    push("--permission-mode");
+                    push(mode);
+                }
+                None => push("--dangerously-skip-permissions"),
+            }
+            config.disable_mcp
+        }
+    };
+
+    if let Some(turns) = config.max_turns {
+        push("--max-turns");
+        push(&turns.to_string());
+    }
+    if let Some(budget) = config.max_budget_usd {
+        push("--max-budget-usd");
+        push(&budget.to_string());
+    }
+    if let Some(ref sid) = config.session_id {
+        push("--session-id");
+        push(sid);
+    }
+    if let Some(ref resume) = config.resume_session {
+        push("--resume");
+        push(resume);
+    }
+    if let Some(ref model) = config.model {
+        push("--model");
+        push(model);
+    }
+    if let Some(ref sys) = config.system_prompt {
+        push("--system-prompt");
+        push(sys);
+    }
+    if let Some(ref extra) = config.append_system_prompt {
+        push("--append-system-prompt");
+        push(extra);
+    }
+
+    if strict_mcp {
+        push("--strict-mcp-config");
+    }
+
+    for dir in &config.additional_dirs {
+        if !dir.is_dir() {
+            eprintln!(
+                "[claude-runner] skipping --add-dir for missing directory: {}",
+                dir.display()
+            );
+            continue;
+        }
+        args.push("--add-dir".into());
+        args.push(dir.into());
+    }
+
+    args
 }
 
 /// Events emitted by the Claude runner during execution.
@@ -106,53 +264,7 @@ impl ClaudeRunner {
     ) -> Result<Self, String> {
         let mut cmd = Command::new(program);
 
-        cmd.arg("-p").arg(&config.prompt);
-        cmd.arg("--verbose");
-        cmd.arg("--output-format").arg("stream-json");
-
-        if !config.allowed_tools.is_empty() {
-            cmd.arg("--allowedTools").arg(config.allowed_tools.join(","));
-        }
-
-        if let Some(ref mode) = config.permission_mode {
-            cmd.arg("--permission-mode").arg(mode);
-        } else {
-            cmd.arg("--dangerously-skip-permissions");
-        }
-
-        if let Some(turns) = config.max_turns {
-            cmd.arg("--max-turns").arg(turns.to_string());
-        }
-        if let Some(budget) = config.max_budget_usd {
-            cmd.arg("--max-budget-usd").arg(budget.to_string());
-        }
-        if let Some(ref sid) = config.session_id {
-            cmd.arg("--session-id").arg(sid);
-        }
-        if let Some(ref resume) = config.resume_session {
-            cmd.arg("--resume").arg(resume);
-        }
-        if let Some(ref model) = config.model {
-            cmd.arg("--model").arg(model);
-        }
-        if let Some(ref sys) = config.system_prompt {
-            cmd.arg("--system-prompt").arg(sys);
-        }
-
-        if config.disable_mcp {
-            cmd.arg("--strict-mcp-config");
-        }
-
-        for dir in &config.additional_dirs {
-            if !dir.is_dir() {
-                eprintln!(
-                    "[claude-runner] skipping --add-dir for missing directory: {}",
-                    dir.display()
-                );
-                continue;
-            }
-            cmd.arg("--add-dir").arg(dir);
-        }
+        cmd.args(claude_args(&config));
 
         cmd.current_dir(&config.working_dir);
         cmd.stdout(std::process::Stdio::piped());
@@ -406,6 +518,9 @@ impl ClaudeRunner {
             if !stderr_text.is_empty() {
                 self.accumulated_output.write().await.push_str(&format!("\n--- STDERR ---\n{}", stderr_text));
             }
+            if let Some(reason) = restricted_unsupported_reason(&stderr_text) {
+                return Err(reason);
+            }
             return Err(format!("Exit code {} — {}", code, stderr_summary));
         }
 
@@ -599,6 +714,117 @@ async fn parse_claude_event(
     }
 }
 
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    fn config(tools: ToolAccess) -> ClaudeRunConfig {
+        ClaudeRunConfig {
+            prompt: "prompt text".to_string(),
+            working_dir: ".".to_string(),
+            tools,
+            max_turns: Some(3),
+            max_budget_usd: None,
+            session_id: None,
+            resume_session: None,
+            model: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            disable_mcp: false,
+            additional_dirs: Vec::new(),
+        }
+    }
+
+    fn args(config: &ClaudeRunConfig) -> Vec<String> {
+        claude_args(config)
+            .into_iter()
+            .map(|a| a.into_string().expect("utf-8 arg"))
+            .collect()
+    }
+
+    fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let at = args.iter().position(|a| a == flag)?;
+        args.get(at + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn read_only_makes_only_read_tools_available() {
+        let args = args(&config(ToolAccess::ReadOnly));
+
+        let available = value_of(&args, "--tools").expect("read-only runs pass --tools");
+        assert_eq!(available, "Read,Glob,Grep");
+        for tool in available.split(',') {
+            assert!(
+                !["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"].contains(&tool),
+                "{tool} must not be available to a read-only run"
+            );
+        }
+        assert_eq!(value_of(&args, "--allowedTools"), Some("Read,Glob,Grep"));
+
+        let denied = value_of(&args, "--disallowedTools").expect("read-only runs deny by name too");
+        for tool in ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Agent"] {
+            assert!(denied.split(',').any(|d| d == tool), "{tool} should be denied, got {denied}");
+        }
+    }
+
+    #[test]
+    fn read_only_never_bypasses_permissions_and_is_restricted() {
+        let args = args(&config(ToolAccess::ReadOnly));
+        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"), "{args:?}");
+        assert_eq!(value_of(&args, "--permission-mode"), Some("dontAsk"));
+        assert!(args.iter().any(|a| a == "--restricted"), "{args:?}");
+    }
+
+    #[test]
+    fn read_only_disables_mcp_even_when_the_caller_did_not_ask() {
+        let mut cfg = config(ToolAccess::ReadOnly);
+        cfg.disable_mcp = false;
+        let args = args(&cfg);
+        assert_eq!(args.iter().filter(|a| *a == "--strict-mcp-config").count(), 1);
+    }
+
+    #[test]
+    fn full_access_keeps_the_default_tool_set_and_its_approval_list() {
+        let args = args(&config(ToolAccess::Full {
+            auto_approve: vec!["Read".into(), "Edit".into(), "Bash".into()],
+            permission_mode: None,
+        }));
+        assert!(!args.iter().any(|a| a == "--tools" || a == "--restricted"), "{args:?}");
+        assert_eq!(value_of(&args, "--allowedTools"), Some("Read,Edit,Bash"));
+        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
+    }
+
+    #[test]
+    fn full_access_with_a_permission_mode_does_not_bypass() {
+        let args = args(&config(ToolAccess::Full {
+            auto_approve: Vec::new(),
+            permission_mode: Some("acceptEdits".into()),
+        }));
+        assert_eq!(value_of(&args, "--permission-mode"), Some("acceptEdits"));
+        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions" || a == "--allowedTools"));
+    }
+
+    #[test]
+    fn the_appended_system_prompt_is_passed_through() {
+        let mut cfg = config(ToolAccess::ReadOnly);
+        cfg.append_system_prompt = Some("rules".into());
+        let args = args(&cfg);
+        assert_eq!(value_of(&args, "--append-system-prompt"), Some("rules"));
+        assert!(!args.iter().any(|a| a == "--system-prompt"));
+    }
+
+    #[test]
+    fn the_prompt_is_a_single_argument_after_dash_p() {
+        let mut cfg = config(ToolAccess::ReadOnly);
+        cfg.prompt = "line one\n--tools Bash\n".into();
+        let args = args(&cfg);
+        assert_eq!(args[0], "-p");
+        assert_eq!(args[1], cfg.prompt);
+        assert_eq!(value_of(&args, "--tools"), Some("Read,Glob,Grep"));
+    }
+}
+
 // The fixtures below are shell scripts, so these only make sense where there is
 // a shell. The Windows and macOS CI jobs are compile-only, and the runtime job
 // is Linux.
@@ -655,14 +881,17 @@ mod tests {
             ClaudeRunConfig {
                 prompt: "do the thing".to_string(),
                 working_dir: self.dir.path().to_string_lossy().into_owned(),
-                allowed_tools: vec!["Read".to_string(), "Edit".to_string()],
+                tools: ToolAccess::Full {
+                    auto_approve: vec!["Read".to_string(), "Edit".to_string()],
+                    permission_mode: None,
+                },
                 max_turns: Some(50),
                 max_budget_usd: None,
                 session_id: Some("session-under-test".to_string()),
                 resume_session: None,
                 model: None,
                 system_prompt: None,
-                permission_mode: None,
+                append_system_prompt: None,
                 disable_mcp: false,
                 additional_dirs: Vec::new(),
             }
@@ -726,6 +955,10 @@ mod tests {
     const BLOCKING: &str = "blocking";
 
     const CLAUDE_LEVEL_ERROR: &str = "claude-level-error";
+
+    /// A Claude Code older than `--restricted`: it rejects the flag the way
+    /// the CLI rejects any unknown option, and otherwise runs normally.
+    const NO_RESTRICTED: &str = "no-restricted";
 
     async fn bounded(label: &str, runner: &ClaudeRunner) -> Result<bool, String> {
         match tokio::time::timeout(DEADLINE, runner.wait()).await {
@@ -932,6 +1165,33 @@ mod tests {
                 .expect_err("is_error should surface as an error");
             assert_eq!(error, "the model refused");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cli_without_restricted_fails_a_read_only_run_with_an_actionable_reason() {
+        let fixture = Fixture::new(NO_RESTRICTED);
+        let config = ClaudeRunConfig { tools: ToolAccess::ReadOnly, ..fixture.config() };
+        let runner = ClaudeRunner::start_program(&fixture.program, config)
+            .await
+            .expect("fixture should spawn");
+        let error = bounded("read-only on an old CLI", &runner)
+            .await
+            .expect_err("a CLI that rejects --restricted must fail the run");
+        assert_eq!(Some(error), restricted_unsupported_reason("error: unknown option '--restricted'"));
+
+        let runner = fixture.start().await;
+        assert_eq!(bounded("full access on an old CLI", &runner).await, Ok(true));
+    }
+
+    #[test]
+    fn only_a_rejected_restricted_flag_is_explained_as_an_old_cli() {
+        let reason = restricted_unsupported_reason("error: unknown option '--restricted'\n")
+            .expect("the unknown-option error is recognised");
+        assert!(reason.contains("update Claude Code"), "{reason}");
+        assert!(reason.contains(RESTRICTED_MIN_VERSION), "{reason}");
+        assert_eq!(restricted_unsupported_reason("error: unknown option '--no-such-flag'"), None);
+        assert_eq!(restricted_unsupported_reason("something went wrong in the CLI"), None);
+        assert_eq!(restricted_unsupported_reason(""), None);
     }
 
     /// Whether `pid` is still a running process.

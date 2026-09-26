@@ -1483,6 +1483,19 @@ fn render_pr_comment_markdown(src: &str) -> String {
     out
 }
 
+/// Whether a review item stays approved after its decision changes. Only a
+/// Fix can be approved. A collaborator's Fix is approved automatically;
+/// anyone else's keeps its approval only if it was already a Fix, so a box
+/// ticked while the item was a Question or Skip does not carry over.
+fn approved_after_decision_change(
+    was_fix: bool,
+    is_fix: bool,
+    from_collaborator: bool,
+    approved: bool,
+) -> bool {
+    is_fix && (from_collaborator || (was_fix && approved))
+}
+
 fn render_review_item(
     idx: usize,
     item: PrReviewItem,
@@ -1493,6 +1506,12 @@ fn render_review_item(
     let comment_id = item.comment_id;
     let related = plan.get_untracked()
         .and_then(|p| comment_id.and_then(|id| p.comments.into_iter().find(|c| c.id == Some(id))));
+    // Only a collaborator's Fix is approved automatically; anyone else's
+    // waits for the checkbox. The backend applies the same rule on triage.
+    let from_collaborator = related.as_ref().is_some_and(|c| c.author_is_collaborator());
+    let association = related.as_ref()
+        .and_then(|c| c.author_association.clone())
+        .unwrap_or_else(|| "UNKNOWN".to_string());
 
     // Apply a mutation to the item at `idx` inside the (possibly absent) plan.
     let update_item = move |mutate: &dyn Fn(&mut PrReviewItem)| {
@@ -1513,10 +1532,11 @@ fn render_review_item(
             "skip" => PrReviewDecisionKind::Skip,
             _ => PrReviewDecisionKind::Question,
         };
-        let approved = matches!(decision, PrReviewDecisionKind::Fix);
+        let is_fix = matches!(decision, PrReviewDecisionKind::Fix);
         update_item(&|it| {
+            let was_fix = matches!(it.decision, PrReviewDecisionKind::Fix);
             it.decision = decision.clone();
-            it.approved = approved;
+            it.approved = approved_after_decision_change(was_fix, is_fix, from_collaborator, it.approved);
         });
     };
     let on_reasoning_input = move |ev: leptos::ev::Event| {
@@ -1574,6 +1594,14 @@ fn render_review_item(
                     <div class="flex items-center gap-2 flex-wrap text-xs text-white/45">
                         <span class="font-mono">{location}</span>
                         {(!author.is_empty()).then(|| view! { <span>"-"</span> <span>{author}</span> })}
+                        {(related.is_some() && !from_collaborator).then(|| view! {
+                            <span
+                                class="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 font-medium text-[10px]"
+                                title=format!("GitHub association: {association}. Comments from outside the repository's collaborators are never approved automatically; tick the box to include this item.")
+                            >
+                                "Not a collaborator: approve explicitly"
+                            </span>
+                        })}
                         {comment_id.map(|id| view! { <span class="opacity-60">{format!("(id {})", id)}</span> })}
                         {comment_url.map(|url| {
                             let url_for_click = url.clone();
@@ -2575,5 +2603,25 @@ fn KanbanTaskCard(
                 }
             ></div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::approved_after_decision_change;
+
+    #[test]
+    fn an_approval_ticked_before_an_item_became_a_fix_does_not_carry_over() {
+        // A non-collaborator item ticked while a Question or Skip, then made a Fix.
+        assert!(!approved_after_decision_change(false, true, false, true));
+        // A non-collaborator Fix that was approved stays approved as a Fix...
+        assert!(approved_after_decision_change(true, true, false, true));
+        // ...and is never approved as anything else.
+        assert!(!approved_after_decision_change(true, false, false, true));
+        // A non-collaborator Fix nobody approved stays unapproved.
+        assert!(!approved_after_decision_change(false, true, false, false));
+        // A collaborator's Fix is approved automatically.
+        assert!(approved_after_decision_change(false, true, true, false));
+        assert!(!approved_after_decision_change(true, false, true, true));
     }
 }
