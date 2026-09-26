@@ -272,6 +272,11 @@ pub struct PrReviewComment {
     pub id: Option<u64>,
     pub kind: PrCommentKind,
     pub author: String,
+    /// GitHub's `author_association` for the comment's author (`OWNER`,
+    /// `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `NONE`, ...). `None` when it
+    /// was not fetched, which includes every plan saved before it was.
+    #[serde(default)]
+    pub author_association: Option<String>,
     pub body: String,
     #[serde(default)]
     pub path: Option<String>,
@@ -283,6 +288,27 @@ pub struct PrReviewComment {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl PrReviewComment {
+    /// Whether a Fix triaged from this comment may start out approved.
+    ///
+    /// Only the repository's owner, its organization's members and invited
+    /// collaborators qualify. Everyone else -- contributors, first-time
+    /// contributors, anyone with no association, and apps such as review
+    /// bots, which GitHub reports as `NONE` -- can still be read and triaged,
+    /// but their Fix items wait for the user to approve them one by one. A
+    /// bot is not an exception: what a review bot posts can be steered by
+    /// whoever talks to it on the PR. An unknown association is not trusted.
+    ///
+    /// This decides eligibility for pre-approval only. The comment's text is
+    /// untrusted data whoever wrote it.
+    pub fn author_is_collaborator(&self) -> bool {
+        matches!(
+            self.author_association.as_deref(),
+            Some("OWNER" | "MEMBER" | "COLLABORATOR")
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
