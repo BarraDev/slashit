@@ -1,4 +1,4 @@
-use crate::domain::{Task, TaskStatus};
+use crate::domain::{BranchOrigin, Task, TaskStatus};
 use crate::domain::task::{
     ExternalRef, PrCommentKind, PrReviewApplyResult, PrReviewComment, PrReviewDecision,
     PrReviewItem, PrReviewPlan,
@@ -2736,10 +2736,16 @@ async fn create_pr_reserved(
     // into their own current change.
     let working_dir = resolve_repository_dir(state, task_uuid).await?;
 
-    let (pr_title, pr_body, task_branch_name) = {
+    let (pr_title, pr_body, task_branch_name, branch_origin, has_dependencies) = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_uuid).ok_or("Task not found")?;
-        (task.title.clone(), build_pr_body(task), task.branch_name.clone())
+        (
+            task.title.clone(),
+            build_pr_body(task),
+            task.branch_name.clone(),
+            task.branch_origin.clone(),
+            !task.dependencies.is_empty(),
+        )
     };
 
     // A task with no branch has produced nothing to open a pull request for.
@@ -2770,6 +2776,10 @@ async fn create_pr_reserved(
         return Ok(existing_pr_url);
     }
 
+    // Decided before the push, so a pull request that cannot be opened
+    // truthfully leaves nothing half done on the remote.
+    let base = pr_base_for(&working_dir, branch_origin.as_ref(), has_dependencies).await?;
+
     refuse_if_pr_operation_cancelled(&reservation, "pushing the branch")?;
     let branch = push_branch(&working_dir, &task_branch_name)
         .await
@@ -2795,16 +2805,16 @@ async fn create_pr_reserved(
     }
 
     refuse_if_pr_operation_cancelled(&reservation, "opening the pull request")?;
-    let pr_url = run_cmd(
-        "gh",
-        &[
-            "pr", "create",
-            "--title", &pr_title,
-            "--body", &pr_body,
-            "--head", &branch,
-        ],
-        &working_dir,
-    ).await.map_err(friendly_pr_error)?;
+    let mut create_args = vec![
+        "pr", "create",
+        "--title", &pr_title,
+        "--body", &pr_body,
+        "--head", &branch,
+    ];
+    if let Some(base) = base.as_deref() {
+        create_args.extend(["--base", base]);
+    }
+    let pr_url = run_cmd("gh", &create_args, &working_dir).await.map_err(friendly_pr_error)?;
 
     // Classified rather than flattened. A cleanup this refused is a task that
     // is simply not finished, and the refusal is already persisted onto its
@@ -2820,6 +2830,237 @@ async fn create_pr_reserved(
         }
     }
     Ok(pr_url)
+}
+
+/// How many pull requests [`pr_base_for`] follows from a stacked task's
+/// parent to where its work landed before giving up.
+const MAX_MERGE_HOPS: usize = 5;
+
+/// The branch a task's pull request is opened against: `None` for the
+/// repository's default branch, which is what `gh pr create` uses without
+/// `--base`.
+///
+/// Decided from the origin recorded when the task's branch was created, never
+/// from what the task's dependencies look like now. For a stacked branch,
+/// starting at the parent:
+///
+/// - its pull request is open: that branch, if it is on `origin`;
+/// - it was merged: the branch it was merged into, where its work now is
+///   (GitHub retargets an open stacked pull request the same way when the
+///   parent's branch is deleted on merge). The repository's default branch
+///   is used as it is; any other is held to these same rules, up to
+///   [`MAX_MERGE_HOPS`] pull requests;
+/// - it was closed without being merged: refused, the work this branch was
+///   built on was never delivered;
+/// - it has none: that branch if it is on `origin`, refused if not;
+/// - GitHub cannot be asked, or the merges lead back to a branch already
+///   seen: refused.
+///
+/// A task with no recorded origin and a dependency is refused too. No origin
+/// means where its branch started is not known to be on the default base:
+/// the branch was created before SlashIt recorded origins, or its starting
+/// commit was not proven to be contained in `refs/remotes/origin/HEAD` when
+/// it was created (see `WorktreeManager::default_base_origin`). It may carry
+/// the dependency's commits, and opening it against the default branch would
+/// put them into its pull request.
+///
+/// Every refusal comes before anything is pushed.
+async fn pr_base_for(
+    working_dir: &str,
+    origin: Option<&BranchOrigin>,
+    has_dependencies: bool,
+) -> Result<Option<String>, String> {
+    let parent = match origin {
+        Some(BranchOrigin::DefaultBase) => return Ok(None),
+        None if !has_dependencies => return Ok(None),
+        None => {
+            return Err(
+                "This task depends on another task, and its branch's starting point is not \
+                 known to be on the default base: the branch was created before SlashIt \
+                 recorded where branches start, or its starting commit was not proven to be \
+                 contained in refs/remotes/origin/HEAD. SlashIt cannot tell whether the pull \
+                 request belongs on the dependency's branch or on the default branch. Open it \
+                 with `gh pr create --base <branch>`; creating the pull request here afterwards \
+                 links it to the task. If the repository has no refs/remotes/origin/HEAD, \
+                 `git remote set-head origin --auto` records it for branches created from \
+                 then on."
+                    .to_string(),
+            )
+        }
+        Some(BranchOrigin::Stacked { parent_branch }) => checked_task_branch(parent_branch)
+            .map_err(|e| format!("The branch this task is stacked on is unusable: {e}"))?,
+    };
+
+    let mut default_branch: Option<String> = None;
+    let mut seen = vec![parent.to_string()];
+    let mut branch = parent.to_string();
+    for _ in 0..MAX_MERGE_HOPS {
+        let context = if branch == parent {
+            format!("This task is stacked on branch {parent}")
+        } else {
+            format!("This task is stacked on branch {parent}, whose work was merged on into {branch}")
+        };
+        let (state, merged_into) = branch_pr_state(working_dir, &branch)
+            .await
+            .map_err(|e| format!("{context}, and the pull request of {branch} could not be looked up: {e}"))?;
+        match state.as_deref() {
+            Some("MERGED") => {
+                let next = merged_into.unwrap_or_default();
+                if checked_task_branch(&next).is_err() {
+                    return Err(format!(
+                        "{context}. GitHub reported {next:?} as the branch {branch} was merged \
+                         into, which is not a branch name SlashIt will pass to git or gh."
+                    ));
+                }
+                if default_branch.is_none() {
+                    default_branch = Some(repository_default_branch(working_dir).await?);
+                }
+                if default_branch.as_deref() == Some(next.as_str()) {
+                    return Ok(Some(next));
+                }
+                if seen.contains(&next) {
+                    return Err(format!(
+                        "{context}, and following where {branch} was merged leads back to {next}, \
+                         so there is no branch this pull request can be opened against."
+                    ));
+                }
+                seen.push(next.clone());
+                branch = next;
+            }
+            Some("OPEN") | None => {
+                if !remote_branch_exists(working_dir, &branch).await? {
+                    return Err(format!(
+                        "{context}, and {branch} is not on origin, so there is nothing to open \
+                         this pull request against. Push that branch, or open its pull request, \
+                         first."
+                    ));
+                }
+                return Ok(Some(branch));
+            }
+            Some("CLOSED") => {
+                return Err(format!(
+                    "{context}, and the pull request of {branch} was closed without being \
+                     merged. The work this task builds on was never delivered, so its pull \
+                     request has no valid base."
+                ))
+            }
+            Some(other) => {
+                return Err(format!(
+                    "{context}, and the pull request of {branch} is in a state SlashIt does not \
+                     know ({other})."
+                ))
+            }
+        }
+    }
+    Err(format!(
+        "This task is stacked on branch {parent}, and finding where its work landed took more \
+         than {MAX_MERGE_HOPS} merged pull requests, so SlashIt stopped rather than guess."
+    ))
+}
+
+/// How many of a branch's pull requests, newest first, [`branch_pr_state`]
+/// looks through for one that is not from a fork.
+const PR_LOOKUP_LIMIT: usize = 30;
+
+/// The state of the newest pull request from this repository whose head is
+/// `branch`, upper-cased, and the branch it targets; `(None, None)` when
+/// there is none.
+///
+/// `gh pr list --head` matches the head branch by name only (it takes no
+/// `<owner>:<branch>`), so pull requests from forks whose branch happens to
+/// have the same name are listed too. Task branch names are public and
+/// predictable, so such a pull request says nothing about the work on this
+/// repository's branch, and taken as the newest it would decide the base
+/// instead of the branch's own. Every entry `gh` marks as
+/// `isCrossRepository` is passed over, among the newest
+/// [`PR_LOOKUP_LIMIT`] pull requests; the first one left is used. An entry
+/// that does not say whether it is from a fork is neither: the lookup fails,
+/// as it does when `gh` cannot answer, rather than let it decide or skip it.
+///
+/// When fewer than [`PR_LOOKUP_LIMIT`] are listed and all are from forks,
+/// the branch has no pull request of its own. When the list is full and all
+/// are from forks, its own may be further back than the list reaches, and
+/// reading that as none could pick the wrong base, so the lookup fails.
+async fn branch_pr_state(
+    working_dir: &str,
+    branch: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let branch = checked_task_branch(branch)?;
+    let limit = PR_LOOKUP_LIMIT.to_string();
+    let listed = run_cmd(
+        "gh",
+        &[
+            "pr", "list",
+            "--head", branch,
+            "--state", "all",
+            "--limit", &limit,
+            "--json", "state,baseRefName,isCrossRepository",
+        ],
+        working_dir,
+    )
+    .await?;
+    let listed: serde_json::Value = serde_json::from_str(&listed)
+        .map_err(|e| format!("Failed to parse gh pr list output: {e}"))?;
+    let listed = listed.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut own = None;
+    for pr in listed {
+        match pr.get("isCrossRepository").and_then(|v| v.as_bool()) {
+            Some(true) => continue,
+            Some(false) => {
+                own = Some(pr);
+                break;
+            }
+            None => {
+                return Err(format!(
+                    "gh pr list did not report isCrossRepository for a pull request of \
+                     {branch}, so SlashIt cannot tell it from a fork's"
+                ))
+            }
+        }
+    }
+    if own.is_none() && listed.len() >= PR_LOOKUP_LIMIT {
+        return Err(format!(
+            "the newest {PR_LOOKUP_LIMIT} pull requests with head {branch} are all from forks, \
+             so SlashIt cannot find this repository's own"
+        ));
+    }
+    let field = |name: &str| {
+        own.and_then(|pr| pr.get(name))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    Ok((field("state").map(|s| s.to_uppercase()), field("baseRefName")))
+}
+
+/// The repository's default branch, as GitHub reports it.
+async fn repository_default_branch(working_dir: &str) -> Result<String, String> {
+    let output = run_cmd("gh", &["repo", "view", "--json", "defaultBranchRef"], working_dir)
+        .await
+        .map_err(|e| format!("Could not ask GitHub for the repository's default branch: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&output)
+        .map_err(|e| format!("Failed to parse gh repo view output: {e}"))?;
+    json.get("defaultBranchRef")
+        .and_then(|r| r.get("name"))
+        .and_then(|v| v.as_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "gh repo view did not report a default branch".to_string())
+}
+
+/// Whether `origin` has a branch named `branch`, asked of the remote itself.
+async fn remote_branch_exists(working_dir: &str, branch: &str) -> Result<bool, String> {
+    let branch = checked_task_branch(branch)?;
+    let mut git_args: Vec<String> = Vec::new();
+    if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
+        git_args.push(git_dir);
+    }
+    let refname = format!("refs/heads/{branch}");
+    git_args.extend(["ls-remote", "--heads", "origin", &refname].map(String::from));
+    let git_args: Vec<&str> = git_args.iter().map(String::as_str).collect();
+    let listed = run_cmd("git", &git_args, working_dir)
+        .await
+        .map_err(|e| format!("Could not ask the remote for branch {branch}: {e}"))?;
+    Ok(!listed.is_empty())
 }
 
 async fn find_existing_pr_for_branch(
@@ -3425,9 +3666,9 @@ async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> 
     if is_jj_repo(working_dir).await {
         run_cmd("jj", &["--ignore-working-copy", "git", "export"], working_dir).await
             .map_err(|e| format!("jj git export failed: {}", e))?;
-        if !git_repository_is_inside_jj_workspace(working_dir).await {
-            git_args.push(format!("--git-dir={}", jj_backing_git_dir(working_dir).await?));
-        }
+    }
+    if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
+        git_args.push(git_dir);
     }
 
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
@@ -3436,6 +3677,16 @@ async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> 
     run_cmd("git", &git_args, working_dir).await
         .map_err(|e| format!("git push failed: {}", e))?;
     Ok(branch.to_string())
+}
+
+/// The `--git-dir` argument `git` needs in `working_dir`: the Git repository
+/// behind a jj repository that `git` would not find there by itself, and
+/// nothing otherwise.
+async fn jj_git_dir_arg(working_dir: &str) -> Result<Option<String>, String> {
+    if is_jj_repo(working_dir).await && !git_repository_is_inside_jj_workspace(working_dir).await {
+        return Ok(Some(format!("--git-dir={}", jj_backing_git_dir(working_dir).await?)));
+    }
+    Ok(None)
 }
 
 /// Whether `git`, run in `working_dir`, discovers a repository whose top
@@ -5670,13 +5921,25 @@ mod tests {
             /// `pr view` with `state_json` -- the three `gh` calls on
             /// `create_pr_inner`'s path for a task with no existing PR.
             fn setup(pr_url: &str, state_json: &str) -> Self {
+                Self::setup_answering(pr_url, state_json, &[])
+            }
+
+            /// [`Self::setup`], with each `(args, shell)` in `answers` run
+            /// instead when the space-joined arguments are exactly `args`.
+            /// The repository's default branch is `main` unless an answer
+            /// says otherwise.
+            fn setup_answering(pr_url: &str, state_json: &str, answers: &[(String, String)]) -> Self {
                 let tmp = tempfile::tempdir().expect("tempdir");
                 let bin_dir = tmp.path().join("bin");
                 std::fs::create_dir_all(&bin_dir).unwrap();
                 let log = tmp.path().join("gh.log");
 
+                let extra: String = answers
+                    .iter()
+                    .map(|(args, shell)| format!("  '{args}') {shell} ;;\n"))
+                    .collect();
                 let script = format!(
-                    "#!/bin/sh\nprintf 'PWD=%s\\n' \"$PWD\" >> {log:?}\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '[]' ;;\n  *'pr create'*) printf '%s' {pr_url:?} ;;\n  *'pr view'*) printf '%s' {state_json:?} ;;\n  *) printf '{{}}' ;;\nesac\n",
+                    "#!/bin/sh\nprintf 'PWD=%s\\n' \"$PWD\" >> {log:?}\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\ncase \"$*\" in\n{extra}  'repo view --json defaultBranchRef') printf '%s' '{{\"defaultBranchRef\":{{\"name\":\"main\"}}}}' ;;\n  *'pr list'*) printf '[]' ;;\n  *'pr create'*) printf '%s' {pr_url:?} ;;\n  *'pr view'*) printf '%s' {state_json:?} ;;\n  *) printf '{{}}' ;;\nesac\n",
                     log = log,
                     pr_url = pr_url,
                     state_json = state_json,
@@ -5913,6 +6176,498 @@ mod tests {
                 "a failed push must not publish a PrCreated state that never happened"
             );
             assert!(task.pr_url.is_none());
+        }
+
+        /// A stacked task's repository: `task-parent` off `main` with a
+        /// commit, and the task's `task-branch` on top of it with its own.
+        /// `task-parent` is pushed only when `push_parent` is set.
+        #[cfg(unix)]
+        fn stacked_repo(push_parent: bool) -> RepoFixture {
+            let repo = RepoFixture::new();
+            git(&repo.checkout, &["checkout", "-q", "-b", "task-parent"]);
+            git(&repo.checkout, &["commit", "-q", "--allow-empty", "-m", "parent work"]);
+            if push_parent {
+                git(&repo.checkout, &["push", "-q", "origin", "task-parent"]);
+            }
+            git(&repo.checkout, &["checkout", "-q", "-b", "task-branch"]);
+            git(&repo.checkout, &["commit", "-q", "--allow-empty", "-m", "task work"]);
+            git(&repo.checkout, &["checkout", "-q", "main"]);
+            repo
+        }
+
+        /// A `Done` task on `task-branch` with `origin` recorded and, when
+        /// `with_dependency` is set, a dependency on another task.
+        #[cfg(unix)]
+        async fn seed_origin_task(
+            state: &crate::AppState,
+            repo: &RepoFixture,
+            origin: Option<crate::domain::BranchOrigin>,
+            with_dependency: bool,
+        ) -> Uuid {
+            let task_id =
+                seed_task(state, repo.checkout.to_str().unwrap(), Some("task-branch"), TaskStatus::Done)
+                    .await;
+            let mut tasks = state.task.tasks.write().await;
+            let task = tasks.get_mut(&task_id).unwrap();
+            task.branch_origin = origin;
+            if with_dependency {
+                task.dependencies = vec![Uuid::new_v4()];
+            }
+            task_id
+        }
+
+        #[cfg(unix)]
+        fn stacked_on_parent() -> Option<crate::domain::BranchOrigin> {
+            Some(crate::domain::BranchOrigin::Stacked { parent_branch: "task-parent".to_string() })
+        }
+
+        /// `gh`'s answer to the lookup of `branch`'s pull request, matched
+        /// on its whole argument list.
+        #[cfg(unix)]
+        fn pr_of(branch: &str, json: &str) -> (String, String) {
+            (
+                format!("pr list --head {branch} --state all --limit 30 --json state,baseRefName,isCrossRepository"),
+                format!("printf '%s' '{json}'"),
+            )
+        }
+
+        #[cfg(unix)]
+        fn merged_into(branch: &str, base: &str) -> (String, String) {
+            pr_of(branch, &format!(r#"[{{"state":"MERGED","baseRefName":"{base}","isCrossRepository":false}}]"#))
+        }
+
+        /// Put a branch `name` at `main` on the fixture's remote.
+        #[cfg(unix)]
+        fn publish(repo: &RepoFixture, name: &str) {
+            git(&repo.checkout, &["push", "-q", "origin", &format!("main:refs/heads/{name}")]);
+        }
+
+        /// The recorded argv of the `gh pr create` call, from its `--head`
+        /// on (the title and body before it are the task's own text).
+        #[cfg(unix)]
+        fn pr_create_tail(log: &str) -> Option<Vec<String>> {
+            log.split("---END-ARGS---\n")
+                .find(|call| call.contains("\npr\ncreate\n"))
+                .map(|call| {
+                    let lines: Vec<&str> = call.lines().collect();
+                    let head = lines.iter().position(|l| *l == "--head").expect("--head");
+                    lines[head..].iter().map(|l| l.to_string()).collect()
+                })
+        }
+
+        /// A stacked task whose parent's pull request is open is opened
+        /// against the parent's branch.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_stacked_task_opens_its_pull_request_against_its_open_parent() {
+            let _guard = PATH_LOCK.lock().await;
+            let repo = stacked_repo(true);
+            let mock = MockGh::setup_answering(
+                "https://github.com/testorg/testrepo/pull/12",
+                r#"{"state":"OPEN"}"#,
+                &[pr_of("task-parent", r#"[{"state":"OPEN","baseRefName":"main","isCrossRepository":false}]"#)],
+            );
+            let (state, _tmp) = build_test_state().await;
+            let task_id = seed_origin_task(&state, &repo, stacked_on_parent(), true).await;
+
+            let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+            assert_eq!(result.as_deref(), Ok("https://github.com/testorg/testrepo/pull/12"));
+            assert!(
+                mock.read_log().contains(
+                    "\npr\nlist\n--head\ntask-parent\n--state\nall\n--limit\n30\n--json\n\
+                     state,baseRefName,isCrossRepository\n---END-ARGS---"
+                ),
+                "the parent's pull request is looked up among closed and merged ones too: {}",
+                mock.read_log()
+            );
+            assert_eq!(
+                pr_create_tail(&mock.read_log()),
+                Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "task-parent".into()]),
+                "{}",
+                mock.read_log()
+            );
+        }
+
+        /// A parent pushed without a pull request of its own is still a
+        /// branch on the remote, and the pull request targets it.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_stacked_task_targets_a_pushed_parent_that_has_no_pull_request() {
+            let _guard = PATH_LOCK.lock().await;
+            let repo = stacked_repo(true);
+            let mock = MockGh::setup("https://github.com/testorg/testrepo/pull/13", r#"{"state":"OPEN"}"#);
+            let (state, _tmp) = build_test_state().await;
+            let task_id = seed_origin_task(&state, &repo, stacked_on_parent(), true).await;
+
+            let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+            assert_eq!(result.as_deref(), Ok("https://github.com/testorg/testrepo/pull/13"));
+            assert_eq!(
+                pr_create_tail(&mock.read_log()),
+                Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "task-parent".into()]),
+            );
+        }
+
+        /// `gh`'s answer to any `pr list --head <branch> --state all` call,
+        /// whatever limit and fields it asks for. The closing quote is moved
+        /// before the `*` so the shell `case` pattern the mock builds from it
+        /// matches as a glob, not literally.
+        #[cfg(unix)]
+        fn any_pr_list_of(branch: &str, json: &str) -> (String, String) {
+            (
+                format!("pr list --head {branch} --state all '*'"),
+                format!("printf '%s' '{json}'"),
+            )
+        }
+
+        /// `gh pr list --head` matches the head branch by name only, so a
+        /// pull request from a fork whose branch has the same name is listed
+        /// with the parent's own, and as the newest it came first. It says
+        /// nothing about the parent's work and is passed over: here the
+        /// parent's own pull request was merged into the default branch, so
+        /// that is what the task's pull request targets, not the parent's
+        /// branch a fork's open pull request would have picked.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_fork_pull_request_from_a_same_named_branch_does_not_stand_in_for_the_parents() {
+            let _guard = PATH_LOCK.lock().await;
+            let repo = stacked_repo(true);
+            let mock = MockGh::setup_answering(
+                "https://github.com/testorg/testrepo/pull/17",
+                r#"{"state":"OPEN"}"#,
+                &[any_pr_list_of(
+                    "task-parent",
+                    r#"[{"state":"OPEN","baseRefName":"main","isCrossRepository":true},{"state":"MERGED","baseRefName":"main","isCrossRepository":false}]"#,
+                )],
+            );
+            let (state, _tmp) = build_test_state().await;
+            let task_id = seed_origin_task(&state, &repo, stacked_on_parent(), true).await;
+
+            let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+            assert_eq!(result.as_deref(), Ok("https://github.com/testorg/testrepo/pull/17"));
+            assert_eq!(
+                pr_create_tail(&mock.read_log()),
+                Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "main".into()]),
+                "{}",
+                mock.read_log()
+            );
+            assert!(
+                mock.read_log().contains(
+                    "\npr\nlist\n--head\ntask-parent\n--state\nall\n--limit\n30\n--json\n\
+                     state,baseRefName,isCrossRepository\n---END-ARGS---"
+                ),
+                "the lookup has to ask which pull requests come from a fork, and list past \
+                 the newest: {}",
+                mock.read_log()
+            );
+        }
+
+        /// A parent whose only listed pull request comes from a fork has no
+        /// pull request of its own, and is treated exactly like one with
+        /// none: a pushed parent is targeted as it is. The fork's closed
+        /// pull request is not read as the parent's work never being
+        /// delivered.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_parent_whose_only_pull_request_is_from_a_fork_has_none() {
+            let _guard = PATH_LOCK.lock().await;
+            let repo = stacked_repo(true);
+            let mock = MockGh::setup_answering(
+                "https://github.com/testorg/testrepo/pull/18",
+                r#"{"state":"OPEN"}"#,
+                &[any_pr_list_of(
+                    "task-parent",
+                    r#"[{"state":"CLOSED","baseRefName":"main","isCrossRepository":true}]"#,
+                )],
+            );
+            let (state, _tmp) = build_test_state().await;
+            let task_id = seed_origin_task(&state, &repo, stacked_on_parent(), true).await;
+
+            let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+            assert_eq!(result.as_deref(), Ok("https://github.com/testorg/testrepo/pull/18"));
+            assert_eq!(
+                pr_create_tail(&mock.read_log()),
+                Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "task-parent".into()]),
+                "{}",
+                mock.read_log()
+            );
+        }
+
+        /// When every one of the pull requests the lookup lists is from a
+        /// fork and the list is full, the parent's own may be further back
+        /// than the lookup reads. Reading that as the parent having none
+        /// would target its branch even if its own pull request was merged,
+        /// so the task is refused before anything is pushed. Fewer than a
+        /// full list, all from forks, is still read as none (see
+        /// `a_parent_whose_only_pull_request_is_from_a_fork_has_none`).
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_full_list_of_fork_pull_requests_is_refused() {
+            let _guard = PATH_LOCK.lock().await;
+            let repo = stacked_repo(true);
+            let fork = r#"{"state":"OPEN","baseRefName":"main","isCrossRepository":true}"#;
+            let full = format!("[{}]", vec![fork; 30].join(","));
+            let mock = MockGh::setup_answering(
+                "https://github.com/testorg/testrepo/pull/20",
+                r#"{"state":"OPEN"}"#,
+                &[any_pr_list_of("task-parent", &full)],
+            );
+            let (state, _tmp) = build_test_state().await;
+            let task_id = seed_origin_task(&state, &repo, stacked_on_parent(), true).await;
+
+            let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+            let error = result.expect_err("the parent's own pull request may be past the list");
+            assert!(error.contains("all from forks"), "{error}");
+            assert_eq!(repo.remote_has_branch("task-branch"), None, "nothing may be pushed");
+            assert_eq!(pr_create_tail(&mock.read_log()), None, "{}", mock.read_log());
+        }
+
+        /// A listed pull request that does not say whether it comes from a
+        /// fork cannot be taken as the parent's, nor skipped as a fork's: it
+        /// may be the very one that decides the base. The lookup fails, and
+        /// the task is refused before anything is pushed, as it is when
+        /// `gh` cannot answer at all.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_pull_request_listed_without_its_fork_status_is_refused() {
+            let _guard = PATH_LOCK.lock().await;
+            let repo = stacked_repo(true);
+            let mock = MockGh::setup_answering(
+                "https://github.com/testorg/testrepo/pull/19",
+                r#"{"state":"OPEN"}"#,
+                &[any_pr_list_of("task-parent", r#"[{"state":"OPEN","baseRefName":"main"}]"#)],
+            );
+            let (state, _tmp) = build_test_state().await;
+            let task_id = seed_origin_task(&state, &repo, stacked_on_parent(), true).await;
+
+            let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+            let error = result.expect_err("an entry of unknown origin must not decide the base");
+            assert!(error.contains("isCrossRepository"), "{error}");
+            assert_eq!(repo.remote_has_branch("task-branch"), None, "nothing may be pushed");
+            assert_eq!(pr_create_tail(&mock.read_log()), None, "{}", mock.read_log());
+        }
+
+        /// Once the parent's pull request is merged its work is in the
+        /// branch that pull request targeted, and so is this one's. That
+        /// branch is held to the same rules as the parent: the default
+        /// branch is used as it is, another branch only while it is on the
+        /// remote and its own pull request is open or absent, and one that
+        /// was merged in turn is followed to where it went.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_stacked_task_whose_parent_was_merged_targets_where_its_work_landed() {
+            let _guard = PATH_LOCK.lock().await;
+            let cases = [
+                ("merged into the default branch", vec![merged_into("task-parent", "main")], vec![], "main"),
+                (
+                    "merged into a branch that was merged into the default branch",
+                    vec![merged_into("task-parent", "task-grand"), merged_into("task-grand", "main")],
+                    vec![],
+                    "main",
+                ),
+                (
+                    "merged into a branch whose pull request is open",
+                    vec![
+                        merged_into("task-parent", "task-grand"),
+                        pr_of("task-grand", r#"[{"state":"OPEN","baseRefName":"main","isCrossRepository":false}]"#),
+                    ],
+                    vec!["task-grand"],
+                    "task-grand",
+                ),
+                (
+                    "merged into a pushed branch with no pull request",
+                    vec![merged_into("task-parent", "release/2")],
+                    vec!["release/2"],
+                    "release/2",
+                ),
+            ];
+            for (name, answers, pushed, expected_base) in cases {
+                let repo = stacked_repo(false);
+                for branch in pushed {
+                    publish(&repo, branch);
+                }
+                let mock = MockGh::setup_answering(
+                    "https://github.com/testorg/testrepo/pull/14",
+                    r#"{"state":"OPEN"}"#,
+                    &answers,
+                );
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_origin_task(&state, &repo, stacked_on_parent(), true).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok("https://github.com/testorg/testrepo/pull/14"), "{name}");
+                assert_eq!(
+                    pr_create_tail(&mock.read_log()),
+                    Some(vec!["--head".into(), "task-branch".into(), "--base".into(), expected_base.into()]),
+                    "{name}: {}",
+                    mock.read_log()
+                );
+            }
+        }
+
+        /// Every stacked case SlashIt cannot open truthfully is refused
+        /// before the task's branch is pushed, and nothing reaches
+        /// `gh pr create`.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_stacked_task_whose_base_cannot_be_known_is_refused_before_anything_is_pushed() {
+            let _guard = PATH_LOCK.lock().await;
+            struct Case {
+                name: &'static str,
+                answers: Vec<(String, String)>,
+                pushed: &'static [&'static str],
+                origin: Option<crate::domain::BranchOrigin>,
+                expected: &'static str,
+            }
+            let closed = r#"[{"state":"CLOSED","baseRefName":"main","isCrossRepository":false}]"#;
+            let open = r#"[{"state":"OPEN","baseRefName":"main","isCrossRepository":false}]"#;
+            let cases = [
+                Case {
+                    name: "parent closed unmerged",
+                    answers: vec![pr_of("task-parent", closed)],
+                    pushed: &["task-parent"],
+                    origin: stacked_on_parent(),
+                    expected: "closed without being merged",
+                },
+                Case {
+                    name: "parent not on origin",
+                    answers: vec![],
+                    pushed: &[],
+                    origin: stacked_on_parent(),
+                    expected: "task-parent is not on origin",
+                },
+                Case {
+                    name: "parent open but not on origin",
+                    answers: vec![pr_of("task-parent", open)],
+                    pushed: &[],
+                    origin: stacked_on_parent(),
+                    expected: "task-parent is not on origin",
+                },
+                Case {
+                    name: "gh cannot answer",
+                    answers: vec![(
+                        "pr list --head task-parent --state all --limit 30 --json state,baseRefName,isCrossRepository"
+                            .to_string(),
+                        "echo 'HTTP 502' >&2; exit 1".to_string(),
+                    )],
+                    pushed: &["task-parent"],
+                    origin: stacked_on_parent(),
+                    expected: "HTTP 502",
+                },
+                Case {
+                    name: "merge base deleted",
+                    answers: vec![merged_into("task-parent", "task-grand")],
+                    pushed: &[],
+                    origin: stacked_on_parent(),
+                    expected: "task-grand is not on origin",
+                },
+                Case {
+                    name: "merge base closed unmerged",
+                    answers: vec![merged_into("task-parent", "task-grand"), pr_of("task-grand", closed)],
+                    pushed: &["task-grand"],
+                    origin: stacked_on_parent(),
+                    expected: "closed without being merged",
+                },
+                Case {
+                    name: "merge bases in a cycle",
+                    answers: vec![
+                        merged_into("task-parent", "task-grand"),
+                        merged_into("task-grand", "task-parent"),
+                    ],
+                    pushed: &[],
+                    origin: stacked_on_parent(),
+                    expected: "leads back to",
+                },
+                Case {
+                    name: "merge chain too long",
+                    answers: vec![
+                        merged_into("task-parent", "s1"),
+                        merged_into("s1", "s2"),
+                        merged_into("s2", "s3"),
+                        merged_into("s3", "s4"),
+                        merged_into("s4", "s5"),
+                    ],
+                    pushed: &[],
+                    origin: stacked_on_parent(),
+                    expected: "more than 5",
+                },
+                Case {
+                    name: "merge base not a branch name",
+                    answers: vec![merged_into("task-parent", "-evil")],
+                    pushed: &[],
+                    origin: stacked_on_parent(),
+                    expected: "GitHub reported \"-evil\"",
+                },
+                Case {
+                    name: "legacy task with a dependency",
+                    answers: vec![],
+                    pushed: &["task-parent"],
+                    origin: None,
+                    expected: "gh pr create --base",
+                },
+            ];
+            for Case { name, answers, pushed, origin, expected } in cases {
+                let repo = stacked_repo(false);
+                for branch in pushed {
+                    publish(&repo, branch);
+                }
+                let mock = MockGh::setup_answering(
+                    "https://github.com/testorg/testrepo/pull/15",
+                    r#"{"state":"OPEN"}"#,
+                    &answers,
+                );
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_origin_task(&state, &repo, origin, true).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                let error = result.expect_err(name);
+                assert!(error.contains(expected), "{name}: {error}");
+                assert_eq!(repo.remote_has_branch("task-branch"), None, "{name}: nothing may be pushed");
+                assert_eq!(pr_create_tail(&mock.read_log()), None, "{name}: {}", mock.read_log());
+                let tasks = state.task.tasks.read().await;
+                assert_eq!(tasks[&task_id].status, TaskStatus::Done, "{name}");
+                assert!(tasks[&task_id].pr_url.is_none(), "{name}");
+            }
+        }
+
+        /// A task started from the default base, and one recorded before
+        /// origins were kept that has no dependency, get exactly the
+        /// `gh pr create` they always did: no `--base`, so GitHub's default.
+        /// A dependency on a task started from the default base does not
+        /// change that; the stack is what was recorded, not what the
+        /// dependencies say now.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_unstacked_task_opens_its_pull_request_against_the_default_branch() {
+            let _guard = PATH_LOCK.lock().await;
+            for (origin, with_dependency) in [
+                (Some(crate::domain::BranchOrigin::DefaultBase), false),
+                (Some(crate::domain::BranchOrigin::DefaultBase), true),
+                (None, false),
+            ] {
+                let repo = stacked_repo(false);
+                let mock = MockGh::setup("https://github.com/testorg/testrepo/pull/16", r#"{"state":"OPEN"}"#);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_origin_task(&state, &repo, origin.clone(), with_dependency).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok("https://github.com/testorg/testrepo/pull/16"), "{origin:?}");
+                assert_eq!(
+                    pr_create_tail(&mock.read_log()),
+                    Some(vec!["--head".into(), "task-branch".into()]),
+                    "{origin:?}: {}",
+                    mock.read_log()
+                );
+                assert!(!mock.read_log().contains("task-parent"), "{origin:?}");
+            }
         }
 
         /// Phase 7: `bulk_create_prs` is `create_pr_inner` called once per task

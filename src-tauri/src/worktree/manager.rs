@@ -1,5 +1,6 @@
 use super::checked_task_branch;
 use crate::config::paths::{AppPaths, ProjectKey, WorktreePlacement};
+use crate::domain::BranchOrigin;
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -361,18 +362,31 @@ impl WorktreeManager {
     /// checked all the same, so that every way of acquiring a worktree holds
     /// its branch to the same contract before any process sees it.
     pub async fn create(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
+        self.create_or_adopt(repo_path, branch).await.map(|(info, _)| info)
+    }
+
+    /// [`Self::create`], also saying whether the worktree was adopted: an
+    /// existing worktree of `branch` reused rather than a new branch
+    /// created. Where an adopted branch started is not known here.
+    pub async fn create_or_adopt(
+        &self,
+        repo_path: &str,
+        branch: &str,
+    ) -> Result<(WorktreeInfo, bool), String> {
         let branch = checked_task_branch(branch)?;
         if let Some(existing) = self.adoptable_path_live(repo_path, branch).await {
-            return Ok(WorktreeInfo {
+            let info = WorktreeInfo {
                 path: existing.to_string_lossy().to_string(),
                 branch: branch.to_string(),
-            });
+            };
+            return Ok((info, true));
         }
-        if self.delegates_to_wt() {
-            self.create_with_wt(repo_path, branch).await
+        let info = if self.delegates_to_wt() {
+            self.create_with_wt(repo_path, branch).await?
         } else {
-            self.create_with_git(repo_path, branch).await
-        }
+            self.create_with_git(repo_path, branch).await?
+        };
+        Ok((info, false))
     }
 
     /// Reattach to an existing branch (no -c flag). Used when re-queuing a task
@@ -542,6 +556,89 @@ impl WorktreeManager {
                 String::from_utf8_lossy(&output.stderr).trim()
             )),
         }
+    }
+
+    /// [`BranchOrigin::DefaultBase`] when `base_commit` is provably contained
+    /// in the repository's known remote default base, `None` when that is
+    /// not proven.
+    ///
+    /// An ordinary task branch starts wherever the tool creating it starts
+    /// it: `git worktree add -b` at the primary checkout's `HEAD` (a feature
+    /// branch the user is on, or the detached `@-` of a JJ-colocated
+    /// repository), `wt switch -c` at the local default branch, which may
+    /// hold commits nobody pushed. Neither is necessarily the default base a
+    /// pull request is opened against, so creating the branch proves nothing
+    /// by itself. What is checked instead is where it actually started,
+    /// against local refs only, with no fetch: the ref
+    /// `refs/remotes/origin/HEAD` is resolved to the commit it names, and
+    /// then `git merge-base --is-ancestor <base_commit> <that commit>` is
+    /// asked. Only its exit status 0 is proof. Not contained, no
+    /// `origin/HEAD` (a remote not named `origin`, or one whose default
+    /// branch was never recorded locally), one naming a branch that is not
+    /// there, an object the repository does not have, or a git that could
+    /// not be run all answer `None`: unknown, never a guessed origin.
+    ///
+    /// The ref is resolved by [`Self::origin_head_commit`] rather than handed
+    /// to `merge-base` by name, because git looks a revision name up in
+    /// several namespaces: with the real ref gone, a local branch or tag
+    /// named `refs/remotes/origin/HEAD` would otherwise answer for it.
+    ///
+    /// Both front doors that create an ordinary branch, the executor and the
+    /// Worktree panel's `create_worktree`, record what this answers, so the
+    /// policy lives only here.
+    ///
+    /// `base_commit` is refused without running git unless it is a full
+    /// object ID as `git rev-parse` prints it: a revision such as `HEAD`,
+    /// `main` or `origin/HEAD` would resolve to something other than the
+    /// commit that was recorded, and an argument starting with `-` would be
+    /// read as an option.
+    pub async fn default_base_origin(
+        repo_path: &str,
+        base_commit: Option<&str>,
+    ) -> Option<BranchOrigin> {
+        let base_commit = base_commit.filter(|c| Self::is_full_object_id(c))?;
+        let default_base = Self::origin_head_commit(repo_path).await?;
+        let output = tokio::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", base_commit, &default_base])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .ok()?;
+        (output.status.code() == Some(0)).then_some(BranchOrigin::DefaultBase)
+    }
+
+    /// The object ID the ref `refs/remotes/origin/HEAD` resolves to, or
+    /// `None` when there is no such ref, it is a symbolic ref to a branch
+    /// that is not there, or git could not be asked cleanly.
+    ///
+    /// `for-each-ref` matches the full ref name only, never a branch or tag
+    /// that merely carries the same name, and dereferences the symbolic ref
+    /// to its target's object ID; a dangling one is not listed at all. Its
+    /// pattern also matches refs below `refs/remotes/origin/HEAD/`, so only
+    /// the line for the exact name is taken.
+    async fn origin_head_commit(repo_path: &str) -> Option<String> {
+        const ORIGIN_HEAD: &str = "refs/remotes/origin/HEAD";
+        let output = tokio::process::Command::new("git")
+            .args(["for-each-ref", "--format=%(refname) %(objectname)", ORIGIN_HEAD])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() || !output.stderr.is_empty() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout).lines().find_map(|line| {
+            let (refname, oid) = line.split_once(' ')?;
+            (refname == ORIGIN_HEAD && Self::is_full_object_id(oid)).then(|| oid.to_string())
+        })
+    }
+
+    /// Whether `value` is a full object ID: exactly 40 (SHA-1) or 64
+    /// (SHA-256) lowercase hexadecimal digits, which is all `git rev-parse`
+    /// prints for one.
+    fn is_full_object_id(value: &str) -> bool {
+        matches!(value.len(), 40 | 64)
+            && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }
 
     /// Create the local branch `branch` at exactly `commit`, failing if the
@@ -4796,5 +4893,192 @@ branch refs/heads/some-other-branch
                 .await
                 .is_err()
         );
+    }
+
+    /// A repository whose `main` is pushed to a bare `origin` next to it,
+    /// with `refs/remotes/origin/HEAD` pointing at `origin/main` the way
+    /// `git clone` leaves it.
+    fn repo_with_default_base() -> tempfile::TempDir {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repository");
+        let remote = temp.path().join("origin.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo = repo.to_str().unwrap();
+        run_git(repo, &["init", "-q", "-b", "main"]);
+        run_git(
+            repo,
+            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-q",
+              "--allow-empty", "-m", "first"],
+        );
+        run_git(repo, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        run_git(repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_git(repo, &["push", "-q", "origin", "main"]);
+        run_git(repo, &["remote", "set-head", "origin", "main"]);
+        temp
+    }
+
+    fn commit_in(repo: &str, message: &str) -> String {
+        run_git(
+            repo,
+            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-q",
+              "--allow-empty", "-m", message],
+        );
+        run_git(repo, &["rev-parse", "HEAD"])
+    }
+
+    #[tokio::test]
+    async fn a_commit_origin_head_contains_is_on_the_default_base() {
+        let temp = repo_with_default_base();
+        let repo = temp.path().join("repository");
+        let repo = repo.to_str().unwrap();
+        let tip = run_git(repo, &["rev-parse", "main"]);
+
+        assert_eq!(
+            WorktreeManager::default_base_origin(repo, Some(&tip)).await,
+            Some(BranchOrigin::DefaultBase)
+        );
+        // An ancestor of what `origin/HEAD` names is contained too.
+        run_git(repo, &["checkout", "-q", "--detach"]);
+        let pushed = commit_in(repo, "second");
+        run_git(repo, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        run_git(repo, &["fetch", "-q", "origin"]);
+        assert_eq!(
+            WorktreeManager::default_base_origin(repo, Some(&tip)).await,
+            Some(BranchOrigin::DefaultBase)
+        );
+        assert_eq!(
+            WorktreeManager::default_base_origin(repo, Some(&pushed)).await,
+            Some(BranchOrigin::DefaultBase)
+        );
+    }
+
+    /// What `wt switch -c <branch>` does without `--base`: the new branch
+    /// starts at the local default branch. When that is what `origin/HEAD`
+    /// already holds, the proof holds for a Worktrunk-created branch exactly
+    /// as it does for one `git worktree add` created. Modeled with `git
+    /// branch` rather than a real `wt`, whose placement follows the user's
+    /// own configuration and would put the worktree outside the test's
+    /// temporary directory.
+    #[tokio::test]
+    async fn a_branch_started_from_the_local_default_branch_is_on_the_default_base() {
+        let temp = repo_with_default_base();
+        let repo = temp.path().join("repository");
+        let repo = repo.to_str().unwrap();
+        run_git(repo, &["checkout", "-q", "-b", "feature-f"]);
+        commit_in(repo, "feature work");
+        run_git(repo, &["branch", "task-1234abcd", "main"]);
+        let start = run_git(repo, &["rev-parse", "task-1234abcd"]);
+
+        assert_eq!(
+            WorktreeManager::default_base_origin(repo, Some(&start)).await,
+            Some(BranchOrigin::DefaultBase)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_origin_head_does_not_contain_has_no_known_origin() {
+        let temp = repo_with_default_base();
+        let repo = temp.path().join("repository");
+        let repo = repo.to_str().unwrap();
+        let unpushed = commit_in(repo, "not pushed");
+
+        assert_eq!(WorktreeManager::default_base_origin(repo, Some(&unpushed)).await, None);
+    }
+
+    #[tokio::test]
+    async fn without_a_usable_origin_head_nothing_is_on_the_default_base() {
+        let temp = repo_with_default_base();
+        let repo = temp.path().join("repository");
+        let repo = repo.to_str().unwrap();
+        let tip = run_git(repo, &["rev-parse", "main"]);
+
+        // Dangling: `origin/HEAD` names a remote branch that is not there.
+        run_git(repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone"]);
+        assert_eq!(WorktreeManager::default_base_origin(repo, Some(&tip)).await, None);
+
+        // Absent: the remote exists, but nothing says which branch is its
+        // default, which is what a `git remote add` + `git fetch` leaves.
+        run_git(repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+        assert_eq!(WorktreeManager::default_base_origin(repo, Some(&tip)).await, None);
+
+        // No base commit recorded at all.
+        run_git(repo, &["remote", "set-head", "origin", "main"]);
+        assert_eq!(WorktreeManager::default_base_origin(repo, None).await, None);
+
+        // A well-formed object ID of no object in the repository.
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(WorktreeManager::default_base_origin(repo, Some(absent)).await, None);
+
+        // Not a repository at all.
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            WorktreeManager::default_base_origin(elsewhere.path().to_str().unwrap(), Some(&tip)).await,
+            None
+        );
+    }
+
+    /// Only the ref `refs/remotes/origin/HEAD` itself is the proof. Passed
+    /// to git as a revision, that name is looked up the way any revision is,
+    /// and with the real ref gone a local branch or a tag that happens to be
+    /// called `refs/remotes/origin/HEAD` would answer for it.
+    #[tokio::test]
+    async fn a_branch_or_tag_named_like_origin_head_is_not_the_default_base() {
+        for namespace in ["refs/heads", "refs/tags"] {
+            let temp = repo_with_default_base();
+            let repo = temp.path().join("repository");
+            let repo = repo.to_str().unwrap();
+            let tip = run_git(repo, &["rev-parse", "main"]);
+            run_git(repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+            run_git(repo, &["update-ref", &format!("{namespace}/refs/remotes/origin/HEAD"), &tip]);
+
+            assert_eq!(
+                WorktreeManager::default_base_origin(repo, Some(&tip)).await,
+                None,
+                "{namespace}"
+            );
+        }
+    }
+
+    /// Anything but a full lowercase object ID is refused before git is
+    /// asked, even input git would happily resolve to a commit
+    /// `origin/HEAD` contains. `base_commit` is read back from a board file
+    /// that may say anything, and a revision or an option has no business
+    /// reaching `git merge-base`.
+    #[tokio::test]
+    async fn only_a_full_object_id_is_checked() {
+        let temp = repo_with_default_base();
+        let repo = temp.path().join("repository");
+        let repo = repo.to_str().unwrap();
+        let tip = run_git(repo, &["rev-parse", "main"]);
+        run_git(repo, &["tag", "v1"]);
+
+        for input in [
+            "HEAD",
+            "main",
+            "v1",
+            "origin/HEAD",
+            "refs/remotes/origin/HEAD",
+            "--foo",
+            "-h",
+            "",
+            &tip[..12],
+            &tip.to_uppercase(),
+            &format!("{tip}^"),
+            &format!("{tip} "),
+            &format!("-{}", &tip[1..]),
+            &format!("{}g", &tip[..39]),
+            &format!("{tip}0"),
+        ] {
+            assert_eq!(
+                WorktreeManager::default_base_origin(repo, Some(input)).await,
+                None,
+                "{input:?}"
+            );
+        }
+        assert!(WorktreeManager::is_full_object_id(&tip));
+        assert!(WorktreeManager::is_full_object_id(&"a".repeat(64)));
+        for input in ["HEAD", "--foo", "", &tip[..39], &"a".repeat(41), &"a".repeat(63), &"a".repeat(65)] {
+            assert!(!WorktreeManager::is_full_object_id(input), "{input:?}");
+        }
     }
 }

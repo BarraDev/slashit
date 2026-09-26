@@ -122,6 +122,18 @@ pub struct Task {
     #[serde(default)]
     pub base_commit: Option<String>,
 
+    /// What the task's branch was started from, recorded when SlashIt
+    /// creates the branch (or resumes one an unfinished start left) and
+    /// never re-derived afterward. A pull request for the task is opened
+    /// against what this names, not against whatever the task's
+    /// dependencies look like by then. `None` for a branch created before
+    /// this field existed, or one SlashIt reattached without creating it:
+    /// where those started cannot be recovered after the fact. `None` too
+    /// for an ordinary branch whose start was not proven to be on the
+    /// default base (see [`BranchOrigin::DefaultBase`]).
+    #[serde(default)]
+    pub branch_origin: Option<BranchOrigin>,
+
     /// A destructive worktree cleanup was started for this task and this
     /// process has not yet durably recorded its outcome.
     ///
@@ -216,6 +228,28 @@ impl Task {
             && self.phase == TaskPhase::Idle
             && !self.cleanup_in_flight
     }
+}
+
+/// Where a task's branch was created, as recorded on [`Task::branch_origin`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BranchOrigin {
+    /// Created from the repository's default base. Its pull request targets
+    /// the repository's default branch.
+    ///
+    /// Recorded only when the commit the branch started from was proven,
+    /// when the branch was created, to be contained in
+    /// `refs/remotes/origin/HEAD` (see
+    /// `worktree::WorktreeManager::default_base_origin`). An ordinary branch
+    /// starts wherever its backend starts it, which may be a feature branch
+    /// or unpushed work; one whose start was not proven, including every
+    /// branch in a repository whose remote is not named `origin` or that
+    /// has no `origin/HEAD`, records no origin at all.
+    DefaultBase,
+    /// Created at the tip of a dependency's branch, `parent_branch`, so that
+    /// it builds on that work. Its pull request targets `parent_branch` while
+    /// the parent is still open.
+    Stacked { parent_branch: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -667,6 +701,50 @@ mod tests {
         let task: Task = toml::from_str(LEGACY_TASK_TOML)
             .expect("a record written before the field existed must still deserialize");
         assert!(!task.cleanup_in_flight);
+    }
+
+    /// A board written before `branch_origin` existed loads with no origin
+    /// recorded, rather than failing or claiming one it cannot know.
+    #[test]
+    fn a_task_written_before_branch_origin_existed_has_none() {
+        assert!(
+            !LEGACY_TASK_TOML.contains("branch_origin"),
+            "this fixture only proves anything while it predates the field"
+        );
+        let task: Task = toml::from_str(LEGACY_TASK_TOML)
+            .expect("a record written before the field existed must still deserialize");
+        assert_eq!(task.branch_origin, None);
+
+        let json = serde_json::to_value(&task).unwrap();
+        let mut object = json.as_object().unwrap().clone();
+        object.remove("branch_origin");
+        let task: Task = serde_json::from_value(serde_json::Value::Object(object))
+            .expect("a JSON task without the field must still deserialize");
+        assert_eq!(task.branch_origin, None);
+    }
+
+    /// Both origins survive the task file (TOML) and IPC (JSON) unchanged.
+    #[test]
+    fn branch_origin_round_trips_through_toml_and_json() {
+        #[derive(Serialize, Deserialize)]
+        struct File {
+            tasks: Vec<Task>,
+        }
+        for origin in [
+            BranchOrigin::DefaultBase,
+            BranchOrigin::Stacked { parent_branch: "task-parent".to_string() },
+        ] {
+            let mut task = startable_task();
+            task.branch_origin = Some(origin.clone());
+
+            let toml_text = toml::to_string_pretty(&File { tasks: vec![task.clone()] }).unwrap();
+            let loaded: File = toml::from_str(&toml_text).expect(&toml_text);
+            assert_eq!(loaded.tasks[0].branch_origin.as_ref(), Some(&origin), "{toml_text}");
+
+            let json = serde_json::to_string(&task).unwrap();
+            let loaded: Task = serde_json::from_str(&json).unwrap();
+            assert_eq!(loaded.branch_origin.as_ref(), Some(&origin), "{json}");
+        }
     }
 }
 

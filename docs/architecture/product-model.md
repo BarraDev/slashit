@@ -112,7 +112,12 @@ Product text, UI copy and user-facing docs use it. Backend docs and code name
 the concrete backend, "Git worktree", when the implementation matters.
 
 Today every Task Checkout is a Git worktree on its own branch, recorded on
-the Task as its checkout path, branch name and base commit. SlashIt places
+the Task as its checkout path, branch name and base commit, and whether the
+branch was started from the default base or stacked on a dependency's branch
+(which the Task's pull request then targets). A branch is recorded as started
+from the default base only when its starting commit was proven, at creation,
+to be contained in `refs/remotes/origin/HEAD`; otherwise where it started is
+recorded as unknown. SlashIt places
 it under its data directory, or leaves placement to worktrunk when the user
 has configured it; either way it is a Git worktree (see
 [state-locations.md](state-locations.md#worktrees)).
@@ -152,7 +157,7 @@ The procedure is in [development-workflow.md](../development-workflow.md).
 | Workspace | `domain::Workspace`, `config::WorkspaceRegistry` (`workspaces.toml`), `commands/workspace.rs` |
 | Project, ProjectScope | `domain::Project`, `domain::ProjectScope` (`Project.scope`); attach/detach in `commands/project.rs` |
 | Task | `domain::Task` |
-| Task Checkout | `Task.worktree_path`, `branch_name`, `base_commit`; `worktree::WorktreeManager` |
+| Task Checkout | `Task.worktree_path`, `branch_name`, `base_commit`, `branch_origin` (`domain::BranchOrigin`); `worktree::WorktreeManager` |
 | Workspace root as agent context | `TaskExecutor::resolve_workspace_launch` in `queue/executor.rs` |
 | Task Checkout lifecycle | `lifecycle.rs` |
 | Jujutsu integration | `jj/`, `commands/jj.rs` |

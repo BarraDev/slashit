@@ -1,5 +1,6 @@
 use crate::agents::runner::{ClaudeRunner, ClaudeRunConfig, ClaudeEvent, ToolAccess};
-use crate::domain::{Task, TaskStatus, TaskPhase, AgentExecution, AgentStatus, AgentLogEntry, LogLevel, QaSignoff, QaStatus};
+use crate::domain::{Task, TaskStatus, TaskPhase, AgentExecution, AgentStatus, AgentLogEntry, LogLevel, QaSignoff, QaStatus, BranchOrigin};
+use crate::domain::task::ExternalRef;
 use crate::queue::admission::{Admission, AdmissionPermit};
 use crate::queue::prompt::{build_task_prompt, build_review_prompt, build_fix_prompt};
 use crate::queue::QueueManager;
@@ -91,9 +92,60 @@ fn fix_outcome(outcome: Result<Option<AgentRun>, String>) -> FixOutcome {
     }
 }
 
-/// A task's worktree, how it was obtained, and the commit it started from,
-/// or why none could be attached.
-type AcquiredWorktree = Result<(WorktreeInfo, &'static str, Option<String>), String>;
+/// A task's worktree, or why none could be attached.
+type AcquiredWorktree = Result<Acquired, String>;
+
+/// The worktree a starting task was given and what is known about where its
+/// branch came from.
+struct Acquired {
+    info: WorktreeInfo,
+    /// What was done to get the worktree, for the log.
+    what_happened: &'static str,
+    /// The commit the task's branch started from, when it was created or
+    /// resumed here. `None` on reattach, which keeps the recorded one.
+    base_commit: Option<String>,
+    /// What the task's branch was created from, when it was created or
+    /// resumed here and that is known. `None` on reattach, which keeps the
+    /// recorded one, and for a branch whose origin is unknown: one adopted
+    /// from an unrecorded start, or an ordinary branch that did not start on
+    /// the proven default base.
+    origin: Option<BranchOrigin>,
+}
+
+/// What the pull requests recorded on a dependency say about its work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedPr {
+    /// No pull request is recorded.
+    None,
+    /// At least one was recorded as merged.
+    Merged,
+    /// Every one was recorded as closed, and none as merged.
+    ClosedUnmerged,
+    /// Open, or of a state SlashIt never recorded.
+    NotMerged,
+}
+
+impl RecordedPr {
+    fn of(task: &Task) -> Self {
+        let states: Vec<Option<&str>> = task
+            .external_refs
+            .iter()
+            .filter_map(|r| match r {
+                ExternalRef::GithubPr { state, .. } => Some(state.as_deref()),
+                _ => None,
+            })
+            .collect();
+        if states.is_empty() {
+            Self::None
+        } else if states.iter().any(|s| matches!(s, Some(st) if st.eq_ignore_ascii_case("MERGED"))) {
+            Self::Merged
+        } else if states.iter().all(|s| matches!(s, Some(st) if st.eq_ignore_ascii_case("CLOSED"))) {
+            Self::ClosedUnmerged
+        } else {
+            Self::NotMerged
+        }
+    }
+}
 
 /// Event emitted to the frontend via Tauri events.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1004,8 +1056,7 @@ impl TaskExecutor {
                     // Dependency must have a branch
                     let branch = dep_task.branch_name.clone()?;
                     let is_done = dep_task.status == TaskStatus::Done;
-                    let has_pr = dep_task.external_refs.iter().any(|r| r.is_pr());
-                    Some((branch, is_done, has_pr))
+                    Some((branch, is_done, RecordedPr::of(dep_task)))
                 })
         } else {
             None
@@ -1013,22 +1064,42 @@ impl TaskExecutor {
         let base_branch = match dependency {
             None => None,
             // Done with no pull request: its work reached main without one.
-            Some((_, true, false)) => None,
-            // Done, and its branch is gone: the pull request was merged and
-            // the branch deleted, so its work is on the default base too.
-            // Only a definite answer from git counts. An invalid name, or a
-            // git that could not be asked, still goes to the stacked path,
-            // which refuses it and says why.
-            Some((branch, true, true))
-                if WorktreeManager::local_branch_exists(repo_path, &branch).await == Ok(false) =>
+            Some((_, true, RecordedPr::None)) => None,
+            // A dependency with a pull request whose branch git confirms is
+            // gone is only taken as delivered when that pull request was
+            // recorded as merged. A missing branch on its own proves
+            // nothing: a pull request closed without merging, or one still
+            // open, can lose its local branch just the same, and starting
+            // from the default base then runs the agent without the work it
+            // was queued to build on. Only a definite answer from git
+            // counts. An invalid name, or a git that could not be asked,
+            // still goes to the stacked path, which refuses it and says why.
+            Some((branch, _, recorded))
+                if recorded != RecordedPr::None
+                    && WorktreeManager::local_branch_exists(repo_path, &branch).await == Ok(false) =>
             {
+                if recorded != RecordedPr::Merged {
+                    let why = if recorded == RecordedPr::ClosedUnmerged {
+                        "was closed without being merged, so that work was never delivered"
+                    } else {
+                        "is not recorded as merged; refresh its pull request state, or restore \
+                         the branch"
+                    };
+                    return (
+                        existing_branch,
+                        Err(format!(
+                            "it depends on the work on branch {branch}, which no longer exists \
+                             locally, and the dependency's pull request {why}"
+                        )),
+                    );
+                }
                 self.events.agent_event(AgentEvent::Log {
                     task_id: task_id.to_string(),
                     level: LogLevel::Info,
                     message: format!(
-                        "The dependency is done and its branch {branch} no longer exists \
-                         locally, so its work is taken to be delivered; starting from the \
-                         default base instead of stacking on it"
+                        "The dependency's pull request was merged and its branch {branch} \
+                         no longer exists locally, so its work is delivered; starting an \
+                         ordinary branch instead of stacking on it"
                     ),
                 });
                 None
@@ -1064,7 +1135,12 @@ impl TaskExecutor {
             self.worktree_manager
                 .reattach(repo_path, &branch_name)
                 .await
-                .map(|info| (info, "Reattached worktree", None))
+                .map(|info| Acquired {
+                    info,
+                    what_happened: "Reattached worktree",
+                    base_commit: None,
+                    origin: None,
+                })
         } else if let Some(parent_branch) = base_branch.as_deref() {
             // A task stacked on a dependency is not started from anywhere
             // else. It used to fall back to an ordinary branch off the
@@ -1096,7 +1172,14 @@ impl TaskExecutor {
                     } else {
                         "Created stacked worktree"
                     };
-                    Ok((stacked.info, what_happened, Some(stacked.dependency_tip)))
+                    Ok(Acquired {
+                        info: stacked.info,
+                        what_happened,
+                        base_commit: Some(stacked.dependency_tip),
+                        origin: Some(BranchOrigin::Stacked {
+                            parent_branch: parent_branch.to_string(),
+                        }),
+                    })
                 }
                 Err(e) => Err(format!(
                     "it depends on the work on branch {parent_branch}, and stacking on that \
@@ -1104,15 +1187,59 @@ impl TaskExecutor {
                 )),
             }
         } else {
-            match self.worktree_manager.create(repo_path, &branch_name).await {
-                Ok(info) => {
+            // An ordinary branch starts wherever the backend starts it (the
+            // primary checkout's `HEAD` for git, the local default branch for
+            // worktrunk), which is not necessarily the default base, so a
+            // branch created here is recorded as coming from the default base
+            // only when `origin/HEAD` provably contains where it started; see
+            // `WorktreeManager::default_base_origin`. Otherwise its origin is
+            // unknown. An adopted worktree was left by an earlier start that
+            // never recorded it, and that start may have stacked it, so it
+            // gets no origin at all.
+            match self.worktree_manager.create_or_adopt(repo_path, &branch_name).await {
+                Ok((info, adopted)) => {
                     let base_commit = Self::resolve_commit(&info.path, "HEAD").await;
-                    Ok((info, "Created worktree", base_commit))
+                    let origin = if adopted {
+                        None
+                    } else {
+                        WorktreeManager::default_base_origin(repo_path, base_commit.as_deref()).await
+                    };
+                    Ok(Acquired {
+                        info,
+                        what_happened: if adopted { "Adopted worktree" } else { "Created worktree" },
+                        base_commit,
+                        origin,
+                    })
                 }
                 Err(e) => Err(e),
             }
         };
         (existing_branch, acquired)
+    }
+
+    /// Record the worktree a starting task was given on the task and persist
+    /// it, returning the worktree's path.
+    ///
+    /// The starting commit and the branch's origin are written only when
+    /// this start created (or resumed) the branch. A reattach leaves the ones
+    /// recorded by the start that created it, so a retry or a restart keeps
+    /// the stack parent the branch was actually built on.
+    async fn record_acquired_worktree(&self, task_id: Uuid, acquired: Acquired) -> String {
+        {
+            let mut tasks_w = self.tasks.write().await;
+            if let Some(t) = tasks_w.get_mut(&task_id) {
+                t.worktree_path = Some(acquired.info.path.clone());
+                t.branch_name = Some(acquired.info.branch.clone());
+                if let Some(base_commit) = acquired.base_commit {
+                    t.base_commit = Some(base_commit);
+                }
+                if let Some(origin) = acquired.origin {
+                    t.branch_origin = Some(origin);
+                }
+            }
+        }
+        Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
+        acquired.info.path
     }
 
     /// Start an agent for `task_id`, or leave the task alone.
@@ -1189,7 +1316,7 @@ impl TaskExecutor {
 
         let (existing_branch, acquired) = self.acquire_task_worktree(task_id, &repo_path).await;
 
-        let (info, what_happened, resolved_base_commit) = match acquired {
+        let acquired = match acquired {
             Ok(acquired) => acquired,
             Err(e) => {
                 let message = format!(
@@ -1209,9 +1336,9 @@ impl TaskExecutor {
         self.events.agent_event(AgentEvent::Log {
             task_id: task_id.to_string(),
             level: LogLevel::Info,
-            message: format!("{}: {}", what_happened, info.path),
+            message: format!("{}: {}", acquired.what_happened, acquired.info.path),
         });
-        if existing_branch.is_none() && resolved_base_commit.is_none() {
+        if existing_branch.is_none() && acquired.base_commit.is_none() {
             self.events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Warn,
@@ -1220,18 +1347,7 @@ impl TaskExecutor {
                     .to_string(),
             });
         }
-        {
-            let mut tasks_w = self.tasks.write().await;
-            if let Some(t) = tasks_w.get_mut(&task_id) {
-                t.worktree_path = Some(info.path.clone());
-                t.branch_name = Some(info.branch.clone());
-                if let Some(base_commit) = resolved_base_commit {
-                    t.base_commit = Some(base_commit);
-                }
-            }
-        }
-        Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
-        let working_dir = info.path;
+        let working_dir = self.record_acquired_worktree(task_id, acquired).await;
 
         let (prompt, task_model) = {
             let tasks = self.tasks.read().await;
@@ -4154,7 +4270,7 @@ mod tests {
         executor: &TaskExecutor,
         temps: &[tempfile::TempDir],
         dependency_status: TaskStatus,
-        dependency_has_pr: bool,
+        dependency_pr_state: Option<&str>,
         dependency_branch: &str,
     ) -> (std::path::PathBuf, Uuid, Uuid) {
         let repo = temps[0].path().join("repository");
@@ -4180,12 +4296,12 @@ mod tests {
 
         let mut dependency = create_test_task_full("dependency", project_id, dependency_status, 0);
         dependency.branch_name = Some(dependency_branch.to_string());
-        if dependency_has_pr {
+        if let Some(state) = dependency_pr_state {
             dependency.external_refs.push(crate::domain::task::ExternalRef::GithubPr {
                 url: "https://github.com/test-org/test-repo/pull/7".to_string(),
                 number: 7,
                 repo: "test-org/test-repo".to_string(),
-                state: Some("MERGED".to_string()),
+                state: (!state.is_empty()).then(|| state.to_string()),
             });
         }
         let dependency_id = dependency.id;
@@ -4198,6 +4314,20 @@ mod tests {
         executor.tasks.write().await.insert(task_id, task);
 
         (repo, task_id, dependency_id)
+    }
+
+    /// Give the fixture's `repo` a bare `origin` next to it holding its
+    /// `main`, with `refs/remotes/origin/HEAD` pointing at `origin/main` the
+    /// way `git clone` leaves it, so that what is on `main` now is provably
+    /// on the repository's known remote default base. Without this the
+    /// repository has no remote at all, and no branch started in it can be
+    /// recorded as coming from the default base.
+    fn publish_default_base(repo: &std::path::Path) {
+        let remote = repo.parent().unwrap().join("origin.git");
+        git_in(repo, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git_in(repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git_in(repo, &["push", "-q", "origin", "main"]);
+        git_in(repo, &["remote", "set-head", "origin", "main"]);
     }
 
     fn refs_of(repo: &std::path::Path) -> String {
@@ -4221,7 +4351,7 @@ mod tests {
     async fn a_stacked_task_whose_dependency_cannot_be_stacked_on_is_not_started_unstacked() {
         let (executor, temps) = test_executor();
         let (repo, task_id, _) = stacked_task_fixture(
-            &executor, &temps, TaskStatus::InProgress, false, "task-deadbeef",
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
         )
         .await;
         let refs_before = refs_of(&repo);
@@ -4248,14 +4378,17 @@ mod tests {
     }
 
     /// A dependency that is done, with a pull request, and whose local
-    /// branch has since been deleted has been delivered: its work is on the
-    /// default base, so the task starts there, and the log says why.
+    /// branch has since been deleted has been delivered, so the task gets an
+    /// ordinary branch instead of a stacked one, and the log says why. The
+    /// primary checkout here is on a pushed `main`, so that branch provably
+    /// starts on the default base.
     #[tokio::test]
     async fn a_task_whose_done_dependency_branch_is_gone_starts_from_the_default_base() {
         let recording = Arc::new(crate::events::RecordingEventSink::new());
         let (executor, temps) = test_executor_with_events(recording.clone());
         let (repo, task_id, _) =
-            stacked_task_fixture(&executor, &temps, TaskStatus::Done, true, "task-deadbeef").await;
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, Some("MERGED"), "task-deadbeef").await;
+        publish_default_base(&repo);
         let main_tip = git_in(&repo, &["rev-parse", "main"]);
 
         let (existing, acquired) = executor
@@ -4263,16 +4396,18 @@ mod tests {
             .await;
 
         assert_eq!(existing, None);
-        let (info, what_happened, base_commit) = acquired.expect("an ordinary worktree");
+        let Acquired { info, what_happened, base_commit, origin } =
+            acquired.expect("an ordinary worktree");
         assert_eq!(what_happened, "Created worktree");
         assert_eq!(git_in(&repo, &["rev-parse", &format!("refs/heads/{}", info.branch)]), main_tip);
         assert_eq!(git_in(std::path::Path::new(&info.path), &["rev-parse", "HEAD"]), main_tip);
         assert_eq!(base_commit.as_deref(), Some(main_tip.as_str()));
+        assert_eq!(origin, Some(BranchOrigin::DefaultBase));
         assert_eq!(worktree_count(&repo), 2);
 
         let recorded = serde_json::to_string(&recording.recorded()).unwrap();
         assert!(
-            recorded.contains("task-deadbeef") && recorded.contains("default base"),
+            recorded.contains("task-deadbeef") && recorded.contains("ordinary branch"),
             "the log has to say why the task was not stacked: {recorded}"
         );
     }
@@ -4283,7 +4418,7 @@ mod tests {
     async fn a_done_dependency_whose_branch_is_still_there_is_stacked_on() {
         let (executor, temps) = test_executor();
         let (repo, task_id, _) =
-            stacked_task_fixture(&executor, &temps, TaskStatus::Done, true, "task-deadbeef").await;
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, Some("MERGED"), "task-deadbeef").await;
         git_in(&repo, &["branch", "task-deadbeef"]);
         git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "main moves on"]);
         let dependency_tip = git_in(&repo, &["rev-parse", "task-deadbeef"]);
@@ -4292,10 +4427,15 @@ mod tests {
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
             .await;
 
-        let (info, what_happened, base_commit) = acquired.expect("a stacked worktree");
+        let Acquired { info, what_happened, base_commit, origin } =
+            acquired.expect("a stacked worktree");
         assert_eq!(what_happened, "Created stacked worktree");
         assert_eq!(git_in(std::path::Path::new(&info.path), &["rev-parse", "HEAD"]), dependency_tip);
         assert_eq!(base_commit.as_deref(), Some(dependency_tip.as_str()));
+        assert_eq!(
+            origin,
+            Some(BranchOrigin::Stacked { parent_branch: "task-deadbeef".to_string() })
+        );
     }
 
     /// A retry that picks up the branch an earlier attempt left, with the
@@ -4307,7 +4447,7 @@ mod tests {
     async fn a_resumed_stacked_branch_keeps_the_dependency_tip_as_its_base() {
         let (executor, temps) = test_executor();
         let (repo, task_id, _) = stacked_task_fixture(
-            &executor, &temps, TaskStatus::InProgress, false, "task-deadbeef",
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
         )
         .await;
         git_in(&repo, &["checkout", "-q", "-b", "task-deadbeef"]);
@@ -4324,11 +4464,299 @@ mod tests {
             .await;
 
         assert_eq!(existing, None, "the task never recorded the branch");
-        let (info, what_happened, base_commit) = acquired.expect("the leftover branch is resumed");
+        let Acquired { info, what_happened, base_commit, origin } =
+            acquired.expect("the leftover branch is resumed");
         assert_eq!(what_happened, "Resumed stacked worktree");
         assert_eq!(info.branch, task_branch);
         assert_eq!(git_in(std::path::Path::new(&info.path), &["rev-parse", "HEAD"]), task_tip);
         assert_eq!(base_commit.as_deref(), Some(dependency_tip.as_str()));
+        assert_eq!(
+            origin,
+            Some(BranchOrigin::Stacked { parent_branch: "task-deadbeef".to_string() })
+        );
+    }
+
+    /// The task as it was last persisted, read back from storage the way a
+    /// restart would.
+    fn persisted_task(executor: &TaskExecutor, project_id: Uuid, task_id: Uuid) -> Task {
+        executor
+            .storage
+            .load_project_tasks(project_id)
+            .expect("load tasks")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task was persisted")
+    }
+
+    /// Starting a stacked task records the dependency's branch as the stack
+    /// parent, on disk, next to the branch itself.
+    #[tokio::test]
+    async fn starting_a_stacked_task_records_its_stack_parent() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        git_in(&repo, &["branch", "task-deadbeef"]);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        executor.record_acquired_worktree(task_id, acquired.expect("a stacked worktree")).await;
+
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let persisted = persisted_task(&executor, project_id, task_id);
+        assert_eq!(
+            persisted.branch_origin,
+            Some(BranchOrigin::Stacked { parent_branch: "task-deadbeef".to_string() })
+        );
+        assert_eq!(persisted.branch_name, Some(WorktreeManager::branch_for_task(task_id)));
+    }
+
+    /// A task with no dependency, started while the primary checkout is on a
+    /// commit `origin/HEAD` contains, records that its branch came from the
+    /// default base, not a stack parent.
+    #[tokio::test]
+    async fn starting_an_ordinary_task_records_the_default_base() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        publish_default_base(&repo);
+        let main_tip = git_in(&repo, &["rev-parse", "main"]);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("an ordinary worktree");
+        assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()));
+        assert_eq!(acquired.origin, Some(BranchOrigin::DefaultBase));
+        executor.record_acquired_worktree(task_id, acquired).await;
+
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        assert_eq!(
+            persisted_task(&executor, project_id, task_id).branch_origin,
+            Some(BranchOrigin::DefaultBase)
+        );
+    }
+
+    /// An ordinary task's branch starts wherever the primary checkout is,
+    /// because that is what `git worktree add -b` does. Started while the
+    /// user is on a feature branch holding a commit the default base does
+    /// not, the branch starts at the feature branch's tip exactly as it
+    /// always has, and nothing claims it came from the default base: its
+    /// origin is recorded as unknown, returned and on disk.
+    #[tokio::test]
+    async fn an_ordinary_task_started_from_a_feature_checkout_records_no_origin() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        publish_default_base(&repo);
+        git_in(&repo, &["checkout", "-q", "-b", "feature-f"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "feature work"]);
+        let feature_tip = git_in(&repo, &["rev-parse", "HEAD"]);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("an ordinary worktree");
+        assert_eq!(acquired.what_happened, "Created worktree");
+        assert_eq!(
+            git_in(&repo, &["rev-parse", &format!("refs/heads/{}", acquired.info.branch)]),
+            feature_tip,
+            "where the branch starts is unchanged"
+        );
+        assert_eq!(acquired.base_commit.as_deref(), Some(feature_tip.as_str()));
+        assert_eq!(acquired.origin, None);
+        executor.record_acquired_worktree(task_id, acquired).await;
+
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let persisted = persisted_task(&executor, project_id, task_id);
+        assert_eq!(persisted.base_commit.as_deref(), Some(feature_tip.as_str()));
+        assert_eq!(persisted.branch_origin, None);
+    }
+
+    /// The same holds for a detached primary checkout, which is what a
+    /// JJ-colocated repository looks like to git (`HEAD` detached at `@-`):
+    /// a branch started at a commit `origin/HEAD` does not contain has no
+    /// known origin.
+    #[tokio::test]
+    async fn an_ordinary_task_started_from_a_detached_checkout_off_the_default_base_records_no_origin() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        publish_default_base(&repo);
+        git_in(&repo, &["checkout", "-q", "--detach"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "working-copy parent"]);
+        let detached = git_in(&repo, &["rev-parse", "HEAD"]);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("an ordinary worktree");
+        assert_eq!(acquired.base_commit.as_deref(), Some(detached.as_str()));
+        assert_eq!(acquired.origin, None);
+        executor.record_acquired_worktree(task_id, acquired).await;
+
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let persisted = persisted_task(&executor, project_id, task_id);
+        assert_eq!(persisted.base_commit.as_deref(), Some(detached.as_str()));
+        assert_eq!(persisted.branch_origin, None);
+    }
+
+    /// Nothing short of `refs/remotes/origin/HEAD` containing the starting
+    /// commit proves a default-base origin. With no remote at all, with an
+    /// `origin/HEAD` that names a branch the repository does not have, or
+    /// with `main` ahead of what was pushed, the origin is unknown -- never
+    /// guessed from the local `main` or from where the branch happens to
+    /// sit.
+    #[tokio::test]
+    async fn an_ordinary_task_records_no_origin_when_the_default_base_is_not_proven() {
+        type Arrange = fn(&std::path::Path);
+        let cases: [(&str, Arrange); 3] = [
+            ("no origin/HEAD", |_| {}),
+            ("dangling origin/HEAD", |repo| {
+                git_in(repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone"]);
+            }),
+            ("main ahead of origin", |repo| {
+                publish_default_base(repo);
+                git_in(repo, &["commit", "-q", "--allow-empty", "-m", "not pushed"]);
+            }),
+        ];
+        for (name, arrange) in cases {
+            let (executor, temps) = test_executor();
+            let (repo, task_id, _) = stacked_task_fixture(
+                &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+            )
+            .await;
+            executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+            arrange(&repo);
+            let head = git_in(&repo, &["rev-parse", "HEAD"]);
+
+            let (_, acquired) = executor
+                .acquire_task_worktree(task_id, repo.to_str().unwrap())
+                .await;
+            let acquired = acquired.unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(acquired.base_commit.as_deref(), Some(head.as_str()), "{name}");
+            assert_eq!(acquired.origin, None, "{name}");
+            executor.record_acquired_worktree(task_id, acquired).await;
+
+            let project_id = executor.tasks.read().await[&task_id].project_id;
+            assert_eq!(persisted_task(&executor, project_id, task_id).branch_origin, None, "{name}");
+        }
+    }
+
+    /// A live worktree of the task's branch that the task never recorded,
+    /// left by a start that died before it saved anything, is adopted
+    /// without claiming the branch came from the default base: that start
+    /// may have stacked it.
+    #[tokio::test]
+    async fn adopting_an_unrecorded_worktree_records_no_origin() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        let task_branch = WorktreeManager::branch_for_task(task_id);
+        // Where versions before managed placement put it, which `create`
+        // still adopts.
+        let leftover = repo.parent().unwrap().join(format!("repository.{task_branch}"));
+        git_in(&repo, &["worktree", "add", "-q", "-b", &task_branch, leftover.to_str().unwrap()]);
+
+        let (existing, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+
+        assert_eq!(existing, None);
+        let acquired = acquired.expect("the leftover worktree is adopted");
+        assert_eq!(
+            std::fs::canonicalize(&acquired.info.path).unwrap(),
+            std::fs::canonicalize(&leftover).unwrap()
+        );
+        assert_eq!(acquired.what_happened, "Adopted worktree");
+        assert_eq!(acquired.origin, None);
+        executor.record_acquired_worktree(task_id, acquired).await;
+
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        assert_eq!(persisted_task(&executor, project_id, task_id).branch_origin, None);
+    }
+
+    /// Reattaching to a branch recorded before origins were kept does not
+    /// invent one: where that branch started is not known.
+    #[tokio::test]
+    async fn reattaching_a_legacy_branch_records_no_origin() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        git_in(&repo, &["branch", "task-deadbeef"]);
+        git_in(&repo, &["branch", "task-legacy"]);
+        executor.tasks.write().await.get_mut(&task_id).unwrap().branch_name =
+            Some("task-legacy".to_string());
+
+        let (existing, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        assert_eq!(existing.as_deref(), Some("task-legacy"));
+        let acquired = acquired.expect("the recorded branch is reattached");
+        assert_eq!(acquired.what_happened, "Reattached worktree");
+        assert_eq!(acquired.origin, None);
+        executor.record_acquired_worktree(task_id, acquired).await;
+
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        assert_eq!(persisted_task(&executor, project_id, task_id).branch_origin, None);
+    }
+
+    /// A stacked task started again after a restart, with its worktree gone
+    /// and its dependency now pointing somewhere else, reattaches to its own
+    /// branch and keeps the stack parent it was built on. Nothing about the
+    /// dependency's current state is read back into it.
+    #[tokio::test]
+    async fn a_restarted_stacked_task_keeps_the_stack_parent_it_recorded() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        git_in(&repo, &["branch", "task-deadbeef"]);
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let path = executor
+            .record_acquired_worktree(task_id, acquired.expect("a stacked worktree"))
+            .await;
+
+        // The worktree is removed and the process restarts from disk; the
+        // dependency has since moved on to another branch.
+        git_in(&repo, &["worktree", "remove", "--force", &path]);
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let mut reloaded = persisted_task(&executor, project_id, task_id);
+        reloaded.worktree_path = None;
+        executor.tasks.write().await.insert(task_id, reloaded);
+        git_in(&repo, &["branch", "task-elsewhere"]);
+        executor.tasks.write().await.get_mut(&dependency_id).unwrap().branch_name =
+            Some("task-elsewhere".to_string());
+
+        let (existing, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        assert_eq!(existing, Some(WorktreeManager::branch_for_task(task_id)));
+        executor.record_acquired_worktree(task_id, acquired.expect("reattached")).await;
+
+        assert_eq!(
+            persisted_task(&executor, project_id, task_id).branch_origin,
+            Some(BranchOrigin::Stacked { parent_branch: "task-deadbeef".to_string() })
+        );
     }
 
     /// A done dependency whose recorded branch is not a branch name is
@@ -4337,7 +4765,7 @@ mod tests {
     async fn a_done_dependency_with_an_invalid_recorded_branch_is_refused() {
         let (executor, temps) = test_executor();
         let (repo, task_id, _) =
-            stacked_task_fixture(&executor, &temps, TaskStatus::Done, true, "-Bvictim").await;
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, Some("MERGED"), "-Bvictim").await;
         let refs_before = refs_of(&repo);
 
         let (_, acquired) = executor
@@ -4348,6 +4776,56 @@ mod tests {
         assert!(error.contains("\"-Bvictim\""), "{error}");
         assert_eq!(refs_of(&repo), refs_before);
         assert_eq!(worktree_count(&repo), 1);
+    }
+
+    /// A done dependency whose branch is gone and whose pull request was
+    /// closed without being merged has not delivered anything. The task is
+    /// neither started from the default base as if it had, nor stacked on a
+    /// branch that is not there.
+    #[tokio::test]
+    async fn a_done_dependency_whose_pull_request_was_closed_unmerged_is_not_taken_as_delivered() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, Some("CLOSED"), "task-deadbeef")
+                .await;
+        let refs_before = refs_of(&repo);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+
+        let error = acquired.err().expect("a closed, unmerged dependency must be refused");
+        assert!(
+            error.contains("task-deadbeef") && error.contains("closed without being merged"),
+            "the reason has to name the branch and the closed pull request: {error}"
+        );
+        assert_eq!(refs_of(&repo), refs_before, "nothing may be created off the default base");
+        assert_eq!(worktree_count(&repo), 1);
+    }
+
+    /// The same for a pull request SlashIt has not seen merged, open or of
+    /// unknown state: a deleted branch alone is no evidence of delivery.
+    #[tokio::test]
+    async fn a_done_dependency_whose_pull_request_is_not_known_merged_is_not_taken_as_delivered() {
+        for state in ["OPEN", ""] {
+            let (executor, temps) = test_executor();
+            let (repo, task_id, _) =
+                stacked_task_fixture(&executor, &temps, TaskStatus::Done, Some(state), "task-deadbeef")
+                    .await;
+            let refs_before = refs_of(&repo);
+
+            let (_, acquired) = executor
+                .acquire_task_worktree(task_id, repo.to_str().unwrap())
+                .await;
+
+            let error = acquired.err().expect("an unmerged dependency must be refused");
+            assert!(
+                error.contains("task-deadbeef") && error.contains("not recorded as merged"),
+                "state {state:?}: {error}"
+            );
+            assert_eq!(refs_of(&repo), refs_before);
+            assert_eq!(worktree_count(&repo), 1);
+        }
     }
 
     /// An AI review has nowhere to run without the task's own worktree, and

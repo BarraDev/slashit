@@ -178,6 +178,7 @@ mod tests {
                 worktree_path: None,
                 branch_name: None,
                 base_commit: None,
+                branch_origin: None,
                 cleanup_in_flight: false,
                 position: 0,
                 pr_review_plan: None,
