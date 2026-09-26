@@ -15,6 +15,16 @@
 //! branch was, so before the rebase the old tip is written to a backup ref
 //! under `refs/slashit/restack-backup/`, which every worktree of the
 //! repository shares and which jj neither imports nor rewrites.
+//!
+//! SlashIt's own flows are kept out of the worktree while a restack runs, but
+//! the user is not: a commit from the task's terminal, or another tool, can
+//! move the branch or the worktree's `HEAD` at any moment. So the rebase
+//! marks every ref update it makes with a reflog action unique to this
+//! restack (`slashit-restack/<nonce>`, see [`REFLOG_ACTION_PREFIX`]), and a
+//! rollback only ever undoes a state that the reflogs prove this restack
+//! produced and nothing moved since. A branch or `HEAD` that moved otherwise
+//! is left exactly as it is, with the backup ref kept
+//! ([`RestackFailure::BranchMoved`]).
 
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
@@ -199,10 +209,20 @@ pub async fn worktree_state(dir: &Path) -> Result<WorktreeState, String> {
     Ok(WorktreeState { head_ref, head, in_progress, uncommitted })
 }
 
+/// A rebase of a branch left in progress in a worktree, as git's own state
+/// files for it record it.
+pub struct InterruptedRebase {
+    /// The branch tip it started from (its `orig-head`).
+    pub orig_head: String,
+    /// The commit it replays onto (its `onto`).
+    pub onto: String,
+}
+
 /// A rebase of `refs/heads/<branch>` left in progress in the worktree at
-/// `dir`, as the branch tip it started from (its `orig-head`), or `None`.
-/// A rebase of anything else is not reported here.
-pub async fn interrupted_rebase_of(dir: &Path, branch: &str) -> Result<Option<String>, String> {
+/// `dir`, or `None`. A rebase of anything else is not reported here. Both
+/// backends, `rebase-merge/` and `rebase-apply/`, keep `head-name`,
+/// `orig-head` and `onto` files.
+pub async fn interrupted_rebase_of(dir: &Path, branch: &str) -> Result<Option<InterruptedRebase>, String> {
     let wanted = format!("refs/heads/{branch}");
     for name in ["rebase-merge", "rebase-apply"] {
         let state = git_path(dir, name).await?;
@@ -210,11 +230,93 @@ pub async fn interrupted_rebase_of(dir: &Path, branch: &str) -> Result<Option<St
             continue;
         };
         if head_name.trim() == wanted {
-            let orig_head = std::fs::read_to_string(state.join("orig-head")).unwrap_or_default();
-            return Ok(Some(orig_head.trim().to_string()));
+            let read = |file: &str| std::fs::read_to_string(state.join(file)).unwrap_or_default().trim().to_string();
+            return Ok(Some(InterruptedRebase { orig_head: read("orig-head"), onto: read("onto") }));
         }
     }
     Ok(None)
+}
+
+/// The prefix of the reflog action a restack runs its rebase under. The
+/// full action, its marker, is this prefix and a fresh UUID, so that every
+/// ref update the rebase makes is logged as `<marker> (start)`,
+/// `<marker> (pick)`, `<marker> (finish)` and so on, and nothing else writes
+/// that marker.
+pub const REFLOG_ACTION_PREFIX: &str = "slashit-restack/";
+
+/// The entries of `refname`'s reflog in the worktree at `dir`, newest first,
+/// as the object ID each one set and its message. `HEAD` is the worktree's
+/// own. A ref with no reflog has no entries.
+async fn reflog(dir: &Path, refname: &str) -> Result<Vec<(String, String)>, String> {
+    let ran = run(dir, &["log", "-g", "--no-show-signature", "--format=%H%x00%gs", refname, "--"], &[]).await?;
+    if ran.code != Some(0) {
+        return Err(format!("git could not read the reflog of {refname}: {}", ran.stderr));
+    }
+    Ok(ran
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_once('\0'))
+        .map(|(oid, message)| (oid.to_string(), message.to_string()))
+        .collect())
+}
+
+/// The tip the rebase marked `marker` produced for `refs/heads/<branch>`,
+/// when that is still the latest update of the branch: the newest entry of
+/// its reflog is the rebase's `(finish)`. `None` when anything else moved
+/// the branch since, or the rebase never finished.
+async fn produced_tip(dir: &Path, branch: &str, marker: &str) -> Result<Option<String>, String> {
+    let entries = reflog(dir, &format!("refs/heads/{branch}")).await?;
+    let finish = format!("{marker} (finish):");
+    Ok(entries
+        .into_iter()
+        .next()
+        .filter(|(oid, message)| message.starts_with(&finish) && is_full_object_id(oid))
+        .map(|(oid, _)| oid))
+}
+
+/// Whether every move of the worktree's `HEAD` since the rebase marked
+/// `marker` started was that rebase's (or its rollback's): walking `HEAD`'s
+/// reflog from the newest entry, each one carries the marker, down to its
+/// `(start)`, and `HEAD` is where the newest entry left it. A commit, a
+/// checkout or a rebase from anywhere else, or no `(start)` at all, is not.
+async fn head_moved_only_by(dir: &Path, marker: &str) -> Result<bool, String> {
+    let entries = reflog(dir, "HEAD").await?;
+    let Some((newest, _)) = entries.first() else {
+        return Ok(false);
+    };
+    if &git(dir, &["rev-parse", "--verify", "HEAD^{commit}"]).await? != newest {
+        return Ok(false);
+    }
+    let start = format!("{marker} (start)");
+    let own = format!("{marker} ");
+    for (_, message) in &entries {
+        if message.starts_with(&start) {
+            return Ok(true);
+        }
+        if !message.starts_with(&own) {
+            return Ok(false);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the worktree's `HEAD` has been moved by nothing but one restack's
+/// rebase since it started, whichever restack that was: the newest entry of
+/// `HEAD`'s reflog carries a marker under [`REFLOG_ACTION_PREFIX`], and every
+/// entry down to that marker's `(start)` carries the same one. A rebase run
+/// or continued by hand, or a commit from the terminal, is logged under
+/// another action and makes this false.
+pub async fn head_moved_only_by_a_restack(dir: &Path) -> Result<bool, String> {
+    let entries = reflog(dir, "HEAD").await?;
+    let marker = entries.first().and_then(|(_, message)| {
+        let marker = message.split(' ').next()?;
+        let nonce = marker.strip_prefix(REFLOG_ACTION_PREFIX)?;
+        Uuid::parse_str(nonce).is_ok().then(|| marker.to_string())
+    });
+    match marker {
+        Some(marker) => head_moved_only_by(dir, &marker).await,
+        None => Ok(false),
+    }
 }
 
 /// Abort the rebase in progress in the worktree at `dir`.
@@ -270,6 +372,8 @@ pub struct Restack<'a> {
     pub old_tip: &'a str,
     pub onto: &'a str,
     pub backup: &'a str,
+    /// The reflog action this restack's rebase runs under, unique to it.
+    marker: String,
 }
 
 /// Why [`Restack::replay`] did not produce a verified restacked branch.
@@ -281,9 +385,43 @@ pub enum RestackFailure {
     /// What went wrong, and why the branch could not be verified as
     /// restored. The backup ref is kept, holding the old tip.
     NotRestored(String),
+    /// What went wrong, and how the branch or the worktree's `HEAD` was
+    /// found moved by something other than this restack: a commit from the
+    /// task's terminal, say, or another tool. Nothing was reset, aborted or
+    /// deleted, so whatever moved it is kept, and the backup ref is kept,
+    /// holding the old tip.
+    BranchMoved(String),
 }
 
-impl Restack<'_> {
+/// Why a rollback left the branch as it found it.
+enum NotUndone {
+    /// Something other than this restack moved the branch or `HEAD`.
+    Moved(String),
+    /// Anything else; the branch could not be verified as restored.
+    Failed(String),
+}
+
+impl From<String> for NotUndone {
+    fn from(why: String) -> Self {
+        NotUndone::Failed(why)
+    }
+}
+
+impl<'a> Restack<'a> {
+    /// A restack of `refs/heads/<branch>` in `worktree`, with a reflog
+    /// marker of its own.
+    pub fn new(
+        worktree: &'a Path,
+        branch: &'a str,
+        fork_point: &'a str,
+        old_tip: &'a str,
+        onto: &'a str,
+        backup: &'a str,
+    ) -> Self {
+        let marker = format!("{REFLOG_ACTION_PREFIX}{}", Uuid::new_v4());
+        Restack { worktree, branch, fork_point, old_tip, onto, backup, marker }
+    }
+
     /// Replay the task's commits onto `onto` and verify the result.
     ///
     /// The rebase names every revision exactly: the new base and the fork
@@ -294,14 +432,22 @@ impl Restack<'_> {
     /// guessing another fork point from the reflog (`--no-fork-point`),
     /// recreating merges, and reordering `fixup!` commits. The caller has
     /// already checked that the worktree is clean and has the branch
-    /// checked out, and has written the backup ref.
+    /// checked out, and has written the backup ref. The branch is passed by
+    /// its short name, since `refs/heads/<branch>` would make git rebase a
+    /// detached `HEAD` instead of the branch.
+    ///
+    /// The rebase runs under this restack's reflog marker, with every ref
+    /// update logged (`core.logAllRefUpdates=always`), so that the branch's
+    /// and the worktree's reflogs tell its moves from anybody else's.
     ///
     /// Git needs a committer identity to write the replayed commits. Where
     /// the repository has none, the committer of the branch's tip is used,
     /// the same way SlashIt's author rewrite keeps the tip's own committer
     /// rather than inventing one.
     ///
-    /// Success is not taken from the exit status alone. The new tip must
+    /// Success is not taken from the exit status alone. The branch must be
+    /// exactly at the tip the rebase produced, per its reflog, with the
+    /// worktree's `HEAD` on it and moved by nothing else. The new tip must
     /// contain `onto`, `onto..<new tip>` must hold as many commits as
     /// `fork_point..old_tip`, and each replayed commit must change the same
     /// lines as its original, compared as `git patch-id --stable` over diffs
@@ -309,15 +455,27 @@ impl Restack<'_> {
     /// line does not count as a difference while a dropped or altered change
     /// does. A commit that became empty against `onto` is dropped by the
     /// rebase and fails the count. Anything that does not verify is rolled
-    /// back to the old tip.
+    /// back to the old tip, as far as [`Restack::roll_back`] allows.
     pub async fn replay(&self) -> Result<String, RestackFailure> {
-        let envs = match committer_env(self.worktree, self.old_tip).await {
+        let rebased = self.rebase().await?;
+        self.settle(rebased).await
+    }
+
+    /// Run the rebase. An `Err` is a rebase that never started, already
+    /// settled.
+    async fn rebase(&self) -> Result<Ran, RestackFailure> {
+        let mut envs = match committer_env(self.worktree, self.old_tip).await {
             Ok(envs) => envs,
-            Err(e) => return Err(self.restore_now(format!("the rebase could not be started: {e}")).await),
+            Err(e) => {
+                return Err(self.restore(false, format!("the rebase could not be started: {e}")).await)
+            }
         };
+        envs.push(("GIT_REFLOG_ACTION", self.marker.clone()));
         let rebased = run(
             self.worktree,
             &[
+                "-c",
+                "core.logAllRefUpdates=always",
                 "rebase",
                 "--no-autostash",
                 "--no-update-refs",
@@ -333,10 +491,14 @@ impl Restack<'_> {
             &envs,
         )
         .await;
-        let rebased = match rebased {
-            Ok(ran) => ran,
-            Err(e) => return Err(self.restore_now(format!("git rebase could not be run: {e}")).await),
-        };
+        match rebased {
+            Ok(ran) => Ok(ran),
+            Err(e) => Err(self.restore(false, format!("git rebase could not be run: {e}")).await),
+        }
+    }
+
+    /// Verify what the rebase left, or roll it back.
+    async fn settle(&self, rebased: Ran) -> Result<String, RestackFailure> {
         if rebased.code != Some(0) {
             let conflicted = git(self.worktree, &["diff", "--name-only", "--diff-filter=U"])
                 .await
@@ -346,22 +508,36 @@ impl Restack<'_> {
             } else {
                 format!("it stopped on a conflict in {}", conflicted.lines().collect::<Vec<_>>().join(", "))
             };
-            return Err(self.restore_now(what).await);
+            return Err(self.restore(true, what).await);
         }
 
         match self.verify().await {
             Ok(new_tip) => Ok(new_tip),
-            Err(why) => Err(self.restore_now(format!("the rebased branch did not verify: {why}")).await),
+            Err(why) => Err(self.restore(true, format!("the rebased branch did not verify: {why}")).await),
         }
     }
 
-    /// The new tip, when the rebased branch holds exactly the task's commits
-    /// on top of `onto`.
+    /// The new tip, when the branch is exactly where this restack's rebase
+    /// left it and holds exactly the task's commits on top of `onto`.
     async fn verify(&self) -> Result<String, String> {
         let branch_ref = format!("refs/heads/{}", self.branch);
-        let new_tip = exact_ref(self.worktree, &branch_ref)
+        let new_tip = produced_tip(self.worktree, self.branch, &self.marker)
             .await?
-            .ok_or_else(|| format!("{branch_ref} is gone"))?;
+            .ok_or_else(|| format!("the latest update of {branch_ref} is not this restack's rebase"))?;
+        let tip = exact_ref(self.worktree, &branch_ref).await?;
+        if tip.as_deref() != Some(new_tip.as_str()) {
+            return Err(format!("{branch_ref} is at {tip:?}, not at {new_tip}, which the rebase produced"));
+        }
+        if !head_moved_only_by(self.worktree, &self.marker).await? {
+            return Err("the worktree's HEAD was moved by something other than this restack".to_string());
+        }
+        let state = worktree_state(self.worktree).await?;
+        if state.head_ref.as_deref() != Some(branch_ref.as_str()) || state.head != new_tip {
+            return Err(format!("the worktree's HEAD is not {branch_ref} at {new_tip}"));
+        }
+        if let Some(operation) = state.in_progress {
+            return Err(format!("the worktree is in the middle of a {operation}"));
+        }
         if !is_ancestor(self.worktree, self.onto, &new_tip).await? {
             return Err(format!("{new_tip} does not contain {}", self.onto));
         }
@@ -383,42 +559,163 @@ impl Restack<'_> {
         Ok(new_tip)
     }
 
-    /// Put the branch back at the old tip after a rebase that ran, verify
-    /// it, and say which [`RestackFailure`] that makes `what`.
+    /// Put the branch back at the old tip, but only a state this restack
+    /// produced and nothing moved since, verify it, and say which
+    /// [`RestackFailure`] that makes `what`. `ran` says whether the rebase
+    /// was run at all.
     ///
-    /// A rebase still in progress is aborted, which is how git itself
-    /// restores the branch. A rebase that finished moved the branch, and
-    /// `git reset --keep` in the worktree moves it back: the worktree was
-    /// clean before the rebase and a finished rebase leaves it clean, and
-    /// `--keep` refuses rather than discard anything if that is somehow no
-    /// longer true. Only a verified restoration retires the backup ref.
-    async fn restore_now(&self, what: String) -> RestackFailure {
-        let undo = async {
-            if operation_in_progress(self.worktree).await? == Some("rebase") {
-                abort_rebase(self.worktree).await?;
-            }
-            let branch_ref = format!("refs/heads/{}", self.branch);
-            if exact_ref(self.worktree, &branch_ref).await?.as_deref() != Some(self.old_tip) {
-                git(self.worktree, &["reset", "--quiet", "--keep", self.old_tip]).await?;
-            }
-            verify_restored(self.worktree, self.branch, self.old_tip).await
-        };
-        if let Err(why) = undo.await {
-            return RestackFailure::NotRestored(format!(
+    /// - A rebase that never started changed nothing, and nothing is done:
+    ///   the branch and the worktree are only verified at the old tip.
+    /// - A rebase still in progress is aborted, which is how git itself
+    ///   restores the branch, only while it is provably this one: a rebase
+    ///   of `refs/heads/<branch>` from the old tip onto `onto`, the branch
+    ///   still at the old tip, and `HEAD` moved by nothing but this rebase.
+    ///   `git rebase --abort` has no compare-and-swap of its own, so a move
+    ///   of `HEAD` in the instant between that check and the abort is not
+    ///   detected.
+    /// - A rebase that finished moved the branch. It is moved back only
+    ///   while it is still at the tip the rebase produced, per its reflog,
+    ///   with the worktree's `HEAD` on it, moved by nothing else and in the
+    ///   middle of nothing. The ref is moved back with a compare-and-swap
+    ///   (`git update-ref <branch> <old tip> <produced tip>`), which changes
+    ///   nothing if it moved in the meantime; only then are the index and
+    ///   the files brought back with `git read-tree -m -u`, which refuses
+    ///   rather than overwrite local changes or untracked files. A commit
+    ///   made in the instant between the swap and the read-tree is not
+    ///   detected before it, and fails the verification after it.
+    /// - A branch already at the old tip with no rebase in progress is
+    ///   only verified.
+    ///
+    /// Anything else was moved by someone other than this restack, and is
+    /// left exactly as it is ([`RestackFailure::BranchMoved`]). Only a
+    /// verified restoration retires the backup ref.
+    async fn restore(&self, ran: bool, what: String) -> RestackFailure {
+        let undone = if ran { self.undo().await } else { self.check_untouched().await };
+        match undone {
+            Ok(()) => match retire_backup(self.worktree, self.backup, self.old_tip).await {
+                Ok(()) => RestackFailure::Restored(what),
+                Err(e) => RestackFailure::Restored(format!("{what} ({e})")),
+            },
+            Err(NotUndone::Moved(how)) => RestackFailure::BranchMoved(format!("{what}; meanwhile {how}")),
+            Err(NotUndone::Failed(why)) => RestackFailure::NotRestored(format!(
                 "{what}, and the branch could not be verified as restored: {why}"
-            ));
-        }
-        match retire_backup(self.worktree, self.backup, self.old_tip).await {
-            Ok(()) => RestackFailure::Restored(what),
-            Err(e) => RestackFailure::Restored(format!("{what} ({e})")),
+            )),
         }
     }
 
+    /// After a rebase that never started: nothing to undo, and anything not
+    /// at the old tip was moved by someone else.
+    async fn check_untouched(&self) -> Result<(), NotUndone> {
+        let branch_ref = format!("refs/heads/{}", self.branch);
+        exact_ref(self.worktree, &branch_ref).await?;
+        verify_restored(self.worktree, self.branch, self.old_tip)
+            .await
+            .map_err(|why| NotUndone::Moved(format!("{why}, although SlashIt had not changed anything yet")))
+    }
+
+    /// After a rebase that ran: undo what it provably did, and nothing else.
+    async fn undo(&self) -> Result<(), NotUndone> {
+        let branch_ref = format!("refs/heads/{}", self.branch);
+        let tip = exact_ref(self.worktree, &branch_ref).await?;
+        let shown = |tip: &Option<String>| tip.clone().unwrap_or_else(|| "gone".to_string());
+
+        if operation_in_progress(self.worktree).await? == Some("rebase") {
+            let rebase = interrupted_rebase_of(self.worktree, self.branch).await?;
+            let own_rebase = rebase.is_some_and(|r| r.orig_head == self.old_tip && r.onto == self.onto);
+            if !own_rebase {
+                return Err(NotUndone::Moved(format!(
+                    "the rebase in progress in the worktree is not this restack's; {branch_ref} is at {}",
+                    shown(&tip)
+                )));
+            }
+            if tip.as_deref() != Some(self.old_tip) {
+                return Err(NotUndone::Moved(format!("{branch_ref} was moved to {}", shown(&tip))));
+            }
+            if !head_moved_only_by(self.worktree, &self.marker).await? {
+                let head = git(self.worktree, &["rev-parse", "--verify", "HEAD"]).await?;
+                return Err(NotUndone::Moved(format!(
+                    "the worktree's HEAD was moved to {head} by something other than this restack, \
+                     while its rebase was stopped; {branch_ref} is at {}",
+                    shown(&tip)
+                )));
+            }
+            abort_rebase(self.worktree).await?;
+            return Ok(verify_restored(self.worktree, self.branch, self.old_tip).await?);
+        }
+
+        if tip.as_deref() == Some(self.old_tip) {
+            return Ok(verify_restored(self.worktree, self.branch, self.old_tip).await?);
+        }
+
+        let produced = produced_tip(self.worktree, self.branch, &self.marker).await?;
+        let Some(produced) = produced.filter(|p| tip.as_deref() == Some(p.as_str())) else {
+            return Err(NotUndone::Moved(format!(
+                "{branch_ref} was moved to {} by something other than this restack",
+                shown(&tip)
+            )));
+        };
+        if !head_moved_only_by(self.worktree, &self.marker).await? {
+            let head = git(self.worktree, &["rev-parse", "--verify", "HEAD"]).await?;
+            return Err(NotUndone::Moved(format!(
+                "the worktree's HEAD was moved to {head} by something other than this restack; \
+                 {branch_ref} is at {produced}"
+            )));
+        }
+        let state = worktree_state(self.worktree).await?;
+        if state.head_ref.as_deref() != Some(branch_ref.as_str())
+            || state.head != produced
+            || state.in_progress.is_some()
+        {
+            return Err(NotUndone::Moved(format!(
+                "the worktree is no longer on {branch_ref} at {produced} with nothing in progress: \
+                 its HEAD is {} at {}{}",
+                state.head_ref.as_deref().unwrap_or("detached"),
+                state.head,
+                state.in_progress.map(|op| format!(", in the middle of a {op}")).unwrap_or_default()
+            )));
+        }
+
+        let message = format!("{} (rollback)", self.marker);
+        let swapped = run(
+            self.worktree,
+            &["update-ref", "-m", &message, &branch_ref, self.old_tip, &produced],
+            &[],
+        )
+        .await?;
+        if swapped.code != Some(0) {
+            let now = exact_ref(self.worktree, &branch_ref).await?;
+            if now.as_deref() != Some(produced.as_str()) {
+                return Err(NotUndone::Moved(format!(
+                    "{branch_ref} was moved to {} before it could be put back",
+                    shown(&now)
+                )));
+            }
+            return Err(NotUndone::Failed(format!(
+                "{branch_ref} could not be moved back from {produced}: {}",
+                swapped.stderr
+            )));
+        }
+        run(self.worktree, &["update-index", "-q", "--refresh"], &[]).await?;
+        let files = run(self.worktree, &["read-tree", "-m", "-u", &produced, self.old_tip], &[]).await?;
+        if files.code != Some(0) {
+            return Err(NotUndone::Failed(format!(
+                "{branch_ref} is back at {}, but the worktree's index and files still hold the \
+                 restacked {produced}, because git would not update them without overwriting \
+                 something ({}). Run `git status` in the worktree, move aside what is in the way, \
+                 then run `git read-tree -m -u {produced} {}` there",
+                self.old_tip, files.stderr, self.old_tip
+            )));
+        }
+        Ok(verify_restored(self.worktree, self.branch, self.old_tip).await?)
+    }
+
     /// Roll a verified restack back, for a caller that could not record it:
-    /// the branch goes back to the old tip, and the backup ref is retired
-    /// once that is verified.
+    /// the branch goes back to the old tip while it is still exactly where
+    /// the rebase left it, and the backup ref is retired once that is
+    /// verified. A branch or `HEAD` that moved since is left as it is
+    /// ([`RestackFailure::BranchMoved`]).
     pub async fn roll_back(&self, what: String) -> RestackFailure {
-        self.restore_now(what).await
+        self.restore(true, what).await
     }
 }
 
@@ -481,4 +778,279 @@ async fn patch_id(dir: &Path, commit: &str) -> Result<String, String> {
         .next()
         .unwrap_or_default()
         .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as StdCommand;
+
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let output = StdCommand::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env_remove("GIT_REFLOG_ACTION")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A repository with `main` (F, then M) pushed to a bare `origin`, and
+    /// `task` (B1, B2 on b.txt) forked from F, never pushed and checked out
+    /// in a worktree of its own. With `conflict`, M edits b.txt so replaying
+    /// B1 onto it stops on a conflict. The backup ref is written as the
+    /// caller of a restack writes it.
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        origin: PathBuf,
+        worktree: PathBuf,
+        fork_point: String,
+        old_tip: String,
+        onto: String,
+        backup: String,
+    }
+
+    impl Fixture {
+        fn new(conflict: bool) -> Self {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let origin = tmp.path().join("origin.git");
+            let repo = tmp.path().join("repo");
+            let worktree = tmp.path().join("worktree");
+            git_in(tmp.path(), &["init", "-q", "--bare", origin.to_str().unwrap()]);
+            git_in(tmp.path(), &["init", "-q", "-b", "main", repo.to_str().unwrap()]);
+            git_in(&repo, &["config", "user.name", "Test"]);
+            git_in(&repo, &["config", "user.email", "test@example.com"]);
+            git_in(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+            commit(&repo, "f.txt", "f\n", "F");
+            let fork_point = git_in(&repo, &["rev-parse", "HEAD"]);
+            git_in(&repo, &["checkout", "-q", "-b", "task"]);
+            commit(&repo, "b.txt", "b1\n", "B1");
+            commit(&repo, "b.txt", "b2\n", "B2");
+            let old_tip = git_in(&repo, &["rev-parse", "HEAD"]);
+            git_in(&repo, &["checkout", "-q", "main"]);
+            if conflict {
+                commit(&repo, "b.txt", "main's own b\n", "M");
+            } else {
+                commit(&repo, "m.txt", "m\n", "M");
+            }
+            let onto = git_in(&repo, &["rev-parse", "HEAD"]);
+            git_in(&repo, &["push", "-q", "origin", "main"]);
+            git_in(&repo, &["worktree", "add", "-q", worktree.to_str().unwrap(), "task"]);
+            let backup = backup_ref(Uuid::new_v4());
+            git_in(&repo, &["update-ref", &backup, &old_tip, ""]);
+            Fixture { _tmp: tmp, origin, worktree, fork_point, old_tip, onto, backup }
+        }
+
+        fn restack(&self) -> Restack<'_> {
+            Restack::new(&self.worktree, "task", &self.fork_point, &self.old_tip, &self.onto, &self.backup)
+        }
+
+        fn tip(&self) -> Option<String> {
+            ref_in(&self.worktree, "refs/heads/task")
+        }
+
+        fn backup_at(&self) -> Option<String> {
+            ref_in(&self.worktree, &self.backup)
+        }
+
+        fn head(&self) -> String {
+            git_in(&self.worktree, &["rev-parse", "HEAD"])
+        }
+
+        fn rebase_in_progress(&self) -> bool {
+            ["rebase-merge", "rebase-apply"].iter().any(|name| {
+                let path = git_in(&self.worktree, &["rev-parse", "--git-path", name]);
+                self.worktree.join(path).exists()
+            })
+        }
+
+        /// Nothing reached `origin` but `main`.
+        fn assert_nothing_pushed(&self) {
+            assert_eq!(ref_in(&self.origin, "refs/heads/task"), None, "nothing may be pushed");
+        }
+
+        /// The ordinary outcome of a rollback: the branch and the worktree
+        /// exactly at the old tip, clean, and the backup retired.
+        fn assert_restored(&self, name: &str) {
+            assert_eq!(self.tip().as_deref(), Some(self.old_tip.as_str()), "{name}");
+            assert_eq!(git_in(&self.worktree, &["symbolic-ref", "HEAD"]), "refs/heads/task", "{name}");
+            assert_eq!(self.head(), self.old_tip, "{name}");
+            assert!(!self.rebase_in_progress(), "{name}");
+            assert_eq!(git_in(&self.worktree, &["status", "--porcelain", "--untracked-files=all"]), "", "{name}");
+            assert_eq!(self.backup_at(), None, "{name}: the backup is retired");
+            self.assert_nothing_pushed();
+        }
+    }
+
+    fn commit(dir: &Path, file: &str, content: &str, subject: &str) -> String {
+        std::fs::write(dir.join(file), content).unwrap();
+        git_in(dir, &["add", "-A"]);
+        git_in(dir, &["commit", "-q", "-m", subject]);
+        git_in(dir, &["rev-parse", "HEAD"])
+    }
+
+    fn ref_in(dir: &Path, refname: &str) -> Option<String> {
+        git_in(dir, &["for-each-ref", "--format=%(refname) %(objectname)", refname])
+            .lines()
+            .find_map(|line| {
+                let (name, oid) = line.split_once(' ')?;
+                (name == refname).then(|| oid.to_string())
+            })
+    }
+
+    fn describe(failure: &RestackFailure) -> &str {
+        match failure {
+            RestackFailure::Restored(why) | RestackFailure::NotRestored(why) | RestackFailure::BranchMoved(why) => why,
+        }
+    }
+
+    /// A restack that completed and verified is rolled back because its
+    /// caller could not record it, but a commit was made on the branch from
+    /// the task's terminal in between. The branch is not SlashIt's to move
+    /// any more: the commit stays its tip, the backup is kept, and the
+    /// failure says so.
+    #[tokio::test]
+    async fn a_rollback_after_a_terminal_commit_leaves_the_branch_alone() {
+        let fixture = Fixture::new(false);
+        let restack = fixture.restack();
+        let new_tip = restack.replay().await.unwrap_or_else(|_| panic!("the replay verifies"));
+        assert_eq!(fixture.tip().as_deref(), Some(new_tip.as_str()));
+        let user = commit(&fixture.worktree, "u.txt", "u\n", "U");
+
+        let failure = restack.roll_back("the task could not record the restack".to_string()).await;
+
+        assert!(
+            matches!(&failure, RestackFailure::BranchMoved(why) if why.contains(&user)),
+            "{}",
+            describe(&failure)
+        );
+        assert_eq!(fixture.tip().as_deref(), Some(user.as_str()), "the terminal commit stays the tip");
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()), "the backup is kept");
+        fixture.assert_nothing_pushed();
+    }
+
+    /// A completed restack whose worktree was moved off the branch before
+    /// the rollback, without the branch itself moving, is not rolled back
+    /// either: the ref would move under a `HEAD` SlashIt no longer owns.
+    #[tokio::test]
+    async fn a_rollback_after_the_worktree_left_the_branch_leaves_it_alone() {
+        let fixture = Fixture::new(false);
+        let restack = fixture.restack();
+        let new_tip = restack.replay().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
+        git_in(&fixture.worktree, &["checkout", "-q", "--detach"]);
+
+        let failure = restack.roll_back("the task could not record the restack".to_string()).await;
+
+        assert!(matches!(failure, RestackFailure::BranchMoved(_)), "{}", describe(&failure));
+        assert_eq!(fixture.tip().as_deref(), Some(new_tip.as_str()));
+        assert!(git_in(&fixture.worktree, &["branch", "--show-current"]).is_empty(), "still detached");
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
+        fixture.assert_nothing_pushed();
+    }
+
+    /// Moving the files back never overwrites a change made in the worktree:
+    /// when git refuses to, the branch ref is back at the old tip, the change
+    /// is still there, the backup is kept, and the failure says what to run.
+    #[tokio::test]
+    async fn a_rollback_that_would_overwrite_a_local_change_keeps_it() {
+        let fixture = Fixture::new(false);
+        let restack = fixture.restack();
+        restack.replay().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
+        std::fs::write(fixture.worktree.join("m.txt"), "edited\n").unwrap();
+
+        let failure = restack.roll_back("the task could not record the restack".to_string()).await;
+
+        assert!(
+            matches!(&failure, RestackFailure::NotRestored(why) if why.contains("read-tree")),
+            "{}",
+            describe(&failure)
+        );
+        assert_eq!(fixture.tip().as_deref(), Some(fixture.old_tip.as_str()));
+        assert_eq!(std::fs::read_to_string(fixture.worktree.join("m.txt")).unwrap(), "edited\n");
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
+        fixture.assert_nothing_pushed();
+    }
+
+    /// A rebase that stopped on a conflict is aborted only while it is still
+    /// exactly as SlashIt's rebase left it. A commit made from the terminal
+    /// on the detached `HEAD`, or a branch moved by another tool, leaves the
+    /// rebase and the branch alone and the backup kept.
+    #[tokio::test]
+    async fn a_conflicted_restack_that_the_user_touched_is_not_aborted() {
+        for moved_branch in [false, true] {
+            let fixture = Fixture::new(true);
+            let restack = fixture.restack();
+            let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
+            assert_ne!(ran.code, Some(0));
+            assert!(fixture.rebase_in_progress());
+            let (expected_tip, expected_head) = if moved_branch {
+                let tree = git_in(&fixture.worktree, &["rev-parse", &format!("{}^{{tree}}", fixture.old_tip)]);
+                let moved = git_in(&fixture.worktree, &["commit-tree", "-p", &fixture.old_tip, "-m", "U", &tree]);
+                git_in(&fixture.worktree, &["update-ref", "refs/heads/task", &moved, &fixture.old_tip]);
+                (moved, fixture.head())
+            } else {
+                std::fs::write(fixture.worktree.join("b.txt"), "resolved\n").unwrap();
+                git_in(&fixture.worktree, &["add", "b.txt"]);
+                git_in(&fixture.worktree, &["commit", "-q", "-m", "U"]);
+                (fixture.old_tip.clone(), fixture.head())
+            };
+
+            let failure = restack.settle(ran).await.expect_err("not restacked");
+
+            assert!(
+                matches!(&failure, RestackFailure::BranchMoved(why) if why.contains("moved")),
+                "moved_branch={moved_branch}: {}",
+                describe(&failure)
+            );
+            assert!(fixture.rebase_in_progress(), "moved_branch={moved_branch}: not aborted");
+            assert_eq!(fixture.head(), expected_head, "moved_branch={moved_branch}");
+            assert_eq!(fixture.tip().as_deref(), Some(expected_tip.as_str()), "moved_branch={moved_branch}");
+            assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
+            fixture.assert_nothing_pushed();
+        }
+    }
+
+    /// When the rebase never started, SlashIt changed nothing, so it has
+    /// nothing to undo: a branch that moved meanwhile is not reset.
+    #[tokio::test]
+    async fn a_restack_that_never_started_does_not_reset_a_moved_branch() {
+        let fixture = Fixture::new(false);
+        let restack = fixture.restack();
+        let user = commit(&fixture.worktree, "u.txt", "u\n", "U");
+
+        let failure = restack.restore(false, "the rebase could not be started: no identity".to_string()).await;
+
+        assert!(matches!(&failure, RestackFailure::BranchMoved(why) if why.contains(&user)), "{}", describe(&failure));
+        assert_eq!(fixture.tip().as_deref(), Some(user.as_str()));
+        assert_eq!(fixture.head(), user);
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
+        fixture.assert_nothing_pushed();
+    }
+
+    /// With nobody else in the worktree, both rollbacks still restore the old
+    /// tip exactly: after a conflict, and after a completed replay.
+    #[tokio::test]
+    async fn an_untouched_restack_is_rolled_back_exactly() {
+        let fixture = Fixture::new(true);
+        let failure = fixture.restack().replay().await.expect_err("conflict");
+        assert!(matches!(failure, RestackFailure::Restored(_)));
+        fixture.assert_restored("conflict");
+
+        let fixture = Fixture::new(false);
+        let restack = fixture.restack();
+        let new_tip = restack.replay().await.unwrap_or_else(|_| panic!("the replay verifies"));
+        assert_ne!(new_tip, fixture.old_tip);
+        let failure = restack.roll_back("the task could not record the restack".to_string()).await;
+        assert!(matches!(failure, RestackFailure::Restored(_)));
+        fixture.assert_restored("completed");
+    }
 }
