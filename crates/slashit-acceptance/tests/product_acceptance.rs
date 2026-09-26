@@ -3378,7 +3378,13 @@ async fn choose_and_attach(item: &WebElement, project_name: &str) -> Result<()> 
     Ok(())
 }
 
-/// Wait for a toast of this variant whose message contains `expected`.
+/// Wait for a toast of this variant whose message contains `expected`, then
+/// clear every toast off the screen.
+///
+/// Clearing is part of the wait, not tidiness: toasts are fixed to the bottom
+/// right, up to 28rem wide, and a success toast lingers for four seconds. In a
+/// narrow window that stack covers the attach controls, and the journey's
+/// next click would land on a toast instead of the button under it.
 async fn await_toast(driver: &WebDriver, variant: &str, expected: &str) -> Result<()> {
     let selector = format!("[data-testid=\"toast\"][data-variant=\"{variant}\"]");
     let started = Instant::now();
@@ -3388,7 +3394,7 @@ async fn await_toast(driver: &WebDriver, variant: &str, expected: &str) -> Resul
             shown.push(toast.text().await.unwrap_or_default());
         }
         if shown.iter().any(|text| text.contains(expected)) {
-            return Ok(());
+            return dismiss_toasts(driver).await;
         }
         if started.elapsed() > MEMBERSHIP_DEADLINE {
             let all: Vec<String> = {
@@ -3404,6 +3410,32 @@ async fn await_toast(driver: &WebDriver, variant: &str, expected: &str) -> Resul
             };
             bail!(
                 "no {variant} toast saying {expected:?} within {}s; toasts on screen: {all:?}",
+                MEMBERSHIP_DEADLINE.as_secs()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Dismiss every toast through its own close button and wait until none is
+/// left in the document.
+async fn dismiss_toasts(driver: &WebDriver) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let toasts = driver.find_all(By::Css("[data-testid=\"toast\"]")).await?;
+        if toasts.is_empty() {
+            return Ok(());
+        }
+        for toast in toasts {
+            // A toast can expire on its own between the query and the click;
+            // that is the outcome this loop is waiting for, not a failure.
+            if let Ok(close) = toast.find(By::Css("[data-testid=\"toast-dismiss\"]")).await {
+                let _ = close.click().await;
+            }
+        }
+        if started.elapsed() > MEMBERSHIP_DEADLINE {
+            bail!(
+                "toasts were still on screen after {}s of dismissing them",
                 MEMBERSHIP_DEADLINE.as_secs()
             );
         }
@@ -3483,6 +3515,7 @@ fn find_table_with_id<'a>(value: &'a toml::Value, id: &str) -> Option<&'a toml::
         _ => None,
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

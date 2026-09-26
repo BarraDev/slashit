@@ -90,9 +90,10 @@ pub async fn delete_workspace(
     // Held across the registry mutation below: releasing it right after the
     // check would leave a window where a project can attach to this
     // workspace before the removal lands, recreating the dangling reference
-    // this check exists to prevent. No other path in this module acquires
-    // both locks, so holding this order (projects, then registry) here
-    // cannot deadlock against anything else.
+    // this check exists to prevent. Lock order: any path that holds both the
+    // projects lock and the workspace registry lock takes projects first,
+    // then the registry (`attach_project_to_workspace` does the same), so
+    // the two cannot deadlock.
     let projects = state.project.projects.read().await;
     let referencing = projects_referencing(&projects, workspace_id);
     if !referencing.is_empty() {

@@ -10,8 +10,9 @@ use leptos::task::spawn_local;
 pub fn WorkspacePanel(
     workspaces: ReadSignal<Vec<Workspace>>,
     projects: ReadSignal<Vec<Project>>,
-    /// Fired after a successful attach or detach, so the parent can reload
-    /// the project list that both this panel and the rest of the app share.
+    /// Fired after every attach or detach attempt, successful or refused, so
+    /// the Workspaces page can reload the project list it owns and passes in
+    /// as `projects`.
     on_membership_change: Callback<()>,
 ) -> impl IntoView {
     // No `overflow-hidden` here: the attach dropdown is absolutely positioned
@@ -99,7 +100,10 @@ fn WorkspaceItem(
                     toast::error(format!("Failed to attach project: {}", e));
                     // A refusal usually means this page is out of date (another
                     // client changed the membership), so resync rather than keep
-                    // offering what the backend just declined.
+                    // offering what the backend just declined. The selection is
+                    // cleared too: after the resync the project may no longer be
+                    // offered, and Attach must not resubmit a hidden choice.
+                    set_selected_to_attach.set(String::new());
                     on_membership_change.run(());
                 }
             }
