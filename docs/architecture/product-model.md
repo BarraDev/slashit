@@ -154,7 +154,7 @@ The procedure is in [development-workflow.md](../development-workflow.md).
 | Workspace | `domain::Workspace`, `config::WorkspaceRegistry` (`workspaces.toml`), `commands/workspace.rs` |
 | Project, ProjectScope | `domain::Project`, `domain::ProjectScope` (`Project.scope`); attach/detach in `commands/project.rs` |
 | Task | `domain::Task` |
-| Task Checkout | `Task.worktree_path`, `branch_name`, `base_commit`; `worktree::WorktreeManager` |
+| Task Checkout | `Task.worktree_path`, `branch_name`, `base_commit`, `branch_origin` (`domain::BranchOrigin`); `worktree::WorktreeManager` |
 | Workspace root as agent context | `TaskExecutor::resolve_workspace_launch` in `queue/executor.rs` |
 | Task Checkout lifecycle | `lifecycle.rs` |
 | Jujutsu integration | `jj/`, `commands/jj.rs` |

@@ -55,10 +55,10 @@ pub async fn create_worktree(
     let branch_name = existing_branch.clone().unwrap_or_else(|| WorktreeManager::branch_for_task(task_id));
 
     let is_fresh = existing_branch.is_none();
-    let info = if existing_branch.is_some() {
-        state.worktree_manager.reattach(&repo_path, &branch_name).await?
+    let (info, adopted) = if existing_branch.is_some() {
+        (state.worktree_manager.reattach(&repo_path, &branch_name).await?, false)
     } else {
-        state.worktree_manager.create(&repo_path, &branch_name).await?
+        state.worktree_manager.create_or_adopt(&repo_path, &branch_name).await?
     };
     // Captured once, only for a fresh worktree, matching
     // `queue::executor::spawn_task_execution`'s canonical-diff boundary
@@ -88,10 +88,11 @@ pub async fn create_worktree(
             if let Some(base_commit) = fresh_base_commit {
                 task.base_commit = Some(base_commit);
             }
-            // This path never stacks: a fresh branch here starts from the
-            // default base whatever the task depends on, and a reattach
-            // keeps the origin recorded when the branch was created.
-            if is_fresh {
+            // This path never stacks: a branch it creates starts from the
+            // default base whatever the task depends on. A reattach keeps
+            // the origin recorded when the branch was created, and an
+            // adopted worktree was made by something that recorded none.
+            if is_fresh && !adopted {
                 task.branch_origin = Some(crate::domain::BranchOrigin::DefaultBase);
             }
             task.updated_at = chrono::Utc::now();

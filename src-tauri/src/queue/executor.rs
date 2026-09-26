@@ -995,40 +995,31 @@ impl TaskExecutor {
                 if recorded != RecordedPr::None
                     && WorktreeManager::local_branch_exists(repo_path, &branch).await == Ok(false) =>
             {
-                match recorded {
-                    RecordedPr::Merged => {
-                        self.events.agent_event(AgentEvent::Log {
-                            task_id: task_id.to_string(),
-                            level: LogLevel::Info,
-                            message: format!(
-                                "The dependency's pull request was merged and its branch {branch} \
-                                 no longer exists locally, so its work is delivered; starting from \
-                                 the default base instead of stacking on it"
-                            ),
-                        });
-                        None
-                    }
-                    RecordedPr::ClosedUnmerged => {
-                        return (
-                            existing_branch,
-                            Err(format!(
-                                "it depends on the work on branch {branch}, which no longer exists \
-                                 locally, and the dependency's pull request was closed without \
-                                 being merged, so that work was never delivered"
-                            )),
-                        );
-                    }
-                    RecordedPr::None | RecordedPr::NotMerged => {
-                        return (
-                            existing_branch,
-                            Err(format!(
-                                "it depends on the work on branch {branch}, which no longer exists \
-                                 locally, and the dependency's pull request is not recorded as \
-                                 merged; refresh its pull request state, or restore the branch"
-                            )),
-                        );
-                    }
+                if recorded != RecordedPr::Merged {
+                    let why = if recorded == RecordedPr::ClosedUnmerged {
+                        "was closed without being merged, so that work was never delivered"
+                    } else {
+                        "is not recorded as merged; refresh its pull request state, or restore \
+                         the branch"
+                    };
+                    return (
+                        existing_branch,
+                        Err(format!(
+                            "it depends on the work on branch {branch}, which no longer exists \
+                             locally, and the dependency's pull request {why}"
+                        )),
+                    );
                 }
+                self.events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Info,
+                    message: format!(
+                        "The dependency's pull request was merged and its branch {branch} \
+                         no longer exists locally, so its work is delivered; starting from \
+                         the default base instead of stacking on it"
+                    ),
+                });
+                None
             }
             Some((branch, _, _)) => Some(branch),
         };
@@ -1113,14 +1104,17 @@ impl TaskExecutor {
                 )),
             }
         } else {
-            match self.worktree_manager.create(repo_path, &branch_name).await {
-                Ok(info) => {
+            // An adopted worktree was left by an earlier start that never
+            // recorded it, and that start may have stacked it, so only a
+            // branch created here is known to come from the default base.
+            match self.worktree_manager.create_or_adopt(repo_path, &branch_name).await {
+                Ok((info, adopted)) => {
                     let base_commit = Self::resolve_commit(&info.path, "HEAD").await;
                     Ok(Acquired {
                         info,
-                        what_happened: "Created worktree",
+                        what_happened: if adopted { "Adopted worktree" } else { "Created worktree" },
                         base_commit,
-                        origin: Some(BranchOrigin::DefaultBase),
+                        origin: (!adopted).then_some(BranchOrigin::DefaultBase),
                     })
                 }
                 Err(e) => Err(e),
@@ -4370,6 +4364,42 @@ mod tests {
             persisted_task(&executor, project_id, task_id).branch_origin,
             Some(BranchOrigin::DefaultBase)
         );
+    }
+
+    /// A live worktree of the task's branch that the task never recorded,
+    /// left by a start that died before it saved anything, is adopted
+    /// without claiming the branch came from the default base: that start
+    /// may have stacked it.
+    #[tokio::test]
+    async fn adopting_an_unrecorded_worktree_records_no_origin() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        let task_branch = WorktreeManager::branch_for_task(task_id);
+        // Where versions before managed placement put it, which `create`
+        // still adopts.
+        let leftover = repo.parent().unwrap().join(format!("repository.{task_branch}"));
+        git_in(&repo, &["worktree", "add", "-q", "-b", &task_branch, leftover.to_str().unwrap()]);
+
+        let (existing, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+
+        assert_eq!(existing, None);
+        let acquired = acquired.expect("the leftover worktree is adopted");
+        assert_eq!(
+            std::fs::canonicalize(&acquired.info.path).unwrap(),
+            std::fs::canonicalize(&leftover).unwrap()
+        );
+        assert_eq!(acquired.what_happened, "Adopted worktree");
+        assert_eq!(acquired.origin, None);
+        executor.record_acquired_worktree(task_id, acquired).await;
+
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        assert_eq!(persisted_task(&executor, project_id, task_id).branch_origin, None);
     }
 
     /// Reattaching to a branch recorded before origins were kept does not

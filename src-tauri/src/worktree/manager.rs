@@ -361,18 +361,31 @@ impl WorktreeManager {
     /// checked all the same, so that every way of acquiring a worktree holds
     /// its branch to the same contract before any process sees it.
     pub async fn create(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
+        self.create_or_adopt(repo_path, branch).await.map(|(info, _)| info)
+    }
+
+    /// [`Self::create`], also saying whether the worktree was adopted: an
+    /// existing worktree of `branch` reused rather than a new branch
+    /// created. Where an adopted branch started is not known here.
+    pub async fn create_or_adopt(
+        &self,
+        repo_path: &str,
+        branch: &str,
+    ) -> Result<(WorktreeInfo, bool), String> {
         let branch = checked_task_branch(branch)?;
         if let Some(existing) = self.adoptable_path_live(repo_path, branch).await {
-            return Ok(WorktreeInfo {
+            let info = WorktreeInfo {
                 path: existing.to_string_lossy().to_string(),
                 branch: branch.to_string(),
-            });
+            };
+            return Ok((info, true));
         }
-        if self.delegates_to_wt() {
-            self.create_with_wt(repo_path, branch).await
+        let info = if self.delegates_to_wt() {
+            self.create_with_wt(repo_path, branch).await?
         } else {
-            self.create_with_git(repo_path, branch).await
-        }
+            self.create_with_git(repo_path, branch).await?
+        };
+        Ok((info, false))
     }
 
     /// Reattach to an existing branch (no -c flag). Used when re-queuing a task
