@@ -40,8 +40,8 @@ the security boundary of the run:
 ## Prompt transport
 
 The prompt never goes in argv. `claude_args` passes a bare `-p`, and
-`ClaudeRunner::start_program` writes the prompt to the child's stdin from a
-separate task, then closes it; the CLI reads stdin to EOF before it starts.
+`ClaudeRunner` writes the prompt to the child's stdin from a separate task
+started at spawn, then closes it; the CLI reads stdin to EOF before it starts.
 An argument is capped at 128 KiB on Linux and is readable by any local
 process, and prompts carry review text and diffs of any size. This holds for
 every run, `ReadOnly` and `Full` alike. `--append-system-prompt` stays in
