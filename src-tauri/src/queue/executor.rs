@@ -2400,7 +2400,8 @@ impl TaskExecutor {
                 )
                 .await;
 
-                let fix_result = match fix_outcome(fix_run) {
+                // Why the fixes were not applied, when they were not.
+                let fix_failure = match fix_outcome(fix_run) {
                     FixOutcome::Applied => {
                         // Re-describe in jj after fixes
                         let _ = tokio::process::Command::new("jj")
@@ -2416,7 +2417,7 @@ impl TaskExecutor {
                             .current_dir(&working_dir)
                             .output()
                             .await;
-                        true
+                        None
                     }
                     FixOutcome::Cancelled => {
                         // Cancelled during the fix agent's run: it has
@@ -2425,13 +2426,19 @@ impl TaskExecutor {
                         reviewing_handles.write().await.remove(&task_id);
                         return;
                     }
-                    FixOutcome::Failed(message) => {
+                    FixOutcome::Failed(reason) => {
+                        // The fix agent has full tools, so a run that failed
+                        // part-way may still have edited the checkout.
+                        let message = format!(
+                            "{reason}. The task checkout may hold partial edits from the fix \
+                             agent that were not recorded."
+                        );
                         events.agent_event(AgentEvent::Log {
                             task_id: task_id_str.clone(),
                             level: LogLevel::Error,
-                            message,
+                            message: message.clone(),
                         });
-                        false
+                        Some(message)
                     }
                 };
 
@@ -2440,13 +2447,16 @@ impl TaskExecutor {
                     return;
                 }
 
-                let issues: Vec<String> = findings.lines()
-                    .filter(|l| l.starts_with("- ISSUE:") || l.starts_with("ISSUE:"))
-                    .map(|l| l.to_string())
+                let issues: Vec<String> = fix_failure.iter().cloned()
+                    .chain(
+                        findings.lines()
+                            .filter(|l| l.starts_with("- ISSUE:") || l.starts_with("ISSUE:"))
+                            .map(|l| l.to_string()),
+                    )
                     .collect();
 
                 let signoff = QaSignoff {
-                    status: if fix_result { QaStatus::FixesApplied } else { QaStatus::Rejected },
+                    status: if fix_failure.is_none() { QaStatus::FixesApplied } else { QaStatus::Rejected },
                     issues_found: issues,
                     timestamp: chrono::Utc::now(),
                     session_id: Uuid::new_v4(),
@@ -5287,6 +5297,16 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                     "the fix agent ran"
                 );
                 assert_eq!(signoff.status, QaStatus::Rejected, "{:?}", signoff.issues_found);
+                assert!(
+                    signoff.issues_found.iter().any(|i| {
+                        i.starts_with("Fix agent failed: Exit code 1") && i.contains("partial edits")
+                    }),
+                    "the signoff must say why the fixes were rejected: {:?}", signoff.issues_found
+                );
+                assert!(
+                    signoff.issues_found.iter().any(|i| i.contains("a.rs:1 - broken")),
+                    "the reviewer's issues are kept: {:?}", signoff.issues_found
+                );
             }
 
             #[tokio::test(flavor = "multi_thread")]
