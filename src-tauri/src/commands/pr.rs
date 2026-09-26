@@ -2977,7 +2977,7 @@ fn build_pr_body(task: &Task) -> String {
 /// which branch it means, so the parameter that allowed it is gone.
 ///
 /// The push itself is always `git push`, in a jj repository too. The task
-/// branch is a Git branch -- created by `git worktree`, git-spice or `wt` --
+/// branch is a Git branch -- created by `git worktree` or `wt` --
 /// and `git push -u` is exact about it: it fails when the branch does not
 /// exist, refuses a non-fast-forward update, and records the upstream the
 /// branch then tracks. `jj git push --bookmark` differs on all three: it
@@ -3074,37 +3074,6 @@ async fn jj_backing_git_dir(working_dir: &str) -> Result<String, String> {
         ));
     }
     Ok(git_dir)
-}
-
-#[tauri::command]
-pub async fn submit_stack(
-    state: tauri::State<'_, crate::AppState>,
-    task_id: String,
-) -> Result<Vec<String>, String> {
-    let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let working_dir = resolve_task_workspace(&state.task.tasks, task_uuid).await?;
-
-    if !state.worktree_manager.gs_available {
-        return Err("git-spice not available".to_string());
-    }
-
-    // Submit the entire stack
-    let output = tokio::process::Command::new("git-spice")
-        .args(["stack", "submit"])
-        .current_dir(&working_dir)
-        .output()
-        .await
-        .map_err(|e| format!("git-spice stack submit failed: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "git-spice stack submit failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    Ok(vec![stdout])
 }
 
 /// PR status from GitHub
