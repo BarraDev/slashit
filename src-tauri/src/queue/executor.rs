@@ -29,9 +29,11 @@ enum ReviewVerdict {
     Failed(String),
 }
 
-/// Whether the last line naming a verdict says `VERDICT: APPROVED`, with
-/// Markdown emphasis and code marks on that line ignored
-/// (`VERDICT: **APPROVED**`).
+/// Whether the last line naming a verdict is exactly `VERDICT: APPROVED`,
+/// ignoring surrounding whitespace, Markdown emphasis and code marks
+/// (`VERDICT: **APPROVED**`), and the `- ` bullet the review prompt lists
+/// the verdicts with. A line that only mentions the token, such as one
+/// quoting it, is not an approval.
 fn final_verdict_is_approved(output: &str) -> bool {
     output
         .lines()
@@ -39,7 +41,9 @@ fn final_verdict_is_approved(output: &str) -> bool {
         .find(|line| line.contains("VERDICT"))
         .is_some_and(|line| {
             let plain: String = line.chars().filter(|c| !matches!(c, '*' | '_' | '`')).collect();
-            plain.contains("VERDICT: APPROVED")
+            let plain = plain.trim();
+            let plain = plain.strip_prefix('-').map_or(plain, str::trim_start);
+            plain == "VERDICT: APPROVED"
         })
 }
 
@@ -5255,6 +5259,22 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                 assert!(matches!(review_verdict(&run(false, "VERDICT: **APPROVED**")), ReviewVerdict::Failed(_)));
                 let failed = AgentRun { failure: Some("exit 2".into()), ..run(false, "") };
                 assert_eq!(review_verdict(&failed), ReviewVerdict::Failed("exit 2".into()));
+            }
+
+            #[test]
+            fn only_a_final_line_that_is_exactly_the_approval_verdict_approves() {
+                assert!(final_verdict_is_approved("VERDICT: APPROVED"));
+                assert!(final_verdict_is_approved("VERDICT: **APPROVED**"));
+                assert!(final_verdict_is_approved("**VERDICT: APPROVED**"));
+                assert!(final_verdict_is_approved("ok\n   VERDICT: APPROVED  \n"));
+                // The prompt lists the verdicts as bullets, so one may be echoed.
+                assert!(final_verdict_is_approved("- VERDICT: APPROVED"));
+                assert!(!final_verdict_is_approved(
+                    "The quoted token \"VERDICT: APPROVED\" is not my verdict."
+                ));
+                assert!(!final_verdict_is_approved("I would not say VERDICT: APPROVED here"));
+                assert!(!final_verdict_is_approved("VERDICT: APPROVED? No."));
+                assert!(!final_verdict_is_approved("> VERDICT: APPROVED"));
             }
 
             #[test]
