@@ -3007,6 +3007,482 @@ async fn clean_up_beside_a_bystander(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Workspace membership: attaching a Project to a Workspace and detaching it
+// again, driven through the Workspaces page.
+// ---------------------------------------------------------------------------
+
+/// How long the Workspaces page gets to reflect a membership change or show
+/// its toast. Both are one IPC round trip and one re-render away.
+const MEMBERSHIP_DEADLINE: Duration = Duration::from_secs(20);
+const NAV_WORKSPACES: &str = "[data-testid=\"nav-workspaces\"]";
+
+/// Prove that a Project can be attached to a Workspace from the Workspaces
+/// page, that the membership survives a full application restart, and that
+/// detaching returns the Project to the set that can be attached again.
+///
+/// The prerequisites -- one Workspace and two standalone Projects -- are
+/// created through the IPC bridge, as in the queue journeys; everything the
+/// journey claims about membership happens through the rendered page: the
+/// eligible-project dropdown, the Attach and Detach buttons, the member list
+/// and the toasts. Two Projects rather than one on purpose: with a single
+/// Project the eligible set flips between empty and non-empty on every
+/// change, which re-renders the whole attach control and would hide a
+/// dropdown that never refreshes its options.
+///
+/// The failure toast is exercised through the one refusal a user can really
+/// reach: the page still offers a Project that another client attached in
+/// the meantime. The backend's reason has to reach the user, and the page has
+/// to catch up with the membership it was refused over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_attached_to_a_workspace_stays_a_member_across_restart_until_detached() {
+    let context = TestContext::new("workspace_membership").expect("harness setup");
+    let outcome = membership_journey(&context).await;
+    context.finish(outcome);
+}
+
+struct MembershipFixture {
+    workspace_id: String,
+    alpha: (String, String),
+    beta: (String, String),
+}
+
+async fn membership_journey(context: &TestContext) -> Result<()> {
+    // Process A: attach through the page.
+    let session = context.start_session("attach").await?;
+    let attached = attach_through_the_page(session.driver(), context.state().path()).await;
+    context.close_session(session, "attach", &attached).await?;
+    let fixture = attached?;
+
+    // The membership has to be what the application wrote, not something the
+    // first process only held in memory.
+    assert_persisted_scope(
+        &context.state().config_file(),
+        &fixture.alpha.0,
+        Some(&fixture.workspace_id),
+    )?;
+    assert_persisted_scope(&context.state().config_file(), &fixture.beta.0, None)?;
+
+    // Process B: a brand new application process against the same state.
+    let session = context.start_session("detach").await?;
+    let detached = detach_after_restart(session.driver(), &fixture).await;
+    context.close_session(session, "detach", &detached).await?;
+    detached?;
+
+    // Detach is persisted; Beta was attached by the "other client" and a
+    // refused UI attempt must not have changed that.
+    assert_persisted_scope(&context.state().config_file(), &fixture.alpha.0, None)?;
+    assert_persisted_scope(
+        &context.state().config_file(),
+        &fixture.beta.0,
+        Some(&fixture.workspace_id),
+    )?;
+    Ok(())
+}
+
+async fn attach_through_the_page(driver: &WebDriver, root: &Path) -> Result<MembershipFixture> {
+    ui::assert_frontend_is_real(driver).await?;
+
+    let workspace_root = root.join("workspace-root");
+    std::fs::create_dir_all(&workspace_root)
+        .with_context(|| format!("could not create {}", workspace_root.display()))?;
+    let workspace_id = created_id(
+        ui::invoke(
+            driver,
+            "create_workspace",
+            json!({ "name": "Acceptance Workspace", "rootPath": workspace_root }),
+        )
+        .await?,
+        "create_workspace",
+    )?;
+
+    let mut projects = Vec::new();
+    for name in ["Acceptance Alpha", "Acceptance Beta"] {
+        let id = created_id(
+            ui::invoke(
+                driver,
+                "create_project",
+                json!({ "name": name, "repositoryId": Value::Null, "agentType": "claude_code" }),
+            )
+            .await?,
+            "create_project",
+        )?;
+        projects.push((id, name.to_string()));
+    }
+    let beta = projects.pop().context("two projects were created")?;
+    let alpha = projects.pop().context("two projects were created")?;
+
+    // Reloaded for the same reason `open_board` reloads: the prerequisites
+    // were created behind the frontend's back.
+    driver
+        .refresh()
+        .await
+        .context("could not reload the application window")?;
+    let item = open_workspace(driver, &workspace_id).await?;
+
+    // Before: nothing is a member, and both projects are eligible.
+    assert_members(&item, &[]).await?;
+    assert_eligible(&item, &[&alpha.1, &beta.1]).await?;
+
+    // Attach Alpha.
+    choose_and_attach(&item, &alpha.1).await?;
+    await_toast(
+        driver,
+        "success",
+        &format!("Attached {} to this workspace", alpha.1),
+    )
+    .await?;
+    await_members(&item, &[&alpha.0]).await?;
+    assert_eligible(&item, &[&beta.1]).await?;
+
+    // The backend agrees with what the page shows.
+    assert_backend_scope(driver, &alpha.0, Some(&workspace_id)).await?;
+    assert_backend_scope(driver, &beta.0, None).await?;
+
+    Ok(MembershipFixture {
+        workspace_id,
+        alpha,
+        beta,
+    })
+}
+
+async fn detach_after_restart(driver: &WebDriver, fixture: &MembershipFixture) -> Result<()> {
+    ui::assert_frontend_is_real(driver).await?;
+    let (alpha_id, alpha_name) = (&fixture.alpha.0, &fixture.alpha.1);
+    let (beta_id, beta_name) = (&fixture.beta.0, &fixture.beta.1);
+
+    // After the restart: a fresh frontend, fed by a fresh backend that read
+    // the membership off disk.
+    let item = open_workspace(driver, &fixture.workspace_id).await?;
+    await_members(&item, &[alpha_id]).await?;
+    assert_eligible(&item, &[beta_name]).await?;
+
+    // Detach Alpha: it leaves the member list and becomes eligible again.
+    item.find(By::Css(format!(
+        "[data-testid=\"workspace-member-{alpha_id}\"] [data-testid=\"workspace-detach\"]"
+    )))
+    .await
+    .context("the member row has no Detach button")?
+    .click()
+    .await
+    .context("could not click Detach")?;
+    await_toast(
+        driver,
+        "success",
+        &format!("Detached {alpha_name} from this workspace"),
+    )
+    .await?;
+    await_members(&item, &[]).await?;
+    assert_eligible(&item, &[alpha_name, beta_name]).await?;
+    assert_backend_scope(driver, alpha_id, None).await?;
+
+    // Another client attaches Beta while this page still offers it. The
+    // attempt from the page must be refused, and the refusal must reach the
+    // user in the backend's own words.
+    ui::invoke(
+        driver,
+        "attach_project_to_workspace",
+        json!({ "projectId": beta_id, "workspaceId": fixture.workspace_id }),
+    )
+    .await?;
+    choose_and_attach(&item, beta_name).await?;
+    await_toast(
+        driver,
+        "error",
+        "Failed to attach project: Project already belongs to a workspace",
+    )
+    .await?;
+    assert_backend_scope(driver, beta_id, Some(&fixture.workspace_id)).await?;
+
+    // And the page stops contradicting the backend: it resyncs, showing Beta
+    // as the member it now is and no longer offering it.
+    await_members(&item, &[beta_id]).await?;
+    assert_eligible(&item, &[alpha_name]).await?;
+
+    Ok(())
+}
+
+/// Navigate to the Workspaces page and expand one workspace.
+async fn open_workspace(driver: &WebDriver, workspace_id: &str) -> Result<WebElement> {
+    ui::assert_frontend_is_real(driver).await?;
+    ui::visible(driver, NAV_WORKSPACES)
+        .await?
+        .click()
+        .await
+        .context("could not open the Workspaces page")?;
+    let item_selector = format!("[data-testid=\"workspace-{workspace_id}\"]");
+    let item = ui::visible(driver, &item_selector)
+        .await
+        .context("the Workspaces page does not list the workspace")?;
+    item.find(By::Css("[data-testid=\"workspace-toggle\"]"))
+        .await
+        .context("the workspace row has no toggle")?
+        .click()
+        .await
+        .context("could not expand the workspace")?;
+    ui::visible(
+        driver,
+        &format!("{item_selector} [data-testid=\"workspace-members\"]"),
+    )
+    .await
+    .context("expanding the workspace did not show its member list")?;
+    Ok(item)
+}
+
+/// The project ids the workspace currently renders as members.
+async fn member_ids(item: &WebElement) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for row in item
+        .find_all(By::Css("[data-testid^=\"workspace-member-\"]"))
+        .await
+        .context("could not read the member list")?
+    {
+        if let Some(testid) = row.attr("data-testid").await? {
+            if let Some(id) = testid.strip_prefix("workspace-member-") {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+async fn assert_members(item: &WebElement, expected: &[&str]) -> Result<()> {
+    let mut expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    let shown = member_ids(item).await?;
+    if shown != expected {
+        bail!("the workspace shows members {shown:?}, expected {expected:?}");
+    }
+    Ok(())
+}
+
+async fn await_members(item: &WebElement, expected: &[&str]) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match assert_members(item, expected).await {
+            Ok(()) => return Ok(()),
+            Err(error) if started.elapsed() > MEMBERSHIP_DEADLINE => {
+                return Err(error.context(format!(
+                    "the member list did not settle within {}s",
+                    MEMBERSHIP_DEADLINE.as_secs()
+                )))
+            }
+            Err(_) => tokio::time::sleep(POLL).await,
+        }
+    }
+}
+
+/// The trigger of the eligible-project dropdown.
+async fn attach_trigger(item: &WebElement) -> Result<WebElement> {
+    item.find(By::Css(
+        "[data-testid=\"workspace-attach\"] button[aria-haspopup=\"listbox\"]",
+    ))
+    .await
+    .context("the workspace offers no project dropdown to attach from")
+}
+
+/// Open the dropdown and read the project names it offers.
+///
+/// The list fades in, and until it has, WebDriver reports its options with no
+/// rendered text and refuses to click them. So this waits for every option to
+/// be readable -- the moment a user could see and pick it -- rather than
+/// reading the list the instant it is inserted.
+async fn open_eligible(item: &WebElement) -> Result<Vec<(String, WebElement)>> {
+    let trigger = attach_trigger(item).await?;
+    if trigger.attr("aria-expanded").await?.as_deref() != Some("true") {
+        trigger
+            .click()
+            .await
+            .context("could not open the project dropdown")?;
+    }
+    let started = Instant::now();
+    loop {
+        let mut offered = Vec::new();
+        for option in item
+            .find_all(By::Css(
+                "[data-testid=\"workspace-attach\"] [role=\"option\"]",
+            ))
+            .await
+            .context("could not read the dropdown's options")?
+        {
+            offered.push((option.text().await?.trim().to_string(), option));
+        }
+        if !offered.is_empty() && offered.iter().all(|(name, _)| !name.is_empty()) {
+            return Ok(offered);
+        }
+        if started.elapsed() > MEMBERSHIP_DEADLINE {
+            bail!(
+                "the project dropdown opened but never showed readable options within {}s \
+                 ({} option elements)",
+                MEMBERSHIP_DEADLINE.as_secs(),
+                offered.len()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Assert exactly these project names are offered for attachment.
+///
+/// Read from the rendered dropdown, never from the backend: the claim is what
+/// the user is offered. The dropdown is closed again afterwards.
+async fn assert_eligible(item: &WebElement, expected: &[&str]) -> Result<()> {
+    let mut expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    let started = Instant::now();
+    loop {
+        let mut offered: Vec<String> = open_eligible(item)
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        offered.sort();
+        attach_trigger(item)
+            .await?
+            .click()
+            .await
+            .context("could not close the project dropdown")?;
+        if offered == expected {
+            return Ok(());
+        }
+        if started.elapsed() > MEMBERSHIP_DEADLINE {
+            bail!(
+                "the attach dropdown offers {offered:?}, expected {expected:?} (still after {}s)",
+                MEMBERSHIP_DEADLINE.as_secs()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn choose_and_attach(item: &WebElement, project_name: &str) -> Result<()> {
+    let offered = open_eligible(item).await?;
+    let names: Vec<&str> = offered.iter().map(|(name, _)| name.as_str()).collect();
+    let (_, option) = offered
+        .iter()
+        .find(|(name, _)| name == project_name)
+        .with_context(|| {
+            format!("the dropdown does not offer {project_name:?}; it offers {names:?}")
+        })?;
+    option
+        .click()
+        .await
+        .context("could not choose the project")?;
+    item.find(By::Css("[data-testid=\"workspace-attach-submit\"]"))
+        .await
+        .context("the workspace has no Attach button")?
+        .click()
+        .await
+        .context("could not click Attach")?;
+    Ok(())
+}
+
+/// Wait for a toast of this variant whose message contains `expected`.
+async fn await_toast(driver: &WebDriver, variant: &str, expected: &str) -> Result<()> {
+    let selector = format!("[data-testid=\"toast\"][data-variant=\"{variant}\"]");
+    let started = Instant::now();
+    loop {
+        let mut shown = Vec::new();
+        for toast in driver.find_all(By::Css(&selector)).await? {
+            shown.push(toast.text().await.unwrap_or_default());
+        }
+        if shown.iter().any(|text| text.contains(expected)) {
+            return Ok(());
+        }
+        if started.elapsed() > MEMBERSHIP_DEADLINE {
+            let all: Vec<String> = {
+                let mut all = Vec::new();
+                for toast in driver.find_all(By::Css("[data-testid=\"toast\"]")).await? {
+                    all.push(format!(
+                        "{}: {}",
+                        toast.attr("data-variant").await?.unwrap_or_default(),
+                        toast.text().await.unwrap_or_default()
+                    ));
+                }
+                all
+            };
+            bail!(
+                "no {variant} toast saying {expected:?} within {}s; toasts on screen: {all:?}",
+                MEMBERSHIP_DEADLINE.as_secs()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The workspace a project belongs to, as `list_projects` reports it.
+async fn assert_backend_scope(
+    driver: &WebDriver,
+    project_id: &str,
+    workspace_id: Option<&str>,
+) -> Result<()> {
+    let listed = ui::invoke(driver, "list_projects", json!({})).await?;
+    let project = listed
+        .as_array()
+        .and_then(|all| {
+            all.iter()
+                .find(|p| p.get("id").and_then(Value::as_str) == Some(project_id))
+        })
+        .with_context(|| format!("list_projects does not return {project_id}: {listed}"))?;
+    let scope = &project["scope"];
+    let actual = match scope.get("kind").and_then(Value::as_str) {
+        Some("standalone") => None,
+        Some("in_workspace") => scope.get("workspace_id").and_then(Value::as_str),
+        _ => bail!("project {project_id} has an unrecognised scope: {scope}"),
+    };
+    if actual != workspace_id {
+        bail!("project {project_id} is in workspace {actual:?}, expected {workspace_id:?}");
+    }
+    Ok(())
+}
+
+/// The workspace a project belongs to, as the application wrote it to disk.
+fn assert_persisted_scope(
+    config_file: &Path,
+    project_id: &str,
+    workspace_id: Option<&str>,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(config_file)
+        .with_context(|| format!("could not read {}", config_file.display()))?;
+    let document: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("{} is not TOML", config_file.display()))?;
+    let project = find_table_with_id(&document, project_id).with_context(|| {
+        format!(
+            "{} holds no record for project {project_id}",
+            config_file.display()
+        )
+    })?;
+    let actual = match project.get("scope") {
+        None => None,
+        Some(scope) => match scope.get("kind").and_then(toml::Value::as_str) {
+            Some("standalone") => None,
+            Some("in_workspace") => scope.get("workspace_id").and_then(toml::Value::as_str),
+            _ => bail!("project {project_id} was persisted with an unrecognised scope: {scope}"),
+        },
+    };
+    if actual != workspace_id {
+        bail!(
+            "{} records project {project_id} in workspace {actual:?}, expected {workspace_id:?}",
+            config_file.display()
+        );
+    }
+    Ok(())
+}
+
+/// The table anywhere in the document whose `id` is `id`.
+fn find_table_with_id<'a>(value: &'a toml::Value, id: &str) -> Option<&'a toml::value::Table> {
+    match value {
+        toml::Value::Table(table) => {
+            if table.get("id").and_then(toml::Value::as_str) == Some(id) {
+                return Some(table);
+            }
+            table.values().find_map(|v| find_table_with_id(v, id))
+        }
+        toml::Value::Array(items) => items.iter().find_map(|v| find_table_with_id(v, id)),
+        _ => None,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
