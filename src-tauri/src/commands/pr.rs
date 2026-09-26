@@ -3153,7 +3153,10 @@ const GITHUB_PR_COMMIT_LIST_LIMIT: usize = 250;
 ///   branch (what it was moved to stays in `HEAD`'s reflog). An edit inside
 ///   a path the stop left unmerged cannot be told from its conflict markers
 ///   and is discarded with them, as is a nested repository created at such a
-///   path. Resetting the files after a stop never
+///   path. Likewise a staged edit on a path the stopped commit itself
+///   changes cannot be told from git's clean merge there, and is discarded.
+///   Submodule checkouts are never moved by an undo, so one the rebase moved
+///   stays where it is. Resetting the files after a stop never
 ///   refuses: an edit or untracked file made in the instant between the
 ///   check and the reset is destroyed, and ignored files at paths the old
 ///   tip tracks are overwritten. A `.gitignore` that differs between the old
@@ -3441,7 +3444,8 @@ fn restack_failure_message(
     match failure {
         RestackFailure::Restored(what) => format!(
             "Restacking {branch} onto {default} ({onto}) failed: {what}. The branch is back at \
-             {old_tip}, exactly as it was. Nothing was pushed and no pull request was opened. \
+             {old_tip}, exactly as it was (submodule checkouts are not moved back: if `git status` \
+             lists one, run `git submodule update` there). Nothing was pushed and no pull request was opened. \
              Move the branch onto {default} in the task's worktree (for example `git rebase \
              --onto origin/{default} {fork_point} {branch}`), resolve what that stops on, then \
              create the pull request again."
@@ -8406,7 +8410,7 @@ mod tests {
             /// one restack's reflog marker. A rebase onto another commit, one
             /// without the marker, or one with a terminal commit on top is
             /// the user's, and so is a stop whose conflict was resolved or
-            /// beside which another file was edited: undoing it would
+            /// beside which another file was edited or staged: undoing it would
             /// discard that work. The restack then runs again from the start. A backup
             /// that still equals the branch is reused. Anything else (a backup
             /// the branch no longer equals, with or without a rebase in
@@ -8428,6 +8432,7 @@ mod tests {
                     UnmarkedRebase,
                     ResolvedStop,
                     EditBesidesTheStop,
+                    StagedBesidesTheStop,
                 }
                 for leftover in [
                     Leftover::OwnRebaseInProgress,
@@ -8440,6 +8445,7 @@ mod tests {
                     Leftover::UnmarkedRebase,
                     Leftover::ResolvedStop,
                     Leftover::EditBesidesTheStop,
+                    Leftover::StagedBesidesTheStop,
                 ] {
                     let landed = land(Spec::new(Landing::Squash));
                     let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
@@ -8512,6 +8518,13 @@ mod tests {
                             start_marked_rebase("refs/remotes/origin/main");
                             std::fs::write(wt.join("m.txt"), "edited\n").unwrap();
                         }
+                        Leftover::StagedBesidesTheStop => {
+                            git(wt, &["update-ref", &backup, &landed.child_tip, ""]);
+                            start_marked_rebase("refs/remotes/origin/main");
+                            std::fs::write(wt.join("m.txt"), "edited\n").unwrap();
+                            std::fs::write(wt.join("n.txt"), "new\n").unwrap();
+                            git(wt, &["add", "m.txt", "n.txt"]);
+                        }
                         Leftover::BackupAtTip => {
                             git(wt, &["update-ref", &backup, &landed.child_tip, ""]);
                         }
@@ -8559,10 +8572,14 @@ mod tests {
                         | Leftover::RebaseWithForeignMoves
                         | Leftover::UnmarkedRebase
                         | Leftover::ResolvedStop
-                        | Leftover::EditBesidesTheStop => {
+                        | Leftover::EditBesidesTheStop
+                        | Leftover::StagedBesidesTheStop => {
                             let error = result.expect_err("refused");
                             assert!(error.contains(&backup), "{leftover:?}: {error}");
-                            if matches!(leftover, Leftover::ResolvedStop | Leftover::EditBesidesTheStop) {
+                            if matches!(
+                                leftover,
+                                Leftover::ResolvedStop | Leftover::EditBesidesTheStop | Leftover::StagedBesidesTheStop
+                            ) {
                                 assert!(error.contains("changes SlashIt did not make"), "{leftover:?}: {error}");
                             }
                             match leftover {
@@ -8576,6 +8593,10 @@ mod tests {
                                     "edited\n",
                                     "the edit is kept"
                                 ),
+                                Leftover::StagedBesidesTheStop => {
+                                    assert_eq!(std::fs::read_to_string(wt.join("m.txt")).unwrap(), "edited\n");
+                                    assert_eq!(std::fs::read_to_string(wt.join("n.txt")).unwrap(), "new\n");
+                                }
                                 _ => {}
                             }
                             assert!(mid_operation(wt), "{leftover:?}: a rebase that is not provably SlashIt's is not aborted");

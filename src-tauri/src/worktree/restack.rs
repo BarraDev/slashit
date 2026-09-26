@@ -352,10 +352,19 @@ pub async fn head_moved_only_by_a_restack(dir: &Path) -> Result<Option<String>, 
 /// the stop itself left, or `None` when it does.
 ///
 /// A rebase that stops on a conflict leaves the conflicted paths unmerged,
-/// and the worktree was clean before it started. So a stop with no unmerged
-/// paths left (resolved by hand, or a stop that was not a conflict), a
-/// change to any other tracked path that is not staged, or an untracked file
-/// are someone else's work, which undoing the stop would discard. What
+/// stages its clean merge of the other paths the stopped commit changes
+/// (`REBASE_HEAD`, against its parent), and the worktree was clean before it
+/// started. So a stop with no unmerged paths left (resolved by hand, or a
+/// stop that was not a conflict), a change to any other tracked path that is
+/// not staged, a path staged against `HEAD` that the stopped commit does not
+/// change, or an untracked file are someone else's work, which undoing the
+/// stop would discard. Without a `REBASE_HEAD` that has a parent, the stop
+/// cannot be checked, and is refused. A user's staged edit on a path the
+/// stopped commit does change cannot be told from git's clean merge there,
+/// and is discarded with it. The other way round, when `onto` renamed a path
+/// the stopped commit changes, git stages that change at the new path, which
+/// the commit itself does not name, and the undo is refused though nothing
+/// is the user's (failing closed). What
 /// cannot be told apart: an edit inside a path that is still unmerged looks
 /// the same as the conflict markers the stop wrote there, and a nested
 /// repository created at an unmerged path is removed with it. Neither can a file
@@ -382,10 +391,37 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
         return Ok(Some("no conflicted paths are left, so they were resolved by hand".to_string()));
     }
     let mut unstaged = paths(git(dir, &["diff", "-z", "--name-only", "--ignore-submodules=all"]).await?);
-    unstaged.extend(paths(git(dir, &["diff", "-z", "--name-only", "--diff-filter=T"]).await?));
+    unstaged.extend(paths(
+        git(dir, &["diff", "-z", "--name-only", "--diff-filter=T", "--ignore-submodules=none"]).await?,
+    ));
     let others: Vec<String> = unstaged.difference(&unmerged).cloned().collect();
     if !others.is_empty() {
         return Ok(Some(format!("{} changed besides the conflict", others.join(", "))));
+    }
+    let Some(stopped) = run(dir, &["rev-parse", "-q", "--verify", "REBASE_HEAD^{commit}"], &[])
+        .await?
+        .stdout
+        .lines()
+        .next()
+        .filter(|oid| is_full_object_id(oid))
+        .map(str::to_string)
+    else {
+        return Ok(Some("git does not name the commit it stopped on (REBASE_HEAD)".to_string()));
+    };
+    let parent = run(dir, &["rev-parse", "-q", "--verify", &format!("{stopped}^1")], &[]).await?;
+    if parent.code != Some(0) || !is_full_object_id(&parent.stdout) {
+        return Ok(Some(format!("the commit it stopped on, {stopped}, has no parent to compare it with")));
+    }
+    let own = paths(git(dir, &["diff-tree", "-r", "-z", "--name-only", "--no-renames", &parent.stdout, &stopped]).await?);
+    let staged = paths(
+        git(dir, &["diff", "--cached", "-z", "--name-only", "--no-renames", "--ignore-submodules=none", "HEAD"]).await?,
+    );
+    let foreign: Vec<String> = staged.difference(&unmerged).filter(|p| !own.contains(*p)).cloned().collect();
+    if !foreign.is_empty() {
+        return Ok(Some(format!(
+            "{} staged, which the commit it stopped on does not change",
+            foreign.join(", ")
+        )));
     }
     let untracked = paths(git(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).await?);
     if !untracked.is_empty() {
@@ -407,7 +443,9 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
 /// (logged as `message`), and `git read-tree --reset -u <old tip>` makes the
 /// index and the files the old tip's, removing what the stop added. It never
 /// goes into a submodule's checkout (`--no-recurse-submodules`), whatever
-/// `submodule.recurse` says.
+/// `submodule.recurse` says, so a submodule checkout the rebase moved (a git
+/// that honors `submodule.recurse` in a rebase does) is not moved back:
+/// `git submodule update` does that.
 /// Untracked files at paths the old tip does not track are left; ignored
 /// files at paths it does track are overwritten. The caller has checked
 /// that the rebase is the one it means to undo and that the worktree holds
@@ -1005,17 +1043,23 @@ mod tests {
 
     impl Fixture {
         fn new(conflict: bool) -> Self {
-            Self::build(conflict, false)
+            Self::build(conflict, false, false)
+        }
+
+        /// A restack whose first commit replays cleanly and whose second,
+        /// B2, stops on a conflict in f.txt, which B2 and M both change.
+        fn stopping_on_the_second_commit() -> Self {
+            Self::build(false, false, true)
         }
 
         /// [`Fixture::new`] with a conflict, where the repository also has
         /// a submodule `sub` (at S1 on F and on the task's branch, and moved
         /// to S2 by M), checked out in the task's worktree.
         fn with_submodule() -> Self {
-            Self::build(true, true)
+            Self::build(true, true, false)
         }
 
-        fn build(conflict: bool, submodule: bool) -> Self {
+        fn build(conflict: bool, submodule: bool, second: bool) -> Self {
             let tmp = tempfile::tempdir().expect("tempdir");
             let origin = tmp.path().join("origin.git");
             let repo = tmp.path().join("repo");
@@ -1039,13 +1083,18 @@ mod tests {
             let fork_point = git_in(&repo, &["rev-parse", "HEAD"]);
             git_in(&repo, &["checkout", "-q", "-b", "task"]);
             commit(&repo, "b.txt", "b1\n", "B1");
+            if second {
+                std::fs::write(repo.join("f.txt"), "the task's f\n").unwrap();
+            }
             commit(&repo, "b.txt", "b2\n", "B2");
             let old_tip = git_in(&repo, &["rev-parse", "HEAD"]);
             git_in(&repo, &["checkout", "-q", "main"]);
             if let Some((_, s2)) = &sub_commits {
                 git_in(&repo.join("sub"), &["checkout", "-q", s2]);
             }
-            if conflict {
+            if second {
+                commit(&repo, "f.txt", "main's own f\n", "M");
+            } else if conflict {
                 commit(&repo, "b.txt", "main's own b\n", "M");
             } else {
                 commit(&repo, "m.txt", "m\n", "M");
@@ -1362,6 +1411,69 @@ mod tests {
         assert!(fixture.rebase_in_progress(), "the stop is left as it is");
         assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
         fixture.assert_nothing_pushed();
+    }
+
+    /// A submodule replaced by a file is refused even where configuration
+    /// tells `git diff` to ignore that submodule.
+    #[tokio::test]
+    async fn undoing_a_stop_refuses_a_replaced_submodule_that_configuration_ignores() {
+        for (key, value) in [("submodule.sub.ignore", "all"), ("diff.ignoreSubmodules", "all")] {
+            let fixture = Fixture::with_submodule();
+            git_in(&fixture.worktree, &["config", key, value]);
+            let restack = fixture.restack();
+            let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
+            let sub = fixture.worktree.join("sub");
+            std::fs::remove_dir_all(&sub).unwrap();
+            std::fs::write(&sub, "a file now\n").unwrap();
+
+            let failure = restack.settle(ran).await.expect_err("not restacked");
+
+            assert!(matches!(failure, RestackFailure::BranchMoved(_)), "{key}: {}", describe(&failure));
+            assert_eq!(std::fs::read_to_string(&sub).unwrap(), "a file now\n", "{key}");
+            assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()), "{key}");
+        }
+    }
+
+    /// Work staged during the stop on a path the stopped commit does not
+    /// change, an edit or a new file, is the user's: the undo is refused and
+    /// the work kept.
+    #[tokio::test]
+    async fn undoing_a_stop_refuses_staged_work_beside_it() {
+        for new_file in [false, true] {
+            let fixture = Fixture::new(true);
+            let restack = fixture.restack();
+            let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
+            let file = if new_file { "n.txt" } else { "f.txt" };
+            std::fs::write(fixture.worktree.join(file), "staged by the user\n").unwrap();
+            git_in(&fixture.worktree, &["add", file]);
+
+            let failure = restack.settle(ran).await.expect_err("not restacked");
+
+            assert!(matches!(failure, RestackFailure::BranchMoved(_)), "{file}: {}", describe(&failure));
+            assert_eq!(
+                std::fs::read_to_string(fixture.worktree.join(file)).unwrap(),
+                "staged by the user\n",
+                "{file}"
+            );
+            assert!(fixture.rebase_in_progress(), "{file}: the stop is left as it is");
+            assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()), "{file}");
+        }
+    }
+
+    /// A stop after earlier commits replayed cleanly is still the
+    /// restack's own, and is undone to the old tip exactly.
+    #[tokio::test]
+    async fn a_stop_on_the_second_commit_is_undone_as_the_restacks_own() {
+        let fixture = Fixture::stopping_on_the_second_commit();
+
+        let failure = fixture.restack().replay().await.expect_err("conflict");
+
+        assert!(
+            matches!(&failure, RestackFailure::Restored(why) if why.contains("f.txt")),
+            "{}",
+            describe(&failure)
+        );
+        fixture.assert_restored("second commit");
     }
 
     /// When the rebase never started, SlashIt changed nothing, so it has
