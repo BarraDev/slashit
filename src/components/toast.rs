@@ -19,6 +19,18 @@ impl ToastVariant {
         }
     }
 
+    /// Stable identifier for the variant, exposed as `data-variant` so a
+    /// caller can tell a success toast from a failure one without matching
+    /// on colour classes.
+    fn name(&self) -> &'static str {
+        match self {
+            ToastVariant::Success => "success",
+            ToastVariant::Error => "error",
+            ToastVariant::Warning => "warning",
+            ToastVariant::Info => "info",
+        }
+    }
+
     fn class(&self) -> &'static str {
         match self {
             ToastVariant::Success => "border-green-500/50 bg-green-500/10 text-green-300",
@@ -116,6 +128,8 @@ fn ToastItem(
 
     view! {
         <div
+            data-testid="toast"
+            data-variant=variant.name()
             class=format!(
                 "flex items-start gap-3 p-4 rounded-lg border shadow-lg animate-toast-in {}",
                 variant.class(),

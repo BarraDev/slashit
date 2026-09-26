@@ -14,8 +14,11 @@ pub fn WorkspacePanel(
     /// the project list that both this panel and the rest of the app share.
     on_membership_change: Callback<()>,
 ) -> impl IntoView {
+    // No `overflow-hidden` here: the attach dropdown is absolutely positioned
+    // inside the panel, and clipping would hide its options below the last
+    // workspace row.
     view! {
-        <div class="border border-white/10 rounded-xl bg-white/[0.02] overflow-hidden">
+        <div class="border border-white/10 rounded-xl bg-white/[0.02]">
             <div class="px-4 py-3 border-b border-white/5">
                 <div class="flex items-center gap-2">
                     <svg class="w-5 h-5 text-white/40" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -92,7 +95,13 @@ fn WorkspaceItem(
                     set_selected_to_attach.set(String::new());
                     on_membership_change.run(());
                 }
-                Err(e) => toast::error(format!("Failed to attach project: {}", e)),
+                Err(e) => {
+                    toast::error(format!("Failed to attach project: {}", e));
+                    // A refusal usually means this page is out of date (another
+                    // client changed the membership), so resync rather than keep
+                    // offering what the backend just declined.
+                    on_membership_change.run(());
+                }
             }
             set_busy.set(false);
         });
@@ -106,15 +115,19 @@ fn WorkspaceItem(
                     toast::success(format!("Detached {} from this workspace", project_name));
                     on_membership_change.run(());
                 }
-                Err(e) => toast::error(format!("Failed to detach project: {}", e)),
+                Err(e) => {
+                    toast::error(format!("Failed to detach project: {}", e));
+                    on_membership_change.run(());
+                }
             }
             set_busy.set(false);
         });
     };
 
     view! {
-        <div class="group">
+        <div class="group" data-testid=format!("workspace-{}", ws_id)>
             <button
+                data-testid="workspace-toggle"
                 on:click=move |_| set_expanded.update(|e| *e = !*e)
                 class="w-full px-4 py-3 flex items-center justify-between hover:bg-white/5 transition-colors"
             >
@@ -150,7 +163,7 @@ fn WorkspaceItem(
 
                     <div class="space-y-2">
                         <h4 class="text-xs font-medium text-white/40 uppercase tracking-wide">"Projects in this workspace"</h4>
-                        <div class="space-y-1">
+                        <div class="space-y-1" data-testid="workspace-members">
                             <For
                                 each=members
                                 key=|p| p.id
@@ -158,10 +171,15 @@ fn WorkspaceItem(
                                     let name = p.name.clone();
                                     let name_for_detach = name.clone();
                                     let pid = p.id.to_string();
+                                    let member_testid = format!("workspace-member-{}", pid);
                                     view! {
-                                        <div class="flex items-center justify-between px-3 py-2 rounded-lg bg-white/[0.03]">
+                                        <div
+                                            data-testid=member_testid
+                                            class="flex items-center justify-between px-3 py-2 rounded-lg bg-white/[0.03]"
+                                        >
                                             <span class="text-sm text-white/80 truncate">{name}</span>
                                             <button
+                                                data-testid="workspace-detach"
                                                 disabled=move || busy.get()
                                                 on:click=move |_| on_detach(pid.clone(), name_for_detach.clone())
                                                 class="text-xs px-2 py-1 rounded bg-white/5 hover:bg-red-500/20 hover:text-red-300 text-white/50 transition-colors disabled:opacity-50"
@@ -186,7 +204,7 @@ fn WorkspaceItem(
                                 <p class="text-xs text-white/30">"No standalone projects available to attach"</p>
                             }
                         >
-                            <div class="flex gap-2">
+                            <div class="flex gap-2" data-testid="workspace-attach">
                                 <div class="flex-1">
                                     <CustomSelect
                                         options=eligible_options()
@@ -197,6 +215,7 @@ fn WorkspaceItem(
                                     />
                                 </div>
                                 <button
+                                    data-testid="workspace-attach-submit"
                                     disabled=move || busy.get() || selected_to_attach.get().is_empty()
                                     on:click=on_attach
                                     class="px-3 py-2 rounded-lg bg-yellow-500 hover:bg-yellow-600 text-black text-sm font-medium disabled:opacity-50 transition-colors"
