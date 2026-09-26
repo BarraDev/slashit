@@ -112,7 +112,9 @@ Product text, UI copy and user-facing docs use it. Backend docs and code name
 the concrete backend, "Git worktree", when the implementation matters.
 
 Today every Task Checkout is a Git worktree on its own branch, recorded on
-the Task as its checkout path, branch name and base commit. SlashIt places
+the Task as its checkout path, branch name and base commit, and whether the
+branch was started from the default base or stacked on a dependency's branch
+(which the Task's pull request then targets). SlashIt places
 it under its data directory, or leaves placement to worktrunk when the user
 has configured it; either way it is a Git worktree (see
 [state-locations.md](state-locations.md#worktrees)).

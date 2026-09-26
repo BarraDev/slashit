@@ -88,6 +88,12 @@ pub async fn create_worktree(
             if let Some(base_commit) = fresh_base_commit {
                 task.base_commit = Some(base_commit);
             }
+            // This path never stacks: a fresh branch here starts from the
+            // default base whatever the task depends on, and a reattach
+            // keeps the origin recorded when the branch was created.
+            if is_fresh {
+                task.branch_origin = Some(crate::domain::BranchOrigin::DefaultBase);
+            }
             task.updated_at = chrono::Utc::now();
 
             // Persist

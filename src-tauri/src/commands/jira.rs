@@ -146,6 +146,7 @@ pub async fn import_jira_issues(
             worktree_path: None,
             branch_name: None,
             base_commit: None,
+            branch_origin: None,
             cleanup_in_flight: false,
             pr_review_plan: None,
             created_at: now,
