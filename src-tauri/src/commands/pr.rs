@@ -121,9 +121,46 @@ async fn resolve_repository_dir(
     Ok(repo.local_path.clone())
 }
 
+/// The program started for `cmd` by [`run_cmd`] and [`is_jj_repo`]: `cmd`
+/// itself, looked up on `PATH`. A unit test can stand in its own `git` or
+/// `jj` for the code it awaits through [`test_programs::scope`], rather than
+/// by changing the process-wide `PATH` that every other test running the
+/// real tools reads at the same time.
+fn program(cmd: &str) -> std::ffi::OsString {
+    #[cfg(test)]
+    if let Some(path) = test_programs::lookup(cmd) {
+        return path.into_os_string();
+    }
+    cmd.into()
+}
+
+#[cfg(test)]
+mod test_programs {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    tokio::task_local! {
+        static OVERRIDES: HashMap<String, PathBuf>;
+    }
+
+    pub(super) fn lookup(cmd: &str) -> Option<PathBuf> {
+        OVERRIDES.try_with(|m| m.get(cmd).cloned()).ok().flatten()
+    }
+
+    /// Runs `future` with each `(name, path)` in `overrides` started in place
+    /// of the program `name`. Only this task sees the overrides.
+    pub(super) async fn scope<F: std::future::Future>(
+        overrides: impl IntoIterator<Item = (&'static str, PathBuf)>,
+        future: F,
+    ) -> F::Output {
+        let map = overrides.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        OVERRIDES.scope(map, future).await
+    }
+}
+
 /// Run an async command and return stdout on success, or Err with stderr.
 async fn run_cmd(cmd: &str, args: &[&str], cwd: &str) -> Result<String, String> {
-    let output = tokio::process::Command::new(cmd)
+    let output = tokio::process::Command::new(program(cmd))
         .args(args)
         .current_dir(cwd)
         .output()
@@ -219,7 +256,7 @@ fn jj_exact_bookmark_revset(branch: &str) -> String {
 }
 
 async fn is_jj_repo(working_dir: &str) -> bool {
-    tokio::process::Command::new("jj")
+    tokio::process::Command::new(program("jj"))
         .args(["root"])
         .current_dir(working_dir)
         .output()
@@ -3005,20 +3042,21 @@ fn build_pr_body(task: &Task) -> String {
 /// primary checkout as a side effect of pushing a named branch that has
 /// nothing to do with it.
 ///
-/// `git push` runs in `working_dir` and finds its repository there, as it
-/// does outside jj, whenever Git can discover one from that directory: a
-/// colocated repository, a Git worktree or subdirectory inside one, or a
-/// plain Git repository that merely sits inside some other jj workspace. Only
-/// when Git discovers nothing there, and the directory is a jj repository,
-/// is `git` pointed at the repository jj names with `jj git root`, through
-/// `--git-dir`. That is the case for a non-colocated repository, whose Git
-/// repository lives in `.jj/repo/store/git`, and for one created with
-/// `jj git init --git-repo <path>`: Git cannot discover either from the
-/// workspace. `--git-dir` names that repository exactly, with no discovery
-/// and no `GIT_DIR` from the environment taking precedence, and `-u` records
-/// the upstream in its config. If discovery fails for some other reason (a
-/// repository Git refuses as unsafe, say), the push still goes only to the
-/// repository jj itself is backed by.
+/// Which Git repository the push uses follows the nearest repository to
+/// `working_dir`. When Git discovers a repository there whose top level is
+/// the jj workspace root or lies inside it -- a colocated repository, a Git
+/// worktree or subdirectory inside one, or a plain Git repository nested in
+/// some other jj workspace -- `git push` runs in `working_dir` and uses it,
+/// as it does outside jj. Otherwise the jj workspace is the nearer one, and
+/// `git` is pointed at the repository jj names with `jj git root`, through
+/// `--git-dir`: a non-colocated repository, whose Git repository lives in
+/// `.jj/repo/store/git`, or one created with `jj git init --git-repo
+/// <path>`, where Git discovers nothing, and either of those nested inside
+/// an unrelated Git repository, where Git discovers the outer one.
+/// `--git-dir` names the repository exactly, and `-u` records the upstream
+/// in its config. If discovery fails for some other reason (a repository
+/// Git refuses as unsafe, say), the push still goes only to the repository
+/// jj itself is backed by.
 ///
 /// The branch is checked by [`checked_task_branch`] and, separately, never
 /// reaches `git` as a bare argument: it gets `--` and a fully qualified
@@ -3029,7 +3067,7 @@ async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> 
     if is_jj_repo(working_dir).await {
         run_cmd("jj", &["--ignore-working-copy", "git", "export"], working_dir).await
             .map_err(|e| format!("jj git export failed: {}", e))?;
-        if !git_discovers_repository(working_dir).await {
+        if !git_repository_is_inside_jj_workspace(working_dir).await {
             git_args.push(format!("--git-dir={}", jj_backing_git_dir(working_dir).await?));
         }
     }
@@ -3042,9 +3080,26 @@ async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> 
     Ok(branch.to_string())
 }
 
-/// Whether `git`, run in `working_dir`, finds a repository there on its own.
-async fn git_discovers_repository(working_dir: &str) -> bool {
-    run_cmd("git", &["rev-parse", "--git-dir"], working_dir).await.is_ok()
+/// Whether `git`, run in `working_dir`, discovers a repository whose top
+/// level (its Git directory, for a bare one) is the root of the jj workspace
+/// containing `working_dir` or lies inside it. Both paths are canonicalized
+/// before they are compared. A repository discovered above the workspace
+/// root, or none at all, is `false`.
+async fn git_repository_is_inside_jj_workspace(working_dir: &str) -> bool {
+    let git_location = match run_cmd("git", &["rev-parse", "--show-toplevel"], working_dir).await {
+        Ok(top) => top,
+        Err(_) => match run_cmd("git", &["rev-parse", "--absolute-git-dir"], working_dir).await {
+            Ok(git_dir) => git_dir,
+            Err(_) => return false,
+        },
+    };
+    let Ok(jj_root) = run_cmd("jj", &["--ignore-working-copy", "root"], working_dir).await else {
+        return false;
+    };
+    match (std::fs::canonicalize(&git_location), std::fs::canonicalize(&jj_root)) {
+        (Ok(git_location), Ok(jj_root)) => git_location.starts_with(&jj_root),
+        _ => false,
+    }
 }
 
 /// The Git repository backing the jj repository at `working_dir`, as printed
@@ -4609,6 +4664,59 @@ mod tests {
             );
         }
 
+        /// The other nesting: a non-colocated jj workspace inside an
+        /// unrelated Git repository. Git discovers the outer repository,
+        /// which even has a branch of the same name, but the jj workspace is
+        /// the nearer repository, so its backing repository is the one
+        /// pushed, to its own `origin`.
+        #[tokio::test]
+        async fn push_branch_pushes_a_jj_workspace_nested_in_an_unrelated_git_repository() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let outer = tmp.path().join("outer");
+            let outer_remote = tmp.path().join("outer-remote.git");
+            let jj_remote = tmp.path().join("jj-remote.git");
+            let workspace = outer.join("workspace");
+            git(tmp.path(), &["init", "-q", "--bare", outer_remote.to_str().unwrap()]);
+            git(tmp.path(), &["init", "-q", "--bare", jj_remote.to_str().unwrap()]);
+            git(tmp.path(), &["init", "-q", "-b", "main", outer.to_str().unwrap()]);
+            git(&outer, &["remote", "add", "origin", outer_remote.to_str().unwrap()]);
+            git(&outer, &["commit", "-q", "--allow-empty", "-m", "outer"]);
+            git(&outer, &["branch", "task-branch"]);
+            jj(tmp.path(), &["git", "init", "--no-colocate", workspace.to_str().unwrap()]);
+            jj(&workspace, &["git", "remote", "add", "origin", jj_remote.to_str().unwrap()]);
+            std::fs::write(workspace.join("taskfile.txt"), "task work").unwrap();
+            jj_as_test_user(&workspace, &["commit", "-m", "task commit"]);
+            jj(&workspace, &["bookmark", "create", "task-branch", "-r", "@-"]);
+            let task_sha = jj(
+                &workspace,
+                &[
+                    "--ignore-working-copy", "log", "--no-graph", "-T", "commit_id",
+                    "-r", &jj_exact_bookmark_revset("task-branch"),
+                ],
+            );
+
+            push_branch(workspace.to_str().unwrap(), "task-branch")
+                .await
+                .expect("the jj workspace's branch must push");
+
+            assert_eq!(remote_branch_sha(&jj_remote, "task-branch").as_deref(), Some(task_sha.as_str()));
+            assert_eq!(
+                git(&outer_remote, &["for-each-ref", "refs/heads"]),
+                "",
+                "the outer repository must not be pushed"
+            );
+            assert!(
+                StdCommand::new("git")
+                    .args(["config", "branch.task-branch.remote"])
+                    .current_dir(&outer)
+                    .output()
+                    .expect("git config")
+                    .stdout
+                    .is_empty(),
+                "the outer repository's config must be left alone"
+            );
+        }
+
         /// A non-colocated jj repository pushes through its backing Git
         /// repository, which Git cannot discover from the workspace. The
         /// remote gets exactly the task's commit and nothing else, and the
@@ -4793,34 +4901,28 @@ mod tests {
 
         /// The branch check is one of two layers: `git push` must also never
         /// see the branch as a bare argument, whatever the check lets through.
-        /// A fake `git` records exactly what `push_branch` hands it.
+        /// A fake `git` records exactly what `push_branch` hands it. It is
+        /// installed for this task only, through `test_programs::scope`, so
+        /// no other test running at the same time is handed it.
         #[cfg(unix)]
-        #[tokio::test(flavor = "multi_thread")]
+        #[tokio::test]
         async fn push_branch_gives_git_a_separator_and_a_fully_qualified_refspec() {
-            let _guard = PATH_LOCK.lock().await;
             let tmp = tempfile::tempdir().expect("tempdir");
-            let bin_dir = tmp.path().join("bin");
-            std::fs::create_dir_all(&bin_dir).unwrap();
             let log = tmp.path().join("git.log");
+            let fake_git = tmp.path().join("git");
             write_executable(
-                &bin_dir.join("git"),
+                &fake_git,
                 &format!("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\n"),
             );
-            let saved_path = std::env::var("PATH").ok();
-            // Safety: serialized via PATH_LOCK; restored below. `jj root`
-            // fails in the empty directory, so the plain-git path runs.
-            unsafe {
-                std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), saved_path.clone().unwrap_or_default()));
-            }
 
-            let result = push_branch(tmp.path().to_str().unwrap(), "task-abcd1234").await;
+            // The real `jj root` fails in the empty directory, so the
+            // plain-git path runs.
+            let result = test_programs::scope(
+                [("git", fake_git)],
+                push_branch(tmp.path().to_str().unwrap(), "task-abcd1234"),
+            )
+            .await;
 
-            unsafe {
-                match &saved_path {
-                    Some(p) => std::env::set_var("PATH", p),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
             result.expect("the fake git succeeds");
             assert_eq!(
                 std::fs::read_to_string(&log).unwrap().lines().collect::<Vec<_>>(),
@@ -6484,6 +6586,7 @@ mod tests {
                 _tmp: tempfile::TempDir,
                 blocked_pidfile: PathBuf,
                 jj_log: PathBuf,
+                fake_jj: PathBuf,
                 saved_path: Option<String>,
             }
 
@@ -6516,7 +6619,11 @@ mod tests {
                         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {jj_log:?}\n[ \"$1\" = root ] && exit 1\nexit 0\n",
                         jj_log = jj_log,
                     );
-                    write_executable(&bin_dir.join("jj"), &jj);
+                    // `jj` is handed to the apply flow through
+                    // `test_programs::scope`, not put on `PATH`, where every
+                    // test running real jj at the same time would find it.
+                    let fake_jj = tmp.path().join("jj");
+                    write_executable(&fake_jj, &jj);
 
                     let saved_path = std::env::var("PATH").ok();
                     let new_path = match &saved_path {
@@ -6528,7 +6635,7 @@ mod tests {
                         std::env::set_var("PATH", new_path);
                     }
 
-                    FixThenBlockTools { _tmp: tmp, blocked_pidfile, jj_log, saved_path }
+                    FixThenBlockTools { _tmp: tmp, blocked_pidfile, jj_log, fake_jj, saved_path }
                 }
 
                 fn blocked_pid(&self) -> Option<i32> {
@@ -6610,13 +6717,16 @@ mod tests {
 
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 let working_dir = repo.checkout.to_str().unwrap().to_string();
-                let apply = tokio::spawn(address_pr_review_inner(
-                    task,
-                    working_dir,
-                    plan,
-                    options,
-                    no_progress(),
-                    cancel_rx,
+                let apply = tokio::spawn(test_programs::scope(
+                    [("jj", tools.fake_jj.clone())],
+                    address_pr_review_inner(
+                        task,
+                        working_dir,
+                        plan,
+                        options,
+                        no_progress(),
+                        cancel_rx,
+                    ),
                 ));
 
                 // The first item has been fixed by the time the second one is
