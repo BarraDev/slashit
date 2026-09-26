@@ -3005,20 +3005,63 @@ fn build_pr_body(task: &Task) -> String {
 /// primary checkout as a side effect of pushing a named branch that has
 /// nothing to do with it.
 ///
+/// `git push` runs in `working_dir` and finds its repository there, as it
+/// does outside jj, whenever Git can discover one from that directory: a
+/// colocated repository, a Git worktree or subdirectory inside one, or a
+/// plain Git repository that merely sits inside some other jj workspace. Only
+/// when Git discovers nothing there, and the directory is a jj repository,
+/// is `git` pointed at the repository jj names with `jj git root`, through
+/// `--git-dir`. That is the case for a non-colocated repository, whose Git
+/// repository lives in `.jj/repo/store/git`, and for one created with
+/// `jj git init --git-repo <path>`: Git cannot discover either from the
+/// workspace. `--git-dir` names that repository exactly, with no discovery
+/// and no `GIT_DIR` from the environment taking precedence, and `-u` records
+/// the upstream in its config. If discovery fails for some other reason (a
+/// repository Git refuses as unsafe, say), the push still goes only to the
+/// repository jj itself is backed by.
+///
 /// The branch is checked by [`checked_task_branch`] and, separately, never
 /// reaches `git` as a bare argument: it gets `--` and a fully qualified
 /// `refs/heads/<b>:refs/heads/<b>` refspec.
 async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> {
     let branch = checked_task_branch(branch)?;
+    let mut git_args: Vec<String> = Vec::new();
     if is_jj_repo(working_dir).await {
         run_cmd("jj", &["--ignore-working-copy", "git", "export"], working_dir).await
             .map_err(|e| format!("jj git export failed: {}", e))?;
+        if !git_discovers_repository(working_dir).await {
+            git_args.push(format!("--git-dir={}", jj_backing_git_dir(working_dir).await?));
+        }
     }
 
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    run_cmd("git", &["push", "-u", "--", "origin", &refspec], working_dir).await
+    git_args.extend(["push", "-u", "--", "origin", &refspec].map(String::from));
+    let git_args: Vec<&str> = git_args.iter().map(String::as_str).collect();
+    run_cmd("git", &git_args, working_dir).await
         .map_err(|e| format!("git push failed: {}", e))?;
     Ok(branch.to_string())
+}
+
+/// Whether `git`, run in `working_dir`, finds a repository there on its own.
+async fn git_discovers_repository(working_dir: &str) -> bool {
+    run_cmd("git", &["rev-parse", "--git-dir"], working_dir).await.is_ok()
+}
+
+/// The Git repository backing the jj repository at `working_dir`, as printed
+/// by `jj git root`: an absolute path to the Git directory itself (`.git`
+/// when colocated, `.jj/repo/store/git` when not), never a working tree.
+/// Anything else is refused rather than handed to `git`.
+async fn jj_backing_git_dir(working_dir: &str) -> Result<String, String> {
+    let git_dir = run_cmd("jj", &["--ignore-working-copy", "git", "root"], working_dir)
+        .await
+        .map_err(|e| format!("Could not find the Git repository behind this jj repository: {e}"))?;
+    if git_dir.is_empty() || !std::path::Path::new(&git_dir).is_absolute() {
+        return Err(format!(
+            "jj reported {git_dir:?} as this repository's Git directory, which is not an \
+             absolute path, so SlashIt will not push through it."
+        ));
+    }
+    Ok(git_dir)
 }
 
 #[tauri::command]
@@ -4406,6 +4449,249 @@ mod tests {
             assert!(err.starts_with("git push failed:"), "unexpected error: {err}");
             assert!(!err.contains("jj:"), "no jj push may be attempted: {err}");
             assert!(repo.remote_has_branch("task-gone").is_none());
+        }
+
+        /// The commit `refs/heads/<branch>` names in the bare repository
+        /// `remote`, if it has that branch at all.
+        fn remote_branch_sha(remote: &Path, branch: &str) -> Option<String> {
+            let out = StdCommand::new("git")
+                .args([
+                    "--git-dir",
+                    remote.to_str().unwrap(),
+                    "for-each-ref",
+                    "--format=%(objectname)",
+                    &format!("refs/heads/{branch}"),
+                ])
+                .output()
+                .expect("for-each-ref");
+            String::from_utf8_lossy(&out.stdout).lines().next().map(str::to_string)
+        }
+
+        /// jj with a fixed identity, for the commits these tests make with jj.
+        fn jj_as_test_user(dir: &Path, args: &[&str]) -> String {
+            let mut all = vec!["--config", "user.name=Test", "--config", "user.email=test@example.com"];
+            all.extend_from_slice(args);
+            jj(dir, &all)
+        }
+
+        /// A jj repository that is not colocated: the workspace has no `.git`,
+        /// and the Git repository backing it lives in `.jj/repo/store/git`,
+        /// which `git` cannot discover from the workspace. One task commit
+        /// under the bookmark `branch`, and a bare `origin`.
+        struct NonColocatedJj {
+            _tmp: tempfile::TempDir,
+            remote: PathBuf,
+            workspace: PathBuf,
+            task_sha: String,
+        }
+
+        impl NonColocatedJj {
+            fn new(branch: &str) -> Self {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let remote = tmp.path().join("remote.git");
+                let workspace = tmp.path().join("workspace");
+                git(tmp.path(), &["init", "-q", "--bare", remote.to_str().unwrap()]);
+                jj(tmp.path(), &["git", "init", "--no-colocate", workspace.to_str().unwrap()]);
+                jj(&workspace, &["git", "remote", "add", "origin", remote.to_str().unwrap()]);
+                std::fs::write(workspace.join("taskfile.txt"), "task work").unwrap();
+                jj_as_test_user(&workspace, &["commit", "-m", "task commit"]);
+                jj(&workspace, &["bookmark", "create", branch, "-r", "@-"]);
+                let task_sha = jj(
+                    &workspace,
+                    &[
+                        "--ignore-working-copy", "log", "--no-graph", "-T", "commit_id",
+                        "-r", &jj_exact_bookmark_revset(branch),
+                    ],
+                );
+                assert!(!workspace.join(".git").exists(), "the fixture must not be colocated");
+                NonColocatedJj { _tmp: tmp, remote, workspace, task_sha }
+            }
+
+            fn git_dir(&self) -> PathBuf {
+                self.workspace.join(".jj/repo/store/git")
+            }
+
+            fn dir(&self) -> &str {
+                self.workspace.to_str().unwrap()
+            }
+        }
+
+        /// A jj workspace created with `jj git init --git-repo <path>` on a
+        /// separate Git repository, bare or not: Git cannot discover that
+        /// repository from the workspace either. Returns the remote, the
+        /// workspace, the backing Git directory and the task commit.
+        fn external_backend_jj(tmp: &Path, bare: bool, branch: &str) -> (PathBuf, PathBuf, PathBuf, String) {
+            let remote = tmp.join("remote.git");
+            let workspace = tmp.join("workspace");
+            git(tmp, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+            let git_dir = if bare {
+                let git_dir = tmp.join("backing.git");
+                git(tmp, &["init", "-q", "--bare", "-b", "main", git_dir.to_str().unwrap()]);
+                git_dir
+            } else {
+                let repo = tmp.join("backing");
+                git(tmp, &["init", "-q", "-b", "main", repo.to_str().unwrap()]);
+                repo.join(".git")
+            };
+            let git_dir_arg = format!("--git-dir={}", git_dir.display());
+            git(tmp, &[&git_dir_arg, "remote", "add", "origin", remote.to_str().unwrap()]);
+            jj(tmp, &["git", "init", "--git-repo", git_dir.to_str().unwrap(), workspace.to_str().unwrap()]);
+            std::fs::write(workspace.join("taskfile.txt"), "task work").unwrap();
+            jj_as_test_user(&workspace, &["commit", "-m", "task commit"]);
+            jj(&workspace, &["bookmark", "create", branch, "-r", "@-"]);
+            let task_sha = jj(
+                &workspace,
+                &[
+                    "--ignore-working-copy", "log", "--no-graph", "-T", "commit_id",
+                    "-r", &jj_exact_bookmark_revset(branch),
+                ],
+            );
+            (remote, workspace, git_dir, task_sha)
+        }
+
+        async fn assert_external_backend_pushes(bare: bool) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (remote, workspace, git_dir, task_sha) =
+                external_backend_jj(tmp.path(), bare, "task-branch");
+
+            push_branch(workspace.to_str().unwrap(), "task-branch")
+                .await
+                .expect("push must succeed");
+
+            assert_eq!(remote_branch_sha(&remote, "task-branch").as_deref(), Some(task_sha.as_str()));
+            let git_dir_arg = format!("--git-dir={}", git_dir.display());
+            assert_eq!(git(tmp.path(), &[&git_dir_arg, "config", "branch.task-branch.remote"]), "origin");
+        }
+
+        #[tokio::test]
+        async fn push_branch_pushes_a_jj_workspace_on_an_external_git_repository() {
+            assert_external_backend_pushes(false).await;
+        }
+
+        #[tokio::test]
+        async fn push_branch_pushes_a_jj_workspace_on_an_external_bare_git_repository() {
+            assert_external_backend_pushes(true).await;
+        }
+
+        /// A plain Git repository -- or a task worktree -- that happens to sit
+        /// inside an unrelated jj workspace. `jj root` succeeds there through
+        /// the outer `.jj`, and `jj git root` names the outer repository, but
+        /// Git discovers the inner one, and that is the repository whose
+        /// branch is pushed, to its own `origin`.
+        #[tokio::test]
+        async fn push_branch_pushes_a_git_repository_nested_in_an_unrelated_jj_workspace() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let outer_remote = tmp.path().join("outer-remote.git");
+            let inner_remote = tmp.path().join("inner-remote.git");
+            let outer = tmp.path().join("outer");
+            let inner = outer.join("inner");
+            git(tmp.path(), &["init", "-q", "--bare", outer_remote.to_str().unwrap()]);
+            git(tmp.path(), &["init", "-q", "--bare", inner_remote.to_str().unwrap()]);
+            jj(tmp.path(), &["git", "init", "--no-colocate", outer.to_str().unwrap()]);
+            jj(&outer, &["git", "remote", "add", "origin", outer_remote.to_str().unwrap()]);
+            git(tmp.path(), &["init", "-q", "-b", "main", inner.to_str().unwrap()]);
+            git(&inner, &["remote", "add", "origin", inner_remote.to_str().unwrap()]);
+            git(&inner, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+            git(&inner, &["checkout", "-q", "-b", "task-branch"]);
+            git(&inner, &["commit", "-q", "--allow-empty", "-m", "task commit"]);
+            let task_sha = git(&inner, &["rev-parse", "task-branch"]);
+
+            push_branch(inner.to_str().unwrap(), "task-branch")
+                .await
+                .expect("the inner repository's branch must push");
+
+            assert_eq!(remote_branch_sha(&inner_remote, "task-branch").as_deref(), Some(task_sha.as_str()));
+            assert_eq!(git(&inner, &["config", "branch.task-branch.remote"]), "origin");
+            assert_eq!(
+                git(&outer_remote, &["for-each-ref", "refs/heads"]),
+                "",
+                "the outer repository's remote must not be pushed to"
+            );
+        }
+
+        /// A non-colocated jj repository pushes through its backing Git
+        /// repository, which Git cannot discover from the workspace. The
+        /// remote gets exactly the task's commit and nothing else, and the
+        /// upstream lands in the backing repository's config.
+        #[tokio::test]
+        async fn push_branch_pushes_a_non_colocated_jj_repository_through_its_git_repository() {
+            let repo = NonColocatedJj::new("task-branch");
+
+            let pushed = push_branch(repo.dir(), "task-branch").await.expect("push must succeed");
+
+            assert_eq!(pushed, "task-branch");
+            assert_eq!(
+                remote_branch_sha(&repo.remote, "task-branch").as_deref(),
+                Some(repo.task_sha.as_str())
+            );
+            let remote_branches = git(&repo.remote, &["for-each-ref", "--format=%(refname)", "refs/heads"]);
+            assert_eq!(remote_branches, "refs/heads/task-branch", "only the task's branch may be pushed");
+            let git_dir = format!("--git-dir={}", repo.git_dir().display());
+            assert_eq!(git(&repo.workspace, &[&git_dir, "config", "branch.task-branch.remote"]), "origin");
+            assert_eq!(
+                git(&repo.workspace, &[&git_dir, "config", "branch.task-branch.merge"]),
+                "refs/heads/task-branch"
+            );
+        }
+
+        #[tokio::test]
+        async fn push_branch_fails_for_a_missing_branch_in_a_non_colocated_jj_repository() {
+            let repo = NonColocatedJj::new("task-branch");
+
+            let err = push_branch(repo.dir(), "task-gone")
+                .await
+                .expect_err("a branch that does not exist must not push");
+
+            assert!(err.starts_with("git push failed:"), "unexpected error: {err}");
+            assert!(err.contains("does not match any"), "git must have looked for the branch: {err}");
+            assert!(remote_branch_sha(&repo.remote, "task-gone").is_none());
+        }
+
+        /// A task commit rewritten with jj after it was pushed is not forced
+        /// onto the remote: the push is git's, fast-forward only.
+        #[tokio::test]
+        async fn push_branch_rejects_a_non_fast_forward_in_a_non_colocated_jj_repository() {
+            let repo = NonColocatedJj::new("task-branch");
+            push_branch(repo.dir(), "task-branch").await.expect("first push must succeed");
+            jj_as_test_user(
+                &repo.workspace,
+                &[
+                    "describe", "--ignore-immutable", "-m", "rewritten task commit",
+                    "-r", &jj_exact_bookmark_revset("task-branch"),
+                ],
+            );
+
+            let err = push_branch(repo.dir(), "task-branch")
+                .await
+                .expect_err("a rewritten, already-pushed branch must not be forced");
+
+            assert!(err.contains("non-fast-forward"), "unexpected error: {err}");
+            assert_eq!(
+                remote_branch_sha(&repo.remote, "task-branch").as_deref(),
+                Some(repo.task_sha.as_str()),
+                "the remote must keep the commit it had"
+            );
+        }
+
+        /// The same for a colocated repository, with the branch rewritten by
+        /// Git, as a task checkout would.
+        #[tokio::test]
+        async fn push_branch_rejects_a_non_fast_forward_in_a_colocated_jj_repository() {
+            let repo = RepoFixture::new();
+            let task_sha = repo.seed_task_branch_and_dirty_unrelated_checkout("task-branch");
+            repo.colocate_jj();
+            push_branch(repo.checkout.to_str().unwrap(), "task-branch")
+                .await
+                .expect("first push must succeed");
+            let rewritten = git(&repo.checkout, &["commit-tree", "-p", "main", "-m", "rewritten", "main^{tree}"]);
+            git(&repo.checkout, &["update-ref", "refs/heads/task-branch", &rewritten]);
+
+            let err = push_branch(repo.checkout.to_str().unwrap(), "task-branch")
+                .await
+                .expect_err("a rewritten, already-pushed branch must not be forced");
+
+            assert!(err.contains("non-fast-forward"), "unexpected error: {err}");
+            assert_eq!(repo.remote_has_branch("task-branch").as_deref(), Some(task_sha.as_str()));
         }
 
         /// A task's `branch_name` is read back from `tasks.toml`, which for an
