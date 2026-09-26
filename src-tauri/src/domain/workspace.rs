@@ -45,11 +45,12 @@ impl AsRef<Path> for WorkspaceRoot {
     }
 }
 
-/// A meta-workspace folder that coordinates one or more projects.
+/// A product-level container over several projects.
 ///
 /// The workspace folder is what agents are launched from (cwd). It holds
-/// shared instruction files (`AGENTS.md`, `CLAUDE.md`, `.agents/`, etc.) and a
-/// `projects.toml` registry listing the projects belonging to it.
+/// shared instruction files (`AGENTS.md`, `CLAUDE.md`, `.agents/`, etc.).
+/// Membership is not tracked here; a Project names the Workspace it belongs
+/// to via `ProjectScope`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: Uuid,

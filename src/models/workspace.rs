@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// A meta-workspace folder that coordinates one or more projects.
+/// A product-level container over several projects.
 ///
 /// Mirrors `src-tauri/src/domain/workspace.rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

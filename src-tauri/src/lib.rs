@@ -294,6 +294,8 @@ pub fn run() {
             delete_project,
             update_project,
             get_project_path,
+            attach_project_to_workspace,
+            detach_project_from_workspace,
             create_workspace,
             list_workspaces,
             get_workspace,

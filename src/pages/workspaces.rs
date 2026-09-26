@@ -1,13 +1,15 @@
 use crate::components::toast;
 use crate::components::workspace_panel::WorkspacePanel;
-use crate::models::workspace::Workspace;
-use crate::services::{pick_folder, workspace_service};
+use crate::models::{project::Project, workspace::Workspace};
+use crate::services::{list_projects, pick_folder, workspace_service};
+use leptos::callback::Callback;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 #[component]
 pub fn Workspaces() -> impl IntoView {
     let (workspaces, set_workspaces) = signal::<Vec<Workspace>>(Vec::new());
+    let (projects, set_projects) = signal::<Vec<Project>>(Vec::new());
     let (new_name, set_new_name) = signal(String::new());
     let (new_path, set_new_path) = signal(String::new());
     let (creating, set_creating) = signal(false);
@@ -24,8 +26,25 @@ pub fn Workspaces() -> impl IntoView {
         });
     };
 
+    let reload_projects = move || {
+        spawn_local(async move {
+            match list_projects().await {
+                Ok(ps) => set_projects.set(ps),
+                Err(e) => {
+                    set_projects.set(Vec::new());
+                    toast::error(format!("Could not load projects: {}", e));
+                }
+            }
+        });
+    };
+
     Effect::new(move |_| {
         reload();
+        reload_projects();
+    });
+
+    let on_membership_change = Callback::new(move |()| {
+        reload_projects();
     });
 
     let on_pick_folder = move |_| {
@@ -65,7 +84,7 @@ pub fn Workspaces() -> impl IntoView {
             <div>
                 <h1 class="text-2xl font-bold text-white/90">"Workspaces"</h1>
                 <p class="text-sm text-white/40 mt-1">
-                    "A workspace is a meta folder that coordinates one or more projects. Agents launch from the workspace root and read its instruction files."
+                    "A workspace coordinates one or more projects. Agents launch from the workspace root and read its instruction files."
                 </p>
             </div>
 
@@ -100,7 +119,7 @@ pub fn Workspaces() -> impl IntoView {
                 </div>
             </div>
 
-            <WorkspacePanel workspaces=workspaces />
+            <WorkspacePanel workspaces=workspaces projects=projects on_membership_change=on_membership_change />
         </div>
     }
 }

@@ -1,5 +1,5 @@
-use crate::domain::{Project, AgentType, AgentConfig};
-use crate::config::Storage;
+use crate::domain::{Project, ProjectScope, AgentType, AgentConfig};
+use crate::config::{Storage, WorkspaceRegistry};
 use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -239,6 +239,105 @@ async fn update_project_committed(
     } else {
         Ok(None)
     }
+}
+
+#[tauri::command]
+pub async fn attach_project_to_workspace(
+    state: tauri::State<'_, crate::AppState>,
+    project_id: String,
+    workspace_id: String,
+) -> Result<Project, String> {
+    let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
+    let workspace_id = Uuid::parse_str(&workspace_id).map_err(|e| e.to_string())?;
+
+    attach_project_to_workspace_committed(
+        &state.project.projects,
+        &state.workspace.registry,
+        &state.storage,
+        project_id,
+        workspace_id,
+    )
+    .await
+}
+
+/// Core of [`attach_project_to_workspace`]; see [`create_project_committed`]
+/// for why the map is cloned first. Refuses a project that is already in a
+/// workspace rather than silently re-parenting it -- moving between
+/// workspaces is an ambiguous action a caller should express as an explicit
+/// detach followed by an attach.
+///
+/// The workspace's existence is checked while both locks are held, and they
+/// stay held through the persist: checking the registry and then releasing
+/// it would let `delete_workspace` remove the workspace before the
+/// attachment lands, leaving the project pointing at nothing. Locks are taken
+/// in the order every path that needs both uses -- projects, then the
+/// workspace registry -- so this cannot deadlock against `delete_workspace`.
+async fn attach_project_to_workspace_committed(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    registry: &RwLock<WorkspaceRegistry>,
+    storage: &Storage,
+    project_id: Uuid,
+    workspace_id: Uuid,
+) -> Result<Project, String> {
+    let mut projects_w = projects.write().await;
+    let registry_r = registry.read().await;
+    if registry_r.get(&workspace_id).is_none() {
+        return Err("Workspace not found".to_string());
+    }
+    let mut proposed = projects_w.clone();
+
+    let project = proposed
+        .get_mut(&project_id)
+        .ok_or_else(|| "Project not found".to_string())?;
+    if !matches!(project.scope, ProjectScope::Standalone) {
+        return Err("Project already belongs to a workspace; detach it first".to_string());
+    }
+    project.scope = ProjectScope::InWorkspace { workspace_id };
+    project.updated_at = chrono::Utc::now();
+    let result = project.clone();
+
+    try_persist_projects(storage, &proposed)
+        .map_err(|e| format!("Failed to persist workspace attachment: {e}"))?;
+
+    *projects_w = proposed;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn detach_project_from_workspace(
+    state: tauri::State<'_, crate::AppState>,
+    project_id: String,
+) -> Result<Project, String> {
+    let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
+    detach_project_from_workspace_committed(&state.project.projects, &state.storage, project_id).await
+}
+
+/// Core of [`detach_project_from_workspace`]; see [`create_project_committed`]
+/// for why the map is cloned first. Refuses a project that is already
+/// standalone so a caller cannot mistake a no-op for a successful detach.
+async fn detach_project_from_workspace_committed(
+    projects: &RwLock<HashMap<Uuid, Project>>,
+    storage: &Storage,
+    project_id: Uuid,
+) -> Result<Project, String> {
+    let mut projects_w = projects.write().await;
+    let mut proposed = projects_w.clone();
+
+    let project = proposed
+        .get_mut(&project_id)
+        .ok_or_else(|| "Project not found".to_string())?;
+    if matches!(project.scope, ProjectScope::Standalone) {
+        return Err("Project is not attached to a workspace".to_string());
+    }
+    project.scope = ProjectScope::Standalone;
+    project.updated_at = chrono::Utc::now();
+    let result = project.clone();
+
+    try_persist_projects(storage, &proposed)
+        .map_err(|e| format!("Failed to persist workspace detachment: {e}"))?;
+
+    *projects_w = proposed;
+    Ok(result)
 }
 
 /// Get the working directory path for a project by looking up its repository
@@ -555,6 +654,226 @@ mod tests {
             projects.read().await.get(&id).unwrap().name,
             original_name,
             "memory must not contain an update disk never recorded"
+        );
+    }
+
+    /// A registry, backed by a tempdir, holding one real workspace.
+    struct RegisteredWorkspace {
+        registry: RwLock<WorkspaceRegistry>,
+        id: Uuid,
+        _registry_dir: TempDir,
+        _root: TempDir,
+    }
+
+    fn registered_workspace() -> RegisteredWorkspace {
+        let root = TempDir::new().expect("workspace root tempdir");
+        let registry_dir = TempDir::new().expect("registry tempdir");
+        let mut registry = WorkspaceRegistry::load_from(registry_dir.path().join("workspaces.toml"))
+            .expect("a missing registry file should load empty");
+        let workspace = crate::domain::Workspace::new(
+            "ws".to_string(),
+            crate::domain::WorkspaceRoot::try_new(root.path()).expect("real dir must validate"),
+        );
+        let id = workspace.id;
+        registry.upsert(workspace).expect("upsert should succeed");
+        RegisteredWorkspace {
+            registry: RwLock::new(registry),
+            id,
+            _registry_dir: registry_dir,
+            _root: root,
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_project_to_workspace_committed_attaches_a_standalone_project() {
+        let (storage, _temp) = create_test_storage();
+        let existing = make_test_project(Uuid::new_v4());
+        let id = existing.id;
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+        let ws = registered_workspace();
+        let workspace_id = ws.id;
+
+        let result = attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, workspace_id)
+            .await
+            .expect("attaching a standalone project should succeed");
+
+        assert_eq!(result.scope.workspace_id(), Some(workspace_id));
+        assert_eq!(
+            projects.read().await.get(&id).unwrap().scope.workspace_id(),
+            Some(workspace_id),
+            "the attachment must be reflected in memory"
+        );
+        let persisted = storage.load_config().expect("config should load");
+        let persisted_project = persisted
+            .projects
+            .get(&id.to_string())
+            .expect("project should still be persisted");
+        assert_eq!(
+            persisted_project.scope.workspace_id(),
+            Some(workspace_id),
+            "the attachment must be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_project_to_workspace_committed_refuses_a_project_already_in_a_workspace() {
+        let (storage, _temp) = create_test_storage();
+        let mut existing = make_test_project(Uuid::new_v4());
+        let id = existing.id;
+        let original_workspace_id = Uuid::new_v4();
+        existing.scope = ProjectScope::InWorkspace { workspace_id: original_workspace_id };
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+        let ws = registered_workspace();
+
+        let result =
+            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, ws.id).await;
+
+        assert!(result.is_err(), "re-parenting an already-attached project must be refused");
+        assert_eq!(
+            projects.read().await.get(&id).unwrap().scope.workspace_id(),
+            Some(original_workspace_id),
+            "the refused attach must not change the existing membership"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_project_to_workspace_committed_refuses_a_missing_project() {
+        let (storage, _temp) = create_test_storage();
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
+        let ws = registered_workspace();
+
+        let result =
+            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, Uuid::new_v4(), ws.id)
+                .await;
+
+        assert!(result.is_err(), "attaching a project that does not exist must be refused");
+    }
+
+    #[tokio::test]
+    async fn attach_project_to_workspace_committed_refuses_a_missing_workspace() {
+        let (storage, _temp) = create_test_storage();
+        let existing = make_test_project(Uuid::new_v4());
+        let id = existing.id;
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+        let ws = registered_workspace();
+
+        let result =
+            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, Uuid::new_v4())
+                .await;
+
+        assert_eq!(result.unwrap_err(), "Workspace not found");
+        assert_eq!(
+            projects.read().await.get(&id).unwrap().scope.workspace_id(),
+            None,
+            "a refused attach must not change memory"
+        );
+        let persisted = storage.load_config().expect("config should load");
+        assert!(
+            persisted
+                .projects
+                .get(&id.to_string())
+                .is_none_or(|p| p.scope.workspace_id().is_none()),
+            "a refused attach must not be persisted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attach_project_to_workspace_leaves_memory_unchanged_when_persistence_fails() {
+        if crate::ipc::server::current_uid() == 0 {
+            return;
+        }
+        let (storage, _temp) = make_storage_with_unreadable_config();
+        let existing = make_test_project(Uuid::new_v4());
+        let id = existing.id;
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+        // A real workspace, so the failure under test is the persist and not
+        // the existence check that precedes it.
+        let ws = registered_workspace();
+
+        let result =
+            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, ws.id).await;
+
+        let error = result.expect_err("a persistence failure must be reported, not swallowed");
+        assert!(
+            error.starts_with("Failed to persist workspace attachment"),
+            "the refusal must come from the persist, got {error:?}"
+        );
+        assert_eq!(
+            projects.read().await.get(&id).unwrap().scope.workspace_id(),
+            None,
+            "memory must not contain an attachment disk never recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_project_from_workspace_committed_detaches_a_member_project() {
+        let (storage, _temp) = create_test_storage();
+        let mut existing = make_test_project(Uuid::new_v4());
+        let id = existing.id;
+        existing.scope = ProjectScope::InWorkspace { workspace_id: Uuid::new_v4() };
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+
+        let result = detach_project_from_workspace_committed(&projects, &storage, id)
+            .await
+            .expect("detaching a member project should succeed");
+
+        assert_eq!(result.scope.workspace_id(), None);
+        let persisted = storage.load_config().expect("config should load");
+        let persisted_project = persisted
+            .projects
+            .get(&id.to_string())
+            .expect("project should still be persisted");
+        assert_eq!(
+            persisted_project.scope.workspace_id(),
+            None,
+            "the detachment must be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_project_from_workspace_committed_refuses_an_already_standalone_project() {
+        let (storage, _temp) = create_test_storage();
+        let existing = make_test_project(Uuid::new_v4());
+        let id = existing.id;
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+
+        let result = detach_project_from_workspace_committed(&projects, &storage, id).await;
+
+        assert!(result.is_err(), "detaching an already-standalone project must be refused");
+    }
+
+    #[tokio::test]
+    async fn detach_project_from_workspace_committed_refuses_a_missing_project() {
+        let (storage, _temp) = create_test_storage();
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
+
+        let result =
+            detach_project_from_workspace_committed(&projects, &storage, Uuid::new_v4()).await;
+
+        assert!(result.is_err(), "detaching a project that does not exist must be refused");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detach_project_from_workspace_leaves_memory_unchanged_when_persistence_fails() {
+        if crate::ipc::server::current_uid() == 0 {
+            return;
+        }
+        let (storage, _temp) = make_storage_with_unreadable_config();
+        let mut existing = make_test_project(Uuid::new_v4());
+        let id = existing.id;
+        let workspace_id = Uuid::new_v4();
+        existing.scope = ProjectScope::InWorkspace { workspace_id };
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+
+        let result = detach_project_from_workspace_committed(&projects, &storage, id).await;
+
+        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
+        assert_eq!(
+            projects.read().await.get(&id).unwrap().scope.workspace_id(),
+            Some(workspace_id),
+            "memory must not contain a detachment disk never recorded"
         );
     }
 }
