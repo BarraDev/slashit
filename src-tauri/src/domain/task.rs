@@ -119,18 +119,39 @@ pub struct Task {
     /// didn't create: there is no reliable way to recover a boundary for
     /// those after the fact, so their task diff is truthfully "unknown",
     /// never guessed via `merge-base`/`HEAD~1`.
+    ///
+    /// For a stacked task this is also the fork point: `base_commit..<tip>`
+    /// is exactly the task's own commits. It changes only when SlashIt
+    /// itself moves the branch onto another base, which today is one
+    /// operation: restacking an unpublished stacked branch onto the default
+    /// branch after its parent was merged there, before its first pull
+    /// request is opened (see `commands::pr::restack_onto_landed_parent`).
+    /// That sets it to the exact commit the branch was replayed onto, in the
+    /// same durable write that sets [`Self::branch_origin`].
     #[serde(default)]
     pub base_commit: Option<String>,
 
-    /// What the task's branch was started from, recorded when SlashIt
-    /// creates the branch (or resumes one an unfinished start left) and
-    /// never re-derived afterward. A pull request for the task is opened
-    /// against what this names, not against whatever the task's
-    /// dependencies look like by then. `None` for a branch created before
-    /// this field existed, or one SlashIt reattached without creating it:
-    /// where those started cannot be recovered after the fact. `None` too
-    /// for an ordinary branch whose start was not proven to be on the
-    /// default base (see [`BranchOrigin::DefaultBase`]).
+    /// What the task's branch currently starts from, as far as SlashIt
+    /// knows: its ancestry and base as of now, not a history of where it
+    /// once started. A pull request for the task is opened against what
+    /// this names, not against whatever the task's dependencies look like
+    /// by then.
+    ///
+    /// Recorded when SlashIt creates the branch (or resumes one an
+    /// unfinished start left), and never inferred later from mutable task
+    /// state such as the task's dependencies or the branch's tip. It changes
+    /// afterwards only when SlashIt itself deliberately rewrites the
+    /// branch's history onto another base: restacking an unpublished
+    /// stacked branch onto the default branch its parent was merged into
+    /// turns [`BranchOrigin::Stacked`] into [`BranchOrigin::DefaultBase`],
+    /// together with [`Self::base_commit`]. Where the branch started before
+    /// that is not kept.
+    ///
+    /// `None` for a branch created before this field existed, or one SlashIt
+    /// reattached without creating it: where those started cannot be
+    /// recovered after the fact. `None` too for an ordinary branch whose
+    /// start was not proven to be on the default base (see
+    /// [`BranchOrigin::DefaultBase`]).
     #[serde(default)]
     pub branch_origin: Option<BranchOrigin>,
 
@@ -230,25 +251,30 @@ impl Task {
     }
 }
 
-/// Where a task's branch was created, as recorded on [`Task::branch_origin`].
+/// What a task's branch currently starts from, as recorded on
+/// [`Task::branch_origin`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BranchOrigin {
-    /// Created from the repository's default base. Its pull request targets
+    /// Starts from the repository's default base. Its pull request targets
     /// the repository's default branch.
     ///
-    /// Recorded only when the commit the branch started from was proven,
-    /// when the branch was created, to be contained in
-    /// `refs/remotes/origin/HEAD` (see
-    /// `worktree::WorktreeManager::default_base_origin`). An ordinary branch
-    /// starts wherever its backend starts it, which may be a feature branch
-    /// or unpushed work; one whose start was not proven, including every
-    /// branch in a repository whose remote is not named `origin` or that
-    /// has no `origin/HEAD`, records no origin at all.
+    /// Recorded when the branch is created only if the commit it started
+    /// from was proven then to be contained in `refs/remotes/origin/HEAD`
+    /// (see `worktree::WorktreeManager::default_base_origin`). An ordinary
+    /// branch starts wherever its backend starts it, which may be a feature
+    /// branch or unpushed work; one whose start was not proven, including
+    /// every branch in a repository whose remote is not named `origin` or
+    /// that has no `origin/HEAD`, records no origin at all.
+    ///
+    /// Also recorded when SlashIt restacked a [`Self::Stacked`] branch onto
+    /// the default branch, after verifying the replayed branch contains the
+    /// exact default-branch commit it was replayed onto, which is then the
+    /// task's `base_commit`.
     DefaultBase,
     /// Created at the tip of a dependency's branch, `parent_branch`, so that
-    /// it builds on that work. Its pull request targets `parent_branch` while
-    /// the parent is still open.
+    /// it builds on that work, and not moved off it by SlashIt since. Its
+    /// pull request targets `parent_branch` while the parent is still open.
     Stacked { parent_branch: String },
 }
 

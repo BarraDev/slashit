@@ -2733,7 +2733,10 @@ async fn create_pr_reserved(
     // for. See `push_branch` for why its `jj git export` passes
     // `--ignore-working-copy`: without it, this directory being the user's
     // own primary checkout would silently fold whatever the user has dirty
-    // into their own current change.
+    // into their own current change. The one step that touches a working
+    // tree, restacking an unpublished stacked branch, does so in the task's
+    // own worktree and refuses when there is none; see
+    // `restack_onto_landed_parent`.
     let working_dir = resolve_repository_dir(state, task_uuid).await?;
 
     let (pr_title, pr_body, task_branch_name, branch_origin, has_dependencies) = {
@@ -2780,6 +2783,26 @@ async fn create_pr_reserved(
     // truthfully leaves nothing half done on the remote.
     let base = pr_base_for(&working_dir, branch_origin.as_ref(), has_dependencies).await?;
 
+    // A stacked branch whose parent was merged into the default branch is
+    // replayed onto it here, before its first push, when that is proven
+    // safe; a restack that cannot be done safely refuses before anything is
+    // pushed. See `restack_onto_landed_parent`.
+    let restacked = restack_onto_landed_parent(
+        state,
+        task_uuid,
+        &working_dir,
+        &task_branch_name,
+        base.landed_parent.as_ref(),
+        &reservation,
+    )
+    .await?;
+    if let (RestackOutcome::Unchanged(why), Some(landed)) = (&restacked, &base.landed_parent) {
+        eprintln!(
+            "[pr] {task_branch_name} was not restacked onto {}: {why}",
+            landed.default_branch
+        );
+    }
+
     refuse_if_pr_operation_cancelled(&reservation, "pushing the branch")?;
     let branch = push_branch(&working_dir, &task_branch_name)
         .await
@@ -2811,7 +2834,7 @@ async fn create_pr_reserved(
         "--body", &pr_body,
         "--head", &branch,
     ];
-    if let Some(base) = base.as_deref() {
+    if let Some(base) = base.base.as_deref() {
         create_args.extend(["--base", base]);
     }
     let pr_url = run_cmd("gh", &create_args, &working_dir).await.map_err(friendly_pr_error)?;
@@ -2836,13 +2859,11 @@ async fn create_pr_reserved(
 /// parent to where its work landed before giving up.
 const MAX_MERGE_HOPS: usize = 5;
 
-/// The branch a task's pull request is opened against: `None` for the
-/// repository's default branch, which is what `gh pr create` uses without
-/// `--base`.
+/// The branch a task's pull request is opened against (see [`PrBase`]).
 ///
-/// Decided from the origin recorded when the task's branch was created, never
-/// from what the task's dependencies look like now. For a stacked branch,
-/// starting at the parent:
+/// Decided from the origin recorded on the task (see
+/// [`Task::branch_origin`]), never from what the task's dependencies look
+/// like now. For a stacked branch, starting at the parent:
 ///
 /// - its pull request is open: that branch, if it is on `origin`;
 /// - it was merged: the branch it was merged into, where its work now is
@@ -2864,15 +2885,23 @@ const MAX_MERGE_HOPS: usize = 5;
 /// the dependency's commits, and opening it against the default branch would
 /// put them into its pull request.
 ///
+/// When the parent's own pull request was merged straight into the default
+/// branch, which pull request that was is part of the answer
+/// ([`PrBase::landed_parent`]), taken from this same lookup, so that
+/// [`restack_onto_landed_parent`] works from the decision made here rather
+/// than from a second policy of its own. Only the first hop counts: a parent
+/// merged into another branch that was merged on in turn gets the base it
+/// always got and no restack.
+///
 /// Every refusal comes before anything is pushed.
 async fn pr_base_for(
     working_dir: &str,
     origin: Option<&BranchOrigin>,
     has_dependencies: bool,
-) -> Result<Option<String>, String> {
+) -> Result<PrBase, String> {
     let parent = match origin {
-        Some(BranchOrigin::DefaultBase) => return Ok(None),
-        None if !has_dependencies => return Ok(None),
+        Some(BranchOrigin::DefaultBase) => return Ok(PrBase::default()),
+        None if !has_dependencies => return Ok(PrBase::default()),
         None => {
             return Err(
                 "This task depends on another task, and its branch's starting point is not \
@@ -2900,12 +2929,12 @@ async fn pr_base_for(
         } else {
             format!("This task is stacked on branch {parent}, whose work was merged on into {branch}")
         };
-        let (state, merged_into) = branch_pr_state(working_dir, &branch)
+        let found = branch_pr_state(working_dir, &branch)
             .await
             .map_err(|e| format!("{context}, and the pull request of {branch} could not be looked up: {e}"))?;
-        match state.as_deref() {
+        match found.state.as_deref() {
             Some("MERGED") => {
-                let next = merged_into.unwrap_or_default();
+                let next = found.base.unwrap_or_default();
                 if checked_task_branch(&next).is_err() {
                     return Err(format!(
                         "{context}. GitHub reported {next:?} as the branch {branch} was merged \
@@ -2916,7 +2945,14 @@ async fn pr_base_for(
                     default_branch = Some(repository_default_branch(working_dir).await?);
                 }
                 if default_branch.as_deref() == Some(next.as_str()) {
-                    return Ok(Some(next));
+                    let landed_parent = found.number.filter(|_| branch == parent).map(|number| {
+                        LandedParent {
+                            parent_branch: parent.to_string(),
+                            number,
+                            default_branch: next.clone(),
+                        }
+                    });
+                    return Ok(PrBase { base: Some(next), landed_parent });
                 }
                 if seen.contains(&next) {
                     return Err(format!(
@@ -2935,7 +2971,7 @@ async fn pr_base_for(
                          first."
                     ));
                 }
-                return Ok(Some(branch));
+                return Ok(PrBase { base: Some(branch), landed_parent: None });
             }
             Some("CLOSED") => {
                 return Err(format!(
@@ -2958,13 +2994,585 @@ async fn pr_base_for(
     ))
 }
 
+/// Where a task's pull request is opened, as [`pr_base_for`] decides it.
+#[derive(Debug, Default)]
+struct PrBase {
+    /// The branch the pull request targets: `None` for the repository's
+    /// default branch, which is what `gh pr create` uses without `--base`.
+    base: Option<String>,
+    /// Set only when the task is stacked on a parent whose own pull request
+    /// was merged straight into the repository's default branch, which is
+    /// then `base`.
+    landed_parent: Option<LandedParent>,
+}
+
+/// A stacked task's parent whose own pull request was merged straight into
+/// the repository's default branch.
+#[derive(Debug)]
+struct LandedParent {
+    parent_branch: String,
+    /// The parent's merged pull request, found by the lookup that decided the
+    /// base, with pull requests from forks passed over.
+    number: u64,
+    /// The repository's default branch, as GitHub reports it.
+    default_branch: String,
+}
+
+/// What [`restack_onto_landed_parent`] did, when it did not refuse.
+#[derive(Debug)]
+enum RestackOutcome {
+    /// The branch was left exactly as it is, and its pull request is opened
+    /// the way it was before restacking existed. Says why, for the log.
+    Unchanged(String),
+    /// The branch was replayed onto the default branch, and the task
+    /// records that it now starts there.
+    Restacked,
+}
+
+/// The fields `gh pr view` is asked for about a landed parent's pull request.
+const LANDED_PR_FIELDS: &str = "state,baseRefName,headRefName,isCrossRepository,mergeCommit";
+
+/// The most commits GitHub lists for one pull request.
+const GITHUB_PR_COMMIT_LIST_LIMIT: usize = 250;
+
+/// Restack an unpublished stacked task onto the default branch its parent
+/// landed on, before the task's first push, so that its pull request holds
+/// only the task's own commits.
+///
+/// A parent merged by squash or rebase lands as new commits. The task's
+/// branch still carries the parent's original ones, and a pull request from
+/// it would list them all again. The one replay that is correct under every
+/// merge method is `git rebase --onto <default> <fork point> <branch>`, where
+/// the fork point is the parent tip the branch was created at, which
+/// SlashIt recorded as the task's `base_commit`. A plain `git rebase
+/// <default>` depends on each parent commit becoming empty and conflicts
+/// as soon as one parent commit rewrites another's lines; the merge-base of
+/// the branch and the default branch is the wrong fork point after a squash.
+///
+/// Nothing is rewritten until every one of these holds, checked in this
+/// order. A check that finds the proof merely incomplete leaves the branch
+/// alone ([`RestackOutcome::Unchanged`]), and the pull request is opened
+/// exactly as it was before restacking existed. A check that finds opening
+/// the pull request would be misleading, or that a rewrite could lose work,
+/// refuses pull request creation before anything is changed or pushed.
+///
+/// 1. The parent's own pull request was merged straight into the default
+///    branch ([`PrBase::landed_parent`]), and the task records a fork point
+///    that is a full object ID. Otherwise: unchanged. That covers a parent
+///    still open, a task started from the default base, and a task recorded
+///    before `base_commit` or `branch_origin` existed.
+/// 2. No earlier restack was left unfinished (see
+///    [`recover_unfinished_restack`]), or it is provably SlashIt's and has
+///    been rolled back. Otherwise: refused.
+/// 3. The task's branch exists locally and has no pull request. A branch
+///    with one is never rewritten: unchanged, and its pull request is linked.
+///    Whether the branch is already on `origin` is noted for step 8.
+/// 4. The fork point is in the repository and is an ancestor of the
+///    branch's tip. A branch no longer holding it was already moved off it,
+///    by an earlier restack or by hand, and is not replayed a second time:
+///    unchanged.
+/// 5. GitHub reports the parent's pull request, by number, as merged from
+///    this repository's `parent_branch` into the default branch, with a
+///    merge commit. Otherwise: refused.
+/// 6. The default branch is fetched from `origin` with an explicit refspec,
+///    and `refs/remotes/origin/<default>` read back by its exact name is the
+///    one commit the branch is replayed onto. The parent's merge commit must
+///    be an ancestor of it; otherwise it is refused.
+/// 7. When the fork point is already an ancestor of that commit, nothing
+///    needs rewriting: the parent was merged with a merge commit, so its
+///    commits are on the default branch as they are, or the task forked
+///    before the parent had commits of its own. The branch already differs
+///    from the default branch by exactly its own commits, and nothing about
+///    the task changes: unchanged.
+/// 8. From here a rewrite would be needed. A branch already on `origin` is
+///    refused: SlashIt never rewrites a pushed branch or forces a push, and
+///    opened as it is its pull request would list the parent's commits.
+/// 9. The fork point is among the parent pull request's commits, listed
+///    through the REST API (see [`parent_pull_request_commits`]). When it is
+///    not, the parent was rewritten after the task started from it:
+///    replaying would silently drop what the task was built on, and opening
+///    the branch as it is would list the parent's old commits, so it is
+///    refused. When the listing reached GitHub's limit, the fork point may
+///    lie beyond it, and it is refused as unprovable instead.
+/// 10. Nothing else builds on the branch: no other task of a project on the
+///     same repository records it as its stack parent (whether or not that
+///     task's recorded branch still exists, which is counted all the same),
+///     and no other local branch contains its tip. Restacking
+///     it would strand that dependent on the old commits, whose own pull
+///     request would then list them, and whose fork point would be missing
+///     from this branch's pull request once it landed. Refused, naming it.
+/// 11. Every remaining condition is required, each refused when it fails:
+///     no merge commits among the task's own; a worktree for the task; that
+///     worktree on `refs/heads/<branch>` at the tip, not in the middle of a
+///     rebase, merge, cherry-pick or revert, and with no uncommitted or
+///     untracked changes, since SlashIt never sets work aside on its own.
+///
+/// Then the branch's tip is written to the backup ref
+/// ([`crate::worktree::restack::backup_ref`]), create-only, and the branch
+/// is replayed and verified in the task's worktree
+/// ([`crate::worktree::restack::Restack::replay`]). A replay that fails or
+/// does not verify is rolled back to the old tip and refused, naming any
+/// conflicting files; the backup ref is deleted once the old tip is verified
+/// and kept, and named, when it could not be. A verified replay is recorded
+/// in one durable write, `base_commit` set to the commit replayed onto and
+/// `branch_origin` to [`BranchOrigin::DefaultBase`], and only if the task
+/// still records the branch, fork point and parent the replay started from;
+/// a write that fails or finds them changed rolls the branch back as well.
+/// After the write the backup ref is deleted: task and branch agree again,
+/// and the old commits stay in the branch's reflog. Since the task then
+/// records the default base, a retry after a failed push or `gh pr create`
+/// does not come back here.
+///
+/// The caller holds the task's PR side-effect reservation, taken before this
+/// is reached, so no execution, AI review or fix, PR helper or other pull
+/// request operation runs in the worktree meanwhile, and a lifecycle
+/// transition that would remove it waits for this flow first. A transition
+/// that asked this flow to end is honored before the backup is written.
+///
+/// Known limits, not handled here:
+///
+/// - If SlashIt dies after the durable write and before the backup ref is
+///   deleted, the backup ref is left behind. It is harmless (the task then
+///   records the default base, so this function is never reached for it
+///   again) and nothing deletes it later.
+/// - The reservation keeps SlashIt's own flows out of the worktree, not the
+///   user. A commit made from the task's own terminal while the restack runs
+///   is dropped from the branch if the restack is then rolled back to the
+///   old tip; it stays in the branch's reflog.
+/// - Recovery treats a rebase of the branch that started from the backup's
+///   commit, while a stale backup equal to the tip exists, as SlashIt's own
+///   and aborts it, even if the user started it.
+async fn restack_onto_landed_parent(
+    state: &crate::AppState,
+    task_uuid: Uuid,
+    working_dir: &str,
+    branch: &str,
+    landed: Option<&LandedParent>,
+    reservation: &Option<crate::queue::PrHelperLease>,
+) -> Result<RestackOutcome, String> {
+    use crate::worktree::restack;
+    let unchanged = |why: &str| Ok(RestackOutcome::Unchanged(why.to_string()));
+
+    let Some(landed) = landed else {
+        return unchanged("its parent's pull request was not merged straight into the default branch");
+    };
+    let (fork_point, worktree) = {
+        let tasks = state.task.tasks.read().await;
+        let task = tasks.get(&task_uuid).ok_or("Task not found")?;
+        (task.base_commit.clone(), task.worktree_path.clone())
+    };
+    let Some(fork_point) = fork_point.filter(|c| restack::is_full_object_id(c)) else {
+        return unchanged("the task has no recorded fork point");
+    };
+    let branch = checked_task_branch(branch)?;
+    let default = checked_task_branch(&landed.default_branch)?;
+    let parent = landed.parent_branch.as_str();
+    let number = landed.number;
+    let repo = std::path::Path::new(working_dir);
+    let worktree = worktree.map(std::path::PathBuf::from).filter(|p| p.is_dir());
+    let context = format!(
+        "This task is stacked on {parent}, whose pull request #{number} was merged into {default}"
+    );
+
+    let branch_ref = format!("refs/heads/{branch}");
+    let Some(tip) = restack::exact_ref(repo, &branch_ref).await? else {
+        return unchanged("the task's branch does not exist locally");
+    };
+    let backup = restack::backup_ref(task_uuid);
+    recover_unfinished_restack(repo, worktree.as_deref(), branch, &tip, &backup).await?;
+
+    let published = find_existing_pr_for_branch_strict(working_dir, branch).await.map_err(|e| {
+        format!(
+            "{context}. SlashIt could not confirm that {branch} has no pull request yet, which it \
+             must know before restacking the branch onto {default}: {e}. Nothing was changed or \
+             pushed."
+        )
+    })?;
+    if published.is_some() {
+        return unchanged("the task's branch already has a pull request");
+    }
+    let pushed = remote_branch_commit(working_dir, branch).await.map_err(|e| {
+        format!(
+            "{context}. SlashIt could not confirm that {branch} is not on origin yet, which it must \
+             know before restacking the branch onto {default}: {e}. Nothing was changed or pushed."
+        )
+    })?;
+    if !restack::has_commit(repo, &fork_point).await? {
+        return unchanged("the task's recorded fork point is not in the repository");
+    }
+    if !restack::is_ancestor(repo, &fork_point, &tip).await? {
+        return unchanged("the task's branch no longer contains its recorded fork point");
+    }
+
+    let merge_commit = merged_pull_request(working_dir, landed)
+        .await
+        .map_err(|e| format!("{context}, and SlashIt could not confirm what landed: {e}. Nothing was changed or pushed."))?;
+    let onto = restack::fetch_remote_branch(repo, default)
+        .await
+        .map_err(|e| format!("{context}. {e}. Nothing was changed or pushed."))?;
+    let merge_commit = merge_commit.as_str();
+    if !restack::has_commit(repo, merge_commit).await?
+        || !restack::is_ancestor(repo, merge_commit, &onto).await?
+    {
+        return Err(format!(
+            "{context} as {merge_commit}, but {default} on origin ({onto}) does not contain that \
+             commit, so SlashIt cannot tell what this task's branch should be restacked onto. \
+             Nothing was changed or pushed. Check what happened to {default}, then create the pull \
+             request again."
+        ));
+    }
+    if restack::is_ancestor(repo, &fork_point, &onto).await? {
+        return unchanged(
+            "its parent's commits are on the default branch as they are, so the branch already \
+             holds only its own commits on top of it",
+        );
+    }
+
+    let unchanged_note = "Nothing was changed or pushed.";
+    if let Some(remote_tip) = pushed {
+        return Err(format!(
+            "{context}, whose commits landed there as new commits, but {branch} is already on \
+             origin without a pull request. Opened as it is, its pull request would list \
+             {parent}'s commits again, and SlashIt does not rewrite a branch that has been pushed. \
+             Restack it yourself, in the task's worktree: `git rebase --onto origin/{default} \
+             {fork_point} {branch}`, then `git push --force-with-lease=refs/heads/{branch}:{remote_tip} \
+             origin refs/heads/{branch}`, and create the pull request again; or open it by hand. \
+             {unchanged_note}"
+        ));
+    }
+    match parent_pull_request_commits(working_dir, number).await {
+        Err(e) => {
+            return Err(format!(
+                "{context}, and SlashIt could not list that pull request's commits: {e}. \
+                 {unchanged_note}"
+            ))
+        }
+        Ok(commits) if commits.contains(&fork_point) => {}
+        Ok(commits) if commits.len() >= GITHUB_PR_COMMIT_LIST_LIMIT => {
+            return Err(format!(
+                "{context}, but GitHub lists at most {GITHUB_PR_COMMIT_LIST_LIMIT} commits of a \
+                 pull request and pull request #{number} has at least that many, so SlashIt \
+                 cannot prove that the commit this task's branch was started from, {fork_point}, \
+                 is among them. Move the branch onto {default} yourself (for example `git rebase \
+                 --onto origin/{default} {fork_point} {branch}` in the task's worktree), then \
+                 create the pull request again, or open it by hand. {unchanged_note}"
+            ))
+        }
+        Ok(_) => {
+            return Err(format!(
+                "{context}, but the commit this task's branch was started from, {fork_point}, is \
+                 not among the commits of pull request #{number}: {parent} was rewritten after \
+                 this task started from it. Restacking {branch} onto {default} would drop that \
+                 commit's changes from under the task, and opening the branch as it is would list \
+                 {parent}'s old commits in its pull request, so SlashIt changed and pushed \
+                 nothing. Move the branch onto {default} yourself, keeping what the task still \
+                 needs (for example `git rebase --onto origin/{default} {fork_point} {branch}` in \
+                 the task's worktree, after checking what that leaves out), then create the pull \
+                 request again."
+            ))
+        }
+    }
+
+    let needs = format!(
+        "{context}, whose commits landed there as new commits, so {branch} has to be restacked \
+         onto {default} before its pull request is opened; opened as it is, the pull request \
+         would list {parent}'s commits again"
+    );
+    let strands = |what: String| {
+        format!(
+            "{needs}, but {what}. Restacking {branch} would strand it on the old commits: its pull \
+             request would list them again, and once {branch} lands it could not be restacked onto \
+             what landed. Deal with it first, or open this pull request by hand with `gh pr create \
+             --head {branch} --base {default}`. {unchanged_note}"
+        )
+    };
+    let dependent = {
+        let tasks = state.task.tasks.read().await;
+        let projects = state.project.projects.read().await;
+        let repository_of = |project_id: &Uuid| projects.get(project_id).and_then(|p| p.repository_id);
+        let own_project = tasks.get(&task_uuid).map(|t| t.project_id);
+        let own_repository = own_project.as_ref().and_then(repository_of);
+        let same_repository = |t: &&Task| {
+            Some(t.project_id) == own_project
+                || (own_repository.is_some() && repository_of(&t.project_id) == own_repository)
+        };
+        tasks
+            .values()
+            .filter(|t| t.id != task_uuid && t.branch_name.is_some())
+            .filter(same_repository)
+            .find(|t| {
+                matches!(&t.branch_origin, Some(BranchOrigin::Stacked { parent_branch }) if parent_branch == branch)
+            })
+            .map(|t| (t.title.clone(), t.id, t.branch_name.clone().unwrap_or_default()))
+    };
+    if let Some((title, id, dependent_branch)) = dependent {
+        return Err(strands(format!(
+            "task \"{title}\" ({id}) is stacked on it, on branch {dependent_branch}"
+        )));
+    }
+    if let Some(other) = restack::branches_containing(repo, &tip)
+        .await?
+        .into_iter()
+        .find(|b| b != &branch_ref)
+    {
+        return Err(strands(format!("branch {other} is built on it (it contains {branch}'s tip {tip})")));
+    }
+    if let Some(merge) = restack::merges_between(repo, &fork_point, &tip).await?.first() {
+        return Err(format!(
+            "{needs}. The branch has a merge commit of its own ({merge}), which a restack would \
+             flatten, so SlashIt will not replay it. Move the branch onto {default} yourself, then \
+             create the pull request again. {unchanged_note}"
+        ));
+    }
+    let Some(worktree) = worktree else {
+        return Err(format!(
+            "{needs}, but this task has no worktree to do that in. Attach a worktree to the task, \
+             then create the pull request again. {unchanged_note}"
+        ));
+    };
+    let shown = worktree.display();
+    let checkout = restack::worktree_state(&worktree).await?;
+    if let Some(operation) = checkout.in_progress {
+        return Err(format!(
+            "{needs}, but the task's worktree at {shown} is in the middle of a {operation} that \
+             SlashIt did not start. Finish it or abort it there, then create the pull request \
+             again. {unchanged_note}"
+        ));
+    }
+    if checkout.head_ref.as_deref() != Some(branch_ref.as_str()) || checkout.head != tip {
+        return Err(format!(
+            "{needs}, but the task's worktree at {shown} does not have {branch} checked out at \
+             {tip}. Check out {branch} there, then create the pull request again. {unchanged_note}"
+        ));
+    }
+    if !checkout.uncommitted.is_empty() {
+        return Err(format!(
+            "{needs}, but the task's worktree at {shown} has uncommitted changes ({}). SlashIt \
+             does not set work aside on its own. Commit or remove them, then create the pull \
+             request again. {unchanged_note}",
+            checkout.uncommitted.join("; ")
+        ));
+    }
+
+    refuse_if_pr_operation_cancelled(reservation, "restacking the branch")?;
+    restack::create_backup(repo, &backup, &tip)
+        .await
+        .map_err(|e| format!("{needs}, but {e}. {unchanged_note}"))?;
+    let replay = restack::Restack {
+        worktree: &worktree,
+        branch,
+        fork_point: &fork_point,
+        old_tip: &tip,
+        onto: &onto,
+        backup: &backup,
+    };
+    if let Err(failure) = replay.replay().await {
+        return Err(restack_failure_message(&replay, default, failure));
+    }
+
+    let recorded = std::sync::atomic::AtomicBool::new(false);
+    let stacked = BranchOrigin::Stacked { parent_branch: parent.to_string() };
+    let apply = |staged: &mut std::collections::HashMap<Uuid, Task>| {
+        if let Some(task) = staged.get_mut(&task_uuid) {
+            if task.branch_name.as_deref() == Some(branch)
+                && task.base_commit.as_deref() == Some(fork_point.as_str())
+                && task.branch_origin.as_ref() == Some(&stacked)
+            {
+                task.base_commit = Some(onto.clone());
+                task.branch_origin = Some(BranchOrigin::DefaultBase);
+                recorded.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    };
+    let written = crate::lifecycle::record(&state.task.tasks, &state.storage, task_uuid, &apply).await;
+    let unrecorded = match written {
+        Err(e) => Some(format!("the task could not record the restack: {e}")),
+        Ok(()) if !recorded.load(std::sync::atomic::Ordering::SeqCst) => Some(
+            "the task's branch, fork point or parent changed while the branch was being restacked"
+                .to_string(),
+        ),
+        Ok(()) => None,
+    };
+    if let Some(what) = unrecorded {
+        let failure = replay.roll_back(what).await;
+        return Err(restack_failure_message(&replay, default, failure));
+    }
+    if let Err(e) = restack::retire_backup(repo, &backup, &tip).await {
+        eprintln!("[pr] {branch} was restacked and recorded, but its backup was kept: {e}");
+    }
+    Ok(RestackOutcome::Restacked)
+}
+
+/// The refusal for a restack that did not produce a recorded, verified
+/// branch, saying where the branch is now and what to do next.
+fn restack_failure_message(
+    replay: &crate::worktree::restack::Restack<'_>,
+    default: &str,
+    failure: crate::worktree::restack::RestackFailure,
+) -> String {
+    use crate::worktree::restack::RestackFailure;
+    let branch = replay.branch;
+    let onto = replay.onto;
+    let old_tip = replay.old_tip;
+    let fork_point = replay.fork_point;
+    let worktree = replay.worktree.display();
+    let backup = replay.backup;
+    match failure {
+        RestackFailure::Restored(what) => format!(
+            "Restacking {branch} onto {default} ({onto}) failed: {what}. The branch is back at \
+             {old_tip}, exactly as it was. Nothing was pushed and no pull request was opened. \
+             Move the branch onto {default} in the task's worktree (for example `git rebase \
+             --onto origin/{default} {fork_point} {branch}`), resolve what that stops on, then \
+             create the pull request again."
+        ),
+        RestackFailure::NotRestored(what) => format!(
+            "Restacking {branch} onto {default} ({onto}) failed: {what}. Its tip from before is \
+             kept at {backup} ({old_tip}). To put it back, in the task's worktree at {worktree} \
+             run `git rebase --abort` if a rebase is still in progress, then `git reset --keep \
+             {backup}`, then delete the backup with `git update-ref -d {backup}`. Nothing was \
+             pushed and no pull request was opened."
+        ),
+    }
+}
+
+/// Deal with what an earlier restack of `branch` may have left, before a new
+/// one is considered.
+///
+/// A restack writes its backup ref before the rebase and deletes it once the
+/// branch is either verified back at the old tip or restacked and recorded,
+/// so a backup ref that is still there means one did not finish. Git moves a
+/// branch only once a rebase completes, so a rebase that was interrupted
+/// (the process died, say) leaves the branch at the old tip and the rebase
+/// in progress in the task's worktree:
+///
+/// - A backup equal to the branch's tip, with a rebase of `refs/heads/<branch>`
+///   in progress in the task's worktree that started from that same tip, is
+///   provably SlashIt's: it is aborted, the worktree verified back on the
+///   branch at that tip, and the backup deleted.
+/// - A backup equal to the branch's tip with no rebase in progress holds
+///   nothing the branch does not, and is deleted.
+/// - Any other backup is refused, naming it and the branch's tip, and nothing
+///   is aborted or deleted: the branch may have been restacked without the
+///   task recording it, or moved since, and SlashIt cannot tell which is
+///   right.
+///
+/// A rebase in progress with no backup ref was not started by SlashIt. It is
+/// left alone here; a restack that would need the worktree refuses it.
+async fn recover_unfinished_restack(
+    repo: &std::path::Path,
+    worktree: Option<&std::path::Path>,
+    branch: &str,
+    tip: &str,
+    backup: &str,
+) -> Result<(), String> {
+    use crate::worktree::restack;
+    let Some(saved) = restack::exact_ref(repo, backup).await? else {
+        return Ok(());
+    };
+    let rebase = match worktree {
+        Some(worktree) => restack::interrupted_rebase_of(worktree, branch).await?,
+        None => None,
+    };
+    let unfinished = |detail: String| {
+        format!(
+            "An earlier restack of {branch} by SlashIt did not finish: {backup} holds the branch's \
+             tip from before it ({saved}), and {branch} is now at {tip}{detail}. SlashIt cannot \
+             tell which of the two is right, so it changed and pushed nothing. To go back to where \
+             the branch was, in the task's worktree run `git rebase --abort` if a rebase is in \
+             progress, then `git reset --keep {backup}`, then delete the backup with `git \
+             update-ref -d {backup}`; creating the pull request afterwards restacks it again. If \
+             {branch} is already what it should be, only delete the backup, then create the pull \
+             request again."
+        )
+    };
+    match (rebase, worktree) {
+        (Some(orig_head), Some(worktree)) if saved == tip && orig_head == saved => {
+            restack::abort_rebase(worktree)
+                .await
+                .map_err(|e| unfinished(format!(", and aborting the rebase still in progress failed: {e}")))?;
+            restack::verify_restored(worktree, branch, &saved)
+                .await
+                .map_err(|e| unfinished(format!(", and after aborting its rebase {e}")))?;
+            restack::retire_backup(repo, backup, &saved).await?;
+            eprintln!("[pr] aborted an unfinished restack of {branch}; it is back at {saved}");
+            Ok(())
+        }
+        (None, _) if saved == tip => restack::retire_backup(repo, backup, &saved).await,
+        (Some(_), Some(worktree)) => Err(unfinished(format!(
+            ", with a rebase of it in progress in {}",
+            worktree.display()
+        ))),
+        _ => Err(unfinished(String::new())),
+    }
+}
+
+/// The merge commit of the parent's merged pull request, by number, once the
+/// pull request is checked to be what [`pr_base_for`] took it for: merged,
+/// from this repository's `parent_branch`, into the default branch. It is
+/// what GitHub reports as `mergeCommit`: the merge commit itself, the
+/// squashed commit, or the last of the rebased commits.
+async fn merged_pull_request(working_dir: &str, landed: &LandedParent) -> Result<String, String> {
+    let number = landed.number.to_string();
+    let output = run_cmd("gh", &["pr", "view", &number, "--json", LANDED_PR_FIELDS], working_dir).await?;
+    let json: serde_json::Value = serde_json::from_str(&output)
+        .map_err(|e| format!("Failed to parse gh pr view output: {e}"))?;
+    let text = |name: &str| json.get(name).and_then(|v| v.as_str()).unwrap_or_default();
+    let is_own = json.get("isCrossRepository").and_then(|v| v.as_bool()) == Some(false);
+    if !text("state").eq_ignore_ascii_case("MERGED")
+        || !is_own
+        || text("headRefName") != landed.parent_branch
+        || text("baseRefName") != landed.default_branch
+    {
+        return Err(format!(
+            "gh reported pull request #{number} as {:?} from {:?} into {:?}{}, not as merged from \
+             this repository's {} into {}",
+            text("state"),
+            text("headRefName"),
+            text("baseRefName"),
+            if is_own { "" } else { " from a fork or of unknown origin" },
+            landed.parent_branch,
+            landed.default_branch
+        ));
+    }
+    json.get("mergeCommit")
+        .and_then(|c| c.get("oid"))
+        .and_then(|v| v.as_str())
+        .filter(|oid| crate::worktree::restack::is_full_object_id(oid))
+        .map(str::to_string)
+        .ok_or_else(|| format!("gh reported no merge commit for pull request #{number}"))
+}
+
+/// The object IDs of the commits pull request `number` lists, oldest first.
+///
+/// Read from the REST API with every page followed. `gh pr view --json
+/// commits` asks GitHub for the first 100 commits only, which would make a
+/// fork point further into a long pull request look absent. The REST API
+/// itself lists at most [`GITHUB_PR_COMMIT_LIST_LIMIT`] commits of one pull
+/// request, so a listing that long may be incomplete; the caller treats it
+/// so. `{owner}/{repo}` is filled in by `gh` from the repository in
+/// `working_dir`, the same one every other `gh` call here resolves.
+async fn parent_pull_request_commits(working_dir: &str, number: u64) -> Result<Vec<String>, String> {
+    let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/commits");
+    let listed = run_cmd("gh", &["api", "--paginate", &path, "--jq", ".[].sha"], working_dir).await?;
+    listed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|oid| {
+            crate::worktree::restack::is_full_object_id(oid)
+                .then(|| oid.to_string())
+                .ok_or_else(|| format!("gh listed {oid:?} as a commit of pull request #{number}"))
+        })
+        .collect()
+}
+
 /// How many of a branch's pull requests, newest first, [`branch_pr_state`]
 /// looks through for one that is not from a fork.
 const PR_LOOKUP_LIMIT: usize = 30;
 
-/// The state of the newest pull request from this repository whose head is
-/// `branch`, upper-cased, and the branch it targets; `(None, None)` when
-/// there is none.
+/// The newest pull request from this repository whose head is `branch`:
+/// its state, upper-cased, the branch it targets and its number, all `None`
+/// when there is none.
 ///
 /// `gh pr list --head` matches the head branch by name only (it takes no
 /// `<owner>:<branch>`), so pull requests from forks whose branch happens to
@@ -2981,10 +3589,7 @@ const PR_LOOKUP_LIMIT: usize = 30;
 /// the branch has no pull request of its own. When the list is full and all
 /// are from forks, its own may be further back than the list reaches, and
 /// reading that as none could pick the wrong base, so the lookup fails.
-async fn branch_pr_state(
-    working_dir: &str,
-    branch: &str,
-) -> Result<(Option<String>, Option<String>), String> {
+async fn branch_pr_state(working_dir: &str, branch: &str) -> Result<BranchPr, String> {
     let branch = checked_task_branch(branch)?;
     let limit = PR_LOOKUP_LIMIT.to_string();
     let listed = run_cmd(
@@ -2994,7 +3599,7 @@ async fn branch_pr_state(
             "--head", branch,
             "--state", "all",
             "--limit", &limit,
-            "--json", "state,baseRefName,isCrossRepository",
+            "--json", "number,state,baseRefName,isCrossRepository",
         ],
         working_dir,
     )
@@ -3029,7 +3634,22 @@ async fn branch_pr_state(
             .and_then(|v| v.as_str())
             .map(str::to_string)
     };
-    Ok((field("state").map(|s| s.to_uppercase()), field("baseRefName")))
+    Ok(BranchPr {
+        state: field("state").map(|s| s.to_uppercase()),
+        base: field("baseRefName"),
+        number: own.and_then(|pr| pr.get("number")).and_then(|v| v.as_u64()),
+    })
+}
+
+/// A branch's own pull request, as [`branch_pr_state`] finds it.
+#[derive(Debug, Default)]
+struct BranchPr {
+    /// Its state, upper-cased; `None` when the branch has none.
+    state: Option<String>,
+    /// The branch it targets.
+    base: Option<String>,
+    /// Its number.
+    number: Option<u64>,
 }
 
 /// The repository's default branch, as GitHub reports it.
@@ -3049,6 +3669,12 @@ async fn repository_default_branch(working_dir: &str) -> Result<String, String> 
 
 /// Whether `origin` has a branch named `branch`, asked of the remote itself.
 async fn remote_branch_exists(working_dir: &str, branch: &str) -> Result<bool, String> {
+    Ok(remote_branch_commit(working_dir, branch).await?.is_some())
+}
+
+/// The commit `origin`'s branch `branch` is at, asked of the remote itself;
+/// `None` when the remote has no such branch.
+async fn remote_branch_commit(working_dir: &str, branch: &str) -> Result<Option<String>, String> {
     let branch = checked_task_branch(branch)?;
     let mut git_args: Vec<String> = Vec::new();
     if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
@@ -3060,7 +3686,10 @@ async fn remote_branch_exists(working_dir: &str, branch: &str) -> Result<bool, S
     let listed = run_cmd("git", &git_args, working_dir)
         .await
         .map_err(|e| format!("Could not ask the remote for branch {branch}: {e}"))?;
-    Ok(!listed.is_empty())
+    Ok(listed.lines().find_map(|line| {
+        let (oid, name) = line.split_once(char::is_whitespace)?;
+        (name.trim() == refname).then(|| oid.to_string())
+    }))
 }
 
 async fn find_existing_pr_for_branch(
@@ -6226,7 +6855,7 @@ mod tests {
         #[cfg(unix)]
         fn pr_of(branch: &str, json: &str) -> (String, String) {
             (
-                format!("pr list --head {branch} --state all --limit 30 --json state,baseRefName,isCrossRepository"),
+                format!("pr list --head {branch} --state all --limit 30 --json number,state,baseRefName,isCrossRepository"),
                 format!("printf '%s' '{json}'"),
             )
         }
@@ -6276,7 +6905,7 @@ mod tests {
             assert!(
                 mock.read_log().contains(
                     "\npr\nlist\n--head\ntask-parent\n--state\nall\n--limit\n30\n--json\n\
-                     state,baseRefName,isCrossRepository\n---END-ARGS---"
+                     number,state,baseRefName,isCrossRepository\n---END-ARGS---"
                 ),
                 "the parent's pull request is looked up among closed and merged ones too: {}",
                 mock.read_log()
@@ -6356,7 +6985,7 @@ mod tests {
             assert!(
                 mock.read_log().contains(
                     "\npr\nlist\n--head\ntask-parent\n--state\nall\n--limit\n30\n--json\n\
-                     state,baseRefName,isCrossRepository\n---END-ARGS---"
+                     number,state,baseRefName,isCrossRepository\n---END-ARGS---"
                 ),
                 "the lookup has to ask which pull requests come from a fork, and list past \
                  the newest: {}",
@@ -6552,7 +7181,7 @@ mod tests {
                 Case {
                     name: "gh cannot answer",
                     answers: vec![(
-                        "pr list --head task-parent --state all --limit 30 --json state,baseRefName,isCrossRepository"
+                        "pr list --head task-parent --state all --limit 30 --json number,state,baseRefName,isCrossRepository"
                             .to_string(),
                         "echo 'HTTP 502' >&2; exit 1".to_string(),
                     )],
@@ -6720,6 +7349,1111 @@ mod tests {
             let log = mock.read_log();
             let create_calls = log.matches("pr\ncreate").count();
             assert_eq!(create_calls, 2, "each task must reach exactly one gh pr create: {log}");
+        }
+
+        // A stacked task whose parent's pull request has been merged into the
+        // default branch, and whose own branch has never left the machine, is
+        // restacked onto the default branch before its first pull request is
+        // opened, so that pull request holds only the task's own commits.
+        // Every test here builds real histories: a bare `origin`, a checkout,
+        // the task's own Git worktree, and a second clone standing in for
+        // GitHub that lands the parent on `main` by squash, by rebase or with
+        // a merge commit. Only `gh` is faked.
+        #[cfg(unix)]
+        mod stack_restack {
+            use super::*;
+
+            const CHILD_PR_URL: &str = "https://github.com/testorg/testrepo/pull/21";
+            const MERGED_PARENT: &str =
+                r#"[{"number":7,"state":"MERGED","baseRefName":"main","isCrossRepository":false}]"#;
+
+            /// How the parent's pull request landed on the remote's `main`.
+            #[derive(Clone, Copy, Debug, PartialEq)]
+            enum Landing {
+                /// One new commit holding the parent's changes.
+                Squash,
+                /// The parent's commits replayed on `main` with new object IDs.
+                Rebase,
+                /// A merge commit whose second parent is the parent's tip.
+                Merge,
+            }
+
+            #[derive(Clone, Copy, Debug)]
+            struct Spec {
+                landing: Landing,
+                /// The parent's branch is deleted on `origin` after landing.
+                delete_parent: bool,
+                /// The parent got another commit after the task forked from
+                /// it, and that commit landed with the rest.
+                parent_commit_after_fork: bool,
+                /// The parent's last commit was amended (and force-pushed)
+                /// after the task forked from it, so what landed does not
+                /// contain the commit the task was built on.
+                amend_parent_after_fork: bool,
+                /// `main` itself changed the task's own file before the
+                /// parent landed, so replaying the task's commits conflicts.
+                main_edits_child_file: bool,
+                /// `main` itself already made the task's first change (B1)
+                /// before the parent landed, so replaying B1 leaves it empty.
+                main_has_first_child_change: bool,
+                /// The parent had this many commits of its own (on p.txt)
+                /// before A1, all listed in its pull request.
+                parent_commits_before_a1: usize,
+                /// The task forked from the parent while the parent still had
+                /// no commits of its own, so the fork point is `main`'s commit.
+                child_forks_before_parent_commits: bool,
+            }
+
+            impl Spec {
+                fn new(landing: Landing) -> Self {
+                    Spec {
+                        landing,
+                        delete_parent: false,
+                        parent_commit_after_fork: false,
+                        amend_parent_after_fork: false,
+                        main_edits_child_file: false,
+                        main_has_first_child_change: false,
+                        parent_commits_before_a1: 0,
+                        child_forks_before_parent_commits: false,
+                    }
+                }
+            }
+
+            /// A stack whose parent has landed on the remote's `main`.
+            struct Landed {
+                repo: RepoFixture,
+                /// The task's own Git worktree, with `task-branch` checked out.
+                worktree: PathBuf,
+                /// The parent's tip the task's branch was created at (`A2`).
+                base_commit: String,
+                /// The task's branch tip before anything ran (`B2`).
+                child_tip: String,
+                /// What the parent's pull request listed as its commits.
+                pr_commits: Vec<String>,
+                /// What GitHub reports as the parent's `mergeCommit`.
+                merge_commit: String,
+            }
+
+            fn commit_file(dir: &Path, file: &str, content: &str, subject: &str) {
+                std::fs::write(dir.join(file), content).unwrap();
+                git(dir, &["add", "-A"]);
+                git(dir, &["commit", "-q", "-m", subject]);
+            }
+
+            /// `git` that may fail, for the steps a test expects to fail.
+            fn git_status(dir: &Path, args: &[&str]) -> (bool, String) {
+                let output = StdCommand::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .env("GIT_AUTHOR_NAME", "Test")
+                    .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                    .env("GIT_COMMITTER_NAME", "Test")
+                    .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                    .output()
+                    .expect("run git");
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                (output.status.success(), text)
+            }
+
+            /// `main` <- `task-parent` (A1: a.txt v1; A2: a.txt v2 and
+            /// a2.txt, so A2 rewrites A1's line) <- `task-branch` (B1, B2 on
+            /// b.txt), the parent pushed, the task's branch in a worktree of
+            /// its own and never pushed. Then, on a separate clone standing in
+            /// for GitHub, `main` gets its own commit M2 and the parent lands
+            /// as `spec.landing` says. The checkout's `origin/main` is left
+            /// stale on purpose: nothing the code under test relies on may
+            /// come from an earlier fetch.
+            fn land(spec: Spec) -> Landed {
+                let repo = RepoFixture::new();
+                let co = repo.checkout.clone();
+                git(&co, &["config", "user.name", "Test"]);
+                git(&co, &["config", "user.email", "test@example.com"]);
+                git(&co, &["checkout", "-q", "-b", "task-parent"]);
+                let parent_commits = |co: &Path| {
+                    for n in 0..spec.parent_commits_before_a1 {
+                        commit_file(co, "p.txt", &format!("{n}\n"), &format!("P{n}"));
+                    }
+                    commit_file(co, "a.txt", "v1\n", "A1");
+                    std::fs::write(co.join("a2.txt"), "x\n").unwrap();
+                    commit_file(co, "a.txt", "v2\n", "A2");
+                };
+                if !spec.child_forks_before_parent_commits {
+                    parent_commits(&co);
+                }
+                let base_commit = git(&co, &["rev-parse", "task-parent"]);
+                git(&co, &["checkout", "-q", "-b", "task-branch"]);
+                commit_file(&co, "b.txt", "b1\n", "B1");
+                commit_file(&co, "b.txt", "b2\n", "B2");
+                let child_tip = git(&co, &["rev-parse", "task-branch"]);
+                if spec.child_forks_before_parent_commits {
+                    git(&co, &["checkout", "-q", "task-parent"]);
+                    parent_commits(&co);
+                }
+                git(&co, &["push", "-q", "origin", "task-parent"]);
+                git(&co, &["checkout", "-q", "main"]);
+                let worktree = repo._tmp.path().join("task-worktree");
+                git(&co, &["worktree", "add", "-q", worktree.to_str().unwrap(), "task-branch"]);
+
+                if spec.parent_commit_after_fork {
+                    git(&co, &["checkout", "-q", "task-parent"]);
+                    commit_file(&co, "a.txt", "v3\n", "A3");
+                    git(&co, &["push", "-q", "origin", "task-parent"]);
+                    git(&co, &["checkout", "-q", "main"]);
+                }
+                if spec.amend_parent_after_fork {
+                    git(&co, &["checkout", "-q", "task-parent"]);
+                    std::fs::write(co.join("a.txt"), "v2 amended\n").unwrap();
+                    git(&co, &["commit", "-q", "-a", "--amend", "-m", "A2 amended"]);
+                    git(&co, &["push", "-q", "-f", "origin", "task-parent"]);
+                    git(&co, &["checkout", "-q", "main"]);
+                }
+
+                let hub = repo._tmp.path().join("hub");
+                git(repo._tmp.path(), &["clone", "-q", "-b", "main", repo.remote.to_str().unwrap(), hub.to_str().unwrap()]);
+                let pr_commits: Vec<String> = git(&hub, &["rev-list", "--reverse", "origin/main..origin/task-parent"])
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                if spec.main_edits_child_file {
+                    commit_file(&hub, "b.txt", "main's own b\n", "M2");
+                } else if spec.main_has_first_child_change {
+                    commit_file(&hub, "b.txt", "b1\n", "M2");
+                } else {
+                    commit_file(&hub, "m.txt", "m2\n", "M2");
+                }
+                match spec.landing {
+                    Landing::Squash => {
+                        git(&hub, &["merge", "-q", "--squash", "origin/task-parent"]);
+                        git(&hub, &["commit", "-q", "-m", "Parent work (#7)"]);
+                    }
+                    Landing::Rebase => {
+                        for commit in &pr_commits {
+                            git(&hub, &["cherry-pick", commit]);
+                        }
+                    }
+                    Landing::Merge => {
+                        git(&hub, &["merge", "-q", "--no-ff", "origin/task-parent", "-m", "Merge pull request #7"]);
+                    }
+                }
+                let merge_commit = git(&hub, &["rev-parse", "HEAD"]);
+                git(&hub, &["push", "-q", "origin", "main"]);
+                if spec.delete_parent {
+                    git(&hub, &["push", "-q", "origin", "--delete", "task-parent"]);
+                }
+                Landed { repo, worktree, base_commit, child_tip, pr_commits, merge_commit }
+            }
+
+            /// `gh`'s answers for a parent whose pull request #7 was merged
+            /// into `main`: the lookup by head branch, the pull request
+            /// itself with its merge commit, and its commits, listed through
+            /// the REST API with every page read.
+            fn merged_parent_answers(landed: &Landed) -> Vec<(String, String)> {
+                merged_parent_answers_listing(landed, &landed.pr_commits)
+            }
+
+            /// [`merged_parent_answers`], with `listed` as the commits the
+            /// REST API lists for the pull request.
+            fn merged_parent_answers_listing(landed: &Landed, listed: &[String]) -> Vec<(String, String)> {
+                let view = format!(
+                    r#"{{"state":"MERGED","baseRefName":"main","headRefName":"task-parent","isCrossRepository":false,"mergeCommit":{{"oid":"{}"}}"#,
+                    landed.merge_commit,
+                );
+                vec![
+                    any_pr_list_of("task-parent", MERGED_PARENT),
+                    (
+                        "pr view 7 --json state,baseRefName,headRefName,isCrossRepository,mergeCommit".to_string(),
+                        format!("printf '%s' '{view}}}'"),
+                    ),
+                    (
+                        "api --paginate repos/{owner}/{repo}/pulls/7/commits --jq .[].sha".to_string(),
+                        format!("printf '%s\\n' {}", listed.join(" ")),
+                    ),
+                ]
+            }
+
+            /// A task stacked on `task-parent`, on `task-branch` in the
+            /// fixture's worktree, whose recorded fork point is `base_commit`.
+            async fn seed_stacked_task(
+                state: &crate::AppState,
+                landed: &Landed,
+                base_commit: Option<&str>,
+            ) -> Uuid {
+                let task_id = seed_origin_task(state, &landed.repo, stacked_on_parent(), true).await;
+                let mut tasks = state.task.tasks.write().await;
+                let task = tasks.get_mut(&task_id).unwrap();
+                task.status = TaskStatus::HumanReview;
+                task.worktree_path = Some(landed.worktree.to_str().unwrap().to_string());
+                task.base_commit = base_commit.map(str::to_string);
+                task_id
+            }
+
+            fn backup_ref(task_id: Uuid) -> String {
+                format!("refs/slashit/restack-backup/{task_id}")
+            }
+
+            /// Where `refname` points, read exactly, or `None`.
+            fn ref_at(dir: &Path, refname: &str) -> Option<String> {
+                git(dir, &["for-each-ref", "--format=%(refname) %(objectname)", refname])
+                    .lines()
+                    .find_map(|line| {
+                        let (name, oid) = line.split_once(' ')?;
+                        (name == refname).then(|| oid.to_string())
+                    })
+            }
+
+            fn local_tip(landed: &Landed) -> String {
+                ref_at(&landed.repo.checkout, "refs/heads/task-branch").expect("task branch")
+            }
+
+            fn remote_main(landed: &Landed) -> String {
+                git(&landed.repo.checkout, &["ls-remote", "origin", "refs/heads/main"])
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            }
+
+            /// Whether the worktree is in the middle of a rebase or a merge.
+            fn mid_operation(worktree: &Path) -> bool {
+                ["rebase-merge", "rebase-apply", "MERGE_HEAD"].iter().any(|name| {
+                    let path = git(worktree, &["rev-parse", "--git-path", name]);
+                    worktree.join(path).exists()
+                })
+            }
+
+            fn subjects(dir: &Path, range: &str) -> Vec<String> {
+                git(dir, &["log", "--reverse", "--format=%s", range])
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            }
+
+            /// Everything a refusal must have left alone: the task's branch
+            /// and worktree exactly as they were, no backup ref, nothing on
+            /// the remote, no pull request, and the task's record untouched.
+            async fn assert_untouched(
+                name: &str,
+                state: &crate::AppState,
+                landed: &Landed,
+                task_id: Uuid,
+                mock: &MockGh,
+            ) {
+                assert_eq!(local_tip(landed), landed.child_tip, "{name}: the branch must not move");
+                assert_eq!(
+                    git(&landed.worktree, &["symbolic-ref", "HEAD"]),
+                    "refs/heads/task-branch",
+                    "{name}: the worktree must be back on its branch"
+                );
+                assert!(!mid_operation(&landed.worktree), "{name}: no rebase may be left behind");
+                assert_eq!(ref_at(&landed.repo.checkout, &backup_ref(task_id)), None, "{name}");
+                assert_eq!(landed.repo.remote_has_branch("task-branch"), None, "{name}: nothing may be pushed");
+                assert_eq!(pr_create_tail(&mock.read_log()), None, "{name}: {}", mock.read_log());
+                let tasks = state.task.tasks.read().await;
+                let task = &tasks[&task_id];
+                assert_eq!(task.base_commit.as_deref(), Some(landed.base_commit.as_str()), "{name}");
+                assert_eq!(task.branch_origin, stacked_on_parent(), "{name}");
+                assert!(task.pr_url.is_none(), "{name}");
+            }
+
+            /// Squash and rebase merges give the parent's work new commits on
+            /// `main`, so the task's branch still carries the parent's old
+            /// ones and a pull request from it would list them all. Before
+            /// the first push the branch is replayed from its recorded fork
+            /// point onto `main` as `origin` has it now: the pull request
+            /// then holds exactly the task's commits and files, the push is
+            /// the branch's creation, and the task records the new base and
+            /// that the branch now starts from the default base. Whether the
+            /// parent's branch was kept or deleted after merging, and whether
+            /// the parent had more commits after the task forked, make no
+            /// difference.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_unpublished_task_is_restacked_onto_the_default_branch_its_parent_landed_on() {
+                let _guard = PATH_LOCK.lock().await;
+                let cases = [
+                    ("squash, parent kept", Spec::new(Landing::Squash)),
+                    ("squash, parent deleted", Spec { delete_parent: true, ..Spec::new(Landing::Squash) }),
+                    ("rebase, parent kept", Spec::new(Landing::Rebase)),
+                    ("rebase, parent deleted", Spec { delete_parent: true, ..Spec::new(Landing::Rebase) }),
+                    (
+                        "squash, parent committed after the fork",
+                        Spec { parent_commit_after_fork: true, ..Spec::new(Landing::Squash) },
+                    ),
+                ];
+                for (name, spec) in cases {
+                    let landed = land(spec);
+                    let mock = MockGh::setup_answering(
+                        CHILD_PR_URL,
+                        r#"{"state":"OPEN"}"#,
+                        &merged_parent_answers(&landed),
+                    );
+                    let (state, _tmp) = build_test_state().await;
+                    let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                    assert_eq!(landed.repo.remote_has_branch("task-branch"), None, "{name}");
+
+                    let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                    assert_eq!(result.as_deref(), Ok(CHILD_PR_URL), "{name}");
+                    assert_eq!(
+                        pr_create_tail(&mock.read_log()),
+                        Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "main".into()]),
+                        "{name}: {}",
+                        mock.read_log()
+                    );
+                    let onto = remote_main(&landed);
+                    let tip = local_tip(&landed);
+                    assert_ne!(tip, landed.child_tip, "{name}: the branch must have been restacked");
+                    assert_eq!(
+                        landed.repo.remote_has_branch("task-branch").as_deref(),
+                        Some(tip.as_str()),
+                        "{name}: the restacked branch is what was pushed"
+                    );
+                    let co = &landed.repo.checkout;
+                    git(co, &["fetch", "-q", "origin"]);
+                    assert_eq!(subjects(co, "origin/main..origin/task-branch"), ["B1", "B2"], "{name}");
+                    assert_eq!(
+                        git(co, &["diff", "--name-only", "origin/main...origin/task-branch"]),
+                        "b.txt",
+                        "{name}"
+                    );
+                    assert_eq!(git(co, &["rev-parse", "task-branch^^"]), onto, "{name}");
+                    assert_eq!(
+                        git(&landed.worktree, &["symbolic-ref", "HEAD"]),
+                        "refs/heads/task-branch",
+                        "{name}"
+                    );
+                    assert_eq!(git(&landed.worktree, &["status", "--porcelain"]), "", "{name}");
+                    assert!(!mid_operation(&landed.worktree), "{name}");
+                    assert_eq!(ref_at(co, &backup_ref(task_id)), None, "{name}: the backup is retired");
+                    let tasks = state.task.tasks.read().await;
+                    let task = &tasks[&task_id];
+                    assert_eq!(task.base_commit.as_deref(), Some(onto.as_str()), "{name}");
+                    assert_eq!(task.branch_origin, Some(crate::domain::BranchOrigin::DefaultBase), "{name}");
+                    assert_eq!(task.pr_url.as_deref(), Some(CHILD_PR_URL), "{name}");
+                }
+            }
+
+            /// With a merge commit the parent's own commits are on `main`
+            /// unchanged, so the task's branch already differs from `main` by
+            /// exactly its own commits. Nothing is rewritten and nothing about
+            /// the task's recorded provenance changes; the pull request is
+            /// opened against `main` with the branch as it is.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_task_whose_parent_landed_with_a_merge_commit_is_opened_without_a_rewrite() {
+                let _guard = PATH_LOCK.lock().await;
+                for delete_parent in [false, true] {
+                    let landed = land(Spec { delete_parent, ..Spec::new(Landing::Merge) });
+                    let mock = MockGh::setup_answering(
+                        CHILD_PR_URL,
+                        r#"{"state":"OPEN"}"#,
+                        &merged_parent_answers(&landed),
+                    );
+                    let (state, _tmp) = build_test_state().await;
+                    let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                    let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                    assert_eq!(result.as_deref(), Ok(CHILD_PR_URL), "{delete_parent}");
+                    assert_eq!(
+                        pr_create_tail(&mock.read_log()),
+                        Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "main".into()]),
+                    );
+                    assert_eq!(local_tip(&landed), landed.child_tip, "no rewrite");
+                    assert_eq!(
+                        landed.repo.remote_has_branch("task-branch").as_deref(),
+                        Some(landed.child_tip.as_str())
+                    );
+                    let co = &landed.repo.checkout;
+                    git(co, &["fetch", "-q", "origin"]);
+                    assert_eq!(subjects(co, "origin/main..origin/task-branch"), ["B1", "B2"]);
+                    assert_eq!(git(co, &["diff", "--name-only", "origin/main...origin/task-branch"]), "b.txt");
+                    assert_eq!(ref_at(co, &backup_ref(task_id)), None);
+                    let tasks = state.task.tasks.read().await;
+                    assert_eq!(tasks[&task_id].base_commit.as_deref(), Some(landed.base_commit.as_str()));
+                    assert_eq!(tasks[&task_id].branch_origin, stacked_on_parent());
+                }
+            }
+
+            /// Replaying from the recorded fork point is not the same as a
+            /// plain `git rebase main`. When a later parent commit rewrites an
+            /// earlier one's lines and the parent was squashed, the plain
+            /// rebase tries to replay the parent's commits too and conflicts
+            /// on the first of them; the restack replays only the task's.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn the_restack_succeeds_where_a_plain_rebase_onto_main_would_conflict() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec::new(Landing::Squash));
+
+                let scratch = landed.repo._tmp.path().join("scratch");
+                git(landed.repo._tmp.path(), &["clone", "-q", landed.repo.checkout.to_str().unwrap(), scratch.to_str().unwrap()]);
+                git(&scratch, &["checkout", "-q", "-b", "child", &landed.child_tip]);
+                git(&scratch, &["fetch", "-q", landed.repo.remote.to_str().unwrap(), "main:landed-main"]);
+                let (plain_ok, plain_out) = git_status(&scratch, &["rebase", "landed-main"]);
+                assert!(!plain_ok, "a plain rebase must conflict here: {plain_out}");
+                assert!(plain_out.contains("a.txt"), "{plain_out}");
+
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok(CHILD_PR_URL), "{}", mock.read_log());
+                let co = &landed.repo.checkout;
+                git(co, &["fetch", "-q", "origin"]);
+                assert_eq!(subjects(co, "origin/main..origin/task-branch"), ["B1", "B2"]);
+                assert_eq!(git(co, &["show", "origin/task-branch:a.txt"]), "v2");
+            }
+
+            /// When the parent was amended after the task forked from it, the
+            /// commit the task was built on is not among what landed. Replaying
+            /// onto `main` would silently drop what the task inherited, and
+            /// opening the branch as it is would list the old parent commits,
+            /// so pull request creation is refused before anything changes.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_task_built_on_a_parent_commit_that_did_not_land_is_refused() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec { amend_parent_after_fork: true, ..Spec::new(Landing::Squash) });
+                assert!(!landed.pr_commits.contains(&landed.base_commit));
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let error = create_pr_inner(&state, &task_id.to_string()).await.expect_err("refused");
+
+                assert!(error.contains("not among the commits of pull request #7"), "{error}");
+                assert!(error.contains(&landed.base_commit), "{error}");
+                assert_untouched("amended parent", &state, &landed, task_id, &mock).await;
+            }
+
+            /// A worktree with uncommitted changes is never rebased, and the
+            /// refusal comes before the backup ref is written.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_task_worktree_with_uncommitted_changes_is_refused_before_anything_changes() {
+                let _guard = PATH_LOCK.lock().await;
+                for (name, file, content) in [
+                    ("tracked change", "b.txt", "not committed\n"),
+                    ("untracked file", "notes.txt", "scratch\n"),
+                ] {
+                    let landed = land(Spec::new(Landing::Squash));
+                    std::fs::write(landed.worktree.join(file), content).unwrap();
+                    let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                    let (state, _tmp) = build_test_state().await;
+                    let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                    let error = create_pr_inner(&state, &task_id.to_string()).await.expect_err(name);
+
+                    assert!(error.contains("uncommitted changes"), "{name}: {error}");
+                    assert!(error.contains(file), "{name}: {error}");
+                    assert_untouched(name, &state, &landed, task_id, &mock).await;
+                    assert_eq!(std::fs::read_to_string(landed.worktree.join(file)).unwrap(), content, "{name}");
+                }
+            }
+
+            /// A task commit that conflicts with `main` stops the rebase. It
+            /// is aborted, the branch and the worktree are back exactly where
+            /// they were, the backup is retired once that is verified, and
+            /// the refusal names the conflicting file. Nothing is pushed and
+            /// no pull request is opened.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_restack_that_conflicts_is_aborted_and_refused() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec { main_edits_child_file: true, ..Spec::new(Landing::Squash) });
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let error = create_pr_inner(&state, &task_id.to_string()).await.expect_err("conflict");
+
+                assert!(error.contains("b.txt"), "{error}");
+                assert!(error.contains("Nothing was pushed"), "{error}");
+                assert_untouched("conflict", &state, &landed, task_id, &mock).await;
+            }
+
+            /// A branch whose recorded fork point is no longer among its
+            /// ancestors was already moved off it, by an earlier restack or by
+            /// hand. It is not replayed a second time: the pull request is
+            /// opened from the branch as it is, as it was before restacking
+            /// existed, and the task's record is left alone.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_branch_already_moved_off_its_fork_point_is_not_restacked_again() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec::new(Landing::Squash));
+                git(&landed.worktree, &["fetch", "-q", "origin", "main"]);
+                git(&landed.worktree, &["rebase", "-q", "--onto", "FETCH_HEAD", &landed.base_commit, "task-branch"]);
+                let moved = local_tip(&landed);
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok(CHILD_PR_URL));
+                assert_eq!(local_tip(&landed), moved, "not replayed again");
+                assert_eq!(landed.repo.remote_has_branch("task-branch").as_deref(), Some(moved.as_str()));
+                assert!(!mock.read_log().contains("\npr\nview\n7\n"), "{}", mock.read_log());
+                let tasks = state.task.tasks.read().await;
+                assert_eq!(tasks[&task_id].base_commit.as_deref(), Some(landed.base_commit.as_str()));
+                assert_eq!(tasks[&task_id].branch_origin, stacked_on_parent());
+            }
+
+            /// A task branch that is already on `origin`, or already has a
+            /// pull request, is published and is never rewritten; no push
+            /// here is ever forced. On `origin` with no pull request yet (an
+            /// earlier push went through and `gh pr create` did not), it is
+            /// opened as it is only when no restack is needed, as after a
+            /// merge-commit landing. When one would be needed, opening it
+            /// would list the parent's commits again, so pull request
+            /// creation is refused and the remote branch keeps its commit.
+            /// A branch with a pull request already has it linked, as before.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_published_task_branch_is_never_rewritten() {
+                let _guard = PATH_LOCK.lock().await;
+
+                // Pushed at B2, then committed on locally: the lease the
+                // refusal suggests must name what origin has, not the local
+                // tip, or it would be stale and the push would be refused.
+                let landed = land(Spec::new(Landing::Squash));
+                git(&landed.repo.checkout, &["push", "-q", "origin", "task-branch"]);
+                commit_file(&landed.worktree, "b.txt", "b3\n", "B3");
+                let local = local_tip(&landed);
+                assert_ne!(local, landed.child_tip);
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let error = create_pr_inner(&state, &task_id.to_string()).await.expect_err("pushed, needs restack");
+
+                assert!(error.contains("already on origin"), "{error}");
+                assert!(
+                    error.contains(&format!("--force-with-lease=refs/heads/task-branch:{}", landed.child_tip)),
+                    "the lease names the remote's commit: {error}"
+                );
+                assert!(!error.contains(&local), "{error}");
+                assert_eq!(pr_create_tail(&mock.read_log()), None, "{}", mock.read_log());
+                assert_eq!(local_tip(&landed), local);
+                assert_eq!(landed.repo.remote_has_branch("task-branch").as_deref(), Some(landed.child_tip.as_str()));
+                assert_eq!(ref_at(&landed.repo.checkout, &backup_ref(task_id)), None);
+                {
+                    let tasks = state.task.tasks.read().await;
+                    assert_eq!(tasks[&task_id].base_commit.as_deref(), Some(landed.base_commit.as_str()));
+                    assert_eq!(tasks[&task_id].branch_origin, stacked_on_parent());
+                    assert!(tasks[&task_id].pr_url.is_none());
+                }
+                drop(mock);
+                drop(state);
+
+                let landed = land(Spec::new(Landing::Merge));
+                git(&landed.repo.checkout, &["push", "-q", "origin", "task-branch"]);
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok(CHILD_PR_URL));
+                assert_eq!(
+                    pr_create_tail(&mock.read_log()),
+                    Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "main".into()]),
+                );
+                assert_eq!(local_tip(&landed), landed.child_tip);
+                assert_eq!(landed.repo.remote_has_branch("task-branch").as_deref(), Some(landed.child_tip.as_str()));
+                drop(mock);
+                drop(state);
+
+                let landed = land(Spec::new(Landing::Squash));
+                let existing = "https://github.com/testorg/testrepo/pull/20";
+                let mut answers = merged_parent_answers(&landed);
+                answers.push((
+                    "pr list --head task-branch --state all --limit 1 --json url".to_string(),
+                    format!(r#"printf '%s' '[{{"url":"{existing}"}}]'"#),
+                ));
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &answers);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok(existing));
+                assert_eq!(local_tip(&landed), landed.child_tip);
+                assert_eq!(landed.repo.remote_has_branch("task-branch"), None);
+                assert_eq!(pr_create_tail(&mock.read_log()), None);
+            }
+
+            /// A branch another task is stacked on, or another local branch
+            /// contains, is not restacked: that dependent would be left on
+            /// the old commits, its pull request would list them, and once
+            /// this branch landed the dependent's own fork point would be
+            /// missing from it, so it could never be restacked. Refused
+            /// before anything changes, naming the dependent. A task in a
+            /// project of another repository whose recorded stack parent
+            /// happens to have the same name is not a dependent.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_branch_another_branch_builds_on_is_not_restacked() {
+                let _guard = PATH_LOCK.lock().await;
+                for dependent_task in [true, false] {
+                    let name = if dependent_task { "dependent task" } else { "local branch" };
+                    let landed = land(Spec::new(Landing::Squash));
+                    let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                    let (state, _tmp) = build_test_state().await;
+                    let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                    if dependent_task {
+                        let project_id = state.task.tasks.read().await[&task_id].project_id;
+                        let mut grandchild =
+                            create_test_task_full("grandchild work", project_id, TaskStatus::InProgress, 1);
+                        grandchild.branch_name = Some("task-grandchild".to_string());
+                        grandchild.branch_origin = Some(crate::domain::BranchOrigin::Stacked {
+                            parent_branch: "task-branch".to_string(),
+                        });
+                        state.task.tasks.write().await.insert(grandchild.id, grandchild);
+                    } else {
+                        git(&landed.repo.checkout, &["branch", "experiment", "task-branch"]);
+                    }
+
+                    let error = create_pr_inner(&state, &task_id.to_string()).await.expect_err(name);
+
+                    if dependent_task {
+                        assert!(error.contains("grandchild work"), "{name}: {error}");
+                        assert!(error.contains("task-grandchild"), "{name}: {error}");
+                    } else {
+                        assert!(error.contains("experiment"), "{name}: {error}");
+                    }
+                    assert!(error.contains("strand"), "{name}: {error}");
+                    assert_untouched(name, &state, &landed, task_id, &mock).await;
+                }
+
+                let landed = land(Spec::new(Landing::Squash));
+                let elsewhere = RepoFixture::new();
+                let _mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                let other = seed_task(
+                    &state,
+                    elsewhere.checkout.to_str().unwrap(),
+                    Some("task-grandchild"),
+                    TaskStatus::InProgress,
+                )
+                .await;
+                state.task.tasks.write().await.get_mut(&other).unwrap().branch_origin =
+                    Some(crate::domain::BranchOrigin::Stacked { parent_branch: "task-branch".to_string() });
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok(CHILD_PR_URL), "another repository's task");
+                assert_ne!(local_tip(&landed), landed.child_tip, "restacked");
+            }
+
+            /// `gh pr view --json commits` lists only a pull request's first
+            /// 100 commits. A fork point further in is still found, because
+            /// the commits are listed through the REST API, every page read.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fork_point_past_the_first_hundred_parent_commits_is_found() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec { parent_commits_before_a1: 105, ..Spec::new(Landing::Squash) });
+                assert_eq!(landed.pr_commits.last(), Some(&landed.base_commit));
+                assert!(landed.pr_commits.len() > 100);
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok(CHILD_PR_URL), "{}", mock.read_log());
+                let co = &landed.repo.checkout;
+                git(co, &["fetch", "-q", "origin"]);
+                assert_eq!(subjects(co, "origin/main..origin/task-branch"), ["B1", "B2"]);
+            }
+
+            /// GitHub lists at most 250 commits of a pull request. When the
+            /// listing is that long and the fork point is not in it, it may
+            /// simply be past the end, so the refusal says the pull request
+            /// is too long to prove it, not that the parent was rewritten.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_parent_pull_request_too_long_to_list_is_refused_as_unprovable() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec::new(Landing::Squash));
+                let listed: Vec<String> = (0..250).map(|n| format!("{n:040x}")).collect();
+                let mock = MockGh::setup_answering(
+                    CHILD_PR_URL,
+                    r#"{"state":"OPEN"}"#,
+                    &merged_parent_answers_listing(&landed, &listed),
+                );
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let error = create_pr_inner(&state, &task_id.to_string()).await.expect_err("unprovable");
+
+                assert!(error.contains("250"), "{error}");
+                assert!(!error.contains("was rewritten"), "{error}");
+                assert_untouched("too long", &state, &landed, task_id, &mock).await;
+            }
+
+            /// A task that forked from its parent before the parent had any
+            /// commits of its own started from `main`'s commit, which is not
+            /// among the parent's pull request commits and never needed to
+            /// be. Nothing needs rewriting: the pull request is opened, not
+            /// refused.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_task_forked_before_its_parent_had_commits_is_opened_without_a_rewrite() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec { child_forks_before_parent_commits: true, ..Spec::new(Landing::Squash) });
+                assert!(!landed.pr_commits.contains(&landed.base_commit));
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok(CHILD_PR_URL));
+                assert_eq!(
+                    pr_create_tail(&mock.read_log()),
+                    Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "main".into()]),
+                );
+                assert_eq!(local_tip(&landed), landed.child_tip, "no rewrite");
+                let tasks = state.task.tasks.read().await;
+                assert_eq!(tasks[&task_id].base_commit.as_deref(), Some(landed.base_commit.as_str()));
+                assert_eq!(tasks[&task_id].branch_origin, stacked_on_parent());
+            }
+
+            /// A task commit that `main` already made becomes empty when
+            /// replayed, and git drops it. The replayed branch then no longer
+            /// holds each of the task's commits, fails verification, and is
+            /// put back exactly where it was; pull request creation is
+            /// refused with nothing pushed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_replay_that_loses_a_task_commit_is_rolled_back_and_refused() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec { main_has_first_child_change: true, ..Spec::new(Landing::Squash) });
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let error = create_pr_inner(&state, &task_id.to_string()).await.expect_err("unverified");
+
+                assert!(error.contains("did not verify"), "{error}");
+                assert!(error.contains("is back at"), "{error}");
+                assert_untouched("empty replay", &state, &landed, task_id, &mock).await;
+            }
+
+            /// The task's record is compared before the restack is written
+            /// onto it. When the branch, fork point or parent it records
+            /// changed while the rebase ran, the restack is not recorded over
+            /// it: the branch is rolled back and pull request creation is
+            /// refused. A `post-rewrite` hook holds the rebase open while the
+            /// record is changed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_restack_whose_task_changed_meanwhile_is_rolled_back() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec::new(Landing::Squash));
+                let hooks = landed.repo._tmp.path().join("hooks");
+                std::fs::create_dir_all(&hooks).unwrap();
+                let entered = landed.repo._tmp.path().join("hook-entered");
+                let release = landed.repo._tmp.path().join("hook-release");
+                write_executable(
+                    &hooks.join("post-rewrite"),
+                    &format!(
+                        "#!/bin/sh\ncat >/dev/null\ntouch {entered:?}\nwhile [ ! -e {release:?} ]; do sleep 0.05; done\n"
+                    ),
+                );
+                git(&landed.repo.checkout, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                let state = std::sync::Arc::new(state);
+
+                let running = tokio::spawn({
+                    let state = state.clone();
+                    let task_id = task_id.to_string();
+                    async move { create_pr_inner(&state, &task_id).await }
+                });
+                for _ in 0..600 {
+                    if entered.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                assert!(entered.exists(), "the rebase never reached its post-rewrite hook");
+                state.task.tasks.write().await.get_mut(&task_id).unwrap().branch_origin =
+                    Some(crate::domain::BranchOrigin::Stacked { parent_branch: "task-other".to_string() });
+                std::fs::write(&release, "").unwrap();
+                let error = running.await.unwrap().expect_err("changed meanwhile");
+
+                assert!(error.contains("changed while the branch was being restacked"), "{error}");
+                assert!(error.contains("is back at"), "{error}");
+                assert_eq!(local_tip(&landed), landed.child_tip);
+                assert!(!mid_operation(&landed.worktree));
+                assert_eq!(ref_at(&landed.repo.checkout, &backup_ref(task_id)), None);
+                assert_eq!(landed.repo.remote_has_branch("task-branch"), None);
+                assert_eq!(pr_create_tail(&mock.read_log()), None);
+                let tasks = state.task.tasks.read().await;
+                assert_eq!(tasks[&task_id].base_commit.as_deref(), Some(landed.base_commit.as_str()));
+            }
+
+            /// A task with no recorded fork point, or one that is not a full
+            /// object ID, cannot be proven to carry only the parent's landed
+            /// work below its own. It gets exactly what it got before
+            /// restacking existed: the pull request against where the parent
+            /// landed, the branch as it is.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_task_without_a_recorded_fork_point_keeps_the_earlier_behavior() {
+                let _guard = PATH_LOCK.lock().await;
+                for base_commit in [None, Some("abc1234")] {
+                    let landed = land(Spec::new(Landing::Squash));
+                    let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                    let (state, _tmp) = build_test_state().await;
+                    let task_id = seed_stacked_task(&state, &landed, base_commit).await;
+
+                    let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                    assert_eq!(result.as_deref(), Ok(CHILD_PR_URL), "{base_commit:?}");
+                    assert_eq!(
+                        pr_create_tail(&mock.read_log()),
+                        Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "main".into()]),
+                    );
+                    assert_eq!(local_tip(&landed), landed.child_tip, "{base_commit:?}");
+                    assert!(!mock.read_log().contains("\npr\nview\n7\n"), "{base_commit:?}");
+                    let tasks = state.task.tasks.read().await;
+                    assert_eq!(tasks[&task_id].base_commit.as_deref(), base_commit);
+                    assert_eq!(tasks[&task_id].branch_origin, stacked_on_parent());
+                }
+            }
+
+            /// While the parent's pull request is open the task's pull request
+            /// belongs on the parent's branch, and the task's branch is left
+            /// exactly as it is.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_task_whose_parent_is_still_open_is_not_restacked() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec::new(Landing::Squash));
+                let mock = MockGh::setup_answering(
+                    CHILD_PR_URL,
+                    r#"{"state":"OPEN"}"#,
+                    &[any_pr_list_of(
+                        "task-parent",
+                        r#"[{"number":7,"state":"OPEN","baseRefName":"main","isCrossRepository":false}]"#,
+                    )],
+                );
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok(CHILD_PR_URL));
+                assert_eq!(
+                    pr_create_tail(&mock.read_log()),
+                    Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "task-parent".into()]),
+                );
+                assert_eq!(local_tip(&landed), landed.child_tip);
+                assert!(!mock.read_log().contains("\npr\nview\n7\n"), "{}", mock.read_log());
+                let tasks = state.task.tasks.read().await;
+                assert_eq!(tasks[&task_id].base_commit.as_deref(), Some(landed.base_commit.as_str()));
+                assert_eq!(tasks[&task_id].branch_origin, stacked_on_parent());
+            }
+
+            /// Leftovers of an earlier restack that did not finish. A rebase
+            /// of the task's branch still in progress in its worktree is
+            /// aborted only when it is provably SlashIt's: the backup ref
+            /// exists and the branch still points at it, which is what an
+            /// unfinished rebase leaves, since git moves the branch only at
+            /// the end. The restack then runs again from the start. A backup
+            /// that still equals the branch is reused. Anything else (a backup
+            /// the branch no longer equals, with or without a rebase in
+            /// progress, or a rebase SlashIt has no backup for) is refused
+            /// with the backup ref or the rebase named, and nothing is
+            /// aborted, deleted or pushed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_unfinished_earlier_restack_is_recovered_only_when_provably_its_own() {
+                let _guard = PATH_LOCK.lock().await;
+                #[derive(Debug, Clone, Copy)]
+                enum Leftover {
+                    OwnRebaseInProgress,
+                    BackupAtTip,
+                    RebaseWithBackupElsewhere,
+                    BackupElsewhere,
+                    RebaseWithoutBackup,
+                }
+                for leftover in [
+                    Leftover::OwnRebaseInProgress,
+                    Leftover::BackupAtTip,
+                    Leftover::RebaseWithBackupElsewhere,
+                    Leftover::BackupElsewhere,
+                    Leftover::RebaseWithoutBackup,
+                ] {
+                    let landed = land(Spec::new(Landing::Squash));
+                    let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                    let (state, _tmp) = build_test_state().await;
+                    let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                    let backup = backup_ref(task_id);
+                    let wt = &landed.worktree;
+                    let start_rebase = || {
+                        git(wt, &["fetch", "-q", "origin", "main"]);
+                        let (ok, out) = git_status(
+                            wt,
+                            &["rebase", "-x", "false", "--onto", "FETCH_HEAD", &landed.base_commit, "task-branch"],
+                        );
+                        assert!(!ok, "the rebase must stop part way: {out}");
+                        assert!(mid_operation(wt));
+                    };
+                    match leftover {
+                        Leftover::OwnRebaseInProgress => {
+                            git(wt, &["update-ref", &backup, &landed.child_tip, ""]);
+                            start_rebase();
+                        }
+                        Leftover::BackupAtTip => {
+                            git(wt, &["update-ref", &backup, &landed.child_tip, ""]);
+                        }
+                        Leftover::RebaseWithBackupElsewhere => {
+                            git(wt, &["update-ref", &backup, &landed.base_commit, ""]);
+                            start_rebase();
+                        }
+                        Leftover::BackupElsewhere => {
+                            git(wt, &["update-ref", &backup, &landed.base_commit, ""]);
+                        }
+                        Leftover::RebaseWithoutBackup => start_rebase(),
+                    }
+
+                    let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                    match leftover {
+                        Leftover::OwnRebaseInProgress | Leftover::BackupAtTip => {
+                            assert_eq!(result.as_deref(), Ok(CHILD_PR_URL), "{leftover:?}");
+                            assert!(!mid_operation(wt), "{leftover:?}");
+                            let co = &landed.repo.checkout;
+                            git(co, &["fetch", "-q", "origin"]);
+                            assert_eq!(subjects(co, "origin/main..origin/task-branch"), ["B1", "B2"], "{leftover:?}");
+                            assert_eq!(ref_at(co, &backup), None, "{leftover:?}");
+                            let tasks = state.task.tasks.read().await;
+                            assert_eq!(tasks[&task_id].branch_origin, Some(crate::domain::BranchOrigin::DefaultBase));
+                        }
+                        Leftover::RebaseWithBackupElsewhere | Leftover::BackupElsewhere => {
+                            let error = result.expect_err("refused");
+                            assert!(error.contains(&backup), "{leftover:?}: {error}");
+                            assert_eq!(
+                                ref_at(&landed.repo.checkout, &backup).as_deref(),
+                                Some(landed.base_commit.as_str()),
+                                "{leftover:?}: the backup is kept"
+                            );
+                            assert_eq!(local_tip(&landed), landed.child_tip, "{leftover:?}");
+                            assert_eq!(
+                                mid_operation(wt),
+                                matches!(leftover, Leftover::RebaseWithBackupElsewhere),
+                                "{leftover:?}: a rebase that is not provably SlashIt's is not aborted"
+                            );
+                            assert_eq!(landed.repo.remote_has_branch("task-branch"), None, "{leftover:?}");
+                            assert_eq!(pr_create_tail(&mock.read_log()), None, "{leftover:?}");
+                        }
+                        Leftover::RebaseWithoutBackup => {
+                            let error = result.expect_err("refused");
+                            assert!(error.contains("in the middle of a rebase"), "{error}");
+                            assert!(mid_operation(wt), "a rebase SlashIt did not start is left alone");
+                            assert_eq!(local_tip(&landed), landed.child_tip);
+                            assert_eq!(ref_at(&landed.repo.checkout, &backup), None);
+                            assert_eq!(landed.repo.remote_has_branch("task-branch"), None);
+                            assert_eq!(pr_create_tail(&mock.read_log()), None);
+                        }
+                    }
+                }
+            }
+
+            /// A task whose worktree is gone cannot be restacked there, and
+            /// SlashIt does not create one on its own. Opening the branch as
+            /// it is would list the parent's commits, so it is refused.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_task_that_needs_a_restack_but_has_no_worktree_is_refused() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec::new(Landing::Squash));
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                state.task.tasks.write().await.get_mut(&task_id).unwrap().worktree_path = None;
+
+                let error = create_pr_inner(&state, &task_id.to_string()).await.expect_err("refused");
+
+                assert!(error.contains("no worktree"), "{error}");
+                assert_untouched("no worktree", &state, &landed, task_id, &mock).await;
+            }
+
+            /// A restack is recorded on the task in one durable write before
+            /// anything is pushed. When that write fails, the replayed branch
+            /// does not stay behind a task record that still names the old
+            /// fork point and parent: it is rolled back to its old tip, the
+            /// backup is retired once that is verified, and pull request
+            /// creation is refused with nothing pushed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_restack_the_task_cannot_record_is_rolled_back() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec::new(Landing::Squash));
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                std::fs::create_dir_all(state.storage.paths().config_dir()).unwrap();
+                block_task_persistence(&state.storage);
+
+                let error = create_pr_inner(&state, &task_id.to_string()).await.expect_err("refused");
+
+                assert!(error.contains("could not record the restack"), "{error}");
+                assert!(error.contains("is back at"), "{error}");
+                assert_untouched("unrecorded restack", &state, &landed, task_id, &mock).await;
+            }
+
+            /// The `jj` on `PATH`, when there is one that runs: the version
+            /// `mise.toml` pins, on CI and under `mise exec`.
+            fn installed_jj() -> Option<PathBuf> {
+                let runs = StdCommand::new("jj").arg("--version").output().is_ok_and(|o| o.status.success());
+                runs.then(|| PathBuf::from("jj"))
+            }
+
+            /// In a jj-colocated repository the restack is still a Git ref
+            /// update. The push path's `jj git export` must not undo it or
+            /// leave the bookmark conflicted: jj imports the moved branch, and
+            /// the restacked commits are what is pushed and what jj's
+            /// bookmark names afterwards. Skipped where no `jj` is installed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_restack_in_a_jj_colocated_repository_is_what_jj_sees_and_pushes() {
+                let _guard = PATH_LOCK.lock().await;
+                let Some(jj_bin) = installed_jj() else {
+                    eprintln!("skipped: no jj is installed");
+                    return;
+                };
+                let landed = land(Spec::new(Landing::Squash));
+                let jj_at = |args: &[&str]| {
+                    let output = StdCommand::new(&jj_bin)
+                        .args(args)
+                        .current_dir(&landed.repo.checkout)
+                        .env("JJ_USER", "Test")
+                        .env("JJ_EMAIL", "test@example.com")
+                        .output()
+                        .expect("run jj");
+                    assert!(output.status.success(), "jj {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                };
+                jj_at(&["git", "init", "--colocate"]);
+                assert_eq!(
+                    jj_at(&["log", "--no-graph", "-r", "task-branch", "-T", "commit_id"]),
+                    landed.child_tip
+                );
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok(CHILD_PR_URL), "{}", mock.read_log());
+                let tip = local_tip(&landed);
+                assert_ne!(tip, landed.child_tip);
+                assert_eq!(landed.repo.remote_has_branch("task-branch").as_deref(), Some(tip.as_str()));
+                assert_eq!(
+                    jj_at(&["log", "--no-graph", "-r", "task-branch", "-T", "commit_id"]),
+                    tip,
+                    "jj's bookmark follows the restacked branch"
+                );
+                assert_eq!(local_tip(&landed), tip, "a jj command afterwards leaves the branch where it is");
+                let bookmarks = jj_at(&["bookmark", "list", "task-branch"]);
+                assert!(!bookmarks.contains("conflict"), "{bookmarks}");
+            }
         }
 
         // ──────────────────────────────────────────────
