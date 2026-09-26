@@ -2335,7 +2335,7 @@ async fn create_pr_reserved(
     // tree at `working_dir`. A `Done` task has no worktree by construction --
     // see `resolve_task_workspace` -- and its branch is preserved specifically
     // so it can still be delivered without recreating a checkout nobody asked
-    // for. See `push_branch` for why its jj path passes
+    // for. See `push_branch` for why its `jj git export` passes
     // `--ignore-working-copy`: without it, this directory being the user's
     // own primary checkout would silently fold whatever the user has dirty
     // into their own current change.
@@ -2982,40 +2982,41 @@ fn build_pr_body(task: &Task) -> String {
 /// bookmark rather than one. There is no caller that legitimately does not know
 /// which branch it means, so the parameter that allowed it is gone.
 ///
-/// Both jj invocations pass `--ignore-working-copy`. `jj`'s default behavior is
-/// to snapshot the working copy at the start of nearly every command -- including
-/// `git export` and `git push` -- folding whatever is dirty in `working_dir` into
-/// the current change. That is fine when `working_dir` is a task's own worktree,
-/// but this function is also reached with the repository root as `working_dir`
-/// (a `Done` task has no worktree of its own), where that same default would
-/// silently mutate the user's own primary checkout as a side effect of pushing a
-/// named branch that has nothing to do with it. `--ignore-working-copy` makes
-/// both commands operate purely on refs, which is all a push ever needs.
+/// The push itself is always `git push`, in a jj repository too. The task
+/// branch is a Git branch -- created by `git worktree`, git-spice or `wt` --
+/// and `git push -u` is exact about it: it fails when the branch does not
+/// exist, refuses a non-fast-forward update, and records the upstream the
+/// branch then tracks. `jj git push --bookmark` differs on all three: it
+/// reports success and pushes nothing for a bookmark that does not exist,
+/// moves the remote sideways after a rewrite (it is closer to
+/// `--force-with-lease`), and writes no upstream into the Git config. This
+/// used to try `jj git push --allow-new` first and fall back to `git push`;
+/// current jj rejects `--allow-new`, so with it every push already ended on
+/// the `git push` path.
+///
+/// In a jj repository, `jj git export` runs first so that a bookmark moved by
+/// jj (a rewrite of the task's commit, say) is what the Git branch -- and so
+/// the push -- sees. It passes `--ignore-working-copy`: `jj` snapshots the
+/// working copy at the start of nearly every command, folding whatever is
+/// dirty in `working_dir` into the current change. That is fine when
+/// `working_dir` is a task's own worktree, but this function is also reached
+/// with the repository root as `working_dir` (a `Done` task has no worktree of
+/// its own), where that same default would silently mutate the user's own
+/// primary checkout as a side effect of pushing a named branch that has
+/// nothing to do with it.
 ///
 /// The branch is checked by [`checked_task_branch`] and, separately, never
-/// reaches either program as a bare argument: `git` gets `--` and a fully
-/// qualified `refs/heads/<b>:refs/heads/<b>` refspec, and `jj` gets an
-/// `exact:` bookmark pattern (a bare `--bookmark` value is a glob).
+/// reaches `git` as a bare argument: it gets `--` and a fully qualified
+/// `refs/heads/<b>:refs/heads/<b>` refspec.
 async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> {
     let branch = checked_task_branch(branch)?;
-    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-    let git_push = ["push", "-u", "--", "origin", refspec.as_str()];
     if is_jj_repo(working_dir).await {
         run_cmd("jj", &["--ignore-working-copy", "git", "export"], working_dir).await
             .map_err(|e| format!("jj git export failed: {}", e))?;
-        let bookmark = format!("exact:{branch}");
-        if let Err(jj_err) = run_cmd(
-            "jj",
-            &["--ignore-working-copy", "git", "push", "--allow-new", "--bookmark", &bookmark],
-            working_dir,
-        ).await {
-            run_cmd("git", &git_push, working_dir).await
-                .map_err(|git_err| format!("Push failed. jj: {}. git: {}", jj_err, git_err))?;
-        }
-        return Ok(branch.to_string());
     }
 
-    run_cmd("git", &git_push, working_dir).await
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    run_cmd("git", &["push", "-u", "--", "origin", &refspec], working_dir).await
         .map_err(|e| format!("git push failed: {}", e))?;
     Ok(branch.to_string())
 }
@@ -4333,13 +4334,12 @@ mod tests {
             assert_eq!(repo.worktree_count(), 1, "no worktree may be created merely to push");
         }
 
-        /// Same proof for the jj-colocated path, plus the defect this closure
-        /// found by source inspection: `jj git export`/`jj git push` snapshot
-        /// the working copy by default (nearly every jj command does), which
-        /// would fold the user's own dirty state into their own current change
-        /// if this ran without `--ignore-working-copy` -- exactly the failure
-        /// mode this whole unit exists to close, reached through the fix
-        /// itself rather than around it.
+        /// Same proof for the jj-colocated path. `jj git export` snapshots the
+        /// working copy by default (nearly every jj command does), so without
+        /// `--ignore-working-copy` pushing a task's branch from the repository
+        /// root would fold the user's own dirty state into their own current
+        /// change. The push also records the branch's upstream, as it does
+        /// without jj.
         #[tokio::test]
         async fn push_branch_targets_only_the_named_branch_jj_without_snapshotting_the_dirty_primary_checkout()
         {
@@ -4380,6 +4380,32 @@ mod tests {
                 "dirty untracked",
                 "the dirty file must still be exactly what the user left, not folded into a commit"
             );
+            assert_eq!(git(&repo.checkout, &["config", "branch.task-branch.remote"]), "origin");
+            assert_eq!(
+                git(&repo.checkout, &["config", "branch.task-branch.merge"]),
+                "refs/heads/task-branch"
+            );
+        }
+
+        /// A jj repository pushes with `git push` alone. `jj git push
+        /// --bookmark exact:<b>` exits 0 and pushes nothing when the bookmark
+        /// does not exist ("No matching bookmarks"), so the push must fail
+        /// the way `git push` does, and a task whose branch is gone is never
+        /// reported as pushed. The error is git's own: this path no longer
+        /// tries `jj git push --allow-new` first, an argument jj rejects,
+        /// whose failure used to lead every such error.
+        #[tokio::test]
+        async fn push_branch_fails_for_a_missing_branch_in_a_jj_repository() {
+            let repo = RepoFixture::new();
+            repo.colocate_jj();
+
+            let err = push_branch(repo.checkout.to_str().unwrap(), "task-gone")
+                .await
+                .expect_err("a branch that does not exist must not push");
+
+            assert!(err.starts_with("git push failed:"), "unexpected error: {err}");
+            assert!(!err.contains("jj:"), "no jj push may be attempted: {err}");
+            assert!(repo.remote_has_branch("task-gone").is_none());
         }
 
         /// A task's `branch_name` is read back from `tasks.toml`, which for an
@@ -4405,8 +4431,8 @@ mod tests {
             assert!(result.is_err(), "an option-shaped branch must be refused, got {result:?}");
         }
 
-        /// The same refusal through the jj-colocated path, whose `git push`
-        /// fallback is the one that actually runs.
+        /// The same refusal through the jj-colocated path, which pushes with
+        /// `git push` as well.
         #[tokio::test]
         async fn push_branch_refuses_an_option_shaped_branch_in_a_jj_repository() {
             let repo = RepoFixture::new();
