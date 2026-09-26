@@ -1493,6 +1493,12 @@ fn render_review_item(
     let comment_id = item.comment_id;
     let related = plan.get_untracked()
         .and_then(|p| comment_id.and_then(|id| p.comments.into_iter().find(|c| c.id == Some(id))));
+    // Only a collaborator's Fix is approved automatically; anyone else's
+    // waits for the checkbox. The backend applies the same rule on triage.
+    let from_collaborator = related.as_ref().is_some_and(|c| c.author_is_collaborator());
+    let association = related.as_ref()
+        .and_then(|c| c.author_association.clone())
+        .unwrap_or_else(|| "UNKNOWN".to_string());
 
     // Apply a mutation to the item at `idx` inside the (possibly absent) plan.
     let update_item = move |mutate: &dyn Fn(&mut PrReviewItem)| {
@@ -1513,10 +1519,10 @@ fn render_review_item(
             "skip" => PrReviewDecisionKind::Skip,
             _ => PrReviewDecisionKind::Question,
         };
-        let approved = matches!(decision, PrReviewDecisionKind::Fix);
+        let is_fix = matches!(decision, PrReviewDecisionKind::Fix);
         update_item(&|it| {
             it.decision = decision.clone();
-            it.approved = approved;
+            it.approved = is_fix && (from_collaborator || it.approved);
         });
     };
     let on_reasoning_input = move |ev: leptos::ev::Event| {
@@ -1574,6 +1580,14 @@ fn render_review_item(
                     <div class="flex items-center gap-2 flex-wrap text-xs text-white/45">
                         <span class="font-mono">{location}</span>
                         {(!author.is_empty()).then(|| view! { <span>"-"</span> <span>{author}</span> })}
+                        {(related.is_some() && !from_collaborator).then(|| view! {
+                            <span
+                                class="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 font-medium text-[10px]"
+                                title=format!("GitHub association: {association}. Comments from outside the repository's collaborators are never approved automatically; tick the box to include this item.")
+                            >
+                                "Not a collaborator: approve explicitly"
+                            </span>
+                        })}
                         {comment_id.map(|id| view! { <span class="opacity-60">{format!("(id {})", id)}</span> })}
                         {comment_url.map(|url| {
                             let url_for_click = url.clone();

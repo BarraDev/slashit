@@ -1,4 +1,4 @@
-use crate::agents::runner::{ClaudeRunner, ClaudeRunConfig, ClaudeEvent};
+use crate::agents::runner::{ClaudeRunner, ClaudeRunConfig, ClaudeEvent, ToolAccess};
 use crate::domain::{Task, TaskStatus, TaskPhase, AgentExecution, AgentStatus, AgentLogEntry, LogLevel, QaSignoff, QaStatus};
 use crate::queue::admission::{Admission, AdmissionPermit};
 use crate::queue::prompt::{build_task_prompt, build_review_prompt, build_fix_prompt};
@@ -10,6 +10,57 @@ use crate::events::{EventSink, SharedEventSink};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+/// A finished agent run inside the review flow.
+struct AgentRun {
+    /// The CLI exited successfully and reported no error result.
+    success: bool,
+    /// Why the run did not succeed, when the runner said.
+    failure: Option<String>,
+    output: String,
+}
+
+/// What the AI reviewer concluded.
+#[derive(Debug, PartialEq, Eq)]
+enum ReviewVerdict {
+    Approved,
+    ChangesRequested,
+    /// No verdict: the run failed, or it ended without one.
+    Failed(String),
+}
+
+/// Whether the last line naming a verdict says `VERDICT: APPROVED`, with
+/// Markdown emphasis and code marks on that line ignored
+/// (`VERDICT: **APPROVED**`).
+fn final_verdict_is_approved(output: &str) -> bool {
+    output
+        .lines()
+        .rev()
+        .find(|line| line.contains("VERDICT"))
+        .is_some_and(|line| {
+            let plain: String = line.chars().filter(|c| !matches!(c, '*' | '_' | '`')).collect();
+            plain.contains("VERDICT: APPROVED")
+        })
+}
+
+/// The verdict of a reviewer run. Only a successful run whose final verdict
+/// line says `VERDICT: APPROVED` (and that requests no changes) approves; a
+/// failed run, or one with no verdict at all, is [`ReviewVerdict::Failed`].
+fn review_verdict(run: &AgentRun) -> ReviewVerdict {
+    if !run.success {
+        let reason = run.failure.clone().unwrap_or_else(|| "the reviewer run did not succeed".to_string());
+        return ReviewVerdict::Failed(reason);
+    }
+    if run.output.contains("CHANGES_REQUESTED") {
+        ReviewVerdict::ChangesRequested
+    } else if final_verdict_is_approved(&run.output) {
+        ReviewVerdict::Approved
+    } else if run.output.trim().is_empty() {
+        ReviewVerdict::Failed("the reviewer produced no output".to_string())
+    } else {
+        ReviewVerdict::Failed("the reviewer gave no verdict".to_string())
+    }
+}
 
 /// Event emitted to the frontend via Tauri events.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1185,17 +1236,21 @@ impl TaskExecutor {
             let runner = match ClaudeRunner::start(ClaudeRunConfig {
                 prompt,
                 working_dir: claude_cwd.clone(),
-                allowed_tools: vec![
-                    "Read".to_string(), "Edit".to_string(), "Write".to_string(),
-                    "Bash".to_string(), "Glob".to_string(), "Grep".to_string(),
-                ],
+                // `permission_mode: None` passes --dangerously-skip-permissions.
+                tools: ToolAccess::Full {
+                    auto_approve: vec![
+                        "Read".to_string(), "Edit".to_string(), "Write".to_string(),
+                        "Bash".to_string(), "Glob".to_string(), "Grep".to_string(),
+                    ],
+                    permission_mode: None,
+                },
                 max_turns: Some(50),
                 max_budget_usd: None,
                 session_id: Some(Uuid::new_v4().to_string()),
                 resume_session: None,
                 model: task_model,
                 system_prompt: None,
-                permission_mode: None, // defaults to --dangerously-skip-permissions
+                append_system_prompt: None,
                 disable_mcp: false,
                 additional_dirs: claude_add_dirs.clone(),
             }).await {
@@ -1836,13 +1891,14 @@ impl TaskExecutor {
     /// is met with this function's own `kill()` before it returns -- never a
     /// caller racing the whole call from outside.
     ///
-    /// `Ok(Some(output))` is a normal completion; `Ok(None)` is a graceful
-    /// decline (cancelled before start, or cancelled during `wait()` and
-    /// killed); `Err` is a real failure to start.
+    /// `Ok(Some(run))` is a completed run, successful or not (see
+    /// [`AgentRun::success`]); `Ok(None)` is a graceful decline (cancelled
+    /// before start, or cancelled during `wait()` and killed); `Err` is a
+    /// real failure to start.
     async fn run_cancellable_agent(
         config: ClaudeRunConfig,
         cancelled: &mut tokio::sync::watch::Receiver<bool>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<AgentRun>, String> {
         if *cancelled.borrow() {
             return Ok(None);
         }
@@ -1850,10 +1906,11 @@ impl TaskExecutor {
         tokio::select! {
             biased;
             result = runner.wait() => {
-                let _success = result.unwrap_or(false);
+                let success = matches!(result, Ok(true));
+                let failure = result.err();
                 let output = runner.get_output().await;
                 let _ = runner.kill().await;
-                Ok(Some(output))
+                Ok(Some(AgentRun { success, failure, output }))
             }
             _ = cancelled.changed() => {
                 let _ = runner.kill().await;
@@ -2109,26 +2166,32 @@ impl TaskExecutor {
                     ClaudeRunConfig {
                         prompt: review_prompt,
                         working_dir: working_dir_for_claude,
-                        allowed_tools: vec![
-                            "Read".to_string(), "Glob".to_string(), "Grep".to_string(),
-                        ],
+                        // The reviewer only reads. `ReadOnly` is what makes
+                        // that true: an approval list alone would still leave
+                        // it Bash, Edit and the network.
+                        tools: ToolAccess::ReadOnly,
                         max_turns: Some(10),
                         max_budget_usd: None,
                         session_id: Some(Uuid::new_v4().to_string()),
                         resume_session: None,
                         model: None,
                         system_prompt: None,
-                        permission_mode: None,
-                        disable_mcp: false,
+                        append_system_prompt: None,
+                        disable_mcp: true,
                         additional_dirs: Vec::new(),
                     },
                     &mut cancelled_for_claude,
                 )
                 .await
                 {
-                    Ok(Some(output)) => output,
-                    Ok(None) => String::new(), // cancelled; the outer check below stops this flow
-                    Err(e) => format!("Claude review error: {}", e),
+                    Ok(Some(run)) => run,
+                    // Cancelled; the outer check below stops this flow.
+                    Ok(None) => AgentRun { success: false, failure: None, output: String::new() },
+                    Err(e) => AgentRun {
+                        success: false,
+                        failure: Some(format!("the reviewer could not start: {e}")),
+                        output: String::new(),
+                    },
                 }
             };
 
@@ -2177,8 +2240,32 @@ impl TaskExecutor {
                 return;
             }
 
+            // A reviewer run that failed, or ended without a verdict, has
+            // not reviewed anything, and must not read as a pass.
+            let has_claude_issues = match review_verdict(&claude_result) {
+                ReviewVerdict::ChangesRequested => true,
+                ReviewVerdict::Approved => false,
+                ReviewVerdict::Failed(reason) => {
+                    let message = format!("AI review failed, so the change is not approved: {reason}");
+                    events.agent_event(AgentEvent::Log {
+                        task_id: task_id_str.clone(),
+                        level: LogLevel::Error,
+                        message: message.clone(),
+                    });
+                    let signoff = QaSignoff {
+                        status: QaStatus::Rejected,
+                        issues_found: vec![message],
+                        timestamp: chrono::Utc::now(),
+                        session_id: Uuid::new_v4(),
+                    };
+                    Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff)).await;
+                    reviewing_handles.write().await.remove(&task_id);
+                    return;
+                }
+            };
+            let claude_result = claude_result.output;
+
             // Merge findings
-            let has_claude_issues = claude_result.contains("CHANGES_REQUESTED");
             let has_coderabbit_issues = !coderabbit_result.is_empty()
                 && !coderabbit_result.starts_with("CodeRabbit error:")
                 && !coderabbit_result.starts_with("CodeRabbit warning:");
@@ -2219,17 +2306,23 @@ impl TaskExecutor {
                     ClaudeRunConfig {
                         prompt: fix_prompt,
                         working_dir: working_dir.clone(),
-                        allowed_tools: vec![
-                            "Read".to_string(), "Edit".to_string(), "Write".to_string(),
-                            "Glob".to_string(), "Grep".to_string(),
-                        ],
+                        // An approval list under --dangerously-skip-permissions:
+                        // the fix agent still has the full default tool set,
+                        // Bash included.
+                        tools: ToolAccess::Full {
+                            auto_approve: vec![
+                                "Read".to_string(), "Edit".to_string(), "Write".to_string(),
+                                "Glob".to_string(), "Grep".to_string(),
+                            ],
+                            permission_mode: None,
+                        },
                         max_turns: Some(20),
                         max_budget_usd: None,
                         session_id: Some(Uuid::new_v4().to_string()),
                         resume_session: None,
                         model: None,
                         system_prompt: None,
-                        permission_mode: None,
+                        append_system_prompt: None,
                         disable_mcp: false,
                         additional_dirs: Vec::new(),
                     },
@@ -4608,7 +4701,9 @@ mod tests {
 
         /// A stand-in `claude` binary that plays either the reviewer role
         /// (its `--allowedTools` has neither `Edit` nor `Bash`) or the fix
-        /// role (`--allowedTools` has `Edit`). Whichever role equals
+        /// role (`--allowedTools` has `Edit`). Only the `--allowedTools`
+        /// value is read: the reviewer's `--disallowedTools` names `Edit`
+        /// too. Whichever role equals
         /// `block_role` blocks until killed, recording its own pid; every
         /// other invocation exits immediately reporting an issue, which is
         /// what drives the flow from the reviewer into the fix agent.
@@ -4629,9 +4724,13 @@ mod tests {
                     "#!/bin/sh\n\
                      printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-fixture\",\"model\":\"fixture-model\"}}\\n'\n\
                      role=review\n\
-                     case \"$*\" in\n\
-                     \x20 *Edit*) role=fix ;;\n\
-                     esac\n\
+                     prev=\n\
+                     for a in \"$@\"; do\n\
+                     \x20 if [ \"$prev\" = --allowedTools ]; then\n\
+                     \x20   case \"$a\" in *Edit*) role=fix ;; esac\n\
+                     \x20 fi\n\
+                     \x20 prev=$a\n\
+                     done\n\
                      if [ \"$role\" = {block_role:?} ]; then\n\
                      \x20 printf '%s\\n' \"$$\" > {pidfile:?}\n\
                      \x20 exec sleep 300\n\
@@ -4727,6 +4826,167 @@ mod tests {
             task.worktree_path = Some(worktree_path.to_string());
             task.base_commit = Some(base_commit.to_string());
             task
+        }
+
+        /// The reviewer's verdict gate, driven through the real
+        /// `spawn_review` with a stand-in `claude` that records its argv.
+        mod verdict_gate {
+            use super::*;
+
+            struct MockReviewer {
+                _tmp: tempfile::TempDir,
+                args_file: std::path::PathBuf,
+                saved_path: Option<String>,
+            }
+
+            impl MockReviewer {
+                /// `result` is the reviewer's result text; `exit` its status.
+                fn install(result: &str, exit: i32) -> Self {
+                    let tmp = tempfile::tempdir().expect("tempdir");
+                    let bin_dir = tmp.path().join("bin");
+                    std::fs::create_dir_all(&bin_dir).unwrap();
+                    let args_file = tmp.path().join("args");
+                    let result_json = serde_json::to_string(result).unwrap();
+                    let script = format!(
+                        "#!/bin/sh\n\
+                         for a in \"$@\"; do printf '%s\\n' \"$a\" >> {args:?}; done\n\
+                         printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"model\":\"m\"}}\\n'\n\
+                         printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"result\":{result_json}}}'\n\
+                         exit {exit}\n",
+                        args = args_file,
+                    );
+                    let bin = bin_dir.join("claude");
+                    std::fs::write(&bin, &script).unwrap();
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+                    let saved_path = std::env::var("PATH").ok();
+                    let new_path = match &saved_path {
+                        Some(p) => format!("{}:{}", bin_dir.display(), p),
+                        None => bin_dir.display().to_string(),
+                    };
+                    // Safety: serialized via PATH_LOCK; restored on Drop.
+                    unsafe { std::env::set_var("PATH", new_path) };
+                    MockReviewer { _tmp: tmp, args_file, saved_path }
+                }
+
+                fn args(&self) -> Vec<String> {
+                    std::fs::read_to_string(&self.args_file)
+                        .unwrap_or_default()
+                        .lines()
+                        .map(str::to_string)
+                        .collect()
+                }
+            }
+
+            impl Drop for MockReviewer {
+                fn drop(&mut self) {
+                    unsafe {
+                        match &self.saved_path {
+                            Some(p) => std::env::set_var("PATH", p),
+                            None => std::env::remove_var("PATH"),
+                        }
+                    }
+                }
+            }
+
+            /// Run one AI review to completion and return the recorded signoff.
+            async fn review_once(mock: &MockReviewer) -> QaSignoff {
+                let (executor, _temps) = test_executor();
+                // Only the Claude reviewer is under test, not a CodeRabbit CLI
+                // that may or may not be installed on this machine.
+                let config = crate::config::queue::QueueConfig {
+                    use_coderabbit: false,
+                    ..Default::default()
+                };
+                executor.queue_manager.write().await.set_config(config).await;
+                let (repo, base_commit) = git_repo_with_change();
+                let task = reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+                let task_id = task.id;
+                executor.tasks.write().await.insert(task_id, task);
+
+                executor.spawn_review(task_id).await;
+                for _ in 0..400 {
+                    let done = executor.reviewing_handles.read().await.is_empty();
+                    if done {
+                        let tasks = executor.tasks.read().await;
+                        let t = tasks.get(&task_id).expect("task still exists");
+                        assert_eq!(t.status, TaskStatus::HumanReview);
+                        assert!(!mock.args().is_empty(), "the stand-in reviewer ran");
+                        return t.qa_signoff.clone().expect("the review records a signoff");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("the review never finished");
+            }
+
+            fn run(success: bool, output: &str) -> AgentRun {
+                AgentRun { success, failure: None, output: output.to_string() }
+            }
+
+            #[test]
+            fn only_a_successful_run_with_an_approval_verdict_approves() {
+                assert_eq!(review_verdict(&run(true, "ok
+VERDICT: APPROVED")), ReviewVerdict::Approved);
+                assert_eq!(
+                    review_verdict(&run(true, "VERDICT: CHANGES_REQUESTED
+- ISSUE: [high] a:1 - b")),
+                    ReviewVerdict::ChangesRequested
+                );
+                assert!(matches!(review_verdict(&run(false, "VERDICT: APPROVED")), ReviewVerdict::Failed(_)));
+                assert!(matches!(review_verdict(&run(true, "")), ReviewVerdict::Failed(_)));
+                assert!(matches!(review_verdict(&run(true, "Looks fine to me.")), ReviewVerdict::Failed(_)));
+                assert_eq!(review_verdict(&run(true, "ok\nVERDICT: **APPROVED**")), ReviewVerdict::Approved);
+                assert_eq!(review_verdict(&run(true, "`VERDICT: APPROVED`")), ReviewVerdict::Approved);
+                assert!(matches!(
+                    review_verdict(&run(true, "VERDICT: APPROVED\nVERDICT: pending")),
+                    ReviewVerdict::Failed(_)
+                ), "only the final verdict line counts");
+                assert!(matches!(review_verdict(&run(false, "VERDICT: **APPROVED**")), ReviewVerdict::Failed(_)));
+                let failed = AgentRun { failure: Some("exit 2".into()), ..run(false, "") };
+                assert_eq!(review_verdict(&failed), ReviewVerdict::Failed("exit 2".into()));
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_reviewer_that_exits_non_zero_does_not_approve() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("VERDICT: APPROVED", 1);
+                let signoff = review_once(&mock).await;
+                assert_eq!(signoff.status, QaStatus::Rejected);
+                assert!(
+                    signoff.issues_found.iter().any(|i| i.starts_with("AI review failed")),
+                    "{:?}", signoff.issues_found
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_reviewer_with_empty_output_does_not_approve() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("", 0);
+                let signoff = review_once(&mock).await;
+                assert_eq!(signoff.status, QaStatus::Rejected);
+                assert!(
+                    signoff.issues_found.iter().any(|i| i.contains("no output")),
+                    "{:?}", signoff.issues_found
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_explicit_approval_still_approves_and_the_reviewer_runs_read_only() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install("Looks good.\nVERDICT: APPROVED", 0);
+                let signoff = review_once(&mock).await;
+                assert_eq!(signoff.status, QaStatus::Approved);
+
+                let args = mock.args();
+                let value_of = |flag: &str| {
+                    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+                };
+                assert_eq!(value_of("--tools").as_deref(), Some("Read,Glob,Grep"), "{args:?}");
+                assert_eq!(value_of("--permission-mode").as_deref(), Some("dontAsk"), "{args:?}");
+                assert!(args.iter().any(|a| a == "--restricted"), "{args:?}");
+                assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
+                assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"), "{args:?}");
+            }
         }
 
         /// RED: today, `stop_task` only ever looks at `running_handles`.

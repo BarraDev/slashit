@@ -150,6 +150,8 @@ pub struct PrReviewComment {
     pub id: Option<u64>,
     pub kind: PrCommentKind,
     pub author: String,
+    #[serde(default)]
+    pub author_association: Option<String>,
     pub body: String,
     #[serde(default)]
     pub path: Option<String>,
@@ -161,6 +163,17 @@ pub struct PrReviewComment {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl PrReviewComment {
+    /// Mirrors the backend rule of the same name: only an owner, member or
+    /// collaborator's Fix items may start out approved.
+    pub fn author_is_collaborator(&self) -> bool {
+        matches!(
+            self.author_association.as_deref(),
+            Some("OWNER" | "MEMBER" | "COLLABORATOR")
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
