@@ -307,10 +307,16 @@ async fn stop_a_running_task(
         );
     }
     let prompt = invocation
-        .flag("-p")
-        .context("the agent was invoked without a prompt")?;
+        .prompt
+        .as_deref()
+        .context("the agent was invoked without reading a prompt from stdin")?;
     if prompt.is_empty() {
         bail!("the agent was invoked with an empty prompt");
+    }
+    // The prompt travels on stdin only, where other local processes cannot
+    // read it and no argument size limit applies.
+    if let Some(leaked) = invocation.args.iter().find(|arg| arg.to_string_lossy().contains(prompt)) {
+        bail!("the prompt was also passed as an argument: {leaked:?}");
     }
 
     // And it ran where the product's own executions run.
@@ -881,10 +887,16 @@ async fn execute_one_task(
         );
     }
     let prompt = invocation
-        .flag("-p")
-        .context("the agent was invoked without a prompt")?;
+        .prompt
+        .as_deref()
+        .context("the agent was invoked without reading a prompt from stdin")?;
     if prompt.is_empty() {
         bail!("the agent was invoked with an empty prompt");
+    }
+    // The prompt travels on stdin only, where other local processes cannot
+    // read it and no argument size limit applies.
+    if let Some(leaked) = invocation.args.iter().find(|arg| arg.to_string_lossy().contains(prompt)) {
+        bail!("the prompt was also passed as an argument: {leaked:?}");
     }
 
     // And it ran inside a worktree this run owns, not in the repository and
@@ -1309,7 +1321,7 @@ async fn card_titles(column: &WebElement) -> Result<Vec<String>> {
 /// control.
 ///
 /// A run is identified by the flag the runner always passes and the probe
-/// never does: the prompt.
+/// never does: `-p`, which makes the CLI read its prompt from stdin.
 fn agent_runs(agent: &FakeAgent) -> Result<Vec<fake_agent::Invocation>> {
     Ok(agent
         .invocations()?
@@ -3525,10 +3537,11 @@ mod tests {
     fn run(session: &str, working_dir: &str) -> fake_agent::Invocation {
         fake_agent::Invocation {
             working_dir: PathBuf::from(working_dir),
-            args: ["-p", "do the work", "--session-id", session]
+            args: ["-p", "--session-id", session]
                 .iter()
                 .map(OsString::from)
                 .collect(),
+            prompt: Some("do the work".to_string()),
         }
     }
 
@@ -3647,7 +3660,8 @@ mod tests {
     fn run_without_a_session(working_dir: &str) -> fake_agent::Invocation {
         fake_agent::Invocation {
             working_dir: PathBuf::from(working_dir),
-            args: ["-p", "do the work"].iter().map(OsString::from).collect(),
+            args: ["-p"].iter().map(OsString::from).collect(),
+            prompt: Some("do the work".to_string()),
         }
     }
 

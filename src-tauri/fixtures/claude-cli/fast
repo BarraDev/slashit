@@ -1,4 +1,6 @@
 #!/bin/sh
+# Reads its prompt to EOF first, as `claude -p` does.
+cat > /dev/null
 printf '{"type":"system","subtype":"init","session_id":"s-fast","model":"fixture-model"}\n'
 printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-fast","result":"done"}\n'
 exit 0

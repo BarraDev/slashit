@@ -1,4 +1,6 @@
 #!/bin/sh
+# Reads its prompt to EOF first, as `claude -p` does.
+cat > /dev/null
 printf '{"type":"system","subtype":"init","session_id":"s-descendant","model":"fixture-model"}\n'
 # A background descendant the leader does not wait for, in the same process
 # group (nothing here calls setpgid/setsid) -- and with its own stdio, so it

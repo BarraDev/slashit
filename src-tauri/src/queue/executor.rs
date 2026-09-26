@@ -5023,6 +5023,7 @@ mod tests {
 
                 let script = format!(
                     "#!/bin/sh\n\
+                     cat > /dev/null\n\
                      printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-fixture\",\"model\":\"fixture-model\"}}\\n'\n\
                      role=review\n\
                      prev=\n\
@@ -5130,13 +5131,16 @@ mod tests {
         }
 
         /// The reviewer's verdict gate, driven through the real
-        /// `spawn_review` with a stand-in `claude` that records its argv.
+        /// `spawn_review` with a stand-in `claude` that records its argv
+        /// and the prompt each role read from its stdin.
         mod verdict_gate {
             use super::*;
 
             struct MockReviewer {
                 _tmp: tempfile::TempDir,
                 args_file: std::path::PathBuf,
+                review_prompt_file: std::path::PathBuf,
+                fix_prompt_file: std::path::PathBuf,
                 saved_path: Option<String>,
             }
 
@@ -5155,6 +5159,8 @@ mod tests {
                     let bin_dir = tmp.path().join("bin");
                     std::fs::create_dir_all(&bin_dir).unwrap();
                     let args_file = tmp.path().join("args");
+                    let review_prompt_file = tmp.path().join("review.prompt");
+                    let fix_prompt_file = tmp.path().join("fix.prompt");
                     let result_json = serde_json::to_string(result).unwrap();
                     let fix_result_json = serde_json::to_string(fix_result).unwrap();
                     let script = format!(
@@ -5163,12 +5169,16 @@ mod tests {
                          printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"model\":\"m\"}}\\n'\n\
                          case \" $* \" in\n\
                          *\" --restricted \"*)\n\
+                         cat > {review_prompt:?}\n\
                          printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"result\":{result_json}}}'\n\
                          exit {exit} ;;\n\
                          esac\n\
+                         cat > {fix_prompt:?}\n\
                          printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"result\":{fix_result_json}}}'\n\
                          exit {fix_exit}\n",
                         args = args_file,
+                        review_prompt = review_prompt_file,
+                        fix_prompt = fix_prompt_file,
                     );
                     let bin = bin_dir.join("claude");
                     std::fs::write(&bin, &script).unwrap();
@@ -5181,7 +5191,17 @@ mod tests {
                     };
                     // Safety: serialized via PATH_LOCK; restored on Drop.
                     unsafe { std::env::set_var("PATH", new_path) };
-                    MockReviewer { _tmp: tmp, args_file, saved_path }
+                    MockReviewer { _tmp: tmp, args_file, review_prompt_file, fix_prompt_file, saved_path }
+                }
+
+                /// What the reviewer read from its stdin, if it ran.
+                fn review_prompt(&self) -> String {
+                    std::fs::read_to_string(&self.review_prompt_file).unwrap_or_default()
+                }
+
+                /// What the fix agent read from its stdin, if it ran.
+                fn fix_prompt(&self) -> String {
+                    std::fs::read_to_string(&self.fix_prompt_file).unwrap_or_default()
                 }
 
                 fn args(&self) -> Vec<String> {
@@ -5340,6 +5360,19 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                 );
                 let signoff = review_once(&mock).await;
                 assert_eq!(signoff.status, QaStatus::FixesApplied, "{:?}", signoff.issues_found);
+
+                // The fix agent runs with full tools, and its prompt, which
+                // carries the reviewer's findings, reached it on stdin and
+                // in no argument.
+                let fix_prompt = mock.fix_prompt();
+                assert!(fix_prompt.contains("a.rs:1 - broken"), "fix prompt on stdin: {fix_prompt:?}");
+                assert!(fix_prompt.contains("under review"), "{fix_prompt:?}");
+                let args = mock.args();
+                assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"), "{args:?}");
+                assert!(
+                    !args.iter().any(|a| a.contains("a.rs:1") || a.contains("under review")),
+                    "no prompt text in argv: {args:?}"
+                );
             }
 
             #[tokio::test(flavor = "multi_thread")]
@@ -5370,6 +5403,16 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                 assert!(args.iter().any(|a| a == "--restricted"), "{args:?}");
                 assert!(args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
                 assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"), "{args:?}");
+
+                // The review prompt, diff included, reached the reviewer on
+                // stdin and in no argument.
+                let prompt = mock.review_prompt();
+                assert!(prompt.contains("agent_change.txt"), "review prompt on stdin: {prompt:?}");
+                assert!(prompt.contains("the agent's work"), "{prompt:?}");
+                assert!(
+                    !args.iter().any(|a| a.contains("agent_change.txt") || a.contains("under review")),
+                    "no prompt text in argv: {args:?}"
+                );
             }
         }
 

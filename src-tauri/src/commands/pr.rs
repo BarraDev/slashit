@@ -2472,19 +2472,30 @@ async fn run_claude_pr_helper(
     // Always persist stdout when it's substantial or when claude failed, so the
     // 200 KB transcript that exposes the real error isn't lost. The path is
     // surfaced in the error message and printed to stderr.
-    let log_path = if !success || stdout.len() > 4096 {
+    let prompt_failure = runner.prompt_failure().await;
+    let log_path = if !success || prompt_failure.is_some() || stdout.len() > 4096 {
         write_pr_helper_log(&stdout, &stderr, can_edit).ok()
     } else {
         None
     };
 
+    let log_hint = log_path
+        .as_ref()
+        .map(|p| format!(" (transcript: {})", p.display()))
+        .unwrap_or_default();
+
     if !success {
         let reason = pr_helper_failure_reason(&stdout, &stderr);
-        let log_hint = log_path
-            .as_ref()
-            .map(|p| format!(" (transcript: {})", p.display()))
-            .unwrap_or_default();
         return Err(format!("claude exited {} — {}{}", exit_label, reason, log_hint));
+    }
+
+    // A zero exit is not a success when the prompt write failed: whatever
+    // claude answered, it was not answering what this helper asked.
+    if let Some(reason) = prompt_failure {
+        return Err(format!(
+            "claude exited {} without the whole prompt — {}{}",
+            exit_label, reason, log_hint
+        ));
     }
 
     let extracted = extract_text_from_stream_json(&stdout);
@@ -6241,6 +6252,70 @@ mod tests {
                 );
             }
 
+            /// A `claude` that answers and exits 0 without reading its
+            /// prompt from stdin fails the helper, read-only or not. The
+            /// helper judges a run by its exit code rather than by
+            /// `ClaudeRunner::wait`, so this is its own check.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_pr_helper_whose_claude_never_read_the_prompt_fails() {
+                let _guard = PATH_LOCK.lock().await;
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let bin_dir = tmp.path().join("bin");
+                std::fs::create_dir_all(&bin_dir).unwrap();
+                write_executable(
+                    &bin_dir.join("claude"),
+                    "#!/bin/sh\n\
+                     printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"all done\"}'\n\
+                     exit 0\n",
+                );
+
+                struct RestorePath(Option<String>);
+                impl Drop for RestorePath {
+                    fn drop(&mut self) {
+                        // Safety: serialized via PATH_LOCK.
+                        unsafe {
+                            match &self.0 {
+                                Some(p) => std::env::set_var("PATH", p),
+                                None => std::env::remove_var("PATH"),
+                            }
+                        }
+                    }
+                }
+                let saved = RestorePath(std::env::var("PATH").ok());
+                let new_path = match &saved.0 {
+                    Some(p) => format!("{}:{}", bin_dir.display(), p),
+                    None => bin_dir.display().to_string(),
+                };
+                // Safety: serialized via PATH_LOCK; restored on drop.
+                unsafe { std::env::set_var("PATH", new_path) };
+
+                // More than any pipe buffers, so it cannot all be written
+                // unless the child reads it.
+                let prompt = "review text\n".repeat((4 << 20) / 12);
+                for can_edit in [false, true] {
+                    let error = run_claude_pr_helper(
+                        prompt.clone(),
+                        tmp.path().display().to_string(),
+                        can_edit,
+                        tokio::sync::watch::channel(false).1,
+                    )
+                    .await
+                    .expect_err("an answer to a prompt claude never read is not a success");
+                    assert!(error.contains("without the whole prompt"), "can_edit={can_edit}: {error}");
+
+                    // The transcript is kept and named in the error. It is
+                    // written to the real helper log directory, so it is
+                    // removed again here.
+                    let transcript = error
+                        .rsplit_once(" (transcript: ")
+                        .and_then(|(_, rest)| rest.strip_suffix(')'))
+                        .unwrap_or_else(|| panic!("can_edit={can_edit}: no transcript hint: {error}"));
+                    let logged = std::fs::read_to_string(transcript).expect("the transcript exists");
+                    assert!(logged.contains("all done"), "{logged}");
+                    std::fs::remove_file(transcript).expect("remove the test transcript");
+                }
+            }
+
             /// Same-task exclusivity, at the level a command actually calls
             /// it: while an edit-capable helper for a task is alive, a
             /// second PR-helper flow for the *same* task is refused before
@@ -7159,6 +7234,7 @@ mod tests {
 
                     let claude = format!(
                         "#!/bin/sh\n\
+                         cat > /dev/null\n\
                          printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-fixture\",\"model\":\"fixture-model\"}}\\n'\n\
                          n=$(cat {counter:?} 2>/dev/null || echo 0)\n\
                          n=$((n + 1))\n\

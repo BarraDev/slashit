@@ -1,4 +1,6 @@
 #!/bin/sh
+# Reads its prompt to EOF first, as `claude -p` does.
+cat > /dev/null
 sleep 0.2
 printf '{"type":"system","subtype":"init","session_id":"s-stream","model":"fixture-model"}\n'
 sleep 0.1

@@ -36,3 +36,29 @@ the security boundary of the run:
   approved PR apply agent and the review-fix agent. They have Bash.
 
 `claude_args` builds the argument list; test capability changes there.
+
+## Prompt transport
+
+The prompt never goes in argv. `claude_args` passes a bare `-p`, and
+`ClaudeRunner` writes the prompt to the child's stdin from a separate task
+started at spawn, then closes it; the CLI reads stdin to EOF before it starts.
+An argument is capped at 128 KiB on Linux and is readable by any local
+process, and prompts carry review text and diffs of any size. This holds for
+every run, `ReadOnly` and `Full` alike. `--append-system-prompt` stays in
+argv: SlashIt only passes a fixed rules text there.
+
+- The writer starts at spawn and runs alongside the stdout and stderr
+  drains, so a large prompt cannot deadlock against a full output pipe. The
+  CLI also stops waiting for stdin if no data arrives within a few seconds.
+- A failed prompt write fails the run, even on exit 0: the write errored
+  (usually `EPIPE`), or was still unfinished when the child exited. A prompt
+  small enough to sit whole in the pipe buffer counts as delivered once
+  written, so a child that exits without reading it cannot be told apart.
+  `wait()` reports a non-zero exit first, then the prompt failure, then a
+  `result` error. `prompt_failure()` exposes it to callers that judge by
+  `exit_status()`, like the PR helper.
+- `kill()` and dropping the runner abort the writer, so a cancelled run
+  never leaves it blocked on a pipe that a process outside the group still
+  holds open.
+- A stand-in `claude` in a test must read its stdin to EOF before answering,
+  as the real one does. One that exits 0 without reading can fail the run.

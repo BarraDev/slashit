@@ -1,0 +1,10 @@
+#!/bin/sh
+# The prompt contract of `claude -p` with no prompt argument: read stdin to
+# EOF, then answer. Records what it was given -- its arguments, NUL-terminated,
+# in `argv`, and its stdin byte for byte in `prompt` -- and reports the number
+# of bytes it read as its result.
+printf '%s\0' "$@" > argv
+cat > prompt
+printf '{"type":"system","subtype":"init","session_id":"s-stdin","model":"fixture-model"}\n'
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-stdin","result":"%s"}\n' "$(wc -c < prompt | tr -d ' ')"
+exit 0
