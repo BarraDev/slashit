@@ -364,7 +364,6 @@ pub fn run() {
             sync_pr_review_replies,
             discuss_pr_review_questions,
             refresh_task_pr_state,
-            submit_stack,
             create_roadmap_feature,
             update_roadmap_feature,
             delete_roadmap_feature,

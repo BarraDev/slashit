@@ -7,7 +7,6 @@ use uuid::Uuid;
 
 pub struct WorktreeManager {
     wt_available: bool,
-    pub gs_available: bool,
     paths: Arc<AppPaths>,
     placement: WorktreePlacement,
 }
@@ -15,6 +14,19 @@ pub struct WorktreeManager {
 pub struct WorktreeInfo {
     pub path: String,
     pub branch: String,
+}
+
+/// A worktree [`WorktreeManager::create_stacked_branch`] produced, with the
+/// dependency commit it verified the branch is stacked on.
+pub struct StackedWorktree {
+    pub info: WorktreeInfo,
+    /// The dependency's tip as resolved and checked at the time. The task's
+    /// diff starts here, rather than at the worktree's `HEAD`, which on a
+    /// resumed branch already includes the task's own commits.
+    pub dependency_tip: String,
+    /// Whether an existing branch of the task's name was picked up rather
+    /// than a new one created.
+    pub resumed: bool,
 }
 
 /// The result of asking the filesystem whether a path is there, keeping the
@@ -100,15 +112,9 @@ impl WorktreeManager {
 
     pub fn new(paths: Arc<AppPaths>, placement: WorktreePlacement) -> Self {
         let wt_available = Self::on_path("wt");
-        let gs_available = Self::on_path("git-spice");
-
-        if gs_available {
-            println!("SlashIt: git-spice detected — available for stacked PRs");
-        }
 
         let manager = Self {
             wt_available,
-            gs_available,
             paths,
             placement,
         };
@@ -485,6 +491,59 @@ impl WorktreeManager {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// Whether the ref `refs/heads/<branch>` exists in `repo_path`.
+    ///
+    /// `Ok(false)` only when git listed the local branches cleanly and this
+    /// one is not among them. A name that is not a plain branch name, a ref
+    /// git warns it cannot read, or a git that could not be asked is an
+    /// error, never an absence. A ref that names a missing object is
+    /// present: it is there, and whatever uses it next refuses it.
+    ///
+    /// `for-each-ref` rather than `rev-parse --verify` or `show-ref
+    /// --verify --quiet`: both of those exit 1 in silence for a ref that is
+    /// there but broken (a missing object, or unreadable contents), exactly
+    /// as they do for one that is not there at all.
+    pub async fn local_branch_exists(repo_path: &str, branch: &str) -> Result<bool, String> {
+        let branch = checked_task_branch(branch)?;
+        let refname = format!("refs/heads/{branch}");
+        let output = tokio::process::Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", &refname])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git for-each-ref: {e}"))?;
+        if !output.status.success() || !output.stderr.is_empty() {
+            return Err(format!(
+                "Could not check for local branch {branch:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        // The pattern also matches every ref below `refs/heads/<branch>/`,
+        // which is not this branch.
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == refname))
+    }
+
+    /// Whether `ancestor` is reachable from the local branch `branch`.
+    async fn branch_contains(repo_path: &str, branch: &str, ancestor: &str) -> Result<bool, String> {
+        let output = tokio::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", ancestor])
+            .arg(format!("refs/heads/{branch}"))
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git merge-base: {e}"))?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(format!(
+                "Could not check whether branch {branch} contains {ancestor}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        }
+    }
+
     /// Create the local branch `branch` at exactly `commit`, failing if the
     /// branch already exists. `git update-ref` takes the object ID as it is,
     /// where `git branch` would prefer a ref that happens to share its name.
@@ -546,17 +605,24 @@ impl WorktreeManager {
     }
 
     /// Create a branch stacked on top of another branch.
-    /// Uses git-spice when available, falls back to wt --base.
+    ///
+    /// Under worktrunk delegation this is `wt switch -c --base`; otherwise
+    /// SlashIt creates the branch at the dependency's tip itself and attaches
+    /// a worktree to it. No other stacking tool is consulted, so what a task
+    /// is stacked on does not depend on what happens to be installed. A
+    /// branch of this name that already contains the dependency's tip is
+    /// reattached instead, so an attempt that did not finish does not block
+    /// the next; one that does not contain it is refused.
     ///
     /// `after_branch` is the dependency's recorded `branch_name`, which is as
-    /// untrusted as the task's own, so both names are checked before git-spice,
-    /// `wt` or `git` is run.
+    /// untrusted as the task's own, so both names are checked before `wt` or
+    /// `git` is run.
     pub async fn create_stacked_branch(
         &self,
         repo_path: &str,
         branch: &str,
         after_branch: &str,
-    ) -> Result<WorktreeInfo, String> {
+    ) -> Result<StackedWorktree, String> {
         let branch = checked_task_branch(branch)?;
         let after_branch = checked_task_branch(after_branch)
             .map_err(|e| format!("Cannot stack on the dependency's branch: {e}"))?;
@@ -565,37 +631,26 @@ impl WorktreeManager {
         let dependency_tip = Self::local_branch_tip(repo_path, after_branch)
             .await
             .map_err(|e| format!("Cannot stack on the dependency's branch: {e}"))?;
-        if self.gs_available {
-            // Use git-spice to create stacked branch
-            let output = tokio::process::Command::new("git-spice")
-                .args(["branch", "create", branch, "--insert-after", after_branch])
-                .current_dir(repo_path)
-                .output()
-                .await
-                .map_err(|e| format!("git-spice branch create failed: {}", e))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("git-spice branch create failed: {}", stderr));
+        // A branch of this name left by an earlier attempt that did not
+        // finish -- a worktree whose checkout hook failed, a start that died
+        // before the task recorded its branch, a `wt switch` whose worktree
+        // could not be found afterwards -- is picked up again rather than
+        // failing every retry on "already exists". Only while it still holds
+        // the dependency's work: a branch that does not is somebody else's,
+        // and is refused and left exactly as it is.
+        if Self::local_branch_exists(repo_path, branch).await? {
+            if !Self::branch_contains(repo_path, branch, &dependency_tip).await? {
+                return Err(format!(
+                    "branch {branch} already exists and does not contain the dependency's \
+                     branch {after_branch} (at {dependency_tip}); it was left as it is"
+                ));
             }
-
-            // Now create a worktree for this branch
-            if self.delegates_to_wt() {
-                let output = tokio::process::Command::new("wt")
-                    .args(["switch", branch, "--no-cd", "-y", "--no-verify"])
-                    .current_dir(repo_path)
-                    .output()
-                    .await
-                    .map_err(|e| format!("wt switch failed: {}", e))?;
-                if output.status.success() {
-                    return self.find_worktree_path(repo_path, branch).await;
-                }
-            }
-
-            // Fallback: create worktree manually
-            self.create_with_git(repo_path, branch).await
-        } else if self.delegates_to_wt() {
-            // Fallback: use wt with --base flag
+            let info = self.reattach(repo_path, branch).await?;
+            return Ok(StackedWorktree { info, dependency_tip, resumed: true });
+        }
+        let info = if self.delegates_to_wt() {
+            // Worktrunk places the worktree and creates the branch from the
+            // dependency.
             let output = tokio::process::Command::new("wt")
                 .args(["switch", "-c", branch, "--base", after_branch, "--no-cd", "-y", "--no-verify"])
                 .current_dir(repo_path)
@@ -608,9 +663,9 @@ impl WorktreeManager {
                 return Err(format!("wt switch with base failed: {}", stderr));
             }
 
-            self.find_worktree_path(repo_path, branch).await
+            self.find_worktree_path(repo_path, branch).await?
         } else {
-            // Git-only fallback: create the branch at the dependency's tip,
+            // Git path: create the branch at the dependency's tip,
             // then attach a worktree to it. Attach, not `-b` (`create_with_git`
             // always passes `-b`): the branch already exists from the line
             // above, so creating it again would fail. A branch that could not
@@ -624,15 +679,18 @@ impl WorktreeManager {
                 .git_worktree_add(repo_path, &worktree_path, branch, false)
                 .await
             {
-                Ok(info) => Ok(info),
+                Ok(info) => info,
                 Err(e) => {
-                    match Self::discard_created_branch(repo_path, branch, &dependency_tip).await {
+                    return match Self::discard_created_branch(repo_path, branch, &dependency_tip)
+                        .await
+                    {
                         Ok(()) => Err(e),
                         Err(kept) => Err(format!("{e}; {kept}")),
-                    }
+                    };
                 }
             }
-        }
+        };
+        Ok(StackedWorktree { info, dependency_tip, resumed: false })
     }
 
     /// Remove a task's worktree -- the disposable checkout, and nothing else.
@@ -1263,7 +1321,6 @@ mod tests {
     fn test_manager() -> WorktreeManager {
         WorktreeManager {
             wt_available: false,
-            gs_available: false,
             paths: test_paths(),
             placement: WorktreePlacement::Auto,
         }
@@ -1271,11 +1328,9 @@ mod tests {
 
     #[test]
     fn new_does_not_panic() {
-        // Even if wt/git-spice are absent, construction must succeed.
+        // Even if wt is absent, construction must succeed.
         let mgr = WorktreeManager::new(test_paths(), WorktreePlacement::Auto);
-        // wt_available and gs_available are booleans; just assert type.
         let _ = mgr.wt_available;
-        let _ = mgr.gs_available;
     }
 
     #[tokio::test]
@@ -2437,7 +2492,6 @@ branch refs/heads/some-other-branch
 
         let mgr = WorktreeManager {
             wt_available: true,
-            gs_available: false,
             paths: test_paths(),
             placement: WorktreePlacement::Auto,
         };
@@ -2717,7 +2771,6 @@ branch refs/heads/some-other-branch
         // test fails by trying (and failing) to run a nonexistent `wt`.
         let mgr = WorktreeManager {
             wt_available: true,
-            gs_available: false,
             paths: test_paths(),
             placement: WorktreePlacement::Managed,
         };
@@ -2725,7 +2778,7 @@ branch refs/heads/some-other-branch
         let info = mgr
             .create_stacked_branch(repo_path, "stacked-branch", "main")
             .await
-            .expect("create_stacked_branch should fall back to git, not delegate to wt");
+            .expect("create_stacked_branch should fall back to git, not delegate to wt").info;
         assert!(Path::new(&info.path).exists(), "worktree dir should exist");
         assert_eq!(info.branch, "stacked-branch");
     }
@@ -2743,7 +2796,6 @@ branch refs/heads/some-other-branch
         // trying (and failing) to run a nonexistent `wt remove`.
         let mgr = WorktreeManager {
             wt_available: true,
-            gs_available: false,
             paths: test_paths(),
             placement: WorktreePlacement::Managed,
         };
@@ -4058,15 +4110,14 @@ branch refs/heads/some-other-branch
             .output()
             .expect("git branch failed");
 
-        // Create a stacked branch on top of the base. In the git-only
-        // fallback path this runs `git branch stacked-branch base-branch`
-        // then attaches a worktree to the already-created branch without
+        // Create a stacked branch on top of the base. The git path creates
+        // `stacked-branch` at `base-branch`'s tip, then attaches a worktree to the already-created branch without
         // `-b` (`git_worktree_add(..., create_branch: false)`), so it must
         // succeed.
         let stacked = mgr
             .create_stacked_branch(repo_path, "stacked-branch", "base-branch")
             .await
-            .expect("git-only stacked branch creation from a non-main base must succeed");
+            .expect("git-only stacked branch creation from a non-main base must succeed").info;
 
         assert!(Path::new(&stacked.path).exists());
         assert_eq!(stacked.branch, "stacked-branch");
@@ -4220,11 +4271,13 @@ branch refs/heads/some-other-branch
         }
     }
 
-    /// The git-only stacked path used to ignore `git branch`'s exit status.
-    /// When the new branch could not be created from the dependency -- here
+    /// The git stacked path used to ignore `git branch`'s exit status. When
+    /// the new branch could not be created from the dependency -- here
     /// because a branch of that name already exists elsewhere -- it went on
     /// to attach a worktree to whatever that name already was, and reported
-    /// a stacked branch that was not stacked on anything.
+    /// a stacked branch that was not stacked on anything. An existing branch
+    /// that does not contain the dependency's work is refused, named, and
+    /// left where it is.
     #[tokio::test]
     async fn stacked_git_fallback_reports_a_branch_it_could_not_create() {
         let tmp = create_temp_git_repo();
@@ -4240,7 +4293,11 @@ branch refs/heads/some-other-branch
             .create_stacked_branch(repo_path, "task-1234abcd", "task-5678abcd")
             .await;
 
-        assert!(result.is_err(), "a branch that could not be created must not be reported as stacked");
+        let error = result.err().expect("a branch that could not be created must not be reported as stacked");
+        assert!(
+            error.contains("task-1234abcd") && error.contains("task-5678abcd"),
+            "the refusal has to name both branches: {error}"
+        );
         assert_eq!(all_refs(repo_path), refs_before);
         assert_eq!(registered_worktrees(repo_path).len(), 1);
     }
@@ -4275,7 +4332,7 @@ branch refs/heads/some-other-branch
         assert_eq!(registered_worktrees(repo_path).len(), 1);
     }
 
-    /// The git-only stacked fallback creates its branch at the exact commit
+    /// The git stacked path creates its branch at the exact commit
     /// it resolved, never over an existing branch, and not at a branch that
     /// happens to be named by that commit's hex, which `git branch` would
     /// prefer.
@@ -4389,7 +4446,7 @@ branch refs/heads/some-other-branch
         let stacked = mgr
             .create_stacked_branch(repo_path, "task-1234abcd", "task-5678abcd")
             .await
-            .expect("a retry once the obstacle is gone");
+            .expect("a retry once the obstacle is gone").info;
         assert_eq!(run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]), "task-1234abcd");
         assert_eq!(
             run_git(&stacked.path, &["rev-parse", "HEAD"]),
@@ -4426,6 +4483,76 @@ branch refs/heads/some-other-branch
             run_git(&registered, &["rev-parse", "HEAD"]),
             run_git(repo_path, &["rev-parse", "task-5678abcd"])
         );
+    }
+
+    /// What a failed checkout hook leaves behind -- the branch, and the
+    /// worktree git registered before the hook ran -- is picked up by the
+    /// next attempt, rather than failing it, and every one after, on
+    /// "already exists".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stacked_attempt_a_failed_hook_left_behind_is_picked_up_on_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        run_git(repo_path, &["checkout", "-q", "-b", "task-5678abcd"]);
+        run_git(repo_path, &["commit", "--allow-empty", "-m", "dependency work"]);
+        run_git(repo_path, &["checkout", "-q", "main"]);
+        let dependency_tip = run_git(repo_path, &["rev-parse", "task-5678abcd"]);
+        let hook = tmp.path().join(".git/hooks/post-checkout");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mgr = test_manager();
+        let first = mgr
+            .create_stacked_branch(repo_path, "task-1234abcd", "task-5678abcd")
+            .await;
+        assert!(first.is_err(), "the hook fails the first attempt");
+        std::fs::remove_file(&hook).unwrap();
+
+        let retried = mgr
+            .create_stacked_branch(repo_path, "task-1234abcd", "task-5678abcd")
+            .await
+            .expect("the retry picks up what the first attempt left");
+        assert!(retried.resumed);
+        assert_eq!(retried.dependency_tip, dependency_tip);
+        let retried = retried.info;
+        assert_eq!(run_git(&retried.path, &["symbolic-ref", "--short", "HEAD"]), "task-1234abcd");
+        assert_eq!(run_git(&retried.path, &["rev-parse", "HEAD"]), dependency_tip);
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-1234abcd"]), dependency_tip);
+        assert_eq!(registered_worktrees(repo_path).len(), 2, "no second worktree for the branch");
+    }
+
+    /// A branch an earlier attempt created and recorded nowhere -- the start
+    /// died before the task saved it, and its worktree is gone -- is
+    /// attached to again as it is, work on top of the dependency included.
+    #[tokio::test]
+    async fn a_stacked_branch_left_without_a_worktree_is_attached_on_retry() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        run_git(repo_path, &["checkout", "-q", "-b", "task-5678abcd"]);
+        run_git(repo_path, &["commit", "--allow-empty", "-m", "dependency work"]);
+        run_git(repo_path, &["checkout", "-q", "-b", "task-1234abcd"]);
+        run_git(repo_path, &["commit", "--allow-empty", "-m", "the task's own work"]);
+        run_git(repo_path, &["checkout", "-q", "main"]);
+        let task_tip = run_git(repo_path, &["rev-parse", "task-1234abcd"]);
+        let refs_before = all_refs(repo_path);
+
+        let mgr = test_manager();
+        let attached = mgr
+            .create_stacked_branch(repo_path, "task-1234abcd", "task-5678abcd")
+            .await
+            .expect("an existing branch holding the dependency's work is attached");
+        assert!(attached.resumed);
+        assert_eq!(
+            attached.dependency_tip,
+            run_git(repo_path, &["rev-parse", "task-5678abcd"]),
+            "the stack is reported against the dependency, not the branch's own tip"
+        );
+        let attached = attached.info;
+        assert_eq!(run_git(&attached.path, &["symbolic-ref", "--short", "HEAD"]), "task-1234abcd");
+        assert_eq!(run_git(&attached.path, &["rev-parse", "HEAD"]), task_tip);
+        assert_eq!(all_refs(repo_path), refs_before, "the branch is attached, never moved");
     }
 
     /// The cleanup deletes the branch only while it still names the commit
@@ -4471,7 +4598,7 @@ branch refs/heads/some-other-branch
         let stacked = mgr
             .create_stacked_branch(repo_path, &newer, &legacy)
             .await
-            .expect("stacked");
+            .expect("stacked").info;
         assert_eq!(run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]), newer);
         assert_eq!(run_git(&stacked.path, &["rev-parse", "HEAD"]), dependency_tip);
     }
@@ -4495,9 +4622,179 @@ branch refs/heads/some-other-branch
         let stacked = mgr
             .create_stacked_branch(repo_path, "task-5678abcd", "task-1234abcd")
             .await
-            .expect("stacked");
+            .expect("stacked").info;
         assert_eq!(run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]), "task-5678abcd");
         assert_eq!(run_git(&stacked.path, &["rev-parse", "HEAD"]), dependency_tip);
         assert_eq!(run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]), "main");
+    }
+
+    /// A `git-spice` executable installed at the front of `PATH` for as long
+    /// as this value lives, recording every invocation in `log`.
+    ///
+    /// Holds [`crate::test_helpers::PATH_LOCK`] itself, so `PATH` is restored
+    /// before the lock is released no matter how the test ends.
+    #[cfg(unix)]
+    struct FakeGitSpice {
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+        log: PathBuf,
+        saved_path: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl FakeGitSpice {
+        /// `body` runs after the invocation has been logged, in whatever
+        /// directory the caller spawned it from.
+        async fn install(body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let lock = crate::test_helpers::PATH_LOCK.lock().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let log = dir.path().join("git-spice.log");
+            let program = dir.path().join("git-spice");
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\n{body}\n"),
+            )
+            .expect("write fake git-spice");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake git-spice");
+
+            let saved_path = std::env::var_os("PATH");
+            let mut entries = vec![dir.path().to_path_buf()];
+            if let Some(path) = &saved_path {
+                entries.extend(std::env::split_paths(path));
+            }
+            let new_path = std::env::join_paths(entries).expect("join PATH");
+            // Safety: serialized via PATH_LOCK, held by this value and
+            // released only after `Drop` has restored PATH.
+            unsafe {
+                std::env::set_var("PATH", new_path);
+            }
+            FakeGitSpice { _lock: lock, _dir: dir, log, saved_path }
+        }
+
+        fn invocations(&self) -> String {
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeGitSpice {
+        fn drop(&mut self) {
+            // Safety: PATH_LOCK is still held; `_lock` drops after this.
+            unsafe {
+                match &self.saved_path {
+                    Some(path) => std::env::set_var("PATH", path),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    /// Stack `stacked` on a `dependency` branch one commit ahead of `main`,
+    /// with a manager constructed while `fake` is on `PATH`, and check the
+    /// result is exactly what the git-only path produces: the new branch at
+    /// the dependency's tip, a worktree attached to it, and the primary
+    /// checkout untouched.
+    #[cfg(unix)]
+    async fn assert_stacks_on_the_dependency_tip_with(fake: &FakeGitSpice) {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        run_git(repo_path, &["branch", "dependency"]);
+        let dependency = fixture_worktree(repo_path, "dependency");
+        let dependency_tip = commit_work(&dependency, "dependency.txt");
+        run_git(repo_path, &["worktree", "remove", &dependency]);
+        let main_tip = run_git(repo_path, &["rev-parse", "main"]);
+        assert_ne!(dependency_tip, main_tip, "the fixture must tell the two bases apart");
+
+        let mgr = WorktreeManager::new(test_paths(), WorktreePlacement::Managed);
+        let stacked = mgr
+            .create_stacked_branch(repo_path, "stacked", "dependency")
+            .await
+            .expect("stacking on a local branch must succeed whatever is on PATH").info;
+
+        assert_eq!(fake.invocations(), "", "git-spice must never be run");
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/stacked"]), dependency_tip);
+        assert_eq!(run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]), "stacked");
+        assert_eq!(run_git(&stacked.path, &["rev-parse", "HEAD"]), dependency_tip);
+        assert!(
+            registered_worktrees(repo_path)
+                .iter()
+                .any(|w| Path::new(w) == Path::new(&stacked.path)),
+            "the stacked worktree must be registered with git"
+        );
+        assert_eq!(run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(run_git(repo_path, &["rev-parse", "main"]), main_tip);
+    }
+
+    /// A worktree for an existing `branch`, made with git directly so the
+    /// fixture does not depend on the manager under test.
+    fn fixture_worktree(repo_path: &str, branch: &str) -> String {
+        let path = std::env::temp_dir().join(format!("slashit-wt-fixture-{}", Uuid::new_v4()));
+        let path = path.to_str().unwrap().to_string();
+        run_git(repo_path, &["worktree", "add", "--", &path, branch]);
+        path
+    }
+
+    /// A `git-spice` that accepts the call behaves the way `branch create`
+    /// does: it creates the branch from whatever the primary checkout has
+    /// checked out, and switches that checkout to it. Stacking must not be
+    /// handed to it, or the task starts from `main` instead of its
+    /// dependency and the user's own checkout is switched under them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_git_spice_that_succeeds_does_not_change_the_stacked_branch() {
+        let fake = FakeGitSpice::install("exec git checkout -q -b \"$3\"").await;
+        assert_stacks_on_the_dependency_tip_with(&fake).await;
+    }
+
+    /// git-spice 0.29 refuses `--insert-after` outright (`unknown flag
+    /// --insert-after`, exit 1). Its presence on `PATH` must not turn a
+    /// stack the git path can build into an error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_git_spice_that_refuses_does_not_change_the_stacked_branch() {
+        let fake = FakeGitSpice::install(
+            "echo 'FTL git-spice: unknown flag --insert-after' >&2\nexit 1",
+        )
+        .await;
+        assert_stacks_on_the_dependency_tip_with(&fake).await;
+    }
+
+    /// `local_branch_exists` says "no" only when git answered: a missing
+    /// branch is `Ok(false)`, but an invalid name or a directory git cannot
+    /// read as a repository is an error, never an absence.
+    #[tokio::test]
+    async fn local_branch_exists_separates_absent_from_unanswerable() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        assert_eq!(WorktreeManager::local_branch_exists(repo_path, "main").await, Ok(true));
+        assert_eq!(WorktreeManager::local_branch_exists(repo_path, "gone").await, Ok(false));
+        assert!(WorktreeManager::local_branch_exists(repo_path, "-Bvictim").await.is_err());
+
+        // Present but broken is not absent: a ref naming a missing object,
+        // which `rev-parse --verify --quiet` reports exactly like no ref at
+        // all, and a ref with unreadable contents.
+        std::fs::write(
+            tmp.path().join(".git/refs/heads/missing-object"),
+            "1234567890123456789012345678901234567890\n",
+        )
+        .unwrap();
+        assert_eq!(
+            WorktreeManager::local_branch_exists(repo_path, "missing-object").await,
+            Ok(true)
+        );
+        std::fs::write(tmp.path().join(".git/refs/heads/garbage"), "garbage\n").unwrap();
+        assert!(WorktreeManager::local_branch_exists(repo_path, "garbage").await.is_err());
+        // Refs below `refs/heads/<name>/` are not the branch `<name>`.
+        run_git(repo_path, &["branch", "nested/child"]);
+        assert_eq!(WorktreeManager::local_branch_exists(repo_path, "nested").await, Ok(false));
+
+        let not_a_repo = tempfile::tempdir().expect("tempdir");
+        assert!(
+            WorktreeManager::local_branch_exists(not_a_repo.path().to_str().unwrap(), "main")
+                .await
+                .is_err()
+        );
     }
 }
