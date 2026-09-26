@@ -3869,6 +3869,86 @@ mod tests {
         );
     }
 
+    /// A task whose recorded branch is not a branch name is refused through
+    /// the same no-fallback path, before git is given the value.
+    ///
+    /// `branch_name` comes back from `tasks.toml`, and a board kept in the
+    /// project holds whatever the last commit put there. Starting a task that
+    /// already carries a branch reattaches to it, which used to run
+    /// `git worktree add <dest> <branch>` with the value as it was: `-Bvictim`
+    /// force-resets the user's unrelated branch `victim` and then starts the
+    /// agent on it.
+    #[tokio::test]
+    async fn a_task_with_a_poisoned_recorded_branch_is_refused_before_git_runs() {
+        let (executor, temps) = test_executor();
+
+        let repo = temps[0].path().join("repository");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo_path = repo.to_string_lossy().to_string();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("spawn git");
+            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "first"]);
+        git(&["branch", "victim"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "second"]);
+        let refs_before = git(&["for-each-ref", "--format=%(refname) %(objectname)"]);
+
+        let project_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        executor.repositories.write().await.insert(
+            repository_id,
+            crate::domain::Repository {
+                id: repository_id,
+                local_path: repo_path.clone(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        let mut project = test_project(project_id, ProjectScope::Standalone);
+        project.repository_id = Some(repository_id);
+        executor.projects.write().await.insert(project_id, project);
+
+        let mut task = create_test_task_full("poisoned branch", project_id, TaskStatus::InProgress, 0);
+        task.phase = TaskPhase::Idle;
+        task.branch_name = Some("-Bvictim".to_string());
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+
+        executor.spawn_task_execution(task_id, None).await;
+
+        assert_eq!(
+            git(&["for-each-ref", "--format=%(refname) %(objectname)"]),
+            refs_before,
+            "no ref may move, `victim` above all"
+        );
+        assert!(
+            executor.running_handles.read().await.is_empty(),
+            "no agent may be started for a task whose branch was refused"
+        );
+        assert_eq!(git(&["worktree", "list", "--porcelain"]).matches("worktree ").count(), 1);
+        assert_eq!(git(&["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(git(&["status", "--porcelain"]), "");
+
+        let after = executor.tasks.read().await.get(&task_id).cloned().unwrap();
+        assert_eq!(after.status, TaskStatus::Error);
+        assert_eq!(after.worktree_path, None, "neither the repository nor anything else is recorded");
+        assert_eq!(after.branch_name.as_deref(), Some("-Bvictim"), "a refused value is reported, never rewritten");
+        assert!(
+            after.error_message.as_deref().is_some_and(|m| m.contains("\"-Bvictim\"")),
+            "the reason has to name the refused branch: {:?}",
+            after.error_message
+        );
+    }
+
     /// An AI review has nowhere to run without the task's own worktree, and
     /// does not borrow the repository instead.
     ///
