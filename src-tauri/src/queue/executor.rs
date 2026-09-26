@@ -105,7 +105,10 @@ struct Acquired {
     /// resumed here. `None` on reattach, which keeps the recorded one.
     base_commit: Option<String>,
     /// What the task's branch was created from, when it was created or
-    /// resumed here. `None` on reattach, which keeps the recorded one.
+    /// resumed here and that is known. `None` on reattach, which keeps the
+    /// recorded one, and for a branch whose origin is unknown: one adopted
+    /// from an unrecorded start, or an ordinary branch that did not start on
+    /// the proven default base.
     origin: Option<BranchOrigin>,
 }
 
@@ -1095,8 +1098,8 @@ impl TaskExecutor {
                     level: LogLevel::Info,
                     message: format!(
                         "The dependency's pull request was merged and its branch {branch} \
-                         no longer exists locally, so its work is delivered; starting from \
-                         the default base instead of stacking on it"
+                         no longer exists locally, so its work is delivered; starting an \
+                         ordinary branch instead of stacking on it"
                     ),
                 });
                 None
@@ -1184,17 +1187,28 @@ impl TaskExecutor {
                 )),
             }
         } else {
-            // An adopted worktree was left by an earlier start that never
-            // recorded it, and that start may have stacked it, so only a
-            // branch created here is known to come from the default base.
+            // An ordinary branch starts wherever the backend starts it (the
+            // primary checkout's `HEAD` for git, the local default branch for
+            // worktrunk), which is not necessarily the default base, so a
+            // branch created here is recorded as coming from the default base
+            // only when `origin/HEAD` provably contains where it started; see
+            // `WorktreeManager::default_base_origin`. Otherwise its origin is
+            // unknown. An adopted worktree was left by an earlier start that
+            // never recorded it, and that start may have stacked it, so it
+            // gets no origin at all.
             match self.worktree_manager.create_or_adopt(repo_path, &branch_name).await {
                 Ok((info, adopted)) => {
                     let base_commit = Self::resolve_commit(&info.path, "HEAD").await;
+                    let origin = if adopted {
+                        None
+                    } else {
+                        WorktreeManager::default_base_origin(repo_path, base_commit.as_deref()).await
+                    };
                     Ok(Acquired {
                         info,
                         what_happened: if adopted { "Adopted worktree" } else { "Created worktree" },
                         base_commit,
-                        origin: (!adopted).then_some(BranchOrigin::DefaultBase),
+                        origin,
                     })
                 }
                 Err(e) => Err(e),
@@ -4302,6 +4316,20 @@ mod tests {
         (repo, task_id, dependency_id)
     }
 
+    /// Give the fixture's `repo` a bare `origin` next to it holding its
+    /// `main`, with `refs/remotes/origin/HEAD` pointing at `origin/main` the
+    /// way `git clone` leaves it, so that what is on `main` now is provably
+    /// on the repository's known remote default base. Without this the
+    /// repository has no remote at all, and no branch started in it can be
+    /// recorded as coming from the default base.
+    fn publish_default_base(repo: &std::path::Path) {
+        let remote = repo.parent().unwrap().join("origin.git");
+        git_in(repo, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git_in(repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git_in(repo, &["push", "-q", "origin", "main"]);
+        git_in(repo, &["remote", "set-head", "origin", "main"]);
+    }
+
     fn refs_of(repo: &std::path::Path) -> String {
         git_in(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
     }
@@ -4350,14 +4378,17 @@ mod tests {
     }
 
     /// A dependency that is done, with a pull request, and whose local
-    /// branch has since been deleted has been delivered: its work is on the
-    /// default base, so the task starts there, and the log says why.
+    /// branch has since been deleted has been delivered, so the task gets an
+    /// ordinary branch instead of a stacked one, and the log says why. The
+    /// primary checkout here is on a pushed `main`, so that branch provably
+    /// starts on the default base.
     #[tokio::test]
     async fn a_task_whose_done_dependency_branch_is_gone_starts_from_the_default_base() {
         let recording = Arc::new(crate::events::RecordingEventSink::new());
         let (executor, temps) = test_executor_with_events(recording.clone());
         let (repo, task_id, _) =
             stacked_task_fixture(&executor, &temps, TaskStatus::Done, Some("MERGED"), "task-deadbeef").await;
+        publish_default_base(&repo);
         let main_tip = git_in(&repo, &["rev-parse", "main"]);
 
         let (existing, acquired) = executor
@@ -4376,7 +4407,7 @@ mod tests {
 
         let recorded = serde_json::to_string(&recording.recorded()).unwrap();
         assert!(
-            recorded.contains("task-deadbeef") && recorded.contains("default base"),
+            recorded.contains("task-deadbeef") && recorded.contains("ordinary branch"),
             "the log has to say why the task was not stacked: {recorded}"
         );
     }
@@ -4482,7 +4513,8 @@ mod tests {
         assert_eq!(persisted.branch_name, Some(WorktreeManager::branch_for_task(task_id)));
     }
 
-    /// A task with no dependency records that its branch came from the
+    /// A task with no dependency, started while the primary checkout is on a
+    /// commit `origin/HEAD` contains, records that its branch came from the
     /// default base, not a stack parent.
     #[tokio::test]
     async fn starting_an_ordinary_task_records_the_default_base() {
@@ -4492,17 +4524,134 @@ mod tests {
         )
         .await;
         executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        publish_default_base(&repo);
+        let main_tip = git_in(&repo, &["rev-parse", "main"]);
 
         let (_, acquired) = executor
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
             .await;
-        executor.record_acquired_worktree(task_id, acquired.expect("an ordinary worktree")).await;
+        let acquired = acquired.expect("an ordinary worktree");
+        assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()));
+        assert_eq!(acquired.origin, Some(BranchOrigin::DefaultBase));
+        executor.record_acquired_worktree(task_id, acquired).await;
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         assert_eq!(
             persisted_task(&executor, project_id, task_id).branch_origin,
             Some(BranchOrigin::DefaultBase)
         );
+    }
+
+    /// An ordinary task's branch starts wherever the primary checkout is,
+    /// because that is what `git worktree add -b` does. Started while the
+    /// user is on a feature branch holding a commit the default base does
+    /// not, the branch starts at the feature branch's tip exactly as it
+    /// always has, and nothing claims it came from the default base: its
+    /// origin is recorded as unknown, returned and on disk.
+    #[tokio::test]
+    async fn an_ordinary_task_started_from_a_feature_checkout_records_no_origin() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        publish_default_base(&repo);
+        git_in(&repo, &["checkout", "-q", "-b", "feature-f"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "feature work"]);
+        let feature_tip = git_in(&repo, &["rev-parse", "HEAD"]);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("an ordinary worktree");
+        assert_eq!(acquired.what_happened, "Created worktree");
+        assert_eq!(
+            git_in(&repo, &["rev-parse", &format!("refs/heads/{}", acquired.info.branch)]),
+            feature_tip,
+            "where the branch starts is unchanged"
+        );
+        assert_eq!(acquired.base_commit.as_deref(), Some(feature_tip.as_str()));
+        assert_eq!(acquired.origin, None);
+        executor.record_acquired_worktree(task_id, acquired).await;
+
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let persisted = persisted_task(&executor, project_id, task_id);
+        assert_eq!(persisted.base_commit.as_deref(), Some(feature_tip.as_str()));
+        assert_eq!(persisted.branch_origin, None);
+    }
+
+    /// The same holds for a detached primary checkout, which is what a
+    /// JJ-colocated repository looks like to git (`HEAD` detached at `@-`):
+    /// a branch started at a commit `origin/HEAD` does not contain has no
+    /// known origin.
+    #[tokio::test]
+    async fn an_ordinary_task_started_from_a_detached_checkout_off_the_default_base_records_no_origin() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        publish_default_base(&repo);
+        git_in(&repo, &["checkout", "-q", "--detach"]);
+        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "working-copy parent"]);
+        let detached = git_in(&repo, &["rev-parse", "HEAD"]);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("an ordinary worktree");
+        assert_eq!(acquired.base_commit.as_deref(), Some(detached.as_str()));
+        assert_eq!(acquired.origin, None);
+        executor.record_acquired_worktree(task_id, acquired).await;
+
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let persisted = persisted_task(&executor, project_id, task_id);
+        assert_eq!(persisted.base_commit.as_deref(), Some(detached.as_str()));
+        assert_eq!(persisted.branch_origin, None);
+    }
+
+    /// Nothing short of `refs/remotes/origin/HEAD` containing the starting
+    /// commit proves a default-base origin. With no remote at all, with an
+    /// `origin/HEAD` that names a branch the repository does not have, or
+    /// with `main` ahead of what was pushed, the origin is unknown -- never
+    /// guessed from the local `main` or from where the branch happens to
+    /// sit.
+    #[tokio::test]
+    async fn an_ordinary_task_records_no_origin_when_the_default_base_is_not_proven() {
+        type Arrange = fn(&std::path::Path);
+        let cases: [(&str, Arrange); 3] = [
+            ("no origin/HEAD", |_| {}),
+            ("dangling origin/HEAD", |repo| {
+                git_in(repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone"]);
+            }),
+            ("main ahead of origin", |repo| {
+                publish_default_base(repo);
+                git_in(repo, &["commit", "-q", "--allow-empty", "-m", "not pushed"]);
+            }),
+        ];
+        for (name, arrange) in cases {
+            let (executor, temps) = test_executor();
+            let (repo, task_id, _) = stacked_task_fixture(
+                &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+            )
+            .await;
+            executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+            arrange(&repo);
+            let head = git_in(&repo, &["rev-parse", "HEAD"]);
+
+            let (_, acquired) = executor
+                .acquire_task_worktree(task_id, repo.to_str().unwrap())
+                .await;
+            let acquired = acquired.unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(acquired.base_commit.as_deref(), Some(head.as_str()), "{name}");
+            assert_eq!(acquired.origin, None, "{name}");
+            executor.record_acquired_worktree(task_id, acquired).await;
+
+            let project_id = executor.tasks.read().await[&task_id].project_id;
+            assert_eq!(persisted_task(&executor, project_id, task_id).branch_origin, None, "{name}");
+        }
     }
 
     /// A live worktree of the task's branch that the task never recorded,

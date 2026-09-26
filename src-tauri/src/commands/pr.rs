@@ -2856,9 +2856,13 @@ const MAX_MERGE_HOPS: usize = 5;
 /// - GitHub cannot be asked, or the merges lead back to a branch already
 ///   seen: refused.
 ///
-/// A task with no recorded origin and a dependency is refused too: its branch
-/// predates the record, and it may have been stacked. Opening it against the
-/// default branch would put the parent's commits into its pull request.
+/// A task with no recorded origin and a dependency is refused too. No origin
+/// means where its branch started is not known to be on the default base:
+/// the branch was created before SlashIt recorded origins, or its starting
+/// commit was not proven to be contained in `refs/remotes/origin/HEAD` when
+/// it was created (see `WorktreeManager::default_base_origin`). It may carry
+/// the dependency's commits, and opening it against the default branch would
+/// put them into its pull request.
 ///
 /// Every refusal comes before anything is pushed.
 async fn pr_base_for(
@@ -2871,11 +2875,15 @@ async fn pr_base_for(
         None if !has_dependencies => return Ok(None),
         None => {
             return Err(
-                "This task depends on another task, and its branch was created before SlashIt \
-                 recorded what a branch was started from, so SlashIt cannot tell whether the \
-                 pull request belongs on the dependency's branch or on the default branch. Open \
-                 it with `gh pr create --base <branch>`; creating the pull request here \
-                 afterwards links it to the task."
+                "This task depends on another task, and its branch's starting point is not \
+                 known to be on the default base: the branch was created before SlashIt \
+                 recorded where branches start, or its starting commit was not proven to be \
+                 contained in refs/remotes/origin/HEAD. SlashIt cannot tell whether the pull \
+                 request belongs on the dependency's branch or on the default branch. Open it \
+                 with `gh pr create --base <branch>`; creating the pull request here afterwards \
+                 links it to the task. If the repository has no refs/remotes/origin/HEAD, \
+                 `git remote set-head origin --auto` records it for branches created from \
+                 then on."
                     .to_string(),
             )
         }

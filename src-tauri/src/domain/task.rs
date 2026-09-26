@@ -128,7 +128,9 @@ pub struct Task {
     /// against what this names, not against whatever the task's
     /// dependencies look like by then. `None` for a branch created before
     /// this field existed, or one SlashIt reattached without creating it:
-    /// where those started cannot be recovered after the fact.
+    /// where those started cannot be recovered after the fact. `None` too
+    /// for an ordinary branch whose start was not proven to be on the
+    /// default base (see [`BranchOrigin::DefaultBase`]).
     #[serde(default)]
     pub branch_origin: Option<BranchOrigin>,
 
@@ -234,6 +236,15 @@ impl Task {
 pub enum BranchOrigin {
     /// Created from the repository's default base. Its pull request targets
     /// the repository's default branch.
+    ///
+    /// Recorded only when the commit the branch started from was proven,
+    /// when the branch was created, to be contained in
+    /// `refs/remotes/origin/HEAD` (see
+    /// `worktree::WorktreeManager::default_base_origin`). An ordinary branch
+    /// starts wherever its backend starts it, which may be a feature branch
+    /// or unpushed work; one whose start was not proven, including every
+    /// branch in a repository whose remote is not named `origin` or that
+    /// has no `origin/HEAD`, records no origin at all.
     DefaultBase,
     /// Created at the tip of a dependency's branch, `parent_branch`, so that
     /// it builds on that work. Its pull request targets `parent_branch` while
