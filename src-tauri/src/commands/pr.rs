@@ -3146,20 +3146,24 @@ const GITHUB_PR_COMMIT_LIST_LIMIT: usize = 250;
 ///   records the default base, so this function is never reached for it
 ///   again) and nothing deletes it later.
 /// - The reservation keeps SlashIt's own flows out of the worktree, not the
-///   user. A commit or checkout from the task's own terminal while the
-///   restack runs is detected and never undone, except in two instants that
-///   have no compare-and-swap: between the check and `git rebase --abort`
-///   of a rebase stopped on a conflict, a move of `HEAD` is not detected and
-///   the abort discards it from `HEAD` (it stays in `HEAD`'s reflog); and
-///   between moving the branch ref back and updating the files, a commit is
-///   not prevented, though the verification afterwards then fails and the
-///   backup is kept.
+///   user. A commit, checkout or edit from the task's own terminal while the
+///   restack runs is detected and never undone, with these exceptions. A
+///   stopped rebase is undone without writing the branch, but a `HEAD` moved
+///   in the instant between the checks and the undo is put back on the
+///   branch (what it was moved to stays in `HEAD`'s reflog). An edit inside
+///   a path the stop left unmerged cannot be told from its conflict markers
+///   and is discarded with them. Between moving the branch ref back after a
+///   finished rebase and updating the files, a commit is not prevented,
+///   though the verification afterwards then fails and the backup is kept.
+///   And hooks the rebase runs inherit its reflog marker, so a hook of the
+///   user's that moves `HEAD` or the branch is taken as the restack's.
 /// - Recovery takes a rebase of the branch that started from the backup's
 ///   commit, onto what `origin/<default>` still holds, with only one
-///   restack's reflog marker on the worktree's `HEAD` moves, while a stale
-///   backup equal to the tip exists, as SlashIt's own and aborts it. Nothing
-///   records which process started a rebase, so one started by hand that
-///   matches all of that exactly would be aborted as well.
+///   restack's reflog marker on the worktree's `HEAD` moves and nothing but
+///   its conflict in the worktree, while a stale backup equal to the tip
+///   exists, as SlashIt's own and undoes it. Nothing records which process
+///   started a rebase, so one started by hand that matches all of that
+///   exactly would be undone as well.
 async fn restack_onto_landed_parent(
     state: &crate::AppState,
     task_uuid: Uuid,
@@ -3438,22 +3442,25 @@ fn restack_failure_message(
         ),
         RestackFailure::NotRestored(what) => format!(
             "Restacking {branch} onto {default} ({onto}) failed: {what}. Its tip from before is \
-             kept at {backup} ({old_tip}). To put it back, in the task's worktree at {worktree} \
+             kept at {backup} ({old_tip}). To put it back, in the task's worktree at {worktree}, \
              check first that nothing you want to keep is only on the branch (`git log \
-             {backup}..{branch}`), run `git rebase --abort` if a rebase is still in progress, then \
-             `git reset --keep {backup}`, then delete the backup with `git update-ref -d \
-             {backup}`. Nothing was pushed and no pull request was opened."
+             {backup}..{branch}`). Where the reason above names a command to finish with, run \
+             that; otherwise run `git rebase --abort` if a rebase is still in progress, then `git \
+             reset --keep {backup}`. Then delete the backup with `git update-ref -d {backup}`. \
+             Nothing was pushed and no pull request was opened."
         ),
         RestackFailure::BranchMoved(what) => format!(
-            "Restacking {branch} onto {default} ({onto}) failed: {what}. {branch} changed while \
-             SlashIt was operating on it, by a commit from the task's terminal or another tool, \
-             so SlashIt deliberately left it untouched: it reset, aborted and deleted nothing. \
-             The branch's tip from before the restack is kept at {backup} ({old_tip}). Inspect \
-             the branch in the task's worktree at {worktree} (`git status`, `git log \
-             {backup}..{branch}`). Only if you want the old tip back, run `git rebase --abort` \
-             there if a rebase is in progress, then `git reset --keep {backup}`. Either way, \
-             delete the backup afterwards with `git update-ref -d {backup}`. Nothing was pushed \
-             and no pull request was opened."
+            "Restacking {branch} onto {default} ({onto}) failed: {what}. The branch or the \
+             worktree's HEAD changed while SlashIt was operating on it (a commit, checkout or edit \
+             from the task's terminal, or another tool), so SlashIt deliberately left it \
+             untouched rather than undo someone else's work. {branch} may still hold the \
+             restacked tip, which the task does not record; until you choose, creating the pull \
+             request again refuses because of the backup. The branch's tip from before the \
+             restack is kept at {backup} ({old_tip}). Inspect the branch in the task's worktree \
+             at {worktree} (`git status`, `git log {backup}..{branch}`). Only if you want the old \
+             tip back, run `git rebase --abort` there if a rebase is in progress, then `git reset \
+             --keep {backup}`. Either way, delete the backup afterwards with `git update-ref -d \
+             {backup}`. Nothing was pushed and no pull request was opened."
         ),
     }
 }
@@ -3474,16 +3481,22 @@ fn restack_failure_message(
 ///   (which the earlier restack fetched and rebased onto), and whose moves
 ///   of the worktree's `HEAD` all carry one restack's reflog marker
 ///   ([`crate::worktree::restack::head_moved_only_by_a_restack`]), is taken
-///   as SlashIt's: it is aborted, the worktree verified back on the branch
-///   at that tip, and the backup deleted.
+///   as SlashIt's. It is undone only while the worktree holds nothing but
+///   the conflict it stopped on
+///   ([`crate::worktree::restack::changes_beyond_the_stop`]): a resolved
+///   conflict, another changed path or an untracked file is refused as
+///   below. It is undone without writing the branch
+///   ([`crate::worktree::restack::undo_stopped_rebase`]), the worktree
+///   verified back on the branch at that tip, and the backup deleted.
 /// - A backup equal to the branch's tip with no rebase in progress holds
 ///   nothing the branch does not, and is deleted.
 /// - Any other backup is refused, naming it and the branch's tip, and nothing
 ///   is aborted or deleted: the branch may have been restacked without the
 ///   task recording it, or moved since, and SlashIt cannot tell which is
 ///   right. That includes a rebase onto another commit, one run or continued
-///   by hand, one with a commit from the terminal on top, and one whose
-///   onto no longer matches because `origin/<default>` was fetched since.
+///   by hand, one with a commit from the terminal on top, one whose onto no
+///   longer matches because `origin/<default>` was fetched since, and one
+///   whose stop the user has worked on.
 ///
 /// A rebase in progress with no backup ref was not started by SlashIt. It is
 /// left alone here; a restack that would need the worktree refuses it.
@@ -3491,7 +3504,9 @@ fn restack_failure_message(
 /// What remains ambiguous: a rebase of the same branch, from the same tip,
 /// onto the same commit, whose reflog entries all carry a
 /// `slashit-restack/<uuid>` action, is taken as SlashIt's, however it was
-/// started. Nothing records which process started it.
+/// started. Nothing records which process started it. An edit inside a path
+/// that is still unmerged cannot be told from the conflict markers the stop
+/// wrote there, and is discarded with them.
 async fn recover_unfinished_restack(
     repo: &std::path::Path,
     worktree: Option<&std::path::Path>,
@@ -3523,22 +3538,28 @@ async fn recover_unfinished_restack(
     match (rebase, worktree) {
         (Some(rebase), Some(worktree)) if saved == tip && rebase.orig_head == saved => {
             let fetched = restack::exact_ref(repo, &format!("refs/remotes/origin/{default}")).await?;
-            let own = fetched.as_deref() == Some(rebase.onto.as_str())
-                && restack::head_moved_only_by_a_restack(worktree).await?;
-            if !own {
+            let marker = match fetched.as_deref() == Some(rebase.onto.as_str()) {
+                true => restack::head_moved_only_by_a_restack(worktree).await?,
+                false => None,
+            };
+            let Some(marker) = marker else {
                 return Err(unfinished(format!(
                     ", with a rebase of it in progress in {} that SlashIt cannot prove is its own",
                     worktree.display()
                 )));
+            };
+            if let Some(why) = restack::changes_beyond_the_stop(worktree).await? {
+                return Err(unfinished(format!(
+                    ", with its rebase stopped in {}, where the worktree holds changes SlashIt did \
+                     not make ({why})",
+                    worktree.display()
+                )));
             }
-            restack::abort_rebase(worktree)
+            restack::undo_stopped_rebase(worktree, branch, &saved, &format!("{marker} (recovery)"))
                 .await
-                .map_err(|e| unfinished(format!(", and aborting the rebase still in progress failed: {e}")))?;
-            restack::verify_restored(worktree, branch, &saved)
-                .await
-                .map_err(|e| unfinished(format!(", and after aborting its rebase {e}")))?;
+                .map_err(|e| unfinished(format!(", and undoing its stopped rebase left {e}")))?;
             restack::retire_backup(repo, backup, &saved).await?;
-            eprintln!("[pr] aborted an unfinished restack of {branch}; it is back at {saved}");
+            eprintln!("[pr] undid an unfinished restack of {branch}; it is back at {saved}");
             Ok(())
         }
         (None, _) if saved == tip => restack::retire_backup(repo, backup, &saved).await,
@@ -8259,6 +8280,15 @@ mod tests {
                     ),
                 );
                 git(&landed.repo.checkout, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+                /// Releases the hook when dropped, so a failing assertion
+                /// cannot leave it looping.
+                struct Release(PathBuf);
+                impl Drop for Release {
+                    fn drop(&mut self) {
+                        let _ = std::fs::write(&self.0, "");
+                    }
+                }
+                let release = Release(release);
                 let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
                 let (state, _tmp) = build_test_state().await;
                 let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
@@ -8278,7 +8308,7 @@ mod tests {
                 assert!(entered.exists(), "the rebase never reached its post-rewrite hook");
                 commit_file(&landed.worktree, "u.txt", "u\n", "U");
                 let user = git(&landed.worktree, &["rev-parse", "HEAD"]);
-                std::fs::write(&release, "").unwrap();
+                drop(release);
                 let error = running.await.unwrap().expect_err("moved meanwhile");
 
                 assert!(error.contains("left it untouched"), "{error}");
@@ -8367,7 +8397,9 @@ mod tests {
             /// every move of the worktree's `HEAD` since it started carries
             /// one restack's reflog marker. A rebase onto another commit, one
             /// without the marker, or one with a terminal commit on top is
-            /// the user's. The restack then runs again from the start. A backup
+            /// the user's, and so is a stop whose conflict was resolved or
+            /// beside which another file was edited: undoing it would
+            /// discard that work. The restack then runs again from the start. A backup
             /// that still equals the branch is reused. Anything else (a backup
             /// the branch no longer equals, with or without a rebase in
             /// progress, or a rebase SlashIt has no backup for) is refused
@@ -8386,6 +8418,8 @@ mod tests {
                     RebaseOntoAnotherCommit,
                     RebaseWithForeignMoves,
                     UnmarkedRebase,
+                    ResolvedStop,
+                    EditBesidesTheStop,
                 }
                 for leftover in [
                     Leftover::OwnRebaseInProgress,
@@ -8396,6 +8430,8 @@ mod tests {
                     Leftover::RebaseOntoAnotherCommit,
                     Leftover::RebaseWithForeignMoves,
                     Leftover::UnmarkedRebase,
+                    Leftover::ResolvedStop,
+                    Leftover::EditBesidesTheStop,
                 ] {
                     let landed = land(Spec::new(Landing::Squash));
                     let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
@@ -8412,14 +8448,21 @@ mod tests {
                         assert!(!ok, "the rebase must stop part way: {out}");
                         assert!(mid_operation(wt));
                     };
-                    // What SlashIt's own rebase leaves: every move of the
-                    // worktree's `HEAD` marked with its reflog action, onto
-                    // `origin/main` as fetched then.
+                    // What SlashIt's own rebase leaves when it stops on a
+                    // conflict: every move of the worktree's `HEAD` marked
+                    // with its reflog action, onto `origin/main` as fetched
+                    // then. Replaying from `main`'s first commit makes A1's
+                    // a.txt collide with the squashed parent's. Onto any
+                    // other commit, `-x false` stops it after the first pick.
                     let start_marked_rebase = |onto: &str| {
                         git(wt, &["fetch", "-q", "origin", "main"]);
+                        let own_onto = onto == "refs/remotes/origin/main";
+                        let from = if own_onto { format!("{}~2", landed.base_commit) } else { landed.base_commit.clone() };
+                        let stop: &[&str] = if own_onto { &[] } else { &["-x", "false"] };
                         let output = StdCommand::new("git")
-                            .args(["-c", "core.logAllRefUpdates=always", "rebase", "-x", "false", "--onto", onto])
-                            .args([landed.base_commit.as_str(), "task-branch"])
+                            .args(["-c", "core.logAllRefUpdates=always", "rebase"])
+                            .args(stop)
+                            .args(["--onto", onto, from.as_str(), "task-branch"])
                             .current_dir(wt)
                             .env("GIT_REFLOG_ACTION", format!("slashit-restack/{}", Uuid::new_v4()))
                             .env("GIT_COMMITTER_NAME", "Test")
@@ -8428,6 +8471,9 @@ mod tests {
                             .expect("run git");
                         assert!(!output.status.success(), "the rebase must stop part way");
                         assert!(mid_operation(wt));
+                        if own_onto {
+                            assert_eq!(git(wt, &["diff", "--name-only", "--diff-filter=U"]), "a.txt");
+                        }
                     };
                     match leftover {
                         Leftover::OwnRebaseInProgress => {
@@ -8446,6 +8492,17 @@ mod tests {
                         Leftover::UnmarkedRebase => {
                             git(wt, &["update-ref", &backup, &landed.child_tip, ""]);
                             start_rebase();
+                        }
+                        Leftover::ResolvedStop => {
+                            git(wt, &["update-ref", &backup, &landed.child_tip, ""]);
+                            start_marked_rebase("refs/remotes/origin/main");
+                            std::fs::write(wt.join("a.txt"), "resolved\n").unwrap();
+                            git(wt, &["add", "a.txt"]);
+                        }
+                        Leftover::EditBesidesTheStop => {
+                            git(wt, &["update-ref", &backup, &landed.child_tip, ""]);
+                            start_marked_rebase("refs/remotes/origin/main");
+                            std::fs::write(wt.join("m.txt"), "edited\n").unwrap();
                         }
                         Leftover::BackupAtTip => {
                             git(wt, &["update-ref", &backup, &landed.child_tip, ""]);
@@ -8492,9 +8549,27 @@ mod tests {
                         }
                         Leftover::RebaseOntoAnotherCommit
                         | Leftover::RebaseWithForeignMoves
-                        | Leftover::UnmarkedRebase => {
+                        | Leftover::UnmarkedRebase
+                        | Leftover::ResolvedStop
+                        | Leftover::EditBesidesTheStop => {
                             let error = result.expect_err("refused");
                             assert!(error.contains(&backup), "{leftover:?}: {error}");
+                            if matches!(leftover, Leftover::ResolvedStop | Leftover::EditBesidesTheStop) {
+                                assert!(error.contains("changes SlashIt did not make"), "{leftover:?}: {error}");
+                            }
+                            match leftover {
+                                Leftover::ResolvedStop => assert_eq!(
+                                    std::fs::read_to_string(wt.join("a.txt")).unwrap(),
+                                    "resolved\n",
+                                    "the resolution is kept"
+                                ),
+                                Leftover::EditBesidesTheStop => assert_eq!(
+                                    std::fs::read_to_string(wt.join("m.txt")).unwrap(),
+                                    "edited\n",
+                                    "the edit is kept"
+                                ),
+                                _ => {}
+                            }
                             assert!(mid_operation(wt), "{leftover:?}: a rebase that is not provably SlashIt's is not aborted");
                             assert_eq!(
                                 ref_at(&landed.repo.checkout, &backup).as_deref(),

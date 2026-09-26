@@ -7,14 +7,22 @@
 //! several namespaces, and never runs anything that could set work aside,
 //! move another branch, or reach the remote.
 //!
-//! The one mutation is `git rebase --onto <onto> <fork point> <branch>`, run
-//! in the worktree that has the branch checked out. Git moves the branch ref
-//! only once every commit has been replayed, keeps the state of a rebase in
-//! progress in the worktree's own Git directory, and restores the branch on
-//! `git rebase --abort`. `ORIG_HEAD` is not a durable record of where the
-//! branch was, so before the rebase the old tip is written to a backup ref
-//! under `refs/slashit/restack-backup/`, which every worktree of the
-//! repository shares and which jj neither imports nor rewrites.
+//! The restack itself is `git rebase --onto <onto> <fork point> <branch>`,
+//! run in the worktree that has the branch checked out. Git moves the branch
+//! ref only once every commit has been replayed, and keeps the state of a
+//! rebase in progress in the worktree's own Git directory. `ORIG_HEAD` is
+//! not a durable record of where the branch was, so before the rebase the
+//! old tip is written to a backup ref under `refs/slashit/restack-backup/`
+//! (created only if absent, and deleted only while it still holds the old
+//! tip), which every worktree of the repository shares and which jj neither
+//! imports nor rewrites. Undoing a restack writes nothing else but:
+//!
+//! - for a rebase that stopped part way, which never moved the branch,
+//!   `git rebase --quit`, `git symbolic-ref HEAD refs/heads/<branch>` and
+//!   `git read-tree --reset -u <old tip>`, none of which writes the branch;
+//! - for a rebase that finished, a compare-and-swap of the branch ref from
+//!   the tip the rebase produced back to the old tip (`git update-ref`),
+//!   then `git read-tree -m -u` to bring the index and files along.
 //!
 //! SlashIt's own flows are kept out of the worktree while a restack runs, but
 //! the user is not: a commit from the task's terminal, or another tool, can
@@ -25,6 +33,11 @@
 //! produced and nothing moved since. A branch or `HEAD` that moved otherwise
 //! is left exactly as it is, with the backup ref kept
 //! ([`RestackFailure::BranchMoved`]).
+//!
+//! Hooks the rebase runs (`post-checkout`, `post-rewrite` and so on) inherit
+//! its `GIT_REFLOG_ACTION`, so a hook of the user's that moves `HEAD` or the
+//! branch during the rebase is logged under the marker and taken as the
+//! restack's own.
 
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
@@ -245,10 +258,16 @@ pub async fn interrupted_rebase_of(dir: &Path, branch: &str) -> Result<Option<In
 pub const REFLOG_ACTION_PREFIX: &str = "slashit-restack/";
 
 /// The entries of `refname`'s reflog in the worktree at `dir`, newest first,
-/// as the object ID each one set and its message. `HEAD` is the worktree's
-/// own. A ref with no reflog has no entries.
-async fn reflog(dir: &Path, refname: &str) -> Result<Vec<(String, String)>, String> {
-    let ran = run(dir, &["log", "-g", "--no-show-signature", "--format=%H%x00%gs", refname, "--"], &[]).await?;
+/// as the object ID each one set and its message, at most `limit` of them.
+/// `HEAD` is the worktree's own. A ref with no reflog has no entries.
+async fn reflog(dir: &Path, refname: &str, limit: usize) -> Result<Vec<(String, String)>, String> {
+    let limit = format!("--max-count={limit}");
+    let ran = run(
+        dir,
+        &["log", "-g", "--no-show-signature", &limit, "--format=%H%x00%gs", refname, "--"],
+        &[],
+    )
+    .await?;
     if ran.code != Some(0) {
         return Err(format!("git could not read the reflog of {refname}: {}", ran.stderr));
     }
@@ -265,7 +284,7 @@ async fn reflog(dir: &Path, refname: &str) -> Result<Vec<(String, String)>, Stri
 /// its reflog is the rebase's `(finish)`. `None` when anything else moved
 /// the branch since, or the rebase never finished.
 async fn produced_tip(dir: &Path, branch: &str, marker: &str) -> Result<Option<String>, String> {
-    let entries = reflog(dir, &format!("refs/heads/{branch}")).await?;
+    let entries = reflog(dir, &format!("refs/heads/{branch}"), 1).await?;
     let finish = format!("{marker} (finish):");
     Ok(entries
         .into_iter()
@@ -274,13 +293,19 @@ async fn produced_tip(dir: &Path, branch: &str, marker: &str) -> Result<Option<S
         .map(|(oid, _)| oid))
 }
 
+/// How far back `HEAD`'s reflog is searched for a rebase's `(start)`: one
+/// entry per replayed commit and a few more, so far more than any task
+/// branch SlashIt restacks. A `(start)` further back is not found, and the
+/// moves are then not taken as the rebase's.
+const HEAD_REFLOG_LIMIT: usize = 10_000;
+
 /// Whether every move of the worktree's `HEAD` since the rebase marked
 /// `marker` started was that rebase's (or its rollback's): walking `HEAD`'s
 /// reflog from the newest entry, each one carries the marker, down to its
 /// `(start)`, and `HEAD` is where the newest entry left it. A commit, a
 /// checkout or a rebase from anywhere else, or no `(start)` at all, is not.
 async fn head_moved_only_by(dir: &Path, marker: &str) -> Result<bool, String> {
-    let entries = reflog(dir, "HEAD").await?;
+    let entries = reflog(dir, "HEAD", HEAD_REFLOG_LIMIT).await?;
     let Some((newest, _)) = entries.first() else {
         return Ok(false);
     };
@@ -300,28 +325,79 @@ async fn head_moved_only_by(dir: &Path, marker: &str) -> Result<bool, String> {
     Ok(false)
 }
 
-/// Whether the worktree's `HEAD` has been moved by nothing but one restack's
-/// rebase since it started, whichever restack that was: the newest entry of
+/// The marker of the one restack whose rebase alone has moved the worktree's
+/// `HEAD` since it started, whichever restack that was, or `None`: the
+/// newest entry of
 /// `HEAD`'s reflog carries a marker under [`REFLOG_ACTION_PREFIX`], and every
 /// entry down to that marker's `(start)` carries the same one. A rebase run
 /// or continued by hand, or a commit from the terminal, is logged under
-/// another action and makes this false.
-pub async fn head_moved_only_by_a_restack(dir: &Path) -> Result<bool, String> {
-    let entries = reflog(dir, "HEAD").await?;
+/// another action and makes this `None`.
+pub async fn head_moved_only_by_a_restack(dir: &Path) -> Result<Option<String>, String> {
+    let entries = reflog(dir, "HEAD", HEAD_REFLOG_LIMIT).await?;
     let marker = entries.first().and_then(|(_, message)| {
         let marker = message.split(' ').next()?;
         let nonce = marker.strip_prefix(REFLOG_ACTION_PREFIX)?;
         Uuid::parse_str(nonce).is_ok().then(|| marker.to_string())
     });
     match marker {
-        Some(marker) => head_moved_only_by(dir, &marker).await,
-        None => Ok(false),
+        Some(marker) if head_moved_only_by(dir, &marker).await? => Ok(Some(marker)),
+        _ => Ok(None),
     }
 }
 
-/// Abort the rebase in progress in the worktree at `dir`.
-pub async fn abort_rebase(dir: &Path) -> Result<(), String> {
-    git(dir, &["rebase", "--abort"]).await.map(|_| ())
+/// Why the rebase stopped in the worktree at `dir` no longer holds only what
+/// the stop itself left, or `None` when it does.
+///
+/// A rebase that stops on a conflict leaves the conflicted paths unmerged,
+/// and the worktree was clean before it started. So a stop with no unmerged
+/// paths left (resolved by hand, or a stop that was not a conflict), a
+/// change to any other tracked path that is not staged, or an untracked file
+/// are someone else's work, which undoing the stop would discard. What
+/// cannot be told apart: an edit inside a path that is still unmerged looks
+/// the same as the conflict markers the stop wrote there.
+pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, String> {
+    let paths = |listed: String| -> std::collections::BTreeSet<String> {
+        listed.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect()
+    };
+    let unmerged = paths(git(dir, &["diff", "-z", "--name-only", "--diff-filter=U"]).await?);
+    if unmerged.is_empty() {
+        return Ok(Some("no conflicted paths are left, so they were resolved by hand".to_string()));
+    }
+    let unstaged = paths(git(dir, &["diff", "-z", "--name-only"]).await?);
+    let others: Vec<String> = unstaged.difference(&unmerged).cloned().collect();
+    if !others.is_empty() {
+        return Ok(Some(format!("{} changed besides the conflict", others.join(", "))));
+    }
+    let untracked = paths(git(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).await?);
+    if !untracked.is_empty() {
+        return Ok(Some(format!(
+            "it has untracked files ({})",
+            untracked.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    Ok(None)
+}
+
+/// Undo a rebase of `refs/heads/<branch>` stopped part way in the worktree
+/// at `dir`, back to `old_tip`, without writing the branch ref: a rebase
+/// that stopped never moved it, and `git rebase --abort` would write it back
+/// to where the rebase started, over anything that moved it since.
+///
+/// `git rebase --quit` drops the rebase's state and leaves `HEAD` detached
+/// where it stopped, `git symbolic-ref` puts `HEAD` back on the branch
+/// (logged as `message`), and `git read-tree --reset -u <old tip>` makes the
+/// index and the files the old tip's, removing what the stop added and
+/// leaving untracked files that neither has alone. The caller has checked
+/// that the rebase is the one it means to undo and that the worktree holds
+/// nothing else ([`changes_beyond_the_stop`]). The result is verified with
+/// [`verify_restored`]; if the branch was moved in the meantime, that fails
+/// and nothing it was moved to is lost.
+pub async fn undo_stopped_rebase(dir: &Path, branch: &str, old_tip: &str, message: &str) -> Result<(), String> {
+    let branch_ref = format!("refs/heads/{branch}");
+    git(dir, &["rebase", "--quit"]).await?;
+    git(dir, &["symbolic-ref", "-m", message, "HEAD", &branch_ref]).await?;
+    git(dir, &["read-tree", "--reset", "-u", old_tip]).await?;
+    verify_restored(dir, branch, old_tip).await
 }
 
 /// Create the backup ref at `tip`, failing if it already exists.
@@ -347,7 +423,7 @@ pub async fn verify_restored(dir: &Path, branch: &str, old_tip: &str) -> Result<
     let branch_ref = format!("refs/heads/{branch}");
     let tip = exact_ref(dir, &branch_ref).await?;
     if tip.as_deref() != Some(old_tip) {
-        return Err(format!("{branch_ref} is at {tip:?}, not {old_tip}"));
+        return Err(format!("{branch_ref} is at {}, not {old_tip}", tip.as_deref().unwrap_or("nothing (it is missing)")));
     }
     let state = worktree_state(dir).await?;
     if state.head_ref.as_deref() != Some(branch_ref.as_str()) || state.head != old_tip {
@@ -374,6 +450,10 @@ pub struct Restack<'a> {
     pub backup: &'a str,
     /// The reflog action this restack's rebase runs under, unique to it.
     marker: String,
+    /// Run once, in tests, between the checks that a stopped rebase is this
+    /// restack's and undoing it, to move things in that window.
+    #[cfg(test)]
+    before_undoing_a_stop: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Why [`Restack::replay`] did not produce a verified restacked branch.
@@ -387,13 +467,15 @@ pub enum RestackFailure {
     NotRestored(String),
     /// What went wrong, and how the branch or the worktree's `HEAD` was
     /// found moved by something other than this restack: a commit from the
-    /// task's terminal, say, or another tool. Nothing was reset, aborted or
-    /// deleted, so whatever moved it is kept, and the backup ref is kept,
-    /// holding the old tip.
+    /// task's terminal, say, or another tool. The branch was not written and
+    /// nothing was deleted, so whatever moved it is kept, and the backup ref
+    /// is kept, holding the old tip. When the branch moved while a stopped
+    /// rebase was being undone, the worktree was already put back on the
+    /// branch with the old tip's files, as the `String` says.
     BranchMoved(String),
 }
 
-/// Why a rollback left the branch as it found it.
+/// Why a rollback did not put the branch back.
 enum NotUndone {
     /// Something other than this restack moved the branch or `HEAD`.
     Moved(String),
@@ -419,7 +501,17 @@ impl<'a> Restack<'a> {
         backup: &'a str,
     ) -> Self {
         let marker = format!("{REFLOG_ACTION_PREFIX}{}", Uuid::new_v4());
-        Restack { worktree, branch, fork_point, old_tip, onto, backup, marker }
+        Restack {
+            worktree,
+            branch,
+            fork_point,
+            old_tip,
+            onto,
+            backup,
+            marker,
+            #[cfg(test)]
+            before_undoing_a_stop: std::sync::Mutex::new(None),
+        }
     }
 
     /// Replay the task's commits onto `onto` and verify the result.
@@ -428,7 +520,8 @@ impl<'a> Restack<'a> {
     /// point as object IDs, the branch by its exact name, and it turns off
     /// everything configuration could turn on behind the caller's back:
     /// setting uncommitted work aside (`--no-autostash`), moving other
-    /// branches that point into the replayed range (`--no-update-refs`),
+    /// branches that point into the replayed range (`--no-update-refs`, on
+    /// a git new enough to have it and so `rebase.updateRefs`),
     /// guessing another fork point from the reflog (`--no-fork-point`),
     /// recreating merges, and reordering `fixup!` commits. The caller has
     /// already checked that the worktree is clean and has the branch
@@ -471,26 +564,27 @@ impl<'a> Restack<'a> {
             }
         };
         envs.push(("GIT_REFLOG_ACTION", self.marker.clone()));
-        let rebased = run(
-            self.worktree,
-            &[
-                "-c",
-                "core.logAllRefUpdates=always",
-                "rebase",
-                "--no-autostash",
-                "--no-update-refs",
-                "--no-fork-point",
-                "--no-rebase-merges",
-                "--no-autosquash",
-                "--quiet",
-                "--onto",
-                self.onto,
-                self.fork_point,
-                self.branch,
-            ],
-            &envs,
-        )
-        .await;
+        let version = match git(self.worktree, &["version"]).await {
+            Ok(version) => version,
+            Err(e) => {
+                return Err(self.restore(false, format!("the rebase could not be started: {e}")).await)
+            }
+        };
+        let mut args = vec!["-c", "core.logAllRefUpdates=always", "rebase", "--no-autostash"];
+        if knows_no_update_refs(&version) {
+            args.push("--no-update-refs");
+        }
+        args.extend([
+            "--no-fork-point",
+            "--no-rebase-merges",
+            "--no-autosquash",
+            "--quiet",
+            "--onto",
+            self.onto,
+            self.fork_point,
+            self.branch,
+        ]);
+        let rebased = run(self.worktree, &args, &envs).await;
         match rebased {
             Ok(ran) => Ok(ran),
             Err(e) => Err(self.restore(false, format!("git rebase could not be run: {e}")).await),
@@ -526,7 +620,10 @@ impl<'a> Restack<'a> {
             .ok_or_else(|| format!("the latest update of {branch_ref} is not this restack's rebase"))?;
         let tip = exact_ref(self.worktree, &branch_ref).await?;
         if tip.as_deref() != Some(new_tip.as_str()) {
-            return Err(format!("{branch_ref} is at {tip:?}, not at {new_tip}, which the rebase produced"));
+            return Err(format!(
+                "{branch_ref} is at {}, not at {new_tip}, which the rebase produced",
+                tip.as_deref().unwrap_or("nothing (it is missing)")
+            ));
         }
         if !head_moved_only_by(self.worktree, &self.marker).await? {
             return Err("the worktree's HEAD was moved by something other than this restack".to_string());
@@ -566,13 +663,16 @@ impl<'a> Restack<'a> {
     ///
     /// - A rebase that never started changed nothing, and nothing is done:
     ///   the branch and the worktree are only verified at the old tip.
-    /// - A rebase still in progress is aborted, which is how git itself
-    ///   restores the branch, only while it is provably this one: a rebase
-    ///   of `refs/heads/<branch>` from the old tip onto `onto`, the branch
-    ///   still at the old tip, and `HEAD` moved by nothing but this rebase.
-    ///   `git rebase --abort` has no compare-and-swap of its own, so a move
-    ///   of `HEAD` in the instant between that check and the abort is not
-    ///   detected.
+    /// - A rebase stopped part way is undone only while it is provably this
+    ///   one: a rebase of `refs/heads/<branch>` from the old tip onto `onto`,
+    ///   the branch still at the old tip, `HEAD` moved by nothing but this
+    ///   rebase, and the worktree holding nothing but the conflict the stop
+    ///   left ([`changes_beyond_the_stop`]). It is undone with
+    ///   [`undo_stopped_rebase`], which never writes the branch ref, never
+    ///   with `git rebase --abort`, which writes it back to where the rebase
+    ///   started. A branch moved after the checks keeps what it was moved to;
+    ///   a `HEAD` moved in that instant is put back on the branch, and what
+    ///   it was moved to stays in its reflog.
     /// - A rebase that finished moved the branch. It is moved back only
     ///   while it is still at the tip the rebase produced, per its reflog,
     ///   with the worktree's `HEAD` on it, moved by nothing else and in the
@@ -580,7 +680,8 @@ impl<'a> Restack<'a> {
     ///   (`git update-ref <branch> <old tip> <produced tip>`), which changes
     ///   nothing if it moved in the meantime; only then are the index and
     ///   the files brought back with `git read-tree -m -u`, which refuses
-    ///   rather than overwrite local changes or untracked files. A commit
+    ///   rather than overwrite local changes or untracked files (ignored
+    ///   files it does overwrite, as `git checkout` would). A commit
     ///   made in the instant between the swap and the read-tree is not
     ///   detected before it, and fails the verification after it.
     /// - A branch already at the old tip with no rebase in progress is
@@ -606,8 +707,6 @@ impl<'a> Restack<'a> {
     /// After a rebase that never started: nothing to undo, and anything not
     /// at the old tip was moved by someone else.
     async fn check_untouched(&self) -> Result<(), NotUndone> {
-        let branch_ref = format!("refs/heads/{}", self.branch);
-        exact_ref(self.worktree, &branch_ref).await?;
         verify_restored(self.worktree, self.branch, self.old_tip)
             .await
             .map_err(|why| NotUndone::Moved(format!("{why}, although SlashIt had not changed anything yet")))
@@ -639,8 +738,34 @@ impl<'a> Restack<'a> {
                     shown(&tip)
                 )));
             }
-            abort_rebase(self.worktree).await?;
-            return Ok(verify_restored(self.worktree, self.branch, self.old_tip).await?);
+            if let Some(why) = changes_beyond_the_stop(self.worktree).await? {
+                return Err(NotUndone::Moved(format!(
+                    "the worktree holds changes SlashIt did not make while its rebase was stopped \
+                     ({why}); {branch_ref} is at {}",
+                    shown(&tip)
+                )));
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.before_undoing_a_stop.lock().unwrap().take() {
+                hook();
+            }
+            let message = format!("{} (rollback)", self.marker);
+            if let Err(why) = undo_stopped_rebase(self.worktree, self.branch, self.old_tip, &message).await {
+                let now = exact_ref(self.worktree, &branch_ref).await?;
+                if now.as_deref() != Some(self.old_tip) {
+                    return Err(NotUndone::Moved(format!(
+                        "{branch_ref} was moved to {} while the stopped rebase was being undone. \
+                         The branch was not written; the worktree is back on it, but its index and \
+                         files hold {}'s version, which `git read-tree -m -u {} HEAD` there brings \
+                         to the branch's tip",
+                        shown(&now),
+                        self.old_tip,
+                        self.old_tip
+                    )));
+                }
+                return Err(NotUndone::Failed(why));
+            }
+            return Ok(());
         }
 
         if tip.as_deref() == Some(self.old_tip) {
@@ -700,9 +825,9 @@ impl<'a> Restack<'a> {
         if files.code != Some(0) {
             return Err(NotUndone::Failed(format!(
                 "{branch_ref} is back at {}, but the worktree's index and files still hold the \
-                 restacked {produced}, because git would not update them without overwriting \
-                 something ({}). Run `git status` in the worktree, move aside what is in the way, \
-                 then run `git read-tree -m -u {produced} {}` there",
+                 restacked {produced}: git read-tree could not update them ({}). To finish, run \
+                 `git status` in the worktree, deal with what it reports, then run `git read-tree \
+                 -m -u {produced} {}` there",
                 self.old_tip, files.stderr, self.old_tip
             )));
         }
@@ -717,6 +842,21 @@ impl<'a> Restack<'a> {
     pub async fn roll_back(&self, what: String) -> RestackFailure {
         self.restore(true, what).await
     }
+}
+
+/// Whether the git that printed `version` (`git version` output, such as
+/// `git version 2.39.5 (Apple Git-154)` or `git version 2.45.1.windows.1`)
+/// knows `git rebase --no-update-refs`, which came with 2.38. An older git
+/// rejects the option, and has no `rebase.updateRefs` for it to turn off
+/// either. A version that cannot be read is taken to know it.
+fn knows_no_update_refs(version: &str) -> bool {
+    let parsed = version.trim().strip_prefix("git version ").and_then(|v| {
+        let mut numbers = v.split(|c: char| !c.is_ascii_digit());
+        let major: u32 = numbers.next()?.parse().ok()?;
+        let minor: u32 = numbers.next()?.parse().ok()?;
+        Some((major, minor))
+    });
+    parsed.is_none_or(|version| version >= (2, 38))
 }
 
 /// The committer identity to give the rebase: nothing when git already has
@@ -1016,6 +1156,54 @@ mod tests {
             assert_eq!(fixture.tip().as_deref(), Some(expected_tip.as_str()), "moved_branch={moved_branch}");
             assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
             fixture.assert_nothing_pushed();
+        }
+    }
+
+    /// Undoing a stopped rebase never writes the branch: a rebase that
+    /// stopped never moved it. A branch moved in the window after the checks
+    /// that the stop is this restack's, and before it is undone, keeps what
+    /// it was moved to, and the backup is kept.
+    #[tokio::test]
+    async fn undoing_a_stopped_restack_never_moves_the_branch_back() {
+        let fixture = Fixture::new(true);
+        let restack = fixture.restack();
+        let ran = restack.rebase().await.unwrap_or_else(|f| panic!("{}", describe(&f)));
+        assert_ne!(ran.code, Some(0));
+        let tree = git_in(&fixture.worktree, &["rev-parse", &format!("{}^{{tree}}", fixture.old_tip)]);
+        let user = git_in(&fixture.worktree, &["commit-tree", "-p", &fixture.old_tip, "-m", "U", &tree]);
+        *restack.before_undoing_a_stop.lock().unwrap() = Some(Box::new({
+            let worktree = fixture.worktree.clone();
+            let (user, old_tip) = (user.clone(), fixture.old_tip.clone());
+            move || {
+                git_in(&worktree, &["update-ref", "refs/heads/task", &user, &old_tip]);
+            }
+        }));
+
+        let failure = restack.settle(ran).await.expect_err("not restacked");
+
+        assert_eq!(fixture.tip().as_deref(), Some(user.as_str()), "the branch keeps what it was moved to");
+        assert!(!matches!(failure, RestackFailure::Restored(_)), "{}", describe(&failure));
+        assert_eq!(fixture.backup_at().as_deref(), Some(fixture.old_tip.as_str()));
+        fixture.assert_nothing_pushed();
+    }
+
+    #[test]
+    fn no_update_refs_is_passed_only_to_a_git_that_knows_it() {
+        for (version, knows) in [
+            ("git version 2.55.0", true),
+            ("git version 2.38.0", true),
+            ("git version 2.37.7", false),
+            ("git version 2.39.5 (Apple Git-154)", true),
+            ("git version 2.45.1.windows.1", true),
+            ("git version 2.34.1.windows.2", false),
+            ("git version 1.9.5", false),
+            ("git version 3.0.0", true),
+            ("git version 2.40.0-rc1\n", true),
+            ("something else", true),
+            ("git version", true),
+            ("git version abc", true),
+        ] {
+            assert_eq!(knows_no_update_refs(version), knows, "{version:?}");
         }
     }
 
