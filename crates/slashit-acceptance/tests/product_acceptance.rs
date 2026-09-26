@@ -592,11 +592,11 @@ async fn fail_then_retry(
     // not arrange, and the retry below would be recovering from the wrong
     // thing.
     let reported = failed.get("error_message").and_then(Value::as_str);
-    if reported != Some(fake_agent::REPORTED_FAILURE) {
+    let expected = fake_agent::recorded_failure();
+    if reported != Some(expected.as_str()) {
         bail!(
-            "the task carries error message {reported:?}, but the agent reported {:?} — the \
-             failure under test is not the one that happened",
-            fake_agent::REPORTED_FAILURE
+            "the task carries error message {reported:?}, but the agent's failure should be \
+             recorded as {expected:?} — the failure under test is not the one that happened"
         );
     }
     let phase = failed.get("phase").and_then(Value::as_str);
