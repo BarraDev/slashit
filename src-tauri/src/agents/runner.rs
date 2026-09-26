@@ -37,6 +37,165 @@ pub fn restricted_unsupported_reason(stderr: &str) -> Option<String> {
     })
 }
 
+/// The most characters of a `result` event's `errors` a failure reason
+/// quotes.
+const RESULT_ERRORS_LIMIT: usize = 400;
+
+/// The most characters of a `result` event's `result` text a failure reason
+/// quotes. Shorter than the others on purpose: on an error result it is
+/// usually an API message, but it is model-written text in general.
+const RESULT_TEXT_LIMIT: usize = 300;
+
+/// The most characters of the last stderr line a failure reason quotes.
+const STDERR_LINE_LIMIT: usize = 400;
+
+/// Why a stream-json `result` event says the run failed, or `None` when it
+/// is not a `result` event or reports no failure.
+///
+/// Claude Code (checked against 2.1.283) puts the reason for some failures
+/// only here, never on stderr:
+///
+/// - Running out of turns: `"subtype": "error_max_turns"`, `"is_error":
+///   true`, `"errors": ["Reached maximum number of turns (1)"]` and no
+///   `result` field, with exit status 1 and an empty stderr.
+/// - An API error: `"subtype": "success"` even so, `"is_error": true`,
+///   `"terminal_reason": "api_error"`, `"api_error_status": 404`, and the
+///   readable message as the `result` text. Stderr only has a diagnostic
+///   tag such as `[claude-code:unrecognized_model] {...}`.
+///
+/// The reason starts with the subtype, or the `terminal_reason` when the
+/// subtype is `success`, then the API status, then `errors`, or failing that
+/// the `result` text. Each is cut to one bounded line, so a long model
+/// answer never becomes the error.
+pub fn result_failure_reason(event: &serde_json::Value) -> Option<String> {
+    if event.get("type").and_then(|t| t.as_str()) != Some("result") {
+        return None;
+    }
+    let is_error = event.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+    let subtype = event.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+    if !is_error && !subtype.contains("error") && !subtype.contains("max_turns") {
+        return None;
+    }
+
+    let terminal_reason = event.get("terminal_reason").and_then(|s| s.as_str()).unwrap_or("");
+    let mut reason = if !subtype.is_empty() && subtype != "success" {
+        subtype.to_string()
+    } else if !terminal_reason.is_empty() {
+        terminal_reason.to_string()
+    } else {
+        "error".to_string()
+    };
+    if let Some(status) = event.get("api_error_status").and_then(|s| s.as_u64()) {
+        reason.push_str(&format!(" (API status {status})"));
+    }
+
+    let errors: Vec<&str> = event
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|e| e.as_str())
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let detail = if errors.is_empty() {
+        let text = event.get("result").and_then(|r| r.as_str()).unwrap_or("");
+        truncate_one_line(text.trim(), RESULT_TEXT_LIMIT)
+    } else {
+        truncate_one_line(&errors.join("; "), RESULT_ERRORS_LIMIT)
+    };
+    if !detail.is_empty() {
+        reason.push_str(": ");
+        reason.push_str(&detail);
+    }
+    Some(reason)
+}
+
+/// `s` on one line: its non-blank lines, ended by `\n` or `\r`, joined with
+/// ` / `.
+fn one_line(s: &str) -> String {
+    s.split(['\n', '\r']).filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" / ")
+}
+
+/// `s` on one line (see [`one_line`]), cut to its first `max` characters
+/// (on a character boundary) with a trailing `…` when longer.
+pub fn truncate_one_line(s: &str, max: usize) -> String {
+    let oneline = one_line(s);
+    if oneline.chars().count() <= max {
+        oneline
+    } else {
+        let truncated: String = oneline.chars().take(max).collect();
+        format!("{}…", truncated)
+    }
+}
+
+/// Like [`truncate_one_line`], but keeps the last `max` characters, with a
+/// leading `…` when longer: for output whose end says how it ended.
+pub fn truncate_one_line_tail(s: &str, max: usize) -> String {
+    let oneline = one_line(s);
+    let count = oneline.chars().count();
+    if count <= max {
+        oneline
+    } else {
+        let tail: String = oneline.chars().skip(count - max).collect();
+        format!("…{}", tail)
+    }
+}
+
+/// Why a run whose child did not exit successfully failed, as
+/// `<how it ended> — <detail>`.
+///
+/// For a child that exited with a code, the detail is, most specific first:
+///
+/// 1. The `result` event's reason ([`result_failure_reason`]), followed by
+///    the last stderr line when there is one. The real CLI's own reasons
+///    for running out of turns or hitting an API error are only there;
+///    what it writes to stderr is at best a diagnostic tag, kept alongside.
+/// 2. The last stderr line, for failures before any stream-json output,
+///    such as a rejected option.
+/// 3. Why the prompt did not arrive, when nothing else says more.
+/// 4. `no details`.
+///
+/// A child ended by a signal was killed, by [`ClaudeRunner::kill`] or from
+/// outside. A `result` event it wrote earlier is not why it ended, and the
+/// prompt write it cut short is a consequence, so only stderr is quoted.
+fn failed_exit_reason(
+    status: std::process::ExitStatus,
+    stderr: &str,
+    result_event: Option<&serde_json::Value>,
+    prompt_failure: Option<&str>,
+) -> String {
+    let stderr_line = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| truncate_one_line(l, STDERR_LINE_LIMIT));
+
+    #[cfg(unix)]
+    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+
+    let (head, structured, prompt_failure) = match (status.code(), signal) {
+        (Some(code), _) => {
+            (format!("Exit code {code}"), result_event.and_then(result_failure_reason), prompt_failure)
+        }
+        (None, Some(signal)) => (format!("Terminated by signal {signal}"), None, None),
+        (None, None) => ("Exit code unknown".to_string(), None, None),
+    };
+
+    let detail = match (structured, stderr_line) {
+        (Some(structured), Some(stderr)) => format!("{structured} (stderr: {stderr})"),
+        (Some(structured), None) => structured,
+        (None, Some(stderr)) => stderr,
+        (None, None) => prompt_failure.unwrap_or("no details").to_string(),
+    };
+    format!("{head} — {detail}")
+}
+
 /// What a run may do with tools.
 ///
 /// The Claude CLI has two separate lists, and confusing them is how a
@@ -225,8 +384,13 @@ pub struct ClaudeRunner {
     event_tx: broadcast::Sender<ClaudeEvent>,
     session_id: Arc<Mutex<Option<String>>>,
     accumulated_output: Arc<RwLock<String>>,
-    /// Set to the error text if the Result event has is_error: true
-    result_error: Arc<RwLock<Option<String>>>,
+    /// The last stream-json `result` event that reports a failure (see
+    /// [`result_failure_reason`]), verbatim, or the last `result` event
+    /// while none has. A failed run takes its reason from here.
+    result_event: Arc<RwLock<Option<serde_json::Value>>>,
+    /// Set once any `result` event has `is_error: true`. A run whose child
+    /// exits 0 still fails then, whatever results came after it.
+    result_is_error: Arc<AtomicBool>,
     /// Handle to the stdout reader task. `wait()` joins this before returning so
     /// callers can read the full accumulated output without racing the reader.
     reader_handle: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -247,10 +411,10 @@ pub struct ClaudeRunner {
     raw_stderr: Arc<RwLock<String>>,
     /// `(exit_success, exit_code)`, populated by [`Self::wait`] as soon as the
     /// child's exit status is known -- before this decides whether that status
-    /// or a `result_error` makes `wait()` itself return `Err`. A caller that
+    /// or an error `result` event makes `wait()` itself return `Err`. A caller that
     /// wants the raw exit code independently of that blended verdict (see
     /// `commands::pr::run_claude_pr_helper`, which gates its own error path on
-    /// exit-code success only, not on `result_error`) reads this instead of
+    /// exit-code success only, not on the `result` event) reads this instead of
     /// `wait()`'s return value.
     exit_status: Arc<RwLock<ExitStatusInfo>>,
     /// The task writing the prompt to the child's stdin. Started at spawn;
@@ -381,7 +545,8 @@ impl ClaudeRunner {
             event_tx,
             session_id: Arc::new(Mutex::new(config.session_id)),
             accumulated_output: Arc::new(RwLock::new(String::new())),
-            result_error: Arc::new(RwLock::new(None)),
+            result_event: Arc::new(RwLock::new(None)),
+            result_is_error: Arc::new(AtomicBool::new(false)),
             reader_handle: Mutex::new(None),
             stderr_handle: Mutex::new(None),
             raw_stdout: Arc::new(RwLock::new(String::new())),
@@ -505,8 +670,8 @@ impl ClaudeRunner {
     }
 
     /// `(exit_success, exit_code)` from the child's real exit status, as
-    /// opposed to [`Self::wait`]'s own `Result`, which also folds in a
-    /// `result_error` from the stream-json `result` event. `None` until
+    /// opposed to [`Self::wait`]'s own `Result`, which also folds in an
+    /// `is_error` from the stream-json `result` event. `None` until
     /// [`Self::wait`] has observed an exit status (i.e. before it is called,
     /// or if it is cancelled/dropped before the child actually exits).
     pub async fn exit_status(&self) -> ExitStatusInfo {
@@ -611,7 +776,10 @@ impl ClaudeRunner {
     }
 
     /// Wait for the process to complete and return exit status.
-    /// On failure, includes stderr in the error message. A child that exits
+    /// A failed exit is reported with the best reason the run left behind:
+    /// the stream-json `result` event and stderr (see [`failed_exit_reason`]).
+    /// A child that exits 0 with an error `result` event failed too, for the
+    /// reason [`result_failure_reason`] gives. A child that exits
     /// 0 is still a failure when the prompt writer saw it leave early: the
     /// write failed, or had not finished when the child exited. A prompt
     /// small enough to sit whole in the pipe buffer counts as delivered once
@@ -645,7 +813,7 @@ impl ClaudeRunner {
 
         // Recorded before either of the two `Err` returns below so a caller
         // that only wants the raw exit outcome (not this method's own blend
-        // of exit status and `result_error`) can always read it once this
+        // of exit status and the `result` event) can always read it once this
         // point is reached, regardless of which branch this takes next.
         *self.exit_status.write().await = Some((status.success(), status.code()));
 
@@ -676,20 +844,19 @@ impl ClaudeRunner {
         }
 
         if !status.success() {
-            let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string());
-            let stderr_summary = stderr_text.trim()
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("no details")
-                .to_string();
             if !stderr_text.is_empty() {
                 self.accumulated_output.write().await.push_str(&format!("\n--- STDERR ---\n{}", stderr_text));
             }
             if let Some(reason) = restricted_unsupported_reason(&stderr_text) {
                 return Err(reason);
             }
-            return Err(format!("Exit code {} — {}", code, stderr_summary));
+            let result_event = self.result_event.read().await;
+            return Err(failed_exit_reason(
+                status,
+                &stderr_text,
+                result_event.as_ref(),
+                prompt_failure.as_deref(),
+            ));
         }
 
         // Checked after a failed exit, which has a reason of its own that
@@ -699,9 +866,12 @@ impl ClaudeRunner {
             return Err(reason);
         }
 
-        // Check for Claude-level errors (exit code 0 but is_error: true in result)
-        if let Some(err_text) = self.result_error.read().await.as_ref() {
-            return Err(err_text.clone());
+        // A Claude-level error: exit code 0, but `is_error: true` in the
+        // result event.
+        // Any error result counts, even one a later success followed.
+        if self.result_is_error.load(Ordering::SeqCst) {
+            let event = self.result_event.read().await;
+            return Err(event.as_ref().and_then(result_failure_reason).unwrap_or_else(|| "error".to_string()));
         }
 
         Ok(true)
@@ -735,7 +905,8 @@ impl ClaudeRunner {
         let event_tx = self.event_tx.clone();
         let session_id = self.session_id.clone();
         let accumulated_output = self.accumulated_output.clone();
-        let result_error = self.result_error.clone();
+        let result_event = self.result_event.clone();
+        let result_is_error = self.result_is_error.clone();
         let raw_stdout = self.raw_stdout.clone();
 
         tauri::async_runtime::spawn(async move {
@@ -760,6 +931,19 @@ impl ClaudeRunner {
                     let parsed: Result<serde_json::Value, _> = serde_json::from_str(&line);
                     match parsed {
                         Ok(json) => {
+                            if json.get("type").and_then(|t| t.as_str()) == Some("result") {
+                                if json.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
+                                    result_is_error.store(true, Ordering::SeqCst);
+                                }
+                                // A later success does not replace a failure:
+                                // the failure is the reason worth reporting.
+                                let mut recorded = result_event.write().await;
+                                let failure_recorded =
+                                    recorded.as_ref().and_then(result_failure_reason).is_some();
+                                if !failure_recorded || result_failure_reason(&json).is_some() {
+                                    *recorded = Some(json.clone());
+                                }
+                            }
                             let event = parse_claude_event(&json, &session_id).await;
                             if let Some(evt) = event {
                                 // Accumulate text from TextDelta and Result events
@@ -778,15 +962,12 @@ impl ClaudeRunner {
                                             }
                                         }
                                     }
-                                    ClaudeEvent::Result { text, is_error, .. } => {
+                                    ClaudeEvent::Result { text, .. } => {
                                         let mut output = accumulated_output.write().await;
                                         if !output.is_empty() {
                                             output.push('\n');
                                         }
                                         output.push_str(text);
-                                        if *is_error {
-                                            *result_error.write().await = Some(text.clone());
-                                        }
                                     }
                                     _ => {}
                                 }
@@ -1007,6 +1188,140 @@ mod args_tests {
             );
             assert_ne!(value_of(&args, "--tools"), Some("Bash"), "{args:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_reason_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_max_turns_result_is_reported_by_subtype_and_errors() {
+        let event = json!({
+            "type": "result", "subtype": "error_max_turns", "is_error": true,
+            "terminal_reason": "max_turns", "num_turns": 2,
+            "errors": ["Reached maximum number of turns (1)"],
+        });
+        assert_eq!(
+            result_failure_reason(&event).as_deref(),
+            Some("error_max_turns: Reached maximum number of turns (1)")
+        );
+    }
+
+    #[test]
+    fn errors_are_preferred_over_the_result_text() {
+        let event = json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "errors": ["first", "  ", "second"], "result": "MODEL TEXT",
+        });
+        assert_eq!(result_failure_reason(&event).as_deref(), Some("error_during_execution: first; second"));
+    }
+
+    #[test]
+    fn an_api_error_with_a_success_subtype_uses_the_terminal_reason() {
+        let event = json!({
+            "type": "result", "subtype": "success", "is_error": true,
+            "terminal_reason": "api_error", "api_error_status": 529, "result": "Overloaded",
+        });
+        assert_eq!(
+            result_failure_reason(&event).as_deref(),
+            Some("api_error (API status 529): Overloaded")
+        );
+    }
+
+    #[test]
+    fn a_bare_error_result_still_has_a_reason() {
+        let event = json!({"type": "result", "is_error": true});
+        assert_eq!(result_failure_reason(&event).as_deref(), Some("error"));
+    }
+
+    #[test]
+    fn a_successful_result_or_another_event_is_no_failure() {
+        let success = json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"});
+        assert_eq!(result_failure_reason(&success), None);
+        let assistant = json!({"type": "assistant", "is_error": true, "subtype": "error"});
+        assert_eq!(result_failure_reason(&assistant), None);
+        assert_eq!(result_failure_reason(&json!("result")), None);
+    }
+
+    /// A long model answer, or a long `errors` list, never becomes the error
+    /// whole: each is cut to one line on a character boundary.
+    #[test]
+    fn long_result_text_and_errors_are_bounded() {
+        let text = "é\n".repeat(10_000);
+        let event = json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "result": text});
+        let reason = result_failure_reason(&event).expect("an error result");
+        assert!(!reason.contains('\n'), "{reason}");
+        assert!(reason.ends_with('…'), "{reason}");
+        let quoted = reason.strip_prefix("error_during_execution: ").expect("labelled");
+        assert_eq!(quoted.chars().count(), RESULT_TEXT_LIMIT + 1);
+
+        let errors: Vec<String> = (0..1_000).map(|i| format!("error number {i}")).collect();
+        let event = json!({"type": "result", "subtype": "error_max_turns", "is_error": true, "errors": errors});
+        let reason = result_failure_reason(&event).expect("an error result");
+        let quoted = reason.strip_prefix("error_max_turns: ").expect("labelled");
+        assert_eq!(quoted.chars().count(), RESULT_ERRORS_LIMIT + 1);
+    }
+
+    #[test]
+    fn a_carriage_return_ends_a_line_too() {
+        assert_eq!(truncate_one_line("first\r\nsecond\rthird\n\r\n", 100), "first / second / third");
+        assert_eq!(truncate_one_line_tail("first\r\nsecond\rthird", 100), "first / second / third");
+    }
+
+    /// The tail variant keeps the end, which is where a run's output says
+    /// how it ended.
+    #[test]
+    fn the_tail_variant_keeps_the_end_on_a_character_boundary() {
+        let text = format!("{}\nthe end é", "x".repeat(1_000));
+        let tail = truncate_one_line_tail(&text, 9);
+        assert_eq!(tail, "…the end é");
+        assert_eq!(truncate_one_line_tail("short", 10), "short");
+    }
+
+    #[cfg(unix)]
+    fn exited(code: i32) -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+    }
+
+    /// A success result on a failed exit is not a reason; the exit falls
+    /// back to stderr, then the prompt failure, then `no details`.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_exit_without_an_error_result_falls_back_in_order() {
+        let success = json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"});
+        assert_eq!(failed_exit_reason(exited(2), "", Some(&success), None), "Exit code 2 — no details");
+        assert_eq!(
+            failed_exit_reason(exited(2), "", Some(&success), Some("prompt cut short")),
+            "Exit code 2 — prompt cut short"
+        );
+        assert_eq!(
+            failed_exit_reason(exited(2), "first\nlast line\n\n", Some(&success), Some("prompt cut short")),
+            "Exit code 2 — last line"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_long_stderr_line_is_bounded() {
+        let stderr = "x".repeat(10_000);
+        let reason = failed_exit_reason(exited(1), &stderr, None, None);
+        let quoted = reason.strip_prefix("Exit code 1 — ").expect("exit code first");
+        assert_eq!(quoted.chars().count(), STDERR_LINE_LIMIT + 1);
+    }
+
+    /// A killed child quotes neither a result event it wrote earlier nor the
+    /// prompt write the kill cut short.
+    #[cfg(unix)]
+    #[test]
+    fn a_signalled_exit_reports_the_signal_only() {
+        let killed = std::os::unix::process::ExitStatusExt::from_raw(libc::SIGKILL);
+        let error = json!({"type": "result", "subtype": "error_during_execution", "is_error": true});
+        assert_eq!(
+            failed_exit_reason(killed, "", Some(&error), Some("prompt cut short")),
+            "Terminated by signal 9 — no details"
+        );
     }
 }
 
@@ -1413,8 +1728,95 @@ mod tests {
             let error = bounded(&format!("claude error {attempt}"), &runner)
                 .await
                 .expect_err("is_error should surface as an error");
-            assert_eq!(error, "the model refused");
+            assert_eq!(error, "error_during_execution: the model refused");
         }
+    }
+
+    /// Runs out of turns the way the real CLI does. See the `max_turns`
+    /// fixture.
+    const MAX_TURNS: &str = "max_turns";
+
+    /// Fails on an API error the way the real CLI does. See the `api_error`
+    /// fixture.
+    const API_ERROR: &str = "api_error";
+
+    /// Fails with nothing on stderr and no complete stream-json line.
+    const MALFORMED_RESULT: &str = "malformed_result";
+
+    /// Reports an error result, then a successful one, and exits 0.
+    const ERROR_THEN_SUCCESS_RESULT: &str = "error_then_success_result";
+
+    /// An error result fails the run even when a later result succeeds,
+    /// and the error is the reason given.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_error_result_followed_by_a_success_still_fails() {
+        let fixture = Fixture::new(ERROR_THEN_SUCCESS_RESULT);
+        let runner = fixture.start().await;
+        let error = bounded("error then success", &runner)
+            .await
+            .expect_err("an earlier error result must still fail the run");
+        assert_eq!(error, "error_during_execution: the first attempt failed");
+        assert_eq!(runner.exit_status().await, Some((true, Some(0))));
+    }
+
+    /// Reports an error result, then blocks until killed.
+    #[cfg(target_os = "linux")]
+    const ERROR_RESULT_THEN_BLOCKS: &str = "error_result_then_blocks";
+
+    /// A run that exits non-zero with an empty stderr says why through the
+    /// `result` event alone, and that is the reason reported.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failure_with_no_stderr_reports_the_result_event_reason() {
+        let fixture = Fixture::new(MAX_TURNS);
+        let runner = fixture.start().await;
+        let error = bounded("max turns", &runner).await.expect_err("exit 1 is a failure");
+        assert_eq!(error, "Exit code 1 — error_max_turns: Reached maximum number of turns (1)");
+        assert_eq!(runner.exit_status().await, Some((false, Some(1))));
+    }
+
+    /// When both are there, the result event's reason leads and the last
+    /// stderr line is kept after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failure_with_stderr_and_a_result_reports_both() {
+        let fixture = Fixture::new(API_ERROR);
+        let runner = fixture.start().await;
+        let error = bounded("api error", &runner).await.expect_err("exit 1 is a failure");
+        assert_eq!(
+            error,
+            "Exit code 1 — api_error (API status 404): There is an issue with the selected \
+             model (no-such-model). (stderr: [claude-code:unrecognized_model] \
+             {\"model\":\"no-such-model\"})"
+        );
+    }
+
+    /// Output that never forms a result event leaves nothing structured to
+    /// report, and the run still fails with the generic reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failure_with_malformed_output_falls_back_to_the_exit_code() {
+        let fixture = Fixture::new(MALFORMED_RESULT);
+        let runner = fixture.start().await;
+        let error = bounded("malformed", &runner).await.expect_err("exit 1 is a failure");
+        assert_eq!(error, "Exit code 1 — no details");
+    }
+
+    /// A killed run is reported as killed, even when the child had already
+    /// reported an error result before the kill: that error is not why the
+    /// run ended.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_killed_run_is_reported_as_killed_not_as_its_result_error() {
+        let fixture = Fixture::new(ERROR_RESULT_THEN_BLOCKS);
+        let runner = fixture.start().await;
+        let pid = blocked_pid(&fixture).await;
+
+        tokio::time::timeout(DEADLINE, runner.kill())
+            .await
+            .expect("kill must not hang")
+            .expect("kill must succeed");
+        assert!(!is_alive(pid));
+
+        let error = bounded("wait after kill", &runner).await.expect_err("a killed run failed");
+        assert_eq!(error, "Terminated by signal 9 — no details");
     }
 
     #[tokio::test(flavor = "multi_thread")]
