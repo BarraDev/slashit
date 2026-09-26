@@ -62,6 +62,31 @@ fn review_verdict(run: &AgentRun) -> ReviewVerdict {
     }
 }
 
+/// What a fix-agent run means for the review's signoff.
+#[derive(Debug, PartialEq, Eq)]
+enum FixOutcome {
+    Applied,
+    /// Cancelled before or during the run; nothing is recorded.
+    Cancelled,
+    /// The run could not start, exited non-zero, or reported an error.
+    Failed(String),
+}
+
+/// The outcome of a fix-agent run. Only a successful run applied fixes: one
+/// that exited non-zero or reported an error failed, like one that never
+/// started.
+fn fix_outcome(outcome: Result<Option<AgentRun>, String>) -> FixOutcome {
+    match outcome {
+        Ok(Some(run)) if run.success => FixOutcome::Applied,
+        Ok(Some(run)) => {
+            let reason = run.failure.unwrap_or_else(|| "the fix agent run did not succeed".to_string());
+            FixOutcome::Failed(format!("Fix agent failed: {reason}"))
+        }
+        Ok(None) => FixOutcome::Cancelled,
+        Err(e) => FixOutcome::Failed(format!("Fix agent failed to start: {e}")),
+    }
+}
+
 /// A task's worktree, how it was obtained, and the commit it started from,
 /// or why none could be attached.
 type AcquiredWorktree = Result<(WorktreeInfo, &'static str, Option<String>), String>;
@@ -2347,7 +2372,7 @@ impl TaskExecutor {
                     }
                 };
 
-                let fix_outcome = Self::run_cancellable_agent(
+                let fix_run = Self::run_cancellable_agent(
                     ClaudeRunConfig {
                         prompt: fix_prompt,
                         working_dir: working_dir.clone(),
@@ -2375,8 +2400,8 @@ impl TaskExecutor {
                 )
                 .await;
 
-                let fix_result = match fix_outcome {
-                    Ok(Some(_output)) => {
+                let fix_result = match fix_outcome(fix_run) {
+                    FixOutcome::Applied => {
                         // Re-describe in jj after fixes
                         let _ = tokio::process::Command::new("jj")
                             .args(["describe", "-m", &format!("task: {} (with review fixes)", {
@@ -2393,18 +2418,18 @@ impl TaskExecutor {
                             .await;
                         true
                     }
-                    Ok(None) => {
+                    FixOutcome::Cancelled => {
                         // Cancelled during the fix agent's run: it has
                         // already been killed by `run_cancellable_agent`.
                         // Nothing durable is recorded on this path either.
                         reviewing_handles.write().await.remove(&task_id);
                         return;
                     }
-                    Err(e) => {
+                    FixOutcome::Failed(message) => {
                         events.agent_event(AgentEvent::Log {
                             task_id: task_id_str.clone(),
                             level: LogLevel::Error,
-                            message: format!("Fix agent failed to start: {}", e),
+                            message,
                         });
                         false
                     }
@@ -5104,17 +5129,31 @@ mod tests {
             impl MockReviewer {
                 /// `result` is the reviewer's result text; `exit` its status.
                 fn install(result: &str, exit: i32) -> Self {
+                    Self::install_with_fixer(result, exit, "", exit)
+                }
+
+                /// Like [`Self::install`], with a separate fix agent. The
+                /// reviewer is the run that passes `--restricted`; any other
+                /// run is the fix agent, which prints `fix_result` and exits
+                /// with `fix_exit`.
+                fn install_with_fixer(result: &str, exit: i32, fix_result: &str, fix_exit: i32) -> Self {
                     let tmp = tempfile::tempdir().expect("tempdir");
                     let bin_dir = tmp.path().join("bin");
                     std::fs::create_dir_all(&bin_dir).unwrap();
                     let args_file = tmp.path().join("args");
                     let result_json = serde_json::to_string(result).unwrap();
+                    let fix_result_json = serde_json::to_string(fix_result).unwrap();
                     let script = format!(
                         "#!/bin/sh\n\
                          for a in \"$@\"; do printf '%s\\n' \"$a\" >> {args:?}; done\n\
                          printf '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"model\":\"m\"}}\\n'\n\
+                         case \" $* \" in\n\
+                         *\" --restricted \"*)\n\
                          printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"result\":{result_json}}}'\n\
-                         exit {exit}\n",
+                         exit {exit} ;;\n\
+                         esac\n\
+                         printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"result\":{fix_result_json}}}'\n\
+                         exit {fix_exit}\n",
                         args = args_file,
                     );
                     let bin = bin_dir.join("claude");
@@ -5208,6 +5247,19 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                 assert_eq!(review_verdict(&failed), ReviewVerdict::Failed("exit 2".into()));
             }
 
+            #[test]
+            fn only_a_successful_fix_run_applies_fixes() {
+                assert_eq!(fix_outcome(Ok(Some(run(true, "done")))), FixOutcome::Applied);
+                assert_eq!(fix_outcome(Ok(None)), FixOutcome::Cancelled);
+                let failed = AgentRun { failure: Some("exit 2".into()), ..run(false, "done") };
+                assert_eq!(fix_outcome(Ok(Some(failed))), FixOutcome::Failed("Fix agent failed: exit 2".into()));
+                assert!(matches!(fix_outcome(Ok(Some(run(false, "")))), FixOutcome::Failed(_)));
+                assert_eq!(
+                    fix_outcome(Err("no claude".into())),
+                    FixOutcome::Failed("Fix agent failed to start: no claude".into())
+                );
+            }
+
             #[tokio::test(flavor = "multi_thread")]
             async fn a_reviewer_that_exits_non_zero_does_not_approve() {
                 let _path_guard = PATH_LOCK.lock().await;
@@ -5218,6 +5270,36 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                     signoff.issues_found.iter().any(|i| i.starts_with("AI review failed")),
                     "{:?}", signoff.issues_found
                 );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_agent_that_exits_non_zero_does_not_record_fixes() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install_with_fixer(
+                    "VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a.rs:1 - broken",
+                    0,
+                    "Fixed everything.",
+                    1,
+                );
+                let signoff = review_once(&mock).await;
+                assert!(
+                    mock.args().iter().any(|a| a == "--dangerously-skip-permissions"),
+                    "the fix agent ran"
+                );
+                assert_eq!(signoff.status, QaStatus::Rejected, "{:?}", signoff.issues_found);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_agent_that_succeeds_records_fixes() {
+                let _path_guard = PATH_LOCK.lock().await;
+                let mock = MockReviewer::install_with_fixer(
+                    "VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a.rs:1 - broken",
+                    0,
+                    "Fixed everything.",
+                    0,
+                );
+                let signoff = review_once(&mock).await;
+                assert_eq!(signoff.status, QaStatus::FixesApplied, "{:?}", signoff.issues_found);
             }
 
             #[tokio::test(flavor = "multi_thread")]
