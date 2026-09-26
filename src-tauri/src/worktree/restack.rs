@@ -5,7 +5,10 @@
 //! is proven safe and records its result). Everything here takes object IDs
 //! and fully qualified ref names only, never a name git would look up in
 //! several namespaces, and never runs anything that could set work aside,
-//! move another branch, or reach the remote.
+//! move another branch, or reach the remote. The one step that discards
+//! worktree state, `git read-tree --reset -u` when a stopped rebase is
+//! undone, runs only after [`changes_beyond_the_stop`] found nothing there
+//! but what the stop itself left.
 //!
 //! The restack itself is `git rebase --onto <onto> <fork point> <branch>`,
 //! run in the worktree that has the branch checked out. Git moves the branch
@@ -354,7 +357,16 @@ pub async fn head_moved_only_by_a_restack(dir: &Path) -> Result<Option<String>, 
 /// change to any other tracked path that is not staged, or an untracked file
 /// are someone else's work, which undoing the stop would discard. What
 /// cannot be told apart: an edit inside a path that is still unmerged looks
-/// the same as the conflict markers the stop wrote there.
+/// the same as the conflict markers the stop wrote there. Neither can a file
+/// ignored at the old tip that `onto`'s `.gitignore` no longer ignores: at
+/// the stop it shows as untracked, and the undo is refused, failing closed.
+///
+/// Submodules are left out of the comparison (`--ignore-submodules=all`):
+/// the rebase moves a submodule's recorded commit without updating its
+/// checkout, so one that `onto` moved always shows as changed at the stop,
+/// and the undo never touches a submodule's checkout or anything in it, so
+/// nothing there can be lost. `=dirty` with a check of each gitlink would
+/// only separate cases that the undo treats alike.
 pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, String> {
     let paths = |listed: String| -> std::collections::BTreeSet<String> {
         listed.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect()
@@ -363,7 +375,7 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
     if unmerged.is_empty() {
         return Ok(Some("no conflicted paths are left, so they were resolved by hand".to_string()));
     }
-    let unstaged = paths(git(dir, &["diff", "-z", "--name-only"]).await?);
+    let unstaged = paths(git(dir, &["diff", "-z", "--name-only", "--ignore-submodules=all"]).await?);
     let others: Vec<String> = unstaged.difference(&unmerged).cloned().collect();
     if !others.is_empty() {
         return Ok(Some(format!("{} changed besides the conflict", others.join(", "))));
@@ -386,10 +398,13 @@ pub async fn changes_beyond_the_stop(dir: &Path) -> Result<Option<String>, Strin
 /// `git rebase --quit` drops the rebase's state and leaves `HEAD` detached
 /// where it stopped, `git symbolic-ref` puts `HEAD` back on the branch
 /// (logged as `message`), and `git read-tree --reset -u <old tip>` makes the
-/// index and the files the old tip's, removing what the stop added and
-/// leaving untracked files that neither has alone. The caller has checked
+/// index and the files the old tip's, removing what the stop added.
+/// Untracked files at paths the old tip does not track are left; ignored
+/// files at paths it does track are overwritten. The caller has checked
 /// that the rebase is the one it means to undo and that the worktree holds
-/// nothing else ([`changes_beyond_the_stop`]). The result is verified with
+/// nothing else ([`changes_beyond_the_stop`]). `read-tree --reset` never
+/// refuses, so an edit or untracked file made after that check and before
+/// the reset is destroyed. The result is verified with
 /// [`verify_restored`]; if the branch was moved in the meantime, that fails
 /// and nothing it was moved to is lost.
 pub async fn undo_stopped_rebase(dir: &Path, branch: &str, old_tip: &str, message: &str) -> Result<(), String> {
@@ -531,7 +546,11 @@ impl<'a> Restack<'a> {
     ///
     /// The rebase runs under this restack's reflog marker, with every ref
     /// update logged (`core.logAllRefUpdates=always`), so that the branch's
-    /// and the worktree's reflogs tell its moves from anybody else's.
+    /// and the worktree's reflogs tell its moves from anybody else's. It runs
+    /// with rerere off (`rerere.enabled=false`): a resolution recorded
+    /// earlier is not replayed into the commits the restack verifies, and a
+    /// stop is left as the conflict git made, which is how an undo tells it
+    /// from the user's own resolution.
     ///
     /// Git needs a committer identity to write the replayed commits. Where
     /// the repository has none, the committer of the branch's tip is used,
@@ -570,7 +589,14 @@ impl<'a> Restack<'a> {
                 return Err(self.restore(false, format!("the rebase could not be started: {e}")).await)
             }
         };
-        let mut args = vec!["-c", "core.logAllRefUpdates=always", "rebase", "--no-autostash"];
+        let mut args = vec![
+            "-c",
+            "core.logAllRefUpdates=always",
+            "-c",
+            "rerere.enabled=false",
+            "rebase",
+            "--no-autostash",
+        ];
         if knows_no_update_refs(&version) {
             args.push("--no-update-refs");
         }
@@ -672,7 +698,10 @@ impl<'a> Restack<'a> {
     ///   with `git rebase --abort`, which writes it back to where the rebase
     ///   started. A branch moved after the checks keeps what it was moved to;
     ///   a `HEAD` moved in that instant is put back on the branch, and what
-    ///   it was moved to stays in its reflog.
+    ///   it was moved to stays in its reflog. The reset of the index and
+    ///   files never refuses: an edit or untracked file made in that instant
+    ///   is destroyed, and ignored files at paths the old tip tracks are
+    ///   overwritten.
     /// - A rebase that finished moved the branch. It is moved back only
     ///   while it is still at the tip the rebase produced, per its reflog,
     ///   with the worktree's `HEAD` on it, moved by nothing else and in the
@@ -961,6 +990,17 @@ mod tests {
 
     impl Fixture {
         fn new(conflict: bool) -> Self {
+            Self::build(conflict, false)
+        }
+
+        /// [`Fixture::new`] with a conflict, where the repository also has
+        /// a submodule `sub` (at S1 on F and on the task's branch, and moved
+        /// to S2 by M), checked out in the task's worktree.
+        fn with_submodule() -> Self {
+            Self::build(true, true)
+        }
+
+        fn build(conflict: bool, submodule: bool) -> Self {
             let tmp = tempfile::tempdir().expect("tempdir");
             let origin = tmp.path().join("origin.git");
             let repo = tmp.path().join("repo");
@@ -970,6 +1010,16 @@ mod tests {
             git_in(&repo, &["config", "user.name", "Test"]);
             git_in(&repo, &["config", "user.email", "test@example.com"]);
             git_in(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+            let sub_commits = submodule.then(|| {
+                let sub = tmp.path().join("sub");
+                git_in(tmp.path(), &["init", "-q", "-b", "main", sub.to_str().unwrap()]);
+                let s1 = commit(&sub, "s.txt", "s1\n", "S1");
+                let s2 = commit(&sub, "s.txt", "s2\n", "S2");
+                let url = sub.to_str().unwrap();
+                git_in(&repo, &["-c", "protocol.file.allow=always", "submodule", "add", "-q", url, "sub"]);
+                git_in(&repo.join("sub"), &["checkout", "-q", &s1]);
+                (s1, s2)
+            });
             commit(&repo, "f.txt", "f\n", "F");
             let fork_point = git_in(&repo, &["rev-parse", "HEAD"]);
             git_in(&repo, &["checkout", "-q", "-b", "task"]);
@@ -977,6 +1027,9 @@ mod tests {
             commit(&repo, "b.txt", "b2\n", "B2");
             let old_tip = git_in(&repo, &["rev-parse", "HEAD"]);
             git_in(&repo, &["checkout", "-q", "main"]);
+            if let Some((_, s2)) = &sub_commits {
+                git_in(&repo.join("sub"), &["checkout", "-q", s2]);
+            }
             if conflict {
                 commit(&repo, "b.txt", "main's own b\n", "M");
             } else {
@@ -985,6 +1038,9 @@ mod tests {
             let onto = git_in(&repo, &["rev-parse", "HEAD"]);
             git_in(&repo, &["push", "-q", "origin", "main"]);
             git_in(&repo, &["worktree", "add", "-q", worktree.to_str().unwrap(), "task"]);
+            if submodule {
+                git_in(&worktree, &["-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init"]);
+            }
             let backup = backup_ref(Uuid::new_v4());
             git_in(&repo, &["update-ref", &backup, &old_tip, ""]);
             Fixture { _tmp: tmp, origin, worktree, fork_point, old_tip, onto, backup }
@@ -1205,6 +1261,46 @@ mod tests {
         ] {
             assert_eq!(knows_no_update_refs(version), knows, "{version:?}");
         }
+    }
+
+    /// A conflict rerere has a recorded resolution for is still SlashIt's
+    /// own stop, not work of the user's: the restack runs with rerere off,
+    /// so the stop is left as git made it and undone, and no recorded
+    /// resolution is replayed into what the restack verifies.
+    #[tokio::test]
+    async fn a_stop_rerere_could_resolve_is_undone_as_the_restacks_own() {
+        let fixture = Fixture::new(true);
+        let wt = &fixture.worktree;
+        git_in(wt, &["config", "rerere.enabled", "true"]);
+        git_in(wt, &["config", "rerere.autoUpdate", "true"]);
+        let stopped = StdCommand::new("git")
+            .args(["rebase", "-q", "--onto", &fixture.onto, &fixture.fork_point, "task"])
+            .current_dir(wt)
+            .output()
+            .expect("run git");
+        assert!(!stopped.status.success(), "the rebase must stop on the conflict");
+        std::fs::write(wt.join("b.txt"), "resolved\n").unwrap();
+        git_in(wt, &["rerere"]);
+        git_in(wt, &["rebase", "--abort"]);
+        assert_eq!(fixture.tip().as_deref(), Some(fixture.old_tip.as_str()));
+
+        let failure = fixture.restack().replay().await.expect_err("conflict");
+
+        assert!(matches!(failure, RestackFailure::Restored(_)), "{}", describe(&failure));
+        fixture.assert_restored("rerere");
+    }
+
+    /// A submodule whose pointer `onto` moved shows as changed at the stop,
+    /// since the rebase does not update its checkout. That is not the
+    /// user's work, and undoing the stop does not touch the submodule.
+    #[tokio::test]
+    async fn a_stop_with_a_moved_submodule_is_undone_as_the_restacks_own() {
+        let fixture = Fixture::with_submodule();
+
+        let failure = fixture.restack().replay().await.expect_err("conflict");
+
+        assert!(matches!(failure, RestackFailure::Restored(_)), "{}", describe(&failure));
+        fixture.assert_restored("submodule");
     }
 
     /// When the rebase never started, SlashIt changed nothing, so it has

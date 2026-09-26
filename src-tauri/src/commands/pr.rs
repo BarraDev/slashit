@@ -3152,7 +3152,12 @@ const GITHUB_PR_COMMIT_LIST_LIMIT: usize = 250;
 ///   in the instant between the checks and the undo is put back on the
 ///   branch (what it was moved to stays in `HEAD`'s reflog). An edit inside
 ///   a path the stop left unmerged cannot be told from its conflict markers
-///   and is discarded with them. Between moving the branch ref back after a
+///   and is discarded with them. Resetting the files after a stop never
+///   refuses: an edit or untracked file made in the instant between the
+///   check and the reset is destroyed, and ignored files at paths the old
+///   tip tracks are overwritten. A `.gitignore` that differs between the old
+///   tip and the new base can make ignored files look untracked at the stop,
+///   which refuses the undo (failing closed). Between moving the branch ref back after a
 ///   finished rebase and updating the files, a commit is not prevented,
 ///   though the verification afterwards then fails and the backup is kept.
 ///   And hooks the rebase runs inherit its reflog marker, so a hook of the
@@ -3452,14 +3457,15 @@ fn restack_failure_message(
         RestackFailure::BranchMoved(what) => format!(
             "Restacking {branch} onto {default} ({onto}) failed: {what}. The branch or the \
              worktree's HEAD changed while SlashIt was operating on it (a commit, checkout or edit \
-             from the task's terminal, or another tool), so SlashIt deliberately left it \
-             untouched rather than undo someone else's work. {branch} may still hold the \
+             from the task's terminal, or another tool), so SlashIt deliberately did not write \
+             the branch, rather than undo someone else's work. {branch} may still hold the \
              restacked tip, which the task does not record; until you choose, creating the pull \
              request again refuses because of the backup. The branch's tip from before the \
              restack is kept at {backup} ({old_tip}). Inspect the branch in the task's worktree \
              at {worktree} (`git status`, `git log {backup}..{branch}`). Only if you want the old \
              tip back, run `git rebase --abort` there if a rebase is in progress, then `git reset \
-             --keep {backup}`. Either way, delete the backup afterwards with `git update-ref -d \
+             --keep {backup}`; that discards from the branch what `git log {backup}..{branch}` \
+             lists. Either way, delete the backup afterwards with `git update-ref -d \
              {backup}`. Nothing was pushed and no pull request was opened."
         ),
     }
@@ -8311,7 +8317,7 @@ mod tests {
                 drop(release);
                 let error = running.await.unwrap().expect_err("moved meanwhile");
 
-                assert!(error.contains("left it untouched"), "{error}");
+                assert!(error.contains("did not write the branch"), "{error}");
                 assert!(error.contains(&user), "{error}");
                 assert!(error.contains(&backup_ref(task_id)), "{error}");
                 assert_eq!(local_tip(&landed), user, "the user's commit stays the branch's tip");
@@ -8460,7 +8466,7 @@ mod tests {
                         let from = if own_onto { format!("{}~2", landed.base_commit) } else { landed.base_commit.clone() };
                         let stop: &[&str] = if own_onto { &[] } else { &["-x", "false"] };
                         let output = StdCommand::new("git")
-                            .args(["-c", "core.logAllRefUpdates=always", "rebase"])
+                            .args(["-c", "core.logAllRefUpdates=always", "-c", "rerere.enabled=false", "rebase"])
                             .args(stop)
                             .args(["--onto", onto, from.as_str(), "task-branch"])
                             .current_dir(wt)
