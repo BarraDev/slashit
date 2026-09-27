@@ -73,12 +73,313 @@ pub enum WorktreeRecovery {
     /// Git confirms a worktree registered for this branch at an adoptable
     /// path. The task should be re-pointed at it.
     Adopt(String),
-    /// Git answered, and has no adoptable worktree for this branch. The
-    /// recorded path is genuinely dead and may be cleared.
+    /// Git answered, and has no adoptable worktree for this branch and no
+    /// locked registration of it. The recorded path is genuinely dead and may
+    /// be cleared. An unlocked registration of a directory that is gone
+    /// counts as dead: acquiring the task's checkout clears it first.
     ConfirmedAbsent,
     /// Git could not be consulted, so absence was never established. The
     /// reference must be kept for a later start to verify again.
     Unverified,
+    /// Git still holds a locked registration of this branch at a path that
+    /// is gone. The branch stays checked out there, and no checkout of it can
+    /// be created until the user unlocks it, so the reference is kept. The
+    /// fields are those of [`CheckoutRegistration::MissingLocked`].
+    Locked { path: String, branch: Option<String>, reason: Option<String> },
+}
+
+/// What git holds for one Task Checkout, found by its path or by its branch.
+///
+/// The one answer removal, startup reconciliation and checkout acquisition
+/// all act on, so that none of them can reach a different conclusion about
+/// the same checkout. It is read from `git worktree list --porcelain -z`
+/// (see [`WorktreeManager::worktree_list_porcelain`]) and from the
+/// filesystem, and nothing here changes either.
+///
+/// Git itself distinguishes the two ways a registration can outlive its
+/// directory. An unlocked one is garbage to git: `git worktree prune` and
+/// `git worktree remove` clear it. A locked one is how a user says a
+/// checkout on a drive that is not always mounted must be kept: both refuse
+/// it, and `git worktree add` refuses to check its branch out anywhere else
+/// until it is unlocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutRegistration {
+    /// Git answered, and registers nothing there.
+    NotRegistered,
+    /// Registered, and its directory is there.
+    Present { path: String },
+    /// Registered and not locked, and its directory is gone. `branch` is the
+    /// branch it has checked out, `None` when its `HEAD` is detached; `head`
+    /// is the commit its `HEAD` is at, as git lists it.
+    MissingPrunable { path: String, branch: Option<String>, head: Option<String> },
+    /// Registered and locked, and its directory is gone. `branch` is the
+    /// branch it has checked out, `None` when its `HEAD` is detached;
+    /// `reason` is the one given to `git worktree lock --reason`, if any.
+    MissingLocked { path: String, branch: Option<String>, reason: Option<String> },
+    /// Git could not be asked, or the filesystem could not say whether the
+    /// directory is there. Nothing may be concluded from it.
+    Unknown(String),
+}
+
+/// One record of `git worktree list --porcelain -z`.
+struct ListedWorktree<'a> {
+    path: &'a str,
+    /// The commit its `HEAD` is at.
+    head: Option<&'a str>,
+    /// The `refs/heads/...` it has checked out, `None` when detached.
+    branch: Option<&'a str>,
+    /// `Some` when locked, with the reason if one was given.
+    locked: Option<Option<&'a str>>,
+}
+
+impl<'a> ListedWorktree<'a> {
+    /// Every record in `porcelain`, whose fields are NUL-terminated and whose
+    /// records end with an empty field.
+    fn parse(porcelain: &'a str) -> Vec<Self> {
+        let mut records = Vec::new();
+        let mut current: Option<Self> = None;
+        for field in porcelain.split('\0') {
+            if let Some(path) = field.strip_prefix("worktree ") {
+                records.extend(current.take());
+                current = Some(Self { path, head: None, branch: None, locked: None });
+            } else if field.is_empty() {
+                records.extend(current.take());
+            } else if let Some(record) = current.as_mut() {
+                if let Some(commit) = field.strip_prefix("HEAD ") {
+                    record.head = Some(commit);
+                } else if let Some(reference) = field.strip_prefix("branch ") {
+                    record.branch = Some(reference);
+                } else if field == "locked" {
+                    record.locked = Some(None);
+                } else if let Some(reason) = field.strip_prefix("locked ") {
+                    record.locked = Some(Some(reason));
+                }
+            }
+        }
+        records.extend(current);
+        records
+    }
+}
+
+impl CheckoutRegistration {
+    /// What git holds for `branch`, from `listing`: git's output, or why
+    /// there is none.
+    ///
+    /// Only a registration with `branch` checked out is found. One whose
+    /// `HEAD` is detached -- an agent ran `git checkout --detach`, or a
+    /// rebase stopped partway -- is invisible here, which is why a decision
+    /// about a checkout also looks it up by path (see [`CheckoutState`]).
+    pub fn of_branch(listing: Result<&str, &str>, branch: &str) -> Self {
+        let porcelain = match listing {
+            Ok(porcelain) => porcelain,
+            Err(why) => return Self::Unknown(why.to_string()),
+        };
+        let wanted = format!("refs/heads/{branch}");
+        Self::of_record(
+            ListedWorktree::parse(porcelain)
+                .into_iter()
+                .find(|record| record.branch == Some(wanted.as_str())),
+        )
+    }
+
+    /// What git holds at `worktree_path`, from `listing`: git's output, or
+    /// why there is none.
+    ///
+    /// A registration is matched by its exact path, or once symlinks are
+    /// resolved on both sides: git records where it created a checkout with
+    /// symlinks resolved, and the checkout's directory being gone is exactly
+    /// when its own path can no longer be resolved. See [`resolved_path`].
+    pub fn of_path(listing: Result<&str, &str>, worktree_path: &str) -> Self {
+        let porcelain = match listing {
+            Ok(porcelain) => porcelain,
+            Err(why) => return Self::Unknown(why.to_string()),
+        };
+        let wanted = resolved_path(Path::new(worktree_path));
+        Self::of_record(ListedWorktree::parse(porcelain).into_iter().find(|record| {
+            record.path == worktree_path || resolved_path(Path::new(record.path)) == wanted
+        }))
+    }
+
+    fn of_record(record: Option<ListedWorktree<'_>>) -> Self {
+        let Some(record) = record else {
+            return Self::NotRegistered;
+        };
+        let path = record.path.to_string();
+        let branch = record
+            .branch
+            .map(|b| b.trim_start_matches("refs/heads/").to_string());
+        match Presence::of(Path::new(record.path)) {
+            Presence::Present => Self::Present { path },
+            Presence::Absent => match record.locked {
+                None => Self::MissingPrunable {
+                    path,
+                    branch,
+                    head: record.head.map(str::to_string),
+                },
+                Some(reason) => Self::MissingLocked {
+                    path,
+                    branch,
+                    reason: reason.map(str::to_string),
+                },
+            },
+            Presence::Unverified(error) => {
+                Self::Unknown(format!("could not tell whether {path} is there: {error}"))
+            }
+        }
+    }
+
+    /// Whether this answer forbids treating the checkout as gone: git holds
+    /// it locked, or could not say.
+    fn holds_the_checkout(&self) -> bool {
+        matches!(self, Self::MissingLocked { .. } | Self::Unknown(_))
+    }
+}
+
+/// What git holds for one Task Checkout whose directory is gone, looked up
+/// both by its recorded path and by its task's branch.
+///
+/// Removal and startup reconciliation decide on this, and only this, so
+/// they cannot disagree about the same checkout. Either lookup alone misses
+/// something the other sees: by branch, a registration whose `HEAD` is
+/// detached; by path, a registration recorded under a spelling of the path
+/// that can no longer be resolved to the task's (a symlinked ancestor whose
+/// target is gone, a drive that is not mounted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutState {
+    pub by_path: CheckoutRegistration,
+    /// `None` when the task records no branch.
+    pub by_branch: Option<CheckoutRegistration>,
+}
+
+impl CheckoutState {
+    pub fn of(listing: Result<&str, &str>, worktree_path: &str, branch: Option<&str>) -> Self {
+        Self {
+            by_path: CheckoutRegistration::of_path(listing, worktree_path),
+            by_branch: branch.map(|branch| CheckoutRegistration::of_branch(listing, branch)),
+        }
+    }
+
+    /// The answer that keeps the checkout from being treated as gone: a
+    /// locked registration, or a lookup git could not answer, from either
+    /// side. `Unknown` wins over `MissingLocked`, because a lookup that
+    /// failed may be hiding anything.
+    pub fn holding(&self) -> Option<&CheckoutRegistration> {
+        let both = || std::iter::once(&self.by_path).chain(self.by_branch.as_ref());
+        both()
+            .find(|r| matches!(r, CheckoutRegistration::Unknown(_)))
+            .or_else(|| both().find(|r| r.holds_the_checkout()))
+    }
+
+    /// Whether git registers nothing at all for the checkout, by path or by
+    /// branch.
+    pub fn nothing_registered(&self) -> bool {
+        self.by_path == CheckoutRegistration::NotRegistered
+            && self
+                .by_branch
+                .as_ref()
+                .is_none_or(|r| *r == CheckoutRegistration::NotRegistered)
+    }
+}
+
+/// `path` with every symlink along it resolved, as far as the filesystem
+/// can say, including a symlink whose target is gone.
+///
+/// [`Path::canonicalize`] fails as soon as any part of the path is missing,
+/// which for a checkout whose directory is gone is always. This resolves
+/// each component that is a symlink, whether or not what it points at
+/// exists, and keeps every other component as it is, so a path git
+/// recorded after resolving its symlinks compares equal to one spelled
+/// through them. A path with more than 40 symlink hops is returned as it
+/// is.
+fn resolved_path(path: &Path) -> PathBuf {
+    use std::collections::VecDeque;
+    use std::path::Component;
+
+    let mut pending: VecDeque<std::ffi::OsString> = VecDeque::new();
+    let mut out = PathBuf::new();
+    let push_all = |pending: &mut VecDeque<std::ffi::OsString>, out: &mut PathBuf, p: &Path| {
+        let mut front = Vec::new();
+        for component in p.components() {
+            match component {
+                // A new drive or share starts over from it.
+                Component::Prefix(_) => {
+                    front.clear();
+                    *out = PathBuf::from(component.as_os_str());
+                }
+                // A root starts over from the root of whatever drive `out` is
+                // on: pushed rather than assigned, so that `C:` followed by
+                // `\` is `C:\`, not a bare `\` that `D:\` would equal.
+                Component::RootDir => {
+                    front.clear();
+                    out.push(component.as_os_str());
+                }
+                other => front.push(other.as_os_str().to_os_string()),
+            }
+        }
+        for c in front.into_iter().rev() {
+            pending.push_front(c);
+        }
+    };
+    push_all(&mut pending, &mut out, path);
+
+    let mut hops = 0;
+    while let Some(component) = pending.pop_front() {
+        if component == "." {
+            continue;
+        }
+        if component == ".." {
+            out.pop();
+            continue;
+        }
+        let candidate = out.join(&component);
+        match std::fs::read_link(&candidate) {
+            Ok(target) => {
+                hops += 1;
+                if hops > 40 {
+                    return path.to_path_buf();
+                }
+                push_all(&mut pending, &mut out, &target);
+            }
+            Err(_) => out = candidate,
+        }
+    }
+    out
+}
+
+/// What to tell a user whose Task Checkout at `path` is gone while git
+/// still holds a locked registration of it, which keeps `branch` checked out
+/// there. The command it names is the only thing that changes that, and it
+/// is theirs to run: SlashIt never unlocks or forces anything.
+pub fn locked_registration_notice(
+    repo_path: &str,
+    path: &str,
+    branch: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    let branch = branch
+        .map(|b| format!(", which keeps branch {} checked out there", b.trim_start_matches("refs/heads/")))
+        .unwrap_or_default();
+    let reason = reason
+        .map(|r| format!(" (lock reason: {r})"))
+        .unwrap_or_default();
+    format!(
+        "{LOCKED_REGISTRATION} of the worktree at {path}{reason}, whose directory is gone{branch}. \
+         SlashIt changed nothing. If that checkout is on a drive that is not mounted, mount it. \
+         If it is gone for good, run `git worktree unlock {path}` in {repo_path} and try again."
+    )
+}
+
+/// The words every [`locked_registration_notice`] carries, wherever it ends
+/// up: on a task by startup, or inside the reason a refused cleanup records.
+const LOCKED_REGISTRATION: &str = "Git holds a locked registration";
+
+/// Whether `message` carries a [`locked_registration_notice`], so that
+/// startup can drop it once git no longer holds anything for the task's
+/// checkout. The notice is only ever produced by that function, and
+/// whatever wraps it (a refused cleanup's "The worktree at ... was kept: ")
+/// keeps it whole.
+pub fn carries_locked_registration_notice(message: &str) -> bool {
+    message.contains(LOCKED_REGISTRATION)
 }
 
 impl WorktreeManager {
@@ -179,7 +480,8 @@ impl WorktreeManager {
     pub fn classify_missing_worktree(
         &self,
         repo_path: &str,
-        branch: &str,
+        recorded_path: &str,
+        branch: Option<&str>,
         porcelain: Option<&str>,
     ) -> WorktreeRecovery {
         let Some(porcelain) = porcelain else {
@@ -190,16 +492,37 @@ impl WorktreeManager {
         // conventions. `adopt_any_registered` is the fallback for a worktree
         // git still has registered for this branch at some other path — for
         // example one Worktrunk (`wt`) placed under its own template, which
-        // versions of SlashIt that delegated to it left behind. Git's confirmation is already the trust boundary, so a worktree it
+        // versions of SlashIt that delegated to it left behind. Git's
+        // confirmation is already the trust boundary, so a worktree it
         // vouches for is exactly as real as one sitting where SlashIt would
-        // itself have put it. Only once BOTH miss has git positively said
-        // there is nothing to adopt — which is what `ConfirmedAbsent` means,
-        // and the only basis on which a reference may be discarded.
-        match self
-            .adopt_existing(repo_path, branch, porcelain)
-            .or_else(|| Self::adopt_any_registered(repo_path, branch, porcelain))
-        {
-            Some(path) => WorktreeRecovery::Adopt(path),
+        // itself have put it.
+        if let Some(branch) = branch {
+            if let Some(path) = self
+                .adopt_existing(repo_path, branch, porcelain)
+                .or_else(|| Self::adopt_any_registered(repo_path, branch, porcelain))
+            {
+                return WorktreeRecovery::Adopt(path);
+            }
+        }
+
+        // Nothing to adopt. What git still holds for the checkout, by its
+        // recorded path and by its branch, decides whether the reference may
+        // go -- the same decision a removal makes (see `CheckoutState`). A
+        // registration whose directory is gone is not "nothing registered":
+        // an unlocked one is cleared by the next acquisition of the task's
+        // checkout (see `Self::adoptable_worktree`), so the reference can go,
+        // but a locked one keeps the checkout, and possibly the branch, held
+        // where nothing can reach it, and the task's reference is then the
+        // only thing pointing at it.
+        match CheckoutState::of(Ok(porcelain), recorded_path, branch).holding() {
+            Some(CheckoutRegistration::MissingLocked { path, branch, reason }) => {
+                WorktreeRecovery::Locked {
+                    path: path.clone(),
+                    branch: branch.clone(),
+                    reason: reason.clone(),
+                }
+            }
+            Some(_) => WorktreeRecovery::Unverified,
             None => WorktreeRecovery::ConfirmedAbsent,
         }
     }
@@ -235,8 +558,9 @@ impl WorktreeManager {
     /// anything is there.
     ///
     /// Unlike [`Self::adopt_any_registered`] this does not ask whether the
-    /// directory exists, and that is the entire point of it. Startup uses it to
-    /// decide whether an interrupted cleanup finished: a removal deletes the
+    /// directory exists, and that is the entire point of it. Startup asks the
+    /// same question, through [`CheckoutRegistration::of_branch`], to decide
+    /// whether an interrupted cleanup finished: a removal deletes the
     /// checkout's contents and takes the registration down last, so a
     /// registration that is still there is proof the removal did not reach its
     /// end, however empty the directory looks. Adoption must not use it, for
@@ -325,16 +649,91 @@ impl WorktreeManager {
         {
             return Ok(Some(adopted));
         }
-        match Self::worktree_for_branch(&porcelain, branch) {
-            Some(path) if Self::is_primary_checkout(Path::new(&path), repo_path, &porcelain) => {
-                Err(format!(
+        // What git holds for the branch, and at the managed path the new
+        // checkout would be added at. The path matters on its own: a
+        // registration there whose `HEAD` is detached holds no branch, and
+        // `git worktree add` still refuses that path while it is registered.
+        let managed = self.managed_path(repo_path, branch);
+        let state = CheckoutState::of(Ok(&porcelain), &managed.to_string_lossy(), Some(branch));
+        if let Some(CheckoutRegistration::Present { path }) = &state.by_branch {
+            if Self::is_primary_checkout(Path::new(path), repo_path, &porcelain) {
+                return Err(format!(
                     "branch {branch} is checked out in {path}, which is the repository's own \
                      checkout, not one SlashIt gives a task. Check out another branch there, \
                      then start the task again."
-                ))
+                ));
             }
-            _ => Ok(None),
         }
+        match state.holding() {
+            // Git refuses the branch, or the path, while this holds it.
+            // Saying why, and what only the user may do about it, is better
+            // than git's own refusal, which names neither the lock nor its
+            // reason.
+            Some(CheckoutRegistration::MissingLocked { path, branch: held, reason }) => {
+                return Err(format!(
+                    "the checkout of branch {branch} cannot be created: {}",
+                    locked_registration_notice(repo_path, path, held.as_deref(), reason.as_deref())
+                ));
+            }
+            Some(CheckoutRegistration::Unknown(why)) => {
+                return Err(format!(
+                    "the checkout of branch {branch} cannot be created, because what git holds \
+                     for it could not be established: {why}"
+                ));
+            }
+            _ => {}
+        }
+        // A checkout that vanished without being removed. Git refuses to
+        // check the branch out again, at that path or any other, and to add
+        // anything at that path, until the registration is cleared.
+        //
+        // One that has a branch checked out is cleared here: every commit
+        // made in it is still named by that branch, git treats an unlocked
+        // registration of a directory that is gone as garbage (`git worktree
+        // prune` removes it), and git's documentation says to lock a checkout
+        // on a drive that is not always mounted if it must be kept. It is
+        // cleared with the same ordinary `git worktree remove` a cleanup
+        // uses, which never forces anything and confirms the registration is
+        // gone. That removal would take a directory that reappeared at that
+        // path in the moment between this check and git acting, but it
+        // refuses one holding modified or untracked files, so only ignored
+        // files are exposed to that.
+        //
+        // One whose `HEAD` is detached is not. Its `HEAD` and reflog live in
+        // the registration, and may be the only thing naming commits made
+        // there, so clearing it could make them unreachable. The user is
+        // told which commit it is, and decides.
+        let mut prunable: Vec<&str> = Vec::new();
+        for registration in std::iter::once(&state.by_path).chain(state.by_branch.as_ref()) {
+            match registration {
+                CheckoutRegistration::MissingPrunable { path, branch: None, head } => {
+                    let head = head.as_deref().unwrap_or("an unknown commit");
+                    return Err(format!(
+                        "the checkout of branch {branch} cannot be created: git still registers \
+                         {path}, whose directory is gone, with a detached HEAD at {head}. SlashIt \
+                         does not clear it, because that HEAD may be the only thing naming \
+                         commits made there. To keep them, run `git branch <name> {head}` in \
+                         {repo_path}; then run `git worktree prune` there, and start the task \
+                         again."
+                    ));
+                }
+                CheckoutRegistration::MissingPrunable { path, .. }
+                    if !prunable.contains(&path.as_str()) =>
+                {
+                    prunable.push(path);
+                }
+                _ => {}
+            }
+        }
+        for path in prunable {
+            self.remove_with_git(path, repo_path, None).await.map_err(|e| {
+                format!(
+                    "git still registers {path}, which is gone, and that registration could not \
+                     be cleared for branch {branch}: {e}"
+                )
+            })?;
+        }
+        Ok(None)
     }
 
     /// The branch a task that records none is given: `task-<its whole id>`.
@@ -734,7 +1133,7 @@ impl WorktreeManager {
                 ));
             }
         }
-        self.remove_with_git(&info.path, repo_path)
+        self.remove_with_git(&info.path, repo_path, Some(branch))
             .await
             .map_err(|e| format!("the {e}, so branch {branch} was kept as well"))?;
         let Err(kept) = Self::discard_created_branch(repo_path, branch, created_at).await else {
@@ -858,8 +1257,22 @@ impl WorktreeManager {
     ///
     /// Any worktree git has registered can be removed this way, including
     /// one at a path SlashIt did not choose.
-    pub async fn remove(&self, worktree_path: &str, repo_path: &str) -> Result<(), String> {
-        self.remove_with_git(worktree_path, repo_path).await
+    ///
+    /// A checkout whose directory is already gone is removed only once git
+    /// confirms it no longer registers it: an unlocked registration is
+    /// cleared on the way, but a locked one is left exactly as it is and
+    /// reported as an `Err` naming the lock, as is a git that cannot be
+    /// asked. `branch` is the task's recorded branch, if any: it is looked
+    /// up as well as the path, and a locked or unanswerable registration of
+    /// it also refuses the removal. See [`CheckoutState`]. Callers keep the
+    /// task's reference on any `Err`.
+    pub async fn remove(
+        &self,
+        worktree_path: &str,
+        repo_path: &str,
+        branch: Option<&str>,
+    ) -> Result<(), String> {
+        self.remove_with_git(worktree_path, repo_path, branch).await
     }
 
     /// Check if a worktree directory exists on disk.
@@ -921,7 +1334,85 @@ impl WorktreeManager {
         Err(failure)
     }
 
-    async fn remove_with_git(&self, worktree_path: &str, repo_path: &str) -> Result<(), String> {
+    /// `git worktree list --porcelain -z` for `repo_path`, or why git could
+    /// not produce it.
+    ///
+    /// `-z` needs git 2.36 or newer. An older git refuses the option, and
+    /// that refusal is reported like any other failure to answer, never read
+    /// as an empty listing.
+    async fn worktree_listing(repo_path: &str) -> Result<String, String> {
+        let output = tokio::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| format!("`git worktree list` could not be run in {repo_path}: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "`git worktree list` failed in {repo_path}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// The outcome of removing a checkout whose directory is gone, from what
+    /// git still holds for it, by path and by branch, once `git worktree
+    /// remove` has run.
+    ///
+    /// Only "git registers nothing at that path, and nothing locked or
+    /// unanswerable for its branch" is a removal. Anything else keeps the
+    /// caller's reference to the checkout, because the caller clears it on
+    /// `Ok`: a locked registration still holds the checkout, and a git that
+    /// could not be asked might be hiding one. Startup decides on the same
+    /// [`CheckoutState`], so the two cannot disagree. `git_said` is what the
+    /// removal printed, for the cases git's own words explain.
+    fn settle_missing_checkout(
+        worktree_path: &str,
+        repo_path: &str,
+        state: CheckoutState,
+        git_said: &str,
+    ) -> Result<(), String> {
+        match state.holding() {
+            Some(CheckoutRegistration::MissingLocked { path, branch, reason }) => {
+                return Err(locked_registration_notice(
+                    repo_path,
+                    path,
+                    branch.as_deref(),
+                    reason.as_deref(),
+                ));
+            }
+            Some(CheckoutRegistration::Unknown(why)) => {
+                return Err(format!(
+                    "the worktree at {worktree_path} is gone, but whether git still registers \
+                     it could not be confirmed, so it was not reported removed: {why}"
+                ));
+            }
+            _ => {}
+        }
+        match state.by_path {
+            CheckoutRegistration::MissingPrunable { path, .. } => Err(format!(
+                "the worktree at {worktree_path} is gone, but git still registers it at {path} \
+                 after `git worktree remove`{}; `git worktree prune` in {repo_path} clears such a \
+                 registration",
+                if git_said.is_empty() { String::new() } else { format!(", which said: {git_said}") }
+            )),
+            CheckoutRegistration::Present { path } => Err(format!(
+                "the worktree at {worktree_path} is gone, but git registers a checkout there that \
+                 is present at {path}; nothing was removed"
+            )),
+            // A branch registered elsewhere, present or prunable, is not this
+            // checkout: startup adopts the one, acquisition clears the other.
+            _ => Ok(()),
+        }
+    }
+
+    async fn remove_with_git(
+        &self,
+        worktree_path: &str,
+        repo_path: &str,
+        branch: Option<&str>,
+    ) -> Result<(), String> {
         // Saved before anything runs, because there is no asking for it back
         // afterwards: git tears its own record down at the end of a removal it
         // could not finish, and a checkout it no longer registers is one no
@@ -940,6 +1431,7 @@ impl WorktreeManager {
         // dirty is the whole policy here, so nothing below parses stderr to
         // second-guess it; ignored build output is not dirty to git and this
         // removal takes the checkout away build output and all.
+        let was_present = matches!(Presence::of(Path::new(worktree_path)), Presence::Present);
         let output = tokio::process::Command::new("git")
             .args(["worktree", "remove", worktree_path])
             .current_dir(repo_path)
@@ -968,6 +1460,32 @@ impl WorktreeManager {
                  remove`: {stderr}"
             )
         };
+        // A directory that is gone is not yet a removal: git may still hold a
+        // registration of it, and that registration, not the directory, is
+        // what keeps the checkout, and its branch, in use. For a directory
+        // that is gone, `git worktree remove` above only drops an unlocked
+        // registration, as `git worktree prune` would, and touches no files;
+        // what is left is asked for rather than assumed. Nothing is restored
+        // here: git dropped nothing it had not finished with, since there
+        // was no directory for it to fail on.
+        if Self::proven_absent(worktree_path) {
+            // A checkout that was there, removed by a `git worktree remove`
+            // that succeeded: git takes its own registration down as the
+            // last step of such a removal, so there is nothing left to ask
+            // about. Asking anyway would also fail every ordinary cleanup on
+            // a git too old for the listing's `-z`.
+            if was_present && output.status.success() {
+                return Ok(());
+            }
+            drop(record);
+            let listing = Self::worktree_listing(repo_path).await;
+            let state = CheckoutState::of(
+                listing.as_deref().map_err(String::as_str),
+                worktree_path,
+                branch,
+            );
+            return Self::settle_missing_checkout(worktree_path, repo_path, state, &stderr);
+        }
         Self::finish_removal(worktree_path, record, failure)?;
 
         // The branch is not touched here, and that is the whole point of this
@@ -1317,6 +1835,10 @@ mod tests {
         WorktreeManager::new(test_paths())
     }
 
+    /// A recorded checkout path that is not on disk and that no hand-written
+    /// listing below registers.
+    const RECORDED: &str = "/nonexistent/recorded-checkout";
+
     /// A worktree whose directory is gone but whose registration git still
     /// keeps is removed as a converged removal, and the registration goes
     /// with it: a stale registration would block `git worktree add` for the
@@ -1338,7 +1860,7 @@ mod tests {
             "the stale registration must still be there before the removal"
         );
 
-        mgr.remove(&info.path, &repo_path)
+        mgr.remove(&info.path, &repo_path, None)
             .await
             .expect("an already-absent worktree is a converged removal");
 
@@ -1349,6 +1871,251 @@ mod tests {
              again"
         );
         assert!(branch_exists(&repo_path, "task-abcd1234"), "the branch is kept");
+    }
+
+    /// Git's record for exactly `worktree_path`, one field per line, or
+    /// `None` when git registers nothing there.
+    fn registration_of(repo_path: &str, worktree_path: &str) -> Option<String> {
+        let listing = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        let wanted = format!("worktree {worktree_path}");
+        listing
+            .split("\0\0")
+            .find(|record| record.split('\0').next() == Some(wanted.as_str()))
+            .map(|record| record.replace('\0', "\n"))
+    }
+
+    /// A worktree whose directory is gone while git still holds a *locked*
+    /// registration for it is not removed, and nothing about it changes.
+    ///
+    /// `git worktree remove` refuses a locked worktree and `git worktree
+    /// prune` skips one, so the branch stays checked out in a checkout that
+    /// is not there and `git worktree add` refuses it everywhere. Reporting
+    /// that as a removal let the caller clear the task's only reference to
+    /// it. Once the user unlocks it, the same removal converges, and the
+    /// branch can be checked out again.
+    #[tokio::test]
+    async fn a_locked_registration_of_a_missing_checkout_is_not_removed_until_unlocked() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let branch = "task-abcd1234";
+        let info = mgr.create(&repo_path, branch).await.expect("create failed");
+        let reason = "on a drive that is not mounted";
+        run_git(&repo_path, &["worktree", "lock", "--reason", reason, &info.path]);
+        std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+        let before = registration_of(&repo_path, &info.path).expect("still registered");
+
+        let refused = mgr
+            .remove(&info.path, &repo_path, None)
+            .await
+            .expect_err("a checkout git still holds a locked registration for is not removed");
+        assert!(refused.contains(reason), "the lock is named: {refused}");
+        assert!(
+            refused.contains("git worktree unlock"),
+            "the way out is named: {refused}"
+        );
+        assert_eq!(
+            registration_of(&repo_path, &info.path),
+            Some(before),
+            "a refused removal changes nothing, the lock included"
+        );
+
+        let not_again = mgr
+            .reattach(&repo_path, branch)
+            .await
+            .err()
+            .expect("the branch stays checked out in the locked registration");
+        assert!(
+            not_again.contains(reason),
+            "acquisition names the lock that holds the branch: {not_again}"
+        );
+
+        run_git(&repo_path, &["worktree", "unlock", &info.path]);
+        mgr.remove(&info.path, &repo_path, None)
+            .await
+            .expect("once unlocked, the missing checkout's registration is cleared");
+        assert_eq!(registration_of(&repo_path, &info.path), None);
+        assert!(branch_exists(&repo_path, branch), "the branch is kept");
+
+        let again = mgr
+            .reattach(&repo_path, branch)
+            .await
+            .expect("the branch can be checked out again");
+        assert_eq!(again.path, info.path);
+        assert!(Path::new(&again.path).is_dir());
+    }
+
+    /// A worktree git no longer registers at all, and whose directory is
+    /// gone, is a removal that has already happened.
+    #[tokio::test]
+    async fn a_checkout_git_no_longer_registers_is_a_converged_removal() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let info = mgr.create(&repo_path, "task-abcd1234").await.expect("create failed");
+        run_git(&repo_path, &["worktree", "remove", &info.path]);
+
+        mgr.remove(&info.path, &repo_path, None)
+            .await
+            .expect("nothing is left to remove");
+        assert_eq!(registration_of(&repo_path, &info.path), None);
+    }
+
+    /// A missing directory is not proof of a removal when git cannot be asked
+    /// what it still registers there: a locked registration would look
+    /// exactly the same from the filesystem.
+    #[tokio::test]
+    async fn a_missing_checkout_is_not_reported_removed_when_git_cannot_be_asked() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let not_a_repo = tmp.path().to_str().unwrap();
+        let missing = tmp.path().join("gone").to_string_lossy().to_string();
+
+        let refused = test_manager()
+            .remove(&missing, not_a_repo, None)
+            .await
+            .expect_err("absence of the directory alone does not prove the removal");
+        assert!(refused.contains(&missing), "the checkout is named: {refused}");
+    }
+
+    /// Git records a checkout's path with symlinks resolved. A task whose
+    /// recorded path reaches the checkout through a symlinked ancestor still
+    /// finds git's locked registration once the directories behind the link
+    /// are gone, and so is not reported removed: neither when only the
+    /// checkout's parent went, nor when the link's whole target did, as when
+    /// the drive it points at is not mounted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_locked_checkout_behind_a_symlink_whose_target_is_gone_is_not_removed() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let branch = "task-abcd1234";
+        let real = repo.root().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let alias = repo.root().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let recorded = alias.join("sub").join("wt").to_string_lossy().to_string();
+        run_git(&repo_path, &["branch", branch]);
+        run_git(&repo_path, &["worktree", "add", "-q", "--", &recorded, branch]);
+        let reason = "on a drive that is not mounted";
+        run_git(&repo_path, &["worktree", "lock", "--reason", reason, &recorded]);
+
+        std::fs::remove_dir_all(real.join("sub")).unwrap();
+        let refused = mgr
+            .remove(&recorded, &repo_path, None)
+            .await
+            .expect_err("the locked registration is found through the symlink");
+        assert!(refused.contains(reason), "the lock is named: {refused}");
+        assert!(refused.contains(branch), "and the branch it holds: {refused}");
+
+        std::fs::remove_dir_all(&real).unwrap();
+        let refused = mgr
+            .remove(&recorded, &repo_path, None)
+            .await
+            .expect_err("the locked registration is found through a symlink that dangles");
+        assert!(refused.contains(reason), "the lock is named: {refused}");
+
+        // However the path is spelled, the branch finds it too.
+        let refused = mgr
+            .remove("/nonexistent/spelled-otherwise", &repo_path, Some(branch))
+            .await
+            .expect_err("the task's branch is held by a locked registration");
+        assert!(refused.contains(reason), "the lock is named: {refused}");
+        assert!(
+            WorktreeManager::worktree_list_porcelain(&repo_path)
+                .expect("git listing")
+                .contains(reason),
+            "and nothing changed"
+        );
+    }
+
+    /// A registration at the managed path whose `HEAD` is detached holds no
+    /// branch, but `git worktree add` still refuses that path while it is
+    /// registered. Acquisition finds it by path. A locked one is reported,
+    /// naming the lock. An unlocked one is not cleared either: its `HEAD`
+    /// may be the only thing naming commits made on it, and clearing the
+    /// registration would drop that `HEAD` and its reflog. It is reported,
+    /// naming the commit, and once the user has kept what they want and
+    /// pruned it, the checkout is acquired.
+    #[tokio::test]
+    async fn a_detached_registration_left_at_the_managed_path_is_found_by_path() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let branch = "task-abcd1234";
+        let info = mgr.create(&repo_path, branch).await.expect("create failed");
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        // Work that only the detached `HEAD` names.
+        let detached = commit_work(&info.path, "detached.txt");
+        assert!(refs_reaching(&repo_path, &detached).is_empty());
+        let reason = "on a drive that is not mounted";
+        run_git(&repo_path, &["worktree", "lock", "--reason", reason, &info.path]);
+        std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+
+        let refused = mgr
+            .reattach(&repo_path, branch)
+            .await
+            .err()
+            .expect("the managed path is held by a locked registration");
+        assert!(refused.contains(reason), "the lock is named: {refused}");
+
+        run_git(&repo_path, &["worktree", "unlock", &info.path]);
+        let refused = mgr
+            .reattach(&repo_path, branch)
+            .await
+            .err()
+            .expect("a detached registration is not cleared automatically");
+        assert!(refused.contains(&detached), "the detached commit is named: {refused}");
+        assert!(refused.contains("git worktree prune"), "the way out is named: {refused}");
+        assert!(
+            registration_of(&repo_path, &info.path)
+                .is_some_and(|r| r.contains(&format!("HEAD {detached}"))),
+            "the registration, and the HEAD it keeps, are left alone"
+        );
+        run_git(&repo_path, &["rev-parse", "--verify", "-q", &format!("{detached}^{{commit}}")]);
+
+        run_git(&repo_path, &["branch", "kept-work", &detached]);
+        run_git(&repo_path, &["worktree", "prune"]);
+        let again = mgr
+            .reattach(&repo_path, branch)
+            .await
+            .expect("once pruned, the checkout is acquired");
+        assert_eq!(again.path, info.path);
+        assert!(Path::new(&again.path).is_dir());
+    }
+
+    /// A task whose checkout directory vanished without being removed leaves
+    /// git a prunable registration of the task's branch. Checking the branch
+    /// out again clears that registration first, as `git worktree prune`
+    /// would, rather than failing on it at the managed path or anywhere else.
+    #[tokio::test]
+    async fn a_branch_whose_checkout_vanished_can_be_checked_out_again() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let branch = "task-abcd1234";
+        let info = mgr.create(&repo_path, branch).await.expect("create failed");
+        std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+
+        let again = mgr
+            .reattach(&repo_path, branch)
+            .await
+            .expect("a prunable registration does not block the branch");
+        assert_eq!(again.path, info.path);
+        assert!(Path::new(&again.path).is_dir());
+
+        // Somewhere SlashIt did not choose, the same.
+        let elsewhere = repo.root().join("elsewhere").to_string_lossy().to_string();
+        run_git(&repo_path, &["worktree", "remove", &again.path]);
+        run_git(&repo_path, &["worktree", "add", "-q", "--", &elsewhere, branch]);
+        std::fs::remove_dir_all(&elsewhere).expect("remove worktree dir");
+
+        let again = mgr
+            .reattach(&repo_path, branch)
+            .await
+            .expect("a prunable registration elsewhere does not block the branch either");
+        assert_eq!(again.path, info.path);
+        assert_eq!(registration_of(&repo_path, &elsewhere), None);
     }
 
     #[test]
@@ -1847,6 +2614,52 @@ branch refs/heads/some-other-branch
         assert!(mgr.exists(&info.path));
     }
 
+    /// A git older than 2.36 refuses `worktree list -z`. Removing a checkout
+    /// that is there must still succeed with such a git: the removal itself
+    /// is the proof, and a listing is only needed for a checkout that was
+    /// already gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_present_checkout_is_removed_by_a_git_without_listing_z() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+        let info = mgr.create(repo_path, "task-old-git").await.expect("create failed");
+
+        let real_git = String::from_utf8(
+            std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .expect("locate git")
+                .stdout,
+        )
+        .expect("git path")
+        .trim()
+        .to_string();
+        let repo = std::fs::canonicalize(repo_path).expect("canonical repo");
+        // Only this test's repository sees the old git; every other test
+        // that spawns git meanwhile gets the real one.
+        let _fake = crate::test_helpers::FakeProgram::install(
+            "git",
+            &format!(
+                "case \"$(pwd -P)\" in {repo:?}*) case \" $* \" in *' list '*' -z '*) \
+                 echo \"error: unknown switch \\`z'\" >&2; exit 129;; esac;; esac\n\
+                 exec {real_git:?} \"$@\"",
+                repo = repo.display().to_string(),
+            ),
+        )
+        .await;
+
+        mgr.remove(&info.path, repo_path, Some("task-old-git"))
+            .await
+            .expect("a checkout git removed is removed, whatever the listing can say");
+        assert!(!Path::new(&info.path).exists(), "worktree dir should be gone");
+        assert!(
+            WorktreeManager::worktree_listing(repo_path).await.is_err(),
+            "precondition: this git cannot list with -z"
+        );
+    }
+
     #[tokio::test]
     async fn integration_remove_leaves_the_work_in_the_worktree_reachable() {
         // The invariant the whole contract exists for, stated the way a user
@@ -1872,7 +2685,7 @@ branch refs/heads/some-other-branch
              could pass on some other ref holding it"
         );
 
-        mgr.remove(&info.path, repo_path)
+        mgr.remove(&info.path, repo_path, None)
             .await
             .expect("removal of a live worktree should succeed");
 
@@ -1901,7 +2714,7 @@ branch refs/heads/some-other-branch
             .expect("create failed");
         assert!(branch_exists(repo_path, "task-removeme"), "precondition");
 
-        mgr.remove(&info.path, repo_path)
+        mgr.remove(&info.path, repo_path, None)
             .await
             .expect("removal of a live worktree should succeed");
 
@@ -1929,7 +2742,7 @@ branch refs/heads/some-other-branch
             .expect("create failed");
         let work = commit_work(&info.path, "agent-work.txt");
 
-        mgr.remove(&info.path, repo_path).await.expect("remove failed");
+        mgr.remove(&info.path, repo_path, None).await.expect("remove failed");
 
         let again = mgr
             .reattach(repo_path, "task-reattach")
@@ -1969,7 +2782,7 @@ branch refs/heads/some-other-branch
         assert!(branch_exists(repo_path, "task-keepme"), "precondition");
 
         let absent = tmp.path().join("never-existed");
-        mgr.remove(absent.to_str().unwrap(), repo_path)
+        mgr.remove(absent.to_str().unwrap(), repo_path, None)
             .await
             .expect("an already-absent worktree is not a failure");
 
@@ -2088,7 +2901,7 @@ branch refs/heads/some-other-branch
                 case.class
             );
 
-            let result = mgr.remove(&info.path, repo_path).await;
+            let result = mgr.remove(&info.path, repo_path, None).await;
 
             let class = case.class;
             match &result {
@@ -2188,7 +3001,7 @@ branch refs/heads/some-other-branch
         std::fs::write(&readme, UNCOMMITTED).expect("write uncommitted content");
 
         let error = mgr
-            .remove(&info.path, repo_path)
+            .remove(&info.path, repo_path, None)
             .await
             .expect_err("a checkout git refuses to remove has not been cleaned up");
 
@@ -2268,7 +3081,7 @@ branch refs/heads/some-other-branch
              is named for was never reached"
         );
 
-        mgr.remove(&info.path, repo_path)
+        mgr.remove(&info.path, repo_path, None)
             .await
             .expect("a clean checkout stays removable however its branch relates to main");
 
@@ -2344,7 +3157,7 @@ branch refs/heads/some-other-branch
             "precondition: and something must actually be ignored, or this test proves nothing"
         );
 
-        mgr.remove(&info.path, repo_path)
+        mgr.remove(&info.path, repo_path, None)
             .await
             .expect("ignored content is not a reason to keep a checkout alive");
 
@@ -2502,7 +3315,7 @@ branch refs/heads/some-other-branch
         );
         let porcelain = z(&format!("{PRIMARY}{porcelain}"));
 
-        let result = mgr.classify_missing_worktree(repo, branch, Some(&porcelain));
+        let result = mgr.classify_missing_worktree(repo, RECORDED, Some(branch), Some(&porcelain));
 
         let _ = std::fs::remove_dir_all(managed.parent().unwrap());
 
@@ -2533,11 +3346,7 @@ branch refs/heads/some-other-branch
         );
         let porcelain = z(&format!("{PRIMARY}{porcelain}"));
 
-        let result = mgr.classify_missing_worktree(
-            repo.to_str().unwrap(),
-            branch,
-            Some(&porcelain),
-        );
+        let result = mgr.classify_missing_worktree(repo.to_str().unwrap(), RECORDED, Some(branch), Some(&porcelain));
 
         assert_eq!(
             result,
@@ -2565,11 +3374,7 @@ branch refs/heads/some-other-branch
         );
         let porcelain = z(&porcelain);
 
-        let result = mgr.classify_missing_worktree(
-            repo.to_str().unwrap(),
-            branch,
-            Some(&porcelain),
-        );
+        let result = mgr.classify_missing_worktree(repo.to_str().unwrap(), RECORDED, Some(branch), Some(&porcelain));
 
         assert_eq!(
             result,
@@ -2583,9 +3388,158 @@ branch refs/heads/some-other-branch
         let mgr = test_manager();
 
         assert_eq!(
-            mgr.classify_missing_worktree("/home/u/app", "task-abcd1234", Some("")),
+            mgr.classify_missing_worktree("/home/u/app", RECORDED, Some("task-abcd1234"), Some("")),
             WorktreeRecovery::ConfirmedAbsent,
             "git answering with no registration is positive proof the reference is dead"
+        );
+    }
+
+    /// The four answers git's listing and the filesystem can give about one
+    /// checkout, and a fifth for when they cannot answer, told apart the same
+    /// way whether the checkout is looked up by branch or by path.
+    #[test]
+    fn checkout_registration_separates_every_state_a_missing_checkout_can_be_in() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let present = tmp.path().join("present");
+        std::fs::create_dir_all(&present).unwrap();
+        let gone = |name: &str| tmp.path().join(name).to_string_lossy().to_string();
+        let present = present.to_string_lossy().to_string();
+        let listing = z(&format!(
+            "{PRIMARY}\
+             worktree {present}\nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/task-present\n\n\
+             worktree {}\nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/task-prunable\nprunable gitdir file points to non-existent location\n\n\
+             worktree {}\nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/task-locked\nlocked on a drive\n\n\
+             worktree {}\nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/task-bare-lock\nlocked\n\n",
+            gone("prunable"),
+            gone("locked"),
+            gone("bare-lock"),
+        ));
+
+        let by_branch = |branch: &str| CheckoutRegistration::of_branch(Ok(&listing), branch);
+        let by_path = |path: &str| CheckoutRegistration::of_path(Ok(&listing), path);
+        for (branch, path, expected) in [
+            ("task-present", present.clone(), CheckoutRegistration::Present { path: present.clone() }),
+            (
+                "task-prunable",
+                gone("prunable"),
+                CheckoutRegistration::MissingPrunable {
+                    path: gone("prunable"),
+                    branch: Some("task-prunable".to_string()),
+                    head: Some("1111111111111111111111111111111111111111".to_string()),
+                },
+            ),
+            (
+                "task-locked",
+                gone("locked"),
+                CheckoutRegistration::MissingLocked {
+                    path: gone("locked"),
+                    branch: Some("task-locked".to_string()),
+                    reason: Some("on a drive".to_string()),
+                },
+            ),
+            (
+                "task-bare-lock",
+                gone("bare-lock"),
+                CheckoutRegistration::MissingLocked {
+                    path: gone("bare-lock"),
+                    branch: Some("task-bare-lock".to_string()),
+                    reason: None,
+                },
+            ),
+            ("task-removed", gone("removed"), CheckoutRegistration::NotRegistered),
+        ] {
+            assert_eq!(by_branch(branch), expected, "by branch {branch}");
+            assert_eq!(by_path(&path), expected, "by path {path}");
+        }
+
+        assert!(matches!(
+            CheckoutRegistration::of_branch(Err("git failed"), "task-locked"),
+            CheckoutRegistration::Unknown(_)
+        ));
+        assert!(matches!(
+            CheckoutRegistration::of_path(Err("git failed"), &gone("locked")),
+            CheckoutRegistration::Unknown(_)
+        ));
+    }
+
+    /// Git records a checkout's path with symlinks resolved, and once the
+    /// directory is gone the recorded path cannot be resolved any more, so a
+    /// registration is still found through a symlinked parent.
+    #[cfg(unix)]
+    #[test]
+    fn checkout_registration_finds_a_missing_checkout_through_a_symlinked_parent() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let recorded = real.canonicalize().unwrap().join("gone");
+        let listing = z(&format!(
+            "worktree {}\nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/task-a\nlocked\n\n",
+            recorded.display()
+        ));
+
+        assert_eq!(
+            CheckoutRegistration::of_path(Ok(&listing), alias.join("gone").to_str().unwrap()),
+            CheckoutRegistration::MissingLocked {
+                path: recorded.to_string_lossy().to_string(),
+                branch: Some("task-a".to_string()),
+                reason: None,
+            }
+        );
+    }
+
+    /// Symlinks are resolved wherever they are along the path, relative or
+    /// absolute, whether or not their target exists, and nothing else about
+    /// the path changes.
+    #[cfg(unix)]
+    #[test]
+    fn resolved_path_follows_every_symlink_even_one_that_dangles() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("relative")).unwrap();
+        std::os::unix::fs::symlink(root.join("unmounted"), root.join("dangling")).unwrap();
+
+        assert_eq!(resolved_path(&root.join("relative/a/b")), root.join("real/a/b"));
+        assert_eq!(resolved_path(&root.join("dangling/a")), root.join("unmounted/a"));
+        assert_eq!(resolved_path(&root.join("real/./x/../y")), root.join("real/y"));
+        assert_eq!(resolved_path(Path::new("/")), PathBuf::from("/"));
+    }
+
+    /// A drive letter survives the root that follows it, so paths on two
+    /// drives never compare equal.
+    #[cfg(windows)]
+    #[test]
+    fn resolved_path_keeps_the_drive_a_root_follows() {
+        assert_eq!(resolved_path(Path::new(r"C:\x\y")), PathBuf::from(r"C:\x\y"));
+        assert_ne!(resolved_path(Path::new(r"C:\x\y")), resolved_path(Path::new(r"D:\x\y")));
+    }
+
+    #[test]
+    fn classify_missing_worktree_keeps_a_branch_git_holds_in_a_locked_registration() {
+        let mgr = test_manager();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let gone = tmp.path().join("gone").to_string_lossy().to_string();
+        let listing = z(&format!(
+            "{PRIMARY}worktree {gone}\nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/task-abcd1234\nlocked usb\n\n"
+        ));
+
+        assert_eq!(
+            mgr.classify_missing_worktree("/home/u/app", RECORDED, Some("task-abcd1234"), Some(&listing)),
+            WorktreeRecovery::Locked {
+                path: gone.clone(),
+                branch: Some("task-abcd1234".to_string()),
+                reason: Some("usb".to_string()),
+            },
+        );
+
+        let unlocked = listing.replace("locked usb\0", "");
+        assert_eq!(
+            mgr.classify_missing_worktree("/home/u/app", RECORDED, Some("task-abcd1234"), Some(&unlocked)),
+            WorktreeRecovery::ConfirmedAbsent,
+            "an unlocked registration is cleared by the next acquisition, so it does not hold \
+             the reference"
         );
     }
 
@@ -2594,7 +3548,7 @@ branch refs/heads/some-other-branch
         let mgr = test_manager();
 
         assert_eq!(
-            mgr.classify_missing_worktree("/home/u/app", "task-abcd1234", None),
+            mgr.classify_missing_worktree("/home/u/app", RECORDED, Some("task-abcd1234"), None),
             WorktreeRecovery::Unverified,
             "a failed git lookup must not be reported as confirmed absence"
         );
@@ -2620,7 +3574,7 @@ branch refs/heads/some-other-branch
         // `.current_dir` on every git invocation, so this no longer needs to
         // mutate the process-wide CWD (which was also unsound under
         // parallel test execution).
-        let result = mgr.remove(&info.path, repo_path).await;
+        let result = mgr.remove(&info.path, repo_path, None).await;
         assert!(result.is_ok(), "remove should succeed: {:?}", result.err());
         assert!(
             !Path::new(&info.path).exists(),
@@ -2662,7 +3616,7 @@ branch refs/heads/some-other-branch
             .await
             .expect("create failed");
 
-        let result = mgr.remove(&info.path, &target_repo_path).await;
+        let result = mgr.remove(&info.path, &target_repo_path, None).await;
 
         assert!(result.is_ok(), "remove should succeed: {:?}", result.err());
         assert!(
@@ -2728,7 +3682,7 @@ branch refs/heads/some-other-branch
         // removal cannot fully delete it.
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let result = mgr.remove(&info.path, repo_path).await;
+        let result = mgr.remove(&info.path, repo_path, None).await;
 
         // Restore permissions so the temp dir can be cleaned up on drop.
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2844,7 +3798,7 @@ branch refs/heads/some-other-branch
 
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
             .expect("close off the parent");
-        let result = mgr.remove(&info.path, repo_path).await;
+        let result = mgr.remove(&info.path, repo_path, None).await;
         // Reopened before asserting, so a failure still leaves a removable
         // temp dir behind and so the worktree can be confirmed still present
         // below.
@@ -3031,7 +3985,7 @@ branch refs/heads/some-other-branch
 
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
             .expect("close off the parent");
-        let blocked = mgr.remove(&info.path, repo_path).await;
+        let blocked = mgr.remove(&info.path, repo_path, None).await;
         // Reopened before asserting, so the outcome can actually be inspected
         // and so a later attempt in this same test has something to act on.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(restore_mode))
@@ -3057,7 +4011,7 @@ branch refs/heads/some-other-branch
         // Git's registration surviving is only useful if a real removal can
         // still use it: a later legitimate cleanup, once access is restored,
         // has to actually converge.
-        mgr.remove(&info.path, repo_path)
+        mgr.remove(&info.path, repo_path, None)
             .await
             .expect("the attempt made once the obstacle is gone is the one that has to converge");
         assert!(
@@ -3133,7 +4087,7 @@ branch refs/heads/some-other-branch
 
         // A later legitimate cleanup, once whatever tool ran has nothing
         // left to stand in its way, still has to converge.
-        mgr.remove(&info.path, repo_path)
+        mgr.remove(&info.path, repo_path, None)
             .await
             .expect("the retry has to actually finish once the registration is back");
         assert!(!Path::new(&info.path).exists(), "the retry has to actually remove the worktree");
@@ -3192,7 +4146,7 @@ branch refs/heads/some-other-branch
 
         std::fs::set_permissions(&info.path, std::fs::Permissions::from_mode(0o000))
             .expect("close off the worktree");
-        let blocked = mgr.remove(&info.path, repo_path).await;
+        let blocked = mgr.remove(&info.path, repo_path, None).await;
         let registered = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
         // Reopened before asserting, so a failure still leaves a removable
         // temp dir behind.
@@ -3209,7 +4163,7 @@ branch refs/heads/some-other-branch
              remove the directory again and no later attempt can converge"
         );
 
-        mgr.remove(&info.path, repo_path)
+        mgr.remove(&info.path, repo_path, None)
             .await
             .expect("the attempt made once the obstacle is gone is the one that has to converge");
         assert!(
@@ -3302,7 +4256,7 @@ branch refs/heads/some-other-branch
              enough to be abandoned partway"
         );
 
-        let abandoned = mgr.remove(&info.path, repo_path).await;
+        let abandoned = mgr.remove(&info.path, repo_path, None).await;
         let registered = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
         // Reopened before asserting, so a failure still leaves a removable
         // temp dir behind.
@@ -3353,7 +4307,7 @@ branch refs/heads/some-other-branch
              is the ordinary dirty refusal and not the record that was put back"
         );
 
-        mgr.remove(&info.path, repo_path)
+        mgr.remove(&info.path, repo_path, None)
             .await
             .expect("the attempt made once the obstacle is gone is the one that has to converge");
         assert!(
@@ -3410,7 +4364,7 @@ branch refs/heads/some-other-branch
             "the worktree must start out unregistered, or this proves nothing"
         );
 
-        let stuck = mgr.remove(&info.path, repo_path).await;
+        let stuck = mgr.remove(&info.path, repo_path, None).await;
         assert!(
             stuck.is_err(),
             "nothing can remove a checkout git does not register: {stuck:?}"
@@ -3421,7 +4375,7 @@ branch refs/heads/some-other-branch
             "the copy left behind by an attempt that could not put the record back has to be              found by the next attempt, or the task is stuck for good"
         );
 
-        mgr.remove(&info.path, repo_path)
+        mgr.remove(&info.path, repo_path, None)
             .await
             .expect("and with the record back, an ordinary removal has to converge");
         assert!(
@@ -3511,7 +4465,7 @@ branch refs/heads/some-other-branch
         std::fs::set_permissions(&bystander.path, std::fs::Permissions::from_mode(0o000))
             .expect("close off the bystander");
 
-        let converged = mgr.remove(&cleaned.path, repo_path).await;
+        let converged = mgr.remove(&cleaned.path, repo_path, None).await;
         let registered = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
         std::fs::set_permissions(&bystander.path, std::fs::Permissions::from_mode(restore))
             .expect("reopen the bystander");
@@ -3550,7 +4504,7 @@ branch refs/heads/some-other-branch
     async fn integration_remove_nonexistent_does_not_panic() {
         let mgr = test_manager();
         // Removing a non-existent worktree should not panic (may return Err, that is fine).
-        let _ = mgr.remove("/tmp/slashit_no_such_wt", "/tmp").await;
+        let _ = mgr.remove("/tmp/slashit_no_such_wt", "/tmp", None).await;
     }
 
     /// `WorktreeManager` no longer owns diff computation itself --
@@ -4642,7 +5596,7 @@ branch refs/heads/some-other-branch
         let work = commit_work(custom.to_str().unwrap(), "agent-work.txt");
 
         test_manager()
-            .remove(custom.to_str().unwrap(), repo_path)
+            .remove(custom.to_str().unwrap(), repo_path, None)
             .await
             .expect("removed");
 
@@ -4666,7 +5620,7 @@ branch refs/heads/some-other-branch
             let created = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
             assert_eq!(run_git(&created.path, &["rev-parse", "HEAD"]), base);
             let work = commit_work(&created.path, "agent-work.txt");
-            mgr.remove(&created.path, repo_path).await.expect("remove");
+            mgr.remove(&created.path, repo_path, None).await.expect("remove");
             assert!(!Path::new(&created.path).exists());
             assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), work);
 
@@ -4679,8 +5633,8 @@ branch refs/heads/some-other-branch
                 .expect("stacked create")
                 .info;
             assert_eq!(run_git(&stacked.path, &["rev-parse", "HEAD"]), work);
-            mgr.remove(&stacked.path, repo_path).await.expect("remove stacked");
-            mgr.remove(&again.path, repo_path).await.expect("remove reattached");
+            mgr.remove(&stacked.path, repo_path, None).await.expect("remove stacked");
+            mgr.remove(&again.path, repo_path, None).await.expect("remove reattached");
             assert_eq!(registered_worktrees(repo_path).len(), 1);
             assert!(branch_exists(repo_path, "task-0a1b2c3d"));
             assert!(branch_exists(repo_path, "task-5eed5eed"));
