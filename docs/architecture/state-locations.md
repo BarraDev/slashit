@@ -234,6 +234,63 @@ re-pointed: both keep the reference they had and say why. The previous
 behaviour cleared the reference, stranding the branch and any uncommitted work
 in it.
 
+### A checkout whose directory is gone
+
+A directory that is gone is not by itself a removed checkout. Git may still
+register it, and while it does the checkout's path, and the branch it has
+checked out, stay in use: `git worktree add` refuses both. SlashIt reads
+`git worktree list --porcelain -z` and looks the checkout up twice, by the
+path the task records and by the task's branch. The path finds a checkout
+whose `HEAD` is detached, which holds no branch; the branch finds one git
+recorded under a spelling of the path that can no longer be resolved to the
+task's, such as through a symlink to a drive that is not mounted. Symlinks
+are resolved along the path, including one whose target is gone, because git
+records paths with symlinks resolved. Removal and startup decide on the same
+two lookups:
+
+- Nothing registered, by path or by branch: the checkout is gone. Removal
+  reports it removed, and startup clears the task's reference.
+- Registered and not locked (git calls it prunable): removal runs its
+  ordinary `git worktree remove`, which for a directory that is gone only
+  drops git's record of it, and reports the checkout removed once git no
+  longer lists it. Startup clears the task's reference. Acquiring the task's
+  checkout later finds such a registration of its branch, or at the path it
+  is about to use. One that has a branch checked out is dropped the same way
+  before a new checkout is added: every commit made in it is still on that
+  branch. That removal is not forced, but it would still act on a directory
+  that reappeared at that path between the check and git running. It refuses
+  one holding modified or untracked files, so only ignored files are exposed.
+  Git treats an unlocked registration of a missing directory as garbage:
+  `git worktree prune` removes it, and git's documentation says to lock a
+  checkout on a drive that is not always mounted. One whose `HEAD` is
+  detached is never dropped automatically, because its `HEAD` and reflog live
+  in the registration and may be the only thing naming commits made there.
+  Acquisition refuses instead, and the task says which commit the detached
+  `HEAD` is at, how to keep it (`git branch <name> <commit>`), and to run
+  `git worktree prune` afterwards.
+- Registered and locked, by either lookup: git refuses to clear it, and so
+  does SlashIt. Removal fails and changes nothing, so the task keeps its
+  reference, and startup keeps the reference too. Both name the lock, its
+  reason and the branch it holds, and how to lift it: mount the drive the
+  checkout is on, or, if it is gone for good, run `git worktree unlock <path>`
+  in the repository. The next removal or start then converges, and startup
+  drops the notice once the lock is gone, or once the checkout is found again
+  where it was recorded or somewhere else. SlashIt never unlocks or forces
+  anything.
+- Git cannot be asked, or cannot say: removal fails and startup keeps the
+  reference. That includes a repository directory that exists but is no
+  longer a usable Git repository: the task keeps its reference, and cannot be
+  finished or deleted, until the repository is fixed. Reading the listing
+  needs git 2.36 or newer, for `-z`; with an older git a checkout whose
+  directory is gone cannot be confirmed removed.
+
+A task whose cleanup was interrupted is not cleared on these terms. Startup
+reconciles it only when its directory is gone and git registers nothing for
+it by path or by branch; otherwise the task stays quarantined until the
+cleanup is asked for again, and says so, naming the lock if there is one.
+
+Startup runs no git command that changes anything.
+
 ## Directories by platform
 
 | Root | Linux | macOS | Windows |
