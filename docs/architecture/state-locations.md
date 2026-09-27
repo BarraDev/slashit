@@ -189,8 +189,10 @@ The board keeps showing what the file says, and a branch and worktree created
 for that attempt are removed again, so the next attempt creates them afresh
 and records where they started. Left in place, they would be adopted
 unrecorded, and an adopted checkout has no known start. The removal is never
-forced. A checkout that gained files or commits in the meantime is kept, and
-the error names it. A worktree added for a branch that already existed, or an
+forced. A checkout that gained commits, modified or untracked files, or an
+initialized submodule in the meantime is kept, as is one that is locked, and
+the error names it. Ignored files are not protected: they are removed with the
+checkout, as `git worktree remove` does. A worktree added for a branch that already existed, or an
 existing worktree SlashIt adopted, is left as it is. After such a failure the
 queue waits a minute before starting the same task again, rather than
 creating and removing a checkout on every poll while the storage keeps

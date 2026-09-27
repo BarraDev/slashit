@@ -494,6 +494,9 @@ mod tests {
     /// A checkout the Worktree command acquires for a task that cannot record
     /// it: refused, with the board and the disk still agreeing, and only what
     /// the command itself created taken back.
+    ///
+    /// Unix only: an unwritable directory is made with permission bits.
+    #[cfg(unix)]
     mod unrecorded_acquisition {
         use super::*;
         use crate::domain::{Task, TaskStatus};
@@ -701,7 +704,7 @@ mod tests {
         /// created -- here from a `post-checkout` hook -- is not removed, and
         /// the refusal says what was kept.
         #[tokio::test]
-        async fn a_created_checkout_holding_new_files_is_kept_and_named() {
+        async fn a_created_checkout_holding_untracked_files_is_kept_and_named() {
             let w = world(Class::Created).await;
             let hook = w.repo.join(".git").join("hooks").join("post-checkout");
             std::fs::create_dir_all(hook.parent().unwrap()).unwrap();

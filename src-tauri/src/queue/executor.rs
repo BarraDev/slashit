@@ -369,6 +369,17 @@ const AGENT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// recovers.
 const UNRECORDED_ACQUISITION_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// One task's backoff after a start could not record its worktree.
+#[derive(Debug, Clone, Copy)]
+struct UnrecordedBackoff {
+    since: std::time::Instant,
+    /// Whether a refusal inside this backoff has been reported yet. The
+    /// poller discards what a start returns, so without one report a task
+    /// moved back to In Progress would sit there with no visible reason;
+    /// with one per poll it would repeat every three seconds.
+    announced: bool,
+}
+
 /// Emit an `AgentEvent` through any sink.
 ///
 /// The executor produces exactly one event name, so the conversion lives here
@@ -432,7 +443,7 @@ pub struct TaskExecutor {
     pr_check_counter: std::sync::atomic::AtomicU32,
     /// When a start of each task last failed to record the worktree it was
     /// given. See [`TaskExecutor::refuse_while_unrecorded_backoff`].
-    unrecorded_acquisitions: std::sync::Mutex<HashMap<Uuid, std::time::Instant>>,
+    unrecorded_acquisitions: std::sync::Mutex<HashMap<Uuid, UnrecordedBackoff>>,
 }
 
 pub struct TaskExecutorConfig {
@@ -1426,7 +1437,16 @@ impl TaskExecutor {
                 // then keeps the poller from creating and taking back a
                 // checkout on every pass.
                 Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &message).await;
-                self.unrecorded_backoff_lock().insert(task_id, std::time::Instant::now());
+                let mut backoff = self.unrecorded_backoff_lock();
+                // Entries otherwise leave only when their own task is looked
+                // up again; this drops the expired ones of tasks that never
+                // are, such as a task deleted meanwhile.
+                backoff.retain(|_, b| b.since.elapsed() < UNRECORDED_ACQUISITION_BACKOFF);
+                backoff.insert(
+                    task_id,
+                    UnrecordedBackoff { since: std::time::Instant::now(), announced: false },
+                );
+                drop(backoff);
                 return Err(message);
             }
         };
@@ -1724,25 +1744,38 @@ impl TaskExecutor {
     /// while still retrying on its own once the storage recovers. It is kept
     /// in memory only, like the handle maps: it is about what this process
     /// just saw, and a restart retries straight away.
+    ///
+    /// The first refusal inside a backoff is also logged on the task, once,
+    /// because the poller does not report what a start returns.
     fn refuse_while_unrecorded_backoff(&self, task_id: Uuid) -> Result<(), String> {
         let mut backoff = self.unrecorded_backoff_lock();
-        let Some(since) = backoff.get(&task_id).copied() else {
+        let Some(entry) = backoff.get_mut(&task_id) else {
             return Ok(());
         };
-        let waited = since.elapsed();
+        let waited = entry.since.elapsed();
         if waited >= UNRECORDED_ACQUISITION_BACKOFF {
             backoff.remove(&task_id);
             return Ok(());
         }
-        Err(format!(
+        let announce = !std::mem::replace(&mut entry.announced, true);
+        drop(backoff);
+        let message = format!(
             "task {task_id} was not started: its worktree could not be recorded {}s ago, and it \
              is tried again {}s from now",
             waited.as_secs(),
             (UNRECORDED_ACQUISITION_BACKOFF - waited).as_secs().max(1),
-        ))
+        );
+        if announce {
+            self.events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message: message.clone(),
+            });
+        }
+        Err(message)
     }
 
-    fn unrecorded_backoff_lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, std::time::Instant>> {
+    fn unrecorded_backoff_lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, UnrecordedBackoff>> {
         // Poisoning cannot leave this map inconsistent: every critical
         // section is a single insert, remove or lookup.
         match self.unrecorded_acquisitions.lock() {
@@ -6816,6 +6849,10 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
     /// A start whose worktree cannot be recorded: refused before any agent
     /// runs, with the board and the disk still agreeing, and only what the
     /// start itself created taken back.
+    ///
+    /// Unix only: an unwritable directory is made with permission bits, and
+    /// the stand-in agent is a shell script.
+    #[cfg(unix)]
     mod unrecorded_acquisition {
         use super::*;
 
@@ -7089,6 +7126,32 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                 .count()
         }
 
+        /// Warnings saying a start was refused inside a backoff.
+        fn backoff_reports(recording: &crate::events::RecordingEventSink) -> usize {
+            recording
+                .recorded()
+                .iter()
+                .filter(|(name, payload)| {
+                    name == "agent-event"
+                        && payload.get("level").and_then(|v| v.as_str()) == Some("warn")
+                        && payload
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|m| m.contains("tried again"))
+                })
+                .count()
+        }
+
+        /// A backoff that began a full window ago.
+        fn expired_backoff() -> UnrecordedBackoff {
+            UnrecordedBackoff {
+                since: std::time::Instant::now()
+                    .checked_sub(UNRECORDED_ACQUISITION_BACKOFF)
+                    .expect("a clock this far past its start"),
+                announced: false,
+            }
+        }
+
         /// While the storage keeps refusing writes, the poller does not
         /// create and take back a checkout on every pass: a start inside the
         /// backoff is refused before anything is acquired, saying when it is
@@ -7115,12 +7178,24 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             );
             assert_eq!(created_worktrees(&recording), 1, "nothing was acquired inside the backoff");
 
-            let elapsed = std::time::Instant::now()
-                .checked_sub(UNRECORDED_ACQUISITION_BACKOFF)
-                .expect("a clock this far past its start");
-            w.executor.unrecorded_backoff_lock().insert(w.task_id, elapsed);
+            let again = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(again.is_err_and(|e| e.contains("tried again")));
+            assert_eq!(
+                backoff_reports(&recording),
+                1,
+                "the refusal is reported once, not on every poll"
+            );
+
+            let expired = expired_backoff();
+            let deleted_task = Uuid::new_v4();
+            w.executor.unrecorded_backoff_lock().insert(w.task_id, expired);
+            w.executor.unrecorded_backoff_lock().insert(deleted_task, expired);
             w.executor.spawn_task_execution(w.task_id, None).await.expect_err("still unrecordable");
             assert_eq!(created_worktrees(&recording), 2, "the backoff bounds retries; it does not end them");
+            assert!(
+                !w.executor.unrecorded_backoff_lock().contains_key(&deleted_task),
+                "an expired entry of a task nobody starts again is dropped"
+            );
 
             assert_eq!(refs_of(&w.repo), refs_before);
             assert_eq!(agent.invocations(), "");

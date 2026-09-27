@@ -660,11 +660,16 @@ impl WorktreeManager {
     /// that reached the checkout in the meantime survives. The worktree must
     /// still have the branch checked out at `created_at`; `git worktree
     /// remove` without `--force` refuses a checkout holding modified or
-    /// untracked files, or one that is locked; and the branch is deleted only
-    /// while it still points at `created_at` and no worktree has it checked
-    /// out, as one compare-and-delete. A commit landing between the first
-    /// check and the removal therefore leaves the branch, with the commit on
-    /// it. Whatever is kept is named in the `Err`.
+    /// untracked (not ignored) files or an initialized submodule, or one that
+    /// is locked, and takes ignored files with it; and the branch is deleted
+    /// only while it still points at `created_at` and no worktree has it
+    /// checked out, as one compare-and-delete. A commit landing between the
+    /// first check and the removal therefore leaves the branch, with the
+    /// commit on it. Whatever is kept is named in the `Err`.
+    ///
+    /// A branch kept after its worktree was removed blocks an ordinary start,
+    /// which creates the task's branch and will not take over one that
+    /// already exists; the `Err` says so, and what to do about it.
     pub async fn undo_created_checkout(
         &self,
         repo_path: &str,
@@ -693,7 +698,18 @@ impl WorktreeManager {
         self.remove_with_git(&info.path, repo_path)
             .await
             .map_err(|e| format!("the {e}, so branch {branch} was kept as well"))?;
-        Self::discard_created_branch(repo_path, branch, created_at).await
+        let Err(kept) = Self::discard_created_branch(repo_path, branch, created_at).await else {
+            return Ok(());
+        };
+        let tip = Self::local_branch_tip(repo_path, branch)
+            .await
+            .unwrap_or_else(|_| "an unreadable commit".to_string());
+        Err(format!(
+            "the worktree at {} was removed, but {kept} (now at {tip}); a new start of the task \
+             cannot create its branch again until branch {branch} is deleted or renamed, once \
+             whatever is on it is safe elsewhere",
+            info.path,
+        ))
     }
 
     /// Release a checkout acquired for a task that could not record it, and
@@ -4655,5 +4671,35 @@ branch refs/heads/some-other-branch
         assert!(kept.contains("kept"), "{kept}");
         assert!(Path::new(&info.path).is_dir());
         assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), work);
+    }
+
+    /// When the worktree is removed but the branch cannot be deleted -- here
+    /// a `reference-transaction` hook refuses the deletion -- the refusal
+    /// says both, names where the branch is, and what a new start needs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_partial_take_back_says_the_worktree_went_and_the_branch_stayed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d").await.expect("create");
+        let created_at = base.expect("created").commit;
+        let hook = tmp.path().join(".git").join("hooks").join("reference-transaction");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\n[ \"$1\" = prepared ] && grep -q ' refs/heads/task-0a1b2c3d$' && exit 1\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let kept = mgr.undo_created_checkout(repo_path, &info, &created_at).await.expect_err("kept");
+
+        assert!(!Path::new(&info.path).exists(), "the worktree was removed");
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), created_at);
+        assert!(kept.contains(&format!("the worktree at {} was removed", info.path)), "{kept}");
+        assert!(kept.contains(&created_at), "{kept}");
+        assert!(kept.contains("deleted or renamed"), "{kept}");
     }
 }
