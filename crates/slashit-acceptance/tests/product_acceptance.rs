@@ -3467,6 +3467,270 @@ async fn dismiss_toasts(driver: &WebDriver) -> Result<()> {
     }
 }
 
+/// Prove that a Project whose Workspace the registry lost stays visible and
+/// recoverable from the Workspaces page, across restarts.
+///
+/// The loss is made the way it happens in the field: the application is
+/// stopped and `workspaces.toml` no longer holds the Workspace -- here the
+/// entry is removed by hand, as a quarantined corrupt registry would lose it.
+/// The next application process must neither drop the Project from view nor
+/// quietly repair its membership: the page lists it as unresolved with the
+/// missing Workspace's id, and only the user's Detach makes it standalone.
+/// A third process shows the detachment held and the Project attachable to a
+/// Workspace that still exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_whose_workspace_is_lost_is_shown_unresolved_and_can_be_detached() {
+    let context = TestContext::new("unresolved_membership").expect("harness setup");
+    let outcome = unresolved_membership_journey(&context).await;
+    context.finish(outcome);
+}
+
+struct UnresolvedFixture {
+    lost_workspace: String,
+    kept_workspace: String,
+    alpha: (String, String),
+    beta: (String, String),
+}
+
+async fn unresolved_membership_journey(context: &TestContext) -> Result<()> {
+    // Process A: two Workspaces, Alpha a member of the one about to be lost.
+    let session = context.start_session("orphan").await?;
+    let prepared = prepare_lost_membership(session.driver(), context.state().path()).await;
+    context.close_session(session, "orphan", &prepared).await?;
+    let fixture = prepared?;
+
+    // While the application is down, the registry loses the Workspace.
+    let registry = context.state().workspaces_file();
+    remove_registered_workspace(&registry, &fixture.lost_workspace)?;
+    assert_persisted_scope(
+        &context.state().config_file(),
+        &fixture.alpha.0,
+        Some(&fixture.lost_workspace),
+    )?;
+
+    // Process B: the dangling membership is shown and detached by the user.
+    let session = context.start_session("recover").await?;
+    let recovered = detach_unresolved(session.driver(), &context.state().config_file(), &fixture).await;
+    context.close_session(session, "recover", &recovered).await?;
+    recovered?;
+
+    assert_persisted_scope(&context.state().config_file(), &fixture.alpha.0, None)?;
+    if registry_holds(&registry, &fixture.lost_workspace)? {
+        bail!("detaching recreated the lost workspace {}", fixture.lost_workspace);
+    }
+
+    // Process C: Alpha is standalone and can join the Workspace that exists.
+    let session = context.start_session("reattach").await?;
+    let reattached = reattach_after_recovery(session.driver(), &fixture).await;
+    context.close_session(session, "reattach", &reattached).await?;
+    reattached?;
+
+    assert_persisted_scope(
+        &context.state().config_file(),
+        &fixture.alpha.0,
+        Some(&fixture.kept_workspace),
+    )?;
+    Ok(())
+}
+
+async fn prepare_lost_membership(driver: &WebDriver, root: &Path) -> Result<UnresolvedFixture> {
+    ui::assert_frontend_is_real(driver).await?;
+
+    let mut workspaces = Vec::new();
+    for (name, dir) in [("Lost Workspace", "lost-root"), ("Kept Workspace", "kept-root")] {
+        let workspace_root = root.join(dir);
+        std::fs::create_dir_all(&workspace_root)
+            .with_context(|| format!("could not create {}", workspace_root.display()))?;
+        workspaces.push(created_id(
+            ui::invoke(
+                driver,
+                "create_workspace",
+                json!({ "name": name, "rootPath": workspace_root }),
+            )
+            .await?,
+            "create_workspace",
+        )?);
+    }
+    let kept_workspace = workspaces.pop().context("two workspaces were created")?;
+    let lost_workspace = workspaces.pop().context("two workspaces were created")?;
+
+    let mut projects = Vec::new();
+    for name in ["Acceptance Alpha", "Acceptance Beta"] {
+        let id = created_id(
+            ui::invoke(
+                driver,
+                "create_project",
+                json!({ "name": name, "repositoryId": Value::Null, "agentType": "claude_code" }),
+            )
+            .await?,
+            "create_project",
+        )?;
+        projects.push((id, name.to_string()));
+    }
+    let beta = projects.pop().context("two projects were created")?;
+    let alpha = projects.pop().context("two projects were created")?;
+    ui::invoke(
+        driver,
+        "attach_project_to_workspace",
+        json!({ "projectId": alpha.0, "workspaceId": lost_workspace }),
+    )
+    .await?;
+
+    // Before the loss the membership resolves, so nothing is unresolved.
+    driver
+        .refresh()
+        .await
+        .context("could not reload the application window")?;
+    let item = open_workspace(driver, &lost_workspace).await?;
+    await_members(&item, &[&alpha.0]).await?;
+    ui::assert_absent(driver, UNRESOLVED_SECTION).await?;
+
+    Ok(UnresolvedFixture {
+        lost_workspace,
+        kept_workspace,
+        alpha,
+        beta,
+    })
+}
+
+async fn detach_unresolved(
+    driver: &WebDriver,
+    config_file: &Path,
+    fixture: &UnresolvedFixture,
+) -> Result<()> {
+    let (alpha_id, alpha_name) = (&fixture.alpha.0, &fixture.alpha.1);
+    let beta_name = &fixture.beta.1;
+
+    // The surviving Workspace neither lists Alpha nor offers it.
+    let kept = open_workspace(driver, &fixture.kept_workspace).await?;
+    await_members(&kept, &[]).await?;
+    assert_eligible(&kept, &[beta_name]).await?;
+    ui::assert_absent(
+        driver,
+        &format!("[data-testid=\"workspace-{}\"]", fixture.lost_workspace),
+    )
+    .await
+    .context("the lost workspace is still listed as if it existed")?;
+
+    // Alpha is listed as unresolved, naming the Workspace it still records.
+    let row = ui::visible(
+        driver,
+        &format!("{UNRESOLVED_SECTION} [data-testid=\"unresolved-member-{alpha_id}\"]"),
+    )
+    .await
+    .context("the project whose workspace was lost is not shown")?;
+    let shown_name = row
+        .find(By::Css("[data-testid=\"unresolved-project-name\"]"))
+        .await
+        .context("the unresolved row does not name the project")?
+        .text()
+        .await?;
+    if shown_name.trim() != alpha_name {
+        bail!("the unresolved row names project {shown_name:?}, expected {alpha_name:?}");
+    }
+    let missing = row
+        .find(By::Css("[data-testid=\"unresolved-workspace-id\"]"))
+        .await
+        .context("the unresolved row does not name the missing workspace")?
+        .text()
+        .await?;
+    if missing.trim() != fixture.lost_workspace {
+        bail!(
+            "the unresolved row names workspace {missing:?}, expected {}",
+            fixture.lost_workspace
+        );
+    }
+
+    // Showing it changed nothing: startup did not rewrite the membership.
+    assert_backend_scope(driver, alpha_id, Some(&fixture.lost_workspace)).await?;
+    assert_persisted_scope(config_file, alpha_id, Some(&fixture.lost_workspace))?;
+
+    row.find(By::Css("[data-testid=\"unresolved-detach\"]"))
+        .await
+        .context("the unresolved row has no Detach button")?
+        .click()
+        .await
+        .context("could not click Detach")?;
+    await_toast(
+        driver,
+        "success",
+        &format!("Detached {alpha_name}; it is now standalone"),
+    )
+    .await?;
+    await_absent(driver, UNRESOLVED_SECTION).await?;
+    assert_backend_scope(driver, alpha_id, None).await?;
+    assert_eligible(&kept, &[alpha_name, beta_name]).await?;
+    Ok(())
+}
+
+async fn reattach_after_recovery(driver: &WebDriver, fixture: &UnresolvedFixture) -> Result<()> {
+    let (alpha_id, alpha_name) = (&fixture.alpha.0, &fixture.alpha.1);
+    let kept = open_workspace(driver, &fixture.kept_workspace).await?;
+    await_members(&kept, &[]).await?;
+    assert_eligible(&kept, &[alpha_name, &fixture.beta.1]).await?;
+    ui::assert_absent(driver, UNRESOLVED_SECTION).await?;
+
+    choose_and_attach(&kept, alpha_name).await?;
+    await_toast(
+        driver,
+        "success",
+        &format!("Attached {alpha_name} to this workspace"),
+    )
+    .await?;
+    await_members(&kept, &[alpha_id]).await?;
+    assert_backend_scope(driver, alpha_id, Some(&fixture.kept_workspace)).await?;
+    Ok(())
+}
+
+const UNRESOLVED_SECTION: &str = "[data-testid=\"unresolved-memberships\"]";
+
+/// Drop one Workspace from the registry file, keeping every other entry.
+fn remove_registered_workspace(registry: &Path, workspace_id: &str) -> Result<()> {
+    let raw = std::fs::read_to_string(registry)
+        .with_context(|| format!("could not read {}", registry.display()))?;
+    let mut document: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("{} is not TOML", registry.display()))?;
+    let entries = document
+        .get_mut("workspaces")
+        .and_then(toml::Value::as_array_mut)
+        .with_context(|| format!("{} holds no workspaces array", registry.display()))?;
+    let before = entries.len();
+    entries.retain(|w| w.get("id").and_then(toml::Value::as_str) != Some(workspace_id));
+    if entries.len() + 1 != before {
+        bail!(
+            "{} did not hold workspace {workspace_id} exactly once",
+            registry.display()
+        );
+    }
+    std::fs::write(registry, toml::to_string_pretty(&document)?)
+        .with_context(|| format!("could not rewrite {}", registry.display()))
+}
+
+fn registry_holds(registry: &Path, workspace_id: &str) -> Result<bool> {
+    let raw = std::fs::read_to_string(registry)
+        .with_context(|| format!("could not read {}", registry.display()))?;
+    let document: toml::Value =
+        toml::from_str(&raw).with_context(|| format!("{} is not TOML", registry.display()))?;
+    Ok(find_table_with_id(&document, workspace_id).is_some())
+}
+
+/// Wait until nothing matches `selector`.
+async fn await_absent(driver: &WebDriver, selector: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if driver.find_all(By::Css(selector)).await?.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() > MEMBERSHIP_DEADLINE {
+            bail!(
+                "{selector} was still shown after {}s",
+                MEMBERSHIP_DEADLINE.as_secs()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// The workspace a project belongs to, as `list_projects` reports it.
 async fn assert_backend_scope(
     driver: &WebDriver,

@@ -876,4 +876,50 @@ mod tests {
             "memory must not contain a detachment disk never recorded"
         );
     }
+
+    /// Recovery from a lost Workspace, end to end at the command layer: the
+    /// registry is corrupted and quarantined, so the Project's membership no
+    /// longer resolves. Attaching elsewhere is still refused -- a dangling
+    /// membership is not silently re-parented -- while detaching succeeds
+    /// without the Workspace, persists, and makes the Project attachable to a
+    /// Workspace that does exist.
+    #[tokio::test]
+    async fn a_project_whose_workspace_was_lost_can_be_detached_and_attached_again() {
+        let (storage, _temp) = create_test_storage();
+        let lost = registered_workspace();
+        let existing = make_test_project(Uuid::new_v4());
+        let id = existing.id;
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
+        attach_project_to_workspace_committed(&projects, &lost.registry, &storage, id, lost.id)
+            .await
+            .expect("attaching to a registered workspace should succeed");
+
+        let registry_file = lost._registry_dir.path().join("workspaces.toml");
+        std::fs::write(&registry_file, "this is [[not toml").unwrap();
+        let reloaded = WorkspaceRegistry::load_from(registry_file)
+            .expect("a corrupt registry is quarantined, not fatal");
+        assert!(reloaded.get(&lost.id).is_none(), "the workspace must now be missing");
+        let survivor = registered_workspace();
+
+        let refused =
+            attach_project_to_workspace_committed(&projects, &survivor.registry, &storage, id, survivor.id)
+                .await;
+        assert!(refused.is_err(), "a dangling membership must not be silently re-parented");
+
+        let detached = detach_project_from_workspace_committed(&projects, &storage, id)
+            .await
+            .expect("detaching must not require the lost workspace to exist");
+        assert_eq!(detached.scope.workspace_id(), None);
+        assert_eq!(
+            storage.load_config().unwrap().projects[&id.to_string()].scope.workspace_id(),
+            None,
+            "the detachment must be persisted"
+        );
+
+        let reattached =
+            attach_project_to_workspace_committed(&projects, &survivor.registry, &storage, id, survivor.id)
+                .await
+                .expect("a detached project is attachable again");
+        assert_eq!(reattached.scope.workspace_id(), Some(survivor.id));
+    }
 }

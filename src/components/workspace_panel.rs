@@ -6,9 +6,43 @@ use leptos::callback::Callback;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+/// Projects whose membership names a Workspace missing from `workspaces`,
+/// sorted by name.
+///
+/// This happens when the registry lost a Workspace -- for example a corrupt
+/// `workspaces.toml` was quarantined -- while the Project still records its
+/// membership. Such a Project is listed under no Workspace and is not offered
+/// for attaching, so without this it would vanish from the page.
+///
+/// Returns nothing unless the registry has actually been loaded: an empty
+/// list that only stands in for "not loaded yet" or "failed to load" would
+/// report every member as unresolved and offer to detach it.
+fn unresolved_members(
+    projects: &[Project],
+    workspaces: &[Workspace],
+    workspaces_loaded: bool,
+) -> Vec<Project> {
+    if !workspaces_loaded {
+        return Vec::new();
+    }
+    let mut unresolved: Vec<Project> = projects
+        .iter()
+        .filter(|p| {
+            p.scope
+                .workspace_id()
+                .is_some_and(|id| !workspaces.iter().any(|w| w.id == id))
+        })
+        .cloned()
+        .collect();
+    unresolved.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    unresolved
+}
+
 #[component]
 pub fn WorkspacePanel(
     workspaces: ReadSignal<Vec<Workspace>>,
+    /// Whether `workspaces` holds the registry as loaded, not a placeholder.
+    workspaces_loaded: ReadSignal<bool>,
     projects: ReadSignal<Vec<Project>>,
     /// Fired after every attach or detach attempt, successful or refused, so
     /// the Workspaces page can reload the project list it owns and passes in
@@ -47,7 +81,98 @@ pub fn WorkspacePanel(
                     <p class="text-white/40 text-sm">"No workspaces configured"</p>
                 </div>
             </Show>
+
+            <UnresolvedMemberships
+                workspaces=workspaces
+                workspaces_loaded=workspaces_loaded
+                projects=projects
+                on_membership_change=on_membership_change
+            />
         </div>
+    }
+}
+
+/// Projects whose Workspace is missing from the registry, each with the id it
+/// still records and a Detach that returns it to standalone. Nothing here
+/// recreates the missing Workspace or changes membership on its own.
+#[component]
+fn UnresolvedMemberships(
+    workspaces: ReadSignal<Vec<Workspace>>,
+    workspaces_loaded: ReadSignal<bool>,
+    projects: ReadSignal<Vec<Project>>,
+    on_membership_change: Callback<()>,
+) -> impl IntoView {
+    let (busy, set_busy) = signal(false);
+    let unresolved = move || {
+        projects.with(|ps| {
+            workspaces.with(|ws| unresolved_members(ps, ws, workspaces_loaded.get()))
+        })
+    };
+
+    let on_detach = move |project_id: String, project_name: String| {
+        set_busy.set(true);
+        spawn_local(async move {
+            match detach_project_from_workspace(project_id).await {
+                Ok(_) => {
+                    toast::success(format!("Detached {}; it is now standalone", project_name));
+                }
+                Err(e) => {
+                    toast::error(format!("Failed to detach project: {}", e));
+                }
+            }
+            on_membership_change.run(());
+            set_busy.set(false);
+        });
+    };
+
+    view! {
+        <Show when=move || !unresolved().is_empty()>
+            <div class="border-t border-white/10 px-4 py-3 space-y-2" data-testid="unresolved-memberships">
+                <h3 class="text-xs font-medium text-amber-300/80 uppercase tracking-wide">"Unresolved membership"</h3>
+                <p class="text-xs text-white/40">
+                    "These projects belong to a workspace that is no longer registered. "
+                    "Detach one to make it standalone; the missing workspace is not recreated."
+                </p>
+                <div class="space-y-1">
+                    <For
+                        each=unresolved
+                        key=|p| p.id
+                        children=move |p| {
+                            let name = p.name.clone();
+                            let name_for_detach = name.clone();
+                            let pid = p.id.to_string();
+                            let row_testid = format!("unresolved-member-{}", pid);
+                            let missing = p.scope.workspace_id().map(|id| id.to_string()).unwrap_or_default();
+                            view! {
+                                <div
+                                    data-testid=row_testid
+                                    class="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-amber-500/[0.06]"
+                                >
+                                    <div class="min-w-0">
+                                        // Both lines wrap rather than truncate: the full name and
+                                        // id are what identify the project and the missing
+                                        // workspace.
+                                        <p class="text-sm text-white/80 break-words" data-testid="unresolved-project-name">{name}</p>
+                                        <p class="text-xs text-white/40 font-mono break-all">
+                                            "Missing workspace: "
+                                            <span data-testid="unresolved-workspace-id">{missing}</span>
+                                        </p>
+                                    </div>
+                                    <button
+                                        data-testid="unresolved-detach"
+                                        disabled=move || busy.get()
+                                        on:click=move |_| on_detach(pid.clone(), name_for_detach.clone())
+                                        class="text-xs px-2 py-1 rounded bg-white/5 hover:bg-red-500/20 hover:text-red-300 text-white/50 transition-colors disabled:opacity-50"
+                                    >
+                                        "Detach"
+                                    </button>
+                                </div>
+                            }
+                        }
+                    />
+                </div>
+            </div>
+        </Show>
     }
 }
 
@@ -232,5 +357,77 @@ fn WorkspaceItem(
                 </div>
             </Show>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unresolved_members;
+    use crate::models::{AgentType, Project, ProjectScope, Workspace};
+    use uuid::Uuid;
+
+    fn project(name: &str, scope: ProjectScope) -> Project {
+        Project {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            repository_id: None,
+            scope,
+            agent_type: AgentType::ClaudeCode,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn workspace() -> Workspace {
+        Workspace {
+            id: Uuid::new_v4(),
+            name: "ws".to_string(),
+            root_path: "/tmp/ws".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn names(projects: &[Project]) -> Vec<&str> {
+        projects.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    #[test]
+    fn only_members_of_a_missing_workspace_are_unresolved() {
+        let kept = workspace();
+        let lost = Uuid::new_v4();
+        let projects = vec![
+            project("standalone", ProjectScope::Standalone),
+            project("member", ProjectScope::InWorkspace { workspace_id: kept.id }),
+            project("orphan-b", ProjectScope::InWorkspace { workspace_id: lost }),
+            project("orphan-a", ProjectScope::InWorkspace { workspace_id: lost }),
+        ];
+
+        let unresolved = unresolved_members(&projects, &[kept], true);
+
+        assert_eq!(names(&unresolved), ["orphan-a", "orphan-b"]);
+        assert!(unresolved
+            .iter()
+            .all(|p| p.scope.workspace_id() == Some(lost)));
+    }
+
+    #[test]
+    fn an_empty_registry_leaves_every_member_unresolved() {
+        let lost = Uuid::new_v4();
+        let projects = vec![project("orphan", ProjectScope::InWorkspace { workspace_id: lost })];
+
+        assert_eq!(names(&unresolved_members(&projects, &[], true)), ["orphan"]);
+    }
+
+    #[test]
+    fn nothing_is_unresolved_before_the_registry_has_loaded() {
+        // The page starts with an empty list and falls back to one on a load
+        // error; neither proves a workspace is missing.
+        let projects = vec![project(
+            "member",
+            ProjectScope::InWorkspace { workspace_id: Uuid::new_v4() },
+        )];
+
+        assert!(unresolved_members(&projects, &[], false).is_empty());
     }
 }

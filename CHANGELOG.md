@@ -43,6 +43,11 @@ release will contain.
 - Architecture documentation for state locations, the IPC security model, the
   headless daemon and the release procedure.
 - Meta-workspace model: a workspace folder that coordinates several projects.
+- A project whose workspace is missing from the registry, for example after a
+  corrupt `workspaces.toml` was quarantined, is listed under "Unresolved
+  membership" on the Workspaces page with the missing workspace's id. Detach
+  makes it standalone again; the missing workspace is not recreated, and
+  startup never rewrites the membership on its own.
 - PR comment review workflow with per-item approve, fix and skip.
 - Community health files for the public contribution flow.
 
