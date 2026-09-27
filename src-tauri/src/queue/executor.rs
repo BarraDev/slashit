@@ -110,6 +110,11 @@ struct Acquired {
     /// from an unrecorded start, or an ordinary branch that did not start on
     /// the proven default base.
     origin: Option<BranchOrigin>,
+    /// The commit this start created the task's branch at, together with its
+    /// worktree. `None` when the branch already existed -- reattached,
+    /// adopted, or a stacked branch resumed -- which is never this start's to
+    /// take back if the task cannot record it.
+    created_at: Option<String>,
 }
 
 /// What the pull requests recorded on a dependency say about its work.
@@ -355,6 +360,26 @@ impl std::fmt::Display for PrHelperRefusal {
 /// answer: a timeout here is not a failed stop, it is nothing attempted yet.
 const AGENT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a task whose worktree could not be recorded waits before the
+/// poller starts it again; see [`TaskExecutor::refuse_while_unrecorded_backoff`].
+///
+/// Twenty poll intervals: long enough that storage refusing writes costs one
+/// checkout created and taken back per task a minute rather than one every
+/// poll, short enough that a task resumes on its own soon after the storage
+/// recovers.
+const UNRECORDED_ACQUISITION_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One task's backoff after a start could not record its worktree.
+#[derive(Debug, Clone, Copy)]
+struct UnrecordedBackoff {
+    since: std::time::Instant,
+    /// Whether a refusal inside this backoff has been reported yet. The
+    /// poller discards what a start returns, so without one report a task
+    /// moved back to In Progress would sit there with no visible reason;
+    /// with one per poll it would repeat every three seconds.
+    announced: bool,
+}
+
 /// Emit an `AgentEvent` through any sink.
 ///
 /// The executor produces exactly one event name, so the conversion lives here
@@ -416,6 +441,9 @@ pub struct TaskExecutor {
     worktree_manager: Arc<WorktreeManager>,
     events: SharedEventSink,
     pr_check_counter: std::sync::atomic::AtomicU32,
+    /// When a start of each task last failed to record the worktree it was
+    /// given. See [`TaskExecutor::refuse_while_unrecorded_backoff`].
+    unrecorded_acquisitions: std::sync::Mutex<HashMap<Uuid, UnrecordedBackoff>>,
 }
 
 pub struct TaskExecutorConfig {
@@ -464,6 +492,7 @@ impl TaskExecutor {
             worktree_manager: config.worktree_manager,
             events: config.events,
             pr_check_counter: std::sync::atomic::AtomicU32::new(0),
+            unrecorded_acquisitions: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1150,6 +1179,7 @@ impl TaskExecutor {
                     what_happened: "Reattached worktree",
                     base_commit: None,
                     origin: None,
+                    created_at: None,
                 })
         } else if let Some(parent_branch) = base_branch.as_deref() {
             // A task stacked on a dependency is not started from anywhere
@@ -1185,6 +1215,7 @@ impl TaskExecutor {
                     Ok(Acquired {
                         info: stacked.info,
                         what_happened,
+                        created_at: (!stacked.resumed).then(|| stacked.dependency_tip.clone()),
                         base_commit: Some(stacked.dependency_tip),
                         origin: Some(BranchOrigin::Stacked {
                             parent_branch: parent_branch.to_string(),
@@ -1214,6 +1245,7 @@ impl TaskExecutor {
                 Ok((info, Some(base))) => Ok(Acquired {
                     info,
                     what_happened: "Created worktree",
+                    created_at: Some(base.commit.clone()),
                     base_commit: Some(base.commit),
                     origin: Some(BranchOrigin::DefaultBase { branch: Some(base.branch) }),
                 }),
@@ -1222,6 +1254,7 @@ impl TaskExecutor {
                     what_happened: "Adopted worktree",
                     base_commit: None,
                     origin: None,
+                    created_at: None,
                 }),
                 Err(e) => Err(e),
             }
@@ -1229,29 +1262,51 @@ impl TaskExecutor {
         (existing_branch, acquired)
     }
 
-    /// Record the worktree a starting task was given on the task and persist
-    /// it, returning the worktree's path.
+    /// Record the worktree a starting task was given on the task, durably
+    /// before the board shows it, returning the worktree's path.
     ///
     /// The starting commit and the branch's origin are written only when
     /// this start created (or resumed) the branch. A reattach leaves the ones
     /// recorded by the start that created it, so a retry or a restart keeps
     /// the stack parent the branch was actually built on.
-    async fn record_acquired_worktree(&self, task_id: Uuid, acquired: Acquired) -> String {
-        {
-            let mut tasks_w = self.tasks.write().await;
-            if let Some(t) = tasks_w.get_mut(&task_id) {
+    ///
+    /// `Err` means nothing was recorded and the agent must not start. A
+    /// checkout this start created is taken back first (see
+    /// [`WorktreeManager::undo_created_checkout`]): left behind unrecorded,
+    /// the next start would adopt it, and an adopted checkout records no
+    /// starting commit and no origin. The message says what was kept, if
+    /// anything.
+    async fn record_acquired_worktree(
+        &self,
+        task_id: Uuid,
+        repo_path: &str,
+        acquired: Acquired,
+    ) -> Result<String, String> {
+        let amend = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
                 t.worktree_path = Some(acquired.info.path.clone());
                 t.branch_name = Some(acquired.info.branch.clone());
-                if let Some(base_commit) = acquired.base_commit {
-                    t.base_commit = Some(base_commit);
+                if let Some(base_commit) = &acquired.base_commit {
+                    t.base_commit = Some(base_commit.clone());
                 }
-                if let Some(origin) = acquired.origin {
-                    t.branch_origin = Some(origin);
+                if let Some(origin) = &acquired.origin {
+                    t.branch_origin = Some(origin.clone());
                 }
             }
+        };
+        match crate::lifecycle::record(&self.tasks, &self.storage, task_id, &amend).await {
+            Ok(()) => Ok(acquired.info.path),
+            Err(e) => {
+                let outcome = self
+                    .worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                Err(format!(
+                    "The task's worktree could not be recorded ({e}), so the task was not \
+                     started; {outcome}"
+                ))
+            }
         }
-        Self::persist_task_static(&self.tasks, &self.storage, task_id).await;
-        acquired.info.path
     }
 
     /// Start an agent for `task_id`, or leave the task alone.
@@ -1275,12 +1330,19 @@ impl TaskExecutor {
     /// call, or a task that was already `InProgress` before this poll pass),
     /// in which case a fresh permit is drawn from [`Self::admission`] here,
     /// so every path that can start an agent -- the poller and a direct
-    /// command alike -- goes through the same gate. Returns whether an
-    /// execution was actually registered, so a caller that answers a person
+    /// command alike -- goes through the same gate.
+    ///
+    /// `Ok(true)` means an execution was registered, `Ok(false)` that this
+    /// pass declined and the task is left for a later one, and `Err` that
+    /// the task was refused, saying why, so a caller that answers a person
     /// can say what happened rather than assume it worked.
-    async fn spawn_task_execution(&self, task_id: Uuid, external_permit: Option<AdmissionPermit>) -> bool {
+    async fn spawn_task_execution(
+        &self,
+        task_id: Uuid,
+        external_permit: Option<AdmissionPermit>,
+    ) -> Result<bool, String> {
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
-            return false; // another lifecycle operation owns this task right now
+            return Ok(false); // another lifecycle operation owns this task right now
         };
 
         // Re-read under the lease. The pending set was sampled before waiting
@@ -1290,12 +1352,13 @@ impl TaskExecutor {
             let tasks = self.tasks.read().await;
             match tasks.get(&task_id) {
                 Some(task) if Self::is_pending(task) => {}
-                _ => return false,
+                _ => return Ok(false),
             }
         }
         if self.is_task_running(task_id).await {
-            return false; // one agent per task
+            return Ok(false); // one agent per task
         }
+        self.refuse_while_unrecorded_backoff(task_id)?;
 
         // Capacity, before any of the worktree/prompt work below runs: a
         // reservation already made for this exact task is honored outright;
@@ -1307,7 +1370,7 @@ impl TaskExecutor {
             Some(p) => p,
             None => match self.admission.try_acquire() {
                 Some(p) => p,
-                None => return false, // no capacity right now; the next pass tries again
+                None => return Ok(false), // no capacity right now; the next pass tries again
             },
         };
 
@@ -1322,7 +1385,7 @@ impl TaskExecutor {
                     message: format!("Cannot resolve working directory: {}", e),
                 });
                 Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &e).await;
-                return false;
+                return Err(format!("Cannot resolve working directory: {e}"));
             }
         };
 
@@ -1341,7 +1404,7 @@ impl TaskExecutor {
                     message: message.clone(),
                 });
                 Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &message).await;
-                return false;
+                return Err(message);
             }
         };
 
@@ -1359,7 +1422,34 @@ impl TaskExecutor {
                     .to_string(),
             });
         }
-        let working_dir = self.record_acquired_worktree(task_id, acquired).await;
+        let working_dir = match self.record_acquired_worktree(task_id, &repo_path, acquired).await {
+            Ok(working_dir) => {
+                self.unrecorded_backoff_lock().remove(&task_id);
+                working_dir
+            }
+            Err(message) => {
+                self.events.agent_event(AgentEvent::Error {
+                    task_id: task_id.to_string(),
+                    message: message.clone(),
+                });
+                // Usually refused by the same storage that refused the
+                // record, which leaves the task pending; the backoff is what
+                // then keeps the poller from creating and taking back a
+                // checkout on every pass.
+                Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &message).await;
+                let mut backoff = self.unrecorded_backoff_lock();
+                // Entries otherwise leave only when their own task is looked
+                // up again; this drops the expired ones of tasks that never
+                // are, such as a task deleted meanwhile.
+                backoff.retain(|_, b| b.since.elapsed() < UNRECORDED_ACQUISITION_BACKOFF);
+                backoff.insert(
+                    task_id,
+                    UnrecordedBackoff { since: std::time::Instant::now(), announced: false },
+                );
+                drop(backoff);
+                return Err(message);
+            }
+        };
 
         let (prompt, task_model) = {
             let tasks = self.tasks.read().await;
@@ -1373,7 +1463,7 @@ impl TaskExecutor {
                     (build_task_prompt(t, Some(working_dir.as_str())), model)
                 },
                 // Deleted while its worktree was being attached.
-                None => return false,
+                None => return Ok(false),
             }
         };
 
@@ -1640,7 +1730,58 @@ impl TaskExecutor {
         });
 
         handles.insert(task_id, RunningTask { handle, cancel });
-        true
+        Ok(true)
+    }
+
+    /// Refuse to start `task_id` again while a recent start of it could not
+    /// record its worktree.
+    ///
+    /// Such a start marks the task errored, but that write usually fails on
+    /// the same storage, which leaves the task pending in memory and eligible
+    /// on every poll. Each attempt then creates a checkout and takes it back,
+    /// every three seconds, for as long as the storage refuses writes. The
+    /// backoff bounds that to one attempt per [`UNRECORDED_ACQUISITION_BACKOFF`]
+    /// while still retrying on its own once the storage recovers. It is kept
+    /// in memory only, like the handle maps: it is about what this process
+    /// just saw, and a restart retries straight away.
+    ///
+    /// The first refusal inside a backoff is also logged on the task, once,
+    /// because the poller does not report what a start returns.
+    fn refuse_while_unrecorded_backoff(&self, task_id: Uuid) -> Result<(), String> {
+        let mut backoff = self.unrecorded_backoff_lock();
+        let Some(entry) = backoff.get_mut(&task_id) else {
+            return Ok(());
+        };
+        let waited = entry.since.elapsed();
+        if waited >= UNRECORDED_ACQUISITION_BACKOFF {
+            backoff.remove(&task_id);
+            return Ok(());
+        }
+        let announce = !std::mem::replace(&mut entry.announced, true);
+        drop(backoff);
+        let message = format!(
+            "task {task_id} was not started: its worktree could not be recorded {}s ago, and it \
+             is tried again {}s from now",
+            waited.as_secs(),
+            (UNRECORDED_ACQUISITION_BACKOFF - waited).as_secs().max(1),
+        );
+        if announce {
+            self.events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message: message.clone(),
+            });
+        }
+        Err(message)
+    }
+
+    fn unrecorded_backoff_lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, UnrecordedBackoff>> {
+        // Poisoning cannot leave this map inconsistent: every critical
+        // section is a single insert, remove or lookup.
+        match self.unrecorded_acquisitions.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     pub async fn execute_task(&self, task_id: Uuid) -> Result<(), String> {
@@ -1674,10 +1815,11 @@ impl TaskExecutor {
         // `spawn_task_execution`. A frontend pre-check believing capacity is
         // free is not authority here -- this is.
         self.reconcile_admission().await;
-        if !self.spawn_task_execution(task_id, None).await {
+        if !self.spawn_task_execution(task_id, None).await? {
             // The task is left where it is, which is what the three-second
             // poll looks for, so this is a deferral rather than a loss. Saying
             // `Ok` would tell the caller an agent is running when none is.
+            // A refusal is not a deferral, and returns its own reason above.
             return Err(format!(
                 "task {task_id} could not be started right now; it stays queued and the \
                  executor will pick it up on its next pass"
@@ -4132,7 +4274,7 @@ mod tests {
         let task_id = task.id;
         executor.tasks.write().await.insert(task_id, task);
 
-        executor.spawn_task_execution(task_id, None).await;
+        executor.spawn_task_execution(task_id, None).await.expect_err("refused");
 
         assert!(
             executor.running_handles.read().await.is_empty(),
@@ -4212,7 +4354,7 @@ mod tests {
         let task_id = task.id;
         executor.tasks.write().await.insert(task_id, task);
 
-        executor.spawn_task_execution(task_id, None).await;
+        executor.spawn_task_execution(task_id, None).await.expect_err("refused");
 
         assert_eq!(
             git(&["for-each-ref", "--format=%(refname) %(objectname)"]),
@@ -4345,7 +4487,7 @@ mod tests {
         .await;
         let refs_before = refs_of(&repo);
 
-        executor.spawn_task_execution(task_id, None).await;
+        executor.spawn_task_execution(task_id, None).await.expect_err("refused");
 
         assert!(
             executor.running_handles.read().await.is_empty(),
@@ -4385,7 +4527,7 @@ mod tests {
             .await;
 
         assert_eq!(existing, None);
-        let Acquired { info, what_happened, base_commit, origin } =
+        let Acquired { info, what_happened, base_commit, origin, .. } =
             acquired.expect("an ordinary worktree");
         assert_eq!(what_happened, "Created worktree");
         assert_eq!(git_in(&repo, &["rev-parse", &format!("refs/heads/{}", info.branch)]), main_tip);
@@ -4416,7 +4558,7 @@ mod tests {
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
             .await;
 
-        let Acquired { info, what_happened, base_commit, origin } =
+        let Acquired { info, what_happened, base_commit, origin, .. } =
             acquired.expect("a stacked worktree");
         assert_eq!(what_happened, "Created stacked worktree");
         assert_eq!(git_in(std::path::Path::new(&info.path), &["rev-parse", "HEAD"]), dependency_tip);
@@ -4453,7 +4595,7 @@ mod tests {
             .await;
 
         assert_eq!(existing, None, "the task never recorded the branch");
-        let Acquired { info, what_happened, base_commit, origin } =
+        let Acquired { info, what_happened, base_commit, origin, .. } =
             acquired.expect("the leftover branch is resumed");
         assert_eq!(what_happened, "Resumed stacked worktree");
         assert_eq!(info.branch, task_branch);
@@ -4491,7 +4633,7 @@ mod tests {
         let (_, acquired) = executor
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
             .await;
-        executor.record_acquired_worktree(task_id, acquired.expect("a stacked worktree")).await;
+        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired.expect("a stacked worktree")).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         let persisted = persisted_task(&executor, project_id, task_id);
@@ -4526,7 +4668,7 @@ mod tests {
         let acquired = acquired.expect("an ordinary worktree");
         assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()));
         assert_eq!(acquired.origin, Some(on_main()));
-        executor.record_acquired_worktree(task_id, acquired).await;
+        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         let persisted = persisted_task(&executor, project_id, task_id);
@@ -4562,7 +4704,7 @@ mod tests {
         );
         assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()));
         assert_eq!(acquired.origin, Some(on_main()));
-        executor.record_acquired_worktree(task_id, acquired).await;
+        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         let persisted = persisted_task(&executor, project_id, task_id);
@@ -4681,7 +4823,7 @@ mod tests {
         );
         assert_eq!(acquired.what_happened, "Adopted worktree");
         assert_eq!(acquired.origin, None);
-        executor.record_acquired_worktree(task_id, acquired).await;
+        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         assert_eq!(persisted_task(&executor, project_id, task_id).branch_origin, None);
@@ -4712,7 +4854,7 @@ mod tests {
         assert_eq!(acquired.what_happened, "Adopted worktree");
         assert_eq!(acquired.base_commit, None);
         assert_eq!(acquired.origin, None);
-        executor.record_acquired_worktree(task_id, acquired).await;
+        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         let persisted = persisted_task(&executor, project_id, task_id);
@@ -4750,7 +4892,7 @@ mod tests {
         let (_, acquired) = executor
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
             .await;
-        executor.record_acquired_worktree(task_id, acquired.expect("adopted")).await;
+        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired.expect("adopted")).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         let persisted = persisted_task(&executor, project_id, task_id);
@@ -4815,7 +4957,7 @@ mod tests {
         let acquired = acquired.expect("the recorded branch is reattached");
         assert_eq!(acquired.what_happened, "Reattached worktree");
         assert_eq!(acquired.origin, None);
-        executor.record_acquired_worktree(task_id, acquired).await;
+        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         assert_eq!(persisted_task(&executor, project_id, task_id).branch_origin, None);
@@ -4837,8 +4979,8 @@ mod tests {
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
             .await;
         let path = executor
-            .record_acquired_worktree(task_id, acquired.expect("a stacked worktree"))
-            .await;
+            .record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired.expect("a stacked worktree"))
+            .await.expect("recorded");
 
         // The worktree is removed and the process restarts from disk; the
         // dependency has since moved on to another branch.
@@ -4855,7 +4997,7 @@ mod tests {
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
             .await;
         assert_eq!(existing, Some(WorktreeManager::branch_for_task(task_id)));
-        executor.record_acquired_worktree(task_id, acquired.expect("reattached")).await;
+        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired.expect("reattached")).await.expect("recorded");
 
         assert_eq!(
             persisted_task(&executor, project_id, task_id).branch_origin,
@@ -6774,13 +6916,386 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                 let acquired = acquired.unwrap_or_else(|e| panic!("{task}: {e}"));
                 assert_eq!(acquired.what_happened, "Created worktree");
                 assert_eq!(acquired.info.branch, WorktreeManager::branch_for_task(task));
-                paths.push(executor.record_acquired_worktree(task, acquired).await);
+                paths.push(executor.record_acquired_worktree(task, repo.to_str().unwrap(), acquired).await.expect("recorded"));
             }
             assert!(!same_path(&paths[0], &paths[1]));
             for task in [A, B] {
                 let persisted = persisted_task(&executor, project_id, task);
                 assert_eq!(persisted.branch_name, Some(WorktreeManager::branch_for_task(task)));
             }
+        }
+    }
+
+    /// A start whose worktree cannot be recorded: refused before any agent
+    /// runs, with the board and the disk still agreeing, and only what the
+    /// start itself created taken back.
+    ///
+    /// Unix only: an unwritable directory is made with permission bits, and
+    /// the stand-in agent is a shell script.
+    #[cfg(unix)]
+    mod unrecorded_acquisition {
+        use super::*;
+
+        /// How a start acquires the task's worktree.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Class {
+            /// A new branch from the default base, and its worktree.
+            Created,
+            /// A new branch stacked on the dependency's, and its worktree.
+            StackedCreated,
+            /// A worktree added for the branch the task records.
+            AddedForRecorded,
+            /// A worktree added for a stacked branch an earlier start left,
+            /// which the task never recorded.
+            StackedResumed,
+            /// A worktree git already has registered for the recorded branch.
+            ReattachedRegistered,
+            /// A worktree registered for the branch the task would be given,
+            /// which it never recorded.
+            AdoptedUnrecorded,
+            /// A registered worktree of a stacked branch an earlier start
+            /// left, which the task never recorded.
+            StackedResumedRegistered,
+        }
+
+        impl Class {
+            fn stacked(self) -> bool {
+                matches!(self, Class::StackedCreated | Class::StackedResumed | Class::StackedResumedRegistered)
+            }
+
+            /// Whether the start adds a worktree for a branch that already
+            /// existed, which is left behind when it cannot be recorded.
+            fn adds_worktree_only(self) -> bool {
+                matches!(self, Class::AddedForRecorded | Class::StackedResumed)
+            }
+        }
+
+        /// The branch the dependency records.
+        const DEPENDENCY: &str = "dependency-branch";
+
+        struct World {
+            executor: Arc<TaskExecutor>,
+            temps: Vec<tempfile::TempDir>,
+            repo: std::path::PathBuf,
+            task_id: Uuid,
+            project_id: Uuid,
+            main_tip: String,
+            dependency_tip: String,
+        }
+
+        fn provenance(t: &Task) -> (Option<String>, Option<String>, Option<String>, Option<BranchOrigin>) {
+            (t.worktree_path.clone(), t.branch_name.clone(), t.base_commit.clone(), t.branch_origin.clone())
+        }
+
+        /// A repository with a published default base and a dependency branch
+        /// one commit past it, a pending task set up for `class`, and the
+        /// board seeded on disk.
+        async fn world_with(
+            (executor, temps): (Arc<TaskExecutor>, Vec<tempfile::TempDir>),
+            class: Class,
+        ) -> World {
+            let (repo, task_id, _) =
+                stacked_task_fixture(&executor, &temps, TaskStatus::InProgress, None, DEPENDENCY).await;
+            publish_default_base(&repo);
+            let main_tip = git_in(&repo, &["rev-parse", "main"]);
+            git_in(&repo, &["checkout", "-q", "-b", DEPENDENCY]);
+            git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "dependency work"]);
+            git_in(&repo, &["checkout", "-q", "main"]);
+            let dependency_tip = git_in(&repo, &["rev-parse", DEPENDENCY]);
+
+            let branch = WorktreeManager::branch_for_task(task_id);
+            let elsewhere = temps[0].path().join("elsewhere").join(&branch);
+            let elsewhere = elsewhere.to_str().unwrap();
+            {
+                let mut tasks_w = executor.tasks.write().await;
+                let task = tasks_w.get_mut(&task_id).unwrap();
+                if !class.stacked() {
+                    task.dependencies.clear();
+                }
+                match class {
+                    Class::Created | Class::StackedCreated => {}
+                    Class::AddedForRecorded | Class::ReattachedRegistered => {
+                        git_in(&repo, &["branch", &branch, "main"]);
+                        task.branch_name = Some(branch.clone());
+                        task.base_commit = Some(main_tip.clone());
+                        task.branch_origin = Some(on_main());
+                        if class == Class::ReattachedRegistered {
+                            git_in(&repo, &["worktree", "add", "-q", "--", elsewhere, &branch]);
+                        }
+                    }
+                    Class::StackedResumed | Class::StackedResumedRegistered => {
+                        git_in(&repo, &["branch", &branch, DEPENDENCY]);
+                        if class == Class::StackedResumedRegistered {
+                            git_in(&repo, &["worktree", "add", "-q", "--", elsewhere, &branch]);
+                        }
+                    }
+                    Class::AdoptedUnrecorded => {
+                        git_in(&repo, &["worktree", "add", "-q", "-b", &branch, "--", elsewhere, "main"]);
+                    }
+                }
+            }
+            let project_id = executor.tasks.read().await[&task_id].project_id;
+            let board: Vec<Task> = executor
+                .tasks
+                .read()
+                .await
+                .values()
+                .filter(|t| t.project_id == project_id)
+                .cloned()
+                .collect();
+            executor.storage.save_project_tasks(project_id, &board).expect("seed the board");
+
+            World { executor, temps, repo, task_id, project_id, main_tip, dependency_tip }
+        }
+
+        async fn world(class: Class) -> World {
+            world_with(test_executor(), class).await
+        }
+
+        impl World {
+            fn tasks_dir(&self) -> std::path::PathBuf {
+                self.temps[0].path().join("config").join("tasks")
+            }
+
+            async fn in_memory(&self) -> Task {
+                self.executor.tasks.read().await[&self.task_id].clone()
+            }
+
+            fn on_disk(&self) -> Task {
+                on_disk_task(&self.executor, self.project_id, self.task_id)
+            }
+
+            /// What a restart does: read the board back from disk, with no
+            /// memory of earlier attempts.
+            async fn restart(&self) {
+                let on_disk = self.on_disk();
+                self.executor.tasks.write().await.insert(self.task_id, on_disk);
+                self.executor.unrecorded_backoff_lock().clear();
+            }
+
+            /// End the stand-in agent a successful start registered.
+            async fn end_run(&self) {
+                let run = self.executor.running_handles.write().await.remove(&self.task_id);
+                if let Some(run) = run {
+                    let _ = run.cancel.send(true);
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), run.handle).await;
+                }
+            }
+        }
+
+        /// A stand-in `claude` that reads its prompt and then waits to be
+        /// stopped, so any start is visible in its invocation log.
+        async fn fake_agent() -> crate::test_helpers::FakeProgram {
+            crate::test_helpers::FakeProgram::install("claude", "cat >/dev/null; sleep 20").await
+        }
+
+        /// Whether the stand-in agent is invoked within a few seconds. A
+        /// registered run spawns its process from its own task, so the
+        /// invocation can trail the start that registered it.
+        async fn agent_invoked(agent: &crate::test_helpers::FakeProgram) -> bool {
+            for _ in 0..100 {
+                if agent.invocations().contains("claude") {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            false
+        }
+
+        /// The start is refused and no agent runs; the board and the disk
+        /// both still show what they showed before; only a branch and
+        /// worktree the start created are taken back. After a restart, once
+        /// the storage accepts writes again, the next start runs and records
+        /// where the branch started -- and invents nothing for a checkout
+        /// whose start was never known.
+        async fn refused_then_recorded_after_retry(class: Class) {
+            let w = world(class).await;
+            let before = provenance(&w.in_memory().await);
+            let (refs_before, worktrees_before) = (refs_of(&w.repo), worktree_count(&w.repo));
+            let agent = fake_agent().await;
+            let Some(unwritable) = crate::test_helpers::UnwritableDir::new(&w.tasks_dir()) else {
+                eprintln!("skipped: the tasks directory stays writable (running as root?)");
+                return;
+            };
+
+            let refused = w
+                .executor
+                .spawn_task_execution(w.task_id, None)
+                .await
+                .expect_err("a start whose worktree cannot be recorded is refused");
+
+            assert!(refused.contains("could not be recorded"), "{class:?}: {refused}");
+            assert!(w.executor.running_handles.read().await.is_empty(), "{class:?}");
+            assert_eq!(agent.invocations(), "", "{class:?}: no agent may start");
+            assert_eq!(provenance(&w.in_memory().await), before, "{class:?}: the board");
+            assert_eq!(provenance(&w.on_disk()), before, "{class:?}: the disk");
+            assert_eq!(refs_of(&w.repo), refs_before, "{class:?}: no branch is left created or moved");
+            let added = usize::from(class.adds_worktree_only());
+            assert_eq!(worktree_count(&w.repo), worktrees_before + added, "{class:?}: worktrees");
+            drop(unwritable);
+
+            w.restart().await;
+            let started = w.executor.spawn_task_execution(w.task_id, None).await;
+            let invoked = agent_invoked(&agent).await;
+            w.end_run().await;
+            assert_eq!(started, Ok(true), "{class:?}");
+            assert!(invoked, "{class:?}: the retry runs the agent");
+
+            let recorded = w.on_disk();
+            let expected = match class {
+                Class::Created | Class::AddedForRecorded | Class::ReattachedRegistered => {
+                    (Some(w.main_tip.clone()), Some(on_main()))
+                }
+                Class::StackedCreated | Class::StackedResumed | Class::StackedResumedRegistered => (
+                    Some(w.dependency_tip.clone()),
+                    Some(BranchOrigin::Stacked { parent_branch: DEPENDENCY.to_string() }),
+                ),
+                Class::AdoptedUnrecorded => (None, None),
+            };
+            assert_eq!((recorded.base_commit, recorded.branch_origin), expected, "{class:?}");
+            assert_eq!(recorded.branch_name, Some(WorktreeManager::branch_for_task(w.task_id)));
+        }
+
+        #[tokio::test]
+        async fn a_created_checkout_is_taken_back_and_created_again_with_its_base() {
+            refused_then_recorded_after_retry(Class::Created).await;
+        }
+
+        #[tokio::test]
+        async fn a_created_stacked_checkout_is_taken_back_and_stacked_again() {
+            refused_then_recorded_after_retry(Class::StackedCreated).await;
+        }
+
+        #[tokio::test]
+        async fn a_worktree_added_for_a_recorded_branch_is_left_and_the_branch_untouched() {
+            refused_then_recorded_after_retry(Class::AddedForRecorded).await;
+        }
+
+        #[tokio::test]
+        async fn a_worktree_added_for_a_resumed_stacked_branch_is_left_and_the_branch_untouched() {
+            refused_then_recorded_after_retry(Class::StackedResumed).await;
+        }
+
+        #[tokio::test]
+        async fn a_registered_worktree_of_the_recorded_branch_is_left_as_it_is() {
+            refused_then_recorded_after_retry(Class::ReattachedRegistered).await;
+        }
+
+        #[tokio::test]
+        async fn an_adopted_unrecorded_checkout_is_left_and_claims_no_start() {
+            refused_then_recorded_after_retry(Class::AdoptedUnrecorded).await;
+        }
+
+        #[tokio::test]
+        async fn a_registered_worktree_of_a_resumed_stacked_branch_is_left_as_it_is() {
+            refused_then_recorded_after_retry(Class::StackedResumedRegistered).await;
+        }
+
+        /// How many times a start acquired a new worktree, from its log.
+        fn created_worktrees(recording: &crate::events::RecordingEventSink) -> usize {
+            recording
+                .recorded()
+                .iter()
+                .filter(|(name, payload)| {
+                    name == "agent-event"
+                        && payload
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|m| m.starts_with("Created worktree:"))
+                })
+                .count()
+        }
+
+        /// Warnings saying a start was refused inside a backoff.
+        fn backoff_reports(recording: &crate::events::RecordingEventSink) -> usize {
+            recording
+                .recorded()
+                .iter()
+                .filter(|(name, payload)| {
+                    name == "agent-event"
+                        && payload.get("level").and_then(|v| v.as_str()) == Some("warn")
+                        && payload
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|m| m.contains("tried again"))
+                })
+                .count()
+        }
+
+        /// A backoff that began a full window ago.
+        fn expired_backoff() -> UnrecordedBackoff {
+            UnrecordedBackoff {
+                since: std::time::Instant::now()
+                    .checked_sub(UNRECORDED_ACQUISITION_BACKOFF)
+                    .expect("a clock this far past its start"),
+                announced: false,
+            }
+        }
+
+        /// While the storage keeps refusing writes, the poller does not
+        /// create and take back a checkout on every pass: a start inside the
+        /// backoff is refused before anything is acquired, saying when it is
+        /// tried again, and one after it acquires again.
+        #[tokio::test]
+        async fn a_start_that_could_not_record_its_worktree_is_not_retried_within_the_backoff() {
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let w = world_with(test_executor_with_events(recording.clone()), Class::Created).await;
+            let refs_before = refs_of(&w.repo);
+            let agent = fake_agent().await;
+            let Some(_unwritable) = crate::test_helpers::UnwritableDir::new(&w.tasks_dir()) else {
+                eprintln!("skipped: the tasks directory stays writable (running as root?)");
+                return;
+            };
+
+            w.executor.spawn_task_execution(w.task_id, None).await.expect_err("first start");
+            assert_eq!(created_worktrees(&recording), 1);
+            assert!(w.in_memory().await.is_ready_to_execute(), "the error could not be recorded either");
+
+            let within = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(
+                within.as_ref().is_err_and(|e| e.contains("tried again")),
+                "a start inside the backoff says when it is retried: {within:?}"
+            );
+            assert_eq!(created_worktrees(&recording), 1, "nothing was acquired inside the backoff");
+
+            let again = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(again.is_err_and(|e| e.contains("tried again")));
+            assert_eq!(
+                backoff_reports(&recording),
+                1,
+                "the refusal is reported once, not on every poll"
+            );
+
+            let expired = expired_backoff();
+            let deleted_task = Uuid::new_v4();
+            w.executor.unrecorded_backoff_lock().insert(w.task_id, expired);
+            w.executor.unrecorded_backoff_lock().insert(deleted_task, expired);
+            w.executor.spawn_task_execution(w.task_id, None).await.expect_err("still unrecordable");
+            assert_eq!(created_worktrees(&recording), 2, "the backoff bounds retries; it does not end them");
+            assert!(
+                !w.executor.unrecorded_backoff_lock().contains_key(&deleted_task),
+                "an expired entry of a task nobody starts again is dropped"
+            );
+
+            assert_eq!(refs_of(&w.repo), refs_before);
+            assert_eq!(agent.invocations(), "");
+        }
+
+        /// A manual start refused for the same reason says so, rather than
+        /// that the task stays queued.
+        #[tokio::test]
+        async fn a_manual_start_that_could_not_record_its_worktree_says_why() {
+            let w = world(Class::Created).await;
+            let _agent = fake_agent().await;
+            let Some(_unwritable) = crate::test_helpers::UnwritableDir::new(&w.tasks_dir()) else {
+                eprintln!("skipped: the tasks directory stays writable (running as root?)");
+                return;
+            };
+
+            let refused = w.executor.execute_task(w.task_id).await.expect_err("refused");
+
+            assert!(refused.contains("could not be recorded"), "{refused}");
+            assert!(!refused.contains("stays queued"), "{refused}");
         }
     }
 }

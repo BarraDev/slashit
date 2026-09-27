@@ -79,28 +79,29 @@ async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result
     )
     .await?;
 
-    // Update task
-    {
-        let mut tasks = state.task.tasks.write().await;
-        if let Some(task) = tasks.get_mut(&task_id) {
+    // Recorded before it is reported, and taken back if it cannot be: see
+    // `WorktreeManager::undo_created_checkout` for why a checkout left behind
+    // unrecorded costs the task its starting commit and origin.
+    let amend = |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>| {
+        if let Some(task) = staged.get_mut(&task_id) {
             task.worktree_path = Some(acquired.info.path.clone());
             task.branch_name = Some(acquired.info.branch.clone());
-            if let Some(base_commit) = acquired.base_commit {
-                task.base_commit = Some(base_commit);
+            if let Some(base_commit) = &acquired.base_commit {
+                task.base_commit = Some(base_commit.clone());
             }
-            if let Some(origin) = acquired.origin {
-                task.branch_origin = Some(origin);
+            if let Some(origin) = &acquired.origin {
+                task.branch_origin = Some(origin.clone());
             }
-            task.updated_at = chrono::Utc::now();
-
-            // Persist
-            let project_id = task.project_id;
-            let project_tasks: Vec<_> = tasks.values()
-                .filter(|t| t.project_id == project_id)
-                .cloned()
-                .collect();
-            let _ = state.storage.save_project_tasks(project_id, &project_tasks);
         }
+    };
+    if let Err(e) =
+        crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &amend).await
+    {
+        let outcome = state
+            .worktree_manager
+            .release_unrecorded(&repo_path, &acquired.info, acquired.created_at.as_deref())
+            .await;
+        return Err(format!("The task's checkout could not be recorded ({e}); {outcome}"));
     }
 
     Ok(acquired.info.path)
@@ -116,6 +117,11 @@ struct AcquiredCheckout {
     /// What the branch was created from, when that is known. `None` leaves
     /// whatever the task already records.
     origin: Option<BranchOrigin>,
+    /// The commit this call created the branch at, together with its
+    /// worktree. `None` when the branch already existed, whether its
+    /// worktree was adopted or added: nothing of that is this call's to take
+    /// back.
+    created_at: Option<String>,
 }
 
 /// Attach `existing_branch` again, or create (or adopt) the task's own
@@ -130,7 +136,7 @@ async fn acquire_checkout(
     // branch was created.
     if let Some(branch) = existing_branch {
         let info = manager.reattach(repo_path, branch).await?;
-        return Ok(AcquiredCheckout { info, base_commit: None, origin: None });
+        return Ok(AcquiredCheckout { info, base_commit: None, origin: None, created_at: None });
     }
     // This path never stacks: a branch it creates starts at the resolved
     // default base, exactly as the executor's ordinary branches do (see
@@ -141,12 +147,15 @@ async fn acquire_checkout(
     {
         (info, Some(base)) => Ok(AcquiredCheckout {
             info,
+            created_at: Some(base.commit.clone()),
             base_commit: Some(base.commit),
             origin: Some(BranchOrigin::DefaultBase { branch: Some(base.branch) }),
         }),
         // An adopted worktree claims no start: its `HEAD` is not where the
         // branch started, and whatever the task already recorded is kept.
-        (info, None) => Ok(AcquiredCheckout { info, base_commit: None, origin: None }),
+        (info, None) => {
+            Ok(AcquiredCheckout { info, base_commit: None, origin: None, created_at: None })
+        }
     }
 }
 
@@ -623,6 +632,246 @@ mod tests {
 
             assert_eq!(git(Path::new(&second), &["rev-parse", "HEAD"]), tip);
             assert_eq!(git(Path::new(&second), &["branch", "--show-current"]), full);
+        }
+    }
+
+    /// A checkout the Worktree command acquires for a task that cannot record
+    /// it: refused, with the board and the disk still agreeing, and only what
+    /// the command itself created taken back.
+    ///
+    /// Unix only: an unwritable directory is made with permission bits.
+    #[cfg(unix)]
+    mod unrecorded_acquisition {
+        use super::*;
+        use crate::domain::{Task, TaskStatus};
+
+        /// How the command acquires the task's checkout.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Class {
+            /// A new branch from the default base, and its worktree.
+            Created,
+            /// A worktree added for the branch the task records.
+            AddedForRecorded,
+            /// A worktree git already has registered for the recorded branch.
+            ReattachedRegistered,
+            /// A worktree registered for the branch the task would be given,
+            /// which it never recorded.
+            AdoptedUnrecorded,
+        }
+
+        struct World {
+            temp: tempfile::TempDir,
+            state: crate::AppState,
+            repo: std::path::PathBuf,
+            task_id: Uuid,
+            project_id: Uuid,
+            main_tip: String,
+        }
+
+        fn provenance(t: &Task) -> (Option<String>, Option<String>, Option<String>, Option<BranchOrigin>) {
+            (t.worktree_path.clone(), t.branch_name.clone(), t.base_commit.clone(), t.branch_origin.clone())
+        }
+
+        fn on_main() -> BranchOrigin {
+            BranchOrigin::DefaultBase { branch: Some("main".to_string()) }
+        }
+
+        fn refs(repo: &Path) -> String {
+            git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+        }
+
+        fn worktrees(repo: &Path) -> usize {
+            git(repo, &["worktree", "list", "--porcelain"]).matches("worktree ").count()
+        }
+
+        /// A project over a repository with a published default base, one
+        /// task in it set up for `class`, and the board seeded on disk.
+        async fn world(class: Class) -> World {
+            let temp = tempfile::TempDir::new().unwrap();
+            let (repo, _) = fixture(&temp);
+            let main_tip = git(&repo, &["rev-parse", "refs/remotes/origin/main"]);
+            let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+                temp.path().join("config"),
+                temp.path().join("data"),
+                temp.path().join("cache"),
+                temp.path().join("runtime"),
+            ));
+            let (state, _) = crate::app_core::build_state_with_paths(paths).await.expect("state");
+            let repository = crate::domain::Repository {
+                id: Uuid::new_v4(),
+                local_path: repo.to_string_lossy().to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            };
+            let repository_id = repository.id;
+            state.repository.repositories.write().await.insert(repository_id, repository);
+            let project_id = Uuid::new_v4();
+            state.project.projects.write().await.insert(
+                project_id,
+                crate::domain::Project {
+                    id: project_id,
+                    name: "project".to_string(),
+                    repository_id: Some(repository_id),
+                    scope: crate::domain::ProjectScope::Standalone,
+                    state_location: crate::config::paths::StateLocation::External,
+                    agent_type: crate::domain::AgentType::ClaudeCode,
+                    agent_config: crate::domain::AgentConfig {
+                        agent_type: crate::domain::AgentType::ClaudeCode,
+                        command: "claude".to_string(),
+                        args: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                        model: None,
+                        api_key: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                },
+            );
+
+            let mut task = crate::test_helpers::create_test_task_full(
+                "subject",
+                project_id,
+                TaskStatus::InProgress,
+                0,
+            );
+            let task_id = task.id;
+            let branch = WorktreeManager::branch_for_task(task_id);
+            let elsewhere = temp.path().join("elsewhere").join(&branch);
+            match class {
+                Class::Created => {}
+                Class::AddedForRecorded | Class::ReattachedRegistered => {
+                    git(&repo, &["branch", &branch]);
+                    task.branch_name = Some(branch.clone());
+                    task.base_commit = Some(main_tip.clone());
+                    task.branch_origin = Some(on_main());
+                    if class == Class::ReattachedRegistered {
+                        git(&repo, &["worktree", "add", "-q", "--", elsewhere.to_str().unwrap(), &branch]);
+                    }
+                }
+                Class::AdoptedUnrecorded => {
+                    git(&repo, &["worktree", "add", "-q", "-b", &branch, "--", elsewhere.to_str().unwrap()]);
+                }
+            }
+            state.task.tasks.write().await.insert(task_id, task.clone());
+            state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+
+            World { temp, state, repo, task_id, project_id, main_tip }
+        }
+
+        impl World {
+            fn tasks_dir(&self) -> std::path::PathBuf {
+                self.temp.path().join("config").join("tasks")
+            }
+
+            fn on_disk(&self) -> Task {
+                self.state
+                    .storage
+                    .load_project_tasks(self.project_id)
+                    .expect("load the board")
+                    .into_iter()
+                    .find(|t| t.id == self.task_id)
+                    .expect("the task is on disk")
+            }
+
+            async fn in_memory(&self) -> Task {
+                self.state.task.tasks.read().await[&self.task_id].clone()
+            }
+
+            /// What a restart does: read the board back from disk.
+            async fn restart(&self) {
+                let on_disk = self.on_disk();
+                self.state.task.tasks.write().await.insert(self.task_id, on_disk);
+            }
+        }
+
+        /// The command is refused, nothing it did is shown or recorded, and
+        /// only a branch and worktree it created itself are taken back. Once
+        /// the storage accepts writes again, asking again after a restart
+        /// records where the branch started.
+        async fn refused_then_recorded_after_retry(class: Class) {
+            let w = world(class).await;
+            let before = provenance(&w.in_memory().await);
+            let (refs_before, worktrees_before) = (refs(&w.repo), worktrees(&w.repo));
+            let Some(unwritable) = crate::test_helpers::UnwritableDir::new(&w.tasks_dir()) else {
+                eprintln!("skipped: the tasks directory stays writable (running as root?)");
+                return;
+            };
+
+            let refused = create_worktree_inner(&w.state, w.task_id)
+                .await
+                .expect_err("a checkout that cannot be recorded is not reported");
+
+            assert!(refused.contains("could not be recorded"), "{class:?}: {refused}");
+            assert_eq!(provenance(&w.in_memory().await), before, "{class:?}: the board");
+            assert_eq!(provenance(&w.on_disk()), before, "{class:?}: the disk");
+            assert_eq!(refs(&w.repo), refs_before, "{class:?}: no branch is left created or moved");
+            let added = usize::from(class == Class::AddedForRecorded);
+            assert_eq!(worktrees(&w.repo), worktrees_before + added, "{class:?}: worktrees");
+            drop(unwritable);
+
+            w.restart().await;
+            create_worktree_inner(&w.state, w.task_id).await.expect("recorded once writes work");
+
+            let recorded = w.on_disk();
+            let expected = match class {
+                Class::AdoptedUnrecorded => (None, None),
+                _ => (Some(w.main_tip.clone()), Some(on_main())),
+            };
+            assert_eq!((recorded.base_commit, recorded.branch_origin), expected, "{class:?}");
+            assert_eq!(recorded.branch_name, Some(WorktreeManager::branch_for_task(w.task_id)));
+        }
+
+        #[tokio::test]
+        async fn a_created_checkout_is_taken_back_and_created_again_with_its_base() {
+            refused_then_recorded_after_retry(Class::Created).await;
+        }
+
+        #[tokio::test]
+        async fn a_worktree_added_for_a_recorded_branch_is_left_and_the_branch_untouched() {
+            refused_then_recorded_after_retry(Class::AddedForRecorded).await;
+        }
+
+        #[tokio::test]
+        async fn a_registered_worktree_of_the_recorded_branch_is_left_as_it_is() {
+            refused_then_recorded_after_retry(Class::ReattachedRegistered).await;
+        }
+
+        /// An adopted checkout is never this command's to take back, and its
+        /// start stays unknown rather than being invented.
+        #[tokio::test]
+        async fn an_adopted_unrecorded_checkout_is_left_and_claims_no_start() {
+            refused_then_recorded_after_retry(Class::AdoptedUnrecorded).await;
+        }
+
+        /// A checkout that gained an untracked file while it was being
+        /// created -- here from a `post-checkout` hook -- is not removed, and
+        /// the refusal says what was kept.
+        #[tokio::test]
+        async fn a_created_checkout_holding_untracked_files_is_kept_and_named() {
+            let w = world(Class::Created).await;
+            let hook = w.repo.join(".git").join("hooks").join("post-checkout");
+            std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+            std::fs::write(&hook, "#!/bin/sh\necho made-by-hook > hook-output.txt\n").unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let Some(unwritable) = crate::test_helpers::UnwritableDir::new(&w.tasks_dir()) else {
+                eprintln!("skipped: the tasks directory stays writable (running as root?)");
+                return;
+            };
+
+            let refused = create_worktree_inner(&w.state, w.task_id).await.expect_err("refused");
+            drop(unwritable);
+
+            let branch = WorktreeManager::branch_for_task(w.task_id);
+            assert!(refused.contains("could not be recorded"), "{refused}");
+            assert!(refused.contains("kept"), "the refusal names what was kept: {refused}");
+            let checkout = git(&w.repo, &["worktree", "list", "--porcelain"]);
+            assert!(checkout.contains(&format!("branch refs/heads/{branch}")), "{checkout}");
+            assert_eq!(git(&w.repo, &["rev-parse", &format!("refs/heads/{branch}")]), w.main_tip);
+            assert_eq!(provenance(&w.on_disk()), (None, None, None, None));
         }
     }
 }

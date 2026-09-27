@@ -161,6 +161,44 @@ impl Drop for FakeProgram {
     }
 }
 
+/// A directory that refuses new files for as long as this value lives, with
+/// what is already in it left readable.
+///
+/// Makes a durable write fail for real, through the ordinary code path,
+/// while the last good file stays on disk to compare against. The atomic
+/// write creates its temporary file beside the target, which a directory
+/// without write permission refuses.
+#[cfg(all(test, unix))]
+pub struct UnwritableDir(std::path::PathBuf);
+
+#[cfg(all(test, unix))]
+impl UnwritableDir {
+    /// Take write permission away from `dir`. `None`, with the permission
+    /// given back, when the directory still accepts a file anyway -- as it
+    /// does for root, who ignores permission bits -- so a caller can skip a
+    /// test that could not prove anything.
+    pub fn new(dir: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
+            .expect("take write permission away");
+        let guard = Self(dir.to_path_buf());
+        let probe = dir.join(".write-probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::remove_file(probe);
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for UnwritableDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 /// The IPC server, reachable from the integration tests.
 ///
 /// `tests/ipc_integration.rs` is a separate crate, so it can only name items
