@@ -18,16 +18,34 @@ pub fn Workspaces() -> impl IntoView {
     let (new_path, set_new_path) = signal(String::new());
     let (creating, set_creating) = signal(false);
 
-    let load_workspaces = move || async move {
-        match workspace_service::list_workspaces().await {
-            Ok(ws) => {
-                set_workspaces.set(ws);
-                set_workspaces_loaded.set(true);
+    // Reloads overlap -- one per attach, detach and created workspace -- and
+    // their replies can arrive out of order. Each read takes a number, and a
+    // reply is applied only if no later read of the same list was started, so
+    // an older registry can never replace a newer one.
+    let workspaces_read = StoredValue::new(0u64);
+    let projects_read = StoredValue::new(0u64);
+    let next = |counter: StoredValue<u64>| {
+        counter.update_value(|n| *n += 1);
+        counter.get_value()
+    };
+
+    let load_workspaces = move || {
+        let read = next(workspaces_read);
+        async move {
+            let result = workspace_service::list_workspaces().await;
+            if workspaces_read.get_value() != read {
+                return;
             }
-            Err(e) => {
-                set_workspaces.set(Vec::new());
-                set_workspaces_loaded.set(false);
-                toast::error(format!("Could not load workspaces: {}", e));
+            match result {
+                Ok(ws) => {
+                    set_workspaces.set(ws);
+                    set_workspaces_loaded.set(true);
+                }
+                Err(e) => {
+                    set_workspaces.set(Vec::new());
+                    set_workspaces_loaded.set(false);
+                    toast::error(format!("Could not load workspaces: {}", e));
+                }
             }
         }
     };
@@ -41,7 +59,12 @@ pub fn Workspaces() -> impl IntoView {
     let reload_membership = move || {
         spawn_local(async move {
             load_workspaces().await;
-            match list_projects().await {
+            let read = next(projects_read);
+            let result = list_projects().await;
+            if projects_read.get_value() != read {
+                return;
+            }
+            match result {
                 Ok(ps) => set_projects.set(ps),
                 Err(e) => {
                     set_projects.set(Vec::new());
