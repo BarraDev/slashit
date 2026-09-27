@@ -180,6 +180,22 @@ else. SlashIt's own push, when it opens the pull request, records
 `origin/<branch>` as the upstream. The pull request targets the default branch
 the task was started from.
 
+### Recording a new checkout
+
+A task's checkout, its branch, and where that branch started are written to
+the task file before SlashIt reports the checkout or starts an agent in it.
+If that write fails, the Worktree command fails and the task does not start.
+The board keeps showing what the file says, and a branch and worktree created
+for that attempt are removed again, so the next attempt creates them afresh
+and records where they started. Left in place, they would be adopted
+unrecorded, and an adopted checkout has no known start. The removal is never
+forced. A checkout that gained files or commits in the meantime is kept, and
+the error names it. A worktree added for a branch that already existed, or an
+existing worktree SlashIt adopted, is left as it is. After such a failure the
+queue waits a minute before starting the same task again, rather than
+creating and removing a checkout on every poll while the storage keeps
+refusing writes.
+
 ### Adoption
 
 An existing worktree is always adopted rather than recreated. Before creating

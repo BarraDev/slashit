@@ -354,7 +354,9 @@ impl WorktreeManager {
     /// [`Self::create`], also returning the default base the new branch was
     /// started from, or `None` when an existing worktree of `branch` was
     /// adopted instead. Where an adopted branch started is not known here,
-    /// and nothing is claimed about it.
+    /// and nothing is claimed about it. `Some` therefore also means this call
+    /// created the branch, at `base.commit`, and the worktree: exactly what
+    /// [`Self::undo_created_checkout`] may take back.
     ///
     /// A new branch starts at exactly the commit [`resolve_default_base`]
     /// resolves, never at the primary checkout's `HEAD`, and with no
@@ -638,6 +640,91 @@ impl WorktreeManager {
             ));
         }
         Ok(())
+    }
+
+    /// Take back a checkout an acquisition created -- the branch `info.branch`
+    /// created at `created_at` and the worktree added for it at `info.path`
+    /// -- when the task it was created for could not record it.
+    ///
+    /// A checkout left behind unrecorded would be adopted by the next
+    /// acquisition, and an adopted checkout records no starting commit or
+    /// origin, so the task's diff boundary and stack parent would be lost for
+    /// good. Removing it lets the retry create it again from the same base
+    /// and record where it started.
+    ///
+    /// Only for a branch this same acquisition created. A branch that already
+    /// existed, or a worktree that was adopted or added for one, is never
+    /// passed here: it is not this call's to take back.
+    ///
+    /// Nothing is forced, and each step is left to git's own guard, so work
+    /// that reached the checkout in the meantime survives. The worktree must
+    /// still have the branch checked out at `created_at`; `git worktree
+    /// remove` without `--force` refuses a checkout holding modified or
+    /// untracked files, or one that is locked; and the branch is deleted only
+    /// while it still points at `created_at` and no worktree has it checked
+    /// out, as one compare-and-delete. A commit landing between the first
+    /// check and the removal therefore leaves the branch, with the commit on
+    /// it. Whatever is kept is named in the `Err`.
+    pub async fn undo_created_checkout(
+        &self,
+        repo_path: &str,
+        info: &WorktreeInfo,
+        created_at: &str,
+    ) -> Result<(), String> {
+        let branch = checked_task_branch(&info.branch)?;
+        let expected = format!("refs/heads/{branch}");
+        match Self::checkout_head(&info.path).await {
+            Ok((Some(head_ref), head)) if head_ref == expected && head == created_at => {}
+            Ok((head_ref, head)) => {
+                return Err(format!(
+                    "the worktree at {} and branch {branch} were kept: the worktree has {} \
+                     checked out at {head}, not the branch at {created_at} where it was created",
+                    info.path,
+                    head_ref.as_deref().unwrap_or("a detached HEAD"),
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "the worktree at {} and branch {branch} were kept: {e}",
+                    info.path
+                ));
+            }
+        }
+        self.remove_with_git(&info.path, repo_path)
+            .await
+            .map_err(|e| format!("the {e}, so branch {branch} was kept as well"))?;
+        Self::discard_created_branch(repo_path, branch, created_at).await
+    }
+
+    /// Release a checkout acquired for a task that could not record it, and
+    /// say what became of it, for the refusal the caller reports.
+    ///
+    /// `created_at` is the commit the acquisition created the branch at, or
+    /// `None` when the branch already existed. Only a created checkout is
+    /// taken back (see [`Self::undo_created_checkout`]). A worktree adopted
+    /// or added for an existing branch is left: the branch's starting commit
+    /// and origin were recorded when it was created, or cannot be known at
+    /// all, so the next acquisition loses nothing by finding it again.
+    pub async fn release_unrecorded(
+        &self,
+        repo_path: &str,
+        info: &WorktreeInfo,
+        created_at: Option<&str>,
+    ) -> String {
+        let path = &info.path;
+        let Some(created_at) = created_at else {
+            return format!(
+                "the checkout at {path}, of branch {} which already existed, was left as it is",
+                info.branch
+            );
+        };
+        match self.undo_created_checkout(repo_path, info, created_at).await {
+            Ok(()) => format!(
+                "the checkout created for it at {path} was removed again, so the next attempt \
+                 creates it afresh"
+            ),
+            Err(kept) => kept,
+        }
     }
 
     /// Create a branch stacked on top of another branch.
@@ -4510,5 +4597,63 @@ branch refs/heads/some-other-branch
             let absent = crate::test_helpers::FakeProgram::without(&["wt", "jj"]).await;
             lifecycle(&absent).await;
         }
+    }
+
+    // -------------------------------------------------------
+    // Taking back a checkout a task could not record
+    // -------------------------------------------------------
+
+    /// A checkout exactly as its creation left it is taken back whole: the
+    /// worktree, its registration and the branch.
+    #[tokio::test]
+    async fn an_unrecorded_created_checkout_is_taken_back_whole() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let refs_before = all_refs(repo_path);
+        let mgr = test_manager();
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d").await.expect("create");
+        let created_at = base.expect("created, not adopted").commit;
+
+        mgr.undo_created_checkout(repo_path, &info, &created_at).await.expect("taken back");
+
+        assert!(!Path::new(&info.path).exists());
+        assert_eq!(registered_worktrees(repo_path).len(), 1, "only the primary checkout");
+        assert_eq!(all_refs(repo_path), refs_before);
+    }
+
+    /// Untracked work in the checkout keeps both the worktree and the
+    /// branch, and the refusal says so.
+    #[tokio::test]
+    async fn a_created_checkout_holding_untracked_work_is_kept() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d").await.expect("create");
+        let created_at = base.expect("created").commit;
+        std::fs::write(Path::new(&info.path).join("notes.txt"), "unsaved\n").unwrap();
+
+        let kept = mgr.undo_created_checkout(repo_path, &info, &created_at).await.expect_err("kept");
+
+        assert!(kept.contains("kept"), "{kept}");
+        assert_eq!(std::fs::read_to_string(Path::new(&info.path).join("notes.txt")).unwrap(), "unsaved\n");
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), created_at);
+    }
+
+    /// A commit made in the checkout after it was created keeps the worktree
+    /// and the branch, so the commit stays reachable from the branch.
+    #[tokio::test]
+    async fn a_created_checkout_whose_branch_moved_is_kept_with_the_commit() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d").await.expect("create");
+        let created_at = base.expect("created").commit;
+        let work = commit_in(&info.path, "work nobody recorded");
+
+        let kept = mgr.undo_created_checkout(repo_path, &info, &created_at).await.expect_err("kept");
+
+        assert!(kept.contains("kept"), "{kept}");
+        assert!(Path::new(&info.path).is_dir());
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), work);
     }
 }
