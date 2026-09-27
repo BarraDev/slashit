@@ -568,6 +568,38 @@ impl WorktreeManager {
             .any(|line| line == refname))
     }
 
+    /// Whether the ref `refs/heads/<branch>` exists in `repo_path`, read
+    /// from git's exit status alone.
+    ///
+    /// For a check that runs on every start, where a git that writes to
+    /// stderr and succeeds must not stop the task: [`Self::local_branch_exists`]
+    /// takes any stderr as a failure, and `GIT_TRACE` is enough for that.
+    /// `git show-ref --exists` exits 0 for a ref that is there, even one
+    /// naming a missing object, 2 for one that is not, and anything else for
+    /// a lookup that failed, which is an error, never an absence. A git
+    /// older than 2.43 does not know `--exists` and exits 129 for it; that
+    /// git is asked through [`Self::local_branch_exists`] instead, so there
+    /// stderr alongside an answer is still a failure.
+    pub async fn local_branch_exists_by_status(repo_path: &str, branch: &str) -> Result<bool, String> {
+        let checked = checked_task_branch(branch)?;
+        let output = tokio::process::Command::new("git")
+            .args(["show-ref", "--exists"])
+            .arg(format!("refs/heads/{checked}"))
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git show-ref: {e}"))?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(2) => Ok(false),
+            Some(129) => Self::local_branch_exists(repo_path, branch).await,
+            _ => Err(format!(
+                "Could not check for local branch {checked:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        }
+    }
+
     /// Whether `ancestor` is reachable from the local branch `branch`.
     async fn branch_contains(repo_path: &str, branch: &str, ancestor: &str) -> Result<bool, String> {
         let output = tokio::process::Command::new("git")
@@ -4116,6 +4148,38 @@ branch refs/heads/some-other-branch
         let not_a_repo = tempfile::tempdir().expect("tempdir");
         assert!(
             WorktreeManager::local_branch_exists(not_a_repo.path().to_str().unwrap(), "main")
+                .await
+                .is_err()
+        );
+    }
+
+    /// `local_branch_exists_by_status` answers as `local_branch_exists` does
+    /// for the exact branch, whatever git writes to stderr on the way.
+    #[tokio::test]
+    async fn local_branch_exists_by_status_separates_absent_from_unanswerable() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let exists = |branch: &'static str| WorktreeManager::local_branch_exists_by_status(repo_path, branch);
+        assert_eq!(exists("main").await, Ok(true));
+        assert_eq!(exists("gone").await, Ok(false));
+        assert!(exists("-Bvictim").await.is_err());
+        std::fs::write(
+            tmp.path().join(".git/refs/heads/missing-object"),
+            "1234567890123456789012345678901234567890\n",
+        )
+        .unwrap();
+        assert_eq!(exists("missing-object").await, Ok(true));
+        std::fs::write(tmp.path().join(".git/refs/heads/garbage"), "garbage\n").unwrap();
+        assert!(exists("garbage").await.is_err());
+        // Refs below `refs/heads/<name>/` are not the branch `<name>`. Git
+        // 2.43 cannot look the name up past a loose ref directory and fails;
+        // later versions answer that it is not there.
+        run_git(repo_path, &["branch", "nested/child"]);
+        assert_ne!(exists("nested").await, Ok(true));
+
+        let not_a_repo = tempfile::tempdir().expect("tempdir");
+        assert!(
+            WorktreeManager::local_branch_exists_by_status(not_a_repo.path().to_str().unwrap(), "main")
                 .await
                 .is_err()
         );

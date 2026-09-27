@@ -78,8 +78,10 @@ pub async fn refuse_shared_task_branch(
 
     let earlier = pre_full_id_branch(task_id);
     // A git that cannot say whether the branch is there refuses: whatever
-    // the task would do next runs on the same git.
-    if super::WorktreeManager::local_branch_exists(repo_path, &earlier).await?
+    // the task would do next runs on the same git. Every task that records
+    // no branch asks this, so what git writes to stderr alongside an answer,
+    // such as `GIT_TRACE` output, must not stop it.
+    if super::WorktreeManager::local_branch_exists_by_status(repo_path, &earlier).await?
         && recorder_in_repository(tasks, projects, repositories, task_id, &earlier, repo_path)
             .await
             .is_none()
@@ -91,10 +93,14 @@ pub async fn refuse_shared_task_branch(
              an earlier start of this task whose record was never saved, or belong to another \
              task whose id starts with the same 8 characters. SlashIt cannot tell which, so it \
              neither gives this task that branch nor starts it on a new one beside it. If it \
-             is this task's, rename it with `git branch -m {earlier} {branch}`, and if no \
-             worktree has it checked out, add one with `git worktree add <directory> \
-             {branch}`; the task then continues that work where it is. If it is not, delete \
-             it or give it another name. Then start the task again."
+             is this task's, `git worktree list` shows whether a checkout has it checked out. \
+             If one does, run `git branch -m {branch}` in that checkout; a linked worktree \
+             then continues as this task's checkout. The repository's main checkout, or the \
+             Project's own, never does: after renaming there, switch it to another branch and \
+             add a worktree as below. If no checkout has it, run `git branch -m {earlier} {branch}`, then \
+             `git worktree add <directory> {branch}`; the task then continues that work \
+             there. If it is not this task's, delete it or give it another name. Then start \
+             the task again."
         ));
     }
     Ok(())
@@ -511,5 +517,76 @@ mod tests {
             assert!(refused.contains(&other.to_string()), "{refused}");
             assert!(refused.contains("Delete whichever"), "{refused}");
         }
+    }
+
+    /// [`the_pre_full_id_branch_check_answers_by_what_git_found`] again, in a
+    /// test process where every git it runs writes trace output to stderr
+    /// and still succeeds. `GIT_TRACE` is set on that process alone, so no
+    /// other test runs under it. A git older than 2.43 is asked the old way,
+    /// which still takes that output as a failure, so it is not tested here.
+    #[test]
+    fn the_pre_full_id_branch_check_holds_while_git_writes_to_stderr() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let probe = std::process::Command::new("git")
+            .args(["show-ref", "--exists", "refs/heads/main"])
+            .current_dir(new_repository(&temp.path().join("repo")))
+            .output()
+            .expect("run git");
+        if probe.status.code() == Some(129) {
+            eprintln!("skipped: this git does not know `git show-ref --exists`");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree::ownership::tests::the_pre_full_id_branch_check_answers_by_what_git_found",
+                "--test-threads=1",
+            ])
+            .env("GIT_TRACE", "1")
+            .output()
+            .expect("run the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "the test did not run: {stdout}");
+    }
+
+    /// A task that records no branch starts when no branch of the name
+    /// earlier versions would have given it is there, and is refused when
+    /// one is, or when git fails to say.
+    #[tokio::test]
+    async fn the_pre_full_id_branch_check_answers_by_what_git_found() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = new_repository(&temp.path().join("repo"));
+        let generated = super::super::WorktreeManager::branch_for_task(B);
+        let board = Board::default();
+        board.add(B, None, Some(&repo)).await;
+        let refuse = |repo_path: String| {
+            let generated = generated.clone();
+            let board = &board;
+            async move {
+                refuse_shared_task_branch(
+                    &board.tasks, &board.projects, &board.repositories, B, &generated, &repo_path,
+                )
+                .await
+            }
+        };
+
+        assert_eq!(refuse(repo.clone()).await, Ok(()), "no branch of the earlier name");
+
+        git(Path::new(&repo), &["branch", BRANCH]);
+        let refused = refuse(repo.clone()).await.expect_err("the earlier name is there");
+        assert!(refused.contains(&format!("while branch {BRANCH} is in its repository")), "{refused}");
+        git(Path::new(&repo), &["branch", "-D", BRANCH]);
+
+        // A ref git cannot read is not an absence.
+        std::fs::write(Path::new(&repo).join(".git/refs/heads").join(BRANCH), "garbage\n").unwrap();
+        let refused = refuse(repo.clone()).await.expect_err("an unreadable ref");
+        assert!(refused.contains("Could not check for local branch"), "{refused}");
+
+        let plain = temp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let refused = refuse(plain.to_string_lossy().to_string()).await.expect_err("not a repository");
+        assert!(refused.contains("Could not check for local branch"), "{refused}");
     }
 }
