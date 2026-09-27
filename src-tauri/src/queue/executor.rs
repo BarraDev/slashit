@@ -1043,6 +1043,22 @@ impl TaskExecutor {
             .clone()
             .unwrap_or_else(|| WorktreeManager::branch_for_task(task_id));
 
+        // Before any arm below reattaches, adopts, resumes or creates it: a
+        // branch another task in the repository can claim is not this
+        // task's to use. See `worktree::refuse_shared_task_branch`.
+        if let Err(refused) = crate::worktree::refuse_shared_task_branch(
+            &self.tasks,
+            &self.projects,
+            &self.repositories,
+            task_id,
+            &branch_name,
+            repo_path,
+        )
+        .await
+        {
+            return (existing_branch, Err(refused));
+        }
+
         // Check dependencies for stacked branching (only for new branches).
         // Stack when the dependency has a branch that hasn't been merged to main yet.
         // If merged, base on main normally (the code is already there).
@@ -1118,19 +1134,13 @@ impl TaskExecutor {
         // uncommitted file in that repository under a task title. A task
         // without its own worktree has nowhere to work, and saying so is the
         // only safe answer.
-        // A freshly-created worktree's `base_commit` is captured here, once,
-        // by reading `HEAD` back out of the new worktree itself right after
-        // `git worktree add` creates it -- not by re-resolving the parent
-        // branch name (or `repo_path`'s `HEAD`) in a separate call
-        // afterward. `git worktree add -b <branch> [<start-point>]` points
-        // the new worktree's `HEAD` at exactly the commit it forked from,
-        // with no commits of its own yet, so this is race-free: nothing else
-        // can move the *new* worktree's `HEAD` before this line runs,
-        // whereas re-querying the parent branch's (or `main`'s) ref after
-        // the fact could observe it having moved in the meantime -- exactly
-        // the kind of attribution drift this field exists to prevent.
-        // `None` on reattach: retry must keep comparing against the original
-        // starting point, not wherever the branch has moved to since.
+        // A new branch's `base_commit` is the exact commit it was created
+        // at, as the creating call resolved and verified it -- not
+        // re-resolved from the parent branch's (or `main`'s) ref afterwards,
+        // which could observe it having moved in the meantime, exactly the
+        // kind of attribution drift this field exists to prevent. `None` on
+        // reattach: retry must keep comparing against the original starting
+        // point, not wherever the branch has moved to since.
         let acquired = if existing_branch.is_some() {
             self.worktree_manager
                 .reattach(repo_path, &branch_name)
@@ -1187,30 +1197,32 @@ impl TaskExecutor {
                 )),
             }
         } else {
-            // An ordinary branch starts wherever the backend starts it (the
-            // primary checkout's `HEAD` for git, the local default branch for
-            // worktrunk), which is not necessarily the default base, so a
-            // branch created here is recorded as coming from the default base
-            // only when `origin/HEAD` provably contains where it started; see
-            // `WorktreeManager::default_base_origin`. Otherwise its origin is
-            // unknown. An adopted worktree was left by an earlier start that
-            // never recorded it, and that start may have stacked it, so it
-            // gets no origin at all.
+            // An ordinary branch starts at the exact commit
+            // `refs/remotes/origin/<D>` names for the repository's default
+            // branch `D`, resolved once before the branch is created (see
+            // `worktree::default_base::resolve_default_base`), and records both. A
+            // repository with no such base refuses the task instead of
+            // starting it from wherever the primary checkout happens to be.
+            // An adopted worktree gets neither a starting commit nor an
+            // origin, and whatever the task already recorded is kept: its
+            // `HEAD` may hold the task's own commits, or whatever a hook
+            // moved it to after a start refused it, and an earlier start that
+            // never recorded it may have stacked it. A task with no starting
+            // commit has no known diff boundary, as for one recorded before
+            // starting commits were kept.
             match self.worktree_manager.create_or_adopt(repo_path, &branch_name).await {
-                Ok((info, adopted)) => {
-                    let base_commit = Self::resolve_commit(&info.path, "HEAD").await;
-                    let origin = if adopted {
-                        None
-                    } else {
-                        WorktreeManager::default_base_origin(repo_path, base_commit.as_deref()).await
-                    };
-                    Ok(Acquired {
-                        info,
-                        what_happened: if adopted { "Adopted worktree" } else { "Created worktree" },
-                        base_commit,
-                        origin,
-                    })
-                }
+                Ok((info, Some(base))) => Ok(Acquired {
+                    info,
+                    what_happened: "Created worktree",
+                    base_commit: Some(base.commit),
+                    origin: Some(BranchOrigin::DefaultBase { branch: Some(base.branch) }),
+                }),
+                Ok((info, None)) => Ok(Acquired {
+                    info,
+                    what_happened: "Adopted worktree",
+                    base_commit: None,
+                    origin: None,
+                }),
                 Err(e) => Err(e),
             }
         };
@@ -1342,8 +1354,8 @@ impl TaskExecutor {
             self.events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Warn,
-                message: "Could not resolve a starting commit for this task's worktree; \
-                          its diff boundary will be reported as unknown rather than guessed"
+                message: "No starting commit is known for this task's worktree; its diff \
+                          boundary will be reported as unknown rather than guessed"
                     .to_string(),
             });
         }
@@ -2743,25 +2755,6 @@ impl TaskExecutor {
         Ok(repo.local_path.clone())
     }
 
-    /// Resolve `rev` to a commit hash in `dir`, for durably recording a
-    /// task's starting point at the moment its worktree is first created.
-    /// `None` on any failure (detached/empty repo, unknown rev, etc.) -- the
-    /// task still gets its worktree; its diff boundary is just truthfully
-    /// unknown rather than guessed.
-    async fn resolve_commit(dir: &str, rev: &str) -> Option<String> {
-        let output = tokio::process::Command::new("git")
-            .args(["rev-parse", rev])
-            .current_dir(dir)
-            .output()
-            .await
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if sha.is_empty() { None } else { Some(sha) }
-    }
-
     /// Commit agent changes in the worktree/working directory.
     async fn commit_changes(
         tasks: &Tasks,
@@ -3345,7 +3338,6 @@ mod tests {
                     paths_temp.path().join("cache"),
                     paths_temp.path().join("runtime"),
                 )),
-                crate::config::paths::WorktreePlacement::Managed,
             )),
             events: crate::events::null_sink(),
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
@@ -3827,7 +3819,6 @@ mod tests {
                     paths_temp.path().join("cache"),
                     paths_temp.path().join("runtime"),
                 )),
-                crate::config::paths::WorktreePlacement::Managed,
             )),
             events,
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
@@ -3959,7 +3950,6 @@ mod tests {
                     paths_temp.path().join("cache"),
                     paths_temp.path().join("runtime"),
                 )),
-                crate::config::paths::WorktreePlacement::Managed,
             )),
             events: crate::events::null_sink(),
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
@@ -4024,7 +4014,6 @@ mod tests {
                     paths_temp.path().join("cache"),
                     paths_temp.path().join("runtime"),
                 )),
-                crate::config::paths::WorktreePlacement::Managed,
             )),
             events: crate::events::null_sink(),
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
@@ -4402,7 +4391,7 @@ mod tests {
         assert_eq!(git_in(&repo, &["rev-parse", &format!("refs/heads/{}", info.branch)]), main_tip);
         assert_eq!(git_in(std::path::Path::new(&info.path), &["rev-parse", "HEAD"]), main_tip);
         assert_eq!(base_commit.as_deref(), Some(main_tip.as_str()));
-        assert_eq!(origin, Some(BranchOrigin::DefaultBase));
+        assert_eq!(origin, Some(on_main()));
         assert_eq!(worktree_count(&repo), 2);
 
         let recorded = serde_json::to_string(&recording.recorded()).unwrap();
@@ -4513,9 +4502,13 @@ mod tests {
         assert_eq!(persisted.branch_name, Some(WorktreeManager::branch_for_task(task_id)));
     }
 
-    /// A task with no dependency, started while the primary checkout is on a
-    /// commit `origin/HEAD` contains, records that its branch came from the
-    /// default base, not a stack parent.
+    /// The origin of a branch started at `origin/main`.
+    fn on_main() -> BranchOrigin {
+        BranchOrigin::DefaultBase { branch: Some("main".to_string()) }
+    }
+
+    /// A task with no dependency records that its branch came from the
+    /// default base `main`, not a stack parent.
     #[tokio::test]
     async fn starting_an_ordinary_task_records_the_default_base() {
         let (executor, temps) = test_executor();
@@ -4532,24 +4525,21 @@ mod tests {
             .await;
         let acquired = acquired.expect("an ordinary worktree");
         assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()));
-        assert_eq!(acquired.origin, Some(BranchOrigin::DefaultBase));
+        assert_eq!(acquired.origin, Some(on_main()));
         executor.record_acquired_worktree(task_id, acquired).await;
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
-        assert_eq!(
-            persisted_task(&executor, project_id, task_id).branch_origin,
-            Some(BranchOrigin::DefaultBase)
-        );
+        let persisted = persisted_task(&executor, project_id, task_id);
+        assert_eq!(persisted.branch_origin, Some(on_main()));
+        assert_eq!(persisted.base_commit.as_deref(), Some(main_tip.as_str()));
     }
 
-    /// An ordinary task's branch starts wherever the primary checkout is,
-    /// because that is what `git worktree add -b` does. Started while the
-    /// user is on a feature branch holding a commit the default base does
-    /// not, the branch starts at the feature branch's tip exactly as it
-    /// always has, and nothing claims it came from the default base: its
-    /// origin is recorded as unknown, returned and on disk.
+    /// An ordinary task's branch starts at `origin/main`, not wherever the
+    /// primary checkout is. Started while the user is on a feature branch
+    /// holding a commit the default base does not, the branch still starts
+    /// at the default base, and records it, returned and on disk.
     #[tokio::test]
-    async fn an_ordinary_task_started_from_a_feature_checkout_records_no_origin() {
+    async fn an_ordinary_task_started_from_a_feature_checkout_starts_at_the_default_base() {
         let (executor, temps) = test_executor();
         let (repo, task_id, _) = stacked_task_fixture(
             &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
@@ -4557,9 +4547,9 @@ mod tests {
         .await;
         executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
         publish_default_base(&repo);
+        let main_tip = git_in(&repo, &["rev-parse", "refs/remotes/origin/main"]);
         git_in(&repo, &["checkout", "-q", "-b", "feature-f"]);
         git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "feature work"]);
-        let feature_tip = git_in(&repo, &["rev-parse", "HEAD"]);
 
         let (_, acquired) = executor
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
@@ -4568,66 +4558,31 @@ mod tests {
         assert_eq!(acquired.what_happened, "Created worktree");
         assert_eq!(
             git_in(&repo, &["rev-parse", &format!("refs/heads/{}", acquired.info.branch)]),
-            feature_tip,
-            "where the branch starts is unchanged"
+            main_tip
         );
-        assert_eq!(acquired.base_commit.as_deref(), Some(feature_tip.as_str()));
-        assert_eq!(acquired.origin, None);
+        assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()));
+        assert_eq!(acquired.origin, Some(on_main()));
         executor.record_acquired_worktree(task_id, acquired).await;
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         let persisted = persisted_task(&executor, project_id, task_id);
-        assert_eq!(persisted.base_commit.as_deref(), Some(feature_tip.as_str()));
-        assert_eq!(persisted.branch_origin, None);
+        assert_eq!(persisted.base_commit.as_deref(), Some(main_tip.as_str()));
+        assert_eq!(persisted.branch_origin, Some(on_main()));
     }
 
     /// The same holds for a detached primary checkout, which is what a
-    /// JJ-colocated repository looks like to git (`HEAD` detached at `@-`):
-    /// a branch started at a commit `origin/HEAD` does not contain has no
-    /// known origin.
+    /// JJ-colocated repository looks like to git (`HEAD` detached at `@-`),
+    /// and for a local `main` ahead of what was pushed: work nobody pushed
+    /// is not carried into the task.
     #[tokio::test]
-    async fn an_ordinary_task_started_from_a_detached_checkout_off_the_default_base_records_no_origin() {
-        let (executor, temps) = test_executor();
-        let (repo, task_id, _) = stacked_task_fixture(
-            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
-        )
-        .await;
-        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
-        publish_default_base(&repo);
-        git_in(&repo, &["checkout", "-q", "--detach"]);
-        git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "working-copy parent"]);
-        let detached = git_in(&repo, &["rev-parse", "HEAD"]);
-
-        let (_, acquired) = executor
-            .acquire_task_worktree(task_id, repo.to_str().unwrap())
-            .await;
-        let acquired = acquired.expect("an ordinary worktree");
-        assert_eq!(acquired.base_commit.as_deref(), Some(detached.as_str()));
-        assert_eq!(acquired.origin, None);
-        executor.record_acquired_worktree(task_id, acquired).await;
-
-        let project_id = executor.tasks.read().await[&task_id].project_id;
-        let persisted = persisted_task(&executor, project_id, task_id);
-        assert_eq!(persisted.base_commit.as_deref(), Some(detached.as_str()));
-        assert_eq!(persisted.branch_origin, None);
-    }
-
-    /// Nothing short of `refs/remotes/origin/HEAD` containing the starting
-    /// commit proves a default-base origin. With no remote at all, with an
-    /// `origin/HEAD` that names a branch the repository does not have, or
-    /// with `main` ahead of what was pushed, the origin is unknown -- never
-    /// guessed from the local `main` or from where the branch happens to
-    /// sit.
-    #[tokio::test]
-    async fn an_ordinary_task_records_no_origin_when_the_default_base_is_not_proven() {
+    async fn an_ordinary_task_does_not_start_on_unpushed_local_work() {
         type Arrange = fn(&std::path::Path);
-        let cases: [(&str, Arrange); 3] = [
-            ("no origin/HEAD", |_| {}),
-            ("dangling origin/HEAD", |repo| {
-                git_in(repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone"]);
+        let cases: [(&str, Arrange); 2] = [
+            ("detached", |repo| {
+                git_in(repo, &["checkout", "-q", "--detach"]);
+                git_in(repo, &["commit", "-q", "--allow-empty", "-m", "working-copy parent"]);
             }),
             ("main ahead of origin", |repo| {
-                publish_default_base(repo);
                 git_in(repo, &["commit", "-q", "--allow-empty", "-m", "not pushed"]);
             }),
         ];
@@ -4638,19 +4593,61 @@ mod tests {
             )
             .await;
             executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+            publish_default_base(&repo);
+            let main_tip = git_in(&repo, &["rev-parse", "refs/remotes/origin/main"]);
             arrange(&repo);
-            let head = git_in(&repo, &["rev-parse", "HEAD"]);
+            assert_ne!(git_in(&repo, &["rev-parse", "HEAD"]), main_tip, "{name}");
 
             let (_, acquired) = executor
                 .acquire_task_worktree(task_id, repo.to_str().unwrap())
                 .await;
             let acquired = acquired.unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(acquired.base_commit.as_deref(), Some(head.as_str()), "{name}");
-            assert_eq!(acquired.origin, None, "{name}");
-            executor.record_acquired_worktree(task_id, acquired).await;
+            assert_eq!(
+                git_in(std::path::Path::new(&acquired.info.path), &["rev-parse", "HEAD"]),
+                main_tip,
+                "{name}"
+            );
+            assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()), "{name}");
+            assert_eq!(acquired.origin, Some(on_main()), "{name}");
+        }
+    }
 
-            let project_id = executor.tasks.read().await[&task_id].project_id;
-            assert_eq!(persisted_task(&executor, project_id, task_id).branch_origin, None, "{name}");
+    /// With no usable default base -- no remote at all, or an `origin/HEAD`
+    /// that names a branch the repository does not have -- an ordinary task
+    /// is refused before anything is created, and says what to run. It is
+    /// never started from the primary checkout's `HEAD` instead.
+    #[tokio::test]
+    async fn an_ordinary_task_without_a_default_base_is_refused() {
+        type Arrange = fn(&std::path::Path);
+        let cases: [(&str, Arrange, &str); 3] = [
+            ("no remote", |_| {}, "no remote named origin"),
+            ("no origin/HEAD", |repo| {
+                publish_default_base(repo);
+                git_in(repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+            }, "git remote set-head origin"),
+            ("dangling origin/HEAD", |repo| {
+                publish_default_base(repo);
+                git_in(repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone"]);
+            }, "git remote set-head origin"),
+        ];
+        for (name, arrange, expected) in cases {
+            let (executor, temps) = test_executor();
+            let (repo, task_id, _) = stacked_task_fixture(
+                &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+            )
+            .await;
+            executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+            arrange(&repo);
+            let refs_before = refs_of(&repo);
+
+            let (_, acquired) = executor
+                .acquire_task_worktree(task_id, repo.to_str().unwrap())
+                .await;
+
+            let refused = acquired.err().unwrap_or_else(|| panic!("{name}: must be refused"));
+            assert!(refused.contains(expected), "{name}: {refused}");
+            assert_eq!(refs_of(&repo), refs_before, "{name}: no branch is created");
+            assert_eq!(worktree_count(&repo), 1, "{name}");
         }
     }
 
@@ -4688,6 +4685,113 @@ mod tests {
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         assert_eq!(persisted_task(&executor, project_id, task_id).branch_origin, None);
+    }
+
+    /// An adopted worktree, here one another tool placed at its own path,
+    /// gets neither a starting commit nor an origin: its `HEAD` may already
+    /// hold the task's own commits, or whatever moved it, and is not where
+    /// the branch started. The task diff is then reported as having no known
+    /// boundary, as it is for a task recorded before starting commits were.
+    #[tokio::test]
+    async fn adopting_a_worktree_records_no_starting_commit_and_no_origin() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        let task_branch = WorktreeManager::branch_for_task(task_id);
+        let custom = temps[0].path().join("elsewhere").join(&task_branch);
+        git_in(&repo, &["worktree", "add", "-q", "-b", &task_branch, "--", custom.to_str().unwrap()]);
+        git_in(&custom, &["commit", "-q", "--allow-empty", "-m", "the task's own work"]);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("adopted");
+        assert_eq!(acquired.what_happened, "Adopted worktree");
+        assert_eq!(acquired.base_commit, None);
+        assert_eq!(acquired.origin, None);
+        executor.record_acquired_worktree(task_id, acquired).await;
+
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let persisted = persisted_task(&executor, project_id, task_id);
+        assert_eq!(persisted.base_commit, None);
+        assert_eq!(persisted.branch_origin, None);
+        assert!(matches!(
+            crate::worktree::task_diff(custom.to_str().unwrap(), persisted.base_commit.as_deref()).await,
+            Err(crate::worktree::TaskDiffError::UnknownBoundary)
+        ));
+    }
+
+    /// Adopting a worktree leaves whatever the task already recorded about
+    /// where its branch started exactly as it was.
+    #[tokio::test]
+    async fn adopting_a_worktree_keeps_what_the_task_already_recorded() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        let recorded_start = git_in(&repo, &["rev-parse", "HEAD"]);
+        let recorded_origin = BranchOrigin::Stacked { parent_branch: "task-deadbeef".to_string() };
+        {
+            let mut tasks = executor.tasks.write().await;
+            let task = tasks.get_mut(&task_id).unwrap();
+            task.dependencies.clear();
+            task.base_commit = Some(recorded_start.clone());
+            task.branch_origin = Some(recorded_origin.clone());
+        }
+        let task_branch = WorktreeManager::branch_for_task(task_id);
+        let custom = temps[0].path().join("elsewhere").join(&task_branch);
+        git_in(&repo, &["worktree", "add", "-q", "-b", &task_branch, "--", custom.to_str().unwrap()]);
+        git_in(&custom, &["commit", "-q", "--allow-empty", "-m", "the task's own work"]);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        executor.record_acquired_worktree(task_id, acquired.expect("adopted")).await;
+
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let persisted = persisted_task(&executor, project_id, task_id);
+        assert_eq!(persisted.base_commit, Some(recorded_start));
+        assert_eq!(persisted.branch_origin, Some(recorded_origin));
+    }
+
+    /// A checkout the creating start refused because a `post-checkout` hook
+    /// moved it is adopted by the next start, which claims no start for it:
+    /// the refusal is not undone by recording the moved `HEAD` instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hook_moved_checkout_is_adopted_on_retry_without_a_starting_commit() {
+        use std::os::unix::fs::PermissionsExt;
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        publish_default_base(&repo);
+        let hook = repo.join(".git/hooks/post-checkout");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\ngit -c user.email=h@example.com -c user.name=Hook commit -q --allow-empty -m hook\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (_, first) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        assert!(first.err().is_some_and(|e| e.contains("post-checkout")));
+
+        let (_, retry) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let retry = retry.expect("the checkout left behind is adopted");
+        assert_eq!(retry.what_happened, "Adopted worktree");
+        assert_eq!(retry.base_commit, None, "the moved HEAD is not recorded as the start");
+        assert_eq!(retry.origin, None);
     }
 
     /// Reattaching to a branch recorded before origins were kept does not
@@ -6357,6 +6461,246 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
 
             executor.stop_task(task_id).await.expect("stop the review");
             assert!(!pid_is_alive(pid));
+        }
+    }
+
+    /// Two tasks whose ids share their first 8 hex digits, and so the branch
+    /// name `task-12345678`, started through the queue.
+    mod branch_ownership {
+        use super::*;
+
+        const A: Uuid = Uuid::from_u128(0x12345678_0000_4000_8000_000000000001);
+        const B: Uuid = Uuid::from_u128(0x12345678_0000_4000_8000_000000000002);
+        /// A task whose branch name is not `task-12345678`.
+        const C: Uuid = Uuid::from_u128(0xabcdef01_0000_4000_8000_000000000003);
+        const BRANCH: &str = "task-12345678";
+
+        /// Where task `A`'s checkout of [`BRANCH`] is.
+        #[derive(Debug, Clone, Copy)]
+        enum Placement {
+            /// SlashIt's managed path.
+            Managed,
+            /// The pre-`AppPaths` sibling `<repo>.<branch>`.
+            Legacy,
+            /// A path of another tool's choosing, such as a Worktrunk template.
+            Custom,
+        }
+
+        /// A repository with a published default base, registered as a new
+        /// project's.
+        async fn repository(executor: &TaskExecutor, temps: &[tempfile::TempDir]) -> (std::path::PathBuf, Uuid) {
+            let repo = temps[0].path().join("repository");
+            std::fs::create_dir_all(&repo).unwrap();
+            git_in(&repo, &["init", "-q", "-b", "main"]);
+            git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
+            publish_default_base(&repo);
+            let project_id = Uuid::new_v4();
+            let repository_id = Uuid::new_v4();
+            executor.repositories.write().await.insert(
+                repository_id,
+                crate::domain::Repository {
+                    id: repository_id,
+                    local_path: repo.to_string_lossy().to_string(),
+                    remote_url: None,
+                    remote_type: None,
+                    created_at: chrono::Utc::now(),
+                },
+            );
+            let mut project = test_project(project_id, ProjectScope::Standalone);
+            project.repository_id = Some(repository_id);
+            executor.projects.write().await.insert(project_id, project);
+            (repo, project_id)
+        }
+
+        async fn add_task(executor: &TaskExecutor, id: Uuid, project_id: Uuid, branch: Option<&str>) {
+            let mut task = create_test_task_full(&format!("task {id}"), project_id, TaskStatus::InProgress, 0);
+            task.id = id;
+            task.phase = TaskPhase::Idle;
+            task.branch_name = branch.map(str::to_string);
+            executor.tasks.write().await.insert(id, task);
+        }
+
+        /// Put a checkout of [`BRANCH`] at `placement`, returning its path.
+        async fn place_checkout(
+            executor: &TaskExecutor,
+            temps: &[tempfile::TempDir],
+            repo: &std::path::Path,
+            placement: Placement,
+        ) -> String {
+            let path = match placement {
+                Placement::Managed => {
+                    return executor
+                        .worktree_manager
+                        .create(repo.to_str().unwrap(), BRANCH)
+                        .await
+                        .expect("a checkout at the managed path")
+                        .path;
+                }
+                Placement::Legacy => repo.parent().unwrap().join(format!("repository.{BRANCH}")),
+                Placement::Custom => temps[0].path().join("elsewhere").join(BRANCH),
+            };
+            git_in(repo, &["worktree", "add", "-q", "-b", BRANCH, "--", path.to_str().unwrap()]);
+            path.to_string_lossy().to_string()
+        }
+
+        /// Task `B` is refused task `A`'s checkout of their shared branch
+        /// name, wherever it is, and nothing is created, adopted or recorded.
+        async fn assert_b_is_refused_a_checkout_a_records(placement: Placement) {
+            let (executor, temps) = test_executor();
+            let (repo, project_id) = repository(&executor, &temps).await;
+            add_task(&executor, A, project_id, Some(BRANCH)).await;
+            add_task(&executor, B, project_id, None).await;
+            place_checkout(&executor, &temps, &repo, placement).await;
+            let (refs, worktrees) = (refs_of(&repo), worktree_count(&repo));
+
+            let (_, acquired) = executor.acquire_task_worktree(B, repo.to_str().unwrap()).await;
+
+            let refused = acquired.err().unwrap_or_else(|| panic!("{placement:?}: B was given A's checkout"));
+            assert!(refused.contains(&A.to_string()), "{placement:?}: {refused}");
+            assert!(refused.contains("records it as its branch"), "{placement:?}: {refused}");
+            assert_eq!(refs_of(&repo), refs, "{placement:?}");
+            assert_eq!(worktree_count(&repo), worktrees, "{placement:?}");
+            assert_eq!(executor.tasks.read().await[&B].branch_name, None, "{placement:?}");
+        }
+
+        #[tokio::test]
+        async fn a_task_is_refused_the_managed_checkout_another_task_records() {
+            assert_b_is_refused_a_checkout_a_records(Placement::Managed).await;
+        }
+
+        #[tokio::test]
+        async fn a_task_is_refused_the_legacy_checkout_another_task_records() {
+            assert_b_is_refused_a_checkout_a_records(Placement::Legacy).await;
+        }
+
+        #[tokio::test]
+        async fn a_task_is_refused_a_custom_path_checkout_another_task_records() {
+            assert_b_is_refused_a_checkout_a_records(Placement::Custom).await;
+        }
+
+        /// A task stacked on a dependency does not resume a same-named branch
+        /// another task records, even when that branch holds the
+        /// dependency's work, with or without a checkout of it.
+        #[tokio::test]
+        async fn a_stacked_task_does_not_resume_a_branch_another_task_records() {
+            for with_checkout in [false, true] {
+                let (executor, temps) = test_executor();
+                let (repo, project_id) = repository(&executor, &temps).await;
+                git_in(&repo, &["branch", "task-deadbeef"]);
+                let mut dependency =
+                    create_test_task_full("dependency", project_id, TaskStatus::InProgress, 0);
+                dependency.branch_name = Some("task-deadbeef".to_string());
+                let dependency_id = dependency.id;
+                executor.tasks.write().await.insert(dependency_id, dependency);
+                add_task(&executor, A, project_id, Some(BRANCH)).await;
+                add_task(&executor, B, project_id, None).await;
+                executor.tasks.write().await.get_mut(&B).unwrap().dependencies = vec![dependency_id];
+                if with_checkout {
+                    place_checkout(&executor, &temps, &repo, Placement::Custom).await;
+                } else {
+                    git_in(&repo, &["branch", BRANCH, "task-deadbeef"]);
+                }
+                let (refs, worktrees) = (refs_of(&repo), worktree_count(&repo));
+
+                let (_, acquired) = executor.acquire_task_worktree(B, repo.to_str().unwrap()).await;
+
+                let refused = acquired
+                    .err()
+                    .unwrap_or_else(|| panic!("with_checkout={with_checkout}: B resumed A's branch"));
+                assert!(refused.contains(&A.to_string()), "{refused}");
+                assert_eq!(refs_of(&repo), refs, "with_checkout={with_checkout}");
+                assert_eq!(worktree_count(&repo), worktrees, "with_checkout={with_checkout}");
+            }
+        }
+
+        /// A checkout of the shared name that neither task records, such as
+        /// one left by a start whose record was never saved, is given to
+        /// neither: SlashIt cannot tell whose it is.
+        #[tokio::test]
+        async fn an_unrecorded_checkout_two_tasks_could_claim_is_given_to_neither() {
+            let (executor, temps) = test_executor();
+            let (repo, project_id) = repository(&executor, &temps).await;
+            add_task(&executor, A, project_id, None).await;
+            add_task(&executor, B, project_id, None).await;
+            place_checkout(&executor, &temps, &repo, Placement::Managed).await;
+            let refs = refs_of(&repo);
+
+            for (task, other) in [(A, B), (B, A)] {
+                let (_, acquired) = executor.acquire_task_worktree(task, repo.to_str().unwrap()).await;
+                let refused = acquired.err().expect("an ambiguous checkout is refused");
+                assert!(refused.contains(&other.to_string()), "{refused}");
+                assert!(refused.contains("would be given the same branch name"), "{refused}");
+            }
+            assert_eq!(refs_of(&repo), refs);
+        }
+
+        /// A task that records its branch keeps reattaching its own
+        /// checkout, wherever it is, beside a task that records no branch but
+        /// would be given the same name.
+        #[tokio::test]
+        async fn a_task_reattaches_its_own_checkout_beside_a_task_with_the_same_prefix() {
+            for placement in [Placement::Managed, Placement::Legacy, Placement::Custom] {
+                let (executor, temps) = test_executor();
+                let (repo, project_id) = repository(&executor, &temps).await;
+                add_task(&executor, A, project_id, Some(BRANCH)).await;
+                add_task(&executor, B, project_id, None).await;
+                let path = place_checkout(&executor, &temps, &repo, placement).await;
+
+                let (existing, acquired) = executor.acquire_task_worktree(A, repo.to_str().unwrap()).await;
+
+                let acquired = acquired.unwrap_or_else(|e| panic!("{placement:?}: {e}"));
+                assert_eq!(existing.as_deref(), Some(BRANCH));
+                assert_eq!(acquired.what_happened, "Reattached worktree", "{placement:?}");
+                assert_eq!(
+                    std::fs::canonicalize(&acquired.info.path).unwrap(),
+                    std::fs::canonicalize(&path).unwrap(),
+                    "{placement:?}"
+                );
+            }
+        }
+
+        /// A checkout a task's own start left unrecorded, at any placement
+        /// including a Worktrunk-era custom path, is still adopted when no
+        /// other task can claim its branch, as after a restart that lost the
+        /// record.
+        #[tokio::test]
+        async fn an_unrecorded_checkout_no_other_task_can_claim_is_still_adopted() {
+            for placement in [Placement::Managed, Placement::Legacy, Placement::Custom] {
+                let (executor, temps) = test_executor();
+                let (repo, project_id) = repository(&executor, &temps).await;
+                add_task(&executor, A, project_id, None).await;
+                add_task(&executor, C, project_id, None).await;
+                let path = place_checkout(&executor, &temps, &repo, placement).await;
+
+                let (_, acquired) = executor.acquire_task_worktree(A, repo.to_str().unwrap()).await;
+
+                let acquired = acquired.unwrap_or_else(|e| panic!("{placement:?}: {e}"));
+                assert_eq!(acquired.what_happened, "Adopted worktree", "{placement:?}");
+                assert_eq!(
+                    std::fs::canonicalize(&acquired.info.path).unwrap(),
+                    std::fs::canonicalize(&path).unwrap(),
+                    "{placement:?}"
+                );
+                assert_eq!(acquired.base_commit, None);
+            }
+        }
+
+        /// Tasks whose branch names differ each get a new checkout from the
+        /// default base.
+        #[tokio::test]
+        async fn tasks_with_different_branch_names_each_get_a_new_checkout() {
+            let (executor, temps) = test_executor();
+            let (repo, project_id) = repository(&executor, &temps).await;
+            add_task(&executor, A, project_id, None).await;
+            add_task(&executor, C, project_id, None).await;
+
+            for task in [A, C] {
+                let (_, acquired) = executor.acquire_task_worktree(task, repo.to_str().unwrap()).await;
+                let acquired = acquired.unwrap_or_else(|e| panic!("{task}: {e}"));
+                assert_eq!(acquired.what_happened, "Created worktree");
+                assert_eq!(acquired.info.branch, WorktreeManager::branch_for_task(task));
+                executor.record_acquired_worktree(task, acquired).await;
+            }
         }
     }
 }

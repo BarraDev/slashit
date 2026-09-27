@@ -78,7 +78,7 @@ async fn journey(context: &TestContext) -> Result<()> {
     context.set_child_env("PATH", agent.path_value());
     context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
 
-    pin_worktree_placement(&context.state().config_file())?;
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
 
     let session = context.start_session("queue").await?;
@@ -150,7 +150,7 @@ async fn retry_journey(context: &TestContext) -> Result<()> {
     // retry is what produced the second run, or that there is a task at all.
     context.set_child_env(fake_agent::FAILING_RUNS_VAR, "1");
 
-    pin_worktree_placement(&context.state().config_file())?;
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
 
     let session = context.start_session("retry").await?;
@@ -219,7 +219,7 @@ async fn cancellation_journey(context: &TestContext) -> Result<()> {
     context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
     context.set_child_env(fake_agent::BLOCK_DIR_VAR, &release);
 
-    pin_worktree_placement(&context.state().config_file())?;
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
 
     let session = context.start_session("cancellation").await?;
@@ -1454,24 +1454,25 @@ fn find_task(listed: &Value, id: &str) -> Option<Value> {
         .cloned()
 }
 
-/// Force SlashIt to place worktrees under its own state root.
+/// Start the product on a configuration that says `placement = "auto"`.
 ///
-/// The default placement delegates to worktrunk (`wt`) when the developer has
-/// it installed, and `wt` decides the location from the user's configuration —
-/// which would put this run's worktrees outside the directory the harness
-/// owns and cleans. Hosted CI has no `wt` and therefore already behaves this
-/// way, so pinning it makes a local run match CI rather than diverging from
-/// it.
+/// That is the spelling every configuration written before SlashIt stopped
+/// delegating to Worktrunk (`wt`) carries, and under it a machine with `wt`
+/// installed used to get worktrees wherever `wt` put them, outside the
+/// directory the harness owns and cleans. It now means the same as
+/// `"managed"`, so every journey that checks its worktrees stay inside the
+/// state root also checks that the old spelling still parses and no longer
+/// hands placement to anything, `wt` on `PATH` or not.
 ///
 /// Written as the product's own configuration file, before the first launch,
 /// because placement is read once at startup and no command exposes it.
-fn pin_worktree_placement(config_file: &Path) -> Result<()> {
+fn start_on_the_legacy_auto_placement(config_file: &Path) -> Result<()> {
     let parent = config_file
         .parent()
         .context("the config file has no parent directory")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("could not create {}", parent.display()))?;
-    std::fs::write(config_file, "[worktree]\nplacement = \"managed\"\n")
+    std::fs::write(config_file, "[worktree]\nplacement = \"auto\"\n")
         .with_context(|| format!("could not write {}", config_file.display()))
 }
 
@@ -1490,7 +1491,7 @@ impl GitFixture {
         std::fs::create_dir_all(path)
             .with_context(|| format!("could not create {}", path.display()))?;
 
-        git(path, &["init", "--quiet"])?;
+        git(path, &["init", "--quiet", "--initial-branch=main"])?;
         // Repository-local, so the run depends on nothing about the machine's
         // global git configuration — and so the commit the executor makes
         // inside the worktree has an identity, since worktrees share this
@@ -1512,6 +1513,17 @@ impl GitFixture {
             .parent()
             .context("the fixture has no parent directory")?
             .to_path_buf();
+
+        // A bare `origin` beside it, inside the state root, with its `HEAD`
+        // recorded locally the way `git clone` leaves it. The product starts
+        // every ordinary task branch at `refs/remotes/origin/<default>` and
+        // refuses a repository that has none, without ever fetching.
+        let origin = state_root.join("fixture-origin.git");
+        let origin = origin.to_str().context("the origin path is not UTF-8")?;
+        git(path, &["init", "--quiet", "--bare", origin])?;
+        git(path, &["remote", "add", "origin", origin])?;
+        git(path, &["push", "--quiet", "origin", "main"])?;
+        git(path, &["remote", "set-head", "origin", "main"])?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -1786,9 +1798,8 @@ async fn establish_work(
 /// report what git makes of it afterwards.
 ///
 /// A directory that is gone while git still lists a registration for it is not
-/// a finished cleanup: `wt switch` refuses a worktree whose directory is
-/// missing and refuses to create one whose branch already exists, so the task
-/// would be left unable to have a worktree at all.
+/// a finished cleanup: `git worktree add` refuses a branch a registration
+/// still claims, so the task would be left unable to have a worktree at all.
 async fn await_worktree_removal(repository: &GitFixture, worktree: &Path) -> Result<()> {
     let started = Instant::now();
     loop {
@@ -1863,7 +1874,7 @@ async fn done_journey(context: &TestContext) -> Result<()> {
     // destroy nothing and the journey would pass for the wrong reason.
     context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
 
-    pin_worktree_placement(&context.state().config_file())?;
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
 
     let session = context.start_session("done").await?;
@@ -2017,7 +2028,7 @@ async fn delete_journey(context: &TestContext) -> Result<()> {
     context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
     context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
 
-    pin_worktree_placement(&context.state().config_file())?;
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
 
     let session = context.start_session("delete").await?;
@@ -2467,7 +2478,7 @@ async fn done_refusal_journey(context: &TestContext) -> Result<()> {
     context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
     context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
 
-    pin_worktree_placement(&context.state().config_file())?;
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
 
     let session = context.start_session("done-refused").await?;
@@ -2703,7 +2714,7 @@ async fn partial_cleanup_journey(context: &TestContext) -> Result<()> {
     context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
     context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
 
-    pin_worktree_placement(&context.state().config_file())?;
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
 
     let session = context.start_session("partial-cleanup").await?;
@@ -2891,7 +2902,7 @@ async fn bystander_journey(context: &TestContext) -> Result<()> {
     context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
     context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
 
-    pin_worktree_placement(&context.state().config_file())?;
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
 
     let session = context.start_session("bystander").await?;

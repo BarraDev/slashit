@@ -46,6 +46,121 @@ use chrono::Utc;
 pub static PATH_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// `PATH` replaced for as long as this value lives, with every
+/// invocation of the fake programs it installs recorded in `log`.
+///
+/// Holds [`crate::test_helpers::PATH_LOCK`] itself, so `PATH` is restored
+/// before the lock is released no matter how the test ends.
+#[cfg(all(test, unix))]
+pub struct FakeProgram {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    dir: tempfile::TempDir,
+    log: std::path::PathBuf,
+    saved_path: Option<std::ffi::OsString>,
+    /// Directories standing in for `PATH` entries, see [`Self::without`].
+    _shadows: Option<tempfile::TempDir>,
+}
+
+#[cfg(all(test, unix))]
+impl FakeProgram {
+    /// Take `PATH` over, with `entries` after the fake programs' own
+    /// directory.
+    async fn take_path(entries: impl FnOnce(&Option<std::ffi::OsString>) -> Vec<std::path::PathBuf>) -> Self {
+        let lock = crate::test_helpers::PATH_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("invocations.log");
+        let saved_path = std::env::var_os("PATH");
+        let mut path = vec![dir.path().to_path_buf()];
+        path.extend(entries(&saved_path));
+        let new_path = std::env::join_paths(path).expect("join PATH");
+        // Safety: serialized via PATH_LOCK, held by this value and
+        // released only after `Drop` has restored PATH.
+        unsafe {
+            std::env::set_var("PATH", new_path);
+        }
+        FakeProgram { _lock: lock, dir, log, saved_path, _shadows: None }
+    }
+
+    /// An executable `name` at the front of `PATH`. `body` runs after
+    /// the invocation has been logged, in whatever directory the caller
+    /// spawned it from.
+    pub async fn install(name: &str, body: &str) -> Self {
+        let fake = Self::take_path(|saved| {
+            saved.as_ref().map(|p| std::env::split_paths(p).collect()).unwrap_or_default()
+        })
+        .await;
+        fake.add(name, body);
+        fake
+    }
+
+    /// The current `PATH` with the programs in `hidden` taken off it, so
+    /// that they are absent whether or not this machine has them installed.
+    ///
+    /// Everything else stays reachable, because tests that do not take
+    /// [`PATH_LOCK`] still run meanwhile and spawn whatever they need: a
+    /// directory holding a hidden program is replaced by one that links
+    /// every other entry in it.
+    pub async fn without(hidden: &[&str]) -> Self {
+        let shadows = tempfile::tempdir().expect("tempdir");
+        let mut fake = Self::take_path(|saved| {
+            let Some(saved) = saved else { return Vec::new() };
+            std::env::split_paths(saved)
+                .enumerate()
+                .map(|(i, dir)| {
+                    if !hidden.iter().any(|name| dir.join(name).exists()) {
+                        return dir;
+                    }
+                    let shadow = shadows.path().join(i.to_string());
+                    std::fs::create_dir_all(&shadow).expect("shadow dir");
+                    for entry in std::fs::read_dir(&dir).expect("read PATH dir").flatten() {
+                        let name = entry.file_name();
+                        if !hidden.iter().any(|h| name == std::ffi::OsStr::new(h)) {
+                            let _ = std::os::unix::fs::symlink(entry.path(), shadow.join(&name));
+                        }
+                    }
+                    shadow
+                })
+                .collect()
+        })
+        .await;
+        fake._shadows = Some(shadows);
+        fake
+    }
+
+    /// Install one more fake program `name` beside the others.
+    pub fn add(&self, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let program = self.dir.path().join(name);
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s %s\\n' {name:?} \"$*\" >> {:?}\n{body}\n",
+                self.log
+            ),
+        )
+        .expect("write fake program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake program");
+    }
+
+    pub fn invocations(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for FakeProgram {
+    fn drop(&mut self) {
+        // Safety: PATH_LOCK is still held; `_lock` drops after this.
+        unsafe {
+            match &self.saved_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+}
+
 /// The IPC server, reachable from the integration tests.
 ///
 /// `tests/ipc_integration.rs` is a separate crate, so it can only name items
@@ -93,10 +208,7 @@ pub fn ipc_test_context(paths: std::sync::Arc<crate::config::paths::AppPaths>) -
             crate::config::features::FeatureFlags::default(),
         )),
         repositories: Arc::new(RwLock::new(HashMap::new())),
-        worktree_manager: Arc::new(crate::worktree::WorktreeManager::new(
-            paths.clone(),
-            crate::config::paths::WorktreePlacement::default(),
-        )),
+        worktree_manager: Arc::new(crate::worktree::WorktreeManager::new(paths.clone())),
         task_lifecycle_locks: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
         executor: Arc::new(tokio::sync::OnceCell::new()),
         feature_diagnostics: None,

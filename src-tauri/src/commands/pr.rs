@@ -2863,7 +2863,10 @@ const MAX_MERGE_HOPS: usize = 5;
 ///
 /// Decided from the origin recorded on the task (see
 /// [`Task::branch_origin`]), never from what the task's dependencies look
-/// like now. For a stacked branch, starting at the parent:
+/// like now. A branch started from the default base `D` targets `D`
+/// explicitly; one recorded before SlashIt kept which branch that was gets
+/// no `--base`, so GitHub's default branch, as it always did. For a stacked
+/// branch, starting at the parent:
 ///
 /// - its pull request is open: that branch, if it is on `origin`;
 /// - it was merged: the branch it was merged into, where its work now is
@@ -2879,9 +2882,9 @@ const MAX_MERGE_HOPS: usize = 5;
 ///
 /// A task with no recorded origin and a dependency is refused too. No origin
 /// means where its branch started is not known to be on the default base:
-/// the branch was created before SlashIt recorded origins, or its starting
-/// commit was not proven to be contained in `refs/remotes/origin/HEAD` when
-/// it was created (see `WorktreeManager::default_base_origin`). It may carry
+/// the branch was created before SlashIt recorded origins, or by a version
+/// that started ordinary branches wherever the primary checkout was and
+/// could not prove that was on `refs/remotes/origin/HEAD`. It may carry
 /// the dependency's commits, and opening it against the default branch would
 /// put them into its pull request.
 ///
@@ -2900,19 +2903,22 @@ async fn pr_base_for(
     has_dependencies: bool,
 ) -> Result<PrBase, String> {
     let parent = match origin {
-        Some(BranchOrigin::DefaultBase) => return Ok(PrBase::default()),
+        Some(BranchOrigin::DefaultBase { branch: Some(branch) }) => {
+            let branch = checked_task_branch(branch)
+                .map_err(|e| format!("The default branch this task was started from is unusable: {e}"))?;
+            return Ok(PrBase { base: Some(branch.to_string()), landed_parent: None });
+        }
+        Some(BranchOrigin::DefaultBase { branch: None }) => return Ok(PrBase::default()),
         None if !has_dependencies => return Ok(PrBase::default()),
         None => {
             return Err(
                 "This task depends on another task, and its branch's starting point is not \
-                 known to be on the default base: the branch was created before SlashIt \
-                 recorded where branches start, or its starting commit was not proven to be \
-                 contained in refs/remotes/origin/HEAD. SlashIt cannot tell whether the pull \
-                 request belongs on the dependency's branch or on the default branch. Open it \
-                 with `gh pr create --base <branch>`; creating the pull request here afterwards \
-                 links it to the task. If the repository has no refs/remotes/origin/HEAD, \
-                 `git remote set-head origin --auto` records it for branches created from \
-                 then on."
+                 known to be on the default base: the branch was created by a version of \
+                 SlashIt that did not record where branches start, or that could not prove its \
+                 starting commit was on refs/remotes/origin/HEAD. SlashIt cannot tell whether \
+                 the pull request belongs on the dependency's branch or on the default branch. \
+                 Open it with `gh pr create --base <branch>`; creating the pull request here \
+                 afterwards links it to the task."
                     .to_string(),
             )
         }
@@ -3115,7 +3121,8 @@ const GITHUB_PR_COMMIT_LIST_LIMIT: usize = 250;
 /// conflicting files; the backup ref is deleted once the old tip is verified
 /// and kept, and named, when it could not be. A verified replay is recorded
 /// in one durable write, `base_commit` set to the commit replayed onto and
-/// `branch_origin` to [`BranchOrigin::DefaultBase`], and only if the task
+/// `branch_origin` to [`BranchOrigin::DefaultBase`] naming the default
+/// branch it was replayed onto, and only if the task
 /// still records the branch, fork point and parent the replay started from;
 /// a write that fails or finds them changed rolls the branch back as well
 /// ([`crate::worktree::restack::Restack::roll_back`]).
@@ -3413,7 +3420,8 @@ async fn restack_onto_landed_parent(
                 && task.branch_origin.as_ref() == Some(&stacked)
             {
                 task.base_commit = Some(onto.clone());
-                task.branch_origin = Some(BranchOrigin::DefaultBase);
+                task.branch_origin =
+                    Some(BranchOrigin::DefaultBase { branch: Some(default.to_string()) });
                 recorded.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -4360,7 +4368,7 @@ fn build_pr_body(task: &Task) -> String {
 /// which branch it means, so the parameter that allowed it is gone.
 ///
 /// The push itself is always `git push`, in a jj repository too. The task
-/// branch is a Git branch -- created by `git worktree` or `wt` --
+/// branch is a Git branch -- one SlashIt created, or a worktree it adopted --
 /// and `git push -u` is exact about it: it fails when the branch does not
 /// exist, refuses a non-fast-forward update, and records the upstream the
 /// branch then tracks. `jj git push --bookmark` differs on all three: it
@@ -6472,6 +6480,56 @@ mod tests {
             );
         }
 
+        /// A Task Checkout SlashIt creates tracks nothing, even under an
+        /// `autoSetupMerge` that would have it inherit `main`'s upstream,
+        /// until SlashIt's own push, which records `origin/<branch>` as its
+        /// upstream as it does for any branch and leaves the remote's `main`
+        /// alone.
+        #[tokio::test]
+        async fn a_native_task_checkout_gets_its_upstream_from_slashits_own_push() {
+            let repo = RepoFixture::new();
+            git(&repo.checkout, &["remote", "set-head", "origin", "main"]);
+            git(&repo.checkout, &["config", "branch.autoSetupMerge", "inherit"]);
+            let main_on_remote = git(&repo.remote, &["rev-parse", "refs/heads/main"]);
+            let root = repo._tmp.path();
+            let manager = crate::worktree::WorktreeManager::new(std::sync::Arc::new(
+                crate::config::paths::AppPaths::with_roots(
+                    root.join("config"),
+                    root.join("data"),
+                    root.join("cache"),
+                    root.join("runtime"),
+                ),
+            ));
+            let branch = crate::worktree::WorktreeManager::branch_for_task(Uuid::new_v4());
+            let info = manager
+                .create(repo.checkout.to_str().unwrap(), &branch)
+                .await
+                .expect("a task checkout");
+            let worktree = Path::new(&info.path);
+            let upstream = || {
+                StdCommand::new("git")
+                    .args(["config", "--get", &format!("branch.{branch}.remote")])
+                    .current_dir(worktree)
+                    .output()
+                    .expect("git config")
+                    .status
+                    .success()
+            };
+            assert!(!upstream(), "a new task branch tracks nothing");
+            git(worktree, &["commit", "-q", "--allow-empty", "-m", "task work"]);
+            let tip = git(worktree, &["rev-parse", "HEAD"]);
+
+            push_branch(&info.path, &branch).await.expect("the push");
+
+            assert_eq!(repo.remote_has_branch(&branch).as_deref(), Some(tip.as_str()));
+            assert_eq!(git(worktree, &["config", &format!("branch.{branch}.remote")]), "origin");
+            assert_eq!(
+                git(worktree, &["config", &format!("branch.{branch}.merge")]),
+                format!("refs/heads/{branch}")
+            );
+            assert_eq!(git(&repo.remote, &["rev-parse", "refs/heads/main"]), main_on_remote);
+        }
+
         /// The branch check is one of two layers: `git push` must also never
         /// see the branch as a bare argument, whatever the check lets through.
         /// A fake `git` records exactly what `push_branch` hands it. It is
@@ -7378,19 +7436,20 @@ mod tests {
             }
         }
 
-        /// A task started from the default base, and one recorded before
-        /// origins were kept that has no dependency, get exactly the
-        /// `gh pr create` they always did: no `--base`, so GitHub's default.
-        /// A dependency on a task started from the default base does not
-        /// change that; the stack is what was recorded, not what the
-        /// dependencies say now.
+        /// A task recorded as started from the default base before SlashIt
+        /// kept which branch that was, and one recorded before origins were
+        /// kept that has no dependency, get exactly the `gh pr create` they
+        /// always did: no `--base`, so GitHub's default. Which branch that
+        /// was is not re-derived from what GitHub says now. A dependency on
+        /// a task started from the default base does not change that; the
+        /// stack is what was recorded, not what the dependencies say now.
         #[cfg(unix)]
         #[tokio::test(flavor = "multi_thread")]
         async fn an_unstacked_task_opens_its_pull_request_against_the_default_branch() {
             let _guard = PATH_LOCK.lock().await;
             for (origin, with_dependency) in [
-                (Some(crate::domain::BranchOrigin::DefaultBase), false),
-                (Some(crate::domain::BranchOrigin::DefaultBase), true),
+                (Some(crate::domain::BranchOrigin::DefaultBase { branch: None }), false),
+                (Some(crate::domain::BranchOrigin::DefaultBase { branch: None }), true),
                 (None, false),
             ] {
                 let repo = stacked_repo(false);
@@ -7408,6 +7467,34 @@ mod tests {
                     mock.read_log()
                 );
                 assert!(!mock.read_log().contains("task-parent"), "{origin:?}");
+            }
+        }
+
+        /// A task SlashIt started from `origin/<D>` opens its pull request
+        /// against `D` explicitly, whatever GitHub reports as the default
+        /// branch by the time the pull request is opened, and with or
+        /// without a dependency.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_task_started_from_a_resolved_default_base_opens_its_pull_request_against_it() {
+            let _guard = PATH_LOCK.lock().await;
+            for with_dependency in [false, true] {
+                let repo = stacked_repo(false);
+                let mock = MockGh::setup("https://github.com/testorg/testrepo/pull/18", r#"{"state":"OPEN"}"#);
+                let (state, _tmp) = build_test_state().await;
+                let origin =
+                    Some(crate::domain::BranchOrigin::DefaultBase { branch: Some("main".to_string()) });
+                let task_id = seed_origin_task(&state, &repo, origin, with_dependency).await;
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok("https://github.com/testorg/testrepo/pull/18"));
+                assert_eq!(
+                    pr_create_tail(&mock.read_log()),
+                    Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "main".into()]),
+                    "{with_dependency}: {}",
+                    mock.read_log()
+                );
             }
         }
 
@@ -7958,7 +8045,7 @@ mod tests {
                     let tasks = state.task.tasks.read().await;
                     let task = &tasks[&task_id];
                     assert_eq!(task.base_commit.as_deref(), Some(onto.as_str()), "{name}");
-                    assert_eq!(task.branch_origin, Some(crate::domain::BranchOrigin::DefaultBase), "{name}");
+                    assert_eq!(task.branch_origin, Some(crate::domain::BranchOrigin::DefaultBase { branch: Some("main".to_string()) }), "{name}");
                     assert_eq!(task.pr_url.as_deref(), Some(CHILD_PR_URL), "{name}");
                 }
             }
@@ -8525,7 +8612,7 @@ mod tests {
                 );
                 {
                     let tasks = state.task.tasks.read().await;
-                    assert_eq!(tasks[&task_id].branch_origin, Some(crate::domain::BranchOrigin::DefaultBase));
+                    assert_eq!(tasks[&task_id].branch_origin, Some(crate::domain::BranchOrigin::DefaultBase { branch: Some("main".to_string()) }));
                     assert_eq!(tasks[&task_id].base_commit.as_deref(), Some(remote_main(&landed).as_str()));
                 }
                 assert_eq!(
@@ -8771,7 +8858,7 @@ mod tests {
                             assert_eq!(subjects(co, "origin/main..origin/task-branch"), ["B1", "B2"], "{leftover:?}");
                             assert_eq!(ref_at(co, &backup), None, "{leftover:?}");
                             let tasks = state.task.tasks.read().await;
-                            assert_eq!(tasks[&task_id].branch_origin, Some(crate::domain::BranchOrigin::DefaultBase));
+                            assert_eq!(tasks[&task_id].branch_origin, Some(crate::domain::BranchOrigin::DefaultBase { branch: Some("main".to_string()) }));
                         }
                         Leftover::RebaseWithBackupElsewhere | Leftover::BackupElsewhere => {
                             let error = result.expect_err("refused");

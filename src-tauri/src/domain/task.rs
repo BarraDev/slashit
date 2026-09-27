@@ -109,14 +109,15 @@ pub struct Task {
     #[serde(default)]
     pub branch_name: Option<String>,
 
-    /// The commit the task's worktree started from: `git rev-parse HEAD`
-    /// (or the parent branch's tip, for a stacked task) resolved once, at
-    /// the moment the worktree/branch is first created, and never
+    /// The commit the task's worktree started from: the exact commit of the
+    /// default branch on `origin` (or the parent branch's tip, for a stacked
+    /// task) resolved once, at the moment the branch is created, and never
     /// re-derived afterward -- a retry reattaches to the same branch and
     /// must keep comparing against the same starting point, not wherever
     /// the branch tip has since moved to. `None` for a task persisted
     /// before this field existed, or one attached to a branch SlashIt
-    /// didn't create: there is no reliable way to recover a boundary for
+    /// didn't create, including an adopted worktree: there is no reliable
+    /// way to recover a boundary for
     /// those after the fact, so their task diff is truthfully "unknown",
     /// never guessed via `merge-base`/`HEAD~1`.
     ///
@@ -149,9 +150,8 @@ pub struct Task {
     ///
     /// `None` for a branch created before this field existed, or one SlashIt
     /// reattached without creating it: where those started cannot be
-    /// recovered after the fact. `None` too for an ordinary branch whose
-    /// start was not proven to be on the default base (see
-    /// [`BranchOrigin::DefaultBase`]).
+    /// recovered after the fact. `None` too for an ordinary branch created
+    /// by a version that could not prove its start was on the default base.
     #[serde(default)]
     pub branch_origin: Option<BranchOrigin>,
 
@@ -256,22 +256,24 @@ impl Task {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BranchOrigin {
-    /// Starts from the repository's default base. Its pull request targets
-    /// the repository's default branch.
+    /// Starts from the repository's default base.
     ///
-    /// Recorded when the branch is created only if the commit it started
-    /// from was proven then to be contained in `refs/remotes/origin/HEAD`
-    /// (see `worktree::WorktreeManager::default_base_origin`). An ordinary
-    /// branch starts wherever its backend starts it, which may be a feature
-    /// branch or unpushed work; one whose start was not proven, including
-    /// every branch in a repository whose remote is not named `origin` or
-    /// that has no `origin/HEAD`, records no origin at all.
+    /// `branch` is the default branch `D` the branch was started from or
+    /// replayed onto, as SlashIt resolved it then: an ordinary branch it
+    /// creates starts at the exact commit `refs/remotes/origin/<D>` named
+    /// (see `worktree::default_base::resolve_default_base`), and a restacked one was
+    /// replayed onto the default branch its parent was merged into. Its pull
+    /// request targets `D` explicitly.
     ///
-    /// Also recorded when SlashIt restacked a [`Self::Stacked`] branch onto
-    /// the default branch, after verifying the replayed branch contains the
-    /// exact default-branch commit it was replayed onto, which is then the
-    /// task's `base_commit`.
-    DefaultBase,
+    /// `None` is what every record written before the branch was kept
+    /// deserializes to, and serializes exactly as those records were
+    /// written (`kind = "default_base"` and nothing else). Where such a
+    /// branch was started is not re-derived: its pull request targets the
+    /// repository's default branch as GitHub reports it, as it always did.
+    DefaultBase {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+    },
     /// Created at the tip of a dependency's branch, `parent_branch`, so that
     /// it builds on that work, and not moved off it by SlashIt since. Its
     /// pull request targets `parent_branch` while the parent is still open.
@@ -749,6 +751,40 @@ mod tests {
         assert_eq!(task.branch_origin, None);
     }
 
+    /// A record written before the default branch was kept, in TOML and
+    /// in JSON, reads as a default base with no branch; and such an origin
+    /// is written back exactly as it was read, so a board file an older
+    /// version shares is not rewritten into something it cannot parse.
+    #[test]
+    fn a_legacy_default_base_reads_and_writes_as_it_always_did() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Holder {
+            origin: BranchOrigin,
+        }
+        let legacy = BranchOrigin::DefaultBase { branch: None };
+
+        let toml_text = "[origin]\nkind = \"default_base\"\n";
+        let read: Holder = toml::from_str(toml_text).expect(toml_text);
+        assert_eq!(read.origin, legacy);
+        assert_eq!(toml::to_string(&read).unwrap(), toml_text);
+
+        let json_text = r#"{"origin":{"kind":"default_base"}}"#;
+        let read: Holder = serde_json::from_str(json_text).expect(json_text);
+        assert_eq!(read.origin, legacy);
+        assert_eq!(serde_json::to_string(&read).unwrap(), json_text);
+
+        let resolved = Holder {
+            origin: BranchOrigin::DefaultBase { branch: Some("main".to_string()) },
+        };
+        assert_eq!(
+            serde_json::to_string(&resolved).unwrap(),
+            r#"{"origin":{"kind":"default_base","branch":"main"}}"#
+        );
+        let toml_text = toml::to_string(&resolved).unwrap();
+        assert_eq!(toml_text, "[origin]\nkind = \"default_base\"\nbranch = \"main\"\n");
+        assert_eq!(toml::from_str::<Holder>(&toml_text).unwrap(), resolved);
+    }
+
     /// Both origins survive the task file (TOML) and IPC (JSON) unchanged.
     #[test]
     fn branch_origin_round_trips_through_toml_and_json() {
@@ -757,7 +793,8 @@ mod tests {
             tasks: Vec<Task>,
         }
         for origin in [
-            BranchOrigin::DefaultBase,
+            BranchOrigin::DefaultBase { branch: None },
+            BranchOrigin::DefaultBase { branch: Some("main".to_string()) },
             BranchOrigin::Stacked { parent_branch: "task-parent".to_string() },
         ] {
             let mut task = startable_task();

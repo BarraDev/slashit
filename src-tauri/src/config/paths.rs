@@ -104,22 +104,25 @@ pub enum ResolvedLocation {
     InProject,
 }
 
-/// Who decides where a SlashIt-managed worktree is created.
+/// The `[worktree] placement` setting.
+///
+/// Every Task Checkout SlashIt creates is placed under its own external
+/// root with `git worktree add`, whichever of these the configuration says;
+/// the setting no longer chooses anything. It is kept, with both spellings,
+/// so that every configuration file already on disk still parses: a
+/// variant that stopped existing would fail the strict read of the whole
+/// file, and the lenient recovery that follows keeps only what it can.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorktreePlacement {
-    /// Delegate to worktrunk (`wt`) when it is installed, otherwise behave as
-    /// [`Self::Managed`].
-    ///
-    /// This is the default because `wt` is the user's own tool: it runs their
-    /// configured hooks and honours their `worktree-path` template. `wt switch`
-    /// has no target-path flag, so delegating means SlashIt cannot dictate the
-    /// location — which is the point. Nothing lands inside the project either
-    /// way.
-    #[default]
+    /// The spelling earlier versions wrote by default, when it meant
+    /// "delegate to Worktrunk (`wt`) when it is installed". It now means
+    /// the same as [`Self::Managed`]. An earlier version reading it again
+    /// would delegate again; see the changelog.
     Auto,
-    /// Always place worktrees under SlashIt's own external root, using plain
-    /// `git worktree add` with an explicit path.
+    /// Place worktrees under SlashIt's own external root, using plain
+    /// `git worktree add` with an explicit path. Written by default.
+    #[default]
     Managed,
 }
 

@@ -622,11 +622,6 @@ mod tests {
 
     /// A context whose worktrees are SlashIt's own, plus a real repository, a
     /// project pointing at it, and one task holding a real checkout.
-    ///
-    /// The placement is pinned to `Managed` rather than left at the default
-    /// `Auto`, which delegates to `wt` when the developer happens to have it
-    /// installed. What is under test is the handler's policy, and it must not
-    /// depend on which tools the machine running the test owns.
     async fn world(dirty: bool) -> (tempfile::TempDir, IpcContext, Uuid, String) {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
@@ -637,10 +632,7 @@ mod tests {
         ));
 
         let mut ctx = ipc_test_context(paths.clone());
-        ctx.worktree_manager = Arc::new(crate::worktree::WorktreeManager::new(
-            paths,
-            crate::config::paths::WorktreePlacement::Managed,
-        ));
+        ctx.worktree_manager = Arc::new(crate::worktree::WorktreeManager::new(paths));
 
         let repo_dir = tmp.path().join("repo");
         std::fs::create_dir_all(&repo_dir).unwrap();
@@ -650,6 +642,13 @@ mod tests {
         std::fs::write(repo_dir.join("README.md"), "seed\n").unwrap();
         git(&repo_dir, &["add", "."]);
         git(&repo_dir, &["commit", "-m", "seed"]);
+        // A bare `origin` whose `HEAD` is recorded locally, so that the task
+        // checkout has a default base to start from.
+        let origin = tmp.path().join("origin.git");
+        git(&repo_dir, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+        git(&repo_dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&repo_dir, &["push", "-q", "origin", "main"]);
+        git(&repo_dir, &["remote", "set-head", "origin", "main"]);
         let repo_path = repo_dir.to_string_lossy().to_string();
 
         let repository_id = Uuid::new_v4();

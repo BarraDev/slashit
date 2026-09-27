@@ -106,10 +106,7 @@ pub async fn build_state_with_paths(
         // Installed by the caller: a webview sink in the GUI, a logging sink
         // in the daemon.
         events: Arc::new(std::sync::OnceLock::new()),
-        worktree_manager: Arc::new(worktree::WorktreeManager::new(
-            paths.clone(),
-            loaded_config.worktree.placement,
-        )),
+        worktree_manager: Arc::new(worktree::WorktreeManager::new(paths.clone())),
         // The resolved set, not the persisted one: what the application does
         // has to match what it reports.
         features: Arc::new(tokio::sync::RwLock::new(
@@ -166,6 +163,11 @@ pub async fn build_state_with_paths(
     // concurrent caller would have to know about. Nothing needs it: the map
     // depends only on projects and repositories.
     let repo_for_project = repository_paths_by_project(&app_state).await;
+    // Tasks recording a branch another task in the same repository records
+    // too. Neither is re-pointed at a checkout of it below; see
+    // `worktree::tasks_sharing_a_recorded_branch`.
+    let shared_branch_owner =
+        worktree::tasks_sharing_a_recorded_branch(&loaded_tasks, &repo_for_project).await;
 
     let mut migrated_projects: HashSet<uuid::Uuid> = HashSet::new();
     {
@@ -293,6 +295,23 @@ pub async fn build_state_with_paths(
             };
 
             match recovery {
+                worktree::WorktreeRecovery::Adopt(path) if shared_branch_owner.contains_key(&task.id) => {
+                    let other = shared_branch_owner[&task.id];
+                    let branch = task.branch_name.as_deref().unwrap_or_default();
+                    eprintln!(
+                        "Warning: worktree of branch {branch} for task '{}' was found at {path}, \
+                         but task {other} records the same branch; keeping the recorded reference",
+                        task.title
+                    );
+                    // Kept, not cleared: the checkout exists, and clearing
+                    // would spend the only record of it.
+                    task.error_message = Some(format!(
+                        "The worktree of branch {branch} is now at {path}, but task {other} records \
+                         the same branch, so SlashIt cannot tell which task it belongs to and did \
+                         not point this task at it. Delete whichever of the two tasks does not own \
+                         that branch."
+                    ));
+                }
                 worktree::WorktreeRecovery::Adopt(path) => {
                     println!(
                         "SlashIt: Adopted relocated worktree for task '{}' at {path}",
@@ -745,7 +764,7 @@ mod tests {
     async fn startup_adopts_a_worktree_registered_at_a_non_conventional_path() {
         // Regression guard: a worktree git still has registered for a task's
         // branch, but at a path that matches neither of SlashIt's own
-        // managed/legacy conventions (e.g. one `wt` placed under its own
+        // managed/legacy conventions (e.g. one Worktrunk placed under its own
         // naming scheme), must be adopted at startup rather than having its
         // reference cleared -- clearing would strand the worktree with no
         // way for the app to find it again.
@@ -843,6 +862,98 @@ mod tests {
             Some(unconventional_worktree.to_string_lossy().as_ref()),
             "worktree_path must be repointed at the git-confirmed location, not cleared"
         );
+    }
+
+    /// Two tasks that both record one branch, whose recorded checkout moved,
+    /// are neither re-pointed at the checkout git has registered for it:
+    /// nothing says which of them it belongs to, and a re-pointed reference
+    /// would let one task's cleanup or push act on the other's checkout.
+    /// Both references are kept as they were, and both tasks say why.
+    #[tokio::test]
+    async fn startup_does_not_repoint_two_tasks_recording_one_branch_at_its_checkout() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_dir, &["config", "user.name", "Test"]);
+        run_git(&repo_dir, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+        let branch = "task-12345678";
+        let moved_to = tmp.path().join("wherever-it-moved");
+        run_git(&repo_dir, &["worktree", "add", "-q", moved_to.to_str().unwrap(), "-b", branch]);
+
+        let repository = domain::Repository {
+            id: uuid::Uuid::new_v4(),
+            local_path: repo_dir.to_string_lossy().to_string(),
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        let project = domain::Project {
+            id: uuid::Uuid::new_v4(),
+            name: "test-project".to_string(),
+            repository_id: Some(repository.id),
+            scope: domain::ProjectScope::Standalone,
+            state_location: config::paths::StateLocation::External,
+            agent_type: domain::AgentType::ClaudeCode,
+            agent_config: domain::AgentConfig {
+                agent_type: domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let stale = tmp.path().join("stale-recorded-path").to_string_lossy().to_string();
+        let ids = [
+            uuid::Uuid::from_u128(0x12345678_0000_4000_8000_000000000001),
+            uuid::Uuid::from_u128(0x12345678_0000_4000_8000_000000000002),
+        ];
+        let tasks: Vec<Task> = ids
+            .iter()
+            .map(|id| {
+                let mut task = crate::test_helpers::create_test_task("A task");
+                task.id = *id;
+                task.project_id = project.id;
+                task.status = domain::TaskStatus::Done;
+                task.branch_name = Some(branch.to_string());
+                task.worktree_path = Some(stale.clone());
+                task
+            })
+            .collect();
+
+        let storage = Storage::with_paths((*paths).clone());
+        let mut cfg = config::storage::AppConfig {
+            projects: HashMap::new(),
+            repositories: HashMap::new(),
+            agent_configs: HashMap::new(),
+            jj_config: Default::default(),
+            worktree: Default::default(),
+            ui_preferences: Default::default(),
+        };
+        cfg.repositories.insert(repository.id.to_string(), repository);
+        cfg.projects.insert(project.id.to_string(), project.clone());
+        storage.save_config(&cfg).expect("save config");
+        storage.save_project_tasks(project.id, &tasks).expect("save tasks");
+
+        let (state, report) = build_state_with_paths(paths).await.expect("hydration must succeed");
+
+        assert_eq!(report.adopted_worktrees, 0, "neither task is given the moved checkout");
+        assert_eq!(report.cleared_worktrees, 0, "neither reference is spent");
+        let hydrated = state.task.tasks.read().await;
+        for (id, other) in [(ids[0], ids[1]), (ids[1], ids[0])] {
+            let task = &hydrated[&id];
+            assert_eq!(task.worktree_path.as_deref(), Some(stale.as_str()));
+            let why = task.error_message.as_deref().unwrap_or_default();
+            assert!(why.contains(&other.to_string()), "{why}");
+        }
+        drop(hydrated);
+        let persisted = storage.load_project_tasks(project.id).expect("load tasks");
+        assert!(persisted.iter().all(|t| t.error_message.is_some()), "the reason survives a restart");
     }
 
     /// A repository, a project and a task with an interrupted cleanup recorded

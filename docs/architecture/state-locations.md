@@ -142,26 +142,72 @@ Sanitising alone would make `feat/login` and `feat-login` collide, so when
 sanitisation actually changes the name a short hash of the original branch is
 appended. Names that need no sanitisation stay readable.
 
-### Worktrunk
-
-If [worktrunk](https://github.com/max-sixty/worktrunk) (`wt`) is installed,
-SlashIt delegates placement to it by default. `wt switch` accepts no target
-path — the location comes from your own `worktree-path` template — and that is
-the point: it is your tool and your hooks. Set `worktree.placement = "managed"`
-in `config.toml` to take the decision back and always use SlashIt's own root.
-
-Either way nothing lands inside the project. The unavoidable exception is
+Nothing lands inside the project. The unavoidable exception is
 `.git/worktrees/<name>`, which git itself maintains inside `.git/` and which is
 invisible to the working tree.
 
+SlashIt creates every worktree itself, with `git worktree add`. No other tool
+is consulted, and having [worktrunk](https://github.com/max-sixty/worktrunk)
+(`wt`) installed or not makes no difference. Earlier versions delegated
+placement to `wt` when it was installed, but always with its hooks turned off
+(`--no-verify`, `--no-hooks`), so no Worktrunk hook ever ran for a SlashIt
+task either way.
+
+`[worktree] placement` in `config.toml` accepts `"managed"` (written by
+default) and `"auto"` (what earlier versions wrote), and both mean SlashIt's
+own root. A configuration that still says `"auto"` needs no change. Going back
+to an earlier version with it, though, would delegate to `wt` again on a
+machine that has it; set `"managed"` first if that matters.
+
+### Where a new task branch starts
+
+An ordinary task branch starts at the exact commit
+`refs/remotes/origin/<default>` names, never at whatever the primary checkout
+has checked out. The default branch is read, from local refs only, from
+`refs/remotes/origin/HEAD`, as `git clone` or `git remote set-head origin`
+records it. In a Jujutsu-colocated repository where that ref is missing,
+Jujutsu's `trunk()` alias is used instead, but only when it is exactly
+`<branch>@origin` and that branch has been fetched. Otherwise the task is
+refused with the command to run, typically `git remote set-head origin --auto`.
+SlashIt never fetches to find out. A repository without a remote named
+`origin` cannot start ordinary tasks.
+
+The branch is created with no upstream, whatever `branch.autoSetupMerge`
+says, so SlashIt never points a bare `git push` or `git pull` in a task's
+checkout at the default branch. A push refspec the user configures, such as
+`remote.origin.push=HEAD:refs/heads/main`, still applies there as anywhere
+else. SlashIt's own push, when it opens the pull request, records
+`origin/<branch>` as the upstream. The pull request targets the default branch
+the task was started from.
+
 ### Adoption
 
-An existing worktree is always adopted rather than recreated. On upgrade,
-SlashIt checks the managed path and then the legacy sibling path before
-creating anything, and a task whose recorded worktree path no longer resolves
-is re-pointed at the worktree's current location before the reference is
-treated as stale. The previous behaviour cleared the reference, stranding the
-branch and any uncommitted work in it.
+An existing worktree is always adopted rather than recreated. Before creating
+or reattaching anything, SlashIt checks the managed path, then the legacy
+sibling path, then any other path git has registered for exactly the task's
+branch, such as one `wt` placed under its own template, which stays where it
+is. The repository's own checkout is never adopted: neither the Project's
+path nor, when the Project is itself a linked worktree, the main worktree git
+lists first. A task whose branch is checked out there is refused and told
+where. An adopted worktree records no starting commit or origin, since its
+`HEAD` is not where the branch started; the task keeps whatever it had
+recorded.
+
+Task branch names use only the first eight hex digits of the task's id, so two
+tasks can be given the same one, and git cannot say which task a branch or
+worktree of that name belongs to. Before reattaching, adopting, resuming or
+creating anything, SlashIt refuses the task, naming the other task, when
+another task in the same git repository can claim the branch. A task that
+records the branch competes only with another task that records it too. A
+task that records no branch also competes with any task that records none and
+would be given the same name. Projects whose repositories are the same
+directory, or linked worktrees of one repository, count as the same
+repository. A task whose recorded worktree path
+no longer resolves is re-pointed at the worktree's current location before the
+reference is treated as stale, unless another task in the same repository
+records the same branch. Then neither task is re-pointed: both keep the
+reference they had and say why. The previous behaviour cleared the reference,
+stranding the branch and any uncommitted work in it.
 
 ## Directories by platform
 

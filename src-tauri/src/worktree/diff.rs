@@ -98,8 +98,8 @@ pub async fn task_diff(working_dir: &str, base_commit: Option<&str>) -> Result<T
 async fn jj_task_diff(working_dir: &str) -> Option<TaskDiff> {
     // jj's own repo discovery walks up parent directories exactly like
     // git's does, so without this check a task worktree nested (however
-    // unexpectedly -- e.g. under an ancestor a user's own `wt` placement
-    // template happens to colocate with a jj-managed repo) could silently
+    // unexpectedly -- e.g. an adopted worktree that another tool's
+    // placement template put under a jj-managed ancestor) could silently
     // diff that unrelated ancestor's workspace, completely bypassing
     // `base_commit`, instead of failing closed and falling through to the
     // git path below. Requiring `.jj` directly in `working_dir` -- not an

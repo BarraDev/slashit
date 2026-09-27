@@ -50,8 +50,37 @@ release will contain.
 
 - **Worktrees are created outside your repository**, under
   `<data_dir>/worktrees/<project-key>/<branch>` instead of as siblings named
-  `<repo>.<branch>`. Existing worktrees are adopted, not recreated. When
-  worktrunk (`wt`) is installed, placement is still delegated to it.
+  `<repo>.<branch>`. Existing worktrees are adopted, not recreated.
+- **Task Checkouts no longer depend on Worktrunk.** SlashIt creates, reattaches,
+  stacks and removes every task worktree with `git` itself, whether or not
+  `wt` is installed. Earlier builds delegated to `wt` when it was on `PATH`,
+  always with its hooks turned off, so no Worktrunk hook ever ran for a task.
+  Worktrees `wt` already created at its own template paths are adopted where
+  they are, for reattaching, starting and cleanup alike.
+- **An ordinary task branch starts at `origin`'s default branch**, at the exact
+  commit `refs/remotes/origin/<default>` names, instead of at whatever the
+  primary checkout had checked out (a feature branch, or unpushed work in a
+  Jujutsu-colocated repository). The default branch comes from
+  `refs/remotes/origin/HEAD`, or from Jujutsu's `trunk()` alias when that is
+  exactly `<branch>@origin`, and nothing is fetched to find it. A repository
+  with neither now refuses to start the task and says to run
+  `git remote set-head origin --auto`; one without a remote named `origin` is
+  not supported. The new branch tracks nothing until SlashIt pushes it, and its
+  pull request is opened against that default branch explicitly. Tasks created
+  earlier keep the origin they recorded and open their pull requests as before.
+- **A task is refused a branch another task can claim.** Task branch names
+  use only the first eight hex digits of a task's id, so two tasks can share
+  one. A task is no longer given a checkout or branch of that name while
+  another task in the same repository records it, or would be given it too,
+  whatever path the checkout is at; it is refused with the other task named.
+- **`[worktree] placement = "auto"` now means `"managed"`.** Both spellings
+  still load, and new configurations are written with `"managed"`. Downgrade
+  caveat: an earlier build reading a configuration that says `"auto"` delegates
+  to `wt` again wherever it is installed. Change the setting to `"managed"`
+  before going back if that matters. An earlier build that rewrites a
+  project's `tasks.toml` also drops the default branch recorded for each task,
+  so those tasks' pull requests lose their explicit `--base` and go to
+  GitHub's default branch again.
 - `config.toml` is written atomically and with owner-only permissions. It
   carries `AgentConfig::api_key`, and was previously world-readable.
 - Task files move from one global directory into each project's own state
