@@ -142,9 +142,12 @@ the Task's branch checked out, is in the middle of a rebase, merge,
 cherry-pick, revert or bisect, or has unresolved conflicts. A commit that
 fails is reported on the Task: the agent's own work that cannot be
 committed fails the Task, and PR review fixes that could not be committed
-are not pushed. Applying the PR review again commits and pushes the fixes
-an earlier apply made but could not commit (because the commit failed or
-was cancelled), without making them again. A fix already committed is
+are not pushed. An apply in which any fix fails commits and pushes none
+of its fixes, since the failed fix may have left partial edits anywhere in
+the checkout; every edit stays on disk for the user to review. Applying the
+PR review again commits and pushes the fixes an earlier apply made but did
+not commit (because the commit failed, was cancelled, or was withheld after
+a failed fix), without making them again. A fix already committed is
 never committed again, and an apply that made no new fix and has no such
 uncommitted fix commits nothing.
 

@@ -401,8 +401,9 @@ pub struct PrReviewItem {
     pub fix_done: bool,
     /// True while this item's fix is on disk but not recorded in a commit:
     /// set when the fix agent succeeds, cleared once an apply commits the
-    /// checkout or finds nothing left to commit. A commit that fails or is
-    /// cancelled leaves it set, so the next apply commits it without
+    /// checkout or finds nothing left to commit. A commit that fails, is
+    /// cancelled, or is withheld because another fix agent failed in the
+    /// same apply leaves it set, so the next apply commits it without
     /// running the agent again. Only these fixes are ever committed by an
     /// apply; a fix committed earlier is never committed again.
     #[serde(default)]

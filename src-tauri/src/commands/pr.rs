@@ -1007,7 +1007,8 @@ pub async fn address_pr_review(
 /// Each approved Fix item is sent to claude in its own invocation, so a single
 /// max-turns blowout no longer wipes the whole batch. Failures are recorded
 /// per-item; subsequent items still run. Push and replies only happen if at
-/// least one item succeeded.
+/// least one item succeeded, and nothing is committed or pushed when any
+/// item's fix failed.
 pub async fn address_pr_review_inner(
     task: Task,
     working_dir: String,
@@ -1047,6 +1048,10 @@ pub async fn address_pr_review_inner(
     let mut fixed_ids: Vec<u64> = Vec::new();
     let mut failed_ids: Vec<u64> = Vec::new();
     let mut fix_errors: Vec<String> = Vec::new();
+    // Whether a fix agent failed in this apply, with or without a comment
+    // id. A failed agent may have edited any file in the checkout before it
+    // failed, so this apply then commits none of its fixes: see below.
+    let mut a_fix_failed = false;
     let mut replies_posted = 0u32;
     let mut reply_errors: Vec<String> = Vec::new();
 
@@ -1165,6 +1170,7 @@ pub async fn address_pr_review_inner(
                     });
                 }
                 Err(e) => {
+                    a_fix_failed = true;
                     if let Some(id) = item.comment_id { failed_ids.push(id); }
                     fix_errors.push(format!("comment {}: {}", label, e));
                     updated_plan.items[orig_idx].last_error = Some(e.clone());
@@ -1283,7 +1289,35 @@ pub async fn address_pr_review_inner(
         uncommitted.iter().filter(|&&idx| updated_plan.items[idx].reply_posted).count(),
     );
 
-    if cancelled && !options.dry_run && any_new_fix {
+    // Committing stages the whole checkout, and a fix agent that failed may
+    // have left edits anywhere in it, so after a failure no fix is committed
+    // or pushed, not even one that succeeded. Their markers stay set and every
+    // edit stays on disk; an apply without a failure commits them.
+    let withheld = !options.dry_run && a_fix_failed && !uncommitted.is_empty();
+
+    if withheld {
+        let also_cancelled = if cancelled {
+            " The task was also changed while these fixes were being applied."
+        } else {
+            ""
+        };
+        let error = format!(
+            "a review fix failed and may have left partial edits in the task checkout, so the \
+             fixes that succeeded were not committed or pushed with them.{also_cancelled} Review \
+             the checkout and remove only what the failed fix left: the successful fixes are not \
+             made again, so their edits must stay. Then apply again to commit and push \
+             them.{unpushed_replies_note}"
+        );
+        progress(PrReviewProgress {
+            task_id: task_id_str.clone(),
+            kind: "commit_withheld".to_string(),
+            current: None,
+            total: None,
+            comment_id: None,
+            message: Some(error.clone()),
+        });
+        push_error = Some(error);
+    } else if cancelled && !options.dry_run && any_new_fix {
         push_error = Some(format!(
             "the task was changed while these fixes were being applied, so they were not \
              committed or pushed; apply again to commit and push them.{unpushed_replies_note}"
@@ -1293,7 +1327,7 @@ pub async fn address_pr_review_inner(
     // Also on an apply that made no new fix, when an earlier one left fixes
     // uncommitted: applying again commits and pushes them without running
     // their fix agents again.
-    if !options.dry_run && !uncommitted.is_empty() && !cancelled {
+    if !options.dry_run && !uncommitted.is_empty() && !cancelled && !withheld {
         // A real Git commit on the task branch, whether or not jj is
         // installed: see `crate::worktree::commit_checkout`. A branch that
         // does not hold the fixes is never pushed.
@@ -10940,6 +10974,196 @@ mod tests {
                 assert_eq!(repo.remote_has_branch("task-branch"), Some(tip));
                 let status = git(&worktree, &["status", "--porcelain"]);
                 assert!(status.contains("?? partial.txt"), "the partial edit stays uncommitted: {status}");
+            }
+
+            /// A fix agent that fails part way writes `partial.txt` on its
+            /// second run and exits non-zero; every other run succeeds.
+            const SECOND_RUN_FAILS_PART_WAY: &str =
+                "if [ \"$n\" -eq 2 ]; then printf 'partial\\n' > partial.txt; exit 1; fi";
+
+            /// `plan` with a second approved fix item, with or without a
+            /// comment id: a fix item need not answer a comment.
+            fn with_second_item(mut plan: PrReviewPlan, comment_id: Option<u64>) -> PrReviewPlan {
+                let mut item = fix_item(2);
+                item.comment_id = comment_id;
+                plan.items.push(item);
+                plan
+            }
+
+            /// Nothing was committed or pushed, the successful fix is still
+            /// owed a commit, the failed one is not marked fixed, and both
+            /// edits are still on disk, the failed fix's unstaged.
+            fn assert_withheld(
+                label: &str,
+                repo: &RepoFixture,
+                worktree: &Path,
+                tip: &str,
+                result: &PrReviewApplyResult,
+                plan: &PrReviewPlan,
+            ) {
+                assert!(!result.pushed, "{label}: nothing may be pushed: {result:?}");
+                assert_eq!(repo.remote_has_branch("task-branch"), None, "{label}: nothing may be pushed");
+                assert_eq!(git(worktree, &["rev-parse", "task-branch"]), tip, "{label}: no commit is made");
+                assert!(plan.items[0].fix_done, "{label}: the successful fix stays recorded");
+                assert!(plan.items[0].fix_uncommitted, "{label}: the successful fix is still owed a commit");
+                assert!(!plan.items[1].fix_done, "{label}: the failed fix is not marked fixed");
+                assert!(!plan.items[1].fix_uncommitted, "{label}: the failed fix is not owed a commit");
+                let status = git(worktree, &["status", "--porcelain"]);
+                assert!(status.contains(" review-fix-1.txt"), "{label}: the successful fix stays on disk: {status}");
+                assert!(status.contains("?? partial.txt"), "{label}: the partial edit stays on disk: {status}");
+                let error = result.push_error.as_deref().unwrap_or_default();
+                assert!(
+                    error.contains("a review fix failed") && error.contains("not committed or pushed"),
+                    "{label}: the result must say why nothing was committed: {error:?}"
+                );
+            }
+
+            /// One apply where one fix succeeds and a later one fails part
+            /// way commits and pushes nothing: the failed agent may have
+            /// edited any file, so the checkout cannot be committed as a
+            /// batch. Holds whether or not the failed item has a comment id.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_apply_where_one_fix_fails_commits_none_of_its_fixes() {
+                let _guard = PATH_LOCK.lock().await;
+                for comment_id in [Some(2), None] {
+                    let label = format!("failed item comment id {comment_id:?}");
+                    let repo = RepoFixture::new();
+                    let worktree = task_checkout_for_review(&repo, false);
+                    let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                    let claude = EditingClaude::install(SECOND_RUN_FAILS_PART_WAY);
+                    let (state, tmp) = build_test_state().await;
+                    let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                    let (result, plan) = apply(
+                        &task,
+                        with_second_item(plan, comment_id),
+                        &worktree,
+                        tmp.path().join("no-such-jj"),
+                        false,
+                    )
+                    .await;
+                    drop(claude);
+
+                    assert_eq!(result.fixed_ids, vec![1], "{label}: {result:?}");
+                    assert_withheld(&label, &repo, &worktree, &tip, &result, &plan);
+                    assert_eq!(git(&worktree, &["diff", "--cached", "--name-only"]), "", "{label}: nothing is staged");
+                }
+            }
+
+            /// A fix an earlier apply left uncommitted is not committed
+            /// together with the partial edit of a fix that fails in a
+            /// later apply.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_pending_fix_is_not_committed_with_a_later_failed_fixs_partial_edit() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let hook = reject_commits(&repo);
+                let claude = EditingClaude::install(SECOND_RUN_FAILS_PART_WAY);
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(!first.pushed, "{first:?}");
+                assert!(plan.items[0].fix_done && plan.items[0].fix_uncommitted, "{:?}", plan.items[0]);
+                std::fs::remove_file(&hook).unwrap();
+
+                let (second, plan) = apply(&task, with_second_item(plan, Some(2)), &worktree, no_jj, false).await;
+
+                assert_eq!(claude.runs(), 2, "the pending fix is not made again");
+                assert!(second.fixed_ids.is_empty(), "{second:?}");
+                assert_withheld("pending fix", &repo, &worktree, &tip, &second, &plan);
+            }
+
+            /// Once the checkout is safe again, the next apply runs only the
+            /// fix that failed, then commits and pushes it with the one that
+            /// succeeded earlier, and clears both commit markers.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn applying_again_after_a_failed_fix_commits_the_withheld_fixes() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let claude = EditingClaude::install(SECOND_RUN_FAILS_PART_WAY);
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) =
+                    apply(&task, with_second_item(plan, None), &worktree, no_jj.clone(), false).await;
+                assert_withheld("first apply", &repo, &worktree, &tip, &first, &plan);
+
+                // The user discards the failed fix's partial edit.
+                std::fs::remove_file(worktree.join("partial.txt")).unwrap();
+                let (second, plan) = apply(&task, plan, &worktree, no_jj, false).await;
+
+                assert_eq!(claude.runs(), 3, "only the failed fix runs again");
+                assert!(second.pushed, "{:?}", second.push_error);
+                assert_eq!(second.push_branch.as_deref(), Some("task-branch"));
+                assert_eq!(git(&worktree, &["status", "--porcelain"]), "", "both fixes are committed");
+                assert_eq!(
+                    repo.remote_has_branch("task-branch"),
+                    Some(git(&worktree, &["rev-parse", "task-branch"])),
+                    "the pushed branch is the committed one"
+                );
+                assert!(remote_branch_has_file(&repo, "review-fix-1.txt"), "the earlier fix is pushed");
+                assert!(remote_branch_has_file(&repo, "review-fix-3.txt"), "the retried fix is pushed");
+                assert!(!remote_branch_has_file(&repo, "partial.txt"), "the discarded partial edit is not");
+                assert!(plan.items.iter().all(|i| i.fix_done && !i.fix_uncommitted), "{:?}", plan.items);
+            }
+
+            /// A fix agent killed part way by cancellation counts as a failed
+            /// fix: nothing is committed with its partial edit (as with any
+            /// cancellation), and the result gives the failed fix as the
+            /// reason, so the user reviews the checkout before applying
+            /// again, not only the cancellation.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_killed_by_cancellation_withholds_the_commit_like_any_failed_fix() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                let pidfile = repo.checkout.parent().unwrap().join("blocked.pid");
+                let _claude = EditingClaude::install(&format!(
+                    "if [ \"$n\" -eq 2 ]; then printf 'partial\\n' > partial.txt; \
+                     printf '%s\\n' \"$$\" > {pidfile:?}; exec sleep 300; fi"
+                ));
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let options = AddressPrReviewOptions { auto_push: true, auto_reply: false, dry_run: false };
+                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                let apply = tokio::spawn(test_programs::scope(
+                    [("jj", tmp.path().join("no-such-jj"))],
+                    address_pr_review_inner(
+                        task,
+                        worktree.to_str().unwrap().to_string(),
+                        with_second_item(plan, None),
+                        options,
+                        no_progress(),
+                        cancel_rx,
+                    ),
+                ));
+
+                let blocked = wait_for_pid(|| {
+                    std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
+                })
+                .await;
+                wait_until(|| worktree.join("partial.txt").exists()).await;
+                cancel_tx.send(true).expect("the apply flow is still listening");
+                let (result, plan) = tokio::time::timeout(std::time::Duration::from_secs(10), apply)
+                    .await
+                    .expect("a cancelled apply must settle promptly")
+                    .expect("the apply task must not panic")
+                    .expect("cancellation is reported per item, not as a command error");
+
+                assert_eq!(result.fixed_ids, vec![1], "{result:?}");
+                assert_withheld("cancelled", &repo, &worktree, &tip, &result, &plan);
+                let error = result.push_error.as_deref().unwrap_or_default();
+                assert!(error.contains("also changed"), "the cancellation is reported too: {error:?}");
+                assert_eq!(git(&worktree, &["diff", "--cached", "--name-only"]), "", "nothing is staged");
+                wait_until(|| !pid_is_alive(blocked)).await;
             }
 
             /// Applying again to a plan whose fixes are all committed and
