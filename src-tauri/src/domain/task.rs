@@ -399,6 +399,14 @@ pub struct PrReviewItem {
     /// across modal reopens. A re-run with `fix_done=true` skips the agent.
     #[serde(default)]
     pub fix_done: bool,
+    /// True while this item's fix is on disk but not recorded in a commit:
+    /// set when the fix agent succeeds, cleared once an apply commits the
+    /// checkout or finds nothing left to commit. A commit that fails or is
+    /// cancelled leaves it set, so the next apply commits it without
+    /// running the agent again. Only these fixes are ever committed by an
+    /// apply; a fix committed earlier is never committed again.
+    #[serde(default)]
+    pub fix_uncommitted: bool,
     /// True once a reply (inline or fallback PR comment) was posted on GitHub
     /// for this item. Decoupled from `fix_done` so a successful fix with a
     /// failed reply leaves the item visibly pending in the "Sync replies" path.
@@ -459,9 +467,11 @@ pub struct PrReviewApplyResult {
     /// summary so the user knows which items need manual attention.
     #[serde(default)]
     pub fix_errors: Vec<String>,
-    /// Set when `auto_push=true` and the push failed AFTER at least one fix
-    /// was applied. The fixes are still on disk; this records why the branch
-    /// did not reach the remote.
+    /// Set when at least one fix was applied but the branch did not reach
+    /// the remote as it should have: the fixes could not be committed (and
+    /// so nothing was pushed), the apply was cancelled before committing, or
+    /// `auto_push=true` and the push itself failed. The fixes are still on
+    /// disk; this records why.
     #[serde(default)]
     pub push_error: Option<String>,
     /// Whether this apply ran with `auto_reply=true` — `Some(true)`/`Some(false)`

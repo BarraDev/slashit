@@ -104,23 +104,7 @@ impl FakeProgram {
         let shadows = tempfile::tempdir().expect("tempdir");
         let mut fake = Self::take_path(|saved| {
             let Some(saved) = saved else { return Vec::new() };
-            std::env::split_paths(saved)
-                .enumerate()
-                .map(|(i, dir)| {
-                    if !hidden.iter().any(|name| dir.join(name).exists()) {
-                        return dir;
-                    }
-                    let shadow = shadows.path().join(i.to_string());
-                    std::fs::create_dir_all(&shadow).expect("shadow dir");
-                    for entry in std::fs::read_dir(&dir).expect("read PATH dir").flatten() {
-                        let name = entry.file_name();
-                        if !hidden.iter().any(|h| name == std::ffi::OsStr::new(h)) {
-                            let _ = std::os::unix::fs::symlink(entry.path(), shadow.join(&name));
-                        }
-                    }
-                    shadow
-                })
-                .collect()
+            path_entries_without(saved, hidden, shadows.path())
         })
         .await;
         fake._shadows = Some(shadows);
@@ -146,6 +130,36 @@ impl FakeProgram {
     pub fn invocations(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
+}
+
+/// The entries of `path` with the programs in `hidden` taken off them: a
+/// directory holding a hidden program is replaced by one under `shadows`
+/// that links every other entry in it, so everything else stays reachable,
+/// for this test and for tests that do not take [`PATH_LOCK`] and run
+/// meanwhile.
+#[cfg(all(test, unix))]
+pub fn path_entries_without(
+    path: &std::ffi::OsStr,
+    hidden: &[&str],
+    shadows: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    std::env::split_paths(path)
+        .enumerate()
+        .map(|(i, dir)| {
+            if !hidden.iter().any(|name| dir.join(name).exists()) {
+                return dir;
+            }
+            let shadow = shadows.join(i.to_string());
+            std::fs::create_dir_all(&shadow).expect("shadow dir");
+            for entry in std::fs::read_dir(&dir).expect("read PATH dir").flatten() {
+                let name = entry.file_name();
+                if !hidden.iter().any(|h| name == std::ffi::OsStr::new(h)) {
+                    let _ = std::os::unix::fs::symlink(entry.path(), shadow.join(&name));
+                }
+            }
+            shadow
+        })
+        .collect()
 }
 
 #[cfg(all(test, unix))]
@@ -439,6 +453,7 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             approved: true,
             user_note: String::new(),
             fix_done: false,
+            fix_uncommitted: false,
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
@@ -454,6 +469,7 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             approved: false,
             user_note: String::new(),
             fix_done: false,
+            fix_uncommitted: false,
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,

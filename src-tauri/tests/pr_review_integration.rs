@@ -7,10 +7,11 @@
 //! test sets PATH to a temp directory containing those mocks (prepended),
 //! then runs the inner function.
 //!
-//! `jj` is invoked by the inner function but the test does NOT set up a
-//! real jj repo; the inner function uses `let _ = run_cmd("jj", ...)` for
-//! describe/export, so missing/failing jj is silently tolerated. We do not
-//! assert on jj behavior here.
+//! The working directory is a real Git repository with one commit on the
+//! tasks' branch, `test-branch`, because a real apply commits the fixes
+//! there and reports a commit that fails. The
+//! mock `claude` edits nothing, so there is nothing to commit. Committing is
+//! covered in `worktree::commit` and the `commands::pr` unit tests.
 
 #[cfg(unix)]
 use std::fs;
@@ -79,6 +80,19 @@ impl MockEnv {
         fs::create_dir_all(&bin_dir).unwrap();
         let working_dir = tmp.path().join("work");
         fs::create_dir_all(&working_dir).unwrap();
+        for args in [
+            &["init", "-q", "-b", "test-branch"][..],
+            &["config", "user.email", "t@example.com"],
+            &["config", "user.name", "T"],
+            &["commit", "-q", "--allow-empty", "-m", "initial"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&working_dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        }
 
         let claude_log = tmp.path().join("claude.log");
         let claude_prompts = tmp.path().join("claude.prompts");
@@ -419,6 +433,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             approved: false,
             user_note: "yes, please add retry with backoff".to_string(),
             fix_done: false,
+            fix_uncommitted: false,
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
@@ -434,6 +449,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             approved: false,
             user_note: "what timeout should we use?".to_string(),
             fix_done: false,
+            fix_uncommitted: false,
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
@@ -449,6 +465,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             approved: false,
             user_note: String::new(),
             fix_done: false,
+            fix_uncommitted: false,
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
@@ -667,6 +684,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             approved: true,
             user_note: String::new(),
             fix_done: false,
+            fix_uncommitted: false,
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
@@ -682,6 +700,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             approved: true,
             user_note: String::new(),
             fix_done: false,
+            fix_uncommitted: false,
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
