@@ -31,7 +31,7 @@ use std::path::Path;
 
 /// The default branch an ordinary task branch starts from, and the commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DefaultBase {
+pub struct ResolvedBase {
     /// `D`, the branch `refs/remotes/origin/<D>` tracks on `origin`. A
     /// branch name [`checked_task_branch`] accepts.
     pub branch: String,
@@ -55,7 +55,7 @@ enum OriginHead {
 
 /// Resolve the default base of the repository at `repo_path`, or say why
 /// there is none SlashIt can use. See the module documentation.
-pub async fn resolve_default_base(repo_path: &str) -> Result<DefaultBase, String> {
+pub async fn resolve_default_base(repo_path: &str) -> Result<ResolvedBase, String> {
     let repo = Path::new(repo_path);
     match origin_head(repo).await? {
         OriginHead::Branch(branch) => {
@@ -65,8 +65,17 @@ pub async fn resolve_default_base(repo_path: &str) -> Result<DefaultBase, String
                      {e}"
                 )
             })?;
-            if let Some(base) = at_origin_branch(repo, branch).await? {
-                return Ok(base);
+            match at_origin_branch(repo, branch).await? {
+                OriginBranch::Found(base) => return Ok(base),
+                OriginBranch::Unusable(why) => {
+                    return Err(format!(
+                        "{ORIGIN_HEAD} in {repo_path} names {ORIGIN_BRANCHES}{branch}, which \
+                         {why}, so a task's branch cannot start there. Fetch origin again, or \
+                         run `git remote set-head origin <default branch>` there, then start \
+                         the task again."
+                    ));
+                }
+                OriginBranch::Missing => {}
             }
         }
         OriginHead::Elsewhere(target) => {
@@ -82,7 +91,7 @@ pub async fn resolve_default_base(repo_path: &str) -> Result<DefaultBase, String
 
     if repo.join(".jj").is_dir() {
         if let Some(branch) = jj_trunk_branch(repo).await {
-            if let Some(base) = at_origin_branch(repo, &branch).await? {
+            if let OriginBranch::Found(base) = at_origin_branch(repo, &branch).await? {
                 return Ok(base);
             }
         }
@@ -91,16 +100,25 @@ pub async fn resolve_default_base(repo_path: &str) -> Result<DefaultBase, String
     Err(refusal(repo, repo_path).await)
 }
 
-/// Read `refs/remotes/origin/HEAD` as the exact ref.
+/// What `for-each-ref` says about exactly `refname`.
+enum Listed {
+    /// Not listed: absent, or a symbolic ref whose target is not there.
+    Absent,
+    /// A ref naming an object directly.
+    Direct,
+    /// A symbolic ref to the ref named.
+    Symbolic(String),
+}
+
+/// Read `refname` as that exact ref.
 ///
 /// `for-each-ref` matches the full ref name only, never a branch or tag that
 /// merely carries the same name, and does not list a symbolic ref whose
-/// target is not there. Its pattern also matches refs below
-/// `refs/remotes/origin/HEAD/`, so only the line for the exact name is
-/// taken.
-async fn origin_head(repo: &Path) -> Result<OriginHead, String> {
+/// target is not there. Its pattern also matches refs below `refname/`, so
+/// only the line for the exact name is taken.
+async fn listed(repo: &Path, refname: &str) -> Result<Listed, String> {
     let output = tokio::process::Command::new("git")
-        .args(["for-each-ref", "--format=%(refname) %(symref)", ORIGIN_HEAD])
+        .args(["for-each-ref", "--format=%(refname) %(symref)", refname])
         .current_dir(repo)
         .stdin(std::process::Stdio::null())
         .output()
@@ -108,7 +126,7 @@ async fn origin_head(repo: &Path) -> Result<OriginHead, String> {
         .map_err(|e| format!("Failed to run git for-each-ref: {e}"))?;
     if !output.status.success() {
         return Err(format!(
-            "Could not read {ORIGIN_HEAD} in {}: {}",
+            "Could not read {refname} in {}: {}",
             repo.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
@@ -116,29 +134,57 @@ async fn origin_head(repo: &Path) -> Result<OriginHead, String> {
     let listed = String::from_utf8_lossy(&output.stdout);
     let target = listed.lines().find_map(|line| {
         let (name, target) = line.split_once(' ')?;
-        (name == ORIGIN_HEAD).then(|| target.to_string())
+        (name == refname).then(|| target.to_string())
     });
     Ok(match target {
-        None => OriginHead::Missing,
-        Some(target) if target.is_empty() => OriginHead::Missing,
-        Some(target) => match target.strip_prefix(ORIGIN_BRANCHES) {
+        None => Listed::Absent,
+        Some(target) if target.is_empty() => Listed::Direct,
+        Some(target) => Listed::Symbolic(target),
+    })
+}
+
+/// Read `refs/remotes/origin/HEAD`; see [`listed`].
+async fn origin_head(repo: &Path) -> Result<OriginHead, String> {
+    Ok(match listed(repo, ORIGIN_HEAD).await? {
+        Listed::Absent | Listed::Direct => OriginHead::Missing,
+        Listed::Symbolic(target) => match target.strip_prefix(ORIGIN_BRANCHES) {
             Some(branch) => OriginHead::Branch(branch.to_string()),
             None => OriginHead::Elsewhere(target),
         },
     })
 }
 
-/// The base at `refs/remotes/origin/<branch>`, when that exact ref names a
-/// commit object the repository has.
-async fn at_origin_branch(repo: &Path, branch: &str) -> Result<Option<DefaultBase>, String> {
+/// What `refs/remotes/origin/<branch>` is.
+enum OriginBranch {
+    /// A ref naming a commit object the repository has.
+    Found(ResolvedBase),
+    /// There is no such ref.
+    Missing,
+    /// There is, but no branch can start at it, for the reason given.
+    Unusable(&'static str),
+}
+
+/// Read `refs/remotes/origin/<branch>` as that exact ref. Only a ref that
+/// names a commit object directly, which the repository has, is a base; a
+/// symbolic ref is not, since it says nothing about origin's own branch.
+async fn at_origin_branch(repo: &Path, branch: &str) -> Result<OriginBranch, String> {
     let branch = checked_task_branch(branch)?;
-    let Some(commit) = exact_ref(repo, &format!("{ORIGIN_BRANCHES}{branch}")).await? else {
-        return Ok(None);
-    };
-    if !has_commit(repo, &commit).await? || !is_commit_object(repo, &commit).await? {
-        return Ok(None);
+    let refname = format!("{ORIGIN_BRANCHES}{branch}");
+    match listed(repo, &refname).await? {
+        Listed::Absent => return Ok(OriginBranch::Missing),
+        Listed::Symbolic(_) => return Ok(OriginBranch::Unusable("is itself a symbolic ref")),
+        Listed::Direct => {}
     }
-    Ok(Some(DefaultBase { branch: branch.to_string(), commit }))
+    let Some(commit) = exact_ref(repo, &refname).await? else {
+        return Ok(OriginBranch::Missing);
+    };
+    if !has_commit(repo, &commit).await? {
+        return Ok(OriginBranch::Unusable("names a commit this repository does not have"));
+    }
+    if !is_commit_object(repo, &commit).await? {
+        return Ok(OriginBranch::Unusable("names a tag object, not a commit"));
+    }
+    Ok(OriginBranch::Found(ResolvedBase { branch: branch.to_string(), commit }))
 }
 
 /// Whether `oid` is itself a commit, rather than a tag that peels to one: a
@@ -252,7 +298,7 @@ mod tests {
         (temp, repo, tip)
     }
 
-    async fn resolve(repo: &Path) -> Result<DefaultBase, String> {
+    async fn resolve(repo: &Path) -> Result<ResolvedBase, String> {
         resolve_default_base(repo.to_str().unwrap()).await
     }
 
@@ -265,7 +311,7 @@ mod tests {
 
         assert_eq!(
             resolve(&repo).await,
-            Ok(DefaultBase { branch: "trunk".to_string(), commit: tip })
+            Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip })
         );
     }
 
@@ -280,7 +326,7 @@ mod tests {
 
         assert_eq!(
             resolve(&repo).await,
-            Ok(DefaultBase { branch: "release/v2".to_string(), commit: tip })
+            Ok(ResolvedBase { branch: "release/v2".to_string(), commit: tip })
         );
     }
 
@@ -312,7 +358,7 @@ mod tests {
                 git(repo, &["tag", "-a", "-m", "annotated", "v1"]);
                 let tag = git(repo, &["rev-parse", "refs/tags/v1"]);
                 git(repo, &["update-ref", "refs/remotes/origin/trunk", &tag]);
-            }, "git remote set-head origin --auto"),
+            }, "names a tag object, not a commit"),
         ];
         for (name, arrange, expected) in cases {
             let (_temp, repo, tip) = cloned_repo();
@@ -369,7 +415,7 @@ mod tests {
     /// The JJ fallback, with a fake `jj` answering `config get` with
     /// `answer`, in a repository whose `origin/HEAD` is gone.
     #[cfg(unix)]
-    async fn with_jj_answering(answer: &str) -> (Result<DefaultBase, String>, String, String) {
+    async fn with_jj_answering(answer: &str) -> (Result<ResolvedBase, String>, String, String) {
         let fake = crate::test_helpers::FakeProgram::install("jj", &format!("printf '%s\\n' '{answer}'")).await;
         let (_temp, repo, tip) = cloned_repo();
         std::fs::create_dir_all(repo.join(".jj")).unwrap();
@@ -382,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn jj_trunk_naming_a_fetched_origin_branch_is_the_default_base() {
         let (resolved, invocations, tip) = with_jj_answering("trunk@origin").await;
-        assert_eq!(resolved, Ok(DefaultBase { branch: "trunk".to_string(), commit: tip }));
+        assert_eq!(resolved, Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip }));
         assert_eq!(
             invocations,
             "jj --ignore-working-copy --color=never config get revset-aliases.\"trunk()\"\n",
@@ -410,6 +456,23 @@ mod tests {
             let refused = resolved.expect_err(answer);
             assert!(refused.contains("trunk() alias did not name one"), "{answer:?}: {refused}");
         }
+    }
+
+    /// A `refs/remotes/origin/<D>` that is itself a symbolic ref says
+    /// nothing about origin's own branch, and is not a base the JJ fallback
+    /// accepts either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jj_trunk_naming_a_symbolic_origin_ref_is_refused() {
+        let fake = crate::test_helpers::FakeProgram::install("jj", "printf 'alias@origin\\n'").await;
+        let (_temp, repo, _) = cloned_repo();
+        std::fs::create_dir_all(repo.join(".jj")).unwrap();
+        git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/alias", "refs/remotes/origin/trunk"]);
+
+        let refused = resolve(&repo).await.expect_err("a symbolic ref is not a base");
+        assert!(refused.contains("trunk() alias did not name one"), "{refused}");
+        assert!(fake.invocations().contains("config get"));
     }
 
     #[cfg(unix)]

@@ -1,5 +1,5 @@
 use super::checked_task_branch;
-use super::default_base::{resolve_default_base, DefaultBase};
+use super::default_base::{resolve_default_base, ResolvedBase};
 use crate::config::paths::{AppPaths, ProjectKey};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -115,7 +115,7 @@ impl WorktreeManager {
     /// Used at startup to re-point a task whose recorded worktree path no
     /// longer resolves, before the reference is discarded as stale.
     ///
-    /// `porcelain` is the output of `git worktree list --porcelain` for
+    /// `porcelain` is the output of `git worktree list --porcelain -z` for
     /// `repo_path`. A caller adopting many branches from the same repo in a
     /// loop (e.g. one task per branch at startup) should fetch it once via
     /// [`Self::worktree_list_porcelain`] and reuse it, rather than shelling
@@ -125,7 +125,12 @@ impl WorktreeManager {
             .map(|p| p.to_string_lossy().to_string())
     }
 
-    /// Run `git worktree list --porcelain` for `repo_path`, synchronously.
+    /// Run `git worktree list --porcelain -z` for `repo_path`, synchronously.
+    ///
+    /// NUL-separated, because a newline is a valid character in a path: in
+    /// the newline-separated form, a worktree at `/x/dir\nbranch
+    /// refs/heads/<b>` reads as a registration of `<b>` at `/x/dir`, which
+    /// could be any directory at all.
     ///
     /// Exists for callers outside an async context (startup adoption runs
     /// before the Tauri/Tokio runtime is driving anything) that still need
@@ -145,7 +150,7 @@ impl WorktreeManager {
     /// supply that proof out of a failed `git` invocation.
     pub fn worktree_list_porcelain(repo_path: &str) -> Option<String> {
         let output = std::process::Command::new("git")
-            .args(["worktree", "list", "--porcelain"])
+            .args(["worktree", "list", "--porcelain", "-z"])
             .current_dir(repo_path)
             .output()
             .ok()?;
@@ -210,7 +215,7 @@ impl WorktreeManager {
     /// confirms git itself has that exact path registered for `branch`.
     fn adoptable_path(&self, repo_path: &str, branch: &str, porcelain: &str) -> Option<PathBuf> {
         let registered = PathBuf::from(Self::worktree_for_branch(porcelain, branch)?);
-        if !registered.is_dir() {
+        if !registered.is_dir() || Self::is_primary_checkout(&registered, repo_path, porcelain) {
             return None;
         }
 
@@ -255,54 +260,81 @@ impl WorktreeManager {
     /// Only a worktree git has registered with exactly `branch` checked out
     /// is returned, never one on another branch or a detached `HEAD`.
     ///
-    /// `repo_path` is never itself adoptable: the primary checkout is a
-    /// registered worktree for whatever branch it has checked out, and
-    /// without this check a task branch checked out there would get
-    /// repointed at the user's own working copy.
+    /// Neither `repo_path` nor the repository's main worktree is ever
+    /// adoptable; see [`Self::is_primary_checkout`].
     pub fn adopt_any_registered(repo_path: &str, branch: &str, porcelain: &str) -> Option<String> {
         let registered = PathBuf::from(Self::worktree_for_branch(porcelain, branch)?);
-        if !registered.is_dir() {
-            return None;
-        }
-        // The primary checkout is itself a registered worktree for whatever
-        // branch it currently has checked out. Adopting it would repoint the
-        // task at the user's own working copy, and the executor would then run
-        // an agent there and target it for cleanup.
-        // `canonicalize` resolves symlinks so a `..`-relative or
-        // symlink-aliased primary path still compares equal; a canonicalize
-        // failure (a path git listed but that no longer resolves) falls back
-        // to the literal comparison rather than treating it as a match --
-        // failing closed, since an unresolvable primary path is not proof the
-        // candidate is a distinct, safe checkout either.
-        let same_as_primary = match (registered.canonicalize(), Path::new(repo_path).canonicalize()) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => registered == Path::new(repo_path),
-        };
-        if same_as_primary {
+        if !registered.is_dir() || Self::is_primary_checkout(&registered, repo_path, porcelain) {
             return None;
         }
         Some(registered.to_string_lossy().to_string())
     }
 
+    /// Whether `candidate` is a checkout of the user's own rather than one a
+    /// task may be given: `repo_path` itself, or the repository's main
+    /// worktree, which git always lists first.
+    ///
+    /// Both are registered worktrees for whatever branch they have checked
+    /// out. Adopting one would repoint the task at the user's own working
+    /// copy, and the executor would then run an agent there and target it
+    /// for cleanup. They differ when the Project is itself a linked worktree
+    /// of another checkout: git, asked from the Project, lists that other
+    /// checkout first.
+    ///
+    /// `canonicalize` resolves symlinks so a `..`-relative or symlink-aliased
+    /// path still compares equal. A path that cannot be canonicalized is
+    /// compared as it is.
+    fn is_primary_checkout(candidate: &Path, repo_path: &str, porcelain: &str) -> bool {
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let candidate = canonical(candidate);
+        std::iter::once(repo_path)
+            .chain(Self::main_worktree(porcelain))
+            .any(|primary| canonical(Path::new(primary)) == candidate)
+    }
+
+    /// The main worktree's path: the first record git lists.
+    fn main_worktree(porcelain: &str) -> Option<&str> {
+        porcelain.split('\0').next()?.strip_prefix("worktree ")
+    }
+
     /// An existing worktree of `branch` to use rather than create one: first
     /// at the managed or legacy path, then anywhere else git has one
-    /// registered for exactly that branch, never the primary checkout.
+    /// registered for exactly that branch.
     ///
-    /// A listing git could not produce adopts nothing, and whatever is then
-    /// tried instead fails on the same git.
-    async fn adoptable_worktree(&self, repo_path: &str, branch: &str) -> Option<String> {
-        let output = tokio::process::Command::new("git")
-            .args(["worktree", "list", "--porcelain"])
+    /// A branch checked out in the primary checkout (see
+    /// [`Self::is_primary_checkout`]) is refused, naming where it is: it is
+    /// never adopted, and git would refuse to check it out a second time
+    /// anyway. A listing git could not produce adopts nothing, and whatever
+    /// is then tried instead fails on the same git.
+    async fn adoptable_worktree(&self, repo_path: &str, branch: &str) -> Result<Option<String>, String> {
+        let Ok(output) = tokio::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain", "-z"])
             .current_dir(repo_path)
             .output()
             .await
-            .ok()?;
+        else {
+            return Ok(None);
+        };
         if !output.status.success() {
-            return None;
+            return Ok(None);
         }
         let porcelain = String::from_utf8_lossy(&output.stdout);
-        self.adopt_existing(repo_path, branch, &porcelain)
+        if let Some(adopted) = self
+            .adopt_existing(repo_path, branch, &porcelain)
             .or_else(|| Self::adopt_any_registered(repo_path, branch, &porcelain))
+        {
+            return Ok(Some(adopted));
+        }
+        match Self::worktree_for_branch(&porcelain, branch) {
+            Some(path) if Self::is_primary_checkout(Path::new(&path), repo_path, &porcelain) => {
+                Err(format!(
+                    "branch {branch} is checked out in {path}, which is the repository's own \
+                     checkout, not one SlashIt gives a task. Check out another branch there, \
+                     then start the task again."
+                ))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Generate a branch name from a task UUID (first 8 chars).
@@ -338,9 +370,9 @@ impl WorktreeManager {
         &self,
         repo_path: &str,
         branch: &str,
-    ) -> Result<(WorktreeInfo, Option<DefaultBase>), String> {
+    ) -> Result<(WorktreeInfo, Option<ResolvedBase>), String> {
         let branch = checked_task_branch(branch)?;
-        if let Some(path) = self.adoptable_worktree(repo_path, branch).await {
+        if let Some(path) = self.adoptable_worktree(repo_path, branch).await? {
             let info = WorktreeInfo { path, branch: branch.to_string() };
             return Ok((info, None));
         }
@@ -418,7 +450,7 @@ impl WorktreeManager {
     /// refused, before `git` is run, unless it is a plain branch name.
     pub async fn reattach(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
         let branch = checked_task_branch(branch)?;
-        if let Some(path) = self.adoptable_worktree(repo_path, branch).await {
+        if let Some(path) = self.adoptable_worktree(repo_path, branch).await? {
             return Ok(WorktreeInfo { path, branch: branch.to_string() });
         }
         // Attaching by name alone is not enough: with no local branch of
@@ -824,7 +856,9 @@ impl WorktreeManager {
         Ok(())
     }
 
-    /// Extract the worktree path for `branch` from `git worktree list --porcelain`.
+    /// Extract the worktree path for `branch` from `git worktree list
+    /// --porcelain -z`, whose fields are NUL-terminated and whose records
+    /// end with an empty field.
     ///
     /// Matching is on the exact `branch refs/heads/<name>` record, not a
     /// substring of the whole block. A substring test matches the `worktree
@@ -835,7 +869,7 @@ impl WorktreeManager {
         let wanted = format!("refs/heads/{branch}");
         let mut current_path: Option<&str> = None;
 
-        for line in porcelain.lines() {
+        for line in porcelain.split('\0') {
             if let Some(path) = line.strip_prefix("worktree ") {
                 current_path = Some(path);
             } else if let Some(reference) = line.strip_prefix("branch ") {
@@ -1126,6 +1160,17 @@ mod tests {
         ))
     }
 
+    /// A `git worktree list --porcelain` listing written with newlines, in
+    /// the NUL-separated form `--porcelain -z` produces.
+    fn z(porcelain: &str) -> String {
+        porcelain.replace('\n', "\0")
+    }
+
+    /// A main worktree record to put first in a hand-written listing, as git
+    /// always lists the main worktree first, and never adopts it.
+    const PRIMARY: &str =
+        "worktree /elsewhere/primary-checkout\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/main\n\n";
+
     fn test_manager() -> WorktreeManager {
         WorktreeManager::new(test_paths())
     }
@@ -1200,7 +1245,8 @@ worktree /home/someone/.local/share/slashit-app/worktrees/app-abcd1234/app
 HEAD 2222222222222222222222222222222222222222
 branch refs/heads/app
 ";
-        let found = WorktreeManager::worktree_for_branch(porcelain, "app");
+        let porcelain = z(porcelain);
+        let found = WorktreeManager::worktree_for_branch(&porcelain, "app");
         assert_eq!(
             found.as_deref(),
             Some("/home/someone/.local/share/slashit-app/worktrees/app-abcd1234/app")
@@ -1214,7 +1260,8 @@ worktree /home/someone/app
 HEAD 1111111111111111111111111111111111111111
 branch refs/heads/feature-two
 ";
-        assert_eq!(WorktreeManager::worktree_for_branch(porcelain, "feature"), None);
+        let porcelain = z(porcelain);
+        assert_eq!(WorktreeManager::worktree_for_branch(&porcelain, "feature"), None);
     }
 
     #[test]
@@ -1228,8 +1275,9 @@ worktree /home/someone/wt/fix
 HEAD 2222222222222222222222222222222222222222
 branch refs/heads/fix
 ";
+        let porcelain = z(porcelain);
         assert_eq!(
-            WorktreeManager::worktree_for_branch(porcelain, "fix").as_deref(),
+            WorktreeManager::worktree_for_branch(&porcelain, "fix").as_deref(),
             Some("/home/someone/wt/fix")
         );
     }
@@ -1265,9 +1313,10 @@ worktree /home/someone/code/my-app
 HEAD 1111111111111111111111111111111111111111
 branch refs/heads/main
 ";
+        let porcelain = z(porcelain);
 
         assert!(
-            mgr.adoptable_path(repo, branch, porcelain).is_none(),
+            mgr.adoptable_path(repo, branch, &porcelain).is_none(),
             "a directory that exists on disk but isn't registered with git must not be adopted"
         );
 
@@ -1287,6 +1336,7 @@ branch refs/heads/main
             managed.display(),
             branch
         );
+        let porcelain = z(&format!("{PRIMARY}{porcelain}"));
 
         let result = mgr.adoptable_path(repo, branch, &porcelain);
         assert_eq!(result.as_deref(), Some(managed.as_path()));
@@ -1309,6 +1359,7 @@ branch refs/heads/main
             "worktree {}\nHEAD 3333333333333333333333333333333333333333\nbranch refs/heads/some-other-branch\n",
             managed.display()
         );
+        let porcelain = z(&porcelain);
 
         assert!(mgr.adoptable_path(repo, branch, &porcelain).is_none());
 
@@ -1331,6 +1382,7 @@ branch refs/heads/main
             "worktree /home/someone/code/my-app\nHEAD 4444444444444444444444444444444444444444\nbranch refs/heads/{}\n",
             branch
         );
+        let porcelain = z(&porcelain);
 
         assert!(mgr.adoptable_path(repo, branch, &porcelain).is_none());
 
@@ -1350,6 +1402,7 @@ branch refs/heads/main
             managed.display(),
             branch
         );
+        let porcelain = z(&format!("{PRIMARY}{porcelain}"));
 
         assert_eq!(
             mgr.adopt_existing(repo, branch, &porcelain),
@@ -1379,6 +1432,7 @@ branch refs/heads/main
             registered_at.display(),
             branch
         );
+        let porcelain = z(&format!("{PRIMARY}{porcelain}"));
 
         assert_eq!(
             WorktreeManager::adopt_any_registered(
@@ -1406,6 +1460,7 @@ branch refs/heads/main
             repo.display(),
             branch
         );
+        let porcelain = z(&porcelain);
 
         assert!(
             WorktreeManager::adopt_any_registered(repo.to_str().unwrap(), branch, &porcelain)
@@ -1436,6 +1491,7 @@ branch refs/heads/main
             alias.display(),
             branch
         );
+        let porcelain = z(&porcelain);
 
         assert!(
             WorktreeManager::adopt_any_registered(repo.to_str().unwrap(), branch, &porcelain)
@@ -1461,10 +1517,11 @@ worktree /home/someone/code/my-app
 HEAD 7777777777777777777777777777777777777777
 branch refs/heads/some-other-branch
 ";
+        let porcelain = z(porcelain);
         assert!(WorktreeManager::adopt_any_registered(
             "/home/someone/code/other-repo",
             branch,
-            porcelain
+            &porcelain
         )
         .is_none());
     }
@@ -1480,6 +1537,7 @@ branch refs/heads/some-other-branch
             Uuid::new_v4(),
             branch
         );
+        let porcelain = z(&porcelain);
         assert!(WorktreeManager::adopt_any_registered(
             "/home/someone/code/other-repo",
             branch,
@@ -2288,6 +2346,7 @@ branch refs/heads/some-other-branch
             managed.display(),
             branch
         );
+        let porcelain = z(&format!("{PRIMARY}{porcelain}"));
 
         let result = mgr.classify_missing_worktree(repo, branch, Some(&porcelain));
 
@@ -2318,6 +2377,7 @@ branch refs/heads/some-other-branch
             external.display(),
             branch
         );
+        let porcelain = z(&format!("{PRIMARY}{porcelain}"));
 
         let result = mgr.classify_missing_worktree(
             repo.to_str().unwrap(),
@@ -2349,6 +2409,7 @@ branch refs/heads/some-other-branch
             repo.display(),
             branch
         );
+        let porcelain = z(&porcelain);
 
         let result = mgr.classify_missing_worktree(
             repo.to_str().unwrap(),
@@ -3486,8 +3547,8 @@ branch refs/heads/some-other-branch
 
     /// The worktrees git has registered, the primary checkout included.
     fn registered_worktrees(repo_path: &str) -> Vec<String> {
-        run_git(repo_path, &["worktree", "list", "--porcelain"])
-            .lines()
+        run_git(repo_path, &["worktree", "list", "--porcelain", "-z"])
+            .split('\0')
             .filter_map(|line| line.strip_prefix("worktree ").map(str::to_string))
             .collect()
     }
@@ -3780,7 +3841,7 @@ branch refs/heads/some-other-branch
             .await;
 
         assert!(result.is_err(), "git reported the attach as failed");
-        let porcelain = run_git(repo_path, &["worktree", "list", "--porcelain"]);
+        let porcelain = run_git(repo_path, &["worktree", "list", "--porcelain", "-z"]);
         let registered = WorktreeManager::registration_for_branch(&porcelain, "task-1234abcd")
             .expect("git registered the worktree before the hook failed");
         assert!(branch_exists(repo_path, "task-1234abcd"), "the checked-out branch must be kept");
@@ -4325,6 +4386,60 @@ branch refs/heads/some-other-branch
         assert!(refused.contains("post-checkout"), "{refused}");
         assert!(branch_exists(repo_path, "task-0a1b2c3d"), "the branch is left as it is");
         assert_eq!(registered_worktrees(repo_path).len(), 2, "and so is the worktree");
+    }
+
+    /// A Project can itself be a linked worktree of another checkout. The
+    /// main worktree git lists first is then the user's own checkout, not
+    /// the Project's, and it is never adopted for a task, even with the
+    /// task's branch checked out there. Nothing is created instead either:
+    /// git refuses a branch checked out elsewhere, so the task is refused
+    /// with where the branch is checked out.
+    #[tokio::test]
+    async fn a_linked_worktree_project_never_adopts_the_main_worktree() {
+        let tmp = create_temp_git_repo();
+        let main_worktree = tmp.path().to_str().unwrap();
+        let project = tmp.root().join("project-w");
+        run_git(main_worktree, &["worktree", "add", "-q", "-b", "project-w", "--", project.to_str().unwrap()]);
+        run_git(main_worktree, &["checkout", "-q", "-b", "task-c0ffee11"]);
+        let before = registered_worktrees(main_worktree);
+        let project = project.to_str().unwrap();
+        let mgr = test_manager();
+
+        let reattached = mgr.reattach(project, "task-c0ffee11").await.map(|info| info.path);
+        let acquired = mgr
+            .create_or_adopt(project, "task-c0ffee11")
+            .await
+            .map(|(info, _)| info.path);
+
+        for (what, result) in [("reattach", reattached), ("acquisition", acquired)] {
+            let refused = result.expect_err(what);
+            assert!(refused.contains(main_worktree), "{what}: {refused}");
+            assert!(refused.contains("checked out"), "{what}: {refused}");
+        }
+        assert_eq!(registered_worktrees(main_worktree), before, "nothing is created");
+    }
+
+    /// A newline in a worktree's path cannot forge a `branch` record in
+    /// git's listing and get an arbitrary directory adopted for a task.
+    #[tokio::test]
+    async fn a_newline_in_a_worktree_path_cannot_forge_a_registration() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let victim = tmp.root().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        let forged = format!("{}\nbranch refs/heads/task-c0ffee11", victim.display());
+        run_git(repo_path, &["worktree", "add", "-q", "-b", "unrelated", "--", &forged]);
+
+        let mgr = test_manager();
+        let (info, created_from) = mgr
+            .create_or_adopt(repo_path, "task-c0ffee11")
+            .await
+            .expect("a new worktree");
+
+        assert!(created_from.is_some(), "created, not adopted: {}", info.path);
+        assert_ne!(Path::new(&info.path), victim.as_path());
+        let listing = WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
+        assert_eq!(WorktreeManager::registration_for_branch(&listing, "unrelated"), Some(forged));
     }
 
     /// A worktree registered at a path SlashIt did not choose is removed

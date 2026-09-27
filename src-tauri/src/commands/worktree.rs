@@ -92,9 +92,8 @@ pub async fn create_worktree(
 /// the task's branch.
 struct AcquiredCheckout {
     info: WorktreeInfo,
-    /// The commit the branch started from, when this call created it or
-    /// adopted a worktree the task never recorded. `None` on reattach, which
-    /// keeps the recorded one.
+    /// The commit the branch started from, when this call created it.
+    /// `None` on reattach and adoption, which keep whatever was recorded.
     base_commit: Option<String>,
     /// What the branch was created from, when that is known. `None` leaves
     /// whatever the task already records.
@@ -127,20 +126,9 @@ async fn acquire_checkout(
             base_commit: Some(base.commit),
             origin: Some(BranchOrigin::DefaultBase { branch: Some(base.branch) }),
         }),
-        // An adopted worktree was made by something that recorded no
-        // origin. Its `HEAD` is the only starting point there is to record,
-        // read from the adopted worktree itself rather than `repo_path`.
-        (info, None) => {
-            let base_commit = tokio::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&info.path)
-                .output()
-                .await
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-            Ok(AcquiredCheckout { info, base_commit, origin: None })
-        }
+        // An adopted worktree claims no start: its `HEAD` is not where the
+        // branch started, and whatever the task already recorded is kept.
+        (info, None) => Ok(AcquiredCheckout { info, base_commit: None, origin: None }),
     }
 }
 
@@ -304,6 +292,7 @@ mod tests {
             std::fs::canonicalize(&acquired.info.path).unwrap(),
             std::fs::canonicalize(&custom).unwrap()
         );
+        assert_eq!(acquired.base_commit, None, "an adopted worktree's HEAD is not its start");
         assert_eq!(acquired.origin, None);
     }
 

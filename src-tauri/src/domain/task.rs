@@ -109,14 +109,15 @@ pub struct Task {
     #[serde(default)]
     pub branch_name: Option<String>,
 
-    /// The commit the task's worktree started from: `git rev-parse HEAD`
-    /// (or the parent branch's tip, for a stacked task) resolved once, at
-    /// the moment the worktree/branch is first created, and never
+    /// The commit the task's worktree started from: the exact commit of the
+    /// default branch on `origin` (or the parent branch's tip, for a stacked
+    /// task) resolved once, at the moment the branch is created, and never
     /// re-derived afterward -- a retry reattaches to the same branch and
     /// must keep comparing against the same starting point, not wherever
     /// the branch tip has since moved to. `None` for a task persisted
     /// before this field existed, or one attached to a branch SlashIt
-    /// didn't create: there is no reliable way to recover a boundary for
+    /// didn't create, including an adopted worktree: there is no reliable
+    /// way to recover a boundary for
     /// those after the fact, so their task diff is truthfully "unknown",
     /// never guessed via `merge-base`/`HEAD~1`.
     ///
@@ -260,7 +261,7 @@ pub enum BranchOrigin {
     /// `branch` is the default branch `D` the branch was started from or
     /// replayed onto, as SlashIt resolved it then: an ordinary branch it
     /// creates starts at the exact commit `refs/remotes/origin/<D>` named
-    /// (see `worktree::resolve_default_base`), and a restacked one was
+    /// (see `worktree::default_base::resolve_default_base`), and a restacked one was
     /// replayed onto the default branch its parent was merged into. Its pull
     /// request targets `D` explicitly.
     ///

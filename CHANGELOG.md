@@ -72,7 +72,10 @@ release will contain.
   still load, and new configurations are written with `"managed"`. Downgrade
   caveat: an earlier build reading a configuration that says `"auto"` delegates
   to `wt` again wherever it is installed. Change the setting to `"managed"`
-  before going back if that matters.
+  before going back if that matters. An earlier build that rewrites a
+  project's `tasks.toml` also drops the default branch recorded for each task,
+  so those tasks' pull requests lose their explicit `--base` and go to
+  GitHub's default branch again.
 - `config.toml` is written atomically and with owner-only permissions. It
   carries `AgentConfig::api_key`, and was previously world-readable.
 - Task files move from one global directory into each project's own state

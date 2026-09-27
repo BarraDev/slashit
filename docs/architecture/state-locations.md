@@ -184,7 +184,12 @@ An existing worktree is always adopted rather than recreated. Before creating
 or reattaching anything, SlashIt checks the managed path, then the legacy
 sibling path, then any other path git has registered for exactly the task's
 branch, such as one `wt` placed under its own template, which stays where it
-is. The primary checkout is never adopted. A task whose recorded worktree path
+is. The repository's own checkout is never adopted: neither the Project's
+path nor, when the Project is itself a linked worktree, the main worktree git
+lists first. A task whose branch is checked out there is refused and told
+where. An adopted worktree records no starting commit or origin, since its
+`HEAD` is not where the branch started; the task keeps whatever it had
+recorded. A task whose recorded worktree path
 no longer resolves is re-pointed at the worktree's current location before the
 reference is treated as stale. The previous behaviour cleared the reference,
 stranding the branch and any uncommitted work in it.
