@@ -3128,8 +3128,11 @@ const GITHUB_PR_COMMIT_LIST_LIMIT: usize = 250;
 /// else moved meanwhile, such as a commit from the task's own terminal, is
 /// left exactly as it is, the backup ref is kept, and pull request creation
 /// is refused naming the branch's tip, the backup ref and the old tip.
-/// After the write the backup ref is deleted: task and branch agree again,
-/// and the old commits stay in the branch's reflog. Since the task then
+/// After the write the backup ref is deleted (compare-and-delete, while it
+/// still holds the old tip): task and branch agree again, and the old
+/// commits stay in the branch's reflog. If deleting it fails, that is logged
+/// with the command to delete it by hand, and the pull request is still
+/// pushed and opened; see the known limits below. Since the task then
 /// records the default base, a retry after a failed push or `gh pr create`
 /// does not come back here.
 ///
@@ -3141,10 +3144,12 @@ const GITHUB_PR_COMMIT_LIST_LIMIT: usize = 250;
 ///
 /// Known limits, not handled here:
 ///
-/// - If SlashIt dies after the durable write and before the backup ref is
-///   deleted, the backup ref is left behind. It is harmless (the task then
-///   records the default base, so this function is never reached for it
-///   again) and nothing deletes it later.
+/// - If SlashIt dies, or deleting the backup ref fails, after the durable
+///   write, the backup ref is left behind, holding exactly the old tip. It
+///   is harmless (the task then records the default base, so neither this
+///   function nor [`recover_unfinished_restack`] is reached for it again)
+///   and nothing deletes it later. A failed delete is only logged, to
+///   stderr: the desktop app shows no task-scoped log from this flow.
 /// - The reservation keeps SlashIt's own flows out of the worktree, not the
 ///   user. A commit, checkout or edit from the task's own terminal while the
 ///   restack runs is detected and never undone, with these exceptions. A
@@ -3427,7 +3432,13 @@ async fn restack_onto_landed_parent(
         return Err(restack_failure_message(&replay, default, failure));
     }
     if let Err(e) = restack::retire_backup(repo, &backup, &tip).await {
-        eprintln!("[pr] {branch} was restacked and recorded, but its backup was kept: {e}");
+        eprintln!(
+            "[pr] {branch} was restacked onto {default} and recorded, and its pull request is \
+             created as usual, but its backup {backup} (holding the old tip {tip}) could not be \
+             deleted: {e}. It is harmless and nothing will use it again; to delete it, run `git \
+             update-ref -d {backup} {tip}` in {}.",
+            repo.display()
+        );
     }
     Ok(RestackOutcome::Restacked)
 }
@@ -8364,6 +8375,64 @@ mod tests {
                 let tasks = state.task.tasks.read().await;
                 assert_eq!(tasks[&task_id].base_commit.as_deref(), Some(landed.base_commit.as_str()));
                 assert_eq!(tasks[&task_id].branch_origin, stacked_on_parent());
+            }
+
+            /// Deleting the backup ref after the restack is recorded can fail.
+            /// That does not hold up the pull request, which is pushed and
+            /// opened from the restacked branch against `main`, and the task
+            /// records the default base. The backup is left holding exactly
+            /// the old tip, and nothing uses it again: creating the pull
+            /// request again goes nowhere near restacking or recovery, and
+            /// leaves the backup as it is. A `post-rewrite` hook locks the
+            /// backup ref so that deleting it fails.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_backup_that_cannot_be_deleted_after_recording_does_not_hold_up_the_pull_request() {
+                let _guard = PATH_LOCK.lock().await;
+                let landed = land(Spec::new(Landing::Squash));
+                let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &merged_parent_answers(&landed));
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                let backup = backup_ref(task_id);
+                let common = git(&landed.repo.checkout, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+                let lock = PathBuf::from(&common).join(format!("{backup}.lock"));
+                let hooks = landed.repo._tmp.path().join("hooks");
+                std::fs::create_dir_all(&hooks).unwrap();
+                write_executable(&hooks.join("post-rewrite"), &format!("#!/bin/sh\ncat >/dev/null\ntouch {lock:?}\n"));
+                git(&landed.repo.checkout, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+
+                let result = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(result.as_deref(), Ok(CHILD_PR_URL), "{}", mock.read_log());
+                assert!(lock.exists(), "the hook locked the backup ref");
+                let tip = local_tip(&landed);
+                assert_ne!(tip, landed.child_tip, "restacked");
+                assert_eq!(landed.repo.remote_has_branch("task-branch").as_deref(), Some(tip.as_str()));
+                assert_eq!(
+                    pr_create_tail(&mock.read_log()),
+                    Some(vec!["--head".into(), "task-branch".into(), "--base".into(), "main".into()]),
+                );
+                {
+                    let tasks = state.task.tasks.read().await;
+                    assert_eq!(tasks[&task_id].branch_origin, Some(crate::domain::BranchOrigin::DefaultBase));
+                    assert_eq!(tasks[&task_id].base_commit.as_deref(), Some(remote_main(&landed).as_str()));
+                }
+                assert_eq!(
+                    ref_at(&landed.repo.checkout, &backup).as_deref(),
+                    Some(landed.child_tip.as_str()),
+                    "the backup holds exactly the old tip"
+                );
+
+                git(&landed.repo.checkout, &["config", "--unset", "core.hooksPath"]);
+                std::fs::remove_file(&lock).unwrap();
+                let again = create_pr_inner(&state, &task_id.to_string()).await;
+
+                assert_eq!(again.as_deref(), Ok(CHILD_PR_URL), "{}", mock.read_log());
+                assert_eq!(local_tip(&landed), tip, "not restacked again");
+                assert_eq!(
+                    ref_at(&landed.repo.checkout, &backup).as_deref(),
+                    Some(landed.child_tip.as_str()),
+                    "the retry leaves the backup alone"
+                );
             }
 
             /// A task with no recorded fork point, or one that is not a full
