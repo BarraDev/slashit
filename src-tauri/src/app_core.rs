@@ -956,6 +956,86 @@ mod tests {
         assert!(persisted.iter().all(|t| t.error_message.is_some()), "the reason survives a restart");
     }
 
+    /// Two tasks whose ids share their first 8 hex digits, each recording
+    /// the branch named from its whole id, are each re-pointed at the
+    /// checkout of their own branch when both checkouts moved: the names no
+    /// longer collide, so neither is held back on the other's account.
+    #[tokio::test]
+    async fn startup_repoints_tasks_sharing_a_prefix_at_their_own_checkouts() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_dir, &["config", "user.name", "Test"]);
+        run_git(&repo_dir, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+
+        let repository = domain::Repository {
+            id: uuid::Uuid::new_v4(),
+            local_path: repo_dir.to_string_lossy().to_string(),
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        let project = domain::Project {
+            id: uuid::Uuid::new_v4(),
+            name: "test-project".to_string(),
+            repository_id: Some(repository.id),
+            scope: domain::ProjectScope::Standalone,
+            state_location: config::paths::StateLocation::External,
+            agent_type: domain::AgentType::ClaudeCode,
+            agent_config: domain::AgentConfig {
+                agent_type: domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let stale = tmp.path().join("stale-recorded-path").to_string_lossy().to_string();
+        let ids = [
+            uuid::Uuid::from_u128(0x12345678_0000_4000_8000_000000000001),
+            uuid::Uuid::from_u128(0x12345678_0000_4000_8000_000000000002),
+        ];
+        let mut moved_to = HashMap::new();
+        let tasks: Vec<Task> = ids
+            .iter()
+            .map(|id| {
+                let branch = worktree::WorktreeManager::branch_for_task(*id);
+                let moved = tmp.path().join(format!("moved-{id}"));
+                run_git(&repo_dir, &["worktree", "add", "-q", moved.to_str().unwrap(), "-b", &branch]);
+                moved_to.insert(*id, moved.to_string_lossy().to_string());
+                let mut task = crate::test_helpers::create_test_task("A task");
+                task.id = *id;
+                task.project_id = project.id;
+                task.status = domain::TaskStatus::InProgress;
+                task.branch_name = Some(branch);
+                task.worktree_path = Some(stale.clone());
+                task
+            })
+            .collect();
+
+        let storage = Storage::with_paths((*paths).clone());
+        let mut cfg = config::storage::AppConfig::default();
+        cfg.repositories.insert(repository.id.to_string(), repository);
+        cfg.projects.insert(project.id.to_string(), project.clone());
+        storage.save_config(&cfg).expect("save config");
+        storage.save_project_tasks(project.id, &tasks).expect("save tasks");
+
+        let (state, report) = build_state_with_paths(paths).await.expect("hydration must succeed");
+
+        assert_eq!(report.adopted_worktrees, 2);
+        let hydrated = state.task.tasks.read().await;
+        for id in ids {
+            assert_eq!(hydrated[&id].worktree_path.as_deref(), Some(moved_to[&id].as_str()));
+            assert_eq!(hydrated[&id].error_message, None);
+        }
+    }
+
     /// A repository, a project and a task with an interrupted cleanup recorded
     /// against a real worktree, seeded on disk exactly as a crashed process
     /// would have left them.

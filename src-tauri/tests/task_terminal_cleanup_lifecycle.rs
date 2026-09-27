@@ -458,7 +458,7 @@ async fn build_fixture(name: &str) -> (Fixture, AppState) {
     // path built from it -- is a pure function of the task id, so a successor
     // execution of the *same* task lands on the *same* checkout. That is what
     // makes an overlapping cleanup a collision rather than a coincidence.
-    let branch = format!("task-{}", &task_id.to_string()[..8]);
+    let branch = format!("task-{task_id}");
 
     let mut config = AppConfig::default();
     config.repositories.insert(

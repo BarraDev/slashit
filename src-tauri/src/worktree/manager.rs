@@ -337,9 +337,16 @@ impl WorktreeManager {
         }
     }
 
-    /// Generate a branch name from a task UUID (first 8 chars).
+    /// The branch a task that records none is given: `task-<its whole id>`.
+    ///
+    /// The whole id, so that no two tasks are ever given one name and a
+    /// branch of this name can only be the task's own. Earlier versions used
+    /// only the first 8 hex digits, which two tasks can share; a task that
+    /// records such a name keeps it, since its recorded `branch_name`, not
+    /// this, is what it is reattached by. `worktree::ownership` says what
+    /// happens to a branch of the old name that no task records.
     pub fn branch_for_task(task_id: Uuid) -> String {
-        format!("task-{}", &task_id.to_string()[..8])
+        format!("task-{}", task_id.hyphenated())
     }
 
     /// Create a worktree for a task. Returns the worktree path and branch name.
@@ -559,6 +566,38 @@ impl WorktreeManager {
         Ok(String::from_utf8_lossy(&output.stdout)
             .lines()
             .any(|line| line == refname))
+    }
+
+    /// Whether the ref `refs/heads/<branch>` exists in `repo_path`, read
+    /// from git's exit status alone.
+    ///
+    /// For a check that runs on every start, where a git that writes to
+    /// stderr and succeeds must not stop the task: [`Self::local_branch_exists`]
+    /// takes any stderr as a failure, and `GIT_TRACE` is enough for that.
+    /// `git show-ref --exists` exits 0 for a ref that is there, even one
+    /// naming a missing object, 2 for one that is not, and anything else for
+    /// a lookup that failed, which is an error, never an absence. A git
+    /// older than 2.43 does not know `--exists` and exits 129 for it; that
+    /// git is asked through [`Self::local_branch_exists`] instead, so there
+    /// stderr alongside an answer is still a failure.
+    pub async fn local_branch_exists_by_status(repo_path: &str, branch: &str) -> Result<bool, String> {
+        let checked = checked_task_branch(branch)?;
+        let output = tokio::process::Command::new("git")
+            .args(["show-ref", "--exists"])
+            .arg(format!("refs/heads/{checked}"))
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git show-ref: {e}"))?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(2) => Ok(false),
+            Some(129) => Self::local_branch_exists(repo_path, branch).await,
+            _ => Err(format!(
+                "Could not check for local branch {checked:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        }
     }
 
     /// Whether `ancestor` is reachable from the local branch `branch`.
@@ -1550,16 +1589,28 @@ branch refs/heads/some-other-branch
     fn branch_for_task_format() {
         let id = Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();
         let branch = WorktreeManager::branch_for_task(id);
-        assert_eq!(branch, "task-a1b2c3d4");
+        assert_eq!(branch, "task-a1b2c3d4-e5f6-7890-abcd-ef1234567890");
     }
 
+    /// Ids that share their first 8 hex digits, which used to be the whole
+    /// branch name, are given different branches and different managed
+    /// checkout paths.
     #[test]
-    fn branch_for_task_uses_first_8_chars() {
-        let id = Uuid::new_v4();
-        let branch = WorktreeManager::branch_for_task(id);
-        assert!(branch.starts_with("task-"));
-        // 5 chars for "task-" + 8 hex chars = 13
-        assert_eq!(branch.len(), 13);
+    fn branch_for_task_distinguishes_ids_sharing_a_prefix() {
+        let a = Uuid::from_u128(0x12345678_0000_4000_8000_000000000001);
+        let b = Uuid::from_u128(0x12345678_0000_4000_8000_000000000002);
+        let (branch_a, branch_b) =
+            (WorktreeManager::branch_for_task(a), WorktreeManager::branch_for_task(b));
+        assert_ne!(branch_a, branch_b);
+        let mgr = test_manager();
+        assert_ne!(
+            mgr.managed_path("/home/someone/code/my-app", &branch_a),
+            mgr.managed_path("/home/someone/code/my-app", &branch_b)
+        );
+        assert_ne!(
+            WorktreeManager::legacy_path("/home/someone/code/my-app", &branch_a),
+            WorktreeManager::legacy_path("/home/someone/code/my-app", &branch_b)
+        );
     }
 
     #[test]
@@ -3945,24 +3996,24 @@ branch refs/heads/some-other-branch
         assert!(!branch_exists(repo_path, "task-1234abcd"));
     }
 
-    /// `task-<full uuid>`, which versions before the 8-hex prefix wrote, is
-    /// a local branch like any other and still reattaches and stacks.
+    /// `task-<full uuid>`, the name a task's branch is given, is a local
+    /// branch like any other, and reattaches and stacks.
     #[tokio::test]
-    async fn legacy_full_uuid_task_branches_reattach_and_stack_through_git() {
+    async fn full_uuid_task_branches_reattach_and_stack_through_git() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
-        let legacy = format!("task-{}", Uuid::new_v4());
+        let task_branch = format!("task-{}", Uuid::new_v4());
         let newer = format!("task-{}", Uuid::new_v4());
-        run_git(repo_path, &["branch", &legacy]);
+        run_git(repo_path, &["branch", &task_branch]);
         let mgr = test_manager();
 
-        let reattached = mgr.reattach(repo_path, &legacy).await.expect("reattach");
-        assert_eq!(run_git(&reattached.path, &["symbolic-ref", "--short", "HEAD"]), legacy);
+        let reattached = mgr.reattach(repo_path, &task_branch).await.expect("reattach");
+        assert_eq!(run_git(&reattached.path, &["symbolic-ref", "--short", "HEAD"]), task_branch);
         let dependency_tip = commit_work(&reattached.path, "dependency.txt");
         run_git(repo_path, &["worktree", "remove", &reattached.path]);
 
         let stacked = mgr
-            .create_stacked_branch(repo_path, &newer, &legacy)
+            .create_stacked_branch(repo_path, &newer, &task_branch)
             .await
             .expect("stacked").info;
         assert_eq!(run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]), newer);
@@ -4097,6 +4148,38 @@ branch refs/heads/some-other-branch
         let not_a_repo = tempfile::tempdir().expect("tempdir");
         assert!(
             WorktreeManager::local_branch_exists(not_a_repo.path().to_str().unwrap(), "main")
+                .await
+                .is_err()
+        );
+    }
+
+    /// `local_branch_exists_by_status` answers as `local_branch_exists` does
+    /// for the exact branch, whatever git writes to stderr on the way.
+    #[tokio::test]
+    async fn local_branch_exists_by_status_separates_absent_from_unanswerable() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let exists = |branch: &'static str| WorktreeManager::local_branch_exists_by_status(repo_path, branch);
+        assert_eq!(exists("main").await, Ok(true));
+        assert_eq!(exists("gone").await, Ok(false));
+        assert!(exists("-Bvictim").await.is_err());
+        std::fs::write(
+            tmp.path().join(".git/refs/heads/missing-object"),
+            "1234567890123456789012345678901234567890\n",
+        )
+        .unwrap();
+        assert_eq!(exists("missing-object").await, Ok(true));
+        std::fs::write(tmp.path().join(".git/refs/heads/garbage"), "garbage\n").unwrap();
+        assert!(exists("garbage").await.is_err());
+        // Refs below `refs/heads/<name>/` are not the branch `<name>`. Git
+        // 2.43 cannot look the name up past a loose ref directory and fails;
+        // later versions answer that it is not there.
+        run_git(repo_path, &["branch", "nested/child"]);
+        assert_ne!(exists("nested").await, Ok(true));
+
+        let not_a_repo = tempfile::tempdir().expect("tempdir");
+        assert!(
+            WorktreeManager::local_branch_exists_by_status(not_a_repo.path().to_str().unwrap(), "main")
                 .await
                 .is_err()
         );
