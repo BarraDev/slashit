@@ -91,8 +91,17 @@ pub async fn resolve_default_base(repo_path: &str) -> Result<ResolvedBase, Strin
 
     if repo.join(".jj").is_dir() {
         if let Some(branch) = jj_trunk_branch(repo).await {
-            if let OriginBranch::Found(base) = at_origin_branch(repo, &branch).await? {
-                return Ok(base);
+            match at_origin_branch(repo, &branch).await? {
+                OriginBranch::Found(base) => return Ok(base),
+                OriginBranch::Unusable(why) => {
+                    return Err(format!(
+                        "{ORIGIN_HEAD} is not set in {repo_path}, and JJ's trunk() alias names \
+                         {branch}@origin, but {ORIGIN_BRANCHES}{branch} {why}, so a task's branch \
+                         cannot start there. Fetch origin again, or run `git remote set-head \
+                         origin <default branch>` there, then start the task again."
+                    ));
+                }
+                OriginBranch::Missing => {}
             }
         }
     }
@@ -458,20 +467,43 @@ mod tests {
         }
     }
 
-    /// A `refs/remotes/origin/<D>` that is itself a symbolic ref says
-    /// nothing about origin's own branch, and is not a base the JJ fallback
-    /// accepts either.
+    /// A `refs/remotes/origin/<D>` that JJ's `trunk()` names but that no
+    /// branch can start at -- itself a symbolic ref, a commit the repository
+    /// does not have, or a tag object -- is refused saying so, not with the
+    /// message for a branch that was never fetched.
     #[cfg(unix)]
     #[tokio::test]
-    async fn jj_trunk_naming_a_symbolic_origin_ref_is_refused() {
+    async fn jj_trunk_naming_an_unusable_origin_ref_is_refused_with_the_reason() {
+        type Arrange = fn(&Path);
+        let cases: [(&str, Arrange, &str); 3] = [
+            ("symbolic ref", |repo| {
+                git(repo, &["symbolic-ref", "refs/remotes/origin/alias", "refs/remotes/origin/trunk"]);
+            }, "is itself a symbolic ref"),
+            ("missing commit", |repo| {
+                std::fs::write(
+                    repo.join(".git/refs/remotes/origin/alias"),
+                    "0123456789abcdef0123456789abcdef01234567\n",
+                )
+                .unwrap();
+            }, "names a commit this repository does not have"),
+            ("tag object", |repo| {
+                git(repo, &["tag", "-a", "-m", "annotated", "v1"]);
+                let tag = git(repo, &["rev-parse", "refs/tags/v1"]);
+                git(repo, &["update-ref", "refs/remotes/origin/alias", &tag]);
+            }, "names a tag object, not a commit"),
+        ];
         let fake = crate::test_helpers::FakeProgram::install("jj", "printf 'alias@origin\\n'").await;
-        let (_temp, repo, _) = cloned_repo();
-        std::fs::create_dir_all(repo.join(".jj")).unwrap();
-        git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
-        git(&repo, &["symbolic-ref", "refs/remotes/origin/alias", "refs/remotes/origin/trunk"]);
+        for (name, arrange, why) in cases {
+            let (_temp, repo, _) = cloned_repo();
+            std::fs::create_dir_all(repo.join(".jj")).unwrap();
+            git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+            arrange(&repo);
 
-        let refused = resolve(&repo).await.expect_err("a symbolic ref is not a base");
-        assert!(refused.contains("trunk() alias did not name one"), "{refused}");
+            let refused = resolve(&repo).await.expect_err(name);
+            assert!(refused.contains("trunk() alias names alias@origin"), "{name}: {refused}");
+            assert!(refused.contains(&format!("refs/remotes/origin/alias {why}")), "{name}: {refused}");
+            assert!(!refused.contains("has not been fetched"), "{name}: {refused}");
+        }
         assert!(fake.invocations().contains("config get"));
     }
 
