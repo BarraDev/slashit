@@ -57,6 +57,10 @@ pub struct StartupReport {
     /// Tasks held back from running because a cleanup was interrupted and the
     /// checkout it was removing, or git's registration of it, is still there.
     pub quarantined_worktrees: usize,
+    /// Tasks whose checkout is gone while git still holds a locked
+    /// registration of their branch. The reference is kept, and the task says
+    /// what the user can do about it.
+    pub locked_worktrees: usize,
 }
 
 /// Resolve the OS directories and build state from what is on disk.
@@ -210,21 +214,27 @@ pub async fn build_state_with_paths(
             // directory straight back to the executor. See
             // `Task::cleanup_in_flight`.
             if task.cleanup_in_flight {
-                let registration = match (
-                    task.branch_name.as_ref(),
-                    repo_for_project.get(&task.project_id),
-                ) {
-                    (Some(branch), Some(repo)) => {
+                // Looked up by path and by branch, as a removal decides (see
+                // `worktree::CheckoutState`): a registration whose `HEAD` is
+                // detached is invisible by branch alone.
+                let state = match repo_for_project.get(&task.project_id) {
+                    Some(repo) => {
                         let porcelain = cached_porcelain(&mut porcelain_cache, repo).await;
                         // `None` here is git failing to answer, not git saying
                         // nothing is registered, so it stays quarantined.
-                        porcelain.as_deref().map(|p| {
-                            worktree::WorktreeManager::registration_for_branch(p, branch).is_some()
-                        })
+                        worktree::CheckoutState::of(
+                            porcelain.as_deref().ok_or(GIT_LIST_FAILED),
+                            &wt_path,
+                            task.branch_name.as_deref(),
+                        )
                     }
-                    // Nothing to look the registration up by or in. Absence
-                    // cannot be established, so it is not assumed.
-                    _ => None,
+                    // Nothing to look the registration up in. Absence cannot
+                    // be established, so it is not assumed.
+                    None => worktree::CheckoutState::of(
+                        Err("the task's project resolves to no repository"),
+                        &wt_path,
+                        task.branch_name.as_deref(),
+                    ),
                 };
 
                 // Removal deletes the checkout's contents and takes git's
@@ -236,7 +246,7 @@ pub async fn build_state_with_paths(
                 // is left exactly as it was found, because nothing on disk says
                 // how far the interrupted removal got and re-running it
                 // automatically is the retry loop this design removed.
-                if !std::path::Path::new(&wt_path).exists() && registration == Some(false) {
+                if !std::path::Path::new(&wt_path).exists() && state.nothing_registered() {
                     println!(
                         "SlashIt: worktree cleanup for task '{}' was interrupted but had \
                          finished; clearing the reference",
@@ -253,12 +263,34 @@ pub async fn build_state_with_paths(
                          resolved",
                         task.title, wt_path
                     );
-                    task.error_message = Some(format!(
+                    let mut message = format!(
                         "A cleanup of the worktree at {wt_path} was interrupted and never \
                          finished. The worktree and everything in it were left alone. This task \
                          will not run until the worktree is removed or the cleanup is asked for \
                          again."
-                    ));
+                    );
+                    // Asking again cannot succeed while git holds the
+                    // checkout locked, so the task says so rather than let the
+                    // retry be the first to find out.
+                    if let Some(worktree::CheckoutRegistration::MissingLocked {
+                        path,
+                        branch,
+                        reason,
+                    }) = state.holding()
+                    {
+                        let repo = repo_for_project
+                            .get(&task.project_id)
+                            .map(String::as_str)
+                            .unwrap_or_default();
+                        message.push(' ');
+                        message.push_str(&worktree::locked_registration_notice(
+                            repo,
+                            path,
+                            branch.as_deref(),
+                            reason.as_deref(),
+                        ));
+                    }
+                    task.error_message = Some(message);
                     report.quarantined_worktrees += 1;
                 }
                 migrated_projects.insert(task.project_id);
@@ -266,24 +298,34 @@ pub async fn build_state_with_paths(
             }
 
             if std::path::Path::new(&wt_path).exists() {
+                // Back where it was recorded, as when the drive it is on is
+                // mounted again: a lock notice no longer says anything true.
+                if drop_lifted_lock_notice(task) {
+                    migrated_projects.insert(task.project_id);
+                }
                 continue;
             }
 
             let recovery = match (
-                task.branch_name.as_ref(),
+                task.branch_name.as_deref(),
                 repo_for_project.get(&task.project_id),
             ) {
-                (Some(branch), Some(repo)) => {
+                // Looked up by the recorded path as well as by branch, so a
+                // task that records no branch is still checked against what
+                // git holds at its path.
+                (branch, Some(repo)) => {
                     let porcelain = cached_porcelain(&mut porcelain_cache, repo).await;
-                    app_state
-                        .worktree_manager
-                        .classify_missing_worktree(repo, branch, porcelain.as_deref())
+                    app_state.worktree_manager.classify_missing_worktree(
+                        repo,
+                        &wt_path,
+                        branch,
+                        porcelain.as_deref(),
+                    )
                 }
-                // No branch was ever recorded, so there is nothing to look a
-                // worktree up by and nothing that could ever recreate it. No
-                // amount of git working would change that answer, so this is
-                // genuine absence rather than a failed check.
-                (None, _) => worktree::WorktreeRecovery::ConfirmedAbsent,
+                // No branch was ever recorded and no repository resolves, so
+                // there is nothing to look a worktree up by or in, and nothing
+                // that could ever recreate it.
+                (None, None) => worktree::WorktreeRecovery::ConfirmedAbsent,
                 // A branch is recorded but the project resolves to no
                 // repository. That is not proof the worktree is gone: this
                 // table is rebuilt from config on every start, and a config
@@ -318,6 +360,7 @@ pub async fn build_state_with_paths(
                         task.title
                     );
                     task.worktree_path = Some(path);
+                    drop_lifted_lock_notice(task);
                     report.adopted_worktrees += 1;
                 }
                 worktree::WorktreeRecovery::ConfirmedAbsent => {
@@ -326,7 +369,33 @@ pub async fn build_state_with_paths(
                         task.title
                     );
                     task.worktree_path = None;
+                    drop_lifted_lock_notice(task);
                     report.cleared_worktrees += 1;
+                }
+                // Git keeps the branch checked out in a checkout that is gone,
+                // and refuses to check it out anywhere else until the user
+                // unlocks it. Clearing the reference would leave that with
+                // nothing on the task pointing at it, so it is kept, and the
+                // task says what only the user may do. Nothing is run against
+                // git: unlocking is the user's decision. The next start after
+                // they do reconciles the task like any other missing checkout.
+                worktree::WorktreeRecovery::Locked { path, branch, reason } => {
+                    let repo = repo_for_project
+                        .get(&task.project_id)
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    let notice = worktree::locked_registration_notice(
+                        repo,
+                        &path,
+                        branch.as_deref(),
+                        reason.as_deref(),
+                    );
+                    eprintln!("Warning: task '{}': {notice}", task.title);
+                    report.locked_worktrees += 1;
+                    if task.error_message.as_deref() == Some(notice.as_str()) {
+                        continue;
+                    }
+                    task.error_message = Some(notice);
                 }
                 // Git could not be consulted, so nothing here proves the
                 // worktree is gone. `worktree_path` is the only persisted
@@ -380,6 +449,27 @@ pub async fn build_state_with_paths(
 
     Ok((app_state, report))
 }
+
+/// Drop a notice an earlier start, or a refused cleanup, left on `task`
+/// about a locked registration of its checkout, once startup has found the
+/// checkout again or found git holding nothing for it: it no longer says
+/// anything true. Any other message is left as it is. Returns whether the
+/// task changed.
+fn drop_lifted_lock_notice(task: &mut Task) -> bool {
+    if task
+        .error_message
+        .as_deref()
+        .is_some_and(worktree::carries_locked_registration_notice)
+    {
+        task.error_message = None;
+        return true;
+    }
+    false
+}
+
+/// Why a lookup in a listing `cached_porcelain` could not produce has no
+/// answer.
+const GIT_LIST_FAILED: &str = "`git worktree list` could not be run";
 
 /// `git worktree list --porcelain` for `repo`, from `cache` if this loop has
 /// already asked, off the runtime thread if it has not.
@@ -1400,6 +1490,380 @@ mod tests {
             "worktree_path is the only record of the worktree; a lookup that never \
              happened must not be allowed to spend it"
         );
+    }
+
+    /// A task whose checkout SlashIt created at the managed path and whose
+    /// directory has since vanished without git removing it, seeded on disk
+    /// as the previous process left it. `lock` locks git's registration
+    /// first, with that reason; `detach` detaches the checkout's `HEAD`
+    /// first, as an agent's `git checkout --detach` or a stopped rebase
+    /// leaves it; `in_flight` records a cleanup of it as interrupted.
+    ///
+    /// Returns the paths, the task, the repository and the recorded checkout.
+    async fn vanished_checkout_fixture(
+        tmp: &TempDir,
+        lock: Option<&str>,
+        detach: bool,
+        in_flight: bool,
+    ) -> (Arc<AppPaths>, uuid::Uuid, String, String) {
+        let paths = test_paths(tmp);
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        run_git(&repo_root, &["init", "-q", "-b", "main"]);
+        run_git(&repo_root, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_root, &["config", "user.name", "Test"]);
+        std::fs::write(repo_root.join("README.md"), "base\n").unwrap();
+        run_git(&repo_root, &["add", "."]);
+        run_git(&repo_root, &["commit", "-q", "-m", "init"]);
+        let repo = repo_root.to_string_lossy().to_string();
+
+        let branch = "task-abcd1234";
+        run_git(&repo_root, &["branch", branch]);
+        let checkout = worktree::WorktreeManager::new(paths.clone())
+            .reattach(&repo, branch)
+            .await
+            .expect("a checkout at the managed path")
+            .path;
+        if detach {
+            run_git(std::path::Path::new(&checkout), &["checkout", "-q", "--detach"]);
+        }
+        if let Some(reason) = lock {
+            run_git(&repo_root, &["worktree", "lock", "--reason", reason, &checkout]);
+        }
+        std::fs::remove_dir_all(&checkout).unwrap();
+
+        let repository = domain::Repository {
+            id: uuid::Uuid::new_v4(),
+            local_path: repo.clone(),
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        let project = domain::Project {
+            id: uuid::Uuid::new_v4(),
+            name: "vanished".to_string(),
+            repository_id: Some(repository.id),
+            scope: domain::ProjectScope::Standalone,
+            state_location: config::paths::StateLocation::External,
+            agent_type: domain::AgentType::ClaudeCode,
+            agent_config: domain::AgentConfig {
+                agent_type: domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let mut task = crate::test_helpers::create_test_task("checkout vanished");
+        task.project_id = project.id;
+        task.status = domain::TaskStatus::HumanReview;
+        task.branch_name = Some(branch.to_string());
+        task.worktree_path = Some(checkout.clone());
+        task.cleanup_in_flight = in_flight;
+        let task_id = task.id;
+
+        let storage = Storage::with_paths((*paths).clone());
+        let mut cfg = config::storage::AppConfig {
+            projects: HashMap::new(),
+            repositories: HashMap::new(),
+            agent_configs: HashMap::new(),
+            jj_config: Default::default(),
+            worktree: Default::default(),
+            ui_preferences: Default::default(),
+        };
+        let project_id = project.id;
+        cfg.projects.insert(project_id.to_string(), project);
+        cfg.repositories.insert(repository.id.to_string(), repository);
+        storage.save_config(&cfg).expect("save config");
+        storage.save_project_tasks(project_id, &[task]).expect("save tasks");
+
+        (paths, task_id, repo, checkout)
+    }
+
+    /// A task whose checkout is missing while git still holds a locked
+    /// registration of its branch keeps its reference across restarts, and
+    /// says why and what to do. Clearing it would leave the branch checked
+    /// out in a checkout nobody can see, with nothing on the task pointing
+    /// at it. Once the user unlocks it, the next start reconciles the task
+    /// and its checkout can be acquired again.
+    #[tokio::test]
+    async fn startup_keeps_a_missing_checkout_git_holds_locked_until_it_is_unlocked() {
+        let tmp = TempDir::new().unwrap();
+        let reason = "on a drive that is not mounted";
+        let (paths, task_id, repo, checkout) = vanished_checkout_fixture(&tmp, Some(reason), false, false).await;
+
+        for start in ["first", "second"] {
+            let (state, report) = build_state_with_paths(paths.clone())
+                .await
+                .expect("hydration must succeed");
+            assert_eq!(report.cleared_worktrees, 0, "{start} start clears nothing");
+            let tasks = state.task.tasks.read().await;
+            let task = tasks.get(&task_id).expect("task must still exist");
+            assert_eq!(
+                task.worktree_path.as_deref(),
+                Some(checkout.as_str()),
+                "the {start} start keeps the reference while git holds the branch locked"
+            );
+            let message = task.error_message.as_deref().unwrap_or_default();
+            assert!(message.contains(reason), "the lock is named: {message}");
+            assert!(
+                message.contains("git worktree unlock"),
+                "the way out is named: {message}"
+            );
+        }
+        assert!(
+            worktree::WorktreeManager::worktree_list_porcelain(&repo)
+                .expect("git listing")
+                .contains(reason),
+            "startup runs nothing destructive: the lock is still there"
+        );
+
+        run_git(std::path::Path::new(&repo), &["worktree", "unlock", &checkout]);
+        let (state, report) = build_state_with_paths(paths)
+            .await
+            .expect("hydration must succeed");
+        assert_eq!(report.cleared_worktrees, 1);
+        {
+            let tasks = state.task.tasks.read().await;
+            let task = tasks.get(&task_id).expect("task must still exist");
+            assert_eq!(task.worktree_path, None, "once unlocked, the reference is reconciled");
+            assert_eq!(task.error_message, None, "and the notice about the lock goes with it");
+        }
+        let again = state
+            .worktree_manager
+            .reattach(&repo, "task-abcd1234")
+            .await
+            .expect("the task's checkout can be acquired again");
+        assert_eq!(again.path, checkout);
+    }
+
+    /// A task whose checkout vanished while git's registration of it is
+    /// merely prunable has its reference cleared at startup, and that is only
+    /// safe because acquiring the task's checkout again then succeeds.
+    #[tokio::test]
+    async fn startup_clears_a_prunable_missing_checkout_and_the_task_can_acquire_it_again() {
+        let tmp = TempDir::new().unwrap();
+        let (paths, task_id, repo, checkout) = vanished_checkout_fixture(&tmp, None, false, false).await;
+
+        let (state, report) = build_state_with_paths(paths)
+            .await
+            .expect("hydration must succeed");
+        assert_eq!(report.cleared_worktrees, 1);
+        assert_eq!(
+            state.task.tasks.read().await.get(&task_id).unwrap().worktree_path,
+            None
+        );
+
+        let again = state
+            .worktree_manager
+            .reattach(&repo, "task-abcd1234")
+            .await
+            .expect("the task's checkout can be acquired again");
+        assert_eq!(again.path, checkout);
+        assert!(std::path::Path::new(&again.path).is_dir());
+    }
+
+    /// A locked checkout whose `HEAD` is detached holds no branch, so git's
+    /// listing shows it only under its path. Startup looks it up by the
+    /// recorded path too, and keeps the reference, exactly as a removal of
+    /// it refuses. Once unlocked, the next start reconciles it and the
+    /// task's checkout can be acquired again at the same path.
+    #[tokio::test]
+    async fn startup_keeps_a_detached_locked_checkout_it_cannot_find_by_branch() {
+        let tmp = TempDir::new().unwrap();
+        let reason = "on a drive that is not mounted";
+        let (paths, task_id, repo, checkout) =
+            vanished_checkout_fixture(&tmp, Some(reason), true, false).await;
+
+        let (state, report) = build_state_with_paths(paths.clone())
+            .await
+            .expect("hydration must succeed");
+        assert_eq!(report.cleared_worktrees, 0);
+        {
+            let tasks = state.task.tasks.read().await;
+            let task = tasks.get(&task_id).expect("task must still exist");
+            assert_eq!(task.worktree_path.as_deref(), Some(checkout.as_str()));
+            let message = task.error_message.as_deref().unwrap_or_default();
+            assert!(message.contains(reason), "the lock is named: {message}");
+        }
+        assert!(
+            state
+                .worktree_manager
+                .remove(&checkout, &repo, Some("task-abcd1234"))
+                .await
+                .is_err(),
+            "and removal agrees"
+        );
+
+        run_git(std::path::Path::new(&repo), &["worktree", "unlock", &checkout]);
+        let (state, report) = build_state_with_paths(paths)
+            .await
+            .expect("hydration must succeed");
+        assert_eq!(report.cleared_worktrees, 1);
+        // The detached registration is now merely prunable, and acquisition
+        // still leaves it for the user (see the next test); once they prune
+        // it, the checkout is acquired again.
+        assert!(state.worktree_manager.reattach(&repo, "task-abcd1234").await.is_err());
+        run_git(std::path::Path::new(&repo), &["worktree", "prune"]);
+        let again = state
+            .worktree_manager
+            .reattach(&repo, "task-abcd1234")
+            .await
+            .expect("the task's checkout can be acquired again");
+        assert_eq!(again.path, checkout);
+    }
+
+    /// A checkout whose `HEAD` was detached and whose directory vanished
+    /// leaves a prunable registration that names no branch. Startup clears the
+    /// task's reference, as for any prunable registration, but acquiring the
+    /// task's checkout afterwards does not clear the registration: its `HEAD`
+    /// may be the only thing naming commits made there. It refuses, naming
+    /// that commit, which is what then reaches the task.
+    #[tokio::test]
+    async fn a_detached_prunable_checkout_is_cleared_at_startup_but_never_pruned_by_acquisition() {
+        let tmp = TempDir::new().unwrap();
+        let (paths, task_id, repo, checkout) =
+            vanished_checkout_fixture(&tmp, None, true, false).await;
+        let head = worktree::WorktreeManager::worktree_list_porcelain(&repo)
+            .expect("git listing")
+            .split("\0\0")
+            .find(|r| r.starts_with(&format!("worktree {checkout}\0")))
+            .and_then(|r| r.split('\0').find_map(|f| f.strip_prefix("HEAD ")).map(str::to_string))
+            .expect("the detached registration and its HEAD");
+
+        let (state, report) = build_state_with_paths(paths)
+            .await
+            .expect("hydration must succeed");
+        assert_eq!(report.cleared_worktrees, 1);
+        assert_eq!(state.task.tasks.read().await[&task_id].worktree_path, None);
+
+        let refused = state
+            .worktree_manager
+            .reattach(&repo, "task-abcd1234")
+            .await
+            .err()
+            .expect("the detached registration is not pruned automatically");
+        assert!(refused.contains(&head), "the detached commit is named: {refused}");
+        assert!(
+            worktree::WorktreeManager::worktree_list_porcelain(&repo)
+                .expect("git listing")
+                .contains(&format!("worktree {checkout}")),
+            "and it is still registered"
+        );
+    }
+
+    /// The notice a lock left on a task goes once the task's checkout is
+    /// found again: whether the checkout reappears where it was recorded, as
+    /// when the drive it is on is mounted, or the lock was lifted and the
+    /// branch is found checked out somewhere else, and adopted there.
+    #[tokio::test]
+    async fn a_locked_registration_notice_goes_once_the_checkout_is_found_again() {
+        let reason = "on a drive that is not mounted";
+        let notice_of = |state: &AppState, task_id| {
+            let state = state.task.tasks.clone();
+            async move { state.read().await[&task_id].error_message.clone() }
+        };
+
+        // Mounted again: the recorded directory is back.
+        let tmp = TempDir::new().unwrap();
+        let (paths, task_id, _, checkout) =
+            vanished_checkout_fixture(&tmp, Some(reason), false, false).await;
+        let (state, _) = build_state_with_paths(paths.clone()).await.expect("hydration");
+        assert!(notice_of(&state, task_id).await.is_some_and(|m| m.contains(reason)));
+        drop(state);
+        std::fs::create_dir_all(&checkout).unwrap();
+        let (state, _) = build_state_with_paths(paths).await.expect("hydration");
+        assert_eq!(notice_of(&state, task_id).await, None, "the checkout is back");
+
+        // Unlocked, and the branch checked out somewhere else.
+        let tmp = TempDir::new().unwrap();
+        let (paths, task_id, repo, checkout) =
+            vanished_checkout_fixture(&tmp, Some(reason), false, false).await;
+        let (state, _) = build_state_with_paths(paths.clone()).await.expect("hydration");
+        assert!(notice_of(&state, task_id).await.is_some_and(|m| m.contains(reason)));
+        drop(state);
+        let repo_dir = std::path::Path::new(&repo);
+        run_git(repo_dir, &["worktree", "unlock", &checkout]);
+        run_git(repo_dir, &["worktree", "prune"]);
+        let elsewhere = tmp.path().join("elsewhere").to_string_lossy().to_string();
+        run_git(repo_dir, &["worktree", "add", "-q", "--", &elsewhere, "task-abcd1234"]);
+        let (state, report) = build_state_with_paths(paths).await.expect("hydration");
+        assert_eq!(report.adopted_worktrees, 1);
+        let tasks = state.task.tasks.read().await;
+        assert_eq!(tasks[&task_id].worktree_path.as_deref(), Some(elsewhere.as_str()));
+        assert_eq!(tasks[&task_id].error_message, None, "the lock is gone and the checkout found");
+    }
+
+    /// An interrupted cleanup of a checkout that is gone is reconciled only
+    /// when git holds nothing for it by path or by branch. A locked
+    /// registration whose `HEAD` is detached is invisible by branch, and
+    /// keeps the task quarantined, saying which lock.
+    #[tokio::test]
+    async fn an_interrupted_cleanup_of_a_detached_locked_checkout_stays_quarantined() {
+        let tmp = TempDir::new().unwrap();
+        let reason = "on a drive that is not mounted";
+        let (paths, task_id, _, checkout) =
+            vanished_checkout_fixture(&tmp, Some(reason), true, true).await;
+
+        let (state, report) = build_state_with_paths(paths)
+            .await
+            .expect("hydration must succeed");
+        assert_eq!(report.reconciled_interrupted_cleanups, 0);
+        assert_eq!(report.quarantined_worktrees, 1);
+        let tasks = state.task.tasks.read().await;
+        let task = tasks.get(&task_id).expect("task must still exist");
+        assert!(task.cleanup_in_flight);
+        assert_eq!(task.worktree_path.as_deref(), Some(checkout.as_str()));
+        let message = task.error_message.as_deref().unwrap_or_default();
+        assert!(message.contains(reason), "the lock is named: {message}");
+    }
+
+    /// A cleanup refused because of a locked registration leaves the reason
+    /// on the task. Once the user unlocks and restarts, the reference is
+    /// reconciled, and that reason goes with it rather than go on claiming a
+    /// lock that is no longer there.
+    #[tokio::test]
+    async fn a_refused_cleanup_notice_goes_once_the_lock_is_lifted() {
+        let tmp = TempDir::new().unwrap();
+        let reason = "on a drive that is not mounted";
+        let (paths, task_id, repo, checkout) =
+            vanished_checkout_fixture(&tmp, Some(reason), false, false).await;
+
+        let (state, _) = build_state_with_paths(paths.clone())
+            .await
+            .expect("hydration must succeed");
+        let refusal = crate::lifecycle::terminalize(
+            crate::commands::task::terminalize_ctx(&state),
+            task_id,
+            crate::lifecycle::Origin::User,
+            crate::lifecycle::TerminalizeRequest::new(domain::TaskStatus::Done),
+        )
+        .await
+        .expect_err("git holds the checkout locked");
+        assert!(matches!(
+            refusal,
+            crate::lifecycle::TerminalizeRefusal::CleanupRefused { .. }
+        ));
+        let kept = state.task.tasks.read().await[&task_id].error_message.clone();
+        assert!(
+            kept.as_deref().unwrap_or_default().starts_with("The worktree at"),
+            "the refused cleanup's own wording is on the task: {kept:?}"
+        );
+        drop(state);
+
+        run_git(std::path::Path::new(&repo), &["worktree", "unlock", &checkout]);
+        let (state, report) = build_state_with_paths(paths)
+            .await
+            .expect("hydration must succeed");
+        assert_eq!(report.cleared_worktrees, 1);
+        let tasks = state.task.tasks.read().await;
+        let task = tasks.get(&task_id).expect("task must still exist");
+        assert_eq!(task.worktree_path, None);
+        assert_eq!(task.error_message, None, "the notice about the lifted lock is gone");
     }
 
     /// Proves the mechanism `cached_porcelain` relies on -- `tokio::task::

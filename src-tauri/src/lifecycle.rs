@@ -638,12 +638,13 @@ pub async fn terminalize_leased(
 ) -> Result<Task, TerminalizeRefusal> {
     // Re-read under the lease: anything sampled before waiting for it is a
     // guess about the past.
-    let (project_id, worktree_path, quarantined) = {
+    let (project_id, worktree_path, branch_name, quarantined) = {
         let tasks = ctx.tasks.read().await;
         let task = tasks.get(&task_id).ok_or(TerminalizeRefusal::TaskNotFound)?;
         (
             task.project_id,
             task.worktree_path.clone(),
+            task.branch_name.clone(),
             task.cleanup_in_flight,
         )
     };
@@ -700,7 +701,10 @@ pub async fn terminalize_leased(
 
     let removal = ctx
         .worktree_manager
-        .remove(&worktree_path, &repo_path)
+        // The branch too: a checkout whose directory is gone is looked up by
+        // both, so that one git registers under a path spelled differently
+        // from the recorded one is still found. See `CheckoutState`.
+        .remove(&worktree_path, &repo_path, branch_name.as_deref())
         .await;
 
     let outcome = match removal {
@@ -1718,6 +1722,58 @@ mod tests {
             std::path::Path::new(&wt).join("unsaved.txt").exists(),
             "the work the refusal was protecting must survive"
         );
+    }
+
+    /// A checkout whose directory is gone while git still holds a locked
+    /// registration of it is not cleaned up: finishing or deleting the task
+    /// keeps it, and its reference, until the user unlocks it. Then both
+    /// converge.
+    #[tokio::test]
+    async fn a_missing_checkout_git_holds_locked_is_kept_until_it_is_unlocked() {
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        let reason = "on a drive that is not mounted";
+        git(
+            std::path::Path::new(&repo_path(&world)),
+            &["worktree", "lock", "--reason", reason, &wt],
+        );
+        std::fs::remove_dir_all(&wt).unwrap();
+        let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
+
+        let refusal = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect_err("git still holds the branch in the locked registration");
+        let TerminalizeRefusal::CleanupRefused { reason: why, .. } = &refusal else {
+            panic!("expected a cleanup refusal, got {refusal:?}");
+        };
+        assert!(why.contains(reason), "the lock is named: {why}");
+        let refusal = delete(world.ctx(), id)
+            .await
+            .expect_err("nor is it a delete");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }));
+
+        let after = world.task(id).await;
+        assert_eq!(after.status, TaskStatus::HumanReview, "the status must not move");
+        assert_eq!(after.worktree_path.as_deref(), Some(wt.as_str()));
+        assert!(after.error_message.as_deref().unwrap_or_default().contains(reason));
+        assert_eq!(world.persisted(id).worktree_path.as_deref(), Some(wt.as_str()));
+
+        git(std::path::Path::new(&repo_path(&world)), &["worktree", "unlock", &wt]);
+        let done = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect("once unlocked, the missing checkout's registration is cleared");
+        assert_eq!(done.status, TaskStatus::Done);
+        assert_eq!(world.persisted(id).worktree_path, None);
     }
 
     #[tokio::test]
