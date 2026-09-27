@@ -337,9 +337,16 @@ impl WorktreeManager {
         }
     }
 
-    /// Generate a branch name from a task UUID (first 8 chars).
+    /// The branch a task that records none is given: `task-<its whole id>`.
+    ///
+    /// The whole id, so that no two tasks are ever given one name and a
+    /// branch of this name can only be the task's own. Earlier versions used
+    /// only the first 8 hex digits, which two tasks can share; a task that
+    /// records such a name keeps it, since its recorded `branch_name`, not
+    /// this, is what it is reattached by. `worktree::ownership` says what
+    /// happens to a branch of the old name that no task records.
     pub fn branch_for_task(task_id: Uuid) -> String {
-        format!("task-{}", &task_id.to_string()[..8])
+        format!("task-{}", task_id.hyphenated())
     }
 
     /// Create a worktree for a task. Returns the worktree path and branch name.
@@ -1550,16 +1557,28 @@ branch refs/heads/some-other-branch
     fn branch_for_task_format() {
         let id = Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();
         let branch = WorktreeManager::branch_for_task(id);
-        assert_eq!(branch, "task-a1b2c3d4");
+        assert_eq!(branch, "task-a1b2c3d4-e5f6-7890-abcd-ef1234567890");
     }
 
+    /// Ids that share their first 8 hex digits, which used to be the whole
+    /// branch name, are given different branches and different managed
+    /// checkout paths.
     #[test]
-    fn branch_for_task_uses_first_8_chars() {
-        let id = Uuid::new_v4();
-        let branch = WorktreeManager::branch_for_task(id);
-        assert!(branch.starts_with("task-"));
-        // 5 chars for "task-" + 8 hex chars = 13
-        assert_eq!(branch.len(), 13);
+    fn branch_for_task_distinguishes_ids_sharing_a_prefix() {
+        let a = Uuid::from_u128(0x12345678_0000_4000_8000_000000000001);
+        let b = Uuid::from_u128(0x12345678_0000_4000_8000_000000000002);
+        let (branch_a, branch_b) =
+            (WorktreeManager::branch_for_task(a), WorktreeManager::branch_for_task(b));
+        assert_ne!(branch_a, branch_b);
+        let mgr = test_manager();
+        assert_ne!(
+            mgr.managed_path("/home/someone/code/my-app", &branch_a),
+            mgr.managed_path("/home/someone/code/my-app", &branch_b)
+        );
+        assert_ne!(
+            WorktreeManager::legacy_path("/home/someone/code/my-app", &branch_a),
+            WorktreeManager::legacy_path("/home/someone/code/my-app", &branch_b)
+        );
     }
 
     #[test]
@@ -3945,10 +3964,10 @@ branch refs/heads/some-other-branch
         assert!(!branch_exists(repo_path, "task-1234abcd"));
     }
 
-    /// `task-<full uuid>`, which versions before the 8-hex prefix wrote, is
-    /// a local branch like any other and still reattaches and stacks.
+    /// `task-<full uuid>`, the name a task's branch is given, is a local
+    /// branch like any other, and reattaches and stacks.
     #[tokio::test]
-    async fn legacy_full_uuid_task_branches_reattach_and_stack_through_git() {
+    async fn full_uuid_task_branches_reattach_and_stack_through_git() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let legacy = format!("task-{}", Uuid::new_v4());
