@@ -275,6 +275,8 @@ mod tests {
         assert_eq!(commit, tip);
     }
 
+    // The hook is a shell script made executable with Unix permissions.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_commit_a_hook_rejects_is_an_error_with_the_hook_s_reason() {
         let (_tmp, repo, checkout) = repo_with_task_checkout();
