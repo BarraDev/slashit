@@ -9,25 +9,38 @@ use leptos::task::spawn_local;
 #[component]
 pub fn Workspaces() -> impl IntoView {
     let (workspaces, set_workspaces) = signal::<Vec<Workspace>>(Vec::new());
+    // Whether `workspaces` is the registry as last read, rather than the
+    // empty list the page starts with or falls back to on a load error. Only
+    // a loaded list can prove a Project's Workspace is missing.
+    let (workspaces_loaded, set_workspaces_loaded) = signal(false);
     let (projects, set_projects) = signal::<Vec<Project>>(Vec::new());
     let (new_name, set_new_name) = signal(String::new());
     let (new_path, set_new_path) = signal(String::new());
     let (creating, set_creating) = signal(false);
 
-    let reload = move || {
-        spawn_local(async move {
-            match workspace_service::list_workspaces().await {
-                Ok(ws) => set_workspaces.set(ws),
-                Err(e) => {
-                    set_workspaces.set(Vec::new());
-                    toast::error(format!("Could not load workspaces: {}", e));
-                }
+    let load_workspaces = move || async move {
+        match workspace_service::list_workspaces().await {
+            Ok(ws) => {
+                set_workspaces.set(ws);
+                set_workspaces_loaded.set(true);
             }
-        });
+            Err(e) => {
+                set_workspaces.set(Vec::new());
+                set_workspaces_loaded.set(false);
+                toast::error(format!("Could not load workspaces: {}", e));
+            }
+        }
     };
 
-    let reload_projects = move || {
+    let reload = move || spawn_local(load_workspaces());
+
+    // The registry is read first and the projects after it, never both at
+    // once. A project list newer than the registry could name a Workspace
+    // another client just created, and that Project would briefly show as
+    // unresolved with a Detach button on it.
+    let reload_membership = move || {
         spawn_local(async move {
+            load_workspaces().await;
             match list_projects().await {
                 Ok(ps) => set_projects.set(ps),
                 Err(e) => {
@@ -38,14 +51,9 @@ pub fn Workspaces() -> impl IntoView {
         });
     };
 
-    Effect::new(move |_| {
-        reload();
-        reload_projects();
-    });
+    Effect::new(move |_| reload_membership());
 
-    let on_membership_change = Callback::new(move |()| {
-        reload_projects();
-    });
+    let on_membership_change = Callback::new(move |()| reload_membership());
 
     let on_pick_folder = move |_| {
         spawn_local(async move {
@@ -119,7 +127,12 @@ pub fn Workspaces() -> impl IntoView {
                 </div>
             </div>
 
-            <WorkspacePanel workspaces=workspaces projects=projects on_membership_change=on_membership_change />
+            <WorkspacePanel
+                workspaces=workspaces
+                workspaces_loaded=workspaces_loaded
+                projects=projects
+                on_membership_change=on_membership_change
+            />
         </div>
     }
 }

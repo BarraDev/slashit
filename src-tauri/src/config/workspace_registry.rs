@@ -10,7 +10,9 @@
 //! [`crate::config::migration::StateMigrator`].
 
 use super::migration::StateMigrator;
-use super::paths::{AppPaths, IN_PROJECT_DIR};
+use super::paths::IN_PROJECT_DIR;
+#[cfg(doc)]
+use super::paths::AppPaths;
 use crate::domain::Workspace;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,16 +54,8 @@ fn unique_quarantine_path(config_path: &Path, ts: &str) -> PathBuf {
 }
 
 impl WorkspaceRegistry {
-    pub fn load() -> io::Result<Self> {
-        Self::load_from(Self::config_path()?)
-    }
-
-    /// Load from an explicit path, split out from `load()` so tests can point
-    /// it at a tempdir instead of the real OS config directory.
-    ///
-    /// `pub(crate)` rather than private so other modules' tests (e.g. the
-    /// queue executor's workspace-root fallback tests) can build a real
-    /// registry backed by a tempdir instead of the OS config directory.
+    /// Load the registry stored at `config_path`, normally
+    /// [`AppPaths::workspaces_file`]. Tests point it at a tempdir.
     pub(crate) fn load_from(config_path: PathBuf) -> io::Result<Self> {
         let workspaces = if config_path.exists() {
             let content = fs::read_to_string(&config_path)?;
@@ -133,10 +127,6 @@ impl WorkspaceRegistry {
         self.workspaces
             .values()
             .any(|w| w.root_path.as_path() == root)
-    }
-
-    fn config_path() -> io::Result<PathBuf> {
-        Ok(AppPaths::new()?.workspaces_file())
     }
 
     /// Delete the empty `.slashit/` directories left behind by earlier versions.

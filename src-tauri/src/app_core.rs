@@ -87,7 +87,7 @@ pub async fn build_state_with_paths(
     let app_state = AppState {
         repository: commands::repository::RepositoryState::new(),
         project: commands::project::ProjectState::new(),
-        workspace: commands::workspace::WorkspaceState::new()?,
+        workspace: commands::workspace::WorkspaceState::load(&paths)?,
         task: task_state,
         agent: commands::agent::AgentState::new(),
         session: commands::session::SessionState::new(),
@@ -1489,5 +1489,78 @@ mod tests {
                  actually distinguishes the two cases rather than always passing"
             );
         }
+    }
+
+    /// A Project whose Workspace the registry lost -- here because a corrupt
+    /// `workspaces.toml` was quarantined -- still loads as a member of that
+    /// Workspace. Startup must not guess a repair: the Workspaces page shows
+    /// the dangling membership, and the user decides to detach it.
+    #[tokio::test]
+    async fn startup_keeps_a_membership_whose_workspace_the_registry_lost() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let lost_workspace = uuid::Uuid::new_v4();
+        let project = domain::Project {
+            id: uuid::Uuid::new_v4(),
+            name: "orphaned-member".to_string(),
+            repository_id: None,
+            scope: domain::ProjectScope::InWorkspace { workspace_id: lost_workspace },
+            state_location: config::paths::StateLocation::External,
+            agent_type: domain::AgentType::ClaudeCode,
+            agent_config: domain::AgentConfig {
+                agent_type: domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let storage = Storage::with_paths((*paths).clone());
+        let mut cfg = config::storage::AppConfig::default();
+        cfg.projects.insert(project.id.to_string(), project.clone());
+        storage.save_config(&cfg).expect("save config");
+        let config_before = std::fs::read(paths.config_file()).unwrap();
+        std::fs::write(paths.workspaces_file(), "this is [[not toml").unwrap();
+
+        let (state, report) = build_state_with_paths(paths.clone())
+            .await
+            .expect("a lost registry must not fail startup");
+
+        assert_eq!(report.projects, 1);
+        // Quarantining is what proves startup read the registry at these
+        // paths, rather than the one in the real OS config directory.
+        assert!(
+            !paths.workspaces_file().exists(),
+            "the corrupt registry at these paths must have been quarantined"
+        );
+        let quarantined = std::fs::read_dir(paths.workspaces_file().parent().unwrap())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("workspaces.toml.corrupt-")
+            })
+            .count();
+        assert_eq!(quarantined, 1, "the corrupt registry must be kept as a backup");
+        assert!(
+            state.workspace.registry.read().await.get(&lost_workspace).is_none(),
+            "the registry must have started empty"
+        );
+        assert_eq!(
+            state.project.projects.read().await[&project.id].scope.workspace_id(),
+            Some(lost_workspace),
+            "startup must not rewrite a membership it cannot resolve"
+        );
+        assert_eq!(
+            std::fs::read(paths.config_file()).unwrap(),
+            config_before,
+            "startup must not persist a rewritten membership either"
+        );
     }
 }

@@ -1,3 +1,4 @@
+use crate::config::paths::AppPaths;
 use crate::config::WorkspaceRegistry;
 use crate::domain::{Project, Workspace, WorkspaceRoot};
 use std::collections::HashMap;
@@ -11,8 +12,10 @@ pub struct WorkspaceState {
 }
 
 impl WorkspaceState {
-    pub fn new() -> Result<Self, std::io::Error> {
-        let registry = WorkspaceRegistry::load()?;
+    /// Load the registry from `paths`, so a state built for a tempdir reads
+    /// that tempdir's registry rather than the user's real one.
+    pub fn load(paths: &AppPaths) -> Result<Self, std::io::Error> {
+        let registry = WorkspaceRegistry::load_from(paths.workspaces_file())?;
         Ok(Self {
             registry: Arc::new(RwLock::new(registry)),
         })

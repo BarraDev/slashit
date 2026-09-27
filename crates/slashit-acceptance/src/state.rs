@@ -153,6 +153,12 @@ impl StateRoot {
         self.config_home().join(APP_DIR).join("config.toml")
     }
 
+    /// The `workspaces.toml` registry of Workspaces, kept apart from the
+    /// `config.toml` that records which Workspace a Project belongs to.
+    pub fn workspaces_file(&self) -> PathBuf {
+        self.config_home().join(APP_DIR).join("workspaces.toml")
+    }
+
     /// Point a child process — and therefore everything it spawns — at this
     /// root.
     pub fn apply_to(&self, command: &mut Command) {
