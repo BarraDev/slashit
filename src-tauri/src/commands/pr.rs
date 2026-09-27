@@ -3679,29 +3679,58 @@ async fn parent_pull_request_commits(working_dir: &str, number: u64) -> Result<V
         .collect()
 }
 
-/// How many of a branch's pull requests, newest first, [`branch_pr_state`]
+/// How many of a branch's pull requests, newest first, [`own_branch_pr`]
 /// looks through for one that is not from a fork.
 const PR_LOOKUP_LIMIT: usize = 30;
 
-/// The newest pull request from this repository whose head is `branch`:
-/// its state, upper-cased, the branch it targets and its number, all `None`
-/// when there is none.
+/// Of the pull requests `gh pr list --head <branch> --limit
+/// PR_LOOKUP_LIMIT` listed, newest first, the newest one from this
+/// repository; `None` when there is none.
 ///
 /// `gh pr list --head` matches the head branch by name only (it takes no
 /// `<owner>:<branch>`), so pull requests from forks whose branch happens to
 /// have the same name are listed too. Task branch names are public and
 /// predictable, so such a pull request says nothing about the work on this
-/// repository's branch, and taken as the newest it would decide the base
-/// instead of the branch's own. Every entry `gh` marks as
-/// `isCrossRepository` is passed over, among the newest
-/// [`PR_LOOKUP_LIMIT`] pull requests; the first one left is used. An entry
-/// that does not say whether it is from a fork is neither: the lookup fails,
-/// as it does when `gh` cannot answer, rather than let it decide or skip it.
+/// repository's branch, and taken as the newest it would stand in for the
+/// branch's own. Every entry `gh` marks as `isCrossRepository` is passed
+/// over; the first one left is used. An entry that does not say whether it
+/// is from a fork is neither: the lookup fails, as it does when `gh` cannot
+/// answer, rather than let it decide or skip it.
 ///
 /// When fewer than [`PR_LOOKUP_LIMIT`] are listed and all are from forks,
 /// the branch has no pull request of its own. When the list is full and all
 /// are from forks, its own may be further back than the list reaches, and
-/// reading that as none could pick the wrong base, so the lookup fails.
+/// reading that as none could act on the wrong pull request, so the lookup
+/// fails.
+fn own_branch_pr<'a>(
+    listed: &'a [serde_json::Value],
+    branch: &str,
+) -> Result<Option<&'a serde_json::Value>, String> {
+    for pr in listed {
+        match pr.get("isCrossRepository").and_then(|v| v.as_bool()) {
+            Some(true) => continue,
+            Some(false) => return Ok(Some(pr)),
+            None => {
+                return Err(format!(
+                    "gh pr list did not report isCrossRepository for a pull request of \
+                     {branch}, so SlashIt cannot tell it from a fork's"
+                ))
+            }
+        }
+    }
+    if listed.len() >= PR_LOOKUP_LIMIT {
+        return Err(format!(
+            "the newest {PR_LOOKUP_LIMIT} pull requests with head {branch} are all from forks, \
+             so SlashIt cannot find this repository's own"
+        ));
+    }
+    Ok(None)
+}
+
+/// The newest pull request from this repository whose head is `branch`:
+/// its state, upper-cased, the branch it targets and its number, all `None`
+/// when there is none. A pull request from a fork's same-named branch is
+/// never taken for it; see [`own_branch_pr`].
 async fn branch_pr_state(working_dir: &str, branch: &str) -> Result<BranchPr, String> {
     let branch = checked_task_branch(branch)?;
     let limit = PR_LOOKUP_LIMIT.to_string();
@@ -3720,28 +3749,7 @@ async fn branch_pr_state(working_dir: &str, branch: &str) -> Result<BranchPr, St
     let listed: serde_json::Value = serde_json::from_str(&listed)
         .map_err(|e| format!("Failed to parse gh pr list output: {e}"))?;
     let listed = listed.as_array().map(Vec::as_slice).unwrap_or_default();
-    let mut own = None;
-    for pr in listed {
-        match pr.get("isCrossRepository").and_then(|v| v.as_bool()) {
-            Some(true) => continue,
-            Some(false) => {
-                own = Some(pr);
-                break;
-            }
-            None => {
-                return Err(format!(
-                    "gh pr list did not report isCrossRepository for a pull request of \
-                     {branch}, so SlashIt cannot tell it from a fork's"
-                ))
-            }
-        }
-    }
-    if own.is_none() && listed.len() >= PR_LOOKUP_LIMIT {
-        return Err(format!(
-            "the newest {PR_LOOKUP_LIMIT} pull requests with head {branch} are all from forks, \
-             so SlashIt cannot find this repository's own"
-        ));
-    }
+    let own = own_branch_pr(listed, branch)?;
     let field = |name: &str| {
         own.and_then(|pr| pr.get(name))
             .and_then(|v| v.as_str())
@@ -3805,6 +3813,43 @@ async fn remote_branch_commit(working_dir: &str, branch: &str) -> Result<Option<
     }))
 }
 
+/// Runs `gh pr list` for the pull requests whose head is `branch`, in any
+/// state, newest first, as [`own_existing_pr_url`] reads them.
+async fn list_existing_prs(working_dir: &str, branch: &str) -> Result<std::process::Output, String> {
+    let limit = PR_LOOKUP_LIMIT.to_string();
+    tokio::process::Command::new("gh")
+        .args([
+            "pr", "list",
+            "--head", branch,
+            "--state", "all",
+            "--limit", &limit,
+            "--json", "url,isCrossRepository",
+        ])
+        .current_dir(working_dir)
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run gh: {}", e))
+}
+
+/// The URL of `branch`'s own newest pull request in the output of
+/// [`list_existing_prs`]. A pull request from a fork's same-named branch is
+/// never taken for it; see [`own_branch_pr`].
+fn own_existing_pr_url(stdout: &[u8], branch: &str) -> Result<Option<String>, String> {
+    let json: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|e| format!("Failed to parse gh output: {}", e))?;
+    let listed = json.as_array().map(Vec::as_slice).unwrap_or_default();
+
+    Ok(own_branch_pr(listed, branch)?
+        .and_then(|item| item.get("url"))
+        .and_then(|url| url.as_str())
+        .map(|url| url.to_string()))
+}
+
+/// The URL of `branch`'s own pull request, to link to its task; `None`
+/// when it has none, and also when `gh` cannot be asked, since opening the
+/// pull request would then fail on its own. Output from `gh` that cannot be
+/// read, or that cannot tell the branch's own pull request from a fork's,
+/// is an error.
 async fn find_existing_pr_for_branch(
     working_dir: &str,
     branch: &str,
@@ -3814,33 +3859,15 @@ async fn find_existing_pr_for_branch(
     }
     let branch = checked_task_branch(branch)?;
 
-    let output = tokio::process::Command::new("gh")
-        .args([
-            "pr", "list",
-            "--head", branch,
-            "--state", "all",
-            "--limit", "1",
-            "--json", "url",
-        ])
-        .current_dir(working_dir)
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run gh: {}", e))?;
-
+    let output = list_existing_prs(working_dir, branch).await?;
     if !output.status.success() {
         return Ok(None);
     }
-
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Failed to parse gh output: {}", e))?;
-
-    Ok(json.as_array()
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("url"))
-        .and_then(|url| url.as_str())
-        .map(|url| url.to_string()))
+    own_existing_pr_url(&output.stdout, branch)
 }
 
+/// [`find_existing_pr_for_branch`], for callers that must know: an empty
+/// branch, or a `gh` that cannot be asked, is an error.
 async fn find_existing_pr_for_branch_strict(
     working_dir: &str,
     branch: &str,
@@ -3850,34 +3877,14 @@ async fn find_existing_pr_for_branch_strict(
     }
     let branch = checked_task_branch(branch)?;
 
-    let output = tokio::process::Command::new("gh")
-        .args([
-            "pr", "list",
-            "--head", branch,
-            "--state", "all",
-            "--limit", "1",
-            "--json", "url",
-        ])
-        .current_dir(working_dir)
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run gh: {}", e))?;
-
+    let output = list_existing_prs(working_dir, branch).await?;
     if !output.status.success() {
         return Err(format!(
             "gh pr list failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Failed to parse gh output: {}", e))?;
-
-    Ok(json.as_array()
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("url"))
-        .and_then(|url| url.as_str())
-        .map(|url| url.to_string()))
+    own_existing_pr_url(&output.stdout, branch)
 }
 
 /// Why recording a pull request on a task did not fully succeed.
@@ -7491,6 +7498,111 @@ mod tests {
             }
         }
 
+        /// The pull request each of the lookups that link an already-open
+        /// pull request to a task finds, when `gh` lists `json` for
+        /// `task-branch`: the lenient one first, then the strict one.
+        #[cfg(unix)]
+        async fn existing_pr_lookups(
+            json: &str,
+        ) -> (Result<Option<String>, String>, Result<Option<String>, String>, String) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let working_dir = dir.path().to_str().unwrap();
+            let mock = MockGh::setup_answering("unused", "{}", &[any_pr_list_of("task-branch", json)]);
+            let lenient = find_existing_pr_for_branch(working_dir, "task-branch").await;
+            let strict = find_existing_pr_for_branch_strict(working_dir, "task-branch").await;
+            (lenient, strict, mock.read_log())
+        }
+
+        /// `gh pr list --head` matches the head branch by name only, so a
+        /// pull request from a fork whose branch has the same name as the
+        /// task's is listed too. It is not the task's, and neither lookup
+        /// that links an existing pull request to a task takes it.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_existing_pr_lookups_pass_over_a_same_named_fork_pull_request() {
+            let _guard = PATH_LOCK.lock().await;
+            let (lenient, strict, log) = existing_pr_lookups(
+                r#"[{"url":"https://github.com/testorg/testrepo/pull/90","isCrossRepository":true}]"#,
+            )
+            .await;
+
+            assert_eq!(lenient, Ok(None), "{log}");
+            assert_eq!(strict, Ok(None), "{log}");
+        }
+
+        /// The task's own pull request is still found, and both lookups ask
+        /// `gh` which pull requests come from a fork, listing past the
+        /// newest so that forks' cannot hide it.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_existing_pr_lookups_find_the_tasks_own_pull_request() {
+            let _guard = PATH_LOCK.lock().await;
+            let own = "https://github.com/testorg/testrepo/pull/91";
+            let (lenient, strict, log) =
+                existing_pr_lookups(&format!(r#"[{{"url":"{own}","isCrossRepository":false}}]"#)).await;
+
+            assert_eq!(lenient, Ok(Some(own.to_string())), "{log}");
+            assert_eq!(strict, Ok(Some(own.to_string())), "{log}");
+            assert_eq!(
+                log.matches(
+                    "\npr\nlist\n--head\ntask-branch\n--state\nall\n--limit\n30\n--json\n\
+                     url,isCrossRepository\n---END-ARGS---"
+                )
+                .count(),
+                2,
+                "{log}"
+            );
+        }
+
+        /// Listed after a newer pull request from a same-named fork branch,
+        /// the task's own pull request is the one found.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_existing_pr_lookups_prefer_the_tasks_own_pull_request_over_a_newer_fork_one() {
+            let _guard = PATH_LOCK.lock().await;
+            let own = "https://github.com/testorg/testrepo/pull/92";
+            let (lenient, strict, log) = existing_pr_lookups(&format!(
+                r#"[{{"url":"https://github.com/testorg/testrepo/pull/93","isCrossRepository":true}},{{"url":"{own}","isCrossRepository":false}}]"#
+            ))
+            .await;
+
+            assert_eq!(lenient, Ok(Some(own.to_string())), "{log}");
+            assert_eq!(strict, Ok(Some(own.to_string())), "{log}");
+        }
+
+        /// A listed pull request that does not say whether it comes from a
+        /// fork can be neither linked to the task nor skipped as a fork's,
+        /// so both lookups fail, as they do on output they cannot parse.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_existing_pr_lookups_fail_on_a_pull_request_listed_without_its_fork_status() {
+            let _guard = PATH_LOCK.lock().await;
+            let (lenient, strict, log) =
+                existing_pr_lookups(r#"[{"url":"https://github.com/testorg/testrepo/pull/94"}]"#).await;
+
+            let strict = strict.expect_err("an entry of unknown origin must not be linked");
+            assert!(strict.contains("isCrossRepository"), "{strict}\n{log}");
+            let lenient = lenient.expect_err("an entry of unknown origin must not be linked");
+            assert!(lenient.contains("isCrossRepository"), "{lenient}\n{log}");
+        }
+
+        /// A full list of pull requests from forks may hide the task's own
+        /// further back. Reading that as none could open a second pull
+        /// request for the task, so both lookups fail.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_existing_pr_lookups_fail_on_a_full_list_of_fork_pull_requests() {
+            let _guard = PATH_LOCK.lock().await;
+            let fork = r#"{"url":"https://github.com/testorg/testrepo/pull/95","isCrossRepository":true}"#;
+            let (lenient, strict, log) =
+                existing_pr_lookups(&format!("[{}]", vec![fork; 30].join(","))).await;
+
+            let strict = strict.expect_err("the task's own pull request may be past the list");
+            assert!(strict.contains("all from forks"), "{strict}\n{log}");
+            let lenient = lenient.expect_err("the task's own pull request may be past the list");
+            assert!(lenient.contains("all from forks"), "{lenient}\n{log}");
+        }
+
         /// Phase 7: `bulk_create_prs` is `create_pr_inner` called once per task
         /// id with no divergent resolution logic of its own (confirmed by
         /// reading its body: a loop over `create_pr_inner`, nothing else that
@@ -8170,8 +8282,8 @@ mod tests {
                 let existing = "https://github.com/testorg/testrepo/pull/20";
                 let mut answers = merged_parent_answers(&landed);
                 answers.push((
-                    "pr list --head task-branch --state all --limit 1 --json url".to_string(),
-                    format!(r#"printf '%s' '[{{"url":"{existing}"}}]'"#),
+                    "pr list --head task-branch --state all --limit 30 --json url,isCrossRepository".to_string(),
+                    format!(r#"printf '%s' '[{{"url":"{existing}","isCrossRepository":false}}]'"#),
                 ));
                 let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &answers);
                 let (state, _tmp) = build_test_state().await;
@@ -10140,7 +10252,7 @@ mod tests {
                     let pr_url_file = tmp.path().join("pr_url.txt");
 
                     std::fs::write(&empty_json, "[]").unwrap();
-                    std::fs::write(&existing_json, format!(r#"[{{"url":"{pr_url}"}}]"#)).unwrap();
+                    std::fs::write(&existing_json, format!(r#"[{{"url":"{pr_url}","isCrossRepository":false}}]"#)).unwrap();
                     std::fs::write(&view_json, r#"{"state":"OPEN"}"#).unwrap();
                     std::fs::write(&pr_url_file, pr_url).unwrap();
 
@@ -10398,7 +10510,7 @@ mod tests {
                     let after = tmp.path().join("after.json");
                     let view = tmp.path().join("view.json");
                     std::fs::write(&before, list_before_create).unwrap();
-                    std::fs::write(&after, format!(r#"[{{"url":"{pr_url}"}}]"#)).unwrap();
+                    std::fs::write(&after, format!(r#"[{{"url":"{pr_url}","isCrossRepository":false}}]"#)).unwrap();
                     std::fs::write(&view, view_json).unwrap();
 
                     let park = if park_create {
@@ -10641,7 +10753,7 @@ mod tests {
                 let pr_url = "https://github.com/testorg/testrepo/pull/612";
                 let gh = ParkingGh::install(
                     pr_url,
-                    &format!(r#"[{{"url":"{pr_url}"}}]"#),
+                    &format!(r#"[{{"url":"{pr_url}","isCrossRepository":false}}]"#),
                     r#"{"state":"MERGED"}"#,
                     false,
                 );
