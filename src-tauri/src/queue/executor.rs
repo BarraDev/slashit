@@ -1043,6 +1043,22 @@ impl TaskExecutor {
             .clone()
             .unwrap_or_else(|| WorktreeManager::branch_for_task(task_id));
 
+        // Before any arm below reattaches, adopts, resumes or creates it: a
+        // branch another task in the repository can claim is not this
+        // task's to use. See `worktree::refuse_shared_task_branch`.
+        if let Err(refused) = crate::worktree::refuse_shared_task_branch(
+            &self.tasks,
+            &self.projects,
+            &self.repositories,
+            task_id,
+            &branch_name,
+            repo_path,
+        )
+        .await
+        {
+            return (existing_branch, Err(refused));
+        }
+
         // Check dependencies for stacked branching (only for new branches).
         // Stack when the dependency has a branch that hasn't been merged to main yet.
         // If merged, base on main normally (the code is already there).
@@ -6445,6 +6461,246 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
 
             executor.stop_task(task_id).await.expect("stop the review");
             assert!(!pid_is_alive(pid));
+        }
+    }
+
+    /// Two tasks whose ids share their first 8 hex digits, and so the branch
+    /// name `task-12345678`, started through the queue.
+    mod branch_ownership {
+        use super::*;
+
+        const A: Uuid = Uuid::from_u128(0x12345678_0000_4000_8000_000000000001);
+        const B: Uuid = Uuid::from_u128(0x12345678_0000_4000_8000_000000000002);
+        /// A task whose branch name is not `task-12345678`.
+        const C: Uuid = Uuid::from_u128(0xabcdef01_0000_4000_8000_000000000003);
+        const BRANCH: &str = "task-12345678";
+
+        /// Where task `A`'s checkout of [`BRANCH`] is.
+        #[derive(Debug, Clone, Copy)]
+        enum Placement {
+            /// SlashIt's managed path.
+            Managed,
+            /// The pre-`AppPaths` sibling `<repo>.<branch>`.
+            Legacy,
+            /// A path of another tool's choosing, such as a Worktrunk template.
+            Custom,
+        }
+
+        /// A repository with a published default base, registered as a new
+        /// project's.
+        async fn repository(executor: &TaskExecutor, temps: &[tempfile::TempDir]) -> (std::path::PathBuf, Uuid) {
+            let repo = temps[0].path().join("repository");
+            std::fs::create_dir_all(&repo).unwrap();
+            git_in(&repo, &["init", "-q", "-b", "main"]);
+            git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
+            publish_default_base(&repo);
+            let project_id = Uuid::new_v4();
+            let repository_id = Uuid::new_v4();
+            executor.repositories.write().await.insert(
+                repository_id,
+                crate::domain::Repository {
+                    id: repository_id,
+                    local_path: repo.to_string_lossy().to_string(),
+                    remote_url: None,
+                    remote_type: None,
+                    created_at: chrono::Utc::now(),
+                },
+            );
+            let mut project = test_project(project_id, ProjectScope::Standalone);
+            project.repository_id = Some(repository_id);
+            executor.projects.write().await.insert(project_id, project);
+            (repo, project_id)
+        }
+
+        async fn add_task(executor: &TaskExecutor, id: Uuid, project_id: Uuid, branch: Option<&str>) {
+            let mut task = create_test_task_full(&format!("task {id}"), project_id, TaskStatus::InProgress, 0);
+            task.id = id;
+            task.phase = TaskPhase::Idle;
+            task.branch_name = branch.map(str::to_string);
+            executor.tasks.write().await.insert(id, task);
+        }
+
+        /// Put a checkout of [`BRANCH`] at `placement`, returning its path.
+        async fn place_checkout(
+            executor: &TaskExecutor,
+            temps: &[tempfile::TempDir],
+            repo: &std::path::Path,
+            placement: Placement,
+        ) -> String {
+            let path = match placement {
+                Placement::Managed => {
+                    return executor
+                        .worktree_manager
+                        .create(repo.to_str().unwrap(), BRANCH)
+                        .await
+                        .expect("a checkout at the managed path")
+                        .path;
+                }
+                Placement::Legacy => repo.parent().unwrap().join(format!("repository.{BRANCH}")),
+                Placement::Custom => temps[0].path().join("elsewhere").join(BRANCH),
+            };
+            git_in(repo, &["worktree", "add", "-q", "-b", BRANCH, "--", path.to_str().unwrap()]);
+            path.to_string_lossy().to_string()
+        }
+
+        /// Task `B` is refused task `A`'s checkout of their shared branch
+        /// name, wherever it is, and nothing is created, adopted or recorded.
+        async fn assert_b_is_refused_a_checkout_a_records(placement: Placement) {
+            let (executor, temps) = test_executor();
+            let (repo, project_id) = repository(&executor, &temps).await;
+            add_task(&executor, A, project_id, Some(BRANCH)).await;
+            add_task(&executor, B, project_id, None).await;
+            place_checkout(&executor, &temps, &repo, placement).await;
+            let (refs, worktrees) = (refs_of(&repo), worktree_count(&repo));
+
+            let (_, acquired) = executor.acquire_task_worktree(B, repo.to_str().unwrap()).await;
+
+            let refused = acquired.err().unwrap_or_else(|| panic!("{placement:?}: B was given A's checkout"));
+            assert!(refused.contains(&A.to_string()), "{placement:?}: {refused}");
+            assert!(refused.contains("records it as its branch"), "{placement:?}: {refused}");
+            assert_eq!(refs_of(&repo), refs, "{placement:?}");
+            assert_eq!(worktree_count(&repo), worktrees, "{placement:?}");
+            assert_eq!(executor.tasks.read().await[&B].branch_name, None, "{placement:?}");
+        }
+
+        #[tokio::test]
+        async fn a_task_is_refused_the_managed_checkout_another_task_records() {
+            assert_b_is_refused_a_checkout_a_records(Placement::Managed).await;
+        }
+
+        #[tokio::test]
+        async fn a_task_is_refused_the_legacy_checkout_another_task_records() {
+            assert_b_is_refused_a_checkout_a_records(Placement::Legacy).await;
+        }
+
+        #[tokio::test]
+        async fn a_task_is_refused_a_custom_path_checkout_another_task_records() {
+            assert_b_is_refused_a_checkout_a_records(Placement::Custom).await;
+        }
+
+        /// A task stacked on a dependency does not resume a same-named branch
+        /// another task records, even when that branch holds the
+        /// dependency's work, with or without a checkout of it.
+        #[tokio::test]
+        async fn a_stacked_task_does_not_resume_a_branch_another_task_records() {
+            for with_checkout in [false, true] {
+                let (executor, temps) = test_executor();
+                let (repo, project_id) = repository(&executor, &temps).await;
+                git_in(&repo, &["branch", "task-deadbeef"]);
+                let mut dependency =
+                    create_test_task_full("dependency", project_id, TaskStatus::InProgress, 0);
+                dependency.branch_name = Some("task-deadbeef".to_string());
+                let dependency_id = dependency.id;
+                executor.tasks.write().await.insert(dependency_id, dependency);
+                add_task(&executor, A, project_id, Some(BRANCH)).await;
+                add_task(&executor, B, project_id, None).await;
+                executor.tasks.write().await.get_mut(&B).unwrap().dependencies = vec![dependency_id];
+                if with_checkout {
+                    place_checkout(&executor, &temps, &repo, Placement::Custom).await;
+                } else {
+                    git_in(&repo, &["branch", BRANCH, "task-deadbeef"]);
+                }
+                let (refs, worktrees) = (refs_of(&repo), worktree_count(&repo));
+
+                let (_, acquired) = executor.acquire_task_worktree(B, repo.to_str().unwrap()).await;
+
+                let refused = acquired
+                    .err()
+                    .unwrap_or_else(|| panic!("with_checkout={with_checkout}: B resumed A's branch"));
+                assert!(refused.contains(&A.to_string()), "{refused}");
+                assert_eq!(refs_of(&repo), refs, "with_checkout={with_checkout}");
+                assert_eq!(worktree_count(&repo), worktrees, "with_checkout={with_checkout}");
+            }
+        }
+
+        /// A checkout of the shared name that neither task records, such as
+        /// one left by a start whose record was never saved, is given to
+        /// neither: SlashIt cannot tell whose it is.
+        #[tokio::test]
+        async fn an_unrecorded_checkout_two_tasks_could_claim_is_given_to_neither() {
+            let (executor, temps) = test_executor();
+            let (repo, project_id) = repository(&executor, &temps).await;
+            add_task(&executor, A, project_id, None).await;
+            add_task(&executor, B, project_id, None).await;
+            place_checkout(&executor, &temps, &repo, Placement::Managed).await;
+            let refs = refs_of(&repo);
+
+            for (task, other) in [(A, B), (B, A)] {
+                let (_, acquired) = executor.acquire_task_worktree(task, repo.to_str().unwrap()).await;
+                let refused = acquired.err().expect("an ambiguous checkout is refused");
+                assert!(refused.contains(&other.to_string()), "{refused}");
+                assert!(refused.contains("would be given the same branch name"), "{refused}");
+            }
+            assert_eq!(refs_of(&repo), refs);
+        }
+
+        /// A task that records its branch keeps reattaching its own
+        /// checkout, wherever it is, beside a task that records no branch but
+        /// would be given the same name.
+        #[tokio::test]
+        async fn a_task_reattaches_its_own_checkout_beside_a_task_with_the_same_prefix() {
+            for placement in [Placement::Managed, Placement::Legacy, Placement::Custom] {
+                let (executor, temps) = test_executor();
+                let (repo, project_id) = repository(&executor, &temps).await;
+                add_task(&executor, A, project_id, Some(BRANCH)).await;
+                add_task(&executor, B, project_id, None).await;
+                let path = place_checkout(&executor, &temps, &repo, placement).await;
+
+                let (existing, acquired) = executor.acquire_task_worktree(A, repo.to_str().unwrap()).await;
+
+                let acquired = acquired.unwrap_or_else(|e| panic!("{placement:?}: {e}"));
+                assert_eq!(existing.as_deref(), Some(BRANCH));
+                assert_eq!(acquired.what_happened, "Reattached worktree", "{placement:?}");
+                assert_eq!(
+                    std::fs::canonicalize(&acquired.info.path).unwrap(),
+                    std::fs::canonicalize(&path).unwrap(),
+                    "{placement:?}"
+                );
+            }
+        }
+
+        /// A checkout a task's own start left unrecorded, at any placement
+        /// including a Worktrunk-era custom path, is still adopted when no
+        /// other task can claim its branch, as after a restart that lost the
+        /// record.
+        #[tokio::test]
+        async fn an_unrecorded_checkout_no_other_task_can_claim_is_still_adopted() {
+            for placement in [Placement::Managed, Placement::Legacy, Placement::Custom] {
+                let (executor, temps) = test_executor();
+                let (repo, project_id) = repository(&executor, &temps).await;
+                add_task(&executor, A, project_id, None).await;
+                add_task(&executor, C, project_id, None).await;
+                let path = place_checkout(&executor, &temps, &repo, placement).await;
+
+                let (_, acquired) = executor.acquire_task_worktree(A, repo.to_str().unwrap()).await;
+
+                let acquired = acquired.unwrap_or_else(|e| panic!("{placement:?}: {e}"));
+                assert_eq!(acquired.what_happened, "Adopted worktree", "{placement:?}");
+                assert_eq!(
+                    std::fs::canonicalize(&acquired.info.path).unwrap(),
+                    std::fs::canonicalize(&path).unwrap(),
+                    "{placement:?}"
+                );
+                assert_eq!(acquired.base_commit, None);
+            }
+        }
+
+        /// Tasks whose branch names differ each get a new checkout from the
+        /// default base.
+        #[tokio::test]
+        async fn tasks_with_different_branch_names_each_get_a_new_checkout() {
+            let (executor, temps) = test_executor();
+            let (repo, project_id) = repository(&executor, &temps).await;
+            add_task(&executor, A, project_id, None).await;
+            add_task(&executor, C, project_id, None).await;
+
+            for task in [A, C] {
+                let (_, acquired) = executor.acquire_task_worktree(task, repo.to_str().unwrap()).await;
+                let acquired = acquired.unwrap_or_else(|e| panic!("{task}: {e}"));
+                assert_eq!(acquired.what_happened, "Created worktree");
+                assert_eq!(acquired.info.branch, WorktreeManager::branch_for_task(task));
+                executor.record_acquired_worktree(task, acquired).await;
+            }
         }
     }
 }

@@ -4200,12 +4200,15 @@ branch refs/heads/some-other-branch
         }
     }
 
-    /// Nothing a bare `git push` in the task's checkout can do moves the
-    /// remote's default branch, even under `push.default=upstream` and an
-    /// `autoSetupMerge` that would otherwise have made `main` the task
-    /// branch's upstream.
+    /// SlashIt does not make the remote's default branch the task branch's
+    /// upstream, so a bare `git push` in the task's checkout under
+    /// `push.default=upstream` does not move it, even with an
+    /// `autoSetupMerge` that would otherwise have set that upstream. This is
+    /// about what SlashIt configures: a push refspec the user configures
+    /// themselves, such as `remote.origin.push=HEAD:refs/heads/main`, still
+    /// applies to a bare `git push` as it would anywhere else.
     #[tokio::test]
-    async fn a_bare_push_from_the_task_checkout_cannot_move_the_remote_default_branch() {
+    async fn a_bare_push_does_not_move_the_remote_default_branch_through_an_upstream_slashit_set() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let base = origin_main(repo_path);

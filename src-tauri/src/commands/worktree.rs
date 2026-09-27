@@ -8,6 +8,11 @@ pub async fn create_worktree(
     task_id: String,
 ) -> Result<String, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    create_worktree_inner(&state, task_id).await
+}
+
+/// [`create_worktree`], on an already parsed task id.
+async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result<String, String> {
 
     // Acquiring a worktree for a task is a lifecycle ownership change, so it
     // waits behind any cleanup, terminalization or delete already running for
@@ -52,6 +57,19 @@ pub async fn create_worktree(
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_id).and_then(|t| t.branch_name.clone())
     };
+
+    // A branch another task in the repository can claim is not this task's
+    // to reattach, adopt or create. See `worktree::refuse_shared_task_branch`.
+    let branch = existing_branch.clone().unwrap_or_else(|| WorktreeManager::branch_for_task(task_id));
+    crate::worktree::refuse_shared_task_branch(
+        &state.task.tasks,
+        &state.project.projects,
+        &state.repository.repositories,
+        task_id,
+        &branch,
+        &repo_path,
+    )
+    .await?;
 
     let acquired = acquire_checkout(
         &state.worktree_manager,
@@ -312,5 +330,155 @@ mod tests {
         assert_eq!(acquired.info.branch, "task-legacy");
         assert_eq!(acquired.base_commit, None);
         assert_eq!(acquired.origin, None);
+    }
+
+    /// Two tasks whose ids share their first 8 hex digits, and so the branch
+    /// name `task-12345678`, given checkouts from the Worktree panel.
+    mod branch_ownership {
+        use super::*;
+        use crate::domain::TaskStatus;
+
+        const A: Uuid = Uuid::from_u128(0x12345678_0000_4000_8000_000000000001);
+        const B: Uuid = Uuid::from_u128(0x12345678_0000_4000_8000_000000000002);
+        const BRANCH: &str = "task-12345678";
+
+        /// App state holding a repository with a published default base,
+        /// registered as a project's, and tasks `A`, recording `a_branch`,
+        /// and `B`, recording nothing.
+        async fn state_with_two_tasks(
+            temp: &tempfile::TempDir,
+            a_branch: Option<&str>,
+        ) -> (crate::AppState, std::path::PathBuf) {
+            let (repo, _) = fixture(temp);
+            let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+                temp.path().join("config"),
+                temp.path().join("data"),
+                temp.path().join("cache"),
+                temp.path().join("runtime"),
+            ));
+            let (state, _) = crate::app_core::build_state_with_paths(paths).await.expect("state");
+            let repository = crate::domain::Repository {
+                id: Uuid::new_v4(),
+                local_path: repo.to_string_lossy().to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            };
+            let repository_id = repository.id;
+            state.repository.repositories.write().await.insert(repository_id, repository);
+            let project = crate::domain::Project {
+                id: Uuid::new_v4(),
+                name: "project".to_string(),
+                repository_id: Some(repository_id),
+                scope: crate::domain::ProjectScope::Standalone,
+                state_location: crate::config::paths::StateLocation::External,
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                agent_config: crate::domain::AgentConfig {
+                    agent_type: crate::domain::AgentType::ClaudeCode,
+                    command: "claude".to_string(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                    model: None,
+                    api_key: None,
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            let project_id = project.id;
+            state.project.projects.write().await.insert(project_id, project);
+            for (id, branch) in [(A, a_branch), (B, None)] {
+                let mut task = crate::test_helpers::create_test_task_full(
+                    &format!("task {id}"),
+                    project_id,
+                    TaskStatus::InProgress,
+                    0,
+                );
+                task.id = id;
+                task.branch_name = branch.map(str::to_string);
+                state.task.tasks.write().await.insert(id, task);
+            }
+            (state, repo)
+        }
+
+        /// Put a checkout of [`BRANCH`] at the managed path, the legacy
+        /// sibling path, or a custom one, returning where it is.
+        async fn place_checkout(
+            state: &crate::AppState,
+            temp: &tempfile::TempDir,
+            repo: &Path,
+            placement: &str,
+        ) -> String {
+            let path = match placement {
+                "managed" => {
+                    return state
+                        .worktree_manager
+                        .create(repo.to_str().unwrap(), BRANCH)
+                        .await
+                        .expect("a checkout at the managed path")
+                        .path;
+                }
+                "legacy" => repo.parent().unwrap().join(format!("repository.{BRANCH}")),
+                _ => temp.path().join("elsewhere").join(BRANCH),
+            };
+            git(repo, &["worktree", "add", "-q", "-b", BRANCH, "--", path.to_str().unwrap()]);
+            path.to_string_lossy().to_string()
+        }
+
+        /// Task `B` is refused task `A`'s checkout of their shared branch
+        /// name at every placement, and nothing is recorded on `B`.
+        #[tokio::test]
+        async fn a_task_is_refused_a_checkout_another_task_records_at_any_placement() {
+            for placement in ["managed", "legacy", "custom"] {
+                let temp = tempfile::TempDir::new().unwrap();
+                let (state, repo) = state_with_two_tasks(&temp, Some(BRANCH)).await;
+                place_checkout(&state, &temp, &repo, placement).await;
+                let refs = git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+
+                let refused = create_worktree_inner(&state, B)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("{placement}: B was given A's checkout"));
+
+                assert!(refused.contains(&A.to_string()), "{placement}: {refused}");
+                let b = state.task.tasks.read().await[&B].clone();
+                assert_eq!((b.branch_name, b.worktree_path), (None, None), "{placement}");
+                assert_eq!(git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+            }
+        }
+
+        /// Task `A`, which records the branch, still gets its own checkout
+        /// back at every placement beside task `B`.
+        #[tokio::test]
+        async fn a_task_reattaches_its_own_checkout_beside_a_task_with_the_same_prefix() {
+            for placement in ["managed", "legacy", "custom"] {
+                let temp = tempfile::TempDir::new().unwrap();
+                let (state, repo) = state_with_two_tasks(&temp, Some(BRANCH)).await;
+                let path = place_checkout(&state, &temp, &repo, placement).await;
+
+                let acquired = create_worktree_inner(&state, A)
+                    .await
+                    .unwrap_or_else(|e| panic!("{placement}: {e}"));
+
+                assert_eq!(
+                    std::fs::canonicalize(acquired).unwrap(),
+                    std::fs::canonicalize(path).unwrap(),
+                    "{placement}"
+                );
+            }
+        }
+
+        /// With neither task recording a branch, the first to ask is
+        /// refused a new one too: a branch it created could later be
+        /// adopted by the other.
+        #[tokio::test]
+        async fn a_task_is_refused_a_new_branch_another_task_would_be_given() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let (state, repo) = state_with_two_tasks(&temp, None).await;
+
+            let refused = create_worktree_inner(&state, A).await.expect_err("refused");
+
+            assert!(refused.contains(&B.to_string()), "{refused}");
+            assert_eq!(git(&repo, &["worktree", "list", "--porcelain"]).matches("worktree ").count(), 1);
+        }
     }
 }

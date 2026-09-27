@@ -173,8 +173,10 @@ SlashIt never fetches to find out. A repository without a remote named
 `origin` cannot start ordinary tasks.
 
 The branch is created with no upstream, whatever `branch.autoSetupMerge`
-says, so a bare `git push` or `git pull` in a task's checkout has no default
-to act on. SlashIt's own push, when it opens the pull request, records
+says, so SlashIt never points a bare `git push` or `git pull` in a task's
+checkout at the default branch. A push refspec the user configures, such as
+`remote.origin.push=HEAD:refs/heads/main`, still applies there as anywhere
+else. SlashIt's own push, when it opens the pull request, records
 `origin/<branch>` as the upstream. The pull request targets the default branch
 the task was started from.
 
@@ -189,9 +191,22 @@ path nor, when the Project is itself a linked worktree, the main worktree git
 lists first. A task whose branch is checked out there is refused and told
 where. An adopted worktree records no starting commit or origin, since its
 `HEAD` is not where the branch started; the task keeps whatever it had
-recorded. A task whose recorded worktree path
+recorded.
+
+Task branch names use only the first eight hex digits of the task's id, so two
+tasks can be given the same one, and git cannot say which task a branch or
+worktree of that name belongs to. Before reattaching, adopting, resuming or
+creating anything, SlashIt refuses the task, naming the other task, when
+another task in the same git repository can claim the branch. A task that
+records the branch competes only with another task that records it too. A
+task that records no branch also competes with any task that records none and
+would be given the same name. Projects whose repositories are the same
+directory, or linked worktrees of one repository, count as the same
+repository. A task whose recorded worktree path
 no longer resolves is re-pointed at the worktree's current location before the
-reference is treated as stale. The previous behaviour cleared the reference,
+reference is treated as stale, unless another task in the same repository
+records the same branch. Then neither task is re-pointed: both keep the
+reference they had and say why. The previous behaviour cleared the reference,
 stranding the branch and any uncommitted work in it.
 
 ## Directories by platform

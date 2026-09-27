@@ -12,9 +12,13 @@
 //! In order:
 //!
 //! 1. `refs/remotes/origin/HEAD`, read as the exact ref, when it is a
-//!    symbolic ref to `refs/remotes/origin/<D>` and that ref names a commit
-//!    the repository has. This is what `git clone` records, and what
-//!    `git remote set-head origin` records later.
+//!    symbolic ref that resolves to `refs/remotes/origin/<D>` and that ref
+//!    names a commit the repository has. This is what `git clone` records,
+//!    and what `git remote set-head origin` records later. Git reports where
+//!    a chain of symbolic refs ends, so one that reaches
+//!    `refs/remotes/origin/<D>` through another symbolic ref resolves to
+//!    `<D>`, that final branch of origin's; one that ends anywhere else is
+//!    refused as below.
 //! 2. When that ref is missing, dangling or not symbolic, and the repository
 //!    is also a JJ repository (`<repo>/.jj`), JJ's `trunk()` alias, but only
 //!    when it is exactly `<D>@origin` and `refs/remotes/origin/<D>` resolves
@@ -115,7 +119,7 @@ enum Listed {
     Absent,
     /// A ref naming an object directly.
     Direct,
-    /// A symbolic ref to the ref named.
+    /// A symbolic ref, and the ref its chain of symbolic refs ends at.
     Symbolic(String),
 }
 
@@ -123,7 +127,8 @@ enum Listed {
 ///
 /// `for-each-ref` matches the full ref name only, never a branch or tag that
 /// merely carries the same name, and does not list a symbolic ref whose
-/// target is not there. Its pattern also matches refs below `refname/`, so
+/// target is not there. For a symbolic ref, `%(symref)` is where its whole
+/// chain of symbolic refs ends, not the next ref along it. Its pattern also matches refs below `refname/`, so
 /// only the line for the exact name is taken.
 async fn listed(repo: &Path, refname: &str) -> Result<Listed, String> {
     let output = tokio::process::Command::new("git")
@@ -375,6 +380,27 @@ mod tests {
             let refused = resolve(&repo).await.expect_err(name);
             assert!(refused.contains(expected), "{name}: {refused}");
         }
+    }
+
+    /// `refs/remotes/origin/HEAD` pointing at another symbolic ref resolves
+    /// to the branch of origin's the chain ends at, which is where a branch
+    /// started from it is created. A chain that ends outside `origin` is
+    /// refused.
+    #[tokio::test]
+    async fn an_origin_head_through_another_symbolic_ref_resolves_to_where_the_chain_ends() {
+        let (_temp, repo, tip) = cloned_repo();
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/alias", "refs/remotes/origin/trunk"]);
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/alias"]);
+
+        assert_eq!(
+            resolve(&repo).await,
+            Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip.clone() })
+        );
+
+        git(&repo, &["update-ref", "refs/remotes/upstream/trunk", &tip]);
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/alias", "refs/remotes/upstream/trunk"]);
+        let refused = resolve(&repo).await.expect_err("a chain ending outside origin");
+        assert!(refused.contains("not at a branch of origin"), "{refused}");
     }
 
     /// A branch or tag that merely carries the name of the ref, or of the
