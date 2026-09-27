@@ -1431,6 +1431,7 @@ impl WorktreeManager {
         // dirty is the whole policy here, so nothing below parses stderr to
         // second-guess it; ignored build output is not dirty to git and this
         // removal takes the checkout away build output and all.
+        let was_present = matches!(Presence::of(Path::new(worktree_path)), Presence::Present);
         let output = tokio::process::Command::new("git")
             .args(["worktree", "remove", worktree_path])
             .current_dir(repo_path)
@@ -1468,6 +1469,14 @@ impl WorktreeManager {
         // here: git dropped nothing it had not finished with, since there
         // was no directory for it to fail on.
         if Self::proven_absent(worktree_path) {
+            // A checkout that was there, removed by a `git worktree remove`
+            // that succeeded: git takes its own registration down as the
+            // last step of such a removal, so there is nothing left to ask
+            // about. Asking anyway would also fail every ordinary cleanup on
+            // a git too old for the listing's `-z`.
+            if was_present && output.status.success() {
+                return Ok(());
+            }
             drop(record);
             let listing = Self::worktree_listing(repo_path).await;
             let state = CheckoutState::of(
@@ -1968,10 +1977,6 @@ mod tests {
         assert!(refused.contains(&missing), "the checkout is named: {refused}");
     }
 
-    /// A task whose checkout directory vanished without being removed leaves
-    /// git a prunable registration of the task's branch. Checking the branch
-    /// out again clears that registration first, as `git worktree prune`
-    /// would, rather than failing on it at the managed path or anywhere else.
     /// Git records a checkout's path with symlinks resolved. A task whose
     /// recorded path reaches the checkout through a symlinked ancestor still
     /// finds git's locked registration once the directories behind the link
@@ -2079,6 +2084,10 @@ mod tests {
         assert!(Path::new(&again.path).is_dir());
     }
 
+    /// A task whose checkout directory vanished without being removed leaves
+    /// git a prunable registration of the task's branch. Checking the branch
+    /// out again clears that registration first, as `git worktree prune`
+    /// would, rather than failing on it at the managed path or anywhere else.
     #[tokio::test]
     async fn a_branch_whose_checkout_vanished_can_be_checked_out_again() {
         let repo = create_temp_git_repo();
@@ -2603,6 +2612,52 @@ branch refs/heads/some-other-branch
         assert!(Path::new(&info.path).exists(), "worktree dir should exist");
         assert_eq!(info.branch, "test-branch");
         assert!(mgr.exists(&info.path));
+    }
+
+    /// A git older than 2.36 refuses `worktree list -z`. Removing a checkout
+    /// that is there must still succeed with such a git: the removal itself
+    /// is the proof, and a listing is only needed for a checkout that was
+    /// already gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_present_checkout_is_removed_by_a_git_without_listing_z() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+        let info = mgr.create(repo_path, "task-old-git").await.expect("create failed");
+
+        let real_git = String::from_utf8(
+            std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .expect("locate git")
+                .stdout,
+        )
+        .expect("git path")
+        .trim()
+        .to_string();
+        let repo = std::fs::canonicalize(repo_path).expect("canonical repo");
+        // Only this test's repository sees the old git; every other test
+        // that spawns git meanwhile gets the real one.
+        let _fake = crate::test_helpers::FakeProgram::install(
+            "git",
+            &format!(
+                "case \"$(pwd -P)\" in {repo:?}*) case \" $* \" in *' list '*' -z '*) \
+                 echo \"error: unknown switch \\`z'\" >&2; exit 129;; esac;; esac\n\
+                 exec {real_git:?} \"$@\"",
+                repo = repo.display().to_string(),
+            ),
+        )
+        .await;
+
+        mgr.remove(&info.path, repo_path, Some("task-old-git"))
+            .await
+            .expect("a checkout git removed is removed, whatever the listing can say");
+        assert!(!Path::new(&info.path).exists(), "worktree dir should be gone");
+        assert!(
+            WorktreeManager::worktree_listing(repo_path).await.is_err(),
+            "precondition: this git cannot list with -z"
+        );
     }
 
     #[tokio::test]

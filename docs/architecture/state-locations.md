@@ -282,7 +282,9 @@ two lookups:
   longer a usable Git repository: the task keeps its reference, and cannot be
   finished or deleted, until the repository is fixed. Reading the listing
   needs git 2.36 or newer, for `-z`; with an older git a checkout whose
-  directory is gone cannot be confirmed removed.
+  directory was already gone cannot be confirmed removed. Removing a
+  checkout that is there needs no listing: a `git worktree remove` that
+  succeeds takes its registration down itself.
 
 A task whose cleanup was interrupted is not cleared on these terms. Startup
 reconciles it only when its directory is gone and git registers nothing for
