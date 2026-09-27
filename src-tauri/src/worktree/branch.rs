@@ -2,7 +2,7 @@
 ///
 /// `Task.branch_name` is read back from `tasks.toml`, and for a board stored in
 /// the project that file is whatever the last commit made it, so the value is
-/// untrusted even though SlashIt writes `task-<8 hex>` itself. Every function
+/// untrusted even though SlashIt writes `task-<task id>` itself. Every function
 /// that passes a recorded branch to a process checks it first: the PR commands,
 /// and the worktree acquisition in [`super::WorktreeManager`]. A leading `-`
 /// would be parsed as an option (`git push -u origin --mirror` deletes every
@@ -55,10 +55,8 @@ mod tests {
             let generated = super::super::WorktreeManager::branch_for_task(Uuid::new_v4());
             assert_eq!(checked_task_branch(&generated), Ok(generated.as_str()));
         }
-        // `task-<full uuid>` is what versions before the 8-hex prefix wrote,
-        // and a board may still carry it.
-        let legacy = format!("task-{}", Uuid::new_v4());
-        assert_eq!(checked_task_branch(&legacy), Ok(legacy.as_str()));
+        // `task-<8 hex>` is what earlier versions wrote, and a board may
+        // still carry it.
         for branch in ["task-abcd1234", "feature/login", "fix_1.2-rc", "task-"] {
             assert_eq!(checked_task_branch(branch), Ok(branch), "{branch}");
         }

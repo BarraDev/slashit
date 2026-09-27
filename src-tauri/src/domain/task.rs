@@ -751,6 +751,33 @@ mod tests {
         assert_eq!(task.branch_origin, None);
     }
 
+    /// A recorded branch is read back and written out exactly as it was,
+    /// whatever form an earlier version gave it, and a record with none
+    /// stays without one: the recorded name is what a task is reattached by,
+    /// so loading a board never renames a task's branch or gives it one.
+    #[test]
+    fn a_recorded_branch_of_any_form_reads_and_writes_unchanged() {
+        assert!(
+            !LEGACY_TASK_TOML.contains("branch_name"),
+            "this fixture only proves anything while it records no branch"
+        );
+        let task: Task = toml::from_str(LEGACY_TASK_TOML).expect("a record with no branch");
+        assert_eq!(task.branch_name, None);
+
+        for branch in [
+            "task-11111111",
+            "task-11111111-1111-1111-1111-111111111111",
+            "feature/login",
+        ] {
+            let toml_text = format!("{LEGACY_TASK_TOML}\nbranch_name = \"{branch}\"\n");
+            let task: Task = toml::from_str(&toml_text).expect(branch);
+            assert_eq!(task.branch_name.as_deref(), Some(branch));
+            let written = toml::to_string(&task).unwrap();
+            let reread: Task = toml::from_str(&written).expect(branch);
+            assert_eq!(reread.branch_name.as_deref(), Some(branch));
+        }
+    }
+
     /// A record written before the default branch was kept, in TOML and
     /// in JSON, reads as a default base with no branch; and such an origin
     /// is written back exactly as it was read, so a board file an older

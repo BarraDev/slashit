@@ -211,21 +211,28 @@ where. An adopted worktree records no starting commit or origin, since its
 `HEAD` is not where the branch started; the task keeps whatever it had
 recorded.
 
-Task branch names use only the first eight hex digits of the task's id, so two
-tasks can be given the same one, and git cannot say which task a branch or
-worktree of that name belongs to. Before reattaching, adopting, resuming or
-creating anything, SlashIt refuses the task, naming the other task, when
-another task in the same git repository can claim the branch. A task that
-records the branch competes only with another task that records it too. A
-task that records no branch also competes with any task that records none and
-would be given the same name. Projects whose repositories are the same
-directory, or linked worktrees of one repository, count as the same
-repository. A task whose recorded worktree path
-no longer resolves is re-pointed at the worktree's current location before the
-reference is treated as stale, unless another task in the same repository
-records the same branch. Then neither task is re-pointed: both keep the
-reference they had and say why. The previous behaviour cleared the reference,
-stranding the branch and any uncommitted work in it.
+A task that records no branch is given `task-<its whole id>`, so no two tasks
+are given the same name. A task keeps the branch it records, whatever its
+form: earlier versions used only the first eight hex digits of the id
+(`task-<8 hex>`), two tasks can record the same such name, and git cannot say
+which task a branch or worktree of that name belongs to. Before reattaching,
+adopting, resuming or creating anything, SlashIt refuses the task, naming the
+other task, when another task in the same git repository records the branch.
+A task that records no branch is also refused while a local branch of the
+`task-<8 hex>` name earlier versions would have given it exists and no task
+in that repository records it: it may hold an earlier start of this task
+whose record was never saved, or another task's work, and SlashIt neither
+adopts it by prefix nor starts the task beside it. The refusal says how to
+hand it to the task (`git branch -m task-<8 hex> task-<id>`, then, if no
+worktree has it checked out, `git worktree add <directory> task-<id>`) or to
+move it out of the way. Projects whose repositories are the same directory, or
+linked worktrees of one repository, count as the same repository. A task whose
+recorded worktree path no longer resolves is re-pointed at the worktree's
+current location before the reference is treated as stale, unless another
+task in the same repository records the same branch. Then neither task is
+re-pointed: both keep the reference they had and say why. The previous
+behaviour cleared the reference, stranding the branch and any uncommitted work
+in it.
 
 ## Directories by platform
 

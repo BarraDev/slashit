@@ -1,15 +1,18 @@
 //! Whether a task branch can be given to a task at all, when another task
 //! could claim the same name.
 //!
-//! A task's branch is named from only the first eight hex digits of its id
-//! (see [`super::WorktreeManager::branch_for_task`]), so two tasks can be
-//! given the same name. Git knows nothing about tasks: a branch of that name,
-//! and any worktree git has registered for it, may be either task's. Every
-//! way of acquiring a checkout for a task asks [`refuse_shared_task_branch`]
-//! first, and a task is refused rather than handed a checkout that may be
-//! another task's. Startup reconciliation, which re-points a recorded
-//! checkout that moved without acquiring it, asks
-//! [`tasks_sharing_a_recorded_branch`] and re-points neither task.
+//! A new task's branch is named from its whole id (see
+//! [`super::WorktreeManager::branch_for_task`]), so no two tasks are ever
+//! given the same name. A task's *recorded* branch is another matter: it is
+//! read back from a board file, earlier versions named branches from only the
+//! first eight hex digits of the id, and two tasks can record one name. Git
+//! knows nothing about tasks: a branch of that name, and any worktree git has
+//! registered for it, may be either task's. Every way of acquiring a checkout
+//! for a task asks [`refuse_shared_task_branch`] first, and a task is refused
+//! rather than handed a checkout that may be another task's. Startup
+//! reconciliation, which re-points a recorded checkout that moved without
+//! acquiring it, asks [`tasks_sharing_a_recorded_branch`] and re-points
+//! neither task.
 //!
 //! The rule, for task `T` and branch `B` in one repository:
 //!
@@ -17,9 +20,14 @@
 //!   records `B` too. A task that has recorded nothing does not compete with
 //!   it: it would be refused by this same rule when it starts.
 //! - When `T` records no branch, `B` is the one it would be given, and `T`
-//!   is refused while another task records `B`, or records no branch and
-//!   would be given `B` as well. Neither can then say which task a branch or
-//!   worktree of that name belongs to.
+//!   is refused while another task records `B`.
+//! - When `T` records no branch, it is also refused while a local branch
+//!   named the way earlier versions named `T`'s, `task-<first 8 hex digits>`,
+//!   exists and no task records it. Such a branch is what an earlier start of
+//!   `T` leaves when its record was never saved, possibly with the agent's
+//!   work in it, but eight hex digits do not say it is `T`'s, so it is
+//!   neither adopted nor silently left behind: the refusal says how to hand
+//!   it to `T` (rename it to `B`) or to get it out of the way.
 //!
 //! "One repository" is the repository git shares between checkouts: two
 //! Projects whose repositories are the same directory, or linked worktrees
@@ -33,25 +41,16 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-/// How another task can claim a branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Claim {
-    /// It records the branch as its own.
-    Recorded,
-    /// It records no branch, and would be given this one.
-    Generated,
-}
-
-/// Another task that can claim the branch, and where its repository is.
+/// Another task that records the branch, and where its repository is.
 struct Claimant {
     id: Uuid,
     title: String,
-    claim: Claim,
     repo_path: Option<String>,
 }
 
 /// Refuse `branch` for `task_id` while another task in the same repository
-/// can claim it; see the module documentation for the rule.
+/// can claim it, or while a branch left under the task's pre-full-id name
+/// is claimed by nobody; see the module documentation for the rule.
 ///
 /// Nothing is created, adopted or changed either way. `repo_path` is the
 /// repository `task_id`'s checkout would be acquired in.
@@ -63,38 +62,83 @@ pub async fn refuse_shared_task_branch(
     branch: &str,
     repo_path: &str,
 ) -> Result<(), String> {
+    let recorded = {
+        let tasks = tasks.read().await;
+        tasks.get(&task_id).and_then(|t| t.branch_name.clone())
+    };
+    let records_branch = recorded.as_deref() == Some(branch);
+    if let Some(claimant) =
+        recorder_in_repository(tasks, projects, repositories, task_id, branch, repo_path).await
+    {
+        return Err(refusal(task_id, branch, records_branch, &claimant));
+    }
+    if recorded.is_some() {
+        return Ok(());
+    }
+
+    let earlier = pre_full_id_branch(task_id);
+    // A git that cannot say whether the branch is there refuses: whatever
+    // the task would do next runs on the same git. Every task that records
+    // no branch asks this, so what git writes to stderr alongside an answer,
+    // such as `GIT_TRACE` output, must not stop it.
+    if super::WorktreeManager::local_branch_exists_by_status(repo_path, &earlier).await?
+        && recorder_in_repository(tasks, projects, repositories, task_id, &earlier, repo_path)
+            .await
+            .is_none()
+    {
+        return Err(format!(
+            "task {task_id} cannot start on branch {branch} while branch {earlier} is in its \
+             repository and no task records it. Versions of SlashIt before task branches were \
+             named from the whole task id would have given this task that name, so it may hold \
+             an earlier start of this task whose record was never saved, or belong to another \
+             task whose id starts with the same 8 characters. SlashIt cannot tell which, so it \
+             neither gives this task that branch nor starts it on a new one beside it. If it \
+             is this task's, `git worktree list` shows whether a checkout has it checked out. \
+             If one does, run `git branch -m {branch}` in that checkout; a linked worktree \
+             then continues as this task's checkout. The repository's main checkout, or the \
+             Project's own, never does: after renaming there, switch it to another branch and \
+             add a worktree as below. If no checkout has it, run `git branch -m {earlier} {branch}`, then \
+             `git worktree add <directory> {branch}`; the task then continues that work \
+             there. If it is not this task's, delete it or give it another name. Then start \
+             the task again."
+        ));
+    }
+    Ok(())
+}
+
+/// The name versions before full-id names gave `task_id`'s branch.
+fn pre_full_id_branch(task_id: Uuid) -> String {
+    format!("task-{}", &task_id.to_string()[..8])
+}
+
+/// Another task than `task_id` that records `branch`, in the repository at
+/// `repo_path` or one that cannot be told apart from it.
+async fn recorder_in_repository(
+    tasks: &Arc<RwLock<HashMap<Uuid, Task>>>,
+    projects: &Arc<RwLock<HashMap<Uuid, Project>>>,
+    repositories: &Arc<RwLock<HashMap<Uuid, Repository>>>,
+    task_id: Uuid,
+    branch: &str,
+    repo_path: &str,
+) -> Option<Claimant> {
     // Each lock is read on its own and released before the next, as
     // everywhere else, so this never holds one while waiting for another.
-    let (records_branch, others) = {
+    let others: Vec<(Uuid, String, Uuid)> = {
         let tasks = tasks.read().await;
-        let records_branch =
-            tasks.get(&task_id).and_then(|t| t.branch_name.as_deref()) == Some(branch);
-        let others: Vec<(Uuid, String, Claim, Uuid)> = tasks
+        tasks
             .values()
-            .filter(|t| t.id != task_id)
-            .filter_map(|t| {
-                let claim = match t.branch_name.as_deref() {
-                    Some(recorded) if recorded == branch => Claim::Recorded,
-                    None if !records_branch
-                        && super::WorktreeManager::branch_for_task(t.id) == branch =>
-                    {
-                        Claim::Generated
-                    }
-                    _ => return None,
-                };
-                Some((t.id, t.title.clone(), claim, t.project_id))
-            })
-            .collect();
-        (records_branch, others)
+            .filter(|t| t.id != task_id && t.branch_name.as_deref() == Some(branch))
+            .map(|t| (t.id, t.title.clone(), t.project_id))
+            .collect()
     };
     if others.is_empty() {
-        return Ok(());
+        return None;
     }
     let repository_of: HashMap<Uuid, Uuid> = {
         let projects = projects.read().await;
         others
             .iter()
-            .filter_map(|(_, _, _, project_id)| {
+            .filter_map(|(_, _, project_id)| {
                 Some((*project_id, projects.get(project_id)?.repository_id?))
             })
             .collect()
@@ -103,10 +147,9 @@ pub async fn refuse_shared_task_branch(
         let repositories = repositories.read().await;
         others
             .into_iter()
-            .map(|(id, title, claim, project_id)| Claimant {
+            .map(|(id, title, project_id)| Claimant {
                 id,
                 title,
-                claim,
                 repo_path: repository_of
                     .get(&project_id)
                     .and_then(|repository_id| repositories.get(repository_id))
@@ -126,28 +169,30 @@ pub async fn refuse_shared_task_branch(
             _ => true,
         };
         if same_repository {
-            return Err(refusal(task_id, branch, records_branch, &claimant));
+            return Some(claimant);
         }
     }
-    Ok(())
+    None
 }
 
 fn refusal(task_id: Uuid, branch: &str, records_branch: bool, claimant: &Claimant) -> String {
-    let how = match claimant.claim {
-        Claim::Recorded => "records it as its branch",
-        Claim::Generated => "would be given the same branch name",
-    };
-    let what_to_do = if records_branch {
-        "Delete whichever of the two tasks does not own that branch, then start this task again."
+    let (why, what_to_do) = if records_branch {
+        (
+            "so SlashIt cannot tell which of the two tasks that branch, or any checkout of it, \
+             belongs to, and uses it for neither",
+            "Delete whichever of the two tasks does not own that branch, then start this task \
+             again.",
+        )
     } else {
-        "Create this task again, which gives it a new id and branch name, or delete the other \
-         task if it is no longer needed."
+        (
+            "so that branch, and any checkout of it, is that task's",
+            "Create this task again, which gives it a new id and branch name, or delete the \
+             other task if it is no longer needed.",
+        )
     };
     format!(
         "branch {branch} cannot be used for task {task_id}: task {} (\"{}\") in the same \
-         repository {how}. Task branch names use only the first 8 characters of a task's id, so \
-         SlashIt cannot tell which of the two tasks that branch, or any checkout of it, belongs \
-         to, and uses neither. {what_to_do}",
+         repository records it as its branch, {why}. {what_to_do}",
         claimant.id, claimant.title
     )
 }
@@ -371,6 +416,92 @@ mod tests {
         assert_eq!(board.refuse(A, &repo).await, Ok(()));
     }
 
+    /// A task that records no branch is refused while a branch of the name
+    /// earlier versions would have given it exists and no task in the same
+    /// repository records it, and the refusal says how to hand it over. A
+    /// branch of that name another task records in the same repository is
+    /// that task's, and does not stand in the way; one recorded in another
+    /// repository does not make the orphan here anyone's.
+    #[tokio::test]
+    async fn an_unclaimed_branch_of_the_pre_full_id_name_refuses_the_task() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = new_repository(&temp.path().join("repo"));
+        let elsewhere = new_repository(&temp.path().join("elsewhere"));
+        git(Path::new(&repo), &["branch", BRANCH]);
+        let generated = super::super::WorktreeManager::branch_for_task(B);
+
+        let board = Board::default();
+        board.add(B, None, Some(&repo)).await;
+        let refused = refuse_shared_task_branch(
+            &board.tasks, &board.projects, &board.repositories, B, &generated, &repo,
+        )
+        .await
+        .expect_err("an unclaimed pre-full-id branch refuses");
+        assert!(refused.contains(&format!("git branch -m {BRANCH} {generated}")), "{refused}");
+
+        board.add(A, Some(BRANCH), Some(&elsewhere)).await;
+        assert!(
+            refuse_shared_task_branch(
+                &board.tasks, &board.projects, &board.repositories, B, &generated, &repo,
+            )
+            .await
+            .is_err(),
+            "a record in another repository does not claim this one's branch"
+        );
+
+        let board = Board::default();
+        board.add(A, Some(BRANCH), Some(&repo)).await;
+        board.add(B, None, Some(&repo)).await;
+        assert_eq!(
+            refuse_shared_task_branch(
+                &board.tasks, &board.projects, &board.repositories, B, &generated, &repo,
+            )
+            .await,
+            Ok(())
+        );
+    }
+
+    /// A task that records a branch is not held back by an unclaimed
+    /// branch of the name earlier versions would have given it: it is
+    /// reattached by what it records, whatever that is.
+    #[tokio::test]
+    async fn an_unclaimed_pre_full_id_branch_does_not_refuse_a_task_that_records_one() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = new_repository(&temp.path().join("repo"));
+        git(Path::new(&repo), &["branch", BRANCH]);
+        for recorded in [super::super::WorktreeManager::branch_for_task(A), "feature/a".to_string()] {
+            let board = Board::default();
+            board.add(A, Some(&recorded), Some(&repo)).await;
+            assert_eq!(
+                refuse_shared_task_branch(
+                    &board.tasks, &board.projects, &board.repositories, A, &recorded, &repo,
+                )
+                .await,
+                Ok(()),
+                "{recorded}"
+            );
+        }
+    }
+
+    /// A task that records no branch, in a directory git cannot list
+    /// branches for, is refused rather than taken to have no old branch.
+    #[tokio::test]
+    async fn a_repository_git_cannot_list_branches_for_refuses() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let plain = temp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let plain = plain.to_string_lossy().to_string();
+        let board = Board::default();
+        board.add(B, None, Some(&plain)).await;
+
+        let generated = super::super::WorktreeManager::branch_for_task(B);
+        assert!(refuse_shared_task_branch(
+            &board.tasks, &board.projects, &board.repositories, B, &generated, &plain,
+        )
+        .await
+        .is_err());
+    }
+
     /// Two tasks both recording the branch both lose it: neither record
     /// says which one created it.
     #[tokio::test]
@@ -386,5 +517,76 @@ mod tests {
             assert!(refused.contains(&other.to_string()), "{refused}");
             assert!(refused.contains("Delete whichever"), "{refused}");
         }
+    }
+
+    /// [`the_pre_full_id_branch_check_answers_by_what_git_found`] again, in a
+    /// test process where every git it runs writes trace output to stderr
+    /// and still succeeds. `GIT_TRACE` is set on that process alone, so no
+    /// other test runs under it. A git older than 2.43 is asked the old way,
+    /// which still takes that output as a failure, so it is not tested here.
+    #[test]
+    fn the_pre_full_id_branch_check_holds_while_git_writes_to_stderr() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let probe = std::process::Command::new("git")
+            .args(["show-ref", "--exists", "refs/heads/main"])
+            .current_dir(new_repository(&temp.path().join("repo")))
+            .output()
+            .expect("run git");
+        if probe.status.code() == Some(129) {
+            eprintln!("skipped: this git does not know `git show-ref --exists`");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree::ownership::tests::the_pre_full_id_branch_check_answers_by_what_git_found",
+                "--test-threads=1",
+            ])
+            .env("GIT_TRACE", "1")
+            .output()
+            .expect("run the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed"), "the test did not run: {stdout}");
+    }
+
+    /// A task that records no branch starts when no branch of the name
+    /// earlier versions would have given it is there, and is refused when
+    /// one is, or when git fails to say.
+    #[tokio::test]
+    async fn the_pre_full_id_branch_check_answers_by_what_git_found() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = new_repository(&temp.path().join("repo"));
+        let generated = super::super::WorktreeManager::branch_for_task(B);
+        let board = Board::default();
+        board.add(B, None, Some(&repo)).await;
+        let refuse = |repo_path: String| {
+            let generated = generated.clone();
+            let board = &board;
+            async move {
+                refuse_shared_task_branch(
+                    &board.tasks, &board.projects, &board.repositories, B, &generated, &repo_path,
+                )
+                .await
+            }
+        };
+
+        assert_eq!(refuse(repo.clone()).await, Ok(()), "no branch of the earlier name");
+
+        git(Path::new(&repo), &["branch", BRANCH]);
+        let refused = refuse(repo.clone()).await.expect_err("the earlier name is there");
+        assert!(refused.contains(&format!("while branch {BRANCH} is in its repository")), "{refused}");
+        git(Path::new(&repo), &["branch", "-D", BRANCH]);
+
+        // A ref git cannot read is not an absence.
+        std::fs::write(Path::new(&repo).join(".git/refs/heads").join(BRANCH), "garbage\n").unwrap();
+        let refused = refuse(repo.clone()).await.expect_err("an unreadable ref");
+        assert!(refused.contains("Could not check for local branch"), "{refused}");
+
+        let plain = temp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let refused = refuse(plain.to_string_lossy().to_string()).await.expect_err("not a repository");
+        assert!(refused.contains("Could not check for local branch"), "{refused}");
     }
 }

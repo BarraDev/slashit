@@ -341,8 +341,9 @@ mod tests {
         assert_eq!(acquired.origin, None);
     }
 
-    /// Two tasks whose ids share their first 8 hex digits, and so the branch
-    /// name `task-12345678`, given checkouts from the Worktree panel.
+    /// Two tasks whose ids share their first 8 hex digits, which was the
+    /// whole of the branch name `task-12345678` earlier versions gave both,
+    /// given checkouts from the Worktree panel.
     mod branch_ownership {
         use super::*;
         use crate::domain::TaskStatus;
@@ -350,22 +351,19 @@ mod tests {
         const A: Uuid = Uuid::from_u128(0x12345678_0000_4000_8000_000000000001);
         const B: Uuid = Uuid::from_u128(0x12345678_0000_4000_8000_000000000002);
         const BRANCH: &str = "task-12345678";
+        const PLACEMENTS: [&str; 3] = ["managed", "legacy", "custom"];
 
         /// App state holding a repository with a published default base,
-        /// registered as a project's, and tasks `A`, recording `a_branch`,
-        /// and `B`, recording nothing.
+        /// registered as a project's, and tasks `A` and `B` recording
+        /// `a_branch` and `b_branch`.
         async fn state_with_two_tasks(
             temp: &tempfile::TempDir,
             a_branch: Option<&str>,
+            b_branch: Option<&str>,
         ) -> (crate::AppState, std::path::PathBuf) {
             let (repo, _) = fixture(temp);
-            let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
-                temp.path().join("config"),
-                temp.path().join("data"),
-                temp.path().join("cache"),
-                temp.path().join("runtime"),
-            ));
-            let (state, _) = crate::app_core::build_state_with_paths(paths).await.expect("state");
+            let (state, _) =
+                crate::app_core::build_state_with_paths(paths(temp)).await.expect("state");
             let repository = crate::domain::Repository {
                 id: Uuid::new_v4(),
                 local_path: repo.to_string_lossy().to_string(),
@@ -395,7 +393,7 @@ mod tests {
             };
             let project_id = project.id;
             state.project.projects.write().await.insert(project_id, project);
-            for (id, branch) in [(A, a_branch), (B, None)] {
+            for (id, branch) in [(A, a_branch), (B, b_branch)] {
                 let mut task = crate::test_helpers::create_test_task_full(
                     &format!("task {id}"),
                     project_id,
@@ -409,85 +407,231 @@ mod tests {
             (state, repo)
         }
 
-        /// Put a checkout of [`BRANCH`] at the managed path, the legacy
+        fn paths(temp: &tempfile::TempDir) -> std::sync::Arc<crate::config::paths::AppPaths> {
+            std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+                temp.path().join("config"),
+                temp.path().join("data"),
+                temp.path().join("cache"),
+                temp.path().join("runtime"),
+            ))
+        }
+
+        /// Put a checkout of `branch` at the managed path, the legacy
         /// sibling path, or a custom one, returning where it is.
         async fn place_checkout(
             state: &crate::AppState,
             temp: &tempfile::TempDir,
             repo: &Path,
+            branch: &str,
             placement: &str,
         ) -> String {
             let path = match placement {
                 "managed" => {
                     return state
                         .worktree_manager
-                        .create(repo.to_str().unwrap(), BRANCH)
+                        .create(repo.to_str().unwrap(), branch)
                         .await
                         .expect("a checkout at the managed path")
                         .path;
                 }
-                "legacy" => repo.parent().unwrap().join(format!("repository.{BRANCH}")),
-                _ => temp.path().join("elsewhere").join(BRANCH),
+                "legacy" => repo.parent().unwrap().join(format!("repository.{branch}")),
+                _ => temp.path().join("elsewhere").join(branch),
             };
-            git(repo, &["worktree", "add", "-q", "-b", BRANCH, "--", path.to_str().unwrap()]);
+            git(repo, &["worktree", "add", "-q", "-b", branch, "--", path.to_str().unwrap()]);
             path.to_string_lossy().to_string()
         }
 
-        /// Task `B` is refused task `A`'s checkout of their shared branch
-        /// name at every placement, and nothing is recorded on `B`.
+        fn same_path(a: &str, b: &str) -> bool {
+            std::fs::canonicalize(a).unwrap() == std::fs::canonicalize(b).unwrap()
+        }
+
+        /// Task `B` gets a branch and checkout of its own beside the
+        /// checkout of the old shared name that task `A` records, at every
+        /// placement, and `A`'s branch and checkout are left as they were.
         #[tokio::test]
-        async fn a_task_is_refused_a_checkout_another_task_records_at_any_placement() {
-            for placement in ["managed", "legacy", "custom"] {
+        async fn a_task_gets_its_own_branch_beside_a_checkout_another_task_records() {
+            for placement in PLACEMENTS {
                 let temp = tempfile::TempDir::new().unwrap();
-                let (state, repo) = state_with_two_tasks(&temp, Some(BRANCH)).await;
-                place_checkout(&state, &temp, &repo, placement).await;
-                let refs = git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+                let (state, repo) = state_with_two_tasks(&temp, Some(BRANCH), None).await;
+                let a_path = place_checkout(&state, &temp, &repo, BRANCH, placement).await;
+                let a_tip = git(&repo, &["rev-parse", BRANCH]);
 
-                let refused = create_worktree_inner(&state, B)
+                let b_path = create_worktree_inner(&state, B)
                     .await
-                    .err()
-                    .unwrap_or_else(|| panic!("{placement}: B was given A's checkout"));
+                    .unwrap_or_else(|e| panic!("{placement}: {e}"));
 
-                assert!(refused.contains(&A.to_string()), "{placement}: {refused}");
                 let b = state.task.tasks.read().await[&B].clone();
-                assert_eq!((b.branch_name, b.worktree_path), (None, None), "{placement}");
-                assert_eq!(git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+                assert_eq!(b.branch_name, Some(WorktreeManager::branch_for_task(B)), "{placement}");
+                assert!(!same_path(&a_path, &b_path), "{placement}: B was given A's checkout");
+                assert_eq!(git(&repo, &["rev-parse", BRANCH]), a_tip, "{placement}");
+                assert_eq!(git(Path::new(&a_path), &["branch", "--show-current"]), BRANCH);
             }
         }
 
-        /// Task `A`, which records the branch, still gets its own checkout
-        /// back at every placement beside task `B`.
+        /// Task `A`, which records the old shared name, still gets its own
+        /// checkout back at every placement beside task `B`.
         #[tokio::test]
         async fn a_task_reattaches_its_own_checkout_beside_a_task_with_the_same_prefix() {
-            for placement in ["managed", "legacy", "custom"] {
+            for placement in PLACEMENTS {
                 let temp = tempfile::TempDir::new().unwrap();
-                let (state, repo) = state_with_two_tasks(&temp, Some(BRANCH)).await;
-                let path = place_checkout(&state, &temp, &repo, placement).await;
+                let (state, repo) = state_with_two_tasks(&temp, Some(BRANCH), None).await;
+                let path = place_checkout(&state, &temp, &repo, BRANCH, placement).await;
 
                 let acquired = create_worktree_inner(&state, A)
                     .await
                     .unwrap_or_else(|e| panic!("{placement}: {e}"));
 
-                assert_eq!(
-                    std::fs::canonicalize(acquired).unwrap(),
-                    std::fs::canonicalize(path).unwrap(),
-                    "{placement}"
-                );
+                assert!(same_path(&acquired, &path), "{placement}");
             }
         }
 
-        /// With neither task recording a branch, the first to ask is
-        /// refused a new one too: a branch it created could later be
-        /// adopted by the other.
+        /// A task that records a branch named from its whole id, as earlier
+        /// versions may also have written, reattaches its checkout at every
+        /// placement.
         #[tokio::test]
-        async fn a_task_is_refused_a_new_branch_another_task_would_be_given() {
+        async fn a_task_recording_a_full_id_branch_reattaches_it() {
+            let full = WorktreeManager::branch_for_task(A);
+            for placement in PLACEMENTS {
+                let temp = tempfile::TempDir::new().unwrap();
+                let (state, repo) = state_with_two_tasks(&temp, Some(&full), None).await;
+                let path = place_checkout(&state, &temp, &repo, &full, placement).await;
+
+                let acquired = create_worktree_inner(&state, A)
+                    .await
+                    .unwrap_or_else(|e| panic!("{placement}: {e}"));
+
+                assert!(same_path(&acquired, &path), "{placement}");
+            }
+        }
+
+        /// Neither task recording a branch, each is given a new one of its
+        /// own, whichever asks first.
+        #[tokio::test]
+        async fn two_tasks_sharing_a_prefix_are_each_given_their_own_branch() {
             let temp = tempfile::TempDir::new().unwrap();
-            let (state, repo) = state_with_two_tasks(&temp, None).await;
+            let (state, repo) = state_with_two_tasks(&temp, None, None).await;
 
-            let refused = create_worktree_inner(&state, A).await.expect_err("refused");
+            let a_path = create_worktree_inner(&state, A).await.expect("A");
+            let b_path = create_worktree_inner(&state, B).await.expect("B");
 
-            assert!(refused.contains(&B.to_string()), "{refused}");
-            assert_eq!(git(&repo, &["worktree", "list", "--porcelain"]).matches("worktree ").count(), 1);
+            assert!(!same_path(&a_path, &b_path));
+            let tasks = state.task.tasks.read().await;
+            for id in [A, B] {
+                assert_eq!(tasks[&id].branch_name, Some(WorktreeManager::branch_for_task(id)));
+            }
+            assert_eq!(git(&repo, &["worktree", "list", "--porcelain"]).matches("worktree ").count(), 3);
+        }
+
+        /// Two tasks recording one branch are both refused its checkout, and
+        /// nothing about either is changed.
+        #[tokio::test]
+        async fn two_tasks_recording_one_branch_are_both_refused() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let (state, repo) = state_with_two_tasks(&temp, Some(BRANCH), Some(BRANCH)).await;
+            place_checkout(&state, &temp, &repo, BRANCH, "managed").await;
+            let refs = git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+
+            for (task, other) in [(A, B), (B, A)] {
+                let refused = create_worktree_inner(&state, task).await.expect_err("refused");
+                assert!(refused.contains(&other.to_string()), "{refused}");
+                assert_eq!(state.task.tasks.read().await[&task].worktree_path, None);
+            }
+            assert_eq!(git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+        }
+
+        /// A checkout of the old name that no task records, as a start whose
+        /// record was never saved leaves it, is refused to the task it may
+        /// belong to, at every placement, with nothing changed; once it is
+        /// renamed to that task's name, as the refusal says, the task adopts
+        /// it where it is.
+        #[tokio::test]
+        async fn an_unrecorded_checkout_of_the_old_name_is_adopted_only_once_renamed() {
+            for placement in PLACEMENTS {
+                let temp = tempfile::TempDir::new().unwrap();
+                let (state, repo) = state_with_two_tasks(&temp, Some("feature/a"), None).await;
+                let path = place_checkout(&state, &temp, &repo, BRANCH, placement).await;
+                let refs = git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+
+                let refused = create_worktree_inner(&state, B)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("{placement}: an orphan was taken or stranded"));
+                let full = WorktreeManager::branch_for_task(B);
+                assert!(refused.contains(&format!("git branch -m {BRANCH} {full}")), "{refused}");
+                assert_eq!(state.task.tasks.read().await[&B].branch_name, None);
+                assert_eq!(git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+
+                git(&repo, &["branch", "-m", BRANCH, &full]);
+                let adopted = create_worktree_inner(&state, B)
+                    .await
+                    .unwrap_or_else(|e| panic!("{placement}: {e}"));
+
+                assert!(same_path(&adopted, &path), "{placement}");
+                assert_eq!(state.task.tasks.read().await[&B].branch_name, Some(full));
+            }
+        }
+
+        /// A leftover of the old name with no checkout of it is taken up by
+        /// exactly what the refusal advises: renamed to the task's name, and
+        /// given a worktree, which the task then adopts where it is.
+        #[tokio::test]
+        async fn a_branch_only_old_name_leftover_is_taken_up_by_the_advised_remedy() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let (state, repo) = state_with_two_tasks(&temp, Some("feature/a"), None).await;
+            git(&repo, &["branch", BRANCH]);
+            let full = WorktreeManager::branch_for_task(B);
+
+            let refused = create_worktree_inner(&state, B).await.expect_err("refused");
+            assert!(refused.contains(&format!("git branch -m {BRANCH} {full}")), "{refused}");
+            assert!(refused.contains(&format!("git worktree add <directory> {full}")), "{refused}");
+
+            git(&repo, &["branch", "-m", BRANCH, &full]);
+            let refused = create_worktree_inner(&state, B)
+                .await
+                .expect_err("a renamed branch with no checkout is not created over");
+            assert!(refused.contains("already exists"), "{refused}");
+
+            let dir = temp.path().join("taken-up");
+            git(&repo, &["worktree", "add", "-q", dir.to_str().unwrap(), &full]);
+            let adopted = create_worktree_inner(&state, B).await.expect("adopted");
+
+            assert!(same_path(&adopted, dir.to_str().unwrap()));
+            assert_eq!(state.task.tasks.read().await[&B].branch_name, Some(full));
+        }
+
+        /// A task's branch and checkout survive a restart as recorded: its
+        /// checkout removed, the app restarted from what it saved, and the
+        /// Worktree panel used again, the task is given a new checkout of
+        /// the same branch, with the work on it.
+        #[tokio::test]
+        async fn a_recorded_branch_is_reattached_after_its_checkout_is_removed_and_a_restart() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let (state, repo) = state_with_two_tasks(&temp, None, None).await;
+            let first = create_worktree_inner(&state, B).await.expect("first checkout");
+            git(Path::new(&first), &["commit", "-q", "--allow-empty", "-m", "task work"]);
+            let full = WorktreeManager::branch_for_task(B);
+            let tip = git(&repo, &["rev-parse", &full]);
+            git(&repo, &["worktree", "remove", "--", &first]);
+            let mut config = crate::config::storage::AppConfig::default();
+            for (id, repository) in state.repository.repositories.read().await.iter() {
+                config.repositories.insert(id.to_string(), repository.clone());
+            }
+            for (id, project) in state.project.projects.read().await.iter() {
+                config.projects.insert(id.to_string(), project.clone());
+            }
+            state.storage.save_config(&config).expect("save config");
+            drop(state);
+
+            let (state, _) =
+                crate::app_core::build_state_with_paths(paths(&temp)).await.expect("restart");
+            let reloaded = state.task.tasks.read().await[&B].clone();
+            assert_eq!(reloaded.branch_name.as_deref(), Some(full.as_str()));
+            assert_eq!(reloaded.worktree_path, None, "startup clears a checkout git confirms gone");
+
+            let second = create_worktree_inner(&state, B).await.expect("second checkout");
+
+            assert_eq!(git(Path::new(&second), &["rev-parse", "HEAD"]), tip);
+            assert_eq!(git(Path::new(&second), &["branch", "--show-current"]), full);
         }
     }
 
