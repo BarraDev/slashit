@@ -6718,17 +6718,45 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             git_in(&repo, &["branch", BRANCH, "task-deadbeef"]);
             let refs = refs_of(&repo);
 
+            let full = WorktreeManager::branch_for_task(A);
             let (_, acquired) = executor.acquire_task_worktree(A, repo.to_str().unwrap()).await;
-            assert!(acquired.is_err(), "resumed or started beside an unclaimed old-name branch");
+            let refused = acquired.err().expect("resumed or started beside an unclaimed old-name branch");
+            assert!(refused.contains(&format!("git branch -m {BRANCH} {full}")), "{refused}");
             assert_eq!(refs_of(&repo), refs);
 
-            let full = WorktreeManager::branch_for_task(A);
             git_in(&repo, &["branch", "-m", BRANCH, &full]);
             let (_, acquired) = executor.acquire_task_worktree(A, repo.to_str().unwrap()).await;
 
             let acquired = acquired.expect("resumed once renamed");
             assert_eq!(acquired.what_happened, "Resumed stacked worktree");
             assert_eq!(acquired.info.branch, full);
+        }
+
+        /// A leftover of the old 8-digit name with no checkout of it, on the
+        /// ordinary path, is taken up by exactly what the refusal advises:
+        /// renamed to the task's name, and given a worktree.
+        #[tokio::test]
+        async fn a_branch_only_old_name_leftover_is_taken_up_by_the_advised_remedy() {
+            let (executor, temps) = test_executor();
+            let (repo, project_id) = repository(&executor, &temps).await;
+            add_task(&executor, A, project_id, None).await;
+            git_in(&repo, &["branch", BRANCH]);
+            let full = WorktreeManager::branch_for_task(A);
+
+            let (_, acquired) = executor.acquire_task_worktree(A, repo.to_str().unwrap()).await;
+            let refused = acquired.err().expect("refused");
+            assert!(refused.contains(&format!("git branch -m {BRANCH} {full}")), "{refused}");
+            assert!(refused.contains(&format!("git worktree add <directory> {full}")), "{refused}");
+
+            let dir = temps[0].path().join("taken-up");
+            git_in(&repo, &["branch", "-m", BRANCH, &full]);
+            git_in(&repo, &["worktree", "add", "-q", dir.to_str().unwrap(), &full]);
+            let (_, acquired) = executor.acquire_task_worktree(A, repo.to_str().unwrap()).await;
+
+            let acquired = acquired.expect("adopted after the advised remedy");
+            assert_eq!(acquired.what_happened, "Adopted worktree");
+            assert_eq!(acquired.info.branch, full);
+            assert!(same_path(&acquired.info.path, dir.to_str().unwrap()));
         }
 
         /// Tasks whose ids share a prefix each get a new checkout of their

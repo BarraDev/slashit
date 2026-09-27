@@ -91,9 +91,10 @@ pub async fn refuse_shared_task_branch(
              an earlier start of this task whose record was never saved, or belong to another \
              task whose id starts with the same 8 characters. SlashIt cannot tell which, so it \
              neither gives this task that branch nor starts it on a new one beside it. If it \
-             is this task's, rename it with `git branch -m {earlier} {branch}` to continue \
-             that work here; if not, delete it or give it another name. Then start the task \
-             again."
+             is this task's, rename it with `git branch -m {earlier} {branch}`, and if no \
+             worktree has it checked out, add one with `git worktree add <directory> \
+             {branch}`; the task then continues that work where it is. If it is not, delete \
+             it or give it another name. Then start the task again."
         ));
     }
     Ok(())
@@ -452,6 +453,28 @@ mod tests {
             .await,
             Ok(())
         );
+    }
+
+    /// A task that records a branch is not held back by an unclaimed
+    /// branch of the name earlier versions would have given it: it is
+    /// reattached by what it records, whatever that is.
+    #[tokio::test]
+    async fn an_unclaimed_pre_full_id_branch_does_not_refuse_a_task_that_records_one() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = new_repository(&temp.path().join("repo"));
+        git(Path::new(&repo), &["branch", BRANCH]);
+        for recorded in [super::super::WorktreeManager::branch_for_task(A), "feature/a".to_string()] {
+            let board = Board::default();
+            board.add(A, Some(&recorded), Some(&repo)).await;
+            assert_eq!(
+                refuse_shared_task_branch(
+                    &board.tasks, &board.projects, &board.repositories, A, &recorded, &repo,
+                )
+                .await,
+                Ok(()),
+                "{recorded}"
+            );
+        }
     }
 
     /// A task that records no branch, in a directory git cannot list

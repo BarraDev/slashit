@@ -68,11 +68,17 @@ release will contain.
   not supported. The new branch tracks nothing until SlashIt pushes it, and its
   pull request is opened against that default branch explicitly. Tasks created
   earlier keep the origin they recorded and open their pull requests as before.
-- **A task is refused a branch another task can claim.** Task branch names
-  use only the first eight hex digits of a task's id, so two tasks can share
-  one. A task is no longer given a checkout or branch of that name while
-  another task in the same repository records it, or would be given it too,
-  whatever path the checkout is at; it is refused with the other task named.
+- **Task branches are named from the whole task id**, `task-<id>`, instead of
+  its first eight hex digits, which two tasks could share, and with them one
+  checkout. A task keeps the branch it already records, whatever its form. A
+  task is refused, with the other task named, while another task in the same
+  repository records its branch, whatever path the checkout is at. A task that
+  records no branch is also refused while a branch of its old eight-digit name
+  (`task-<8 hex>`) exists and no task records it: it may hold an earlier start
+  whose record was never saved, or another task's work. To hand it to the
+  task, rename it with `git branch -m task-<8 hex> task-<id>` and, if no
+  worktree has it checked out, add one with
+  `git worktree add <directory> task-<id>`; otherwise delete or rename it.
 - **`[worktree] placement = "auto"` now means `"managed"`.** Both spellings
   still load, and new configurations are written with `"managed"`. Downgrade
   caveat: an earlier build reading a configuration that says `"auto"` delegates

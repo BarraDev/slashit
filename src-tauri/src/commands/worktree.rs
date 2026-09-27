@@ -562,6 +562,34 @@ mod tests {
             }
         }
 
+        /// A leftover of the old name with no checkout of it is taken up by
+        /// exactly what the refusal advises: renamed to the task's name, and
+        /// given a worktree, which the task then adopts where it is.
+        #[tokio::test]
+        async fn a_branch_only_old_name_leftover_is_taken_up_by_the_advised_remedy() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let (state, repo) = state_with_two_tasks(&temp, Some("feature/a"), None).await;
+            git(&repo, &["branch", BRANCH]);
+            let full = WorktreeManager::branch_for_task(B);
+
+            let refused = create_worktree_inner(&state, B).await.expect_err("refused");
+            assert!(refused.contains(&format!("git branch -m {BRANCH} {full}")), "{refused}");
+            assert!(refused.contains(&format!("git worktree add <directory> {full}")), "{refused}");
+
+            git(&repo, &["branch", "-m", BRANCH, &full]);
+            let refused = create_worktree_inner(&state, B)
+                .await
+                .expect_err("a renamed branch with no checkout is not created over");
+            assert!(refused.contains("already exists"), "{refused}");
+
+            let dir = temp.path().join("taken-up");
+            git(&repo, &["worktree", "add", "-q", dir.to_str().unwrap(), &full]);
+            let adopted = create_worktree_inner(&state, B).await.expect("adopted");
+
+            assert!(same_path(&adopted, dir.to_str().unwrap()));
+            assert_eq!(state.task.tasks.read().await[&B].branch_name, Some(full));
+        }
+
         /// A task's branch and checkout survive a restart as recorded: its
         /// checkout removed, the app restarted from what it saved, and the
         /// Worktree panel used again, the task is given a new checkout of

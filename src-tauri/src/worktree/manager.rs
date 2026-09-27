@@ -3970,18 +3970,18 @@ branch refs/heads/some-other-branch
     async fn full_uuid_task_branches_reattach_and_stack_through_git() {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
-        let legacy = format!("task-{}", Uuid::new_v4());
+        let task_branch = format!("task-{}", Uuid::new_v4());
         let newer = format!("task-{}", Uuid::new_v4());
-        run_git(repo_path, &["branch", &legacy]);
+        run_git(repo_path, &["branch", &task_branch]);
         let mgr = test_manager();
 
-        let reattached = mgr.reattach(repo_path, &legacy).await.expect("reattach");
-        assert_eq!(run_git(&reattached.path, &["symbolic-ref", "--short", "HEAD"]), legacy);
+        let reattached = mgr.reattach(repo_path, &task_branch).await.expect("reattach");
+        assert_eq!(run_git(&reattached.path, &["symbolic-ref", "--short", "HEAD"]), task_branch);
         let dependency_tip = commit_work(&reattached.path, "dependency.txt");
         run_git(repo_path, &["worktree", "remove", &reattached.path]);
 
         let stacked = mgr
-            .create_stacked_branch(repo_path, &newer, &legacy)
+            .create_stacked_branch(repo_path, &newer, &task_branch)
             .await
             .expect("stacked").info;
         assert_eq!(run_git(&stacked.path, &["symbolic-ref", "--short", "HEAD"]), newer);

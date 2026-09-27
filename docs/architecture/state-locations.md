@@ -205,14 +205,16 @@ A task that records no branch is also refused while a local branch of the
 in that repository records it: it may hold an earlier start of this task
 whose record was never saved, or another task's work, and SlashIt neither
 adopts it by prefix nor starts the task beside it. The refusal says how to
-hand it to the task (`git branch -m task-<8 hex> task-<id>`) or to move it out
-of the way. Projects whose repositories are the same directory, or linked
-worktrees of one repository, count as the same repository. A task whose
+hand it to the task (`git branch -m task-<8 hex> task-<id>`, then, if no
+worktree has it checked out, `git worktree add <directory> task-<id>`) or to
+move it out of the way. Projects whose repositories are the same directory, or
+linked worktrees of one repository, count as the same repository. A task whose
 recorded worktree path no longer resolves is re-pointed at the worktree's
 current location before the reference is treated as stale, unless another
-task in the same repository records the same branch. Then neither task is re-pointed: both keep the
-reference they had and say why. The previous behaviour cleared the reference,
-stranding the branch and any uncommitted work in it.
+task in the same repository records the same branch. Then neither task is
+re-pointed: both keep the reference they had and say why. The previous
+behaviour cleared the reference, stranding the branch and any uncommitted work
+in it.
 
 ## Directories by platform
 
