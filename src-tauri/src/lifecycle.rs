@@ -28,8 +28,8 @@ pub type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
 /// How long a user-initiated command waits for a task's lifecycle lease before
 /// giving up.
 ///
-/// Bounded rather than unbounded because the lease is held across `git` and
-/// `wt` subprocesses, and a removal blocked on a repository hook would
+/// Bounded rather than unbounded because the lease is held across `git`
+/// subprocesses, and a removal blocked on a repository hook would
 /// otherwise hang a dragged card with no way out. Long enough that an ordinary
 /// removal -- milliseconds on any checkout the product creates -- is never
 /// interrupted by it, short enough that "the task is busy" reaches the user
@@ -900,7 +900,7 @@ fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::paths::{AppPaths, StateLocation, WorktreePlacement};
+    use crate::config::paths::{AppPaths, StateLocation};
     use crate::domain::{AgentConfig, AgentType, ProjectScope, TaskPhase};
     use crate::test_helpers::create_test_task_full;
     use crate::worktree::WorktreeManager;
@@ -999,6 +999,13 @@ mod tests {
             std::fs::write(repo_dir.join("README.md"), "base\n").unwrap();
             git(&repo_dir, &["add", "."]);
             git(&repo_dir, &["commit", "-q", "-m", "init"]);
+            // A bare `origin` whose `HEAD` is recorded locally, so that a
+            // task checkout has a default base to start from.
+            let origin = root.join("origin.git");
+            git(&repo_dir, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+            git(&repo_dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+            git(&repo_dir, &["push", "-q", "origin", "main"]);
+            git(&repo_dir, &["remote", "set-head", "origin", "main"]);
             repositories.insert(
                 repository_id,
                 Repository {
@@ -1037,12 +1044,7 @@ mod tests {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             projects: Arc::new(RwLock::new(HashMap::from([(project_id, project)]))),
             repositories: Arc::new(RwLock::new(repositories)),
-            // `Managed` forces the git-native path regardless of whether `wt`
-            // happens to be installed on the machine running this test.
-            worktree_manager: WorktreeManager::new(
-                Arc::new(app_paths.clone()),
-                WorktreePlacement::Managed,
-            ),
+            worktree_manager: WorktreeManager::new(Arc::new(app_paths.clone())),
             storage: Storage::with_paths(app_paths.clone()),
             authority: TaskLifecycleLocks::new(),
             project_id,

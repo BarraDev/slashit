@@ -901,7 +901,7 @@ baz = 123
         );
 
         let valid = toml::to_string_pretty(&config).expect("fixture should serialize");
-        let poisoned = valid.replace("placement = \"auto\"", "placement = \"shared_root\"");
+        let poisoned = valid.replace("placement = \"managed\"", "placement = \"shared_root\"");
         assert_ne!(
             poisoned, valid,
             "fixture must actually invalidate the placement variant"
@@ -919,6 +919,38 @@ baz = 123
         );
 
         poisoned
+    }
+
+    /// `placement = "auto"`, which every configuration written before
+    /// SlashIt stopped delegating to Worktrunk carries, and `"managed"` both
+    /// still pass the strict read, so an update keeps every other section.
+    /// Neither chooses anything any more; a new configuration is written as
+    /// `"managed"`.
+    #[test]
+    fn both_worktree_placement_spellings_still_pass_the_strict_read() {
+        use crate::config::paths::WorktreePlacement;
+        let mut seed = AppConfig::default();
+        seed.jj_config.user_name = Some("Kept".to_string());
+        let written = toml::to_string_pretty(&seed).expect("serialize");
+        assert!(written.contains("placement = \"managed\""), "{written}");
+
+        for (spelling, expected) in
+            [("auto", WorktreePlacement::Auto), ("managed", WorktreePlacement::Managed)]
+        {
+            let (storage, _temp) = create_test_storage();
+            let on_disk = written
+                .replace("placement = \"managed\"", &format!("placement = \"{spelling}\""));
+            fs::write(&storage.config_file, &on_disk).expect("write fixture");
+
+            let read = storage.read_config_strict().expect(spelling);
+            assert_eq!(read.worktree.placement, expected, "{spelling}");
+            storage
+                .update_config(|config| config.ui_preferences.theme = "light".to_string())
+                .expect(spelling);
+            let after = storage.read_config_strict().expect(spelling);
+            assert_eq!(after.jj_config.user_name.as_deref(), Some("Kept"), "{spelling}");
+            assert_eq!(after.worktree.placement, expected, "{spelling}: the spelling is kept");
+        }
     }
 
     #[test]

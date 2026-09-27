@@ -184,8 +184,9 @@ scrollback and logs are never part of that choice; they always stay outside the
 project.
 
 Worktrees are created under `<data_dir>/worktrees/`, not as siblings of your
-repository. If you use [worktrunk](https://github.com/max-sixty/worktrunk),
-SlashIt defers to your `wt` configuration and hooks instead.
+repository, and a task's branch starts from `origin`'s default branch, not
+from whatever you have checked out. Worktrees other tools already created for
+a task's branch are used where they are.
 
 Full details in [`docs/architecture/state-locations.md`](docs/architecture/state-locations.md).
 

@@ -1,15 +1,20 @@
 use super::checked_task_branch;
-use crate::config::paths::{AppPaths, ProjectKey, WorktreePlacement};
-use crate::domain::BranchOrigin;
+use super::default_base::{resolve_default_base, DefaultBase};
+use crate::config::paths::{AppPaths, ProjectKey};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Creates, adopts and removes Task Checkouts: Git worktrees, created with
+/// `git` itself under SlashIt's own data directory.
+///
+/// No other tool is consulted, whatever is installed. A worktree some other
+/// tool created for a task's branch (Worktrunk's `wt` placed them under its
+/// own `worktree-path` template) is adopted where it is, as long as git has
+/// it registered for exactly that branch.
 pub struct WorktreeManager {
-    wt_available: bool,
     paths: Arc<AppPaths>,
-    placement: WorktreePlacement,
 }
 
 pub struct WorktreeInfo {
@@ -77,70 +82,12 @@ pub enum WorktreeRecovery {
 }
 
 impl WorktreeManager {
-    /// Whether `name` is an executable on `PATH`.
-    ///
-    /// A directory walk rather than `which`, because `which` is a subprocess
-    /// and this runs during construction. A forked child inherits every open
-    /// descriptor until it reaches `exec`, and the single-instance ownership
-    /// lease is an `flock` held on one of them, so a probe that forks while
-    /// that lease is being released holds it open past the release -- long
-    /// enough for the next acquisition to be told, wrongly, that another
-    /// instance is already listening. Measured: with the two `which` calls in
-    /// place the IPC ownership regression failed 9 runs in 12 against parallel
-    /// construction, and 0 in 12 with them gone.
-    ///
-    /// Answering it directly is also simply the smaller thing to do: two
-    /// process spawns at startup, to read a variable this process already has.
-    fn on_path(name: &str) -> bool {
-        let Some(path) = std::env::var_os("PATH") else {
-            return false;
-        };
-        std::env::split_paths(&path).any(|dir| {
-            let candidate = dir.join(name);
-            std::fs::metadata(&candidate).is_ok_and(|meta| {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    meta.is_file() && meta.permissions().mode() & 0o111 != 0
-                }
-                #[cfg(not(unix))]
-                {
-                    meta.is_file()
-                }
-            })
-        })
-    }
-
-    pub fn new(paths: Arc<AppPaths>, placement: WorktreePlacement) -> Self {
-        let wt_available = Self::on_path("wt");
-
-        let manager = Self {
-            wt_available,
-            paths,
-            placement,
-        };
-
-        if manager.delegates_to_wt() {
-            println!("SlashIt: Worktrunk (wt) detected — delegating worktree placement to it");
-        } else {
-            println!(
-                "SlashIt: managing worktrees under {}",
-                manager.paths.data_dir().join("worktrees").display()
-            );
-        }
-
-        manager
-    }
-
-    /// Whether worktree placement is handed to worktrunk.
-    ///
-    /// `wt switch` accepts no target path, so delegating means SlashIt does not
-    /// choose the directory — worktrunk's own `worktree-path` template does.
-    /// That is deliberate under [`WorktreePlacement::Auto`]: it is the user's
-    /// tool and their hooks. [`WorktreePlacement::Managed`] takes the decision
-    /// back.
-    fn delegates_to_wt(&self) -> bool {
-        self.wt_available && matches!(self.placement, WorktreePlacement::Auto)
+    pub fn new(paths: Arc<AppPaths>) -> Self {
+        println!(
+            "SlashIt: managing worktrees under {}",
+            paths.data_dir().join("worktrees").display()
+        );
+        Self { paths }
     }
 
     /// Where SlashIt would place this branch's worktree.
@@ -237,9 +184,8 @@ impl WorktreeManager {
         // `adopt_existing` only matches this app's own managed/legacy path
         // conventions. `adopt_any_registered` is the fallback for a worktree
         // git still has registered for this branch at some other path — for
-        // example one `wt` placed under its own convention, which happens
-        // whenever `WorktreePlacement::Auto` (the default) delegates to it.
-        // Git's confirmation is already the trust boundary, so a worktree it
+        // example one Worktrunk (`wt`) placed under its own template, which
+        // versions of SlashIt that delegated to it left behind. Git's confirmation is already the trust boundary, so a worktree it
         // vouches for is exactly as real as one sitting where SlashIt would
         // itself have put it. Only once BOTH miss has git positively said
         // there is nothing to adopt — which is what `ConfirmedAbsent` means,
@@ -298,15 +244,16 @@ impl WorktreeManager {
     /// Any worktree git currently has registered for `branch`, regardless of
     /// whether its path matches this app's managed or legacy conventions.
     ///
-    /// Startup reconciliation uses this as a fallback after
-    /// [`Self::adopt_existing`]: git-confirmation is already the trust
-    /// boundary — see that method's doc comment — and a worktree placed by
-    /// an external tool such as `wt` under [`WorktreePlacement::Auto`] (the
-    /// default) never matches either convention, but is exactly as real as
-    /// one that does. Reusing a worktree when *creating* one, by contrast,
-    /// only makes sense at a path the app would itself create at, which is
-    /// why [`Self::adopt_existing`] stays scoped to those two conventions
-    /// and this method is not used there.
+    /// Startup reconciliation, and every way of acquiring a task's
+    /// checkout, use this as a fallback after [`Self::adopt_existing`]:
+    /// git-confirmation is already the trust boundary — see that method's
+    /// doc comment — and a worktree placed by an external tool, such as one
+    /// Worktrunk (`wt`) placed under its own template, never matches either
+    /// convention, but is exactly as real as one that does. It stays where
+    /// it is; only a worktree SlashIt creates is placed by SlashIt.
+    ///
+    /// Only a worktree git has registered with exactly `branch` checked out
+    /// is returned, never one on another branch or a detached `HEAD`.
     ///
     /// `repo_path` is never itself adoptable: the primary checkout is a
     /// registered worktree for whatever branch it has checked out, and
@@ -337,18 +284,25 @@ impl WorktreeManager {
         Some(registered.to_string_lossy().to_string())
     }
 
-    /// Async counterpart of [`Self::adoptable_path`] for callers already
-    /// running on the Tokio runtime: fetches the porcelain listing itself
-    /// rather than requiring the caller to supply one.
-    async fn adoptable_path_live(&self, repo_path: &str, branch: &str) -> Option<PathBuf> {
+    /// An existing worktree of `branch` to use rather than create one: first
+    /// at the managed or legacy path, then anywhere else git has one
+    /// registered for exactly that branch, never the primary checkout.
+    ///
+    /// A listing git could not produce adopts nothing, and whatever is then
+    /// tried instead fails on the same git.
+    async fn adoptable_worktree(&self, repo_path: &str, branch: &str) -> Option<String> {
         let output = tokio::process::Command::new("git")
             .args(["worktree", "list", "--porcelain"])
             .current_dir(repo_path)
             .output()
             .await
             .ok()?;
+        if !output.status.success() {
+            return None;
+        }
         let porcelain = String::from_utf8_lossy(&output.stdout);
-        self.adoptable_path(repo_path, branch, &porcelain)
+        self.adopt_existing(repo_path, branch, &porcelain)
+            .or_else(|| Self::adopt_any_registered(repo_path, branch, &porcelain))
     }
 
     /// Generate a branch name from a task UUID (first 8 chars).
@@ -365,82 +319,123 @@ impl WorktreeManager {
         self.create_or_adopt(repo_path, branch).await.map(|(info, _)| info)
     }
 
-    /// [`Self::create`], also saying whether the worktree was adopted: an
-    /// existing worktree of `branch` reused rather than a new branch
-    /// created. Where an adopted branch started is not known here.
+    /// [`Self::create`], also returning the default base the new branch was
+    /// started from, or `None` when an existing worktree of `branch` was
+    /// adopted instead. Where an adopted branch started is not known here,
+    /// and nothing is claimed about it.
+    ///
+    /// A new branch starts at exactly the commit [`resolve_default_base`]
+    /// resolves, never at the primary checkout's `HEAD`, and with no
+    /// upstream: it is created with a create-only `git update-ref` at that
+    /// object ID, which sets no tracking configuration whatever
+    /// `branch.autoSetupMerge` says, and only then checked out with
+    /// `git worktree add -- <path> <branch>`. The object ID itself is never
+    /// handed to `git worktree add` as a start point, where a branch or tag
+    /// named with those same hex digits would be taken instead. A worktree
+    /// that cannot be added takes the new branch with it, so a retry is not
+    /// blocked by it.
     pub async fn create_or_adopt(
         &self,
         repo_path: &str,
         branch: &str,
-    ) -> Result<(WorktreeInfo, bool), String> {
+    ) -> Result<(WorktreeInfo, Option<DefaultBase>), String> {
         let branch = checked_task_branch(branch)?;
-        if let Some(existing) = self.adoptable_path_live(repo_path, branch).await {
-            let info = WorktreeInfo {
-                path: existing.to_string_lossy().to_string(),
-                branch: branch.to_string(),
-            };
-            return Ok((info, true));
+        if let Some(path) = self.adoptable_worktree(repo_path, branch).await {
+            let info = WorktreeInfo { path, branch: branch.to_string() };
+            return Ok((info, None));
         }
-        let info = if self.delegates_to_wt() {
-            self.create_with_wt(repo_path, branch).await?
-        } else {
-            self.create_with_git(repo_path, branch).await?
+        let base = resolve_default_base(repo_path).await?;
+        Self::create_branch_at(repo_path, branch, &base.commit).await?;
+        let worktree_path = self.managed_path(repo_path, branch);
+        let info = match self.git_worktree_add(repo_path, &worktree_path, branch).await {
+            Ok(info) => info,
+            Err(e) => {
+                return match Self::discard_created_branch(repo_path, branch, &base.commit).await {
+                    Ok(()) => Err(e),
+                    Err(kept) => Err(format!("{e}; {kept}")),
+                };
+            }
         };
-        Ok((info, false))
+        // A `post-checkout` hook runs inside `git worktree add` and can move
+        // what was just checked out. The branch is then no longer only where
+        // the default base put it, so it is not recorded as starting there;
+        // the checkout is left as it is for a person to look at.
+        let (head_ref, head) = Self::checkout_head(&info.path).await?;
+        let expected = format!("refs/heads/{branch}");
+        if head_ref.as_deref() != Some(expected.as_str()) || head != base.commit {
+            return Err(format!(
+                "branch {branch} was created at {} ({}@origin), but its new worktree at {} has \
+                 {} checked out at {} afterwards, which something other than SlashIt (a \
+                 post-checkout hook?) must have done. The worktree and the branch were left as \
+                 they are.",
+                base.commit,
+                base.branch,
+                info.path,
+                head_ref.as_deref().unwrap_or("a detached HEAD"),
+                head,
+            ));
+        }
+        Ok((info, Some(base)))
     }
 
-    /// Reattach to an existing branch (no -c flag). Used when re-queuing a task
-    /// that already has a branch from a previous execution.
+    /// The ref a checkout's `HEAD` names, `None` when it is detached, and
+    /// the commit it is at.
+    async fn checkout_head(worktree: &str) -> Result<(Option<String>, String), String> {
+        let symbolic = tokio::process::Command::new("git")
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .current_dir(worktree)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git symbolic-ref: {e}"))?;
+        let symbolic = symbolic
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&symbolic.stdout).trim().to_string());
+        let commit = tokio::process::Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD^{commit}"])
+            .current_dir(worktree)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git rev-parse: {e}"))?;
+        if !commit.status.success() {
+            return Err(format!(
+                "Could not read HEAD in the new worktree at {worktree}: {}",
+                String::from_utf8_lossy(&commit.stderr).trim()
+            ));
+        }
+        Ok((symbolic, String::from_utf8_lossy(&commit.stdout).trim().to_string()))
+    }
+
+    /// Reattach to an existing branch. Used when re-queuing a task that
+    /// already has a branch from a previous execution.
+    ///
+    /// A worktree git already has registered for the branch is used where
+    /// it is, wherever that is, except the primary checkout. Otherwise a new
+    /// one is added at the managed path.
     ///
     /// `branch` is the task's recorded `branch_name`, read back from a board
     /// file that may be kept in the project and so may say anything; it is
-    /// refused, before `wt` or `git` is run, unless it is a plain branch name.
+    /// refused, before `git` is run, unless it is a plain branch name.
     pub async fn reattach(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
         let branch = checked_task_branch(branch)?;
-        if let Some(existing) = self.adoptable_path_live(repo_path, branch).await {
-            return Ok(WorktreeInfo {
-                path: existing.to_string_lossy().to_string(),
-                branch: branch.to_string(),
-            });
+        if let Some(path) = self.adoptable_worktree(repo_path, branch).await {
+            return Ok(WorktreeInfo { path, branch: branch.to_string() });
         }
         // Attaching by name alone is not enough: with no local branch of
         // that name, `git worktree add` reads a full object ID, `FETCH_HEAD`
         // or `ORIG_HEAD` as a commit and checks it out detached.
         Self::local_branch_tip(repo_path, branch).await?;
-
-        if self.delegates_to_wt() {
-            // wt switch to existing branch (no -c)
-            let output = tokio::process::Command::new("wt")
-                .args(["switch", branch, "--no-cd", "-y", "--no-verify"])
-                .current_dir(repo_path)
-                .output()
-                .await
-                .map_err(|e| format!("Failed to run wt switch: {}", e))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "wt switch failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
-            self.find_worktree_path(repo_path, branch).await
-        } else {
-            // git worktree add without -b (attach to an existing branch)
-            let worktree_path = self.managed_path(repo_path, branch);
-            self.git_worktree_add(repo_path, &worktree_path, branch, false)
-                .await
-        }
+        let worktree_path = self.managed_path(repo_path, branch);
+        self.git_worktree_add(repo_path, &worktree_path, branch).await
     }
 
-    /// Run `git worktree add`, creating the external worktree root first.
-    ///
-    /// `create_branch` selects `-b <branch>` (a new branch) over `<branch>`
-    /// (attach to an existing one).
+    /// Run `git worktree add` to check out the existing local branch
+    /// `branch`, creating the external worktree root first.
     async fn git_worktree_add(
         &self,
         repo_path: &str,
         worktree_path: &Path,
         branch: &str,
-        create_branch: bool,
     ) -> Result<WorktreeInfo, String> {
         if let Some(parent) = worktree_path.parent() {
             std::fs::create_dir_all(parent)
@@ -452,7 +447,7 @@ impl WorktreeManager {
             .ok_or_else(|| "Worktree path is not valid UTF-8".to_string())?;
 
         let output = tokio::process::Command::new("git")
-            .args(Self::git_worktree_add_args(dest, branch, create_branch))
+            .args(Self::git_worktree_add_args(dest, branch))
             .current_dir(repo_path)
             .output()
             .await
@@ -472,17 +467,12 @@ impl WorktreeManager {
     }
 
     /// The arguments for `git worktree add`, with `--` before the positional
-    /// arguments so that neither the destination nor an attached branch can
-    /// be read as an option. `-b` has to come before the `--`; after it, git
-    /// would take `-b` as the path. A revision such as `HEAD~1` is still a
-    /// valid `<commit-ish>` after the `--`, which is why callers also check
-    /// the branch with [`checked_task_branch`].
-    fn git_worktree_add_args<'a>(dest: &'a str, branch: &'a str, create_branch: bool) -> Vec<&'a str> {
-        if create_branch {
-            vec!["worktree", "add", "-b", branch, "--", dest]
-        } else {
-            vec!["worktree", "add", "--", dest, branch]
-        }
+    /// arguments so that neither the destination nor the branch can be read
+    /// as an option. A revision such as `HEAD~1` is still a valid
+    /// `<commit-ish>` after the `--`, which is why callers also check the
+    /// branch with [`checked_task_branch`] and that it is a local branch.
+    fn git_worktree_add_args<'a>(dest: &'a str, branch: &'a str) -> [&'a str; 5] {
+        ["worktree", "add", "--", dest, branch]
     }
 
     /// The commit the local branch `branch` points at, or an error if there
@@ -558,88 +548,6 @@ impl WorktreeManager {
         }
     }
 
-    /// [`BranchOrigin::DefaultBase`] when `base_commit` is provably contained
-    /// in the repository's known remote default base, `None` when that is
-    /// not proven.
-    ///
-    /// An ordinary task branch starts wherever the tool creating it starts
-    /// it: `git worktree add -b` at the primary checkout's `HEAD` (a feature
-    /// branch the user is on, or the detached `@-` of a JJ-colocated
-    /// repository), `wt switch -c` at the local default branch, which may
-    /// hold commits nobody pushed. Neither is necessarily the default base a
-    /// pull request is opened against, so creating the branch proves nothing
-    /// by itself. What is checked instead is where it actually started,
-    /// against local refs only, with no fetch: the ref
-    /// `refs/remotes/origin/HEAD` is resolved to the commit it names, and
-    /// then `git merge-base --is-ancestor <base_commit> <that commit>` is
-    /// asked. Only its exit status 0 is proof. Not contained, no
-    /// `origin/HEAD` (a remote not named `origin`, or one whose default
-    /// branch was never recorded locally), one naming a branch that is not
-    /// there, an object the repository does not have, or a git that could
-    /// not be run all answer `None`: unknown, never a guessed origin.
-    ///
-    /// The ref is resolved by [`Self::origin_head_commit`] rather than handed
-    /// to `merge-base` by name, because git looks a revision name up in
-    /// several namespaces: with the real ref gone, a local branch or tag
-    /// named `refs/remotes/origin/HEAD` would otherwise answer for it.
-    ///
-    /// Both front doors that create an ordinary branch, the executor and the
-    /// Worktree panel's `create_worktree`, record what this answers, so the
-    /// policy lives only here.
-    ///
-    /// `base_commit` is refused without running git unless it is a full
-    /// object ID as `git rev-parse` prints it: a revision such as `HEAD`,
-    /// `main` or `origin/HEAD` would resolve to something other than the
-    /// commit that was recorded, and an argument starting with `-` would be
-    /// read as an option.
-    pub async fn default_base_origin(
-        repo_path: &str,
-        base_commit: Option<&str>,
-    ) -> Option<BranchOrigin> {
-        let base_commit = base_commit.filter(|c| Self::is_full_object_id(c))?;
-        let default_base = Self::origin_head_commit(repo_path).await?;
-        let output = tokio::process::Command::new("git")
-            .args(["merge-base", "--is-ancestor", base_commit, &default_base])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .ok()?;
-        (output.status.code() == Some(0)).then_some(BranchOrigin::DefaultBase)
-    }
-
-    /// The object ID the ref `refs/remotes/origin/HEAD` resolves to, or
-    /// `None` when there is no such ref, it is a symbolic ref to a branch
-    /// that is not there, or git could not be asked cleanly.
-    ///
-    /// `for-each-ref` matches the full ref name only, never a branch or tag
-    /// that merely carries the same name, and dereferences the symbolic ref
-    /// to its target's object ID; a dangling one is not listed at all. Its
-    /// pattern also matches refs below `refs/remotes/origin/HEAD/`, so only
-    /// the line for the exact name is taken.
-    async fn origin_head_commit(repo_path: &str) -> Option<String> {
-        const ORIGIN_HEAD: &str = "refs/remotes/origin/HEAD";
-        let output = tokio::process::Command::new("git")
-            .args(["for-each-ref", "--format=%(refname) %(objectname)", ORIGIN_HEAD])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .ok()?;
-        if !output.status.success() || !output.stderr.is_empty() {
-            return None;
-        }
-        String::from_utf8_lossy(&output.stdout).lines().find_map(|line| {
-            let (refname, oid) = line.split_once(' ')?;
-            (refname == ORIGIN_HEAD && Self::is_full_object_id(oid)).then(|| oid.to_string())
-        })
-    }
-
-    /// Whether `value` is a full object ID: exactly 40 (SHA-1) or 64
-    /// (SHA-256) lowercase hexadecimal digits, which is all `git rev-parse`
-    /// prints for one.
-    fn is_full_object_id(value: &str) -> bool {
-        super::restack::is_full_object_id(value)
-    }
-
     /// Create the local branch `branch` at exactly `commit`, failing if the
     /// branch already exists. `git update-ref` takes the object ID as it is,
     /// where `git branch` would prefer a ref that happens to share its name.
@@ -702,17 +610,16 @@ impl WorktreeManager {
 
     /// Create a branch stacked on top of another branch.
     ///
-    /// Under worktrunk delegation this is `wt switch -c --base`; otherwise
     /// SlashIt creates the branch at the dependency's tip itself and attaches
-    /// a worktree to it. No other stacking tool is consulted, so what a task
-    /// is stacked on does not depend on what happens to be installed. A
+    /// a worktree to it. No stacking tool is consulted, so what a task is
+    /// stacked on does not depend on what happens to be installed. A
     /// branch of this name that already contains the dependency's tip is
     /// reattached instead, so an attempt that did not finish does not block
     /// the next; one that does not contain it is refused.
     ///
     /// `after_branch` is the dependency's recorded `branch_name`, which is as
-    /// untrusted as the task's own, so both names are checked before `wt` or
-    /// `git` is run.
+    /// untrusted as the task's own, so both names are checked before `git`
+    /// is run.
     pub async fn create_stacked_branch(
         &self,
         repo_path: &str,
@@ -722,15 +629,14 @@ impl WorktreeManager {
         let branch = checked_task_branch(branch)?;
         let after_branch = checked_task_branch(after_branch)
             .map_err(|e| format!("Cannot stack on the dependency's branch: {e}"))?;
-        // Every tool below would read a name that is not a local branch as
-        // the commit it resolves to, and stack on that instead.
+        // Git would read a name that is not a local branch as the commit it
+        // resolves to, and stack on that instead.
         let dependency_tip = Self::local_branch_tip(repo_path, after_branch)
             .await
             .map_err(|e| format!("Cannot stack on the dependency's branch: {e}"))?;
         // A branch of this name left by an earlier attempt that did not
-        // finish -- a worktree whose checkout hook failed, a start that died
-        // before the task recorded its branch, a `wt switch` whose worktree
-        // could not be found afterwards -- is picked up again rather than
+        // finish -- a worktree whose checkout hook failed, or a start that
+        // died before the task recorded its branch -- is picked up again rather than
         // failing every retry on "already exists". Only while it still holds
         // the dependency's work: a branch that does not is somebody else's,
         // and is refused and left exactly as it is.
@@ -744,46 +650,22 @@ impl WorktreeManager {
             let info = self.reattach(repo_path, branch).await?;
             return Ok(StackedWorktree { info, dependency_tip, resumed: true });
         }
-        let info = if self.delegates_to_wt() {
-            // Worktrunk places the worktree and creates the branch from the
-            // dependency.
-            let output = tokio::process::Command::new("wt")
-                .args(["switch", "-c", branch, "--base", after_branch, "--no-cd", "-y", "--no-verify"])
-                .current_dir(repo_path)
-                .output()
-                .await
-                .map_err(|e| format!("wt switch failed: {}", e))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("wt switch with base failed: {}", stderr));
-            }
-
-            self.find_worktree_path(repo_path, branch).await?
-        } else {
-            // Git path: create the branch at the dependency's tip,
-            // then attach a worktree to it. Attach, not `-b` (`create_with_git`
-            // always passes `-b`): the branch already exists from the line
-            // above, so creating it again would fail. A branch that could not
-            // be created stops here: attaching to whatever already has that
-            // name would report a stack that is not stacked on anything. A
-            // worktree that could not be attached takes the new branch with
-            // it, or every retry would fail on the branch it left behind.
-            Self::create_branch_at(repo_path, branch, &dependency_tip).await?;
-            let worktree_path = self.managed_path(repo_path, branch);
-            match self
-                .git_worktree_add(repo_path, &worktree_path, branch, false)
-                .await
-            {
-                Ok(info) => info,
-                Err(e) => {
-                    return match Self::discard_created_branch(repo_path, branch, &dependency_tip)
-                        .await
-                    {
-                        Ok(()) => Err(e),
-                        Err(kept) => Err(format!("{e}; {kept}")),
-                    };
-                }
+        // Create the branch at the dependency's tip, then attach a worktree
+        // to it. A branch that could not be created stops here: attaching to
+        // whatever already has that name would report a stack that is not
+        // stacked on anything. A worktree that could not be attached takes
+        // the new branch with it, or every retry would fail on the branch it
+        // left behind.
+        Self::create_branch_at(repo_path, branch, &dependency_tip).await?;
+        let worktree_path = self.managed_path(repo_path, branch);
+        let info = match self.git_worktree_add(repo_path, &worktree_path, branch).await {
+            Ok(info) => info,
+            Err(e) => {
+                return match Self::discard_created_branch(repo_path, branch, &dependency_tip).await
+                {
+                    Ok(()) => Err(e),
+                    Err(kept) => Err(format!("{e}; {kept}")),
+                };
             }
         };
         Ok(StackedWorktree { info, dependency_tip, resumed: false })
@@ -799,12 +681,11 @@ impl WorktreeManager {
     /// nowhere else, so it does not decide; callers that genuinely want a
     /// branch gone need their own contract for saying so, and today none
     /// does.
+    ///
+    /// Any worktree git has registered can be removed this way, including
+    /// one at a path SlashIt did not choose.
     pub async fn remove(&self, worktree_path: &str, repo_path: &str) -> Result<(), String> {
-        if self.delegates_to_wt() {
-            self.remove_with_wt(worktree_path, repo_path).await
-        } else {
-            self.remove_with_git(worktree_path, repo_path).await
-        }
+        self.remove_with_git(worktree_path, repo_path).await
     }
 
     /// Check if a worktree directory exists on disk.
@@ -830,63 +711,21 @@ impl WorktreeManager {
         matches!(Presence::of(Path::new(path)), Presence::Absent)
     }
 
-    // --- Private: wt-based operations ---
-
-    /// The exact `wt remove` invocation this backend runs for every real
-    /// removal. Kept as a named constant, rather than inlined at the one
-    /// call site, so the branch-preservation and synchronicity contract it
-    /// encodes -- `--foreground`, `--no-delete-branch` -- can be asserted
-    /// deterministically (see
-    /// [`tests::wt_remove_args_run_in_the_foreground_and_keep_the_branch`])
-    /// without spawning `wt` at all.
-    ///
-    /// `--no-hooks` is the current spelling for what used to be
-    /// `--no-verify`; `wt` still accepts the old name but warns it is
-    /// deprecated.
-    const WT_REMOVE_ARGS: [&'static str; 5] =
-        ["remove", "-y", "--no-hooks", "--foreground", "--no-delete-branch"];
-
-    async fn create_with_wt(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
-        let output = tokio::process::Command::new("wt")
-            .args(["switch", "-c", branch, "--no-cd", "-y", "--no-verify"])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| format!("Failed to run wt switch: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("wt switch failed: {}", stderr));
-        }
-
-        // wt creates worktree as sibling: ../repo.branch
-        // Find it via git worktree list
-        self.find_worktree_path(repo_path, branch).await
-    }
-
     /// Decide a removal's outcome on positive proof of absence, never on
     /// whatever exit status the attempt itself reported, and put git's own
     /// registration back if the attempt cost the worktree its record without
     /// actually removing it.
     ///
-    /// Both backends share this contract exactly: `git worktree remove`
-    /// (and `--force`) can fail with a non-zero exit without the directory
-    /// actually being gone, and can also exit zero while leaving it behind;
-    /// `wt remove` runs its own removal in the background and exits zero
-    /// even when the directory survives, and its documented sequence --
-    /// rename into its own trash, prune git's registration, delete the
-    /// branch, a detached `rm -rf` -- can have the registration-pruning step
-    /// land before an earlier or later step in that same sequence fails,
-    /// whatever exit status that failure surfaces as. Neither tool's exit
-    /// code is the signal to decide on; `Self::proven_absent` is.
+    /// `git worktree remove` can fail with a non-zero exit without the
+    /// directory actually being gone, and can also exit zero while leaving
+    /// it behind. Its exit code is not the signal to decide on;
+    /// `Self::proven_absent` is.
     ///
     /// `record` is `None` when [`WorktreeRecord::save`] found nothing to
     /// preserve, which is not itself a failure -- a removal that never had a
     /// record to lose behaves exactly as it did before this existed.
-    /// `failure` is the caller's own backend-specific description of what
-    /// went wrong, used only when the worktree could not be proven gone; the
-    /// wording stays entirely with each backend so this never has to guess
-    /// which tool ran or why.
+    /// `failure` is the caller's own description of what went wrong, used
+    /// only when the worktree could not be proven gone.
     fn finish_removal(
         worktree_path: &str,
         record: Option<WorktreeRecord>,
@@ -906,99 +745,6 @@ impl WorktreeManager {
             }
         }
         Err(failure)
-    }
-
-    async fn remove_with_wt(&self, worktree_path: &str, repo_path: &str) -> Result<(), String> {
-        if !self.exists(worktree_path) {
-            // `wt` is spawned with `current_dir(worktree_path)`, so a missing
-            // directory fails at spawn with `NotFound` before `wt` ever runs.
-            // That is anti-convergent rather than merely unhelpful: a first
-            // attempt that did remove the directory guarantees every later
-            // attempt fails. A cleanup that removed the worktree but could not
-            // save the board retains `worktree_path` on purpose, so every
-            // explicit retry the user asks for would fail on a worktree that is
-            // already gone -- and this is the default backend whenever `wt` is
-            // installed, because `WorktreePlacement::Auto` is the default.
-            //
-            // Handing this case to git rather than just returning `Ok(())` is
-            // what makes it converge to a *usable* state. `wt` leaves the
-            // registration behind when the directory disappears underneath it,
-            // and a prunable registration is not inert: `wt switch <branch>`
-            // then refuses with "Worktree directory missing", and
-            // `wt switch -c <branch>` refuses because the branch still exists,
-            // so the task could never get a worktree again. `git worktree
-            // remove` clears a record whose directory is gone by itself, which
-            // is what `remove_with_git` is being handed this case for, and
-            // like this backend it leaves the branch alone.
-            return self.remove_with_git(worktree_path, repo_path).await;
-        }
-
-        // Saved before anything runs, for the same reason `remove_with_git`
-        // saves one: confirmed by hand against a real `wt`, its "Worktree
-        // directory missing; pruned" is not proof the directory is gone --
-        // only that `wt` could not stat it -- and it prunes git's
-        // registration on that basis regardless.
-        let record = WorktreeRecord::save(worktree_path, repo_path).await;
-
-        // `--no-delete-branch`, in `Self::WT_REMOVE_ARGS` below, is what keeps
-        // this backend's contract the same as the git one's. Measured against
-        // worktrunk without it (v0.29.0 originally, and confirmed again on
-        // v0.68.0): `wt remove` deletes the task branch whenever the branch
-        // sits on the same commit as main -- it prints "Removing <branch>
-        // worktree & branch (same commit as main)" and the branch is gone
-        // afterwards. That is not an exotic state; it is the ordinary end of a
-        // task, reached by every task whose agent committed nothing and by
-        // every task whose work has already landed. The task branch is durable
-        // committed task state -- it is what `create_pr` pushes and what
-        // `reattach` checks out again -- so it has to survive cleanup.
-        let output = tokio::process::Command::new("wt")
-            .args(Self::WT_REMOVE_ARGS)
-            .current_dir(worktree_path)
-            .output()
-            .await
-            .map_err(|e| format!("Failed to run wt remove: {}", e))?;
-
-        // `stderr` is kept only to explain a failure in the message below,
-        // never to decide one -- see `finish_removal` for why exit status
-        // is not that signal for this backend either.
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-
-        // `wt remove` defaults to deleting the actual worktree in a detached
-        // background job and returning as soon as that job is launched, but
-        // `--foreground` opts this call out of that: confirmed by hand
-        // against a real, installed `wt`, the checkout is already gone --
-        // no sleep needed to observe it -- immediately after a `--foreground`
-        // call returns, including through the cross-filesystem fallback to
-        // plain `git worktree remove` `wt` documents for that mode. There is
-        // therefore nothing to wait out here; `proven_absent` below is
-        // evaluated exactly once, right after this call returns.
-        //
-        // That still is not the same as trusting the exit status itself: a
-        // pre-remove hook failing, or `wt` hitting trouble partway through
-        // its own removal (the scenario
-        // `remove_with_wt_preserves_and_restores_the_registration_when_its_own_removal_cannot_finish`
-        // exercises), can each surface as success or failure independently
-        // of whether the checkout actually survived. `finish_removal` (via
-        // `proven_absent`) is still the only thing that decides.
-        let failure = if output.status.success() {
-            format!("wt remove reported success but {worktree_path} could not be proven gone")
-        } else if stderr.is_empty() {
-            format!(
-                "wt remove failed and {worktree_path} could not be proven gone, which gave no \
-                 reason"
-            )
-        } else {
-            format!("wt remove failed and {worktree_path} could not be proven gone: {stderr}")
-        };
-        Self::finish_removal(worktree_path, record, failure)
-    }
-
-    // --- Private: git-based fallback ---
-
-    async fn create_with_git(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
-        let worktree_path = self.managed_path(repo_path, branch);
-        self.git_worktree_add(repo_path, &worktree_path, branch, true)
-            .await
     }
 
     async fn remove_with_git(&self, worktree_path: &str, repo_path: &str) -> Result<(), String> {
@@ -1076,38 +822,6 @@ impl WorktreeManager {
         // and deletable by hand, and destroyed work is none of those.
 
         Ok(())
-    }
-
-    /// Find worktree path by branch name using git worktree list.
-    async fn find_worktree_path(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
-        let output = tokio::process::Command::new("git")
-            .args(["worktree", "list", "--porcelain"])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| format!("Failed to list worktrees: {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(path) = Self::worktree_for_branch(&stdout, branch) {
-            return Ok(WorktreeInfo {
-                path,
-                branch: branch.to_string(),
-            });
-        }
-
-        // Not registered with git: fall back to the paths we would have used,
-        // newest scheme first. (`worktree_for_branch` already checked this
-        // same listing above and found no match, so `adoptable_path`'s own
-        // git-registration check can only agree — kept for symmetry with
-        // `create`/`reattach` and in case that matching logic ever diverges.)
-        if let Some(path) = self.adoptable_path(repo_path, branch, &stdout) {
-            return Ok(WorktreeInfo {
-                path: path.to_string_lossy().to_string(),
-                branch: branch.to_string(),
-            });
-        }
-
-        Err(format!("Worktree for branch '{}' not found", branch))
     }
 
     /// Extract the worktree path for `branch` from `git worktree list --porcelain`.
@@ -1412,83 +1126,30 @@ mod tests {
         ))
     }
 
-    /// A manager with external tools forced off, so tests never depend on
-    /// whether `wt` happens to be installed on the machine running them.
     fn test_manager() -> WorktreeManager {
-        WorktreeManager {
-            wt_available: false,
-            paths: test_paths(),
-            placement: WorktreePlacement::Auto,
-        }
+        WorktreeManager::new(test_paths())
     }
 
-    #[test]
-    fn new_does_not_panic() {
-        // Even if wt is absent, construction must succeed.
-        let mgr = WorktreeManager::new(test_paths(), WorktreePlacement::Auto);
-        let _ = mgr.wt_available;
-    }
-
+    /// A worktree whose directory is gone but whose registration git still
+    /// keeps is removed as a converged removal, and the registration goes
+    /// with it: a stale registration would block `git worktree add` for the
+    /// branch, so the task could never get a worktree again.
     #[tokio::test]
-    async fn remove_converges_on_an_absent_directory_under_worktrunk_delegation() {
-        // A second removal of an already-absent worktree has to succeed, or
-        // the state is one nothing can ever finish: `remove_with_git` gets that
-        // from its `exists()` gate; `remove_with_wt` spawns with
-        // `current_dir(worktree_path)`, so without its own guard it fails at
-        // spawn every time it is asked, however many times the user asks. This
-        // runs on machines with and without `wt` installed, because the guard
-        // returns before spawning.
-        let mut mgr = test_manager();
-        mgr.wt_available = true;
-        mgr.placement = WorktreePlacement::Auto;
-        assert!(mgr.delegates_to_wt(), "this test must exercise the wt backend");
-
-        // A private temp root, so parallel test threads cannot race on the name.
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let repo = create_temp_git_repo();
-        let absent = temp.path().join("worktree-that-does-not-exist");
-
-        let result = mgr
-            .remove(absent.to_str().unwrap(), repo.path().to_str().unwrap())
-            .await;
-
-        assert!(
-            result.is_ok(),
-            "an already-absent worktree is a converged removal, not a failure: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn integration_remove_under_worktrunk_delegation_clears_a_stale_registration() {
-        // Converging is not enough on its own: `wt` leaves the registration
-        // behind when the directory goes missing, and a stale registration
-        // blocks `wt switch <branch>` ("Worktree directory missing") while the
-        // surviving branch blocks `wt switch -c <branch>`, so the task could
-        // never get a worktree again. `git worktree remove` clears a record
-        // whose directory is gone, which is the whole reason this case is
-        // handed to the git backend. Needs no `wt` binary: the delegation
-        // happens before anything is spawned.
+    async fn integration_remove_clears_a_stale_registration() {
         let repo = create_temp_git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
-
-        let mut mgr = test_manager();
-        mgr.placement = WorktreePlacement::Managed;
+        let mgr = test_manager();
         let info = mgr
             .create(&repo_path, "task-abcd1234")
             .await
             .expect("create failed");
 
-        // Exactly the state `wt` leaves behind: directory gone, git record kept.
         std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
         let before = WorktreeManager::worktree_list_porcelain(&repo_path).expect("git listing");
         assert!(
             before.contains(&info.path),
             "the stale registration must still be there before the removal"
         );
-
-        mgr.wt_available = true;
-        mgr.placement = WorktreePlacement::Auto;
-        assert!(mgr.delegates_to_wt(), "this test must exercise the wt backend");
 
         mgr.remove(&info.path, &repo_path)
             .await
@@ -1500,26 +1161,7 @@ mod tests {
             "the stale registration must be cleared, or the branch can never be checked out \
              again"
         );
-        assert!(
-            branch_exists(&repo_path, "task-abcd1234"),
-            "the two backends must not differ on data loss: `wt remove` never deletes a branch, \
-             and the git path it delegates to must not either"
-        );
-    }
-
-    #[test]
-    fn delegates_to_wt_respects_managed_placement_regardless_of_wt_availability() {
-        let mut mgr = test_manager();
-        mgr.wt_available = true;
-
-        mgr.placement = WorktreePlacement::Auto;
-        assert!(mgr.delegates_to_wt(), "Auto with wt installed should delegate");
-
-        mgr.placement = WorktreePlacement::Managed;
-        assert!(
-            !mgr.delegates_to_wt(),
-            "Managed must take placement back even when wt is installed"
-        );
+        assert!(branch_exists(&repo_path, "task-abcd1234"), "the branch is kept");
     }
 
     #[test]
@@ -1928,50 +1570,56 @@ branch refs/heads/some-other-branch
     // Integration tests (require git)
     // -------------------------------------------------------
 
-    /// Helper: create a temporary git repository and return its path.
-    fn create_temp_git_repo() -> tempfile::TempDir {
+    /// A repository at `<temp>/repo` with one commit on `main`, pushed to a
+    /// bare `origin` at `<temp>/origin.git`, and `refs/remotes/origin/HEAD`
+    /// pointing at `refs/remotes/origin/main` the way `git clone` leaves it.
+    ///
+    /// The origin is what gives an ordinary task branch somewhere to start:
+    /// a repository without one has no default base, and creating a branch
+    /// in it is refused.
+    struct TempRepo {
+        dir: tempfile::TempDir,
+        repo: PathBuf,
+    }
+
+    impl TempRepo {
+        /// The repository's primary checkout.
+        fn path(&self) -> &Path {
+            &self.repo
+        }
+
+        /// The bare repository `origin` names.
+        fn origin(&self) -> PathBuf {
+            self.dir.path().join("origin.git")
+        }
+
+        /// The temporary directory holding both, outside either of them.
+        fn root(&self) -> &Path {
+            self.dir.path()
+        }
+    }
+
+    /// Helper: create a temporary git repository with a bare `origin`.
+    fn create_temp_git_repo() -> TempRepo {
         let dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let repo = dir.path();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create the repository directory");
+        let path = repo.to_str().unwrap();
 
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(repo)
-            .output()
-            .expect("git init failed");
-
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(repo)
-            .output()
-            .expect("git config email failed");
-
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(repo)
-            .output()
-            .expect("git config name failed");
-
-        // Create an initial commit so HEAD exists
+        run_git(path, &["init", "-q", "-b", "main"]);
+        run_git(path, &["config", "user.email", "test@test.com"]);
+        run_git(path, &["config", "user.name", "Test"]);
         std::fs::write(repo.join("README.md"), "# test").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(repo)
-            .output()
-            .expect("git add failed");
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(repo)
-            .output()
-            .expect("git commit failed");
+        run_git(path, &["add", "."]);
+        run_git(path, &["commit", "-q", "-m", "initial"]);
 
-        // Ensure we are on a branch called "main"
-        std::process::Command::new("git")
-            .args(["branch", "-M", "main"])
-            .current_dir(repo)
-            .output()
-            .expect("git branch -M main failed");
+        let origin = dir.path().join("origin.git");
+        run_git(path, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+        run_git(path, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        run_git(path, &["push", "-q", "origin", "main"]);
+        run_git(path, &["remote", "set-head", "origin", "main"]);
 
-        dir
+        TempRepo { dir, repo }
     }
 
     #[tokio::test]
@@ -2196,20 +1844,7 @@ branch refs/heads/some-other-branch
             let tmp = create_temp_git_repo();
             let repo_path = tmp.path().to_str().unwrap();
 
-            // `Managed` is a placement users actually select, not a harness
-            // fiction, and it forces the git backend even where `wt` is
-            // installed. `wt_available` is therefore set to the value that
-            // would otherwise delegate, which makes the assertion below a
-            // real statement about the gate rather than about the host: this
-            // test exercises `remove_with_git` on every machine, and says so.
-            let mut mgr = test_manager();
-            mgr.wt_available = true;
-            mgr.placement = WorktreePlacement::Managed;
-            assert!(
-                !mgr.delegates_to_wt(),
-                "[{}] this test must exercise the git backend whatever is installed on the host",
-                case.class
-            );
+            let mgr = test_manager();
 
             let info = mgr
                 .create(repo_path, "task-dirty")
@@ -2331,15 +1966,7 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
 
-        // `Managed` forces the git backend even on a machine with `wt`
-        // installed, so this test is about `remove_with_git` everywhere.
-        let mut mgr = test_manager();
-        mgr.wt_available = true;
-        mgr.placement = WorktreePlacement::Managed;
-        assert!(
-            !mgr.delegates_to_wt(),
-            "this test must exercise the git backend whatever is installed on the host"
-        );
+        let mgr = test_manager();
 
         let info = mgr
             .create(repo_path, "task-no-force")
@@ -2519,104 +2146,6 @@ branch refs/heads/some-other-branch
         );
     }
 
-    /// Cleanup under worktrunk must not delete the task branch.
-    ///
-    /// `wt remove` deletes the branch by design whenever it decides that
-    /// merging it would add nothing. The first and cheapest of its five
-    /// checks is "branch HEAD equals the default branch", which is the state
-    /// of every task whose agent committed nothing and of every task whose
-    /// work has already landed. Measured against worktrunk (v0.29.0
-    /// originally, and confirmed again on v0.68.0): without
-    /// `--no-delete-branch` it prints "Removing <branch> worktree & branch
-    /// [in background] (same commit as main)" and the branch is gone
-    /// afterwards; with `--no-delete-branch` it prints "Branch integrated
-    /// (same commit as main); retained with --no-delete-branch" and the
-    /// branch survives.
-    ///
-    /// `remove_with_wt` therefore passes `--no-delete-branch`, and this test
-    /// is what holds that flag in place. Without it the two backends disagree
-    /// about the one thing `remove`'s contract is entirely about:
-    /// `remove_with_git` stopped running `git branch -D` precisely because a
-    /// task branch is routinely the only ref naming the commits a task
-    /// produced, while the backend that is default on any machine with `wt`
-    /// installed would still delete it. `branch_name` is what `create_pr`
-    /// pushes and what `reattach` re-checks-out, so both break.
-    ///
-    /// Ignored by default, like every other real-`wt` test in this file, for
-    /// needing the `wt` binary on PATH -- following the PTY tests that are
-    /// ignored for needing to spawn real processes. Run it with
-    /// `cargo test -- --ignored`.
-    ///
-    /// The checkout is made with plain `git worktree add` rather than through
-    /// `mgr.create`, deliberately. `wt switch` is the only worktrunk
-    /// subcommand that consults the `worktree-path` template, and
-    /// `remove_with_wt` passes no `--config`, so creating through the
-    /// delegating backend would drop a worktree into whichever global root
-    /// the developer running the test has configured -- for a real user, a
-    /// directory full of their own work. `wt remove` acts on the checkout it
-    /// is invoked in, so driving it against a checkout git made under a temp
-    /// dir exercises exactly the code under test and can write nowhere else.
-    #[tokio::test]
-    #[ignore] // Ignore by default as it requires the `wt` binary on PATH
-    async fn integration_worktrunk_cleanup_keeps_the_task_branch() {
-        let tmp = create_temp_git_repo();
-        let repo_path = tmp.path().to_str().unwrap().to_string();
-        let checkout_root = tempfile::TempDir::new().expect("tempdir");
-        let checkout = checkout_root
-            .path()
-            .join("task-checkout")
-            .to_string_lossy()
-            .to_string();
-
-        run_git(
-            &repo_path,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "task-worktrunk",
-                checkout.as_str(),
-                "main",
-            ],
-        );
-        assert_eq!(
-            run_git(&repo_path, &["rev-parse", "refs/heads/task-worktrunk"]),
-            run_git(&repo_path, &["rev-parse", "refs/heads/main"]),
-            "precondition: the branch must sit on main's commit, which is the state wt reads as \
-             safe to delete and the state a task that committed nothing is in"
-        );
-
-        let mgr = WorktreeManager {
-            wt_available: true,
-            paths: test_paths(),
-            placement: WorktreePlacement::Auto,
-        };
-        assert!(
-            mgr.delegates_to_wt(),
-            "this test must exercise the wt backend"
-        );
-
-        let result = mgr.remove(&checkout, &repo_path).await;
-
-        // `--no-delete-branch` alone left `wt remove`'s own removal running in
-        // a detached background job that could still be mid-flight -- deleting
-        // the branch as its tail step -- the instant this call returned, which
-        // is why this test used to poll for the job to settle before judging
-        // the branch. `remove_with_wt` also passes `--foreground` now, which
-        // blocks until that removal, branch decision included, has actually
-        // finished; `result` is therefore already the final outcome.
-        assert!(result.is_ok(), "remove_with_wt must converge on this checkout: {result:?}");
-        assert!(!Path::new(&checkout).exists(), "the checkout must actually be gone");
-        assert!(
-            branch_exists(&repo_path, "task-worktrunk"),
-            "wt cleanup deleted the task branch, which is what create_pr pushes and what \
-             reattach checks out again; remove_with_wt must keep passing --no-delete-branch. \
-             remove returned {result:?}"
-        );
-    }
-
-    /// What a run of the fake agent leaves behind, so a test can recognise
-    /// its own work rather than trust that something was written.
     const WORK: &str = "work produced in the worktree\n";
 
     /// Write [`WORK`] into `worktree_path` and commit it, returning the sha.
@@ -2857,61 +2386,6 @@ branch refs/heads/some-other-branch
     }
 
     #[tokio::test]
-    async fn integration_create_stacked_branch_falls_back_to_git_when_placement_is_managed() {
-        let tmp = create_temp_git_repo();
-        let repo_path = tmp.path().to_str().unwrap();
-
-        // `wt_available` is forced true without an actual `wt` binary on
-        // PATH: under `Managed` placement this must never be consulted, so
-        // if the fix regresses to checking `wt_available` directly, this
-        // test fails by trying (and failing) to run a nonexistent `wt`.
-        let mgr = WorktreeManager {
-            wt_available: true,
-            paths: test_paths(),
-            placement: WorktreePlacement::Managed,
-        };
-
-        let info = mgr
-            .create_stacked_branch(repo_path, "stacked-branch", "main")
-            .await
-            .expect("create_stacked_branch should fall back to git, not delegate to wt").info;
-        assert!(Path::new(&info.path).exists(), "worktree dir should exist");
-        assert_eq!(info.branch, "stacked-branch");
-    }
-
-    #[tokio::test]
-    async fn integration_remove_falls_back_to_git_when_placement_is_managed() {
-        let tmp = create_temp_git_repo();
-        let repo_path = tmp.path().to_str().unwrap();
-
-        // Mirrors `integration_create_stacked_branch_falls_back_to_git_when_placement_is_managed`:
-        // `wt_available` is forced true without an actual `wt` binary on
-        // PATH. `remove()` must gate on `delegates_to_wt()` (false here,
-        // since placement is `Managed`), not raw `wt_available`. If the gate
-        // regresses to checking `wt_available` directly, this test fails by
-        // trying (and failing) to run a nonexistent `wt remove`.
-        let mgr = WorktreeManager {
-            wt_available: true,
-            paths: test_paths(),
-            placement: WorktreePlacement::Managed,
-        };
-
-        let info = mgr
-            .create(repo_path, "managed-remove")
-            .await
-            .expect("create failed");
-        assert!(Path::new(&info.path).exists());
-
-        let result = mgr.remove(&info.path, repo_path).await;
-        assert!(
-            result.is_ok(),
-            "remove should use the git-managed path, not remove_with_wt: {:?}",
-            result.err()
-        );
-        assert!(!Path::new(&info.path).exists(), "worktree directory should be removed");
-    }
-
-    #[tokio::test]
     async fn integration_exists_nonexistent() {
         let mgr = test_manager();
         assert!(!mgr.exists("/tmp/slashit_does_not_exist_999"));
@@ -3126,46 +2600,6 @@ branch refs/heads/some-other-branch
         );
     }
 
-    /// The branch-preservation and synchronicity contract `remove_with_wt`
-    /// depends on, proven against the exact argument list it spawns rather
-    /// than against real `wt` output -- so it runs on every machine, with or
-    /// without the `wt` binary on `PATH`, and needs no process at all.
-    ///
-    /// `remove_with_wt_preserves_and_restores_the_registration_when_its_own_removal_cannot_finish`
-    /// is the real-`wt` counterpart that exercises what these flags actually
-    /// do; this test is what keeps that contract from silently regressing on
-    /// every other run, since that one is `#[ignore]`d.
-    #[test]
-    fn wt_remove_args_run_in_the_foreground_and_keep_the_branch() {
-        let args = WorktreeManager::WT_REMOVE_ARGS;
-        assert!(
-            args.contains(&"--foreground"),
-            "without this, `wt remove` returns before the removal it started has finished, and \
-             the caller has nothing to evaluate `proven_absent` against yet: {args:?}"
-        );
-        assert!(
-            args.contains(&"--no-delete-branch"),
-            "without this, Worktrunk decides for itself whether the task's branch survives \
-             removal -- SlashIt must be the one requiring that it does: {args:?}"
-        );
-    }
-
-    /// The exact parent-blocked scenario the `exists()`-gated success check
-    /// this module used to have could misclassify as removed: both `git
-    /// worktree remove` and the caller's own filesystem check answer "not
-    /// there" for a directory the caller was simply never allowed to look
-    /// at.
-    ///
-    /// `git worktree remove` itself exits `0` here without touching the
-    /// directory at all -- it cannot even stat the path through a
-    /// closed-off parent, and answers that the same way it would answer a
-    /// worktree that is genuinely gone. That is `?`-mapped to a spawn/exit
-    /// failure in the tests above, where the obstacle is inside the
-    /// worktree rather than in its parent; here it is git's own exit status
-    /// that is misleading, which is exactly why the success gate this test
-    /// is about does not trust it either. The gate itself is proven
-    /// directly against `proven_absent` in the unit test above; this is the
-    /// same scenario at the level `remove()` callers observe.
     #[cfg(unix)]
     #[tokio::test]
     async fn remove_reports_err_rather_than_false_success_when_the_worktree_cannot_be_looked_at() {
@@ -3425,92 +2859,13 @@ branch refs/heads/some-other-branch
         );
     }
 
-    /// The same parent-blocked scenario, reached through `remove_with_wt`'s
-    /// delegation rather than by calling the git backend directly.
-    ///
-    /// `remove_with_wt`'s own entry guard treats a worktree it cannot see as
-    /// one to hand to `remove_with_git` -- that guard is `!self.exists(...)`,
-    /// which is `true` for a blocked parent exactly as it is for a genuinely
-    /// missing directory, so this case reaches the same repository-side
-    /// preservation mechanism proven directly above rather than a separate,
-    /// unprotected path. Needs no `wt` binary: the delegation happens before
-    /// anything is spawned.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn remove_with_wt_delegation_reaches_the_same_registration_preservation() {
-        use std::os::unix::fs::PermissionsExt;
-
-        if crate::ipc::server::current_uid() == 0 {
-            return; // root ignores the permission bits this test relies on
-        }
-
-        let tmp = create_temp_git_repo();
-        let repo_path = tmp.path().to_str().unwrap();
-
-        let mut mgr = test_manager();
-        mgr.placement = WorktreePlacement::Managed;
-        let info = mgr
-            .create(repo_path, "task-wt-registration-blocked")
-            .await
-            .expect("create failed");
-
-        let parent = Path::new(&info.path)
-            .parent()
-            .expect("a worktree path has a parent")
-            .to_path_buf();
-        let restore_mode = std::fs::metadata(&parent)
-            .expect("read the parent's mode")
-            .permissions()
-            .mode();
-
-        mgr.wt_available = true;
-        mgr.placement = WorktreePlacement::Auto;
-        assert!(mgr.delegates_to_wt(), "this test must exercise the wt backend's delegation");
-
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
-            .expect("close off the parent");
-        let blocked = mgr.remove(&info.path, repo_path).await;
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(restore_mode))
-            .expect("reopen the parent");
-
-        assert!(
-            blocked.is_err(),
-            "delegation must not turn a blocked-parent removal into a false success: {blocked:?}"
-        );
-        let registered_after =
-            WorktreeManager::worktree_list_porcelain(repo_path).expect("git listing");
-        assert!(
-            registered_after.contains(&info.path),
-            "the registration must survive delegation through remove_with_wt exactly as it does \
-             for the git backend called directly"
-        );
-
-        // The retry converging is already proven, in full, against the git
-        // backend directly above. Routing it back through real `wt` here
-        // would test worktrunk's own ability to act on a worktree it never
-        // created (this one came from `mgr.create`, not `wt switch`), which
-        // is a different, unrelated concern -- so the retry is pointed at
-        // the git backend, the same one that actually did the preserving.
-        mgr.placement = WorktreePlacement::Managed;
-        mgr.remove(&info.path, repo_path)
-            .await
-            .expect("the retry once access is restored has to converge");
-        assert!(!Path::new(&info.path).exists(), "the retry has to actually remove the worktree");
-    }
-
-    /// The shared decision point both backends funnel through
+    /// The decision point every removal funnels through
     /// (`WorktreeManager::finish_removal`), exercised directly against the
-    /// exact post-state a removal tool that could not finish leaves: the
-    /// checkout is still there, but the registration it pointed at is
-    /// already gone.
+    /// exact post-state a removal that could not finish leaves: the checkout
+    /// is still there, but the registration it pointed at is already gone.
     ///
-    /// This is the deterministic seam for a scenario `remove_with_wt`'s real
-    /// invocation cannot be driven through without either a timing race or
-    /// the real `wt` binary. `remove_with_wt_preserves_and_restores_the_registration_when_its_own_removal_cannot_finish`
-    /// below proves the identical scenario against real `wt`, gated behind
-    /// `#[ignore]` for the same reason every other real-`wt` test in this
-    /// file is; this test proves the recovery logic itself, unconditionally,
-    /// on every run.
+    /// This is the deterministic seam for a scenario a real removal cannot
+    /// be driven into without a timing race.
     #[tokio::test]
     async fn finish_removal_restores_a_registration_the_removal_tool_pruned() {
         let tmp = create_temp_git_repo();
@@ -3575,147 +2930,6 @@ branch refs/heads/some-other-branch
             saved_records(repo_path).is_empty(),
             "no saved-record debris should remain once the worktree has actually converged"
         );
-    }
-
-    /// The real-`wt` counterpart to
-    /// `finish_removal_restores_a_registration_the_removal_tool_pruned`
-    /// above: the same scenario, but driven through `remove_with_wt`'s
-    /// actual invocation of the installed `wt` binary rather than
-    /// fabricated by hand.
-    ///
-    /// The obstacle is the worktree's *parent* directory losing write
-    /// permission (not read or execute, which stay intact) before `remove`
-    /// is called -- a static precondition set once, not a race.
-    /// `Path::exists` only needs execute permission on the parent to
-    /// succeed, so the entry guard above still sees the worktree as present
-    /// and lets `wt remove` actually run; `wt`'s own internal rename then
-    /// needs *write* permission on that same parent and cannot get it,
-    /// deleting the worktree's `.git` pointer and pruning git's
-    /// registration before failing on the directory itself. Confirmed by
-    /// hand against a real, installed `wt` before writing this test, and
-    /// stable immediately after the `--foreground` call returns -- checked
-    /// with no sleep, and again a second later, with the same result both
-    /// times.
-    ///
-    /// The retry is not asserted to fully remove the checkout, and that is
-    /// deliberate, not a weaker test. `wt`'s own partial-removal attempt here
-    /// deletes tracked file content on its way to failing (confirmed by
-    /// hand: the checkout comes back from this obstacle missing files
-    /// `git worktree add` had put there, not merely missing its `.git`
-    /// pointer), and [`WorktreeRecord`] was never meant to cover that -- its
-    /// own doc comment scopes it to git's bookkeeping, not user content. A
-    /// forceless retry against a checkout git now considers dirty correctly
-    /// keeps refusing, exactly as `remove_with_git` does for real
-    /// uncommitted changes and exactly as this project's own removal of a
-    /// destructive `--force` fallback intends: this pass does not add one to
-    /// the `wt` backend either. So the only thing asserted about the retry
-    /// is the same invariant proven above -- it is never a silent `Ok(())`
-    /// while the checkout is still there.
-    ///
-    /// The checkout is made with plain `git worktree add` rather than
-    /// through `mgr.create` or `wt switch`: `wt switch` is the only
-    /// worktrunk subcommand that consults the `worktree-path` template, and
-    /// creating through it would drop a worktree into whichever global root
-    /// the developer running this test has configured -- for a real user, a
-    /// directory full of their own work. The branch is created at the same
-    /// commit as `main` (no commits follow `git worktree add`), which is
-    /// exactly the case Worktrunk's own merge-detection considers safe to
-    /// delete on an ordinary `wt remove` -- so the branch surviving below is
-    /// proof of `--no-delete-branch` overriding that heuristic, not an
-    /// accident of the branch already being unmerged.
-    ///
-    /// Ignored by default because it is the only other test in this file
-    /// that needs the `wt` binary on `PATH`. Run it with
-    /// `cargo test -- --ignored`.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[ignore] // Ignore by default as it requires the `wt` binary on PATH
-    async fn remove_with_wt_preserves_and_restores_the_registration_when_its_own_removal_cannot_finish()
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        if crate::ipc::server::current_uid() == 0 {
-            return; // root ignores the permission bits this test relies on
-        }
-
-        let tmp = create_temp_git_repo();
-        let repo_path = tmp.path().to_str().unwrap().to_string();
-        let checkout_root = tempfile::TempDir::new().expect("tempdir");
-        let checkout = checkout_root
-            .path()
-            .join("task-checkout")
-            .to_string_lossy()
-            .to_string();
-
-        run_git(
-            &repo_path,
-            &["worktree", "add", "-b", "task-wt-parent-blocked", checkout.as_str(), "main"],
-        );
-
-        let mut mgr = test_manager();
-        mgr.wt_available = true;
-        mgr.placement = WorktreePlacement::Auto;
-        assert!(mgr.delegates_to_wt(), "this test must exercise the wt backend");
-
-        let parent = checkout_root.path().to_path_buf();
-        let restore_mode = std::fs::metadata(&parent)
-            .expect("read the parent's mode")
-            .permissions()
-            .mode();
-
-        // Read and traverse survive; write does not -- `Path::exists` needs
-        // only the former, so the entry guard still lets `wt remove` run.
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500))
-            .expect("close write access to the parent");
-        let blocked = mgr.remove(&checkout, &repo_path).await;
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(restore_mode))
-            .expect("reopen the parent");
-
-        assert!(
-            blocked.is_err(),
-            "a removal wt could not finish must report Err, not silently Ok(()): {blocked:?}"
-        );
-        assert!(Path::new(&checkout).exists(), "the checkout was never actually removed");
-        let registered_after =
-            WorktreeManager::worktree_list_porcelain(&repo_path).expect("git listing");
-        assert!(
-            registered_after.contains(&checkout),
-            "git's own registration must survive or be restored, not be discarded alongside \
-             wt's own partial removal"
-        );
-
-        // `--foreground` makes this deterministic rather than a race to
-        // catch a background job before it lands, so a single retry, not
-        // several spaced by sleeps, is enough to observe the stable outcome.
-        // It is not asserted to converge: `wt`'s own partial-removal attempt
-        // above deletes tracked file content on its way to failing (see the
-        // doc comment above), leaving the checkout dirty, and a forceless
-        // retry against a dirty checkout correctly keeps refusing.
-        let retried = mgr.remove(&checkout, &repo_path).await;
-        let converged = !Path::new(&checkout).exists();
-        assert!(
-            retried.is_ok() == converged,
-            "remove() must never report Ok(()) while the checkout is still present, nor Err \
-             once it is actually gone: {retried:?}, converged={converged}"
-        );
-
-        // Branch preservation is unconditional here, unlike the checkout
-        // itself: `--no-delete-branch` is on every `wt remove` call this
-        // backend makes, including the blocked one above, so Worktrunk never
-        // reaches its own merge-detection for this branch regardless of
-        // whether the retry actually converged.
-        assert!(
-            branch_exists(&repo_path, "task-wt-parent-blocked"),
-            "SlashIt requires --no-delete-branch on every wt remove call, so the branch must \
-             survive whether or not the checkout itself converged"
-        );
-
-        if converged {
-            assert!(
-                saved_records(&repo_path).is_empty(),
-                "no saved-record debris should remain once the worktree has actually converged"
-            );
-        }
     }
 
     /// The retry contract, at the layer that has to honour it: a removal that
@@ -4207,9 +3421,8 @@ branch refs/heads/some-other-branch
             .expect("git branch failed");
 
         // Create a stacked branch on top of the base. The git path creates
-        // `stacked-branch` at `base-branch`'s tip, then attaches a worktree to the already-created branch without
-        // `-b` (`git_worktree_add(..., create_branch: false)`), so it must
-        // succeed.
+        // `stacked-branch` at `base-branch`'s tip, then attaches a worktree
+        // to the already-created branch, so it must succeed.
         let stacked = mgr
             .create_stacked_branch(repo_path, "stacked-branch", "base-branch")
             .await
@@ -4281,7 +3494,7 @@ branch refs/heads/some-other-branch
 
     /// A repository whose `main` has moved one commit past an unrelated
     /// branch `victim`, so resetting `victim` to `HEAD` is observable.
-    fn repo_with_victim_branch() -> tempfile::TempDir {
+    fn repo_with_victim_branch() -> TempRepo {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         run_git(repo_path, &["branch", "victim"]);
@@ -4401,11 +3614,7 @@ branch refs/heads/some-other-branch
     #[test]
     fn git_worktree_add_args_put_every_positional_after_the_terminator() {
         assert_eq!(
-            WorktreeManager::git_worktree_add_args("/wt/dest", "task-1234abcd", true),
-            ["worktree", "add", "-b", "task-1234abcd", "--", "/wt/dest"]
-        );
-        assert_eq!(
-            WorktreeManager::git_worktree_add_args("/wt/dest", "task-1234abcd", false),
+            WorktreeManager::git_worktree_add_args("/wt/dest", "task-1234abcd"),
             ["worktree", "add", "--", "/wt/dest", "task-1234abcd"]
         );
     }
@@ -4421,7 +3630,7 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
         let dest = mgr.managed_path(repo_path, "unchecked");
-        let result = mgr.git_worktree_add(repo_path, &dest, "-Bvictim", false).await;
+        let result = mgr.git_worktree_add(repo_path, &dest, "-Bvictim").await;
 
         assert_eq!(all_refs(repo_path), refs_before, "`victim` must not be reset");
         assert!(result.is_err());
@@ -4455,7 +3664,7 @@ branch refs/heads/some-other-branch
     /// things that are not local branches but have a branch name's shape:
     /// its full object ID, and `FETCH_HEAD` and `ORIG_HEAD` as a fetch or a
     /// reset leaves them. Returns the repository and that commit.
-    fn repo_with_branch_shaped_revisions() -> (tempfile::TempDir, String) {
+    fn repo_with_branch_shaped_revisions() -> (TempRepo, String) {
         let tmp = repo_with_victim_branch();
         let repo_path = tmp.path().to_str().unwrap();
         let commit = run_git(repo_path, &["rev-parse", "HEAD~1"]);
@@ -4724,76 +3933,13 @@ branch refs/heads/some-other-branch
         assert_eq!(run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]), "main");
     }
 
-    /// A `git-spice` executable installed at the front of `PATH` for as long
-    /// as this value lives, recording every invocation in `log`.
-    ///
-    /// Holds [`crate::test_helpers::PATH_LOCK`] itself, so `PATH` is restored
-    /// before the lock is released no matter how the test ends.
-    #[cfg(unix)]
-    struct FakeGitSpice {
-        _lock: tokio::sync::MutexGuard<'static, ()>,
-        _dir: tempfile::TempDir,
-        log: PathBuf,
-        saved_path: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(unix)]
-    impl FakeGitSpice {
-        /// `body` runs after the invocation has been logged, in whatever
-        /// directory the caller spawned it from.
-        async fn install(body: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
-            let lock = crate::test_helpers::PATH_LOCK.lock().await;
-            let dir = tempfile::tempdir().expect("tempdir");
-            let log = dir.path().join("git-spice.log");
-            let program = dir.path().join("git-spice");
-            std::fs::write(
-                &program,
-                format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\n{body}\n"),
-            )
-            .expect("write fake git-spice");
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fake git-spice");
-
-            let saved_path = std::env::var_os("PATH");
-            let mut entries = vec![dir.path().to_path_buf()];
-            if let Some(path) = &saved_path {
-                entries.extend(std::env::split_paths(path));
-            }
-            let new_path = std::env::join_paths(entries).expect("join PATH");
-            // Safety: serialized via PATH_LOCK, held by this value and
-            // released only after `Drop` has restored PATH.
-            unsafe {
-                std::env::set_var("PATH", new_path);
-            }
-            FakeGitSpice { _lock: lock, _dir: dir, log, saved_path }
-        }
-
-        fn invocations(&self) -> String {
-            std::fs::read_to_string(&self.log).unwrap_or_default()
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for FakeGitSpice {
-        fn drop(&mut self) {
-            // Safety: PATH_LOCK is still held; `_lock` drops after this.
-            unsafe {
-                match &self.saved_path {
-                    Some(path) => std::env::set_var("PATH", path),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
-        }
-    }
-
     /// Stack `stacked` on a `dependency` branch one commit ahead of `main`,
     /// with a manager constructed while `fake` is on `PATH`, and check the
     /// result is exactly what the git-only path produces: the new branch at
     /// the dependency's tip, a worktree attached to it, and the primary
     /// checkout untouched.
     #[cfg(unix)]
-    async fn assert_stacks_on_the_dependency_tip_with(fake: &FakeGitSpice) {
+    async fn assert_stacks_on_the_dependency_tip_with(fake: &crate::test_helpers::FakeProgram) {
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         run_git(repo_path, &["branch", "dependency"]);
@@ -4803,7 +3949,7 @@ branch refs/heads/some-other-branch
         let main_tip = run_git(repo_path, &["rev-parse", "main"]);
         assert_ne!(dependency_tip, main_tip, "the fixture must tell the two bases apart");
 
-        let mgr = WorktreeManager::new(test_paths(), WorktreePlacement::Managed);
+        let mgr = WorktreeManager::new(test_paths());
         let stacked = mgr
             .create_stacked_branch(repo_path, "stacked", "dependency")
             .await
@@ -4840,7 +3986,7 @@ branch refs/heads/some-other-branch
     #[cfg(unix)]
     #[tokio::test]
     async fn a_git_spice_that_succeeds_does_not_change_the_stacked_branch() {
-        let fake = FakeGitSpice::install("exec git checkout -q -b \"$3\"").await;
+        let fake = crate::test_helpers::FakeProgram::install("git-spice", "exec git checkout -q -b \"$3\"").await;
         assert_stacks_on_the_dependency_tip_with(&fake).await;
     }
 
@@ -4850,7 +3996,8 @@ branch refs/heads/some-other-branch
     #[cfg(unix)]
     #[tokio::test]
     async fn a_git_spice_that_refuses_does_not_change_the_stacked_branch() {
-        let fake = FakeGitSpice::install(
+        let fake = crate::test_helpers::FakeProgram::install(
+            "git-spice",
             "echo 'FTL git-spice: unknown flag --insert-after' >&2\nexit 1",
         )
         .await;
@@ -4894,28 +4041,6 @@ branch refs/heads/some-other-branch
         );
     }
 
-    /// A repository whose `main` is pushed to a bare `origin` next to it,
-    /// with `refs/remotes/origin/HEAD` pointing at `origin/main` the way
-    /// `git clone` leaves it.
-    fn repo_with_default_base() -> tempfile::TempDir {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let repo = temp.path().join("repository");
-        let remote = temp.path().join("origin.git");
-        std::fs::create_dir_all(&repo).unwrap();
-        let repo = repo.to_str().unwrap();
-        run_git(repo, &["init", "-q", "-b", "main"]);
-        run_git(
-            repo,
-            &["-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-q",
-              "--allow-empty", "-m", "first"],
-        );
-        run_git(repo, &["init", "-q", "--bare", remote.to_str().unwrap()]);
-        run_git(repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
-        run_git(repo, &["push", "-q", "origin", "main"]);
-        run_git(repo, &["remote", "set-head", "origin", "main"]);
-        temp
-    }
-
     fn commit_in(repo: &str, message: &str) -> String {
         run_git(
             repo,
@@ -4925,159 +4050,347 @@ branch refs/heads/some-other-branch
         run_git(repo, &["rev-parse", "HEAD"])
     }
 
-    #[tokio::test]
-    async fn a_commit_origin_head_contains_is_on_the_default_base() {
-        let temp = repo_with_default_base();
-        let repo = temp.path().join("repository");
-        let repo = repo.to_str().unwrap();
-        let tip = run_git(repo, &["rev-parse", "main"]);
+    // -------------------------------------------------------
+    // Native Task Checkouts, started from the resolved default base
+    // -------------------------------------------------------
 
-        assert_eq!(
-            WorktreeManager::default_base_origin(repo, Some(&tip)).await,
-            Some(BranchOrigin::DefaultBase)
-        );
-        // An ancestor of what `origin/HEAD` names is contained too.
-        run_git(repo, &["checkout", "-q", "--detach"]);
-        let pushed = commit_in(repo, "second");
-        run_git(repo, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
-        run_git(repo, &["fetch", "-q", "origin"]);
-        assert_eq!(
-            WorktreeManager::default_base_origin(repo, Some(&tip)).await,
-            Some(BranchOrigin::DefaultBase)
-        );
-        assert_eq!(
-            WorktreeManager::default_base_origin(repo, Some(&pushed)).await,
-            Some(BranchOrigin::DefaultBase)
-        );
+    /// The commit `refs/remotes/origin/main` names in `repo_path`.
+    fn origin_main(repo_path: &str) -> String {
+        run_git(repo_path, &["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"])
     }
 
-    /// What `wt switch -c <branch>` does without `--base`: the new branch
-    /// starts at the local default branch. When that is what `origin/HEAD`
-    /// already holds, the proof holds for a Worktrunk-created branch exactly
-    /// as it does for one `git worktree add` created. Modeled with `git
-    /// branch` rather than a real `wt`, whose placement follows the user's
-    /// own configuration and would put the worktree outside the test's
-    /// temporary directory.
-    #[tokio::test]
-    async fn a_branch_started_from_the_local_default_branch_is_on_the_default_base() {
-        let temp = repo_with_default_base();
-        let repo = temp.path().join("repository");
-        let repo = repo.to_str().unwrap();
-        run_git(repo, &["checkout", "-q", "-b", "feature-f"]);
-        commit_in(repo, "feature work");
-        run_git(repo, &["branch", "task-1234abcd", "main"]);
-        let start = run_git(repo, &["rev-parse", "task-1234abcd"]);
+    /// Every `branch.<branch>.*` setting, one per line, or the empty string.
+    /// `git config --get-regexp` exits 1 when nothing matches, which is the
+    /// answer this is after, so its status is not asserted.
+    fn branch_config(repo_path: &str, branch: &str) -> String {
+        let output = std::process::Command::new("git")
+            .args(["config", "--get-regexp", &format!("^branch\\.{}\\.", branch.replace('.', "\\."))])
+            .current_dir(repo_path)
+            .output()
+            .expect("spawn git config");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
 
+    /// An ordinary task branch starts at the commit `origin/HEAD` names, not
+    /// at whatever the primary checkout has checked out. It used to start at
+    /// the primary checkout's `HEAD`, so a task started while the user was
+    /// on a feature branch carried that branch's commits into its pull
+    /// request.
+    #[tokio::test]
+    async fn a_task_branch_starts_at_the_default_base_not_at_the_primary_checkout() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let base = origin_main(repo_path);
+        run_git(repo_path, &["checkout", "-q", "-b", "feature-f"]);
+        let feature = commit_in(repo_path, "feature work");
+        assert_ne!(feature, base, "the fixture must tell the two starts apart");
+
+        let info = test_manager().create(repo_path, "task-0a1b2c3d").await.expect("create");
+
+        assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), base);
+        assert_eq!(run_git(&info.path, &["symbolic-ref", "HEAD"]), "refs/heads/task-0a1b2c3d");
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), base);
         assert_eq!(
-            WorktreeManager::default_base_origin(repo, Some(&start)).await,
-            Some(BranchOrigin::DefaultBase)
+            run_git(repo_path, &["symbolic-ref", "--short", "HEAD"]),
+            "feature-f",
+            "the primary checkout is left where the user put it"
         );
+        assert_eq!(run_git(repo_path, &["rev-parse", "HEAD"]), feature);
     }
 
+    /// What a JJ-colocated repository looks like to git: `HEAD` detached at
+    /// the working copy's parent, with local work nobody pushed. The task
+    /// starts at the remote default base and carries none of it.
     #[tokio::test]
-    async fn a_commit_origin_head_does_not_contain_has_no_known_origin() {
-        let temp = repo_with_default_base();
-        let repo = temp.path().join("repository");
-        let repo = repo.to_str().unwrap();
-        let unpushed = commit_in(repo, "not pushed");
+    async fn a_detached_primary_with_unpushed_work_does_not_leak_into_the_task() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let base = origin_main(repo_path);
+        std::fs::create_dir_all(tmp.path().join(".jj")).unwrap();
+        run_git(repo_path, &["checkout", "-q", "--detach"]);
+        let local = commit_in(repo_path, "local work ahead of origin");
 
-        assert_eq!(WorktreeManager::default_base_origin(repo, Some(&unpushed)).await, None);
+        let info = test_manager().create(repo_path, "task-0a1b2c3d").await.expect("create");
+
+        assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), base);
+        assert_eq!(run_git(repo_path, &["rev-parse", "HEAD"]), local, "the primary is untouched");
     }
 
+    /// A new task branch tracks nothing, whatever `branch.autoSetupMerge`
+    /// says. `always` would have it track the branch it was started from and
+    /// `inherit` would copy that branch's upstream, `origin/main`, onto it;
+    /// either one hands a bare `git push` or `git pull` in the task's
+    /// checkout a default the task never asked for.
     #[tokio::test]
-    async fn without_a_usable_origin_head_nothing_is_on_the_default_base() {
-        let temp = repo_with_default_base();
-        let repo = temp.path().join("repository");
-        let repo = repo.to_str().unwrap();
-        let tip = run_git(repo, &["rev-parse", "main"]);
+    async fn a_task_branch_has_no_upstream_under_any_auto_setup_merge() {
+        for setting in ["always", "inherit", "true", "simple"] {
+            let tmp = create_temp_git_repo();
+            let repo_path = tmp.path().to_str().unwrap();
+            run_git(repo_path, &["branch", "--set-upstream-to=origin/main", "main"]);
+            run_git(repo_path, &["config", "branch.autoSetupMerge", setting]);
 
-        // Dangling: `origin/HEAD` names a remote branch that is not there.
-        run_git(repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone"]);
-        assert_eq!(WorktreeManager::default_base_origin(repo, Some(&tip)).await, None);
+            let info = test_manager()
+                .create(repo_path, "task-0a1b2c3d")
+                .await
+                .unwrap_or_else(|e| panic!("{setting}: {e}"));
 
-        // Absent: the remote exists, but nothing says which branch is its
-        // default, which is what a `git remote add` + `git fetch` leaves.
-        run_git(repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
-        assert_eq!(WorktreeManager::default_base_origin(repo, Some(&tip)).await, None);
-
-        // No base commit recorded at all.
-        run_git(repo, &["remote", "set-head", "origin", "main"]);
-        assert_eq!(WorktreeManager::default_base_origin(repo, None).await, None);
-
-        // A well-formed object ID of no object in the repository.
-        let absent = "0123456789abcdef0123456789abcdef01234567";
-        assert_eq!(WorktreeManager::default_base_origin(repo, Some(absent)).await, None);
-
-        // Not a repository at all.
-        let elsewhere = tempfile::TempDir::new().unwrap();
-        assert_eq!(
-            WorktreeManager::default_base_origin(elsewhere.path().to_str().unwrap(), Some(&tip)).await,
-            None
-        );
-    }
-
-    /// Only the ref `refs/remotes/origin/HEAD` itself is the proof. Passed
-    /// to git as a revision, that name is looked up the way any revision is,
-    /// and with the real ref gone a local branch or a tag that happens to be
-    /// called `refs/remotes/origin/HEAD` would answer for it.
-    #[tokio::test]
-    async fn a_branch_or_tag_named_like_origin_head_is_not_the_default_base() {
-        for namespace in ["refs/heads", "refs/tags"] {
-            let temp = repo_with_default_base();
-            let repo = temp.path().join("repository");
-            let repo = repo.to_str().unwrap();
-            let tip = run_git(repo, &["rev-parse", "main"]);
-            run_git(repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
-            run_git(repo, &["update-ref", &format!("{namespace}/refs/remotes/origin/HEAD"), &tip]);
-
-            assert_eq!(
-                WorktreeManager::default_base_origin(repo, Some(&tip)).await,
-                None,
-                "{namespace}"
-            );
+            assert_eq!(branch_config(repo_path, "task-0a1b2c3d"), "", "{setting}");
+            assert_eq!(branch_config(&info.path, "task-0a1b2c3d"), "", "{setting}");
         }
     }
 
-    /// Anything but a full lowercase object ID is refused before git is
-    /// asked, even input git would happily resolve to a commit
-    /// `origin/HEAD` contains. `base_commit` is read back from a board file
-    /// that may say anything, and a revision or an option has no business
-    /// reaching `git merge-base`.
+    /// Nothing a bare `git push` in the task's checkout can do moves the
+    /// remote's default branch, even under `push.default=upstream` and an
+    /// `autoSetupMerge` that would otherwise have made `main` the task
+    /// branch's upstream.
     #[tokio::test]
-    async fn only_a_full_object_id_is_checked() {
-        let temp = repo_with_default_base();
-        let repo = temp.path().join("repository");
-        let repo = repo.to_str().unwrap();
-        let tip = run_git(repo, &["rev-parse", "main"]);
-        run_git(repo, &["tag", "v1"]);
+    async fn a_bare_push_from_the_task_checkout_cannot_move_the_remote_default_branch() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let base = origin_main(repo_path);
+        run_git(repo_path, &["branch", "--set-upstream-to=origin/main", "main"]);
+        run_git(repo_path, &["config", "branch.autoSetupMerge", "inherit"]);
+        let info = test_manager().create(repo_path, "task-0a1b2c3d").await.expect("create");
+        commit_work(&info.path, "agent-work.txt");
 
-        for input in [
-            "HEAD",
-            "main",
-            "v1",
-            "origin/HEAD",
-            "refs/remotes/origin/HEAD",
-            "--foo",
-            "-h",
-            "",
-            &tip[..12],
-            &tip.to_uppercase(),
-            &format!("{tip}^"),
-            &format!("{tip} "),
-            &format!("-{}", &tip[1..]),
-            &format!("{}g", &tip[..39]),
-            &format!("{tip}0"),
+        let _ = std::process::Command::new("git")
+            .args(["-c", "push.default=upstream", "push", "-q"])
+            .current_dir(&info.path)
+            .output()
+            .expect("spawn git push");
+
+        let origin = tmp.origin();
+        assert_eq!(run_git(origin.to_str().unwrap(), &["rev-parse", "refs/heads/main"]), base);
+    }
+
+    /// The start is the object ID of the exact ref, never a name git looks
+    /// up in several namespaces. A branch or tag named with the base's own
+    /// object ID, and a local branch or tag called `origin/main` or `main`,
+    /// all pointing somewhere else, change nothing -- nor does the primary
+    /// checkout sitting on that other commit.
+    #[tokio::test]
+    async fn refs_named_like_the_base_cannot_move_where_a_task_starts() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let base = origin_main(repo_path);
+        run_git(repo_path, &["checkout", "-q", "-b", "elsewhere"]);
+        let other = commit_in(repo_path, "somewhere else");
+        for hijack in [
+            format!("refs/heads/{base}"),
+            format!("refs/tags/{base}"),
+            "refs/heads/origin/main".to_string(),
+            "refs/tags/origin/main".to_string(),
+            "refs/tags/main".to_string(),
+            "refs/heads/refs/remotes/origin/main".to_string(),
         ] {
-            assert_eq!(
-                WorktreeManager::default_base_origin(repo, Some(input)).await,
-                None,
-                "{input:?}"
-            );
+            run_git(repo_path, &["update-ref", &hijack, &other]);
         }
-        assert!(WorktreeManager::is_full_object_id(&tip));
-        assert!(WorktreeManager::is_full_object_id(&"a".repeat(64)));
-        for input in ["HEAD", "--foo", "", &tip[..39], &"a".repeat(41), &"a".repeat(63), &"a".repeat(65)] {
-            assert!(!WorktreeManager::is_full_object_id(input), "{input:?}");
+
+        let info = test_manager().create(repo_path, "task-0a1b2c3d").await.expect("create");
+
+        assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), base);
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), base);
+    }
+
+    /// A worktree of the task's branch registered at a path of somebody
+    /// else's choosing, the way Worktrunk's `worktree-path` template placed
+    /// them, is reattached where it is. `git worktree add` at the managed
+    /// path refuses a branch that is already checked out elsewhere, so
+    /// trying to create one there failed the task.
+    #[tokio::test]
+    async fn reattach_adopts_a_worktree_registered_at_a_custom_path() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let custom = tmp.root().join("repo.worktrunk-template").join("task-c0ffee11");
+        run_git(repo_path, &["worktree", "add", "-q", "-b", "task-c0ffee11", "--", custom.to_str().unwrap()]);
+        let before = registered_worktrees(repo_path);
+
+        let info = test_manager()
+            .reattach(repo_path, "task-c0ffee11")
+            .await
+            .expect("the registered worktree is reattached");
+
+        assert_eq!(
+            std::fs::canonicalize(&info.path).unwrap(),
+            std::fs::canonicalize(&custom).unwrap()
+        );
+        assert_eq!(registered_worktrees(repo_path), before, "nothing new is created");
+    }
+
+    /// The same worktree is adopted when a task that never recorded its
+    /// branch acquires a checkout.
+    #[tokio::test]
+    async fn acquisition_adopts_a_worktree_registered_at_a_custom_path() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let custom = tmp.root().join("repo.worktrunk-template").join("task-c0ffee11");
+        run_git(repo_path, &["worktree", "add", "-q", "-b", "task-c0ffee11", "--", custom.to_str().unwrap()]);
+        let before = registered_worktrees(repo_path);
+
+        let (info, created_from) = test_manager()
+            .create_or_adopt(repo_path, "task-c0ffee11")
+            .await
+            .expect("the registered worktree is adopted");
+
+        assert_eq!(created_from, None, "adopted, not created, and no base is claimed");
+        assert_eq!(
+            std::fs::canonicalize(&info.path).unwrap(),
+            std::fs::canonicalize(&custom).unwrap()
+        );
+        assert_eq!(registered_worktrees(repo_path), before, "nothing new is created");
+    }
+
+    /// The primary checkout is never a task's worktree, even when it has
+    /// the task's branch checked out: it is refused, not adopted, and
+    /// nothing is created.
+    #[tokio::test]
+    async fn the_primary_checkout_is_never_adopted() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        run_git(repo_path, &["checkout", "-q", "-b", "task-c0ffee11"]);
+
+        let reattached = test_manager().reattach(repo_path, "task-c0ffee11").await;
+        let acquired = test_manager().create_or_adopt(repo_path, "task-c0ffee11").await;
+
+        assert!(reattached.is_err(), "{:?}", reattached.map(|i| i.path));
+        assert!(acquired.is_err(), "{:?}", acquired.map(|(i, _)| i.path));
+        assert_eq!(registered_worktrees(repo_path).len(), 1);
+    }
+
+    /// A worktree registered at a custom path for another branch, or with
+    /// a detached `HEAD`, is not the task's and is not adopted.
+    #[tokio::test]
+    async fn only_a_worktree_of_exactly_the_task_branch_is_adopted() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let other = tmp.root().join("other");
+        let detached = tmp.root().join("detached");
+        run_git(repo_path, &["worktree", "add", "-q", "-b", "task-c0ffee11-other", "--", other.to_str().unwrap()]);
+        run_git(repo_path, &["worktree", "add", "-q", "--detach", "--", detached.to_str().unwrap()]);
+
+        let mgr = test_manager();
+        let (info, created_from) = mgr
+            .create_or_adopt(repo_path, "task-c0ffee11")
+            .await
+            .expect("a new worktree");
+
+        assert!(created_from.is_some(), "created, not adopted");
+        assert_eq!(Path::new(&info.path), mgr.managed_path(repo_path, "task-c0ffee11").as_path());
+    }
+
+    /// A worktree that cannot be added takes the branch just created for it
+    /// along, so the next attempt is not blocked by it.
+    #[tokio::test]
+    async fn an_ordinary_create_that_cannot_attach_leaves_no_branch_behind() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+        let dest = mgr.managed_path(repo_path, "task-0a1b2c3d");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("in-the-way"), "occupied\n").unwrap();
+        let refs_before = all_refs(repo_path);
+
+        let refused = mgr.create(repo_path, "task-0a1b2c3d").await;
+
+        assert!(refused.is_err());
+        assert_eq!(all_refs(repo_path), refs_before, "the new branch is discarded");
+        std::fs::remove_dir_all(&dest).unwrap();
+        mgr.create(repo_path, "task-0a1b2c3d").await.expect("a retry succeeds");
+    }
+
+    /// A `post-checkout` hook that moves the new checkout means the branch
+    /// no longer starts only where the default base put it. That is
+    /// reported, not recorded as a default-base start, and the checkout is
+    /// left for a person to look at.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_checkout_a_hook_moved_is_not_recorded_as_starting_at_the_default_base() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let hook = tmp.path().join(".git/hooks/post-checkout");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\ngit -c user.email=h@example.com -c user.name=Hook commit -q --allow-empty -m hook\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let refused = test_manager()
+            .create_or_adopt(repo_path, "task-0a1b2c3d")
+            .await
+            .map(|(info, base)| (info.path, base))
+            .expect_err("a moved checkout is not a default-base start");
+
+        assert!(refused.contains("post-checkout"), "{refused}");
+        assert!(branch_exists(repo_path, "task-0a1b2c3d"), "the branch is left as it is");
+        assert_eq!(registered_worktrees(repo_path).len(), 2, "and so is the worktree");
+    }
+
+    /// A worktree registered at a path SlashIt did not choose is removed
+    /// like any other, and its branch is kept.
+    #[tokio::test]
+    async fn a_worktree_at_a_custom_path_can_be_removed_and_keeps_its_branch() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let custom = tmp.root().join("repo.worktrunk-template").join("task-c0ffee11");
+        run_git(repo_path, &["worktree", "add", "-q", "-b", "task-c0ffee11", "--", custom.to_str().unwrap()]);
+        let work = commit_work(custom.to_str().unwrap(), "agent-work.txt");
+
+        test_manager()
+            .remove(custom.to_str().unwrap(), repo_path)
+            .await
+            .expect("removed");
+
+        assert!(!custom.exists());
+        assert_eq!(registered_worktrees(repo_path).len(), 1);
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-c0ffee11"]), work);
+    }
+
+    /// Whatever `wt` on `PATH` would do, SlashIt never runs it: creating,
+    /// removing, reattaching and stacking produce the same checkouts with a
+    /// `wt` that claims success at the front of `PATH` as with none at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktrunk_on_path_changes_nothing_and_is_never_run() {
+        async fn lifecycle(fake: &crate::test_helpers::FakeProgram) {
+            let tmp = create_temp_git_repo();
+            let repo_path = tmp.path().to_str().unwrap();
+            let base = origin_main(repo_path);
+            let mgr = WorktreeManager::new(test_paths());
+
+            let created = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
+            assert_eq!(run_git(&created.path, &["rev-parse", "HEAD"]), base);
+            let work = commit_work(&created.path, "agent-work.txt");
+            mgr.remove(&created.path, repo_path).await.expect("remove");
+            assert!(!Path::new(&created.path).exists());
+            assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), work);
+
+            let again = mgr.reattach(repo_path, "task-0a1b2c3d").await.expect("reattach");
+            assert_eq!(run_git(&again.path, &["rev-parse", "HEAD"]), work);
+
+            let stacked = mgr
+                .create_stacked_branch(repo_path, "task-5eed5eed", "task-0a1b2c3d")
+                .await
+                .expect("stacked create")
+                .info;
+            assert_eq!(run_git(&stacked.path, &["rev-parse", "HEAD"]), work);
+            mgr.remove(&stacked.path, repo_path).await.expect("remove stacked");
+            mgr.remove(&again.path, repo_path).await.expect("remove reattached");
+            assert_eq!(registered_worktrees(repo_path).len(), 1);
+            assert!(branch_exists(repo_path, "task-0a1b2c3d"));
+            assert!(branch_exists(repo_path, "task-5eed5eed"));
+
+            assert_eq!(fake.invocations(), "", "wt must never be run");
+        }
+
+        {
+            let fake = crate::test_helpers::FakeProgram::install("wt", "exit 0").await;
+            lifecycle(&fake).await;
+        }
+        {
+            let absent = crate::test_helpers::FakeProgram::without(&["wt", "jj"]).await;
+            lifecycle(&absent).await;
         }
     }
 }

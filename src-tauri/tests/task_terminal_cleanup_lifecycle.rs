@@ -70,8 +70,8 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::unix::pipe;
 
-use slashit_ui_lib::config::paths::{AppPaths, StateLocation, WorktreePlacement};
-use slashit_ui_lib::config::storage::{AppConfig, WorktreeConfig};
+use slashit_ui_lib::config::paths::{AppPaths, StateLocation};
+use slashit_ui_lib::config::storage::AppConfig;
 use slashit_ui_lib::domain::{
     AgentConfig, AgentType, Project, ProjectScope, Repository, Task, TaskPhase, TaskStatus,
 };
@@ -434,6 +434,13 @@ async fn build_fixture(name: &str) -> (Fixture, AppState) {
     fs::write(repo_dir.join("README.md"), "base\n").expect("seed file");
     git(&repo_dir, &["add", "."]);
     git(&repo_dir, &["commit", "-q", "-m", "init"]);
+    // A bare `origin` whose `HEAD` is recorded locally, so that the task's
+    // checkout has a default base to start from.
+    let origin = tmp.path().join("origin.git");
+    git(&repo_dir, &["init", "-q", "--bare", origin.to_str().expect("utf-8 origin path")]);
+    git(&repo_dir, &["remote", "add", "origin", origin.to_str().expect("utf-8 origin path")]);
+    git(&repo_dir, &["push", "-q", "origin", "main"]);
+    git(&repo_dir, &["remote", "set-head", "origin", "main"]);
     let repo_path = repo_dir.to_str().expect("utf-8 repo path").to_string();
 
     let paths = Arc::new(AppPaths::with_roots(
@@ -453,15 +460,7 @@ async fn build_fixture(name: &str) -> (Fixture, AppState) {
     // makes an overlapping cleanup a collision rather than a coincidence.
     let branch = format!("task-{}", &task_id.to_string()[..8]);
 
-    // `Managed` rather than the default `Auto`: `Auto` delegates to worktrunk
-    // when `wt` is installed, which it is on this machine, and the boundary
-    // under test is git's.
-    let mut config = AppConfig {
-        worktree: WorktreeConfig {
-            placement: WorktreePlacement::Managed,
-        },
-        ..Default::default()
-    };
+    let mut config = AppConfig::default();
     config.repositories.insert(
         repository_id.to_string(),
         Repository {

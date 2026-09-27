@@ -114,17 +114,19 @@ the concrete backend, "Git worktree", when the implementation matters.
 Today every Task Checkout is a Git worktree on its own branch, recorded on
 the Task as its checkout path, branch name and base commit, and whether the
 branch starts from the default base or is stacked on a dependency's branch
-(which the Task's pull request then targets). A branch is recorded as started
-from the default base only when its starting commit was proven, at creation,
-to be contained in `refs/remotes/origin/HEAD`; otherwise where it started is
-recorded as unknown. The record describes where the branch starts now, and
+(which the Task's pull request then targets). An ordinary branch starts at
+the exact commit of the repository's default branch on `origin`, resolved
+from local refs when the branch is created, and records which branch that was;
+its pull request targets that branch. Branches created by earlier versions
+may record no origin, or a default base with no branch, and keep what they
+recorded. The record describes where the branch starts now, and
 changes only when SlashIt itself rewrites the branch onto another base: a
 stacked branch that was never pushed, whose dependency's pull request was
 merged into the default branch, is replayed onto the default branch before
 its first pull request is opened, and from then on is recorded as starting
 there, at the exact commit it was replayed onto. SlashIt places
-it under its data directory, or leaves placement to worktrunk when the user
-has configured it; either way it is a Git worktree (see
+it under its data directory, and adopts a Git worktree of the Task's branch
+that already exists elsewhere (see
 [state-locations.md](state-locations.md#worktrees)).
 
 A JJ workspace is not an available Task Checkout backend. A Jujutsu

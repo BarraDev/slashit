@@ -106,10 +106,7 @@ pub async fn build_state_with_paths(
         // Installed by the caller: a webview sink in the GUI, a logging sink
         // in the daemon.
         events: Arc::new(std::sync::OnceLock::new()),
-        worktree_manager: Arc::new(worktree::WorktreeManager::new(
-            paths.clone(),
-            loaded_config.worktree.placement,
-        )),
+        worktree_manager: Arc::new(worktree::WorktreeManager::new(paths.clone())),
         // The resolved set, not the persisted one: what the application does
         // has to match what it reports.
         features: Arc::new(tokio::sync::RwLock::new(
@@ -745,7 +742,7 @@ mod tests {
     async fn startup_adopts_a_worktree_registered_at_a_non_conventional_path() {
         // Regression guard: a worktree git still has registered for a task's
         // branch, but at a path that matches neither of SlashIt's own
-        // managed/legacy conventions (e.g. one `wt` placed under its own
+        // managed/legacy conventions (e.g. one Worktrunk placed under its own
         // naming scheme), must be adopted at startup rather than having its
         // reference cleared -- clearing would strand the worktree with no
         // way for the app to find it again.

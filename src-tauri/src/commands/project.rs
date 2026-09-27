@@ -415,7 +415,7 @@ mod tests {
             },
         );
         let valid = toml::to_string_pretty(&seeded).expect("serialize fixture");
-        let poisoned = valid.replace("placement = \"auto\"", "placement = \"shared_root\"");
+        let poisoned = valid.replace("placement = \"managed\"", "placement = \"shared_root\"");
         assert_ne!(poisoned, valid, "fixture must invalidate the placement variant");
         std::fs::write(storage.paths().config_file(), &poisoned).expect("write fixture");
 

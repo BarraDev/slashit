@@ -1,4 +1,5 @@
 mod branch;
+mod default_base;
 mod diff;
 mod manager;
 pub mod restack;

@@ -109,47 +109,39 @@ async fn acquire_checkout(
     existing_branch: Option<&str>,
     task_id: Uuid,
 ) -> Result<AcquiredCheckout, String> {
-    let (info, adopted) = match existing_branch {
-        Some(branch) => (manager.reattach(repo_path, branch).await?, false),
-        None => {
-            manager
-                .create_or_adopt(repo_path, &WorktreeManager::branch_for_task(task_id))
-                .await?
+    // A reattach keeps the starting commit and origin recorded when the
+    // branch was created.
+    if let Some(branch) = existing_branch {
+        let info = manager.reattach(repo_path, branch).await?;
+        return Ok(AcquiredCheckout { info, base_commit: None, origin: None });
+    }
+    // This path never stacks: a branch it creates starts at the resolved
+    // default base, exactly as the executor's ordinary branches do (see
+    // `WorktreeManager::create_or_adopt`), whatever the task depends on.
+    match manager
+        .create_or_adopt(repo_path, &WorktreeManager::branch_for_task(task_id))
+        .await?
+    {
+        (info, Some(base)) => Ok(AcquiredCheckout {
+            info,
+            base_commit: Some(base.commit),
+            origin: Some(BranchOrigin::DefaultBase { branch: Some(base.branch) }),
+        }),
+        // An adopted worktree was made by something that recorded no
+        // origin. Its `HEAD` is the only starting point there is to record,
+        // read from the adopted worktree itself rather than `repo_path`.
+        (info, None) => {
+            let base_commit = tokio::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&info.path)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            Ok(AcquiredCheckout { info, base_commit, origin: None })
         }
-    };
-    let is_fresh = existing_branch.is_none();
-    // Captured once, only for a fresh worktree, matching
-    // `queue::executor::spawn_task_execution`'s canonical-diff boundary
-    // contract: a reattach must keep comparing against the task's original
-    // starting point, not wherever `HEAD` is now. Read from the *new*
-    // worktree's own `HEAD` (not `repo_path`'s) so nothing else can move it
-    // out from under this call between creation and here.
-    let base_commit = if is_fresh {
-        tokio::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&info.path)
-            .output()
-            .await
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    } else {
-        None
-    };
-    // This path never stacks: a branch it creates starts wherever the
-    // backend starts an ordinary branch, whatever the task depends on. That
-    // is recorded as the default base only when `origin/HEAD` provably
-    // contains it, by the same check the executor uses (see
-    // `WorktreeManager::default_base_origin`); otherwise the origin is
-    // unknown. A reattach keeps the origin recorded when the branch was
-    // created, and an adopted worktree was made by something that recorded
-    // none.
-    let origin = if is_fresh && !adopted {
-        WorktreeManager::default_base_origin(repo_path, base_commit.as_deref()).await
-    } else {
-        None
-    };
-    Ok(AcquiredCheckout { info, base_commit, origin })
+    }
 }
 
 /// Remove a task's worktree at the user's explicit request, without saying
@@ -247,45 +239,72 @@ mod tests {
                 temp.path().join("cache"),
                 temp.path().join("runtime"),
             )),
-            crate::config::paths::WorktreePlacement::Managed,
         );
         (repo, manager)
     }
 
     /// A worktree created from the Worktree panel while the primary checkout
-    /// is on a feature branch starts at that branch's tip, and is not
-    /// recorded as coming from the default base.
+    /// is on a feature branch starts at `origin/main`, not at that branch's
+    /// tip, and records `main` as its default base.
     #[tokio::test]
-    async fn a_worktree_created_from_a_feature_checkout_records_no_origin() {
+    async fn a_worktree_created_from_a_feature_checkout_starts_at_the_default_base() {
         let temp = tempfile::TempDir::new().unwrap();
         let (repo, manager) = fixture(&temp);
+        let main_tip = git(&repo, &["rev-parse", "refs/remotes/origin/main"]);
         git(&repo, &["checkout", "-q", "-b", "feature-f"]);
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "feature work"]);
-        let feature_tip = git(&repo, &["rev-parse", "HEAD"]);
 
         let acquired = acquire_checkout(&manager, repo.to_str().unwrap(), None, Uuid::new_v4())
             .await
             .expect("a worktree");
 
-        assert_eq!(git(Path::new(&acquired.info.path), &["rev-parse", "HEAD"]), feature_tip);
-        assert_eq!(acquired.base_commit.as_deref(), Some(feature_tip.as_str()));
-        assert_eq!(acquired.origin, None);
+        assert_eq!(git(Path::new(&acquired.info.path), &["rev-parse", "HEAD"]), main_tip);
+        assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()));
+        assert_eq!(
+            acquired.origin,
+            Some(BranchOrigin::DefaultBase { branch: Some("main".to_string()) })
+        );
     }
 
-    /// Started on a commit `origin/HEAD` contains, the same path records the
-    /// default base.
+    /// A repository with no default base is refused, and nothing is created
+    /// in it.
     #[tokio::test]
-    async fn a_worktree_created_on_the_default_base_records_it() {
+    async fn a_repository_without_a_default_base_is_refused() {
         let temp = tempfile::TempDir::new().unwrap();
         let (repo, manager) = fixture(&temp);
-        let main_tip = git(&repo, &["rev-parse", "main"]);
+        git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+        let refs_before = git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
 
-        let acquired = acquire_checkout(&manager, repo.to_str().unwrap(), None, Uuid::new_v4())
+        let refused = acquire_checkout(&manager, repo.to_str().unwrap(), None, Uuid::new_v4())
             .await
-            .expect("a worktree");
+            .err()
+            .expect("refused");
 
-        assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()));
-        assert_eq!(acquired.origin, Some(BranchOrigin::DefaultBase));
+        assert!(refused.contains("git remote set-head origin"), "{refused}");
+        assert_eq!(git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs_before);
+        assert_eq!(git(&repo, &["worktree", "list", "--porcelain"]).matches("worktree ").count(), 1);
+    }
+
+    /// A worktree of the task's branch that git has registered at a path of
+    /// another tool's choosing is adopted there, with no origin claimed.
+    #[tokio::test]
+    async fn a_registered_worktree_at_a_custom_path_is_adopted_without_an_origin() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (repo, manager) = fixture(&temp);
+        let task_id = Uuid::new_v4();
+        let branch = WorktreeManager::branch_for_task(task_id);
+        let custom = temp.path().join("elsewhere").join(&branch);
+        git(&repo, &["worktree", "add", "-q", "-b", &branch, "--", custom.to_str().unwrap()]);
+
+        let acquired = acquire_checkout(&manager, repo.to_str().unwrap(), None, task_id)
+            .await
+            .expect("adopted");
+
+        assert_eq!(
+            std::fs::canonicalize(&acquired.info.path).unwrap(),
+            std::fs::canonicalize(&custom).unwrap()
+        );
+        assert_eq!(acquired.origin, None);
     }
 
     /// A reattach records neither a starting commit nor an origin, so the
