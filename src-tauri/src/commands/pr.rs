@@ -1259,7 +1259,6 @@ pub async fn address_pr_review_inner(
     }
 
     let agent_summary = per_item_summaries.join("\n\n---\n\n");
-    let any_new_fix = !fixed_ids.is_empty();
 
     let mut pushed = false;
     let mut push_branch_name: Option<String> = None;
@@ -1317,7 +1316,7 @@ pub async fn address_pr_review_inner(
             message: Some(error.clone()),
         });
         push_error = Some(error);
-    } else if cancelled && !options.dry_run && any_new_fix {
+    } else if cancelled && !options.dry_run && !uncommitted.is_empty() {
         push_error = Some(format!(
             "the task was changed while these fixes were being applied, so they were not \
              committed or pushed; apply again to commit and push them.{unpushed_replies_note}"
@@ -11164,6 +11163,51 @@ mod tests {
                 assert!(error.contains("also changed"), "the cancellation is reported too: {error:?}");
                 assert_eq!(git(&worktree, &["diff", "--cached", "--name-only"]), "", "nothing is staged");
                 wait_until(|| !pid_is_alive(blocked)).await;
+            }
+
+            /// A cancelled apply that made no new fix still says the fixes an
+            /// earlier apply left uncommitted were not committed or pushed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_cancelled_apply_reports_fixes_left_uncommitted_earlier() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_commits(&repo);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let (_first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(plan.items[0].fix_uncommitted, "{:?}", plan.items[0]);
+                std::fs::remove_file(&hook).unwrap();
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+
+                let options = AddressPrReviewOptions { auto_push: true, auto_reply: false, dry_run: false };
+                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                cancel_tx.send(true).unwrap();
+                let (result, plan) = test_programs::scope(
+                    [("jj", no_jj)],
+                    address_pr_review_inner(
+                        task,
+                        worktree.to_str().unwrap().to_string(),
+                        plan,
+                        options,
+                        no_progress(),
+                        cancel_rx,
+                    ),
+                )
+                .await
+                .expect("cancellation is reported, not a command error");
+
+                assert_eq!(claude.runs(), 1, "no fix agent runs");
+                assert!(!result.pushed, "{result:?}");
+                assert_eq!(git(&worktree, &["rev-parse", "task-branch"]), tip, "no commit is made");
+                assert!(plan.items[0].fix_uncommitted, "the fix is still owed a commit");
+                let error = result.push_error.as_deref().unwrap_or_default();
+                assert!(
+                    error.contains("not committed or pushed"),
+                    "the result must say the pending fix was not committed: {error:?}"
+                );
             }
 
             /// Applying again to a plan whose fixes are all committed and
