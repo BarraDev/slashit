@@ -637,8 +637,7 @@ impl WorktreeManager {
     /// (SHA-256) lowercase hexadecimal digits, which is all `git rev-parse`
     /// prints for one.
     fn is_full_object_id(value: &str) -> bool {
-        matches!(value.len(), 40 | 64)
-            && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        super::restack::is_full_object_id(value)
     }
 
     /// Create the local branch `branch` at exactly `commit`, failing if the

@@ -13,7 +13,7 @@ Backend source for Tauri v2. This folder contains all Rust backend code organize
 - **jj/** - Jujutsu version control integration (see `jj/AGENTS.md`)
 - **session/** - Session management
 - **config/** - Persistent storage using TOML files in system directories
-- **worktree/** - Git worktrees, the only Task Checkout backend, and task diffs
+- **worktree/** - Git worktrees, the only Task Checkout backend, task diffs, and restacking a task branch onto a new base
 - **queue/** - Task queue, admission and the executor that launches agent runs
 - **pty/** - Terminal (PTY) sessions
 - **ipc/** - Control channel server for the `slashit` CLI (see below)
