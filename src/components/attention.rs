@@ -22,7 +22,13 @@ use crate::models::{AttentionReason, Task, TaskStatus};
 /// to know the task is waiting on SlashIt, not on the user. Never persisted:
 /// an attempt ends with the process that runs it.
 #[derive(Clone, Copy)]
-pub struct Deliveries(RwSignal<HashMap<Uuid, DeliveryRecord>>);
+pub struct Deliveries {
+    records: RwSignal<HashMap<Uuid, DeliveryRecord>>,
+    /// Bumped each time an attempt is answered, so a board or rail that did
+    /// not start it (a board mounted again meanwhile, say) knows to read the
+    /// record again instead of showing the one from before the attempt.
+    settled: RwSignal<u64>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeliveryRecord {
@@ -36,7 +42,7 @@ pub struct DeliveryRecord {
 
 impl Deliveries {
     pub fn provide() {
-        provide_context(Self(RwSignal::new(HashMap::new())));
+        provide_context(Self { records: RwSignal::new(HashMap::new()), settled: RwSignal::new(0) });
     }
 
     pub fn get() -> Option<Self> {
@@ -45,21 +51,26 @@ impl Deliveries {
 
     /// Whether a pull request is being opened for `task_id`. Tracked.
     pub fn in_flight(self, task_id: Uuid) -> bool {
-        self.0.with(|m| m.get(&task_id).is_some_and(|r| r.in_flight > 0))
+        self.records.with(|m| m.get(&task_id).is_some_and(|r| r.in_flight > 0))
     }
 
     /// [`Self::in_flight`], without subscribing to changes.
     pub fn in_flight_untracked(self, task_id: Uuid) -> bool {
-        self.0.with_untracked(|m| m.get(&task_id).is_some_and(|r| r.in_flight > 0))
+        self.records.with_untracked(|m| m.get(&task_id).is_some_and(|r| r.in_flight > 0))
+    }
+
+    /// How many attempts have been answered so far. Tracked.
+    pub fn settled(self) -> u64 {
+        self.settled.get()
     }
 
     /// What this window knows about `task_id`'s attempts. Tracked.
     pub fn record(self, task_id: Uuid) -> Option<DeliveryRecord> {
-        self.0.with(|m| m.get(&task_id).cloned())
+        self.records.with(|m| m.get(&task_id).cloned())
     }
 
     pub fn begin(self, task_id: Uuid) {
-        self.0.update(|m| m.entry(task_id).or_default().in_flight += 1);
+        self.records.update(|m| m.entry(task_id).or_default().in_flight += 1);
     }
 
     /// The attempt was answered. Call it in the same tick as applying the
@@ -71,7 +82,7 @@ impl Deliveries {
     /// not numbered as an attempt.
     pub fn finish(self, task_id: Uuid, attempted: bool) {
         let at = attempted.then(|| String::from(js_sys::Date::new_0().to_locale_time_string("en-US")));
-        self.0.update(|m| {
+        self.records.update(|m| {
             let record = m.entry(task_id).or_default();
             record.in_flight = record.in_flight.saturating_sub(1);
             if let Some(at) = at {
@@ -79,6 +90,7 @@ impl Deliveries {
                 record.last_finished_at = Some(at);
             }
         });
+        self.settled.update(|n| *n += 1);
     }
 }
 
@@ -162,13 +174,13 @@ pub fn AttentionChip(reason: AttentionReason) -> impl IntoView {
     }
 }
 
-/// "Creating PR…", on a card whose pull request is being opened.
+/// "Creating PR…", on a card whose pull request is being opened. Not a live
+/// region: the drawer that started the attempt announces it once.
 #[component]
 pub fn DeliveringChip() -> impl IntoView {
     view! {
         <span
             data-testid="task-card-delivering"
-            role="status"
             class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border border-sky-400/40 bg-sky-500/15 text-[10px] font-semibold text-sky-200"
         >
             <svg class="w-3 h-3 animate-spin flex-shrink-0" aria-hidden="true" fill="none" viewBox="0 0 24 24">
@@ -181,15 +193,16 @@ pub fn DeliveringChip() -> impl IntoView {
 }
 
 /// Bring the card for `task_id` into view in both directions and give it
-/// keyboard focus, without scrolling a second time for the focus.
-pub fn reveal_card(task_id: Uuid) {
+/// keyboard focus, without scrolling a second time for the focus. `false`
+/// when no such card is on the board.
+pub fn reveal_card(task_id: Uuid) -> bool {
     use wasm_bindgen::JsCast;
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
-        return;
+        return false;
     };
     let selector = format!("[data-card-task-id=\"{task_id}\"]");
     let Ok(Some(card)) = document.query_selector(&selector) else {
-        return;
+        return false;
     };
     let options = web_sys::ScrollIntoViewOptions::new();
     options.set_behavior(web_sys::ScrollBehavior::Smooth);
@@ -201,6 +214,7 @@ pub fn reveal_card(task_id: Uuid) {
         focus.set_prevent_scroll(true);
         let _ = card.focus_with_options(&focus);
     }
+    true
 }
 
 #[cfg(test)]

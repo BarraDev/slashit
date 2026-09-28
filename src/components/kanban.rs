@@ -497,6 +497,11 @@ pub fn Kanban(
             }
         });
     }
+    let needs_you_count = move || needs_you.with(|n| n.len());
+    let needs_you_label = move || match needs_you_count() {
+        0 => "Needs you: 0. Nothing is waiting on you in this project.".to_string(),
+        n => format!("Needs you: {n}. Show the next task that needs you."),
+    };
     // Each press of the header shows the next task that needs you.
     let last_shown = StoredValue::new(None::<Uuid>);
     let on_needs_you = move |_| {
@@ -505,9 +510,11 @@ pub fn Kanban(
             return;
         };
         last_shown.set_value(Some(next));
+        if !reveal_card(next) {
+            return;
+        }
         let cue = highlight.get_untracked().map_or(0, |(_, n)| n.wrapping_add(1));
         highlight.set(Some((next, cue)));
-        reveal_card(next);
         set_timeout(
             move || {
                 if highlight.try_get_untracked().flatten() == Some((next, cue)) {
@@ -528,32 +535,24 @@ pub fn Kanban(
                         <p class="text-sm text-white/40 mt-0.5">"Drag and drop tasks to change status"</p>
                     </div>
                     <div class="flex items-center gap-3 ml-4">
-                        {move || {
-                            let count = needs_you.with(|n| n.len());
-                            let label = if count == 0 {
-                                "Needs you: 0. Nothing is waiting on you in this project.".to_string()
+                        // One button for the board's lifetime, so keyboard focus
+                        // stays on it as the count changes.
+                        <button
+                            data-testid="header-needs-you"
+                            data-count=move || needs_you_count().to_string()
+                            aria-label=needs_you_label
+                            aria-disabled=move || (needs_you_count() == 0).to_string()
+                            title=needs_you_label
+                            on:click=on_needs_you
+                            class=move || if needs_you_count() == 0 {
+                                "flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 cursor-default focus:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
                             } else {
-                                format!("Needs you: {count}. Show the next task that needs you.")
-                            };
-                            view! {
-                                <button
-                                    data-testid="header-needs-you"
-                                    data-count=count.to_string()
-                                    aria-label=label.clone()
-                                    title=label
-                                    disabled=count == 0
-                                    on:click=on_needs_you
-                                    class=if count == 0 {
-                                        "flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 cursor-default"
-                                    } else {
-                                        "flex items-center gap-2 px-3 py-1.5 rounded-lg bg-amber-500/15 border border-amber-400/40 hover:bg-amber-500/25 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 transition-colors"
-                                    }
-                                >
-                                    <span class=if count == 0 { "text-xs text-white/40" } else { "text-xs font-medium text-amber-300" }>"Needs you:"</span>
-                                    <span class=if count == 0 { "text-sm font-medium text-white/50" } else { "text-sm font-semibold text-amber-200" }>{count}</span>
-                                </button>
+                                "flex items-center gap-2 px-3 py-1.5 rounded-lg bg-amber-500/15 border border-amber-400/40 hover:bg-amber-500/25 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 transition-colors"
                             }
-                        }}
+                        >
+                            <span class=move || if needs_you_count() == 0 { "text-xs text-white/40" } else { "text-xs font-medium text-amber-300" }>"Needs you:"</span>
+                            <span class=move || if needs_you_count() == 0 { "text-sm font-medium text-white/50" } else { "text-sm font-semibold text-amber-200" }>{needs_you_count}</span>
+                        </button>
                         {move || {
                             let (total, running, done) = task_stats();
                             view! {
@@ -2486,7 +2485,7 @@ fn KanbanTaskCard(
             class=move || if highlighted() {
                 "relative group/card rounded-xl outline-none ring-2 ring-amber-300 ring-offset-2 ring-offset-[#08080C] transition-shadow"
             } else {
-                "relative group/card rounded-xl outline-none"
+                "relative group/card rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-amber-300/60"
             }
         >
             // Drop indicator above task (shows when hovering on upper half)

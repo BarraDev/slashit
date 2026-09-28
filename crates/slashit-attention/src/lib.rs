@@ -6,9 +6,10 @@
 //! for the task at this moment. Nothing here is written to a task file, so
 //! the answer after a restart is whatever the persisted record says it is.
 //!
-//! This crate is the rule itself. The backend, the WASM frontend and the CLI
-//! each describe a task to [`needs_you`] as a [`Stage`]; none of them decides
-//! on its own which combinations need the user.
+//! This crate is the rule itself, and how a task's record is read for it.
+//! The backend and the WASM frontend (and any later surface, such as the CLI
+//! or a tray) each copy the plain facts of a task into [`Facts`]; none of
+//! them decides on its own which combinations need the user.
 
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +45,56 @@ impl AttentionReason {
             Self::Review => "review",
             Self::PrNotCreated => "pr_not_created",
         }
+    }
+}
+
+/// A task's status, as far as attention tells statuses apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Error,
+    HumanReview,
+    /// Backlog, Queue, In Progress, AI Review, PR Created or Done.
+    Other,
+}
+
+/// The Human Review decision made in the task's current arrival.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Approved,
+    ChangesRequested,
+}
+
+/// What the rule reads about one task, copied from its record as is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Facts {
+    pub status: Status,
+    /// The decision in the current Human Review arrival, if any.
+    pub decision: Option<Decision>,
+    /// The record keeps why the last pull request attempt failed.
+    pub pr_error_recorded: bool,
+    /// A pull request is linked to the task: its `pr_url`, or a pull request
+    /// among its external references.
+    pub pr_linked: bool,
+    /// Its pull request is being opened right now.
+    pub delivery_in_flight: bool,
+}
+
+impl Facts {
+    /// Whether the task needs the user now, and why.
+    pub fn needs_you(self) -> Option<AttentionReason> {
+        let stage = match self.status {
+            Status::Error => Stage::Failed,
+            Status::HumanReview => Stage::HumanReview(match self.decision {
+                None => Review::Undecided,
+                Some(Decision::ChangesRequested) => Review::ChangesRequested,
+                Some(Decision::Approved) => Review::Approved {
+                    pr_failed: self.pr_error_recorded,
+                    pr_linked: self.pr_linked,
+                },
+            }),
+            Status::Other => Stage::Elsewhere,
+        };
+        needs_you(stage, self.delivery_in_flight)
     }
 }
 
@@ -149,6 +200,27 @@ mod tests {
     fn every_other_status_is_left_alone() {
         assert_eq!(needs_you(Stage::Elsewhere, false), None);
         assert_eq!(needs_you(Stage::Elsewhere, true), None);
+    }
+
+    #[test]
+    fn facts_are_read_the_way_the_stages_say() {
+        let facts = |status, decision, pr_error_recorded, pr_linked| Facts {
+            status,
+            decision,
+            pr_error_recorded,
+            pr_linked,
+            delivery_in_flight: false,
+        };
+        let approved = Some(Decision::Approved);
+        assert_eq!(facts(Status::Error, None, false, false).needs_you(), Some(AttentionReason::Failed));
+        assert_eq!(facts(Status::HumanReview, None, false, false).needs_you(), Some(AttentionReason::Review));
+        assert_eq!(facts(Status::HumanReview, Some(Decision::ChangesRequested), false, false).needs_you(), None);
+        assert_eq!(facts(Status::HumanReview, approved, false, false).needs_you(), None);
+        assert_eq!(facts(Status::HumanReview, approved, true, false).needs_you(), Some(AttentionReason::PrNotCreated));
+        assert_eq!(facts(Status::HumanReview, approved, true, true).needs_you(), None);
+        assert_eq!(facts(Status::Other, None, true, false).needs_you(), None);
+        let in_flight = Facts { delivery_in_flight: true, ..facts(Status::HumanReview, approved, true, false) };
+        assert_eq!(in_flight.needs_you(), None);
     }
 
     #[test]

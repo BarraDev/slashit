@@ -100,6 +100,19 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
         refresh_tasks.run(());
     });
 
+    // A pull request attempt this board may not have started (one begun
+    // before a project switch, say) has been answered: read the record again
+    // now rather than show the one from before the attempt until the poll.
+    if let Some(deliveries) = crate::components::attention::Deliveries::get() {
+        Effect::new(move |seen: Option<u64>| {
+            let settled = deliveries.settled();
+            if seen.is_some_and(|seen| seen != settled) {
+                refresh_tasks.run(());
+            }
+            settled
+        });
+    }
+
     // Poll tasks every 5s to reflect backend status changes (auto-promotion, review transitions)
     let project_id_for_poll = project_id.clone();
     Effect::new(move |_| {

@@ -260,37 +260,32 @@ impl Task {
     }
 
     /// Whether the task cannot make progress without the user right now, and
-    /// why. The rule is [`slashit_attention::needs_you`]; this only describes
-    /// the task to it.
+    /// why. The rule is [`slashit_attention::Facts::needs_you`]; this only
+    /// copies the task's facts into it.
     ///
     /// `delivery_in_flight` is whether its pull request is being opened at
     /// this moment, which the record cannot say.
     pub fn needs_you(&self, delivery_in_flight: bool) -> Option<AttentionReason> {
-        attention::needs_you(self.attention_stage(), delivery_in_flight)
-    }
-
-    fn attention_stage(&self) -> attention::Stage {
-        match self.status {
-            TaskStatus::Error => attention::Stage::Failed,
-            TaskStatus::HumanReview => {
-                let review = match self.human_review.current_decision().map(|e| e.decision) {
-                    None => attention::Review::Undecided,
-                    Some(HumanReviewDecision::ChangesRequested) => attention::Review::ChangesRequested,
-                    Some(HumanReviewDecision::Approved) => attention::Review::Approved {
-                        pr_failed: self.human_review.pr_error.is_some(),
-                        pr_linked: self.pr_url.is_some()
-                            || self.external_refs.iter().any(ExternalRef::is_pr),
-                    },
-                };
-                attention::Stage::HumanReview(review)
-            }
-            TaskStatus::Backlog
-            | TaskStatus::Queue
-            | TaskStatus::InProgress
-            | TaskStatus::AiReview
-            | TaskStatus::PrCreated
-            | TaskStatus::Done => attention::Stage::Elsewhere,
+        attention::Facts {
+            status: match self.status {
+                TaskStatus::Error => attention::Status::Error,
+                TaskStatus::HumanReview => attention::Status::HumanReview,
+                TaskStatus::Backlog
+                | TaskStatus::Queue
+                | TaskStatus::InProgress
+                | TaskStatus::AiReview
+                | TaskStatus::PrCreated
+                | TaskStatus::Done => attention::Status::Other,
+            },
+            decision: self.human_review.current_decision().map(|e| match e.decision {
+                HumanReviewDecision::Approved => attention::Decision::Approved,
+                HumanReviewDecision::ChangesRequested => attention::Decision::ChangesRequested,
+            }),
+            pr_error_recorded: self.human_review.pr_error.is_some(),
+            pr_linked: self.pr_url.is_some() || self.external_refs.iter().any(ExternalRef::is_pr),
+            delivery_in_flight,
         }
+        .needs_you()
     }
 }
 

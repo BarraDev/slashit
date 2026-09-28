@@ -23,6 +23,9 @@ const PR_CREATED_COLUMN: &str = "[data-testid=\"column-prcreated\"]";
 /// Long enough that a 250 ms poll sees the attempt running, the way a person
 /// sees a real push and GitHub round trip.
 const SLOW_CREATE_SECONDS: u32 = 4;
+/// Long enough for the retry after the restart to still be running once the
+/// journey has closed the drawer, switched projects and read the rail.
+const SLOW_UNSELECTED_SECONDS: u32 = 10;
 
 /// What one card shows, read in one pass so the parts agree with each other.
 #[derive(Debug, Clone, Default)]
@@ -35,6 +38,8 @@ struct Card {
     /// The text of the card's human decision badge, if shown.
     decision: Option<String>,
     sync_pr: bool,
+    /// Every link on the card.
+    links: Vec<String>,
     text: String,
     highlighted: bool,
     focused: bool,
@@ -57,6 +62,7 @@ return {
   delivering: !!card.querySelector('[data-testid="task-card-delivering"]'),
   decision: decision ? decision.textContent.trim() : null,
   sync_pr: !!card.querySelector('[data-testid="task-card-sync-pr"]'),
+  links: [...card.querySelectorAll('a[href]')].map(a => a.getAttribute('href')),
   text: card.textContent,
   highlighted: card.getAttribute('data-attention-highlight') === 'true',
   focused: document.activeElement === card,
@@ -78,6 +84,11 @@ async fn card(driver: &WebDriver, task_id: &str) -> Result<Option<Card>> {
         delivering: flag("delivering"),
         decision: text("decision"),
         sync_pr: flag("sync_pr"),
+        links: found
+            .get("links")
+            .and_then(Value::as_array)
+            .map(|l| l.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default(),
         text: text("text").unwrap_or_default(),
         highlighted: flag("highlighted"),
         focused: flag("focused"),
@@ -162,6 +173,15 @@ async fn await_rail(driver: &WebDriver, project_id: &str, expected: Option<u64>)
     }
 }
 
+async fn select_project(driver: &WebDriver, project_id: &str) -> Result<()> {
+    ui::visible(driver, &format!("[data-testid=\"rail-project-{project_id}\"]"))
+        .await?
+        .click()
+        .await
+        .with_context(|| format!("could not select project {project_id}"))?;
+    ui::visible(driver, KANBAN_BOARD).await.map(|_| ())
+}
+
 async fn move_to(driver: &WebDriver, task_id: &str, status: &str) -> Result<()> {
     ui::invoke(driver, "update_task_status", json!({ "taskId": task_id, "status": status })).await?;
     Ok(())
@@ -208,8 +228,12 @@ async fn walk_to_what_needs_you(driver: &WebDriver, repository: &GitFixture) -> 
         create_prerequisites(driver, repository, "Needs you failed", "Never runs.").await?;
     let (review, _) = create_task_in(driver, &project_id, "Needs you review").await?;
     let (ordinary, _) = create_task_in(driver, &project_id, "Needs you ordinary").await?;
+    // AI Review counts as running and never as needing the user. Moved there
+    // by hand it has no review to run, so it stays put.
+    let (reviewing, _) = create_task_in(driver, &project_id, "Needs you ai review").await?;
     move_to(driver, &failed, "error").await?;
     move_to(driver, &review, "human_review").await?;
+    move_to(driver, &reviewing, "ai_review").await?;
 
     open_board(driver, &project_id).await?;
     await_header(driver, 2).await?;
@@ -218,6 +242,10 @@ async fn walk_to_what_needs_you(driver: &WebDriver, repository: &GitFixture) -> 
     let review_card = await_reason(driver, &review, Some("review")).await?;
     assert_chip(&review_card, "review", "Needs you \u{00B7} Review", "violet")?;
     await_reason(driver, &ordinary, None).await?;
+    await_reason(driver, &reviewing, None).await?;
+    if attribute(driver, "[data-testid=\"header-running\"]", "data-count").await?.as_deref() != Some("1") {
+        bail!("Running does not count the task under AI review");
+    }
 
     // Precondition: the Human Review card is not on screen yet. A window
     // manager may ignore the resize above (a wide Wayland desktop does), and
@@ -255,7 +283,7 @@ async fn walk_to_what_needs_you(driver: &WebDriver, repository: &GitFixture) -> 
         bail!("the highlight changed the card: {shown:?}");
     }
     let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
-    for (id, status) in [(&failed, "error"), (&review, "human_review"), (&ordinary, "backlog")] {
+    for (id, status) in [(&failed, "error"), (&review, "human_review"), (&ordinary, "backlog"), (&reviewing, "ai_review")] {
         let task = find_task(&listed, id).context("a task disappeared")?;
         if status_of(&task) != Some(status) {
             bail!("pressing Needs you moved {id} to {:?}", status_of(&task));
@@ -287,13 +315,15 @@ async fn delivery_journey(context: &TestContext) -> Result<()> {
     let (agent, gh) = install_fakes(context, &root)?;
     let repository = GitFixture::create(&root.join("fixture-repo"))?;
     repository.point_origin_at_github()?;
+    // A second project, to look at the first from while it is not selected.
+    let elsewhere = GitFixture::create(&root.join("fixture-repo-elsewhere"))?;
     gh.fail_pr_creation(true)?;
     gh.delay_pr_creation(Some(SLOW_CREATE_SECONDS))?;
 
     let session = context.start_session("delivery").await?;
-    let outcome = fail_delivery_twice(session.driver(), &agent, &gh, &repository).await;
+    let outcome = fail_delivery_twice(session.driver(), &agent, &gh, &repository, &elsewhere).await;
     context.close_session(session, "delivery", &outcome).await?;
-    let (executed, failed, review) = outcome?;
+    let (executed, failed, review, other_project) = outcome?;
 
     // Nothing about attention was written down: the task file holds the
     // decision and the failure, and nothing else is needed to derive it.
@@ -309,8 +339,11 @@ async fn delivery_journey(context: &TestContext) -> Result<()> {
     }
 
     gh.fail_pr_creation(false)?;
+    // Long enough to switch projects and read the rail while it runs.
+    gh.delay_pr_creation(Some(SLOW_UNSELECTED_SECONDS))?;
     let session = context.start_session("delivery-restart").await?;
-    let outcome = derive_again_and_deliver(session.driver(), &gh, &executed, &failed, &review).await;
+    let outcome =
+        derive_again_and_deliver(session.driver(), &gh, &executed, &failed, &review, &other_project).await;
     context.close_session(session, "delivery-restart", &outcome).await?;
     outcome
 }
@@ -320,8 +353,10 @@ async fn fail_delivery_twice(
     agent: &FakeAgent,
     gh: &FakeGh,
     repository: &GitFixture,
-) -> Result<(ExecutedTask, String, String)> {
+    elsewhere: &GitFixture,
+) -> Result<(ExecutedTask, String, String, String)> {
     let executed = execute_one_task(driver, agent, repository).await?;
+    let other_project = create_prerequisites(driver, elsewhere, "Elsewhere", "Never runs.").await?.project_id;
     show_on_board(driver, &executed.project_id, HUMAN_REVIEW_COLUMN, &executed.title).await?;
     await_reason(driver, &executed.id, Some("review")).await?;
     await_header(driver, 1).await?;
@@ -374,7 +409,7 @@ async fn fail_delivery_twice(
     let (review, _) = create_task_in(driver, &executed.project_id, "Needs you review").await?;
     move_to(driver, &review, "human_review").await?;
     await_header(driver, 3).await?;
-    Ok((executed, failed, review))
+    Ok((executed, failed, review, other_project))
 }
 
 async fn await_attempt(driver: &WebDriver, number: u64) -> Result<()> {
@@ -397,9 +432,15 @@ async fn derive_again_and_deliver(
     executed: &ExecutedTask,
     failed: &str,
     review: &str,
+    other_project: &str,
 ) -> Result<()> {
     ui::assert_frontend_is_real(driver).await?;
-    open_board(driver, &executed.project_id).await?;
+    // Seen from another project first: the backend's summary, derived again
+    // from the task files, says 3.
+    open_board(driver, other_project).await?;
+    await_header(driver, 0).await?;
+    await_rail(driver, &executed.project_id, Some(3)).await?;
+    select_project(driver, &executed.project_id).await?;
     await_header(driver, 3).await?;
     await_reason(driver, failed, Some("failed")).await?;
     await_reason(driver, review, Some("review")).await?;
@@ -414,21 +455,34 @@ async fn derive_again_and_deliver(
     await_card(driver, &executed.id, "Creating PR after the restart", |c| c.delivering && c.reason.is_none()).await?;
     await_header(driver, 2).await?;
 
+    // Switch away while it runs: the backend knows the attempt is running, so
+    // the project's badge drops the task before any pull request exists.
+    close_drawer(driver).await?;
+    select_project(driver, other_project).await?;
+    await_rail(driver, &executed.project_id, Some(2)).await?;
+    let task = read_task(driver, executed).await?;
+    if status_of(&task) != Some("human_review") || gh.create_attempts()? != 3 {
+        bail!("the badge was read after the attempt ended, so it proves nothing about one in flight: {task}");
+    }
+    if task.pointer("/human_review/pr_error").is_none_or(Value::is_null) {
+        bail!("the earlier failure is no longer recorded while the retry runs: {task}");
+    }
+    select_project(driver, &executed.project_id).await?;
+
     let task = await_task(driver, executed, "PR Created", |t| status_of(t) == Some("pr_created")).await?;
     if gh.create_attempts()? != 3 {
         bail!("expected two failed attempts and one that opened the pull request, saw {}", gh.create_attempts()?);
     }
     let url = task.get("pr_url").and_then(Value::as_str).context("the task records no pull request")?;
+    // Answered while its drawer was closed and the board had been mounted
+    // again: the new board still reads the outcome.
+    open_reviewed_drawer(driver, executed).await?;
     if attribute(driver, HR_DELIVERY, "data-delivery").await?.as_deref() != Some("created") {
         bail!("the drawer does not show the pull request");
     }
     await_reason(driver, &executed.id, None).await?;
     await_header(driver, 2).await?;
-    await_rail(driver, &executed.project_id, Some(2)).await?;
-    let card = card(driver, &executed.id).await?.context("the card is gone")?;
-    if !card.text.contains("PR") {
-        bail!("the card does not show the linked pull request {url}: {:?}", card.text);
-    }
+    await_card(driver, &executed.id, "a link to the pull request", |c| c.links.iter().any(|l| l == url)).await?;
     assert_card_in_column(driver, PR_CREATED_COLUMN, &executed.title).await
 }
 
@@ -475,13 +529,17 @@ async fn decide_twice(driver: &WebDriver, agent: &FakeAgent, repository: &GitFix
     await_card(driver, &executed.id, "no attention once requeued", |c| c.reason.is_none()).await?;
     let started = Instant::now();
     loop {
+        // The header first: whatever it says was true of a record at least
+        // as old as the one read next, so a 1 here with the task not yet back
+        // in Human Review is a real early count, not a race between reads.
+        let shown = header_count(driver).await?;
         let task = read_task(driver, &executed).await?;
         let arrivals = task.pointer("/human_review/arrivals").and_then(Value::as_u64);
         if status_of(&task) == Some("human_review") && arrivals == Some(2) {
             break;
         }
         // Every moment between the request and the next arrival.
-        if header_count(driver).await? != Some(0) {
+        if shown != Some(0) {
             bail!("the task needed the user while {:?}", status_of(&task));
         }
         if started.elapsed() > EXECUTION_DEADLINE {
@@ -549,11 +607,7 @@ async fn compare_projects(driver: &WebDriver, first: &GitFixture, second: &GitFi
     await_rail(driver, &b.project_id, Some(1)).await?;
 
     // Switching to A: the header follows, and B keeps its badge.
-    ui::visible(driver, &format!("[data-testid=\"rail-project-{}\"]", a.project_id))
-        .await?
-        .click()
-        .await
-        .context("could not select project A")?;
+    select_project(driver, &a.project_id).await?;
     await_header(driver, 2).await?;
     await_reason(driver, &a_review, Some("review")).await?;
     await_rail(driver, &b.project_id, Some(1)).await?;

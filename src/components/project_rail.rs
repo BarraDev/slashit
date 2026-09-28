@@ -61,10 +61,21 @@ pub fn ProjectRail(
             }
         });
     };
+    let board = BoardAttention::get();
+    let deliveries = crate::components::attention::Deliveries::get();
     Effect::new(move |_| {
-        // Read again whenever the selection changes: the project being left
-        // stops being counted by its board.
+        // Read again whenever the selection changes, whenever the open
+        // board's count changes or goes away (leaving the board hands its
+        // project back to the summary, which must not be the one from before
+        // the user acted there), and whenever a pull request attempt is
+        // answered.
         selected_project.track();
+        if let Some(board) = board {
+            board.0.track();
+        }
+        if let Some(deliveries) = deliveries {
+            deliveries.settled();
+        }
         read_attention();
     });
     {
@@ -80,7 +91,6 @@ pub fn ProjectRail(
             }
         });
     }
-    let board = BoardAttention::get();
     let needs_you = move |project: Uuid| -> usize {
         match board.and_then(|b| b.0.get()) {
             Some((open, count)) if open == project => count,
