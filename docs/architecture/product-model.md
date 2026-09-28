@@ -136,15 +136,14 @@ the branch is created, and never re-derived afterwards:
    remote-backed repository behaves as it always did.
 2. Otherwise, the **Project's local base** (`Project.base`): a local branch
    (in a colocated JJ repository, a bookmark) captured when the Project was
-   registered or its version control initialized, when that was
-   unambiguous (Git's `HEAD` on a branch that agrees with `origin`, the
-   bookmark JJ's `trunk()` names, or the bookmark Initialize with Jujutsu
-   created), or chosen explicitly in Settings > Repository. A colocated JJ
-   repository's only bookmark is suggested there, never captured on its own. Switching the
-   primary checkout to another branch does not move it. The Task records it
-   as starting from the local base; a pull request for it targets that
-   branch on `origin` only once `origin` has it and contains the Task's
-   starting commit.
+   registered or its version control initialized, when that was unambiguous
+   (Git's `HEAD` on a branch that agrees with `origin`, the bookmark JJ's
+   `trunk()` names, or the bookmark Initialize with Jujutsu created), or
+   chosen explicitly in Settings > Repository. A colocated JJ repository's
+   only bookmark is suggested there, never captured on its own. Switching the
+   primary checkout to another branch does not move it. The Task records it as
+   starting from the local base; a pull request for it targets that branch on
+   `origin` only once `origin` has it and contains the Task's starting commit.
 3. Otherwise the Task is refused with what to do. The primary checkout's
    `HEAD` is never used.
 
@@ -157,15 +156,19 @@ ambiguous.
 
 A folder with no version control, or a Git repository with no commit, is
 registered in a setup-required state. It is never initialized on its own;
-Initialize (in Create Project or Settings > Repository) creates the
-repository without choosing a branch name, so the tool's own configuration
-names it, and records the folder's current files, ignore rules applied, as
-the first commit. Jujutsu is initialized colocated with Git
-(`jj git init --colocate`), since Task Checkouts are Git worktrees.
-Initializing refuses, changing nothing, rather than record less than it
-showed: when the folder holds another Git repository, when a file exceeds
+Initialize (in Create Project or Settings > Repository) creates the repository
+without choosing a branch name, so the tool's own configuration names it, and
+records the folder's current files, ignore rules applied, as the first commit.
+Jujutsu is initialized colocated with Git (`jj git init --colocate`), since
+Task Checkouts are Git worktrees. Initializing refuses, changing nothing,
+rather than record less than it showed: when the folder holds another
+repository (Git, or Jujutsu without Git colocation), when a file exceeds
 Jujutsu's own `snapshot.max-new-file-size` (for Jujutsu), or when the folder
-no longer holds the files that were shown.
+no longer holds the files that were shown. A Jujutsu initialization that fails
+after `jj git init` removes the `.jj` and `.git` it created (and nothing
+else), leaving the folder as it was; if even that fails, the error names what
+was left behind. A Git initialization whose first commit fails leaves a
+repository with no commit, which initializing again completes.
 
 Branches created by earlier versions may record no origin, or a default
 base with no branch, and keep what they recorded. Projects registered by

@@ -218,6 +218,9 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                             let git_refusal = p.refusal(VcsInitKind::Git);
                             let jj_refusal = p.refusal(VcsInitKind::Jujutsu);
                             let offers_jj = p.vcs == Vcs::None && p.jj_available;
+                            let git_disabled = git_refusal.is_some();
+                            // Said once when it is the same reason for both.
+                            let jj_reason = jj_refusal.clone().filter(|why| offers_jj && Some(why) != git_refusal.as_ref());
                             view! {
                                 <div class="p-4 rounded-xl bg-white/5 border border-white/10 space-y-3" data-testid="repository-initialize">
                                     <p class="font-medium text-white/90">"Initialize version control"</p>
@@ -225,7 +228,7 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                                     <div class="flex gap-2">
                                         <button type="button" data-testid="repository-initialize-git"
                                             class="px-3 py-1.5 rounded-lg text-sm bg-purple-500/20 text-purple-300 hover:bg-purple-500/30"
-                                            disabled=move || busy.get() || git_refusal.is_some()
+                                            disabled=move || busy.get() || git_disabled
                                             on:click=move |_| initialize(VcsInitKind::Git)>"Initialize with Git"</button>
                                         {offers_jj.then(|| {
                                             let disabled = jj_refusal.is_some();
@@ -237,7 +240,8 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                                             }
                                         })}
                                     </div>
-                                    {p.refusal(VcsInitKind::Git).map(|why| view! { <p class="text-xs text-amber-400">{why}</p> })}
+                                    {git_refusal.map(|why| view! { <p class="text-xs text-amber-400" data-testid="repository-initialize-git-blocked">{why}</p> })}
+                                    {jj_reason.map(|why| view! { <p class="text-xs text-amber-400" data-testid="repository-initialize-jujutsu-blocked">{format!("Jujutsu: {why}")}</p> })}
                                 </div>
                             }
                         })}

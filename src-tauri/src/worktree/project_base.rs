@@ -271,6 +271,7 @@ mod tests {
     /// A colocated JJ repository (simulated: `.jj` beside `.git`) with a
     /// detached Git `HEAD` only *suggests* its only bookmark, and refuses to
     /// pick between several. Task branches never count.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_colocated_jj_repository_only_suggests_its_only_bookmark() {
         let _no_jj = crate::test_helpers::FakeProgram::without(&["jj"]).await;

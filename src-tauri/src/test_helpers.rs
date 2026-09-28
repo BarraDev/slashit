@@ -119,6 +119,14 @@ impl FakeProgram {
         .await
     }
 
+    /// Where `name` is on the `PATH` this value replaced, which no other
+    /// test could have been changing while it was read: the program a fake
+    /// can hand the calls it does not intercept to.
+    pub fn original(&self, name: &str) -> Option<std::path::PathBuf> {
+        let saved = self.saved_path.as_ref()?;
+        std::env::split_paths(saved).map(|dir| dir.join(name)).find(|p| p.is_file())
+    }
+
     /// Install one more fake program `name` beside the others.
     pub fn add(&self, name: &str, body: &str) {
         use std::os::unix::fs::PermissionsExt;

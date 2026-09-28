@@ -104,16 +104,9 @@ async fn local_only_journey(context: &TestContext) -> Result<()> {
             gh.invocations()?
         );
     }
-    let remotes = std::process::Command::new("git")
-        .arg("remote")
-        .current_dir(repository.path_buf())
-        .output()
-        .context("could not list the fixture's remotes")?;
-    if !remotes.stdout.is_empty() {
-        bail!(
-            "a remote appeared: {}",
-            String::from_utf8_lossy(&remotes.stdout)
-        );
+    let remotes = git_output(&repository.path_buf(), &["remote"])?;
+    if !remotes.is_empty() {
+        bail!("a remote appeared: {remotes}");
     }
     let persisted = super::human_review::persisted_review(&root, &executed.id)?;
     if persisted.status != "human_review"

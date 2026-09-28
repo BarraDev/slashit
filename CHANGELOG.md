@@ -57,20 +57,23 @@ release will contain.
   unambiguous (Git's `HEAD` on a branch that agrees with `origin`, or the
   bookmark Jujutsu's `trunk()` names), otherwise chosen in the new
   Settings > Repository tab. Checking out another branch does not move it.
-- **Explicit repository setup.** Settings > Repository shows whether a
-  project can run tasks and why not, and offers Detect default branch
-  (`git remote set-head origin --auto`, which reads `origin` and writes only
+- **Explicit repository setup.** Settings > Repository shows whether a project
+  can run tasks and why not, and offers Detect default branch (`git remote
+  set-head origin --auto`, which reads `origin` and writes only
   `refs/remotes/origin/HEAD`) and Initialize with Git or Jujutsu. Create
   Project offers the same initialization, saying first what it will record.
   Initializing never picks a branch name, records the folder's current files
   (ignore rules applied) as the first commit, needs a configured commit
   identity, colocates Jujutsu with Git, and refuses rather than record less
-  than it showed: a nested Git repository, a file above Jujutsu's own
-  `snapshot.max-new-file-size`, or a folder that changed since it was shown.
-  A folder is never initialized on its own, and starting a task in one
-  without version control is refused with what to do. A Jujutsu repository
-  that is not colocated with Git is recognised and refused, pointing to
-  `jj git colocation enable`.
+  than it showed: a nested repository, a file above Jujutsu's own
+  `snapshot.max-new-file-size`, or a folder that changed since it was shown. A
+  Jujutsu initialization that fails after `jj git init` is undone, removing
+  only the `.jj` and `.git` it created, so the folder is as it was and can be
+  initialized again; a Git initialization whose first commit fails is
+  completed by initializing again. A folder is never initialized on its own,
+  and starting a task in one without version control is refused with what to
+  do. A Jujutsu repository that is not colocated with Git is recognised and
+  refused, pointing to `jj git colocation enable`.
 - Community health files for the public contribution flow.
 
 ### Changed
@@ -84,16 +87,17 @@ release will contain.
   always with its hooks turned off, so no Worktrunk hook ever ran for a task.
   Worktrees `wt` already created at its own template paths are adopted where
   they are, for reattaching, starting and cleanup alike.
-- **An ordinary task branch starts at `origin`'s default branch**, at the exact
-  commit `refs/remotes/origin/<default>` names, instead of at whatever the
-  primary checkout had checked out (a feature branch, or unpushed work in a
-  Jujutsu-colocated repository). The default branch comes from
+- **An ordinary task branch starts at `origin`'s default branch**, at the
+  exact commit `refs/remotes/origin/<default>` names, instead of at whatever
+  the primary checkout had checked out (a feature branch, or unpushed work in
+  a Jujutsu-colocated repository). The default branch comes from
   `refs/remotes/origin/HEAD`, or from Jujutsu's `trunk()` alias when that is
   exactly `<branch>@origin`, and nothing is fetched to find it. Without
-  either, the branch starts at the project's local base branch (see Added);
-  a remote is not required. The new branch tracks nothing until SlashIt pushes it, and its
-  pull request is opened against that default branch explicitly. Tasks created
-  earlier keep the origin they recorded and open their pull requests as before.
+  either, the branch starts at the project's local base branch (see Added); a
+  remote is not required. The new branch tracks nothing until SlashIt pushes
+  it, and its pull request is opened against that default branch explicitly.
+  Tasks created earlier keep the origin they recorded and open their pull
+  requests as before.
 - **Task branches are named from the whole task id**, `task-<id>`, instead of
   its first eight hex digits, which two tasks could share, and with them one
   checkout. A task keeps the branch it already records, whatever its form. A
