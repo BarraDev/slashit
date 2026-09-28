@@ -157,6 +157,15 @@ impl StartRequest {
             _ => None,
         }
     }
+
+    /// The failure to show for a task now in `status`, if any.
+    ///
+    /// A failed Start is about the Backlog task it was pressed for. The task
+    /// can leave Backlog while the request is still in flight, and a failure
+    /// that lands after that no longer describes where the task is.
+    pub fn failure_for(&self, status: Option<&TaskStatus>) -> Option<&str> {
+        self.failure().filter(|_| status == Some(&TaskStatus::Backlog))
+    }
 }
 
 /// How the output section should describe what it is showing.
@@ -411,6 +420,21 @@ mod tests {
         assert_eq!(start.failure(), None);
         assert_eq!(start.settle(Ok(Some(()))), Some(()));
         assert_eq!(start.failure(), None);
+    }
+
+    #[test]
+    fn a_failed_start_is_shown_only_while_the_task_is_in_backlog() {
+        let mut start = StartRequest::default();
+        assert!(start.begin());
+        // The task moved on while the request was in flight, then it failed.
+        assert_eq!(start.settle::<()>(Err("refused".into())), None);
+        assert_eq!(start.failure_for(Some(&TaskStatus::Queue)), None);
+        assert_eq!(start.failure_for(Some(&TaskStatus::InProgress)), None);
+        assert_eq!(start.failure_for(None), None);
+        assert_eq!(
+            start.failure_for(Some(&TaskStatus::Backlog)),
+            Some("Could not start the task: refused")
+        );
     }
 
     #[test]

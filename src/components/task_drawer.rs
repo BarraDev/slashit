@@ -116,7 +116,9 @@ pub fn TaskDrawer(
 
     let start = RwSignal::new(StartRequest::default());
     // A failed Start is about the Backlog task it was pressed for; once the
-    // task is somewhere else, its reason no longer describes anything.
+    // task is somewhere else, its reason no longer describes anything. The
+    // alert is also gated on Backlog (`failure_for`), because a failure can
+    // land after the task has already left it.
     Effect::new(move |_| {
         if status.get() != Some(TaskStatus::Backlog)
             && start.with_untracked(|s| s.failure().is_some())
@@ -145,13 +147,16 @@ pub fn TaskDrawer(
         }
         spawn_local(async move {
             let outcome = enqueue_task(task_id.to_string()).await;
-            if let Some(Some(updated)) = start.try_update(|s| s.settle(outcome)) {
-                apply_task.try_run(updated);
-            }
-            // Read the task again either way: after a success the scheduler
-            // may already have moved it on, and after a failure the drawer
-            // must show where the task really is.
-            refresh_tasks.try_run(());
+            match start.try_update(|s| s.settle(outcome)) {
+                // Applying the record also reads the task list again, since
+                // the scheduler may already have moved the task on.
+                Some(Some(updated)) => apply_task.try_run(updated),
+                // After a failure the drawer must show where the task really
+                // is.
+                Some(None) => refresh_tasks.try_run(()),
+                // The drawer closed meanwhile.
+                None => return,
+            };
             refresh_run();
         });
     };
@@ -336,6 +341,11 @@ pub fn TaskDrawer(
                                 {move || if start.with(StartRequest::is_pending) { "Starting…" } else { "Start" }}
                             </button>
                         </Show>
+                        // Announced, not only shown: a disabled button's new
+                        // label is easy for a screen reader to miss.
+                        <span data-testid="task-drawer-start-status" role="status" aria-live="polite" class="sr-only">
+                            {move || if start.with(StartRequest::is_pending) { "Starting…" } else { "" }}
+                        </span>
                         <Show when=move || actions.get().stop>
                             <button
                                 data-testid="task-drawer-stop"
@@ -371,7 +381,7 @@ pub fn TaskDrawer(
                         </Show>
                     </section>
 
-                    {move || start.with(|s| s.failure().map(str::to_string)).map(|reason| view! {
+                    {move || start.with(|s| s.failure_for(status.get().as_ref()).map(str::to_string)).map(|reason| view! {
                         <p data-testid="task-drawer-start-error" role="alert" class="text-sm text-red-300 whitespace-pre-wrap break-words">
                             {reason}
                         </p>

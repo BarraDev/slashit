@@ -187,7 +187,6 @@ pub fn TaskContextMenu(
 
                 // Add to Queue
                 <button
-                    data-testid="task-menu-add-to-queue"
                     class="w-full px-3 py-2 text-left text-sm text-white/80 hover:bg-white/10 flex items-center gap-2 transition-colors"
                     on:click=on_add_to_queue_click
                 >
