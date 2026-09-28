@@ -34,6 +34,17 @@ pub async fn get_execution_status(
 }
 
 #[tauri::command]
+pub async fn get_task_run(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<crate::queue::executor::TaskRunSnapshot, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let executor = state.executor.get()
+        .ok_or("Executor not initialized")?;
+    Ok(executor.task_run(task_id).await)
+}
+
+#[tauri::command]
 pub async fn get_task_output(
     state: tauri::State<'_, crate::AppState>,
     task_id: String,

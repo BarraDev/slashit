@@ -7,10 +7,17 @@ use crate::models::task::{
     PrCommentKind, PrReviewApplyResult, PrReviewComment, PrReviewDecisionKind, PrReviewItem,
     PrReviewPlan,
 };
-use crate::components::{TaskCard, TaskEditModal, TaskEditMode, toast, TaskContextMenu, DiffModal};
+use crate::components::{TaskCard, TaskDrawer, TaskEditModal, TaskEditMode, toast, TaskContextMenu, DiffModal};
+use crate::components::task_live::{activity_from_event, changes_task_record, shows_activity, ActivityUpdate};
+use crate::services::task_run_service::listen_agent_events;
 use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// Each running task's current one-line activity, fed by the board's
+/// `agent-event` listener and read by the cards.
+#[derive(Clone, Copy)]
+struct LiveActivity(RwSignal<HashMap<Uuid, String>>);
 
 /// Per-item live status updated as `pr-review-progress` events arrive during
 /// an apply or dry-run. Reset whenever the user starts a fresh run.
@@ -123,6 +130,10 @@ pub fn Kanban(
     #[prop(default = String::new())] project_id: String,
     #[prop(into)] selected_tasks: Signal<Vec<Uuid>>,
     set_selected_tasks: WriteSignal<Vec<Uuid>>,
+    /// Read the task list again (ordered against the board's poll).
+    refresh_tasks: Callback<()>,
+    /// Apply a task record a command returned, superseding older reads.
+    apply_task: Callback<Task>,
 ) -> impl IntoView {
     // Use the provided selection state
     let selected_tasks_signal = selected_tasks;
@@ -223,6 +234,39 @@ pub fn Kanban(
             }
         });
     }
+    // The board's one `agent-event` listener, for as long as the board is
+    // mounted: it keeps each running card's activity line current and reads
+    // the task list again when an event says a task's state changed.
+    let live_activity = RwSignal::new(HashMap::<Uuid, String>::new());
+    provide_context(LiveActivity(live_activity));
+    {
+        let listener = StoredValue::new_local(Some(listen_agent_events(move |event| {
+            let Ok(task_id) = Uuid::parse_str(event.task_id()) else {
+                return;
+            };
+            match activity_from_event(&event) {
+                Some(ActivityUpdate::Set(text)) => live_activity.update(|m| {
+                    m.insert(task_id, text);
+                }),
+                Some(ActivityUpdate::Clear) => {
+                    if live_activity.with_untracked(|m| m.contains_key(&task_id)) {
+                        live_activity.update(|m| {
+                            m.remove(&task_id);
+                        });
+                    }
+                }
+                None => {}
+            }
+            if changes_task_record(&event) {
+                refresh_tasks.run(());
+            }
+        })));
+        on_cleanup(move || listener.dispose());
+    }
+
+    // The task whose drawer is open, if any.
+    let drawer_task = RwSignal::new(None::<Uuid>);
+
     let show_pr_candidates_modal = RwSignal::new(false);
     let pr_candidate_task = RwSignal::new(None::<Task>);
     let pr_candidates = RwSignal::new(Vec::<PrCandidate>::new());
@@ -259,36 +303,16 @@ pub fn Kanban(
         }
     });
 
-    let on_task_click = Callback::new({
-        move |task: Task| {
-            // In review/done phases, show diff instead of edit
-            if matches!(task.status, TaskStatus::AiReview | TaskStatus::HumanReview | TaskStatus::Done | TaskStatus::PrCreated) {
-                let task_id = task.id.to_string();
-                let task_title = task.title.clone();
-                spawn_local(async move {
-                    diff_title.set(format!("Diff: {}", task_title));
-                    match get_task_diff(task_id.clone()).await {
-                        Ok(diff) => diff_content.set(diff),
-                        Err(e) => {
-                            toast::error(format!("Failed to load diff: {}", e));
-                            return;
-                        }
-                    }
-                    match get_task_diff_stat(task_id).await {
-                        Ok(stat) => diff_stat_content.set(stat),
-                        Err(_) => diff_stat_content.set(String::new()),
-                    }
-                    show_diff_modal.set(true);
-                });
-            } else if matches!(task.status, TaskStatus::InProgress) {
-                // InProgress — show info toast, task is running
-                toast::info(format!("'{}' is currently running", task.title));
-            } else {
-                // Backlog, Queue, Error — open edit modal
-                set_modal_mode.set(TaskEditMode::Edit(Box::new(task)));
-                set_show_modal.set(true);
-            }
-        }
+    // Every card opens the same drawer: the task's operational surface.
+    // Editing, the diff and the PR tools stay reachable from the drawer and
+    // the card's menu.
+    let on_task_click = Callback::new(move |task: Task| drawer_task.set(Some(task.id)));
+
+    let on_drawer_close = Callback::new(move |()| drawer_task.set(None));
+    let on_drawer_edit = Callback::new(move |task: Task| {
+        drawer_task.set(None);
+        set_modal_mode.set(TaskEditMode::Edit(Box::new(task)));
+        set_show_modal.set(true);
     });
 
     // Context menu edit handler
@@ -501,6 +525,19 @@ pub fn Kanban(
                     }
                 }).collect::<Vec<_>>()}
             </div>
+
+            // Task drawer, keyed by task: switching tasks mounts a new one.
+            {move || drawer_task.get().map(|id| view! {
+                <TaskDrawer
+                    task_id=id
+                    tasks=tasks_signal
+                    activity=Signal::derive(move || live_activity.with(|m| m.get(&id).cloned()))
+                    on_close=on_drawer_close
+                    on_edit=on_drawer_edit
+                    apply_task=apply_task
+                    refresh_tasks=refresh_tasks
+                />
+            })}
 
             // Task edit modal
             <TaskEditModal
@@ -2155,6 +2192,10 @@ fn KanbanTaskCard(
     let task_id = task.id.to_string();
     let task_id_for_indicator = task.id.to_string();
     let task_uuid = task.id;
+    // Only a running card shows what its agent is doing.
+    let live_activity = use_context::<LiveActivity>()
+        .filter(|_| shows_activity(&task.status))
+        .map(|live| Signal::derive(move || live.0.with(|m| m.get(&task_uuid).cloned())));
 
     // Check if this task is selected
     let is_selected = move || selected_tasks.get().contains(&task_uuid);
@@ -2417,7 +2458,7 @@ fn KanbanTaskCard(
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
                     </svg>
                 </button>
-                <TaskCard task=task.clone() />
+                <TaskCard task=task.clone() activity=live_activity />
                 // "Diff" button for review/done statuses
                 {
                     let show_diff = matches!(

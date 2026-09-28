@@ -414,6 +414,7 @@ pub fn run() {
             stop_task_execution,
             get_execution_status,
             get_task_output,
+            get_task_run,
             commands::workflow::get_workflow_config,
             commands::workflow::update_workflow_config,
             commands::workflow::list_workflows,

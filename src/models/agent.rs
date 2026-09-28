@@ -22,20 +22,68 @@ pub enum AgentStatus {
     Failed(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentLogEntry {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub level: LogLevel,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
     Debug,
     Info,
     Warn,
     Error,
+}
+
+/// One `agent-event` from the backend's task executor.
+///
+/// Mirrors `AgentEvent` in `src-tauri/src/queue/executor.rs`. Every variant
+/// names the task it is about, which is what lets a listener ignore events
+/// for any other task.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEvent {
+    /// A line SlashIt writes about the run (not the agent's own words).
+    Log { task_id: String, level: LogLevel, message: String },
+    /// Text the agent itself wrote.
+    Output { task_id: String, text: String },
+    PhaseChange { task_id: String, phase: crate::models::TaskPhase, progress: u8 },
+    ToolUse { task_id: String, tool: String },
+    Completed { task_id: String, success: bool, message: Option<String> },
+    Error { task_id: String, message: String },
+}
+
+impl AgentEvent {
+    pub fn task_id(&self) -> &str {
+        match self {
+            Self::Log { task_id, .. }
+            | Self::Output { task_id, .. }
+            | Self::PhaseChange { task_id, .. }
+            | Self::ToolUse { task_id, .. }
+            | Self::Completed { task_id, .. }
+            | Self::Error { task_id, .. } => task_id,
+        }
+    }
+}
+
+/// What `get_task_run` reports: whether an agent is working on the task now,
+/// and the task's latest execution in this session.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct TaskRunSnapshot {
+    /// Whether the backend holds a live agent for the task, which is exactly
+    /// when stopping it has something to end.
+    pub live: bool,
+    pub last_execution: Option<ExecutionSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ExecutionSnapshot {
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub stopped_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub output: Vec<AgentLogEntry>,
 }
 
 #[cfg(test)]
@@ -52,6 +100,55 @@ mod tests {
             "started_at": "2026-09-05T00:00:00Z",
             "stopped_at": null,
         })
+    }
+
+    #[test]
+    fn agent_events_decode_the_backend_wire_shape() {
+        let output: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "output", "task_id": "a", "text": "hello"
+        }))
+        .expect("output");
+        assert_eq!(output.task_id(), "a");
+
+        let phase: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "phase_change", "task_id": "b", "phase": "qa_review", "progress": 80
+        }))
+        .expect("phase change");
+        assert_eq!(
+            phase,
+            AgentEvent::PhaseChange {
+                task_id: "b".to_string(),
+                phase: crate::models::TaskPhase::QaReview,
+                progress: 80
+            }
+        );
+
+        let log: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "log", "task_id": "c", "level": "warn", "message": "m"
+        }))
+        .expect("log");
+        assert_eq!(log.task_id(), "c");
+    }
+
+    #[test]
+    fn a_task_run_snapshot_decodes_with_and_without_an_execution() {
+        let none: TaskRunSnapshot =
+            serde_json::from_value(serde_json::json!({"live": false, "last_execution": null}))
+                .expect("no execution");
+        assert_eq!(none, TaskRunSnapshot::default());
+
+        let some: TaskRunSnapshot = serde_json::from_value(serde_json::json!({
+            "live": true,
+            "last_execution": {
+                "started_at": "2026-09-27T10:00:00Z",
+                "stopped_at": null,
+                "output": [{"timestamp": "2026-09-27T10:00:01Z", "level": "error", "message": "boom"}]
+            }
+        }))
+        .expect("an execution");
+        let execution = some.last_execution.expect("present");
+        assert!(some.live);
+        assert_eq!(execution.output[0].level, LogLevel::Error);
     }
 
     #[test]

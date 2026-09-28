@@ -167,6 +167,12 @@ impl RecordedPr {
 pub enum AgentEvent {
     #[serde(rename = "log")]
     Log { task_id: String, level: LogLevel, message: String },
+    /// Text the agent itself wrote, as opposed to a [`AgentEvent::Log`] line
+    /// SlashIt writes about the run. Kept apart so a surface that shows what
+    /// the agent is doing never shows executor bookkeeping (paths, commits)
+    /// as though the agent had said it.
+    #[serde(rename = "output")]
+    Output { task_id: String, text: String },
     #[serde(rename = "phase_change")]
     PhaseChange { task_id: String, phase: TaskPhase, progress: u8 },
     #[serde(rename = "tool_use")]
@@ -406,6 +412,62 @@ impl<T: EventSink + ?Sized> AgentEmit for T {
     }
 }
 
+type ExecutionLogs = Arc<RwLock<HashMap<Uuid, Vec<AgentLogEntry>>>>;
+
+/// The most output entries one execution keeps; older ones are dropped
+/// first. The buffer lives in memory for the whole session and is what a
+/// Task's "recent output" is read from, so it is bounded rather than left to
+/// grow with however long an agent talks.
+const EXECUTION_OUTPUT_LIMIT: usize = 1_000;
+
+/// Append one entry to an execution's output.
+async fn record_output(logs: &ExecutionLogs, execution_id: Uuid, level: LogLevel, message: String) {
+    let mut logs = logs.write().await;
+    let output = logs.entry(execution_id).or_default();
+    output.push(AgentLogEntry { timestamp: chrono::Utc::now(), level, message });
+    if output.len() > EXECUTION_OUTPUT_LIMIT {
+        let excess = output.len() - EXECUTION_OUTPUT_LIMIT;
+        output.drain(..excess);
+    }
+}
+
+/// The non-blank text blocks of an assistant message, in order.
+///
+/// Claude Code without partial messages reports what the agent says only as
+/// whole `assistant` messages, so this is where a run's own words come from.
+fn assistant_text_blocks(content: &serde_json::Value) -> Vec<String> {
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// What a Task's agent is doing right now, and what its latest execution in
+/// this session produced. Read-only; see [`TaskExecutor::task_run`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskRunSnapshot {
+    /// Whether an agent-owning flow (an execution, or an AI review/fix) is
+    /// live for the task, which is exactly when
+    /// [`TaskExecutor::stop_task`] has something to end.
+    pub live: bool,
+    /// The task's most recent execution, if one ran in this session.
+    pub last_execution: Option<ExecutionSnapshot>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecutionSnapshot {
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// `None` while the execution's agent is still running.
+    pub stopped_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub output: Vec<AgentLogEntry>,
+}
+
 pub struct TaskExecutor {
     tasks: Tasks,
     queue_manager: Arc<RwLock<QueueManager>>,
@@ -442,7 +504,7 @@ pub struct TaskExecutor {
     /// the task forever, and it was private to the executor, so it never
     /// serialized against a card the user dragged at the same moment.
     lifecycle: Arc<crate::lifecycle::TaskLifecycleLocks>,
-    logs: Arc<RwLock<HashMap<Uuid, Vec<AgentLogEntry>>>>,
+    logs: ExecutionLogs,
     projects: Arc<RwLock<HashMap<Uuid, crate::domain::Project>>>,
     repositories: Arc<RwLock<HashMap<Uuid, crate::domain::Repository>>>,
     workspace_registry: Arc<RwLock<crate::config::WorkspaceRegistry>>,
@@ -1558,6 +1620,7 @@ impl TaskExecutor {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!("Failed to start claude: {}", e);
+                    record_output(&logs, execution_id, LogLevel::Error, msg.clone()).await;
                     events.agent_event(AgentEvent::Error {
                         task_id: task_id.to_string(),
                         message: msg.clone(),
@@ -1567,6 +1630,10 @@ impl TaskExecutor {
                     // below, so it must remove itself here or this slot never
                     // frees up.
                     running_handles.write().await.remove(&task_id);
+                    if let Some(exec) = executions.write().await.get_mut(&execution_id) {
+                        exec.status = AgentStatus::Failed(msg);
+                        exec.stopped_at = Some(chrono::Utc::now());
+                    }
                     return;
                 }
             };
@@ -1592,27 +1659,32 @@ impl TaskExecutor {
 
             tokio::spawn(async move {
                 while let Ok(event) = event_rx.recv().await {
+                    // Each entry is recorded before its event is emitted, so a
+                    // listener that reacts to the event by reading the output
+                    // back finds the entry already there.
                     match &event {
                         ClaudeEvent::TextDelta { text } => {
-                            events_stream.agent_event(AgentEvent::Log {
+                            record_output(&logs_events, execution_id_events, LogLevel::Info, text.clone()).await;
+                            events_stream.agent_event(AgentEvent::Output {
                                 task_id: task_id_str.clone(),
-                                level: LogLevel::Info,
-                                message: text.clone(),
+                                text: text.clone(),
                             });
                         }
+                        ClaudeEvent::AssistantMessage { content } => {
+                            for text in assistant_text_blocks(content) {
+                                record_output(&logs_events, execution_id_events, LogLevel::Info, text.clone()).await;
+                                events_stream.agent_event(AgentEvent::Output {
+                                    task_id: task_id_str.clone(),
+                                    text,
+                                });
+                            }
+                        }
                         ClaudeEvent::ToolUse { tool, .. } => {
+                            record_output(&logs_events, execution_id_events, LogLevel::Info, format!("Using tool: {}", tool)).await;
                             events_stream.agent_event(AgentEvent::ToolUse {
                                 task_id: task_id_str.clone(),
                                 tool: tool.clone(),
                             });
-                            let entry = AgentLogEntry {
-                                timestamp: chrono::Utc::now(),
-                                level: LogLevel::Info,
-                                message: format!("Using tool: {}", tool),
-                            };
-                            logs_events.write().await.entry(execution_id_events)
-                                .or_insert_with(Vec::new)
-                                .push(entry);
                         }
                         ClaudeEvent::SystemInit { session_id, model, .. } => {
                             // Capture actual model on the task
@@ -1622,18 +1694,17 @@ impl TaskExecutor {
                                     t.model = m.clone();
                                 }
                             }
-                            let entry = AgentLogEntry {
-                                timestamp: chrono::Utc::now(),
-                                level: LogLevel::Info,
-                                message: format!("Session started: {} (model: {})",
+                            record_output(
+                                &logs_events,
+                                execution_id_events,
+                                LogLevel::Info,
+                                format!("Session started: {} (model: {})",
                                     session_id,
                                     model.as_deref().unwrap_or("unknown")),
-                            };
-                            logs_events.write().await.entry(execution_id_events)
-                                .or_insert_with(Vec::new)
-                                .push(entry);
+                            ).await;
                         }
                         ClaudeEvent::Error { message } => {
+                            record_output(&logs_events, execution_id_events, LogLevel::Error, message.clone()).await;
                             events_stream.agent_event(AgentEvent::Error {
                                 task_id: task_id_str.clone(),
                                 message: message.clone(),
@@ -1662,6 +1733,7 @@ impl TaskExecutor {
                             if let Err(message) =
                                 Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await
                             {
+                                record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
                                 events.agent_event(AgentEvent::Error {
                                     task_id: task_id.to_string(),
                                     message: message.clone(),
@@ -1680,10 +1752,12 @@ impl TaskExecutor {
                                     t.updated_at = chrono::Utc::now();
                                 }
                             }
+                            let completed = "Agent completed — moving to AI review".to_string();
+                            record_output(&logs, execution_id, LogLevel::Info, completed.clone()).await;
                             events.agent_event(AgentEvent::Completed {
                                 task_id: task_id.to_string(),
                                 success: true,
-                                message: Some("Agent completed — moving to AI review".to_string()),
+                                message: Some(completed),
                             });
                             Self::persist_task_static(&tasks, &storage, task_id).await;
                         }
@@ -1707,6 +1781,7 @@ impl TaskExecutor {
                             } else {
                                 err_msg.clone()
                             };
+                            record_output(&logs, execution_id, LogLevel::Error, full_msg.clone()).await;
                             events.agent_event(AgentEvent::Error {
                                 task_id: task_id.to_string(),
                                 message: full_msg.clone(),
@@ -1731,10 +1806,12 @@ impl TaskExecutor {
             };
 
             if stopped {
+                let message = "Stopped — ending the agent".to_string();
+                record_output(&logs, execution_id, LogLevel::Info, message.clone()).await;
                 events.agent_event(AgentEvent::Log {
                     task_id: task_id.to_string(),
                     level: LogLevel::Info,
-                    message: "Stopped — ending the agent".to_string(),
+                    message,
                 });
             }
 
@@ -2864,16 +2941,43 @@ impl TaskExecutor {
         }
     }
 
+    /// The output of the task's most recent execution in this session.
     pub async fn get_task_output(&self, task_id: Uuid) -> Vec<AgentLogEntry> {
-        let executions = self.executions.read().await;
-        let eid = executions.values()
-            .find(|e| e.task_id == Some(task_id))
-            .map(|e| e.id);
-        if let Some(eid) = eid {
-            self.logs.read().await.get(&eid).cloned().unwrap_or_default()
-        } else {
-            Vec::new()
-        }
+        self.task_run(task_id)
+            .await
+            .last_execution
+            .map(|execution| execution.output)
+            .unwrap_or_default()
+    }
+
+    /// Whether an agent is working on `task_id` now, and the task's most
+    /// recent execution with its output.
+    ///
+    /// "Most recent" is by start time: a retried task has one execution per
+    /// attempt, and the one a person asking about the task means is the last.
+    pub async fn task_run(&self, task_id: Uuid) -> TaskRunSnapshot {
+        let live = self.running_handles.read().await.contains_key(&task_id)
+            || self.reviewing_handles.read().await.contains_key(&task_id);
+
+        let latest = self
+            .executions
+            .read()
+            .await
+            .values()
+            .filter(|e| e.task_id == Some(task_id))
+            .max_by_key(|e| e.started_at)
+            .map(|e| (e.id, e.started_at, e.stopped_at));
+
+        let last_execution = match latest {
+            Some((id, started_at, stopped_at)) => Some(ExecutionSnapshot {
+                started_at,
+                stopped_at,
+                output: self.logs.read().await.get(&id).cloned().unwrap_or_default(),
+            }),
+            None => None,
+        };
+
+        TaskRunSnapshot { live, last_execution }
     }
 
     // --- Helpers ---
@@ -3943,6 +4047,104 @@ mod tests {
             Some("agent could not start"),
             "the file is what the next start reads, so an error only in memory is no error"
         );
+    }
+
+    fn execution_for(task_id: Uuid, started_at: chrono::DateTime<chrono::Utc>, stopped: bool) -> AgentExecution {
+        AgentExecution {
+            id: Uuid::new_v4(),
+            worktree_id: None,
+            task_id: Some(task_id),
+            agent_type: "claude-code".to_string(),
+            status: if stopped { AgentStatus::Stopped } else { AgentStatus::Running },
+            started_at,
+            stopped_at: stopped.then(chrono::Utc::now),
+        }
+    }
+
+    async fn record_execution(
+        executor: &TaskExecutor,
+        execution: AgentExecution,
+        output: &[&str],
+    ) {
+        let id = execution.id;
+        executor.executions.write().await.insert(id, execution);
+        for line in output {
+            record_output(&executor.logs, id, LogLevel::Info, line.to_string()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn task_run_reads_the_latest_execution_not_an_arbitrary_one() {
+        let (executor, _temps) = test_executor();
+        let task_id = Uuid::new_v4();
+        let earlier = chrono::Utc::now() - chrono::Duration::minutes(5);
+
+        // Inserted newest first so a lookup that took whichever execution a
+        // map happened to yield first would have a real chance of reading the
+        // failed attempt instead of the retry.
+        record_execution(&executor, execution_for(task_id, chrono::Utc::now(), false), &["retry output"]).await;
+        record_execution(&executor, execution_for(task_id, earlier, true), &["failed attempt output"]).await;
+        // Another task's execution never leaks into this one's.
+        record_execution(&executor, execution_for(Uuid::new_v4(), chrono::Utc::now(), false), &["someone else"]).await;
+
+        let run = executor.task_run(task_id).await;
+        let last = run.last_execution.expect("the task has executions");
+        let messages: Vec<&str> = last.output.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, ["retry output"]);
+        assert!(last.stopped_at.is_none());
+        assert_eq!(executor.get_task_output(task_id).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_run_is_live_exactly_while_an_owner_can_be_stopped() {
+        let (executor, _temps) = test_executor();
+        let task_id = Uuid::new_v4();
+
+        let idle = executor.task_run(task_id).await;
+        assert!(!idle.live, "nothing owns a task that never ran");
+        assert!(idle.last_execution.is_none());
+
+        executor.register_fake_running_execution_for_test(task_id).await;
+        assert!(executor.task_run(task_id).await.live);
+
+        executor.stop_task(task_id).await.expect("stop ends the fake owner");
+        assert!(!executor.task_run(task_id).await.live, "a stopped task has nothing left to stop");
+    }
+
+    #[tokio::test]
+    async fn execution_output_keeps_only_the_most_recent_entries() {
+        let (executor, _temps) = test_executor();
+        let execution_id = Uuid::new_v4();
+        for n in 0..EXECUTION_OUTPUT_LIMIT + 5 {
+            record_output(&executor.logs, execution_id, LogLevel::Info, n.to_string()).await;
+        }
+        let logs = executor.logs.read().await;
+        let output = &logs[&execution_id];
+        assert_eq!(output.len(), EXECUTION_OUTPUT_LIMIT);
+        assert_eq!(output.first().map(|e| e.message.as_str()), Some("5"));
+        assert_eq!(output.last().map(|e| e.message.clone()), Some((EXECUTION_OUTPUT_LIMIT + 4).to_string()));
+    }
+
+    #[test]
+    fn assistant_text_blocks_keep_the_agents_words_and_skip_tool_calls() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "  Reading the spec\n"},
+            {"type": "tool_use", "name": "Read", "input": {}},
+            {"type": "text", "text": "   "},
+            {"type": "text", "text": "Now editing"},
+        ]);
+        assert_eq!(assistant_text_blocks(&content), ["Reading the spec", "Now editing"]);
+        assert!(assistant_text_blocks(&serde_json::Value::Null).is_empty());
+    }
+
+    #[test]
+    fn agent_text_is_its_own_event_kind() {
+        let value = serde_json::to_value(AgentEvent::Output {
+            task_id: "t".to_string(),
+            text: "hello".to_string(),
+        })
+        .expect("serialises");
+        assert_eq!(value, serde_json::json!({"type": "output", "task_id": "t", "text": "hello"}));
     }
 
     /// A `TaskExecutor` over nothing but temporary directories.
