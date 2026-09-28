@@ -450,7 +450,7 @@ impl WorktreeManager {
     /// absence, and this function returning a bare empty string used to
     /// supply that proof out of a failed `git` invocation.
     pub fn worktree_list_porcelain(repo_path: &str) -> Option<String> {
-        let output = std::process::Command::new("git")
+        let output = std::process::Command::new(git_program())
             .args(["worktree", "list", "--porcelain", "-z"])
             .current_dir(repo_path)
             .output()
@@ -631,7 +631,7 @@ impl WorktreeManager {
     /// anyway. A listing git could not produce adopts nothing, and whatever
     /// is then tried instead fails on the same git.
     async fn adoptable_worktree(&self, repo_path: &str, branch: &str) -> Result<Option<String>, String> {
-        let Ok(output) = tokio::process::Command::new("git")
+        let Ok(output) = tokio::process::Command::new(git_program())
             .args(["worktree", "list", "--porcelain", "-z"])
             .current_dir(repo_path)
             .output()
@@ -821,7 +821,7 @@ impl WorktreeManager {
     /// The ref a checkout's `HEAD` names, `None` when it is detached, and
     /// the commit it is at.
     async fn checkout_head(worktree: &str) -> Result<(Option<String>, String), String> {
-        let symbolic = tokio::process::Command::new("git")
+        let symbolic = tokio::process::Command::new(git_program())
             .args(["symbolic-ref", "-q", "HEAD"])
             .current_dir(worktree)
             .output()
@@ -831,7 +831,7 @@ impl WorktreeManager {
             .status
             .success()
             .then(|| String::from_utf8_lossy(&symbolic.stdout).trim().to_string());
-        let commit = tokio::process::Command::new("git")
+        let commit = tokio::process::Command::new(git_program())
             .args(["rev-parse", "--verify", "HEAD^{commit}"])
             .current_dir(worktree)
             .output()
@@ -886,7 +886,7 @@ impl WorktreeManager {
             .to_str()
             .ok_or_else(|| "Worktree path is not valid UTF-8".to_string())?;
 
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::new(git_program())
             .args(Self::git_worktree_add_args(dest, branch))
             .current_dir(repo_path)
             .output()
@@ -922,7 +922,7 @@ impl WorktreeManager {
     /// mean something else: a full object ID, `FETCH_HEAD` or `ORIG_HEAD`
     /// when no branch has that name, or a tag of the same name.
     async fn local_branch_tip(repo_path: &str, branch: &str) -> Result<String, String> {
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::new(git_program())
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/heads/{branch}^{{commit}}"))
             .current_dir(repo_path)
@@ -950,7 +950,7 @@ impl WorktreeManager {
     pub async fn local_branch_exists(repo_path: &str, branch: &str) -> Result<bool, String> {
         let branch = checked_task_branch(branch)?;
         let refname = format!("refs/heads/{branch}");
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::new(git_program())
             .args(["for-each-ref", "--format=%(refname)", &refname])
             .current_dir(repo_path)
             .output()
@@ -983,7 +983,7 @@ impl WorktreeManager {
     /// stderr alongside an answer is still a failure.
     pub async fn local_branch_exists_by_status(repo_path: &str, branch: &str) -> Result<bool, String> {
         let checked = checked_task_branch(branch)?;
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::new(git_program())
             .args(["show-ref", "--exists"])
             .arg(format!("refs/heads/{checked}"))
             .current_dir(repo_path)
@@ -1003,7 +1003,7 @@ impl WorktreeManager {
 
     /// Whether `ancestor` is reachable from the local branch `branch`.
     async fn branch_contains(repo_path: &str, branch: &str, ancestor: &str) -> Result<bool, String> {
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::new(git_program())
             .args(["merge-base", "--is-ancestor", ancestor])
             .arg(format!("refs/heads/{branch}"))
             .current_dir(repo_path)
@@ -1024,7 +1024,7 @@ impl WorktreeManager {
     /// branch already exists. `git update-ref` takes the object ID as it is,
     /// where `git branch` would prefer a ref that happens to share its name.
     async fn create_branch_at(repo_path: &str, branch: &str, commit: &str) -> Result<(), String> {
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::new(git_program())
             .args(["update-ref", &format!("refs/heads/{branch}"), commit, ""])
             .current_dir(repo_path)
             .output()
@@ -1065,7 +1065,7 @@ impl WorktreeManager {
                 }
             }
         }
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::new(git_program())
             .args(["update-ref", "-d", &format!("refs/heads/{branch}"), commit])
             .current_dir(repo_path)
             .output()
@@ -1341,7 +1341,7 @@ impl WorktreeManager {
     /// that refusal is reported like any other failure to answer, never read
     /// as an empty listing.
     async fn worktree_listing(repo_path: &str) -> Result<String, String> {
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::new(git_program())
             .args(["worktree", "list", "--porcelain", "-z"])
             .current_dir(repo_path)
             .output()
@@ -1432,7 +1432,7 @@ impl WorktreeManager {
         // second-guess it; ignored build output is not dirty to git and this
         // removal takes the checkout away build output and all.
         let was_present = matches!(Presence::of(Path::new(worktree_path)), Presence::Present);
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::new(git_program())
             .args(["worktree", "remove", worktree_path])
             .current_dir(repo_path)
             .output()
@@ -1755,7 +1755,7 @@ impl WorktreeRecord {
     }
 
     async fn common_dir(repo_path: &str) -> Option<PathBuf> {
-        let output = tokio::process::Command::new("git")
+        let output = tokio::process::Command::new(git_program())
             .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .current_dir(repo_path)
             .output()
@@ -1797,6 +1797,38 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The program this module starts for `git`: `git` itself, looked up on
+/// `PATH`. A unit test can stand in its own `git` for the code it awaits
+/// through [`test_git::scope`], rather than by changing the process-wide
+/// `PATH` that every other test running the real git reads at the same time.
+fn git_program() -> std::ffi::OsString {
+    #[cfg(test)]
+    if let Some(path) = test_git::lookup() {
+        return path.into_os_string();
+    }
+    "git".into()
+}
+
+#[cfg(test)]
+mod test_git {
+    use std::path::PathBuf;
+
+    tokio::task_local! {
+        static GIT: PathBuf;
+    }
+
+    pub(super) fn lookup() -> Option<PathBuf> {
+        GIT.try_with(Clone::clone).ok()
+    }
+
+    /// Runs `future` with `git` started in place of the program `git`. Only
+    /// this task sees it. Unix only, like the shell-script fakes it is for.
+    #[cfg(unix)]
+    pub(super) async fn scope<F: std::future::Future>(git: PathBuf, future: F) -> F::Output {
+        GIT.scope(git, future).await
+    }
 }
 
 #[cfg(test)]
@@ -2621,42 +2653,46 @@ branch refs/heads/some-other-branch
     #[cfg(unix)]
     #[tokio::test]
     async fn a_present_checkout_is_removed_by_a_git_without_listing_z() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Handed to this test's own calls through `test_git::scope`, not put
+        // on `PATH`: every other test spawning git meanwhile would find it
+        // there, including while it is still being written or already gone.
+        let bin = tempfile::tempdir().expect("tempdir");
+        let log = bin.path().join("invocations.log");
+        let old_git = bin.path().join("git");
+        std::fs::write(
+            &old_git,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log:?}\n\
+                 case \" $* \" in *' list '*' -z '*) \
+                 echo \"error: unknown switch \\`z'\" >&2; exit 129;; esac\n\
+                 exec git \"$@\"\n"
+            ),
+        )
+        .expect("write old git");
+        std::fs::set_permissions(&old_git, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod old git");
+
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
         let info = mgr.create(repo_path, "task-old-git").await.expect("create failed");
 
-        let real_git = String::from_utf8(
-            std::process::Command::new("sh")
-                .args(["-c", "command -v git"])
-                .output()
-                .expect("locate git")
-                .stdout,
-        )
-        .expect("git path")
-        .trim()
-        .to_string();
-        let repo = std::fs::canonicalize(repo_path).expect("canonical repo");
-        // Only this test's repository sees the old git; every other test
-        // that spawns git meanwhile gets the real one.
-        let _fake = crate::test_helpers::FakeProgram::install(
-            "git",
-            &format!(
-                "case \"$(pwd -P)\" in {repo:?}*) case \" $* \" in *' list '*' -z '*) \
-                 echo \"error: unknown switch \\`z'\" >&2; exit 129;; esac;; esac\n\
-                 exec {real_git:?} \"$@\"",
-                repo = repo.display().to_string(),
-            ),
-        )
+        test_git::scope(old_git, async {
+            mgr.remove(&info.path, repo_path, Some("task-old-git"))
+                .await
+                .expect("a checkout git removed is removed, whatever the listing can say");
+            assert!(
+                WorktreeManager::worktree_listing(repo_path).await.is_err(),
+                "precondition: this git cannot list with -z"
+            );
+        })
         .await;
-
-        mgr.remove(&info.path, repo_path, Some("task-old-git"))
-            .await
-            .expect("a checkout git removed is removed, whatever the listing can say");
         assert!(!Path::new(&info.path).exists(), "worktree dir should be gone");
         assert!(
-            WorktreeManager::worktree_listing(repo_path).await.is_err(),
-            "precondition: this git cannot list with -z"
+            std::fs::read_to_string(&log).unwrap_or_default().contains("worktree remove"),
+            "precondition: the removal ran through the old git"
         );
     }
 
