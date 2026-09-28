@@ -128,8 +128,9 @@ impl StartRequest {
         true
     }
 
-    /// Settle on the enqueue's answer, handing back the committed record to
-    /// apply if there is one.
+    /// Settle on the enqueue's answer, handing back the task's current record
+    /// to apply if there is one: the one just queued, or the task as it now
+    /// is if it had already moved on.
     pub fn settle<T>(&mut self, outcome: Result<Option<T>, String>) -> Option<T> {
         match outcome {
             Ok(Some(task)) => {

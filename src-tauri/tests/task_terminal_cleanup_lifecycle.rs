@@ -1020,6 +1020,7 @@ fn a_terminal_drag_commits_column_positions_computed_after_its_cleanup() {
             Some(TaskStatus::Done),
             1,
             Some(true),
+            None,
         )
         .await
         .expect("a clean checkout must be removable")
@@ -1122,6 +1123,7 @@ fn a_drag_that_waited_for_the_lease_is_classified_against_the_task_it_finds() {
             Some(TaskStatus::Done),
             0,
             Some(true),
+            None,
         );
         tokio::pin!(drag);
         assert!(

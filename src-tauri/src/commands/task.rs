@@ -634,6 +634,15 @@ pub(crate) fn renumber_column(
 ///
 /// Dropping a card from Human Review onto `Done` needs `close_without_merge`,
 /// as [`update_task_status`] does.
+///
+/// `expected_status` is the column the caller saw the task in. When given and
+/// the task is no longer there, nothing is changed and the answer is the task
+/// as it now is, so a caller can tell a refusal from success by the returned
+/// status. Enqueuing from the UI (Start, Retry, "Add to Queue") always passes
+/// it: without it, a request from a view that is behind -- the task already
+/// started by the scheduler -- would end the running agent and queue the task
+/// again. Every other caller (a drag, the card menu's "Move to", closing
+/// without merging) passes `None` and keeps its existing behavior.
 #[tauri::command]
 pub async fn reorder_task(
     state: tauri::State<'_, crate::AppState>,
@@ -641,6 +650,7 @@ pub async fn reorder_task(
     new_status: Option<TaskStatus>,
     new_position: i32,
     close_without_merge: Option<bool>,
+    expected_status: Option<TaskStatus>,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
@@ -652,6 +662,15 @@ pub async fn reorder_task(
     }) else {
         return Ok(None);
     };
+    // A stale request: the caller acted on a column the task has since left
+    // (a drawer still showing Backlog after the scheduler started the task).
+    // Refused before anything else, under the lease, so no owner is ended, no
+    // status written and no execution state reset -- and answered with the
+    // task as it is, which the caller shows instead of what it expected.
+    if expected_status.as_ref().is_some_and(|expected| *expected != old_status) {
+        return Ok(state.task.tasks.read().await.get(&task_id).cloned());
+    }
+
     let target_status = new_status.unwrap_or_else(|| old_status.clone());
 
     let effect = if old_status == target_status {
@@ -1739,7 +1758,7 @@ mod lifecycle_ownership {
                 .await
                 .expect_err("not confirmed");
             assert_eq!(refused, CLOSE_WITHOUT_MERGE_REQUIRED);
-            let refused = reorder_task(app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, confirmed)
+            let refused = reorder_task(app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, confirmed, None)
                 .await
                 .expect_err("not confirmed");
             assert_eq!(refused, CLOSE_WITHOUT_MERGE_REQUIRED);
@@ -1754,7 +1773,7 @@ mod lifecycle_ownership {
             .expect("confirmed")
             .expect("the task exists");
         assert_eq!(closed.status, TaskStatus::Done);
-        let closed = reorder_task(app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, Some(true))
+        let closed = reorder_task(app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, Some(true), None)
             .await
             .expect("confirmed")
             .expect("the task exists");
@@ -1775,7 +1794,7 @@ mod lifecycle_ownership {
             .expect("no guard")
             .expect("exists");
         assert_eq!(done.status, TaskStatus::Done);
-        let done = reorder_task(app.state(), from_pr.to_string(), Some(TaskStatus::Done), 0, None)
+        let done = reorder_task(app.state(), from_pr.to_string(), Some(TaskStatus::Done), 0, None, None)
             .await
             .expect("no guard")
             .expect("exists");
@@ -1916,7 +1935,7 @@ mod lifecycle_ownership {
         app.manage(state);
 
         // Same column: `new_status` names the column the task is already in.
-        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0, None).await;
+        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
 
         assert!(result.is_ok(), "{result:?}");
         assert!(
@@ -1940,7 +1959,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::Backlog), 0, None).await;
+        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::Backlog), 0, None, None).await;
 
         assert!(result.is_ok(), "{result:?}");
         assert!(
@@ -1948,5 +1967,116 @@ mod lifecycle_ownership {
             "moving a task out of its column must end its previous owner first"
         );
         assert!(!executor.is_task_running(task_id).await);
+    }
+
+    /// A stale enqueue: the person saw the task in one column and asked to
+    /// queue it, but by the time the request holds the lease the task has
+    /// moved on -- here, the scheduler has already started it.
+    async fn stale_enqueue(expected: TaskStatus) {
+        let (_tmp, state) = test_state().await;
+        let executor = attach_test_executor(&state);
+        let task_id = seed(&state, TaskStatus::InProgress).await;
+        {
+            let mut tasks = state.task.tasks.write().await;
+            let task = tasks.get_mut(&task_id).unwrap();
+            task.phase = TaskPhase::Coding;
+            task.phase_progress = 40;
+            task.overall_progress = 30;
+        }
+        let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let result = reorder_task(
+            app.state(),
+            task_id.to_string(),
+            Some(TaskStatus::Queue),
+            0,
+            None,
+            Some(expected.clone()),
+        )
+        .await;
+
+        let answered = result.expect("a stale enqueue answers with the task as it is");
+        assert_eq!(
+            answered.map(|t| t.status),
+            Some(TaskStatus::InProgress),
+            "the answer must be the task's actual state, not a Queue that was never written"
+        );
+        assert!(
+            !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+            "a stale enqueue expecting {expected:?} must not end the running agent"
+        );
+        assert!(executor.is_task_running(task_id).await);
+        assert_eq!(executor.running_task_count().await, 1);
+        let live: &crate::AppState = app.state::<crate::AppState>().inner();
+        let after = live.task.tasks.read().await.get(&task_id).cloned().unwrap();
+        assert_eq!(after.status, TaskStatus::InProgress);
+        assert_eq!(
+            (after.phase, after.phase_progress, after.overall_progress),
+            (TaskPhase::Coding, 40, 30),
+            "the running attempt's execution state must not be reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_start_does_not_restart_a_task_the_scheduler_already_started() {
+        stale_enqueue(TaskStatus::Backlog).await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_retry_does_not_restart_a_task_already_running_again() {
+        stale_enqueue(TaskStatus::Error).await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_retry_leaves_an_already_queued_task_as_it_is() {
+        let (_tmp, state) = test_state().await;
+        let task_id = seed(&state, TaskStatus::Queue).await;
+        let before = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let answered = reorder_task(
+            app.state(),
+            task_id.to_string(),
+            Some(TaskStatus::Queue),
+            5,
+            None,
+            Some(TaskStatus::Error),
+        )
+        .await
+        .expect("a stale retry answers with the task as it is")
+        .expect("the task exists");
+        assert_eq!(answered.status, TaskStatus::Queue);
+        assert_eq!(
+            (answered.position, answered.updated_at),
+            (before.position, before.updated_at),
+            "nothing about the task may be rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_enqueue_from_the_expected_column_still_queues_the_task() {
+        let (_tmp, state) = test_state().await;
+        let task_id = seed(&state, TaskStatus::Backlog).await;
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let answered = reorder_task(
+            app.state(),
+            task_id.to_string(),
+            Some(TaskStatus::Queue),
+            0,
+            None,
+            Some(TaskStatus::Backlog),
+        )
+        .await
+        .expect("enqueue")
+        .expect("the task exists");
+        assert_eq!(answered.status, TaskStatus::Queue);
     }
 }

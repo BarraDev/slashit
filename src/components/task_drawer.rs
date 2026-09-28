@@ -18,7 +18,7 @@ use crate::components::task_review::{AiReviewSection, HumanReviewPanel};
 use crate::components::toast;
 use crate::models::{LogLevel, Task, TaskPhase, TaskRunSnapshot, TaskStatus};
 use crate::services::task_run_service::{get_task_run, listen_agent_events, stop_task_execution};
-use crate::services::{enqueue_task, get_task_diff, get_task_diff_stat};
+use crate::services::{enqueue_task, get_task_diff, get_task_diff_stat, EnqueueOutcome};
 
 /// The most output entries the drawer renders. The backend keeps more; this
 /// is "recent output", not a transcript.
@@ -140,13 +140,21 @@ pub fn TaskDrawer(
 
     // Start enqueues, exactly as the card menu's "Add to Queue" does; the
     // scheduler runs the task when there is capacity. The drawer shows what
-    // the task actually became, never a Running it assumed.
+    // the task actually became, never a Running it assumed. Start is only
+    // offered in Backlog, so that is the column it expects: if the task has
+    // left it meanwhile (the scheduler started it), the backend changes
+    // nothing and the drawer shows where the task really is.
     let on_start = move |_| {
         if !start.try_update(|s| s.begin()).unwrap_or(false) {
             return;
         }
         spawn_local(async move {
-            let outcome = enqueue_task(task_id.to_string()).await;
+            let outcome = enqueue_task(task_id.to_string(), TaskStatus::Backlog)
+                .await
+                .map(|outcome| match outcome {
+                    EnqueueOutcome::Queued(task) | EnqueueOutcome::AlreadyMoved(task) => Some(task),
+                    EnqueueOutcome::Missing => None,
+                });
             match start.try_update(|s| s.settle(outcome)) {
                 // Applying the record also reads the task list again, since
                 // the scheduler may already have moved the task on.
@@ -188,12 +196,17 @@ pub fn TaskDrawer(
         let failure = task.with_untracked(|t| t.as_ref().and_then(|t| t.error_message.clone()));
         retrying.set(true);
         spawn_local(async move {
-            match enqueue_task(task_id.to_string()).await {
-                Ok(Some(updated)) => {
+            match enqueue_task(task_id.to_string(), TaskStatus::Error).await {
+                Ok(EnqueueOutcome::Queued(updated)) => {
                     apply_task.try_run(updated);
                     previous_error.try_set(failure);
                 }
-                Ok(None) => toast::error("This task no longer exists".to_string()),
+                // No longer failed (already retried elsewhere): nothing was
+                // changed; show the task as it is.
+                Ok(EnqueueOutcome::AlreadyMoved(current)) => {
+                    apply_task.try_run(current);
+                }
+                Ok(EnqueueOutcome::Missing) => toast::error("This task no longer exists".to_string()),
                 Err(e) => toast::error(format!("Could not retry the task: {e}")),
             }
             retrying.try_set(false);

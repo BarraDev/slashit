@@ -941,6 +941,8 @@ const QUEUED_WINDOW: Duration = Duration::from_secs(10);
 /// - Once the slot frees, the scheduler starts it on its own: the fixture
 ///   records a real agent process running in the task's own worktree, and
 ///   the open drawer follows the task to Running and on to Human Review.
+/// - A Start sent from a view that still shows Backlog after that changes
+///   nothing: the agent keeps running and is not started again.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_task_drawer_starts_a_backlog_task_through_the_queue() {
     let context = TestContext::new("task_drawer_start").expect("harness setup");
@@ -1188,6 +1190,45 @@ async fn start_from_the_drawer(
         bail!("the started task's agent {pid} is not running while the task shows Running");
     }
 
+    // --- A Start from a view that is behind ------------------------------------
+    //
+    // Exactly what a drawer still showing Backlog sends. The task has left
+    // Backlog, so the backend must change nothing: the agent keeps running,
+    // the task stays in progress, and nothing starts it a second time.
+    let answered = ui::invoke(
+        driver,
+        "reorder_task",
+        json!({
+            "taskId": task_id,
+            "newStatus": "queue",
+            "newPosition": 0,
+            "expectedStatus": "backlog",
+        }),
+    )
+    .await?;
+    if status_of(&answered) != Some("in_progress") {
+        bail!("a stale Start was answered with {answered} instead of the running task as it is");
+    }
+    let watched = Instant::now();
+    while watched.elapsed() < QUEUED_WINDOW {
+        let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
+        let status = find_task(&listed, &task_id)
+            .as_ref()
+            .and_then(|t| status_of(t).map(str::to_string));
+        if status.as_deref() != Some("in_progress") {
+            bail!("after a stale Start the running task went to {status:?}");
+        }
+        if !agent.is_running(pid) {
+            bail!("a stale Start ended the running agent {pid}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    let runs = agent_runs(agent)?.len();
+    if runs != 2 {
+        bail!("{runs} agent runs after a stale Start, expected the same 2 as before it");
+    }
+    await_drawer_status(driver, "inprogress").await?;
+
     // --- And the run carries on as any other ---------------------------------
     let settled = Instant::now();
     loop {
@@ -1235,8 +1276,9 @@ async fn start_from_the_drawer(
 /// protocol, named in its URL and carrying its arguments as the body, or as
 /// a `window.ipc.postMessage` when that protocol is unavailable. Both are
 /// watched, so this sees exactly what crosses the boundary whichever part of
-/// the frontend sent it. Starting a task is `reorder_task` to the queue, and
-/// nothing else in this journey sends one.
+/// the frontend sent it. Starting a task is `reorder_task` to the queue. The
+/// counts are read before the journey sends a `reorder_task` of its own (the
+/// stale Start), so every one they hold came from the drawer.
 async fn count_enqueues(driver: &WebDriver) -> Result<()> {
     let installed = page(
         driver,

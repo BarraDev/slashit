@@ -12,8 +12,20 @@ extern "C" {
     async fn try_invoke(cmd: &str, args: JsValue) -> Result<JsValue, JsValue>;
 }
 
-/// Put a task in the queue, top of the column, and return the record the
-/// backend committed (`None` if the task no longer exists).
+/// What became of a request to queue a task.
+#[derive(Debug, Clone)]
+pub enum EnqueueOutcome {
+    /// The task is in the queue.
+    Queued(Task),
+    /// The task was no longer where the caller saw it, so nothing was
+    /// changed. This is the task as it is now.
+    AlreadyMoved(Task),
+    /// There is no such task.
+    Missing,
+}
+
+/// Put a task in the queue, top of the column, provided it is still in
+/// `seen_in`: the column the person saw it in when they asked.
 ///
 /// This is the one way the UI enqueues a single task: the drawer's Start and
 /// Retry and the card menu's "Add to Queue" all call it, so they cannot
@@ -22,11 +34,18 @@ extern "C" {
 /// configured capacity and ordering. Leaving `Error` resets the attempt's
 /// execution state and keeps its checkout, so a re-queued task continues
 /// where it stopped.
-pub async fn enqueue_task(task_id: String) -> Result<Option<Task>, String> {
+///
+/// `seen_in` is checked by the backend under the task's lifecycle lease. A
+/// view that is behind -- a drawer still showing Backlog after the scheduler
+/// started the task -- therefore gets [`EnqueueOutcome::AlreadyMoved`] with
+/// the task as it is, instead of ending the running agent and queuing the
+/// task again.
+pub async fn enqueue_task(task_id: String, seen_in: TaskStatus) -> Result<EnqueueOutcome, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "taskId": task_id,
         "newStatus": TaskStatus::Queue,
         "newPosition": 0,
+        "expectedStatus": seen_in,
     }))
     .map_err(|e| e.to_string())?;
     let value = try_invoke("reorder_task", args).await.map_err(|error| {
@@ -37,7 +56,14 @@ pub async fn enqueue_task(task_id: String) -> Result<Option<Task>, String> {
                 .unwrap_or_else(|| "reorder_task failed".to_string())
         })
     })?;
-    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+    let answer: Option<Task> = serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())?;
+    // The backend answers a refusal with the task as it is, so the returned
+    // status is what tells the two apart.
+    Ok(match answer {
+        Some(task) if task.status == TaskStatus::Queue => EnqueueOutcome::Queued(task),
+        Some(task) => EnqueueOutcome::AlreadyMoved(task),
+        None => EnqueueOutcome::Missing,
+    })
 }
 
 pub async fn update_queue_config(_project_id: String, config: QueueConfig) -> Result<(), String> {
