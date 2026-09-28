@@ -4,6 +4,7 @@ use leptos::callback::Callback;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use crate::components::{Kanban, bulk_actions::BulkActions, toast};
+use crate::components::task_live::ResponseOrder;
 use crate::services::list_tasks;
 use crate::models::Task;
 use uuid::Uuid;
@@ -60,26 +61,53 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
         project_id.clone()
     });
 
-    // Poll tasks every 5s to reflect backend status changes (auto-promotion, review transitions)
-    let project_id_for_poll = project_id.clone();
-    Effect::new(move |_| {
-        let pid = project_id_for_poll.clone();
+    // Every read of the task list after the first goes through here: the
+    // poll, a live event saying a task changed, and a Stop. They overlap, so
+    // each read takes a ticket and a late answer never overwrites a newer one.
+    let order = StoredValue::new(ResponseOrder::default());
+    let project_id_for_refresh = project_id.clone();
+    let refresh_tasks = Callback::new(move |()| {
+        let pid = project_id_for_refresh.clone();
         if pid.is_empty() {
             return;
         }
-
-        let cb = Closure::wrap(Box::new(move || {
-            let pid = pid.clone();
-            spawn_local(async move {
-                if let Ok(t) = list_tasks(pid).await {
-                    // Only update if tasks actually changed to avoid re-rendering
-                    // (which would destroy open modals/menus)
-                    if t != tasks.get_untracked() {
-                        set_tasks.set(t);
-                    }
+        let Some(ticket) = order.try_update_value(|o| o.issue()) else {
+            return;
+        };
+        spawn_local(async move {
+            if let Ok(t) = list_tasks(pid).await {
+                let current = order.try_update_value(|o| o.accept(ticket)).unwrap_or(false);
+                // Only update if tasks actually changed to avoid re-rendering
+                // (which would destroy open modals/menus)
+                if current && t != tasks.get_untracked() {
+                    set_tasks.set(t);
                 }
-            });
-        }) as Box<dyn Fn()>);
+            }
+        });
+    });
+
+    // A command's own answer is newer than any read issued before it was
+    // applied, so those are dropped. One of them may have been issued after
+    // the command ran and be newer still (the queue can start a re-queued
+    // task at once), so a fresh read follows and restores anything dropped.
+    let apply_task = Callback::new(move |task: Task| {
+        order.update_value(|o| o.supersede_pending());
+        set_tasks.update(|tasks| {
+            if let Some(existing) = tasks.iter_mut().find(|t| t.id == task.id) {
+                *existing = task;
+            }
+        });
+        refresh_tasks.run(());
+    });
+
+    // Poll tasks every 5s to reflect backend status changes (auto-promotion, review transitions)
+    let project_id_for_poll = project_id.clone();
+    Effect::new(move |_| {
+        if project_id_for_poll.is_empty() {
+            return;
+        }
+
+        let cb = Closure::wrap(Box::new(move || refresh_tasks.run(())) as Box<dyn Fn()>);
 
         let window = web_sys::window().unwrap();
         let interval_id = window.set_interval_with_callback_and_timeout_and_arguments_0(
@@ -152,6 +180,8 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
                                 project_id=project_id_kanban
                                 selected_tasks=Signal::from(selected_tasks)
                                 set_selected_tasks=set_selected_tasks
+                                refresh_tasks=refresh_tasks
+                                apply_task=apply_task
                             />
                             </div>
 

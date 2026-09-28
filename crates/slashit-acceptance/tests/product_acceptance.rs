@@ -515,6 +515,666 @@ async fn observe_after_stop(agent: &FakeAgent, stopped: u32) -> Result<AfterStop
     })
 }
 
+// --- The task drawer ------------------------------------------------------
+//
+// The drawer is where a person sees and controls a task, so these journeys
+// drive it the way a person does: click the card, read what the drawer shows,
+// press its buttons. Everything the drawer shows is checked against the
+// product's own answer for the same moment, and every control it offers is
+// checked for its effect on the real agent process and the persisted task.
+
+const TASK_DRAWER: &str = "[data-testid=\"task-drawer\"]";
+const DRAWER_STATUS: &str = "[data-testid=\"task-drawer-status\"]";
+const DRAWER_ACTIVITY: &str = "[data-testid=\"task-drawer-activity\"]";
+const DRAWER_OUTPUT_LINE: &str = "[data-testid=\"task-drawer-output-line\"]";
+const DRAWER_STOP: &str = "[data-testid=\"task-drawer-stop\"]";
+const DRAWER_RETRY: &str = "[data-testid=\"task-drawer-retry\"]";
+const DRAWER_EDIT: &str = "[data-testid=\"task-drawer-edit\"]";
+const DRAWER_ERROR: &str = "[data-testid=\"task-drawer-error\"]";
+const DRAWER_ELAPSED: &str = "[data-testid=\"task-drawer-elapsed\"]";
+const DRAWER_CHANGES_TAB: &str = "[data-testid=\"task-drawer-tab-changes\"]";
+const DRAWER_CHANGES: &str = "[data-testid=\"task-drawer-changes\"]";
+/// How many times the drawer is opened and closed before its listener
+/// hygiene is judged.
+const DRAWER_CYCLES: usize = 5;
+
+/// Prove the drawer shows a running task's live activity and output as the
+/// agent produces them, that its Stop really ends the agent through the
+/// backend, and that it then shows the state the task really settled in.
+///
+/// The same journey holds the drawer's live subscription to its contract:
+/// opening and closing it repeatedly leaves no listener behind, and a drawer
+/// open on one task never shows another task's activity or output.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_task_drawer_shows_a_running_task_live_and_stops_it() {
+    let context = TestContext::new("task_drawer_stop").expect("harness setup");
+    let outcome = drawer_stop_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn drawer_stop_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+
+    let agent = FakeAgent::install(&root)?;
+    let release = agent.block_agent_runs()?;
+    context.set_child_env("PATH", agent.path_value());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
+    context.set_child_env(fake_agent::BLOCK_DIR_VAR, &release);
+    // The run narrates its progress in the stream the product parses, so what
+    // the drawer shows can only have come from real backend execution events.
+    context.set_child_env(fake_agent::PROGRESS_VAR, "1");
+
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("drawer-stop").await?;
+    let outcome = observe_and_stop_in_the_drawer(session.driver(), &agent, &repository).await;
+    // Anything still running is a failure and is left for the session's own
+    // shutdown to end, exactly as the cancellation journey does.
+    context.close_session(session, "drawer-stop", &outcome).await?;
+    outcome
+}
+
+async fn observe_and_stop_in_the_drawer(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    repository: &GitFixture,
+) -> Result<()> {
+    ui::assert_frontend_is_real(driver).await?;
+
+    let Prerequisites {
+        project_id,
+        task_id,
+        title,
+    } = create_prerequisites(
+        driver,
+        repository,
+        "Drawer stop journey",
+        "Exercises watching and stopping a running task from its drawer.",
+    )
+    .await?;
+    // A second task in the same project that never runs: the drawer open on
+    // it is where another task's events must not show up.
+    let (bystander_id, bystander_title) = create_task_in(driver, &project_id, "Drawer bystander").await?;
+
+    open_board(driver, &project_id).await?;
+
+    // --- Listener hygiene --------------------------------------------------
+    //
+    // The board holds one `agent-event` listener for as long as it is mounted
+    // and each open drawer holds one more. Opening and closing must return to
+    // exactly that, however often it happens.
+    await_listener_count(driver, 1).await.context("the board's own listener")?;
+    for cycle in 1..=DRAWER_CYCLES {
+        open_drawer(driver, &bystander_id, &bystander_title).await?;
+        await_listener_count(driver, 2)
+            .await
+            .with_context(|| format!("with the drawer open, cycle {cycle}"))?;
+        close_drawer(driver).await?;
+        await_listener_count(driver, 1)
+            .await
+            .with_context(|| format!("after closing the drawer, cycle {cycle}"))?;
+    }
+
+    // A task with nothing running offers neither Stop nor Retry.
+    open_drawer(driver, &bystander_id, &bystander_title).await?;
+    await_drawer_status(driver, "backlog").await?;
+    assert_not_offered(driver, DRAWER_STOP, "Stop, for a task that never ran").await?;
+    assert_not_offered(driver, DRAWER_RETRY, "Retry, for a task that never failed").await?;
+
+    // --- Task A runs while task B's drawer is open ---------------------------
+    ui::invoke(
+        driver,
+        "update_task_status",
+        json!({ "taskId": task_id, "status": "in_progress" }),
+    )
+    .await?;
+    let agent_pid = await_one_blocked_agent(agent).await?;
+
+    // The board received the running task's events: its card shows what the
+    // agent is doing. This is what makes the next check about isolation rather
+    // than about events never arriving at all.
+    let first_activity = format!("Using {}", fake_agent::PROGRESS_FIRST_TOOL);
+    await_card_activity(driver, &title, &first_activity).await?;
+
+    let leaked = drawer_text(driver).await?;
+    if leaked.contains(fake_agent::PROGRESS_FIRST_TEXT) || leaked.contains(&first_activity) {
+        bail!(
+            "the drawer open on {bystander_title:?} shows another task's live output: {leaked:?}"
+        );
+    }
+    if count(driver, DRAWER_OUTPUT_LINE).await? != 0 {
+        bail!("the drawer open on a task that never ran shows output lines");
+    }
+    if count(driver, DRAWER_ACTIVITY).await? != 0 {
+        bail!("the drawer open on a task that is not running shows live activity");
+    }
+    await_drawer_status(driver, "backlog").await?;
+    close_drawer(driver).await?;
+
+    // --- Task A's drawer: live activity and output ---------------------------
+    open_drawer(driver, &task_id, &title).await?;
+    await_listener_count(driver, 2).await.context("with the running task's drawer open")?;
+    await_drawer_status(driver, "inprogress").await?;
+    await_text(driver, DRAWER_ACTIVITY, |text| text == first_activity, "the first activity").await?;
+    await_output_containing(driver, fake_agent::PROGRESS_FIRST_TEXT).await?;
+    ui::visible(driver, DRAWER_ELAPSED)
+        .await
+        .context("a running task's drawer shows how long it has been running")?;
+    ui::visible(driver, DRAWER_STOP).await.context("a running task offers Stop")?;
+    assert_not_offered(driver, DRAWER_RETRY, "Retry, for a running task").await?;
+    assert_not_offered(driver, DRAWER_EDIT, "Edit, for a running task").await?;
+
+    // The agent takes its next step; the open drawer follows it without being
+    // reopened.
+    if agent.advance_blocked_runs()? != 1 {
+        bail!("the running agent could not be advanced to its next step");
+    }
+    let second_activity = format!("Using {}", fake_agent::PROGRESS_SECOND_TOOL);
+    await_text(driver, DRAWER_ACTIVITY, |text| text == second_activity, "the activity after the agent's next step").await?;
+    await_output_containing(driver, fake_agent::PROGRESS_SECOND_TEXT).await?;
+
+    // Each thing the agent said is shown once: output is read from the
+    // backend's record of the run, not accumulated per delivered event.
+    let lines = output_lines(driver).await?;
+    for said in [fake_agent::PROGRESS_FIRST_TEXT, fake_agent::PROGRESS_SECOND_TEXT] {
+        let shown = lines.iter().filter(|line| line.as_str() == said).count();
+        if shown != 1 {
+            bail!("the drawer shows {said:?} {shown} times, expected once: {lines:?}");
+        }
+    }
+
+    if !agent.is_running(agent_pid) {
+        bail!("the agent {agent_pid} was gone before Stop was pressed; the journey would prove nothing");
+    }
+
+    // --- The action under test: Stop, pressed in the drawer ------------------
+    ui::visible(driver, DRAWER_STOP)
+        .await?
+        .click()
+        .await
+        .context("could not press Stop in the drawer")?;
+
+    // The backend really ended the process.
+    let started = Instant::now();
+    while agent.is_running(agent_pid) {
+        if started.elapsed() > EXECUTION_DEADLINE {
+            bail!("the agent {agent_pid} is still running {}s after Stop was pressed", EXECUTION_DEADLINE.as_secs());
+        }
+        tokio::time::sleep(POLL).await;
+    }
+
+    // The drawer settles on the state the backend settled the task in, and
+    // stops offering Stop once nothing is live.
+    let settled = await_status(driver, &project_id, &task_id, &["backlog"]).await?;
+    await_drawer_status(driver, "backlog").await?;
+    await_absent_from_drawer(driver, DRAWER_STOP, "Stop, once the agent is gone").await?;
+    await_output_containing(driver, "Stopped").await?;
+    if settled.get("phase").and_then(Value::as_str) != Some("idle") {
+        bail!("the stopped task reports phase {:?}, expected idle", settled.get("phase"));
+    }
+
+    // Nothing starts it again on its own.
+    let after = observe_after_stop(agent, agent_pid).await?;
+    if after.runs > 0 {
+        bail!("{} agent run(s) started after the stop with no user action: {:?}", after.runs, after.pids);
+    }
+    await_drawer_status(driver, "backlog").await?;
+
+    close_drawer(driver).await?;
+    await_listener_count(driver, 1).await.context("after closing the running task's drawer")?;
+    Ok(())
+}
+
+/// Prove the drawer shows a failed task's whole failure and its output, and
+/// that its Retry re-queues the task through the product's existing
+/// lifecycle, all the way to Human Review.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_task_drawer_shows_a_failure_in_full_and_retries_it() {
+    let context = TestContext::new("task_drawer_retry").expect("harness setup");
+    let outcome = drawer_retry_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn drawer_retry_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+
+    let agent = FakeAgent::install(&root)?;
+    context.set_child_env("PATH", agent.path_value());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
+    context.set_child_env(fake_agent::FAILING_RUNS_VAR, "1");
+    context.set_child_env(fake_agent::PROGRESS_VAR, "1");
+
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("drawer-retry").await?;
+    let outcome = fail_and_retry_in_the_drawer(session.driver(), &agent, &repository).await;
+    context.close_session(session, "drawer-retry", &outcome).await?;
+    let recovered = outcome?;
+
+    assert_persisted(&root, &recovered, "human_review")?;
+    Ok(())
+}
+
+async fn fail_and_retry_in_the_drawer(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    repository: &GitFixture,
+) -> Result<ExecutedTask> {
+    ui::assert_frontend_is_real(driver).await?;
+
+    let Prerequisites {
+        project_id,
+        task_id,
+        title,
+    } = create_prerequisites(
+        driver,
+        repository,
+        "Drawer retry journey",
+        "Fails with a detailed reason, then succeeds when retried from the drawer.",
+    )
+    .await?;
+
+    open_board(driver, &project_id).await?;
+    ui::invoke(
+        driver,
+        "update_task_status",
+        json!({ "taskId": task_id, "status": "in_progress" }),
+    )
+    .await?;
+
+    let first_run = await_agent_runs(agent, 1).await?;
+    let failed_session = first_run[0]
+        .flag("--session-id")
+        .filter(|session| !session.is_empty())
+        .context("the failed run carried no usable --session-id")?
+        .to_os_string();
+    let failed_worktree = resolve(&first_run[0].working_dir);
+
+    let failed = await_status(driver, &project_id, &task_id, &["error", "human_review"]).await?;
+    let recorded = failed
+        .get("error_message")
+        .and_then(Value::as_str)
+        .context("the failed task records no error message")?
+        .to_string();
+    if recorded != fake_agent::recorded_detailed_failure() {
+        bail!(
+            "the task records {recorded:?}, not the failure the agent reported ({:?})",
+            fake_agent::recorded_detailed_failure()
+        );
+    }
+    let failed_branch = failed
+        .get("branch_name")
+        .and_then(Value::as_str)
+        .context("a task that ran should record its branch")?
+        .to_string();
+
+    // --- The failure, in full --------------------------------------------------
+    assert_card_in_column(driver, ERROR_COLUMN, &title).await?;
+    open_drawer(driver, &task_id, &title).await?;
+    await_drawer_status(driver, "error").await?;
+    let shown = await_text(driver, DRAWER_ERROR, |text| !text.is_empty(), "the failure").await?;
+    if shown.trim() != recorded {
+        bail!("the drawer shows the failure as {shown:?}, but the task records {recorded:?}");
+    }
+    for reason in fake_agent::DETAILED_FAILURE {
+        if !shown.contains(reason) {
+            bail!("the drawer's failure omits {reason:?}: {shown:?}");
+        }
+    }
+
+    // And the output the failed attempt produced, ending in its failure.
+    await_output_containing(driver, fake_agent::PROGRESS_FIRST_TEXT).await?;
+    await_output_containing(driver, fake_agent::DETAILED_FAILURE[2]).await?;
+
+    ui::visible(driver, DRAWER_RETRY).await.context("a failed task offers Retry")?;
+    assert_not_offered(driver, DRAWER_STOP, "Stop, for a failed task with nothing running").await?;
+
+    // --- The action under test: Retry, pressed in the drawer -----------------
+    ui::visible(driver, DRAWER_RETRY)
+        .await?
+        .click()
+        .await
+        .context("could not press Retry in the drawer")?;
+
+    // Re-queued through the existing lifecycle: out of Error, the failure
+    // cleared by the product's own reset, and the attempt's work kept for the
+    // next run to continue from.
+    let requeued = await_status(
+        driver,
+        &project_id,
+        &task_id,
+        &["queue", "in_progress", "ai_review", "human_review", "error"],
+    )
+    .await?;
+    if status_of(&requeued) == Some("error") {
+        bail!("pressing Retry left the task in error");
+    }
+    await_absent_from_drawer(driver, DRAWER_RETRY, "Retry, once the task is queued again").await?;
+    let kept_branch = requeued.get("branch_name").and_then(Value::as_str);
+    if kept_branch != Some(failed_branch.as_str()) {
+        bail!("retrying dropped the task's branch: {kept_branch:?} instead of {failed_branch:?}");
+    }
+
+    // The queue starts it again on its own, in the same worktree.
+    let runs = await_agent_runs(agent, 2).await?;
+    let second_run = retry_among(&runs, &failed_session)?;
+    let retried_worktree = resolve(&second_run.working_dir);
+    if retried_worktree != failed_worktree {
+        bail!(
+            "the retry ran in {} instead of continuing in {}",
+            retried_worktree.display(),
+            failed_worktree.display()
+        );
+    }
+
+    // --- Through to Human Review, still in the open drawer -------------------
+    let settled = await_status(driver, &project_id, &task_id, &["human_review", "error"]).await?;
+    if status_of(&settled) != Some("human_review") {
+        bail!(
+            "the retried run did not reach human review: {:?}",
+            settled.get("error_message")
+        );
+    }
+    await_drawer_status(driver, "humanreview").await?;
+    // The output now belongs to the retry, not the attempt it replaced.
+    await_output_containing(driver, "Agent completed").await?;
+    let lines = output_lines(driver).await?;
+    if lines.iter().any(|line| line.contains(fake_agent::DETAILED_FAILURE[0])) {
+        bail!("after the retry succeeded the drawer still shows the failed attempt's output: {lines:?}");
+    }
+    if count(driver, DRAWER_ERROR).await? != 0 {
+        bail!("a task in human review still shows a failure");
+    }
+
+    // Human Review is read-only here: its changes are reachable, and nothing
+    // else is offered.
+    for (control, what) in [
+        (DRAWER_STOP, "Stop, in human review"),
+        (DRAWER_RETRY, "Retry, in human review"),
+        (DRAWER_EDIT, "Edit, in human review"),
+    ] {
+        assert_not_offered(driver, control, what).await?;
+    }
+    ui::visible(driver, DRAWER_CHANGES_TAB).await?.click().await.context("could not open the Changes tab")?;
+    let changes = await_text(driver, DRAWER_CHANGES, |text| !text.contains("Loading"), "the changes").await?;
+    if changes.contains("Could not load the changes") {
+        bail!("the drawer could not load the task's changes: {changes:?}");
+    }
+
+    close_drawer(driver).await?;
+    assert_card_in_column(driver, HUMAN_REVIEW_COLUMN, &title).await?;
+
+    Ok(ExecutedTask {
+        id: task_id,
+        project_id,
+        title,
+        worktree_path: retried_worktree,
+    })
+}
+
+/// Create one more task in an existing project, through the product's own
+/// command. Returns its id and title.
+async fn create_task_in(driver: &WebDriver, project_id: &str, title_prefix: &str) -> Result<(String, String)> {
+    let title = format!(
+        "{title_prefix} {}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let task = ui::invoke(
+        driver,
+        "create_task",
+        json!({
+            "params": {
+                "projectId": project_id,
+                "title": title,
+                "description": "Never runs.",
+                "model": "default",
+                "planningMode": false,
+                "dependencies": [],
+                "category": Value::Null,
+                "priority": Value::Null,
+                "complexity": Value::Null,
+                "impact": Value::Null,
+                "securitySeverity": Value::Null,
+            }
+        }),
+    )
+    .await?;
+    Ok((created_id(task, "create_task")?, title))
+}
+
+/// Click the card with this title and wait for its drawer.
+///
+/// Retried until the deadline because the board re-renders a card whenever the
+/// task list changes, which can leave a located element stale by the time it
+/// is clicked.
+async fn open_drawer(driver: &WebDriver, task_id: &str, title: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let mut last_problem = String::new();
+        for card in driver.find_all(By::Css("[data-testid=\"task-card\"]")).await? {
+            let Ok(shown) = card.find(By::Css(TASK_TITLE)).await else {
+                continue;
+            };
+            if shown.prop("textContent").await.ok().flatten().as_deref() != Some(title) {
+                continue;
+            }
+            match card.click().await {
+                Ok(()) => {
+                    let selector = format!("{TASK_DRAWER}[data-task-id=\"{task_id}\"]");
+                    ui::visible(driver, &selector)
+                        .await
+                        .with_context(|| format!("clicking the card for {title:?} did not open its drawer"))?;
+                    return Ok(());
+                }
+                Err(error) => last_problem = error.to_string(),
+            }
+        }
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("could not open the drawer for {title:?}: no clickable card ({last_problem})");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn close_drawer(driver: &WebDriver) -> Result<()> {
+    ui::visible(driver, "[data-testid=\"task-drawer-close\"]")
+        .await?
+        .click()
+        .await
+        .context("could not close the drawer")?;
+    let started = Instant::now();
+    while count(driver, TASK_DRAWER).await? != 0 {
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("the drawer did not close");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    Ok(())
+}
+
+/// Run a small script against the page and hand back its JSON answer.
+async fn page(driver: &WebDriver, script: &str, args: Vec<Value>) -> Result<Value> {
+    Ok(driver
+        .execute(script, args)
+        .await
+        .context("could not run a script in the window")?
+        .json()
+        .clone())
+}
+
+async fn count(driver: &WebDriver, selector: &str) -> Result<usize> {
+    let found = page(
+        driver,
+        "return document.querySelectorAll(arguments[0]).length;",
+        vec![Value::String(selector.to_string())],
+    )
+    .await?;
+    Ok(found.as_u64().unwrap_or_default() as usize)
+}
+
+/// The `textContent` of the first match, which WebDriver's rendered text
+/// would omit for a truncated or clamped element.
+async fn text_of(driver: &WebDriver, selector: &str) -> Result<Option<String>> {
+    let found = page(
+        driver,
+        "const e = document.querySelector(arguments[0]); return e ? e.textContent : null;",
+        vec![Value::String(selector.to_string())],
+    )
+    .await?;
+    Ok(found.as_str().map(str::to_string))
+}
+
+/// Everything the open drawer holds, as text.
+async fn drawer_text(driver: &WebDriver) -> Result<String> {
+    Ok(text_of(driver, TASK_DRAWER).await?.unwrap_or_default())
+}
+
+async fn output_lines(driver: &WebDriver) -> Result<Vec<String>> {
+    let found = page(
+        driver,
+        "return Array.from(document.querySelectorAll(arguments[0])).map(e => e.textContent);",
+        vec![Value::String(DRAWER_OUTPUT_LINE.to_string())],
+    )
+    .await?;
+    Ok(found
+        .as_array()
+        .map(|lines| lines.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default())
+}
+
+/// Wait until the element's text satisfies `accept`, and return it.
+async fn await_text(
+    driver: &WebDriver,
+    selector: &str,
+    accept: impl Fn(&str) -> bool,
+    what: &str,
+) -> Result<String> {
+    let started = Instant::now();
+    let mut last = None;
+    loop {
+        // Judged only on what is shown now; `last` is kept for the report.
+        let current = text_of(driver, selector).await?.map(|t| t.trim().to_string());
+        if let Some(text) = current.as_deref().filter(|text| accept(text)) {
+            return Ok(text.to_string());
+        }
+        last = current.or(last);
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("the drawer never showed {what} in {selector}; it last showed {last:?}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn await_drawer_status(driver: &WebDriver, status: &str) -> Result<()> {
+    let selector = format!("{DRAWER_STATUS}[data-status=\"{status}\"]");
+    let started = Instant::now();
+    while count(driver, &selector).await? == 0 {
+        if started.elapsed() > RENDER_DEADLINE {
+            let shown = page(
+                driver,
+                "const e = document.querySelector(arguments[0]); return e ? e.dataset.status : null;",
+                vec![Value::String(DRAWER_STATUS.to_string())],
+            )
+            .await?;
+            bail!("the drawer never showed status {status:?}; it shows {shown}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    Ok(())
+}
+
+async fn await_output_containing(driver: &WebDriver, expected: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let lines = output_lines(driver).await?;
+        if lines.iter().any(|line| line.contains(expected)) {
+            return Ok(());
+        }
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("the drawer's output never contained {expected:?}; it holds {lines:?}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn await_card_activity(driver: &WebDriver, title: &str, expected: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let found = page(
+            driver,
+            r#"
+            const [title] = arguments;
+            for (const card of document.querySelectorAll('[data-testid="task-card"]')) {
+                const t = card.querySelector('[data-testid="task-title"]');
+                if (t && t.textContent === title) {
+                    const a = card.querySelector('[data-testid="task-activity"]');
+                    return a ? a.textContent : null;
+                }
+            }
+            return null;
+            "#,
+            vec![Value::String(title.to_string())],
+        )
+        .await?;
+        if found.as_str() == Some(expected) {
+            return Ok(());
+        }
+        if started.elapsed() > EXECUTION_DEADLINE {
+            bail!("the card for {title:?} never showed activity {expected:?}; it shows {found}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The number of `agent-event` listeners the frontend holds registered with
+/// Tauri, which it publishes on the document element.
+async fn listener_count(driver: &WebDriver) -> Result<Option<i64>> {
+    let found = page(
+        driver,
+        "return document.documentElement.dataset.agentEventListeners ?? null;",
+        Vec::new(),
+    )
+    .await?;
+    Ok(found.as_str().and_then(|n| n.parse().ok()))
+}
+
+async fn await_listener_count(driver: &WebDriver, expected: i64) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let found = listener_count(driver).await?;
+        if found == Some(expected) {
+            return Ok(());
+        }
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("the frontend holds {found:?} agent-event listeners, expected {expected}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn assert_not_offered(driver: &WebDriver, control: &str, what: &str) -> Result<()> {
+    if count(driver, control).await? != 0 {
+        bail!("the drawer offers {what}");
+    }
+    Ok(())
+}
+
+async fn await_absent_from_drawer(driver: &WebDriver, control: &str, what: &str) -> Result<()> {
+    let started = Instant::now();
+    while count(driver, control).await? != 0 {
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("the drawer still offers {what}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    Ok(())
+}
+
 /// Open the board and confirm a card with this title is in this column.
 async fn show_on_board(
     driver: &WebDriver,

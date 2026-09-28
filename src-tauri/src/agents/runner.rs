@@ -382,6 +382,11 @@ pub enum ClaudeEvent {
 pub struct ClaudeRunner {
     child: Arc<Mutex<Child>>,
     event_tx: broadcast::Sender<ClaudeEvent>,
+    /// The receiver created with the channel, handed to the first
+    /// [`subscribe`](Self::subscribe). The reader starts inside `start`, so a
+    /// receiver made only when a caller subscribes afterwards would miss
+    /// whatever the agent wrote first (its `system` line, its first words).
+    first_subscriber: std::sync::Mutex<Option<broadcast::Receiver<ClaudeEvent>>>,
     session_id: Arc<Mutex<Option<String>>>,
     accumulated_output: Arc<RwLock<String>>,
     /// The last stream-json `result` event that reports a failure (see
@@ -537,12 +542,13 @@ impl ClaudeRunner {
             .take()
             .ok_or_else(|| "Failed to open claude's stdin for the prompt".to_string())?;
 
-        let (event_tx, _) = broadcast::channel(512);
+        let (event_tx, first_subscriber) = broadcast::channel(512);
         let prompt_written = Arc::new(AtomicBool::new(false));
 
         let runner = Self {
             child: Arc::new(Mutex::new(child)),
             event_tx,
+            first_subscriber: std::sync::Mutex::new(Some(first_subscriber)),
             session_id: Arc::new(Mutex::new(config.session_id)),
             accumulated_output: Arc::new(RwLock::new(String::new())),
             result_event: Arc::new(RwLock::new(None)),
@@ -646,7 +652,11 @@ impl ClaudeRunner {
 
     /// Subscribe to events.
     pub fn subscribe(&self) -> broadcast::Receiver<ClaudeEvent> {
-        self.event_tx.subscribe()
+        let first = match self.first_subscriber.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        first.unwrap_or_else(|| self.event_tx.subscribe())
     }
 
     /// Get the accumulated text output from all TextDelta and Result events.
@@ -1591,6 +1601,25 @@ mod tests {
         for attempt in 0..3 {
             streaming_round(&fixture, attempt).await;
         }
+    }
+
+    /// A caller subscribes only after `start` returns, by which time the
+    /// reader may already have broadcast the agent's first lines. The first
+    /// subscriber is handed the channel's original receiver, so even a run
+    /// that finished before anyone subscribed is seen in full.
+    #[tokio::test]
+    async fn the_first_subscriber_sees_what_the_agent_wrote_before_it_subscribed() {
+        let fixture = Fixture::new(STREAMING);
+        let runner = fixture.start().await;
+        assert_eq!(bounded("finish before subscribing", &runner).await, Ok(true));
+
+        let mut events = runner.subscribe();
+        drop(runner);
+        let mut seen = Vec::new();
+        while let Ok(event) = events.recv().await {
+            seen.push(describe(&event));
+        }
+        assert_eq!(seen, vec!["system_init", "assistant_message", "text_delta", "result"]);
     }
 
     async fn streaming_round(fixture: &Fixture, attempt: usize) {

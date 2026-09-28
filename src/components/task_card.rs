@@ -4,7 +4,12 @@ use crate::models::{Task, TaskStatus, TaskCategory, TaskPriority, TaskPhase, QaS
 /// Compact task card designed to fit well within Kanban columns
 /// Inspired by Auto Claude's clean, modern design
 #[component]
-pub fn TaskCard(task: Task) -> impl IntoView {
+pub fn TaskCard(
+    task: Task,
+    /// The agent's current one-line activity, for a task that is running.
+    #[prop(default = None)]
+    activity: Option<Signal<Option<String>>>,
+) -> impl IntoView {
     let is_stuck = task.stuck_since.is_some();
     let is_running = task.status == TaskStatus::InProgress;
     let show_review = matches!(task.status, TaskStatus::AiReview | TaskStatus::HumanReview);
@@ -51,6 +56,16 @@ pub fn TaskCard(task: Task) -> impl IntoView {
                     </span>
                 })}
             </div>
+
+            // What the agent is doing right now, in one line.
+            {activity.map(|activity| move || activity.get().map(|text| {
+                let title = text.clone();
+                view! {
+                    <p data-testid="task-activity" class="mb-2 text-[11px] text-blue-300/80 truncate" title=title>
+                        {text}
+                    </p>
+                }
+            }))}
 
             // Progress bar - clean design
             <div data-testid="task-progress">

@@ -91,14 +91,14 @@ impl LoggingEventSink {
 
     /// Whether an event is streaming chatter rather than a state change.
     ///
-    /// `agent-event` carries both: a `log` variant emitted per output chunk,
-    /// and `phase_change` / `completed` / `error`, which a daemon operator
-    /// genuinely wants.
+    /// `agent-event` carries both: `log` and `output` variants emitted per
+    /// output chunk, and `phase_change` / `completed` / `error`, which a
+    /// daemon operator genuinely wants.
     fn is_chatter(event: &str, payload: &serde_json::Value) -> bool {
         event == "agent-event"
             && matches!(
                 payload.get("type").and_then(serde_json::Value::as_str),
-                Some("log") | Some("tool_use")
+                Some("log") | Some("output") | Some("tool_use")
             )
     }
 }
@@ -231,6 +231,10 @@ mod tests {
         assert!(LoggingEventSink::is_chatter(
             "agent-event",
             &serde_json::json!({"type": "tool_use", "tool": "Bash"})
+        ));
+        assert!(LoggingEventSink::is_chatter(
+            "agent-event",
+            &serde_json::json!({"type": "output", "text": "x"})
         ));
 
         for kept in ["phase_change", "completed", "error"] {

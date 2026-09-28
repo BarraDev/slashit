@@ -27,21 +27,50 @@ done
 # The session id is echoed back, so the caller can tie this run to the one it
 # asked for rather than to any run at all. The prompt flag is noted in the same
 # pass: it is what separates an agent run from `--version`, which a real CLI
-# also answers without doing any work.
+# also answers without doing any work. The allowed tools are what tell the
+# coding agent (the only role given Bash) from the review and fix agents.
 session=""
 take_next=""
+take_tools=""
 is_run=""
+is_coding=""
 for arg in "$@"; do
     if [ -n "$take_next" ]; then
         session="$arg"
         take_next=""
         continue
     fi
+    if [ -n "$take_tools" ]; then
+        case "$arg" in
+            *Bash*) is_coding="yes" ;;
+        esac
+        take_tools=""
+        continue
+    fi
     case "$arg" in
         --session-id) take_next="yes" ;;
+        --allowedTools) take_tools="yes" ;;
         -p) is_run="yes" ;;
     esac
 done
+
+# Progress mode, when a journey asked for it: a coding run narrates what it is
+# doing the way Claude Code does without partial messages -- whole `assistant`
+# messages, one holding text and one naming a tool -- so the product's own
+# stream parser and live events are what a journey watches. Only coding runs
+# narrate; the review and fix agents answer exactly as they always did.
+progress=""
+if [ -n "$SLASHIT_FAKE_AGENT_PROGRESS" ] && [ -n "$is_run" ] && [ -n "$is_coding" ]; then
+    progress="yes"
+fi
+
+say() {
+    printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"%s"}]}}\n' "$1"
+}
+
+use_tool() {
+    printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_fake","name":"%s","input":{}}]}}\n' "$1"
+}
 
 # An agent run reads its prompt from stdin to EOF before it answers, as
 # `claude -p` without a prompt argument does. It is kept under the same
@@ -64,6 +93,11 @@ printf '%s\0' "$PWD" "$@" > "$record"
 mv "$record" "$SLASHIT_FAKE_AGENT_MARKERS/invocation-$position"
 
 printf '{"type":"system","subtype":"init","session_id":"%s","model":"slashit-fake-agent"}\n' "$session"
+
+if [ -n "$progress" ]; then
+    say "fake agent step one: reading the task"
+    use_tool "Read"
+fi
 
 # Leave work behind, when a journey asked for it. Written into "$PWD", which is
 # the directory the product started this run in -- the task's worktree -- so
@@ -105,8 +139,17 @@ if [ -n "$SLASHIT_FAKE_AGENT_BLOCK_DIR" ] && [ -n "$is_run" ]; then
     mv "$pidfile" "$processes/$name"
 
     # Blocks in the kernel until this run's own release arrives. A failed read
-    # is a released or closed pipe, not a reason to abandon the run.
-    read -r _release <&3 || true
+    # is a released or closed pipe, not a reason to abandon the run. In
+    # progress mode an `advance` line is not a release: the run takes its next
+    # step and goes back to waiting.
+    while read -r command <&3; do
+        if [ "$command" = "advance" ] && [ -n "$progress" ]; then
+            say "fake agent step two: editing the code"
+            use_tool "Edit"
+            continue
+        fi
+        break
+    done
 
     # Stop being releasable in the same breath as stopping to wait, so that an
     # announced run is one that is still owed a release and nothing else.
@@ -135,6 +178,11 @@ if [ -n "$is_run" ] && [ "$failing" -gt 0 ]; then
         # A well-formed result that reports failure, with a zero exit status:
         # the agent ran and said it could not do the work, which is a different
         # thing from the agent crashing.
+        if [ -n "$progress" ]; then
+            # A failure explained over several lines, as an agent reports one.
+            printf '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"%s","result":"fake agent was scripted to fail this run","errors":["the change could not be applied: 3 of 12 checks failed","parser::rejects_empty_input expected an error and got none","stopping here so a person can decide how to continue"]}\n' "$session"
+            exit 0
+        fi
         printf '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"%s","result":"fake agent was scripted to fail this run"}\n' "$session"
         exit 0
     fi

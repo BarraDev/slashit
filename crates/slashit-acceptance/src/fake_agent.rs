@@ -123,6 +123,45 @@ pub const WORK_CONTENT: &str = "work produced by the fake agent\n";
 /// execution the journey is about.
 pub const BLOCK_DIR_VAR: &str = "SLASHIT_FAKE_AGENT_BLOCK_DIR";
 
+/// The variable that makes a coding run narrate its progress.
+///
+/// Set to any value, a coding run (the one role the executor gives `Bash`)
+/// writes [`PROGRESS_FIRST_TEXT`] and a [`PROGRESS_FIRST_TOOL`] call as whole
+/// `assistant` messages right after its `system` line — the shape Claude Code
+/// uses without partial messages — and, while blocked, answers each
+/// [`FakeAgent::advance_blocked_runs`] with [`PROGRESS_SECOND_TEXT`] and a
+/// [`PROGRESS_SECOND_TOOL`] call. A run scripted to fail reports
+/// [`DETAILED_FAILURE`] instead of the one-line [`REPORTED_FAILURE`].
+///
+/// Unset — every journey that does not ask for it — nothing about the
+/// fixture's output changes. Review and fix runs never narrate either way,
+/// so the reviewer's verdict parsing sees exactly what it always saw.
+pub const PROGRESS_VAR: &str = "SLASHIT_FAKE_AGENT_PROGRESS";
+
+/// What a narrating run says first.
+pub const PROGRESS_FIRST_TEXT: &str = "fake agent step one: reading the task";
+/// The tool a narrating run uses first.
+pub const PROGRESS_FIRST_TOOL: &str = "Read";
+/// What a narrating run says when advanced.
+pub const PROGRESS_SECOND_TEXT: &str = "fake agent step two: editing the code";
+/// The tool a narrating run uses when advanced.
+pub const PROGRESS_SECOND_TOOL: &str = "Edit";
+
+/// The lines a narrating run scripted to fail gives as its reasons, in the
+/// `errors` list of its result event.
+pub const DETAILED_FAILURE: [&str; 3] = [
+    "the change could not be applied: 3 of 12 checks failed",
+    "parser::rejects_empty_input expected an error and got none",
+    "stopping here so a person can decide how to continue",
+];
+
+/// The error message the product records for a narrating run scripted to
+/// fail: the subtype, then every reason, joined on one line by the runner's
+/// `result_failure_reason`.
+pub fn recorded_detailed_failure() -> String {
+    format!("{REPORTED_FAILURE_SUBTYPE}: {}", DETAILED_FAILURE.join("; "))
+}
+
 /// The fixture script: a file that already exists, rather than one written
 /// here and then run.
 ///
@@ -428,6 +467,20 @@ impl FakeAgent {
     /// took no release. Any other failure is a broken fixture rather than a
     /// race to swallow.
     pub fn release_blocked_runs(&self) -> Result<usize> {
+        self.tell_blocked_runs(b"release\n")
+    }
+
+    /// Have every currently blocked run in progress mode take its next step
+    /// and go back to waiting, and say how many were told.
+    ///
+    /// Addressed exactly as [`release_blocked_runs`](Self::release_blocked_runs)
+    /// is, one pipe per run. A run that is not narrating treats it as a
+    /// release, because the only thing it waits for is to be let go.
+    pub fn advance_blocked_runs(&self) -> Result<usize> {
+        self.tell_blocked_runs(b"advance\n")
+    }
+
+    fn tell_blocked_runs(&self, line: &[u8]) -> Result<usize> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -438,7 +491,7 @@ impl FakeAgent {
                 .write(true)
                 .custom_flags(libc::O_NONBLOCK)
                 .open(&pipe)
-                .and_then(|mut writer| writer.write_all(b"release\n"));
+                .and_then(|mut writer| writer.write_all(line));
             match delivered {
                 Ok(()) => released += 1,
                 // That run stopped waiting: `ENXIO` because nothing has the
@@ -565,12 +618,149 @@ mod tests {
             FAILING_RUNS_VAR,
             WRITE_FILE_VAR,
             BLOCK_DIR_VAR,
-        ] {
+            PROGRESS_VAR,
+            PROGRESS_FIRST_TEXT,
+            PROGRESS_FIRST_TOOL,
+            PROGRESS_SECOND_TEXT,
+            PROGRESS_SECOND_TOOL,
+        ]
+        .into_iter()
+        .chain(DETAILED_FAILURE)
+        {
             assert!(
                 script.contains(expected),
                 "the fixture script never mentions {expected:?}"
             );
         }
+    }
+
+    /// The stream-json lines a run wrote, parsed.
+    fn json_lines(stdout: &[u8]) -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON ({e}): {l}")))
+            .collect()
+    }
+
+    /// The text and tool names of every `assistant` message, in order.
+    fn narration(lines: &[serde_json::Value]) -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l["type"] == "assistant")
+            .flat_map(|l| l["message"]["content"].as_array().cloned().unwrap_or_default())
+            .map(|block| match block["type"].as_str() {
+                Some("text") => block["text"].as_str().unwrap_or_default().to_string(),
+                Some("tool_use") => format!("tool:{}", block["name"].as_str().unwrap_or_default()),
+                other => panic!("unexpected content block {other:?}"),
+            })
+            .collect()
+    }
+
+    fn progress_run(agent: &FakeAgent, tools: &str, extra: &[(&str, &OsStr)]) -> std::process::Output {
+        let mut command = std::process::Command::new(agent.executable());
+        command
+            .args(["-p", "--allowedTools", tools, "--session-id", "narrating"])
+            .env(MARKER_DIR_VAR, agent.marker_dir())
+            .env(PROGRESS_VAR, "1")
+            .stdin(std::process::Stdio::null());
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        command.output().expect("run the fixture")
+    }
+
+    /// Progress mode narrates a coding run and nothing else, so the review a
+    /// journey reaches afterwards parses the answer it always parsed.
+    #[test]
+    fn only_a_coding_run_narrates_its_progress() {
+        let root = scratch("progress-roles");
+        let agent = FakeAgent::install(&root).expect("install");
+
+        let coding = json_lines(&progress_run(&agent, "Read,Edit,Write,Bash,Glob,Grep", &[]).stdout);
+        assert_eq!(
+            narration(&coding),
+            [PROGRESS_FIRST_TEXT.to_string(), format!("tool:{PROGRESS_FIRST_TOOL}")]
+        );
+        assert_eq!(coding.last().expect("a result")["is_error"], false);
+
+        let review = json_lines(&progress_run(&agent, "Read,Glob,Grep", &[]).stdout);
+        assert!(narration(&review).is_empty(), "a review run must not narrate: {review:?}");
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// A narrating failure gives every one of its reasons.
+    #[test]
+    fn a_narrating_failure_reports_each_reason() {
+        let root = scratch("progress-failure");
+        let agent = FakeAgent::install(&root).expect("install");
+
+        let failed = json_lines(
+            &progress_run(&agent, "Bash", &[(FAILING_RUNS_VAR, OsStr::new("1"))]).stdout,
+        );
+        let result = failed.last().expect("a result");
+        assert_eq!(result["is_error"], true);
+        assert_eq!(result["subtype"], REPORTED_FAILURE_SUBTYPE);
+        let errors: Vec<&str> = result["errors"]
+            .as_array()
+            .expect("an errors list")
+            .iter()
+            .map(|e| e.as_str().expect("a string"))
+            .collect();
+        assert_eq!(errors, DETAILED_FAILURE);
+
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// Advancing a blocked narrating run makes it take its next step and keep
+    /// waiting, so a journey can watch activity change on a run it still
+    /// means to stop.
+    #[test]
+    fn an_advanced_run_takes_its_next_step_and_keeps_waiting() {
+        let root = scratch("progress-advance");
+        let agent = FakeAgent::install(&root).expect("install");
+        let releases = agent.block_agent_runs().expect("create the release directory");
+
+        let mut child = OwnedRun(
+            std::process::Command::new(agent.executable())
+                .args(["-p", "--allowedTools", "Bash", "--session-id", "advanced"])
+                .env(MARKER_DIR_VAR, agent.marker_dir())
+                .env(BLOCK_DIR_VAR, &releases)
+                .env(PROGRESS_VAR, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("start the fixture"),
+        );
+        until(
+            || agent.blocked_pids().expect("read the pid records").len() == 1,
+            "the run never announced itself as blocked",
+        );
+
+        assert_eq!(agent.advance_blocked_runs().expect("advance"), 1);
+        // Still blocked after the step: advancing is not releasing.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(child.try_wait().expect("poll the child").is_none(), "an advance ended the run");
+        assert_eq!(agent.blocked_pids().expect("read the pid records").len(), 1);
+
+        assert_eq!(agent.release_blocked_runs().expect("release"), 1);
+        assert!(child.wait().expect("wait for the released run").success());
+        let mut stdout = Vec::new();
+        std::io::Read::read_to_end(&mut child.stdout.take().expect("piped stdout"), &mut stdout)
+            .expect("read what the run wrote");
+        let lines = json_lines(&stdout);
+        assert_eq!(
+            narration(&lines),
+            [
+                PROGRESS_FIRST_TEXT.to_string(),
+                format!("tool:{PROGRESS_FIRST_TOOL}"),
+                PROGRESS_SECOND_TEXT.to_string(),
+                format!("tool:{PROGRESS_SECOND_TOOL}"),
+            ]
+        );
+
+        std::fs::remove_dir_all(&root).expect("clean up");
     }
 
     /// The fixture has to behave like the program it stands in for, so the
