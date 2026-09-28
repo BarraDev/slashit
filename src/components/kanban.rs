@@ -258,7 +258,7 @@ pub fn Kanban(
                 None => {}
             }
             if changes_task_record(&event) {
-                refresh_tasks.run(());
+                refresh_tasks.try_run(());
             }
         })));
         on_cleanup(move || listener.dispose());

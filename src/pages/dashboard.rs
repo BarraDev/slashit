@@ -86,7 +86,10 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
         });
     });
 
-    // A command's own answer is newer than any read still in flight.
+    // A command's own answer is newer than any read issued before it was
+    // applied, so those are dropped. One of them may have been issued after
+    // the command ran and be newer still (the queue can start a re-queued
+    // task at once), so a fresh read follows and restores anything dropped.
     let apply_task = Callback::new(move |task: Task| {
         order.update_value(|o| o.supersede_pending());
         set_tasks.update(|tasks| {
@@ -94,6 +97,7 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
                 *existing = task;
             }
         });
+        refresh_tasks.run(());
     });
 
     // Poll tasks every 5s to reflect backend status changes (auto-promotion, review transitions)

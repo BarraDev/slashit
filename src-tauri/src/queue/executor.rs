@@ -1621,19 +1621,20 @@ impl TaskExecutor {
                 Err(e) => {
                     let msg = format!("Failed to start claude: {}", e);
                     record_output(&logs, execution_id, LogLevel::Error, msg.clone()).await;
-                    events.agent_event(AgentEvent::Error {
-                        task_id: task_id.to_string(),
-                        message: msg.clone(),
-                    });
                     Self::set_task_error_static(&tasks, &storage, &events, task_id, &msg).await;
                     // This early return skips the removal after `runner.wait()`
                     // below, so it must remove itself here or this slot never
                     // frees up.
                     running_handles.write().await.remove(&task_id);
                     if let Some(exec) = executions.write().await.get_mut(&execution_id) {
-                        exec.status = AgentStatus::Failed(msg);
+                        exec.status = AgentStatus::Failed(msg.clone());
                         exec.stopped_at = Some(chrono::Utc::now());
                     }
+                    // Announced last, as the end of every run is: see below.
+                    events.agent_event(AgentEvent::Error {
+                        task_id: task_id.to_string(),
+                        message: msg,
+                    });
                     return;
                 }
             };
@@ -1721,6 +1722,11 @@ impl TaskExecutor {
             // the completion it is: when both arms are ready the run finished
             // before the stop reached it, and calling that a cancellation would
             // throw away a result the agent had already produced.
+            // How the run ended, announced only once the run is fully over:
+            // the failure recorded, the handle gone and the execution marked
+            // stopped. A listener that reacts by reading the task back then
+            // sees where it settled, not a run that still looks live.
+            let mut ending: Option<AgentEvent> = None;
             let stopped = tokio::select! {
                 biased;
 
@@ -1734,11 +1740,11 @@ impl TaskExecutor {
                                 Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await
                             {
                                 record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
-                                events.agent_event(AgentEvent::Error {
-                                    task_id: task_id.to_string(),
-                                    message: message.clone(),
-                                });
                                 Self::set_task_error_static(&tasks, &storage, &events, task_id, &message).await;
+                                ending = Some(AgentEvent::Error {
+                                    task_id: task_id.to_string(),
+                                    message,
+                                });
                                 break 'finished;
                             }
 
@@ -1754,12 +1760,12 @@ impl TaskExecutor {
                             }
                             let completed = "Agent completed — moving to AI review".to_string();
                             record_output(&logs, execution_id, LogLevel::Info, completed.clone()).await;
-                            events.agent_event(AgentEvent::Completed {
+                            Self::persist_task_static(&tasks, &storage, task_id).await;
+                            ending = Some(AgentEvent::Completed {
                                 task_id: task_id.to_string(),
                                 success: true,
                                 message: Some(completed),
                             });
-                            Self::persist_task_static(&tasks, &storage, task_id).await;
                         }
                         Err(err_msg) => {
                             // Nothing on stderr or in the result event said
@@ -1782,11 +1788,11 @@ impl TaskExecutor {
                                 err_msg.clone()
                             };
                             record_output(&logs, execution_id, LogLevel::Error, full_msg.clone()).await;
-                            events.agent_event(AgentEvent::Error {
-                                task_id: task_id.to_string(),
-                                message: full_msg.clone(),
-                            });
                             Self::set_task_error_static(&tasks, &storage, &events, task_id, &full_msg).await;
+                            ending = Some(AgentEvent::Error {
+                                task_id: task_id.to_string(),
+                                message: full_msg,
+                            });
                         }
                     }
                     false
@@ -1823,6 +1829,10 @@ impl TaskExecutor {
             if let Some(exec) = executions.write().await.get_mut(&execution_id) {
                 exec.status = AgentStatus::Stopped;
                 exec.stopped_at = Some(chrono::Utc::now());
+            }
+
+            if let Some(ending) = ending {
+                events.agent_event(ending);
             }
         });
 
@@ -4079,11 +4089,14 @@ mod tests {
         let task_id = Uuid::new_v4();
         let earlier = chrono::Utc::now() - chrono::Duration::minutes(5);
 
-        // Inserted newest first so a lookup that took whichever execution a
-        // map happened to yield first would have a real chance of reading the
-        // failed attempt instead of the retry.
+        // Twenty earlier attempts beside the latest one: a lookup that took
+        // whichever execution the map happened to yield first would read an
+        // earlier attempt twenty times in twenty-one.
         record_execution(&executor, execution_for(task_id, chrono::Utc::now(), false), &["retry output"]).await;
-        record_execution(&executor, execution_for(task_id, earlier, true), &["failed attempt output"]).await;
+        for n in 0..20 {
+            let started = earlier - chrono::Duration::seconds(n);
+            record_execution(&executor, execution_for(task_id, started, true), &["failed attempt output"]).await;
+        }
         // Another task's execution never leaks into this one's.
         record_execution(&executor, execution_for(Uuid::new_v4(), chrono::Utc::now(), false), &["someone else"]).await;
 

@@ -50,6 +50,7 @@ pub fn TaskDrawer(
 
     let run = RwSignal::new(TaskRunSnapshot::default());
     let run_loaded = RwSignal::new(false);
+    let run_error = RwSignal::new(None::<String>);
     let gate = StoredValue::new(RefreshGate::default());
 
     // Re-read the run snapshot, coalescing requests that arrive while one is
@@ -67,8 +68,13 @@ pub fn TaskDrawer(
                             return;
                         }
                         run_loaded.try_set(true);
+                        run_error.try_set(None);
                     }
-                    Err(e) => leptos::logging::warn!("[task-drawer] reading the run failed: {e}"),
+                    Err(e) => {
+                        if run_error.try_set(Some(e)).is_some() {
+                            return;
+                        }
+                    }
                 }
                 if !gate.try_update_value(|g| g.finish()).unwrap_or(false) {
                     return;
@@ -133,7 +139,8 @@ pub fn TaskDrawer(
             if let Err(e) = stop_task_execution(task_id.to_string()).await {
                 toast::error(format!("Could not stop the task: {e}"));
             }
-            refresh_tasks.run(());
+            // The board may have gone while the stop was running.
+            refresh_tasks.try_run(());
             stopping.try_set(false);
             refresh_run();
         });
@@ -148,7 +155,7 @@ pub fn TaskDrawer(
         spawn_local(async move {
             match requeue_task(task_id.to_string()).await {
                 Ok(Some(updated)) => {
-                    apply_task.run(updated);
+                    apply_task.try_run(updated);
                     previous_error.try_set(failure);
                 }
                 Ok(None) => toast::error("This task no longer exists".to_string()),
@@ -160,13 +167,10 @@ pub fn TaskDrawer(
     };
 
     let tab = RwSignal::new(Tab::Output);
-    // Loaded the first time the Changes tab is opened.
+    // Loaded when the Changes tab is opened, and again if the task moves on
+    // while it is open (an AI review fix changes the code).
     let changes = RwSignal::new(None::<Result<(String, String), String>>);
-    let open_changes = move |_| {
-        tab.set(Tab::Changes);
-        if changes.get_untracked().is_some() {
-            return;
-        }
+    let load_changes = move || {
         spawn_local(async move {
             let loaded = match get_task_diff(task_id.to_string()).await {
                 Ok(diff) => {
@@ -178,6 +182,22 @@ pub fn TaskDrawer(
             changes.try_set(Some(loaded));
         });
     };
+    let open_changes = move |_| {
+        tab.set(Tab::Changes);
+        if changes.get_untracked().is_none() {
+            load_changes();
+        }
+    };
+    Effect::new(move |previous: Option<Option<TaskStatus>>| {
+        let current = status.get();
+        if previous.is_some_and(|p| p != current) {
+            changes.set(None);
+            if tab.get_untracked() == Tab::Changes {
+                load_changes();
+            }
+        }
+        current
+    });
     // A task that no longer has changes to show falls back to its output.
     Effect::new(move |_| {
         if !actions.get().changes && tab.get_untracked() == Tab::Changes {
@@ -185,23 +205,53 @@ pub fn TaskDrawer(
         }
     });
 
+    // Follow new output only while the reader is already at the bottom, so
+    // scrolling back to read earlier output is not undone by the next line.
     let output_ref = NodeRef::<leptos::html::Div>::new();
+    let follow_output = StoredValue::new(true);
     Effect::new(move |_| {
         run.track();
         if let Some(el) = output_ref.get() {
-            el.set_scroll_top(el.scroll_height());
+            if follow_output.get_value() {
+                el.set_scroll_top(el.scroll_height());
+            }
         }
     });
+    let on_output_scroll = move |_| {
+        if let Some(el) = output_ref.get_untracked() {
+            let at_bottom = el.scroll_top() + el.client_height() >= el.scroll_height() - 24;
+            follow_output.set_value(at_bottom);
+        }
+    };
 
     let close = move |_| on_close.run(());
+
+    // Focus the drawer when it opens, so Escape closes it without a click.
+    let drawer_ref = NodeRef::<leptos::html::Aside>::new();
+    Effect::new(move |_| {
+        if let Some(el) = drawer_ref.get() {
+            let _ = el.focus();
+        }
+    });
+    let on_keydown = move |e: leptos::ev::KeyboardEvent| {
+        if e.key() == "Escape" {
+            on_close.run(());
+        }
+    };
 
     view! {
         <div class="fixed inset-0 z-40 flex justify-end" data-testid="task-drawer-overlay">
             <div class="absolute inset-0 bg-black/40" on:click=close></div>
             <aside
+                node_ref=drawer_ref
                 data-testid="task-drawer"
                 data-task-id=task_id.to_string()
-                class="relative h-full w-full max-w-[520px] bg-[#101018] border-l border-white/10 shadow-2xl flex flex-col"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Task details"
+                tabindex="-1"
+                on:keydown=on_keydown
+                class="relative h-full w-full max-w-[520px] bg-[#101018] border-l border-white/10 shadow-2xl flex flex-col outline-none"
             >
                 {move || match task.get() {
                     None => view! {
@@ -303,7 +353,7 @@ pub fn TaskDrawer(
 
                     // Output and, where there are any, changes.
                     <section class="space-y-2">
-                        <div class="flex items-center gap-1 border-b border-white/10">
+                        <div role="tablist" class="flex items-center gap-1 border-b border-white/10">
                             <TabButton label="Output" testid="task-drawer-tab-output" active=Signal::derive(move || tab.get() == Tab::Output) on_click=Callback::new(move |_| tab.set(Tab::Output)) />
                             <Show when=move || actions.get().changes>
                                 <TabButton label="Changes" testid="task-drawer-tab-changes" active=Signal::derive(move || tab.get() == Tab::Changes) on_click=Callback::new(open_changes) />
@@ -314,6 +364,9 @@ pub fn TaskDrawer(
                             <p data-testid="task-drawer-output-provenance" class="text-xs text-white/40">
                                 {move || {
                                     let queued = status.get() == Some(TaskStatus::Queue);
+                                    if let Some(e) = run_error.get() {
+                                        return format!("Could not read this task's run: {e}");
+                                    }
                                     match run.with(output_provenance) {
                                         OutputProvenance::Live => "Live output from the running agent.",
                                         OutputProvenance::LastAttempt if queued => "Output from the last attempt. The next run replaces it.",
@@ -321,10 +374,12 @@ pub fn TaskDrawer(
                                         OutputProvenance::None if !run_loaded.get() => "Loading…",
                                         OutputProvenance::None => "No output from this task since SlashIt started.",
                                     }
+                                    .to_string()
                                 }}
                             </p>
                             <div
                                 node_ref=output_ref
+                                on:scroll=on_output_scroll
                                 data-testid="task-drawer-output"
                                 class="max-h-[45vh] overflow-y-auto rounded-lg bg-black/40 p-3 font-mono text-xs space-y-1"
                             >
@@ -439,6 +494,8 @@ fn TabButton(
     view! {
         <button
             data-testid=testid
+            role="tab"
+            aria-selected=move || if active.get() { "true" } else { "false" }
             class=move || format!(
                 "px-3 py-1.5 text-xs font-medium border-b-2 -mb-px transition-colors {}",
                 if active.get() { "border-blue-400 text-white/90" } else { "border-transparent text-white/40 hover:text-white/70" }

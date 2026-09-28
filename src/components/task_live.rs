@@ -57,7 +57,7 @@ pub fn shows_activity(status: &TaskStatus) -> bool {
 /// What a person can do from the drawer, given the task and its run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DrawerActions {
-    /// An agent is live, so stopping has something to end.
+    /// The task's execution is live, so stopping has something to end.
     pub stop: bool,
     /// The task failed and nothing is running: re-queue it.
     pub retry: bool,
@@ -71,7 +71,10 @@ impl DrawerActions {
     pub fn for_task(status: &TaskStatus, run: &TaskRunSnapshot) -> Self {
         let live = run.live;
         Self {
-            stop: live,
+            // Only a running execution. Stopping an AI review would also
+            // send the task back to Backlog, which is a decision this surface
+            // does not offer yet.
+            stop: live && *status == TaskStatus::InProgress,
             retry: *status == TaskStatus::Error && !live,
             edit: matches!(status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::Error) && !live,
             changes: matches!(
@@ -242,11 +245,11 @@ mod tests {
     }
 
     #[test]
-    fn stop_is_offered_only_while_an_agent_is_live() {
-        for status in [TaskStatus::InProgress, TaskStatus::AiReview] {
-            assert!(DrawerActions::for_task(&status, &run(true, Some(false))).stop);
-            assert!(!DrawerActions::for_task(&status, &run(false, Some(true))).stop);
-        }
+    fn stop_is_offered_only_while_an_execution_is_live() {
+        assert!(DrawerActions::for_task(&TaskStatus::InProgress, &run(true, Some(false))).stop);
+        assert!(!DrawerActions::for_task(&TaskStatus::InProgress, &run(false, Some(true))).stop);
+        // An AI review is live, but stopping it is not offered here.
+        assert!(!DrawerActions::for_task(&TaskStatus::AiReview, &run(true, Some(true))).stop);
         for status in [TaskStatus::Backlog, TaskStatus::Error, TaskStatus::HumanReview] {
             assert!(!DrawerActions::for_task(&status, &run(false, None)).stop);
         }
