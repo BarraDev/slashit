@@ -16,6 +16,7 @@
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use wasm_bindgen::JsCast;
 
 use crate::models::{Task, TaskStatus};
 use crate::services::human_review_service::close_without_merging;
@@ -51,6 +52,44 @@ pub fn close_consequences(task: &Task) -> Vec<String> {
     lines
 }
 
+/// Which of the dialog's two buttons has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogFocus {
+    Cancel,
+    Confirm,
+    /// Anything else, including the page behind the dialog.
+    Elsewhere,
+}
+
+/// What a key press does while the dialog is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogKey {
+    /// Dismiss the dialog, as Cancel does.
+    Cancel,
+    /// Swallow the key: a close is already under way.
+    Ignore,
+    /// Move focus to this button instead of letting it leave the dialog.
+    Focus(DialogFocus),
+    /// Not the dialog's business.
+    Pass,
+}
+
+/// Escape cancels unless a close is already under way, and Tab (either
+/// direction) moves between the two buttons, pulling focus back into the
+/// dialog from wherever it is, so the page behind it is never reachable.
+pub fn dialog_key(key: &str, closing: bool, focus: DialogFocus) -> DialogKey {
+    match key {
+        "Escape" if closing => DialogKey::Ignore,
+        "Escape" => DialogKey::Cancel,
+        // Two buttons: forward and backward both land on the other one.
+        "Tab" => DialogKey::Focus(match focus {
+            DialogFocus::Cancel => DialogFocus::Confirm,
+            DialogFocus::Confirm | DialogFocus::Elsewhere => DialogFocus::Cancel,
+        }),
+        _ => DialogKey::Pass,
+    }
+}
+
 #[component]
 pub fn CloseWithoutMergeDialog(
     pending: RwSignal<Option<PendingClose>>,
@@ -74,6 +113,77 @@ pub fn CloseWithoutMergeDialog(
             pending.set(None);
         }
     };
+
+    let cancel_ref = NodeRef::<leptos::html::Button>::new();
+    let confirm_ref = NodeRef::<leptos::html::Button>::new();
+
+    // Focus goes to Cancel, the safe choice, as soon as the dialog is on the
+    // page, and back to whatever had it before once the dialog is gone, if
+    // that is still on the page.
+    let opener = StoredValue::new_local(None::<web_sys::HtmlElement>);
+    Effect::new(move |was_open: Option<bool>| {
+        let open = pending.with(|p| p.is_some());
+        if open && was_open != Some(true) {
+            let focused = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.active_element())
+                .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok());
+            opener.set_value(focused);
+        } else if !open && was_open == Some(true) {
+            if let Some(el) = opener.get_value().filter(|el| el.is_connected()) {
+                let _ = el.focus();
+            }
+            opener.set_value(None);
+        }
+        open
+    });
+    Effect::new(move |_| {
+        if let Some(el) = cancel_ref.get() {
+            let _ = el.focus();
+        }
+    });
+
+    let focused = move || {
+        let active = web_sys::window().and_then(|w| w.document()).and_then(|d| d.active_element());
+        let is = |el: Option<web_sys::HtmlButtonElement>| {
+            matches!((&active, el), (Some(a), Some(b)) if a == b.unchecked_ref::<web_sys::Element>())
+        };
+        if is(cancel_ref.get_untracked()) {
+            DialogFocus::Cancel
+        } else if is(confirm_ref.get_untracked()) {
+            DialogFocus::Confirm
+        } else {
+            DialogFocus::Elsewhere
+        }
+    };
+    let keys = StoredValue::new_local(Some(window_event_listener(leptos::ev::keydown, move |e| {
+        if pending.with_untracked(|p| p.is_none()) {
+            return;
+        }
+        match dialog_key(&e.key(), closing.get_untracked(), focused()) {
+            DialogKey::Cancel => {
+                e.prevent_default();
+                pending.set(None);
+            }
+            DialogKey::Ignore => e.prevent_default(),
+            DialogKey::Focus(target) => {
+                e.prevent_default();
+                let el = match target {
+                    DialogFocus::Confirm => confirm_ref.get_untracked(),
+                    _ => cancel_ref.get_untracked(),
+                };
+                if let Some(el) = el {
+                    let _ = el.focus();
+                }
+            }
+            DialogKey::Pass => {}
+        }
+    })));
+    on_cleanup(move || {
+        if let Some(handle) = keys.try_update_value(|h| h.take()).flatten() {
+            handle.remove();
+        }
+    });
 
     let confirm = move |_| {
         let Some(request) = pending.get_untracked() else { return };
@@ -143,18 +253,24 @@ pub fn CloseWithoutMergeDialog(
                             <p data-testid="close-without-merge-error" class="text-sm text-red-300 whitespace-pre-wrap break-words">{e}</p>
                         })}
                         <div class="flex justify-end gap-2">
+                            // `aria-disabled` rather than `disabled` while a
+                            // close runs: disabling the focused button would
+                            // drop focus behind the dialog. Both handlers
+                            // already do nothing while closing.
                             <button
+                                node_ref=cancel_ref
                                 data-testid="close-without-merge-cancel"
-                                class="px-3 py-1.5 rounded-lg text-sm bg-white/5 text-white/70 hover:bg-white/10 disabled:opacity-50"
-                                disabled=move || closing.get()
+                                class="px-3 py-1.5 rounded-lg text-sm bg-white/5 text-white/70 hover:bg-white/10 aria-disabled:opacity-50"
+                                aria-disabled=move || if closing.get() { "true" } else { "false" }
                                 on:click=cancel
                             >
                                 "Cancel"
                             </button>
                             <button
+                                node_ref=confirm_ref
                                 data-testid="close-without-merge-confirm"
-                                class="px-3 py-1.5 rounded-lg text-sm font-medium bg-red-500/20 text-red-200 hover:bg-red-500/30 disabled:opacity-50"
-                                disabled=move || closing.get()
+                                class="px-3 py-1.5 rounded-lg text-sm font-medium bg-red-500/20 text-red-200 hover:bg-red-500/30 aria-disabled:opacity-50"
+                                aria-disabled=move || if closing.get() { "true" } else { "false" }
                                 on:click=confirm
                             >
                                 {move || if closing.get() { "Closing…" } else { "Close without merging" }}
@@ -219,6 +335,28 @@ mod tests {
         assert!(text.contains("uncommitted changes"));
         assert!(text.contains("branch task-1"));
         assert!(text.contains("does not delete or push"));
+    }
+
+    #[test]
+    fn escape_cancels_unless_a_close_is_under_way() {
+        for focus in [DialogFocus::Cancel, DialogFocus::Confirm, DialogFocus::Elsewhere] {
+            assert_eq!(dialog_key("Escape", false, focus), DialogKey::Cancel);
+            assert_eq!(dialog_key("Escape", true, focus), DialogKey::Ignore);
+        }
+    }
+
+    #[test]
+    fn tab_never_leaves_the_dialog() {
+        for closing in [false, true] {
+            assert_eq!(dialog_key("Tab", closing, DialogFocus::Cancel), DialogKey::Focus(DialogFocus::Confirm));
+            assert_eq!(dialog_key("Tab", closing, DialogFocus::Confirm), DialogKey::Focus(DialogFocus::Cancel));
+            assert_eq!(
+                dialog_key("Tab", closing, DialogFocus::Elsewhere),
+                DialogKey::Focus(DialogFocus::Cancel),
+                "focus behind the dialog is pulled back to the safe button"
+            );
+        }
+        assert_eq!(dialog_key("Enter", false, DialogFocus::Cancel), DialogKey::Pass);
     }
 
     #[test]

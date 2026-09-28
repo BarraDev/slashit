@@ -10,6 +10,7 @@
 
 use super::*;
 use slashit_acceptance::fake_gh::{self, FakeGh};
+use thirtyfour::Key;
 
 const HR_PANEL: &str = "[data-testid=\"human-review\"]";
 const HR_APPROVE: &str = "[data-testid=\"human-review-approve\"]";
@@ -673,9 +674,10 @@ async fn history_after_restart(driver: &WebDriver, executed: &ExecutedTask) -> R
 
 // --- Journey D ----------------------------------------------------------------
 
-/// Done from Human Review asks first, says what it does, changes nothing
-/// when cancelled, reports a close Git refused as not done, and when
-/// confirmed over a clean checkout closes the task without merging: the
+/// Done from Human Review asks first, says what it does, can be answered
+/// from the keyboard, changes nothing when cancelled, reports a close Git
+/// refused as not done, and when confirmed over a clean checkout closes the
+/// task without merging: the
 /// checkout is removed and the work stays on its branch.
 #[tokio::test(flavor = "multi_thread")]
 async fn closing_a_reviewed_task_without_merging_is_confirmed_first_and_keeps_its_work() {
@@ -726,8 +728,15 @@ async fn close_without_merging(
     // --- First attempt: the card menu, Move to, Done; then Cancel ------------
     move_to_done_from_the_menu(driver, &executed.title).await?;
     assert_consequences_explained(driver, &executed, &work).await?;
-    click(driver, CLOSE_CANCEL, "Cancel").await?;
-    await_gone(driver, CLOSE_DIALOG, "the confirmation, after Cancel").await?;
+    // Keyboard: focus starts on the safe choice, Tab stays inside the
+    // dialog, and Escape cancels.
+    await_focus(driver, "close-without-merge-cancel").await?;
+    press(driver, Key::Tab).await?;
+    await_focus(driver, "close-without-merge-confirm").await?;
+    press(driver, Key::Tab).await?;
+    await_focus(driver, "close-without-merge-cancel").await?;
+    press(driver, Key::Escape).await?;
+    await_gone(driver, CLOSE_DIALOG, "the confirmation, after Escape").await?;
 
     let task = read_task(driver, &executed).await?;
     if status_of(&task) != Some("human_review") || !executed.worktree_path.is_dir() {
@@ -805,6 +814,37 @@ async fn assert_consequences_explained(
         }
     }
     Ok(())
+}
+
+/// The `data-testid` of the element that has keyboard focus, waited for.
+async fn await_focus(driver: &WebDriver, testid: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let focused = page(
+            driver,
+            "const e = document.activeElement; return e ? e.getAttribute('data-testid') : null;",
+            Vec::new(),
+        )
+        .await?;
+        if focused.as_str() == Some(testid) {
+            return Ok(());
+        }
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("keyboard focus is on {focused}, not {testid}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Press one key where keyboard focus is, as a person would.
+async fn press(driver: &WebDriver, key: Key) -> Result<()> {
+    driver
+        .active_element()
+        .await
+        .context("nothing has keyboard focus")?
+        .send_keys(key)
+        .await
+        .context("could not press the key")
 }
 
 /// Move to, Done, from the card's own menu.

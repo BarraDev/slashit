@@ -7337,6 +7337,94 @@ mod tests {
                 assert!(refused.contains("approved"), "{refused}");
             }
 
+            /// Delivery runs outside the task's lease. An approval withdrawn
+            /// while it is on its way makes the pull request refuse, and that
+            /// refusal must not be kept on the task as a delivery failure: the
+            /// approval it would describe is no longer current, and a task
+            /// moved back into Human Review by hand would show it as one.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_delivery_refused_because_its_approval_was_withdrawn_leaves_no_error_behind() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-withdrawn");
+                let mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-withdrawn"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let project_id = project_of(&state, task_id).await;
+                approve(&state, task_id, false).await.expect("approved");
+
+                // A `git` that holds the delivery at its first step, the
+                // availability check, until the test lets it go.
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let started = tmp.path().join("started");
+                let release = tmp.path().join("release");
+                let fake_git = tmp.path().join("git");
+                let real_git = String::from_utf8(
+                    StdCommand::new("sh").args(["-c", "command -v git"]).output().expect("find git").stdout,
+                )
+                .unwrap();
+                write_executable(
+                    &fake_git,
+                    &format!(
+                        "#!/bin/sh\ncase \"$*\" in *get-url*) touch {started:?}; while [ ! -f {release:?} ]; do sleep 0.02; done ;; esac\nexec {} \"$@\"\n",
+                        real_git.trim()
+                    ),
+                );
+
+                let delivery = test_programs::scope([("git", fake_git.clone())], retry_delivery(&state, task_id));
+                let withdraw = async {
+                    while !started.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    assert!(
+                        state.task.tasks.read().await[&task_id].human_review.is_approved(),
+                        "the approval is current when delivery starts"
+                    );
+                    // What every move back to work does.
+                    let to_queue = |staged: &mut HashMap<Uuid, Task>| {
+                        let t = staged.get_mut(&task_id).unwrap();
+                        t.status = TaskStatus::Queue;
+                        t.reset_execution_state();
+                    };
+                    crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &to_queue)
+                        .await
+                        .expect("sent back to work");
+                    std::fs::write(&release, "").unwrap();
+                };
+                let (outcome, ()) = tokio::join!(delivery, withdraw);
+
+                let outcome = outcome.expect("the delivery was attempted");
+                let Some(PrDelivery::Failed { reason }) = outcome.pr else {
+                    panic!("a withdrawn approval must not deliver: {:?}", outcome.pr);
+                };
+                assert!(reason.contains("no longer"), "the caller is told why: {reason}");
+                assert!(!mock.read_log().contains("create"), "no pull request was opened");
+
+                let task = state.task.tasks.read().await[&task_id].clone();
+                assert_eq!(task.human_review.pr_error, None, "a stale failure is not kept");
+                assert_eq!(on_disk(&state, project_id, task_id).human_review.pr_error, None);
+
+                // Moved back by hand: not approved, and nothing to show as a
+                // failed delivery.
+                let back = |staged: &mut HashMap<Uuid, Task>| {
+                    staged.get_mut(&task_id).unwrap().status = TaskStatus::HumanReview;
+                };
+                crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &back)
+                    .await
+                    .expect("moved back");
+                let task = state.task.tasks.read().await[&task_id].clone();
+                assert!(!task.human_review.is_approved());
+                assert_eq!(task.human_review.pr_error, None);
+            }
+
             #[test]
             fn github_remotes_are_recognised_by_host_alone() {
                 for url in [

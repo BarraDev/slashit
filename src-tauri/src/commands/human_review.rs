@@ -248,11 +248,19 @@ async fn deliver(state: &crate::AppState, task_id: Uuid) -> PrDelivery {
 /// Keep why the pull request could not be opened on the task, so it is still
 /// explained after a restart. The failure is reported whether or not that
 /// write succeeds.
+///
+/// Kept only while the task is still in Human Review with its changes
+/// approved. Delivery runs outside the lease, so the task may have gone back
+/// to work meanwhile, which withdraws the approval; a failure recorded then
+/// would describe an approval that is no longer current, and would show as a
+/// failed delivery if the task were moved back by hand.
 async fn record_pr_failure(state: &crate::AppState, task_id: Uuid, reason: String) -> PrDelivery {
     let note = reason.clone();
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(t) = staged.get_mut(&task_id) {
-            t.human_review.pr_error = Some(note.clone());
+            if t.status == TaskStatus::HumanReview && t.human_review.is_approved() {
+                t.human_review.pr_error = Some(note.clone());
+            }
         }
     };
     let _ = crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &amend).await;
