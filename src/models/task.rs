@@ -85,7 +85,8 @@ pub struct Task {
     pub external_refs: Vec<ExternalRef>,
 
     pub qa_signoff: Option<QaSignoff>,
-    pub human_review: Option<HumanReview>,
+    #[serde(default)]
+    pub human_review: HumanReviewRecord,
     pub stuck_since: Option<chrono::DateTime<chrono::Utc>>,
 
     #[serde(default)]
@@ -380,13 +381,90 @@ pub enum QaStatus {
     Rejected,
 }
 
+/// Mirrors the backend `HumanReviewRecord`: decisions made at Human Review,
+/// each tied to the Human Review arrival it was made in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HumanReviewRecord {
+    #[serde(default)]
+    pub arrivals: u32,
+    #[serde(default)]
+    pub entries: Vec<HumanReviewEntry>,
+    /// Why the last attempt to open a pull request for the approved changes
+    /// failed.
+    #[serde(default)]
+    pub pr_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HumanReview {
-    pub approved: bool,
-    pub approver: Option<String>,
-    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
+pub struct HumanReviewEntry {
+    pub sequence: u32,
+    pub arrival: u32,
+    pub decision: HumanReviewDecision,
+    #[serde(default)]
     pub feedback: Option<String>,
-    pub spec_hash: Option<String>,
+    pub decided_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanReviewDecision {
+    Approved,
+    ChangesRequested,
+}
+
+impl HumanReviewRecord {
+    /// The decision made in the current arrival, if one was. Same rule as
+    /// the backend.
+    pub fn current_decision(&self) -> Option<&HumanReviewEntry> {
+        self.entries.last().filter(|e| e.arrival == self.arrivals)
+    }
+
+    pub fn is_approved(&self) -> bool {
+        self.current_decision()
+            .is_some_and(|e| e.decision == HumanReviewDecision::Approved)
+    }
+
+    /// Changes requested in earlier reviews, oldest first: the feedback the
+    /// changes now under review were made to answer.
+    pub fn earlier_requests(&self) -> Vec<&HumanReviewEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.arrival < self.arrivals)
+            .filter(|e| e.decision == HumanReviewDecision::ChangesRequested)
+            .collect()
+    }
+}
+
+/// The AI review's findings, ready to show: list markers and `ISSUE:`
+/// prefixes removed, blank lines dropped, and exact repeats shown once, in
+/// the order they were first reported.
+pub fn review_findings(issues: &[String]) -> Vec<String> {
+    let mut findings: Vec<String> = Vec::new();
+    for issue in issues {
+        let text = strip_finding_prefixes(issue);
+        if !text.is_empty() && !findings.iter().any(|f| f == text) {
+            findings.push(text.to_string());
+        }
+    }
+    findings
+}
+
+fn strip_finding_prefixes(issue: &str) -> &str {
+    let mut text = issue.trim();
+    loop {
+        let before = text;
+        for marker in ["- ", "* "] {
+            if let Some(rest) = text.strip_prefix(marker) {
+                text = rest.trim_start();
+            }
+        }
+        if text.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("issue:")) {
+            text = text[6..].trim_start();
+        }
+        if text == before {
+            return text;
+        }
+    }
 }
 
 
@@ -442,4 +520,76 @@ pub enum Mergeability {
     Mergeable,
     Conflicting,
     Unknown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn issues(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn findings_lose_their_prefixes_and_repeats() {
+        let found = review_findings(&issues(&[
+            "- ISSUE: [high] src/lib.rs:4 - panics on empty input",
+            "- - ISSUE: ISSUE: [high] src/lib.rs:4 - panics on empty input",
+            "ISSUE: [low] README.md:1 - typo",
+            "issue: [low] README.md:1 - typo",
+            "   ",
+            "* [medium] src/main.rs:9 - flag ignored",
+            "The review fixes could not be committed: git said no.",
+        ]));
+        assert_eq!(
+            found,
+            vec![
+                "[high] src/lib.rs:4 - panics on empty input",
+                "[low] README.md:1 - typo",
+                "[medium] src/main.rs:9 - flag ignored",
+                "The review fixes could not be committed: git said no.",
+            ]
+        );
+    }
+
+    #[test]
+    fn findings_that_only_look_like_prefixes_are_kept_intact() {
+        assert_eq!(review_findings(&issues(&["Issues found in parser"])), vec!["Issues found in parser"]);
+        assert_eq!(review_findings(&issues(&["ÉISSUE: accent"])), vec!["ÉISSUE: accent"]);
+        assert_eq!(review_findings(&issues(&["ISSUE:"])), Vec::<String>::new());
+    }
+
+    fn entry(sequence: u32, arrival: u32, decision: HumanReviewDecision, feedback: Option<&str>) -> HumanReviewEntry {
+        HumanReviewEntry {
+            sequence,
+            arrival,
+            decision,
+            feedback: feedback.map(str::to_string),
+            decided_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn the_current_decision_and_earlier_requests_follow_the_arrivals() {
+        let mut review = HumanReviewRecord { arrivals: 1, ..Default::default() };
+        assert!(review.current_decision().is_none());
+        review.entries.push(entry(1, 1, HumanReviewDecision::ChangesRequested, Some("fix it")));
+        assert!(review.earlier_requests().is_empty(), "not earlier yet: it is this review's");
+
+        review.arrivals = 2;
+        assert!(review.current_decision().is_none());
+        assert_eq!(review.earlier_requests().len(), 1);
+
+        review.entries.push(entry(2, 2, HumanReviewDecision::Approved, None));
+        assert!(review.is_approved());
+    }
+
+    /// The backend sends `human_review` as a table; a task from before it
+    /// existed sends none at all.
+    #[test]
+    fn a_task_without_a_review_record_deserializes_as_unreviewed() {
+        let json = serde_json::json!({ "arrivals": 0 });
+        let review: HumanReviewRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(review, HumanReviewRecord::default());
+    }
 }

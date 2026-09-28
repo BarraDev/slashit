@@ -8,6 +8,7 @@ use crate::models::task::{
     PrReviewPlan,
 };
 use crate::components::{TaskCard, TaskDrawer, TaskEditModal, TaskEditMode, toast, TaskContextMenu, DiffModal};
+use crate::components::close_without_merge_dialog::{CloseWithoutMergeDialog, PendingClose};
 use crate::components::task_live::{activity_from_event, changes_task_record, shows_activity, ActivityUpdate};
 use crate::services::task_run_service::listen_agent_events;
 use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
@@ -267,6 +268,19 @@ pub fn Kanban(
     // The task whose drawer is open, if any.
     let drawer_task = RwSignal::new(None::<Uuid>);
 
+    // A move from Human Review to Done waiting for confirmation. Every
+    // ordinary path there (a drop, the card menu) comes through here.
+    let pending_close = RwSignal::new(None::<PendingClose>);
+    let request_close = Callback::new(move |(task_id, position): (String, i32)| {
+        let task = tasks_signal.with_untracked(|all| all.iter().find(|t| t.id.to_string() == task_id).cloned());
+        if let Some(task) = task {
+            pending_close.set(Some(PendingClose { task, position }));
+        }
+    });
+    let on_context_request_close = Callback::new(move |task: Task| {
+        pending_close.set(Some(PendingClose { task, position: 0 }));
+    });
+
     let show_pr_candidates_modal = RwSignal::new(false);
     let pr_candidate_task = RwSignal::new(None::<Task>);
     let pr_candidates = RwSignal::new(Vec::<PrCandidate>::new());
@@ -521,6 +535,7 @@ pub fn Kanban(
                             show_pr_candidates_modal=show_pr_candidates_modal
                             pr_candidate_task=pr_candidate_task
                             pr_candidates=pr_candidates
+                            request_close=request_close
                         />
                     }
                 }).collect::<Vec<_>>()}
@@ -561,6 +576,13 @@ pub fn Kanban(
                 on_pr_created=on_pr_created
                 on_analyze_pr_comments=on_analyze_pr_comments
                 on_private_email_pr_error=on_private_email_pr_error
+                on_request_close=on_context_request_close
+            />
+
+            <CloseWithoutMergeDialog
+                pending=pending_close
+                apply_task=apply_task
+                refresh_tasks=refresh_tasks
             />
 
             // Diff modal (shared across all task cards)
@@ -1819,6 +1841,8 @@ fn KanbanColumn(
     show_pr_candidates_modal: RwSignal<bool>,
     pr_candidate_task: RwSignal<Option<Task>>,
     pr_candidates: RwSignal<Vec<PrCandidate>>,
+    /// Ask for confirmation before a card leaves Human Review for Done.
+    request_close: Callback<(String, i32)>,
 ) -> impl IntoView {
     let status_drop = status.clone();
     let status_tasks = status.clone();
@@ -1871,6 +1895,13 @@ fn KanbanColumn(
             
             // Determine if this is a same-column reorder or cross-column move
             let is_same_column = current_status == new_status;
+
+            // Done from Human Review closes the task without merging it, so
+            // it waits for the person to confirm that first.
+            if current_status == TaskStatus::HumanReview && new_status == TaskStatus::Done {
+                request_close.run((task_id_clone, target_position));
+                return;
+            }
                 
             spawn_local(async move {
                 // Use reorder_task for both within-column and cross-column moves
@@ -2449,6 +2480,7 @@ fn KanbanTaskCard(
             >
                 // 3-dot menu button (appears on hover)
                 <button
+                    data-testid="task-card-menu"
                     class="absolute top-2 right-2 p-1.5 rounded-md opacity-0 group-hover/card:opacity-100 hover:bg-white/10 z-10 transition-all"
                     on:click=on_menu_button_click
                     title="Task options"

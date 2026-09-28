@@ -2938,9 +2938,12 @@ impl TaskExecutor {
                 t.phase = TaskPhase::Complete;
                 t.phase_progress = 95;
                 t.overall_progress = 90;
-                if let Some(s) = signoff.clone() {
-                    t.qa_signoff = Some(s);
-                }
+                // These are new changes to review. The AI review outcome and
+                // any human decision about the previous ones do not carry
+                // over: `None` means no AI review ran for these changes, and
+                // showing an earlier run's verdict would describe other code.
+                t.qa_signoff = signoff.clone();
+                t.human_review.record_arrival();
             }
         };
         if let Err(e) = crate::lifecycle::record(tasks, storage, task_id, &amend).await {

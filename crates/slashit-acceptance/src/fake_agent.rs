@@ -574,7 +574,7 @@ fn read_invocation(path: &Path, prompt_path: &Path) -> Result<Invocation> {
 
 /// The first executable named `name` in `path`, using the same left-to-right
 /// rule the operating system applies.
-fn resolve_on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
+pub(crate) fn resolve_on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     std::env::split_paths(path)

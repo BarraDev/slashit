@@ -90,6 +90,7 @@ async fn desktop_mutation_refuses_to_publish_when_the_durable_write_fails() {
         app.state(),
         task_id.to_string(),
         TaskStatus::InProgress,
+        None,
     )
     .await;
 

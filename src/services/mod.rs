@@ -19,6 +19,7 @@ pub mod opener_service;
 pub mod state_service;
 pub mod updater_service;
 pub mod task_run_service;
+pub mod human_review_service;
 
 pub use opener_service::open_url_external;
 pub use repository_service::{create_repository, list_repositories, pick_folder, check_is_git_repo};

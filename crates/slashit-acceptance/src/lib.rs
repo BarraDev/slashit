@@ -63,6 +63,8 @@ pub mod driver;
 #[cfg(target_os = "linux")]
 pub mod fake_agent;
 #[cfg(target_os = "linux")]
+pub mod fake_gh;
+#[cfg(target_os = "linux")]
 pub mod process;
 #[cfg(target_os = "linux")]
 pub mod state;

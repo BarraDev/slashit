@@ -627,6 +627,7 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
             app.state(),
             fixture.task_id.to_string(),
             TaskStatus::Done,
+            Some(true),
         );
         tokio::pin!(terminal);
         let mut terminal_outcome: Option<Result<Option<Task>, String>> = None;
@@ -707,6 +708,7 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
             app.state(),
             fixture.task_id.to_string(),
             TaskStatus::InProgress,
+            None,
         );
         let reactivation_outcome = tokio::time::timeout(DESIGN_MAY_WAIT, reactivation)
             .await
@@ -857,6 +859,7 @@ fn a_terminal_transition_whose_cleanup_did_not_happen_is_not_reported_as_done() 
             app.state(),
             fixture.task_id.to_string(),
             TaskStatus::Done,
+            Some(true),
         );
         tokio::pin!(terminal);
         let mut terminal_outcome: Option<Result<Option<Task>, String>> = None;
@@ -1016,6 +1019,7 @@ fn a_terminal_drag_commits_column_positions_computed_after_its_cleanup() {
             fixture.task_id.to_string(),
             Some(TaskStatus::Done),
             1,
+            Some(true),
         )
         .await
         .expect("a clean checkout must be removable")
@@ -1117,6 +1121,7 @@ fn a_drag_that_waited_for_the_lease_is_classified_against_the_task_it_finds() {
             fixture.task_id.to_string(),
             Some(TaskStatus::Done),
             0,
+            Some(true),
         );
         tokio::pin!(drag);
         assert!(
