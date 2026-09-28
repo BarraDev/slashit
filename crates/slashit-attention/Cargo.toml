@@ -1,0 +1,16 @@
+[package]
+name = "slashit-attention"
+version = "0.1.0"
+edition = "2021"
+authors = ["Barradev Digital Services <admin@barradev.com>"]
+license = "Apache-2.0"
+description = "Which SlashIt tasks cannot make progress without the user: the one rule the app, the CLI and the backend share"
+repository = "https://github.com/BarraDev/slashit"
+
+# Compiled into both the native backend and the WASM frontend, so it depends
+# on nothing that cannot build for either.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

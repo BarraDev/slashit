@@ -11,6 +11,7 @@ description = "SlashIt frontend - Leptos/WASM UI for the AI agent workspace mana
 repository = "https://github.com/BarraDev/slashit"
 [dependencies]
 leptos = { version = "0.8", features = ["csr"] }
+slashit-attention = { path = "crates/slashit-attention" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 gloo-timers = { version = "0.3", features = ["futures"] }
@@ -25,11 +26,11 @@ uuid = { version = "1", features = ["v4", "serde", "js"] }
 thiserror = "2"
 vte = "0.13"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "KeyboardEvent", "FocusEvent", "WheelEvent", "MouseEvent", "DragEvent", "DataTransfer", "ResizeObserver", "ResizeObserverEntry", "DomRect", "DomRectReadOnly", "Storage", "EventTarget"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlElement", "KeyboardEvent", "FocusEvent", "WheelEvent", "MouseEvent", "DragEvent", "DataTransfer", "ResizeObserver", "ResizeObserverEntry", "DomRect", "DomRectReadOnly", "Storage", "EventTarget", "ScrollIntoViewOptions", "ScrollBehavior", "ScrollLogicalPosition", "FocusOptions"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 
 [workspace]
-members = ["src-tauri", "crates/slashit-ipc", "crates/slashit-cli", "crates/slashit-acceptance"]
+members = ["src-tauri", "crates/slashit-attention", "crates/slashit-ipc", "crates/slashit-cli", "crates/slashit-acceptance"]
 resolver = "2"

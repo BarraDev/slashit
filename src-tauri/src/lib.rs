@@ -349,6 +349,7 @@ pub fn run() {
             approve_task,
             create_approved_task_pr,
             request_task_changes,
+            get_attention_summary,
             create_worktree,
             cleanup_worktree,
             check_worktree_exists,

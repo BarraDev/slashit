@@ -83,7 +83,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Clippy (backend + CLI)
-        run: cargo clippy -p slashit-ui -p slashit -p slashit-ipc -- -D warnings
+        run: cargo clippy -p slashit-ui -p slashit -p slashit-ipc -p slashit-attention -- -D warnings
 
       # `--all-targets --features run-acceptance` so the acceptance journeys
       # themselves are linted, not just the harness library. They are behind a
@@ -99,7 +99,7 @@ jobs:
           install_args: jj
 
       - name: Tests (backend + harness units)
-        run: cargo test -p slashit-ui -p slashit-ipc -p slashit-acceptance
+        run: cargo test -p slashit-ui -p slashit-ipc -p slashit-attention -p slashit-acceptance
 
       # `slashit-frontend` is the root package (Leptos/WASM), not `slashit-ui`
       # -- see that crate's own Cargo.toml comment. Its unit tests run on the
@@ -251,7 +251,7 @@ jobs:
       # quietly becoming unbuildable.
       #
       # `--tests` compiles (not runs) every unit and integration test target
-      # in these four packages, not just their production code. It is safe
+      # in these five packages, not just their production code. It is safe
       # here specifically because: `slashit-acceptance`'s Linux-only runtime
       # (`context`/`driver`/`fake_agent`/`process`/`state`) is gated
       # `#[cfg(target_os = "linux")]` at the `pub mod` declaration, and its
@@ -260,11 +260,11 @@ jobs:
       # does not pass -- so cargo skips compiling those binaries here
       # entirely, on any platform. It does *not* prove they compile with that
       # feature enabled off Linux; nothing in this job claims that. Every
-      # `std::os::unix`/`PermissionsExt`-using test in the other three
+      # `std::os::unix`/`PermissionsExt`-using test in the other four
       # packages is individually `#[cfg(unix)]`-gated at its own definition,
       # and test code that needs a Linux-only API (tokio's read-write FIFO
       # open in `task_terminal_cleanup_lifecycle.rs`, and runner fixtures that
       # only Linux tests use) is gated `#[cfg(target_os = "linux")]` instead,
       # so the macOS leg compiles it out rather than failing on it.
-      - name: Check (backend + CLI + IPC + acceptance harness, including test code)
-        run: cargo check --tests -p slashit-ui -p slashit -p slashit-ipc -p slashit-acceptance
+      - name: Check (backend + CLI + IPC + attention rule + acceptance harness, including test code)
+        run: cargo check --tests -p slashit-ui -p slashit -p slashit-ipc -p slashit-attention -p slashit-acceptance

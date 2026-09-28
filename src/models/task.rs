@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+pub use slashit_attention::AttentionReason;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -102,6 +103,38 @@ pub struct Task {
 
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Task {
+    /// Whether the task cannot make progress without the user right now, and
+    /// why. The rule is `slashit_attention::Facts::needs_you`, the same one
+    /// the backend answers with; this only copies the task's facts into it.
+    ///
+    /// `delivery_in_flight` is whether its pull request is being opened at
+    /// this moment.
+    pub fn needs_you(&self, delivery_in_flight: bool) -> Option<AttentionReason> {
+        use slashit_attention::{Decision, Facts, Status};
+        Facts {
+            status: match self.status {
+                TaskStatus::Error => Status::Error,
+                TaskStatus::HumanReview => Status::HumanReview,
+                TaskStatus::Backlog
+                | TaskStatus::Queue
+                | TaskStatus::InProgress
+                | TaskStatus::AiReview
+                | TaskStatus::PrCreated
+                | TaskStatus::Done => Status::Other,
+            },
+            decision: self.human_review.current_decision().map(|e| match e.decision {
+                HumanReviewDecision::Approved => Decision::Approved,
+                HumanReviewDecision::ChangesRequested => Decision::ChangesRequested,
+            }),
+            pr_error_recorded: self.human_review.pr_error.is_some(),
+            pr_linked: self.pr_url.is_some() || self.external_refs.iter().any(ExternalRef::is_pr),
+            delivery_in_flight,
+        }
+        .needs_you()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -582,6 +615,52 @@ mod tests {
 
         review.entries.push(entry(2, 2, HumanReviewDecision::Approved, None));
         assert!(review.is_approved());
+    }
+
+    /// A task exactly as the backend sends it over IPC.
+    fn task_json(status: &str, review: serde_json::Value, pr_url: Option<&str>) -> Task {
+        serde_json::from_value(serde_json::json!({
+            "id": "11111111-1111-1111-1111-111111111111",
+            "project_id": "22222222-2222-2222-2222-222222222222",
+            "title": "t", "description": null, "status": status, "model": "m",
+            "planning_mode": false, "dependencies": [], "workspace_id": null, "jj_change_id": null,
+            "category": "feature", "priority": "medium", "complexity": "moderate",
+            "impact": "medium", "security_severity": "none", "phase": "idle",
+            "phase_progress": 0, "overall_progress": 0, "subtasks": [], "sequence_number": 1,
+            "github_issue_url": null, "gitlab_issue_url": null, "linear_ticket_id": null,
+            "pr_url": pr_url, "qa_signoff": null, "human_review": review, "stuck_since": null,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn decided(decision: &str, pr_error: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "arrivals": 1,
+            "entries": [{ "sequence": 1, "arrival": 1, "decision": decision, "decided_at": "2026-01-01T00:00:00Z" }],
+            "pr_error": pr_error,
+        })
+    }
+
+    #[test]
+    fn attention_reads_the_record_the_backend_sends() {
+        let undecided = serde_json::json!({ "arrivals": 1, "entries": [] });
+        assert_eq!(task_json("error", undecided.clone(), None).needs_you(false), Some(AttentionReason::Failed));
+        assert_eq!(task_json("human_review", undecided.clone(), None).needs_you(false), Some(AttentionReason::Review));
+        assert_eq!(task_json("human_review", undecided.clone(), None).needs_you(true), None);
+        assert_eq!(task_json("human_review", decided("approved", None), None).needs_you(false), None);
+        assert_eq!(
+            task_json("human_review", decided("approved", Some("gh failed")), None).needs_you(false),
+            Some(AttentionReason::PrNotCreated)
+        );
+        assert_eq!(
+            task_json("human_review", decided("approved", Some("gh failed")), Some("https://x/pull/1")).needs_you(false),
+            None
+        );
+        assert_eq!(task_json("human_review", decided("changes_requested", None), None).needs_you(false), None);
+        for status in ["backlog", "queue", "in_progress", "ai_review", "pr_created", "done"] {
+            assert_eq!(task_json(status, undecided.clone(), None).needs_you(false), None, "{status}");
+        }
     }
 
     /// The backend sends `human_review` as a table; a task from before it

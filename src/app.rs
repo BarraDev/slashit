@@ -74,6 +74,10 @@ pub fn App() -> impl IntoView {
     // and disagreeing about the result.
     let _ = provide_updater_context();
 
+    // What the board and the project rail both read about "Needs you".
+    crate::components::attention::Deliveries::provide();
+    crate::components::attention::BoardAttention::provide();
+
     // Validate persisted project exists on startup
     Effect::new(move |prev: Option<bool>| {
         // Only run once on mount

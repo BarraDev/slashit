@@ -26,6 +26,9 @@ pub const REPOSITORY_URL: &str = "https://github.com/slashit-acceptance/fixture.
 /// The file whose presence makes `pr create` fail.
 const FAIL_CREATE: &str = "fail-create";
 
+/// The file whose contents, a number of seconds, `pr create` sleeps first.
+const DELAY_CREATE: &str = "delay-create";
+
 /// What `pr create` prints on stderr when scripted to fail.
 pub const CREATE_FAILURE: &str = "creating the pull request was scripted to fail";
 
@@ -73,6 +76,21 @@ impl FakeGh {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e).with_context(|| format!("could not remove {}", marker.display())),
             }
+        }
+    }
+
+    /// Make every following `pr create` take `seconds` before answering, or
+    /// answer at once again with `None`.
+    pub fn delay_pr_creation(&self, seconds: Option<u32>) -> Result<()> {
+        let marker = self.dir.join(DELAY_CREATE);
+        match seconds {
+            Some(seconds) => std::fs::write(&marker, seconds.to_string())
+                .with_context(|| format!("could not write {}", marker.display())),
+            None => match std::fs::remove_file(&marker) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e).with_context(|| format!("could not remove {}", marker.display())),
+            },
         }
     }
 

@@ -9,7 +9,8 @@ use crate::models::task::{
 };
 use crate::components::{TaskCard, TaskDrawer, TaskEditModal, TaskEditMode, toast, TaskContextMenu, DiffModal};
 use crate::components::close_without_merge_dialog::{CloseWithoutMergeDialog, PendingClose};
-use crate::components::task_live::{activity_from_event, changes_task_record, shows_activity, ActivityUpdate};
+use crate::components::attention::{attention_order, next_after, reveal_card, BoardAttention, Deliveries};
+use crate::components::task_live::{activity_from_event, changes_task_record, counts_as_running, shows_activity, ActivityUpdate};
 use crate::services::task_run_service::listen_agent_events;
 use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
@@ -19,6 +20,19 @@ use std::collections::{HashMap, HashSet};
 /// `agent-event` listener and read by the cards.
 #[derive(Clone, Copy)]
 struct LiveActivity(RwSignal<HashMap<Uuid, String>>);
+
+/// The card the header's "Needs you" last pointed at, and a counter that
+/// makes each press a new cue. Read by the cards.
+#[derive(Clone, Copy)]
+struct AttentionHighlight(RwSignal<Option<(Uuid, u32)>>);
+
+/// How long a card stays outlined after "Needs you" pointed at it.
+const HIGHLIGHT_MS: u64 = 2_500;
+
+/// Where a status's column sits on the board, left to right.
+fn column_rank(status: &TaskStatus) -> usize {
+    COLUMNS.iter().position(|c| c.status == *status).unwrap_or(COLUMNS.len())
+}
 
 /// Per-item live status updated as `pr-review-progress` events arrive during
 /// an apply or dry-run. Reset whenever the user starts a fresh run.
@@ -268,6 +282,11 @@ pub fn Kanban(
     // The task whose drawer is open, if any.
     let drawer_task = RwSignal::new(None::<Uuid>);
 
+    // The card the header just pointed at, briefly outlined. The counter
+    // makes a second press on the same card a fresh cue.
+    let highlight = RwSignal::new(None::<(Uuid, u32)>);
+    provide_context(AttentionHighlight(highlight));
+
     // A move from Human Review to Done waiting for confirmation. Every
     // ordinary path there (a drop, the card menu) comes through here.
     let pending_close = RwSignal::new(None::<PendingClose>);
@@ -454,9 +473,56 @@ pub fn Kanban(
     let task_stats = move || {
         let tasks = tasks_signal.get();
         let total = tasks.len();
-        let in_progress = tasks.iter().filter(|t| t.status == TaskStatus::InProgress).count();
+        let running = tasks.iter().filter(|t| counts_as_running(&t.status)).count();
         let done = tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
-        (total, in_progress, done)
+        (total, running, done)
+    };
+
+    // Needs you, for this project only, in the order the board shows it.
+    let deliveries = Deliveries::get();
+    let needs_you = Memo::new(move |_| {
+        tasks_signal.with(|tasks| {
+            attention_order(tasks, column_rank, |id| deliveries.is_some_and(|d| d.in_flight(id)))
+        })
+    });
+    // The rail shows this project's count from here, so the two always agree.
+    if let (Some(board), Ok(project)) = (BoardAttention::get(), Uuid::parse_str(&project_id)) {
+        Effect::new(move |_| {
+            let count = needs_you.with(|n| n.len());
+            board.0.set(Some((project, count)));
+        });
+        on_cleanup(move || {
+            if board.0.try_get_untracked().flatten().is_some_and(|(p, _)| p == project) {
+                board.0.try_set(None);
+            }
+        });
+    }
+    let needs_you_count = move || needs_you.with(|n| n.len());
+    let needs_you_label = move || match needs_you_count() {
+        0 => "Needs you: 0. Nothing is waiting on you in this project.".to_string(),
+        n => format!("Needs you: {n}. Show the next task that needs you."),
+    };
+    // Each press of the header shows the next task that needs you.
+    let last_shown = StoredValue::new(None::<Uuid>);
+    let on_needs_you = move |_| {
+        let order: Vec<Uuid> = needs_you.with_untracked(|n| n.iter().map(|(id, _)| *id).collect());
+        let Some(next) = next_after(&order, last_shown.get_value()) else {
+            return;
+        };
+        last_shown.set_value(Some(next));
+        if !reveal_card(next) {
+            return;
+        }
+        let cue = highlight.get_untracked().map_or(0, |(_, n)| n.wrapping_add(1));
+        highlight.set(Some((next, cue)));
+        set_timeout(
+            move || {
+                if highlight.try_get_untracked().flatten() == Some((next, cue)) {
+                    highlight.try_set(None);
+                }
+            },
+            std::time::Duration::from_millis(HIGHLIGHT_MS),
+        );
     };
 
     view! {
@@ -469,16 +535,34 @@ pub fn Kanban(
                         <p class="text-sm text-white/40 mt-0.5">"Drag and drop tasks to change status"</p>
                     </div>
                     <div class="flex items-center gap-3 ml-4">
+                        // One button for the board's lifetime, so keyboard focus
+                        // stays on it as the count changes.
+                        <button
+                            data-testid="header-needs-you"
+                            data-count=move || needs_you_count().to_string()
+                            aria-label=needs_you_label
+                            aria-disabled=move || (needs_you_count() == 0).to_string()
+                            title=needs_you_label
+                            on:click=on_needs_you
+                            class=move || if needs_you_count() == 0 {
+                                "flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 cursor-default focus:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
+                            } else {
+                                "flex items-center gap-2 px-3 py-1.5 rounded-lg bg-amber-500/15 border border-amber-400/40 hover:bg-amber-500/25 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 transition-colors"
+                            }
+                        >
+                            <span class=move || if needs_you_count() == 0 { "text-xs text-white/40" } else { "text-xs font-medium text-amber-300" }>"Needs you:"</span>
+                            <span class=move || if needs_you_count() == 0 { "text-sm font-medium text-white/50" } else { "text-sm font-semibold text-amber-200" }>{needs_you_count}</span>
+                        </button>
                         {move || {
-                            let (total, in_progress, done) = task_stats();
+                            let (total, running, done) = task_stats();
                             view! {
                                 <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5">
                                     <span class="text-xs text-white/40">"Total:"</span>
                                     <span class="text-sm font-medium text-white/70">{total}</span>
                                 </div>
-                                <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-blue-500/10">
+                                <div data-testid="header-running" data-count=running.to_string() class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-blue-500/10">
                                     <span class="text-xs text-blue-400">"Running:"</span>
-                                    <span class="text-sm font-medium text-blue-300">{in_progress}</span>
+                                    <span class="text-sm font-medium text-blue-300">{running}</span>
                                 </div>
                                 <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-500/10">
                                     <span class="text-xs text-emerald-400">"Done:"</span>
@@ -2389,8 +2473,21 @@ fn KanbanTaskCard(
         }
     };
 
+    // Outlined for a moment when the header's "Needs you" points here.
+    let highlight = use_context::<AttentionHighlight>();
+    let highlighted = move || highlight.is_some_and(|h| h.0.with(|v| v.is_some_and(|(id, _)| id == task_uuid)));
+
     view! {
-        <div class="relative group/card">
+        <div
+            data-card-task-id=task_uuid.to_string()
+            data-attention-highlight=move || highlighted().to_string()
+            tabindex="-1"
+            class=move || if highlighted() {
+                "relative group/card rounded-xl outline-none ring-2 ring-amber-300 ring-offset-2 ring-offset-[#08080C] transition-shadow"
+            } else {
+                "relative group/card rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-amber-300/60"
+            }
+        >
             // Drop indicator above task (shows when hovering on upper half)
             <div
                 class=move || {
@@ -2539,8 +2636,15 @@ fn KanbanTaskCard(
                 // Visible PR review action for tasks that already have a PR.
                 {
                     let has_pr = task.pr_url.is_some() || task.external_refs.iter().any(|r| r.is_pr());
-                    let can_sync_pr = matches!(task.status, TaskStatus::HumanReview | TaskStatus::Done)
-                        && !has_pr;
+                    // Linking a pull request only makes sense for changes
+                    // someone approved (or a finished task), never for changes
+                    // still waiting on a decision.
+                    let can_sync_pr = !has_pr
+                        && match task.status {
+                            TaskStatus::HumanReview => task.human_review.is_approved(),
+                            TaskStatus::Done => true,
+                            _ => false,
+                        };
 
                     (has_pr || can_sync_pr).then(|| {
                         let task_for_pr_review = task_for_pr_review.clone();
@@ -2551,6 +2655,7 @@ fn KanbanTaskCard(
                                     let task_for_sync_pr = task_for_sync_pr.clone();
                                     view! {
                                         <button
+                                            data-testid="task-card-sync-pr"
                                             class="px-2 py-0.5 text-[10px] rounded bg-green-500/10 text-green-300 hover:bg-green-500/20 transition-colors"
                                             on:click=move |e: web_sys::MouseEvent| {
                                                 e.stop_propagation();

@@ -205,6 +205,7 @@ button:focus:not(:focus-visible) {
 }
 
 .rail-badge {
+  position: relative;
   width: 32px;
   height: 32px;
   min-width: 32px;
@@ -218,6 +219,24 @@ button:focus:not(:focus-visible) {
   color: rgba(255,255,255,0.5);
   transition: background 0.15s, color 0.15s, border-color 0.15s;
   border: 1px solid transparent;
+}
+
+/* Needs you: how many of the project's tasks wait on the user. */
+.rail-attention {
+  position: absolute;
+  top: -6px;
+  right: -7px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 9999px;
+  background: #f59e0b;
+  color: #1c1204;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  box-shadow: 0 0 0 2px #0b0b10;
 }
 
 .rail-badge.active {

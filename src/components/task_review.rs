@@ -11,6 +11,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use uuid::Uuid;
 
+use crate::components::attention::Deliveries;
 use crate::models::{review_findings, HumanReviewDecision, QaSignoff, QaStatus, Task, TaskStatus};
 use crate::services::human_review_service::{
     approve_task, create_approved_task_pr, get_pr_availability, request_task_changes,
@@ -152,6 +153,12 @@ pub fn AiReviewSection(signoff: QaSignoff) -> impl IntoView {
     }
 }
 
+/// Whether a delivery answer means a pull request was actually tried, so the
+/// drawer numbers it as an attempt.
+fn tried_a_pull_request(answer: Option<&PrDelivery>) -> bool {
+    matches!(answer, Some(PrDelivery::Created { .. } | PrDelivery::Failed { .. }))
+}
+
 /// The decision section for a task in Human Review, and what became of an
 /// approval once the task has moved on to its pull request.
 #[component]
@@ -181,10 +188,20 @@ pub fn HumanReviewPanel(
     let composing = RwSignal::new(false);
     let feedback = RwSignal::new(String::new());
 
+    // Attempts to open the pull request are registered app-wide, so the
+    // card and the header know the task is waiting on SlashIt while one runs,
+    // even after this drawer is closed.
+    let deliveries = Deliveries::get();
+    let in_flight = move || deliveries.is_some_and(|d| d.in_flight(task_id));
+    let attempt = move || deliveries.and_then(|d| d.record(task_id));
+
     let apply_outcome = move |task: Task, pr: Option<PrDelivery>| {
         apply_task.try_run(task);
         if let Some(PrDelivery::Created { url }) = &pr {
             crate::components::toast::success(format!("Pull request created: {url}"));
+        }
+        if let Some(PrDelivery::Failed { .. }) = &pr {
+            crate::components::toast::error("The pull request was not created.".to_string());
         }
         if let Some(PrDelivery::Unavailable { reason }) = &pr {
             availability.try_set(Some(PrAvailability::Unavailable { reason: reason.clone() }));
@@ -198,11 +215,26 @@ pub fn HumanReviewPanel(
         }
         busy.set(true);
         error.set(None);
+        if create_pr {
+            if let Some(d) = deliveries {
+                d.begin(task_id);
+            }
+        }
         spawn_local(async move {
-            match approve_task(task_id.to_string(), create_pr).await {
-                Ok(outcome) => apply_outcome(outcome.task, outcome.pr),
+            let attempted = match approve_task(task_id.to_string(), create_pr).await {
+                Ok(outcome) => {
+                    let attempted = tried_a_pull_request(outcome.pr.as_ref());
+                    apply_outcome(outcome.task, outcome.pr);
+                    attempted
+                }
                 Err(e) => {
                     error.try_set(Some(e));
+                    false
+                }
+            };
+            if create_pr {
+                if let Some(d) = deliveries {
+                    d.finish(task_id, attempted);
                 }
             }
             busy.try_set(false);
@@ -210,17 +242,28 @@ pub fn HumanReviewPanel(
     };
 
     let retry_pr = move |_| {
-        if busy.get_untracked() {
+        if busy.get_untracked() || deliveries.is_some_and(|d| d.in_flight_untracked(task_id)) {
             return;
         }
         busy.set(true);
         error.set(None);
+        if let Some(d) = deliveries {
+            d.begin(task_id);
+        }
         spawn_local(async move {
-            match create_approved_task_pr(task_id.to_string()).await {
-                Ok(outcome) => apply_outcome(outcome.task, outcome.pr),
+            let attempted = match create_approved_task_pr(task_id.to_string()).await {
+                Ok(outcome) => {
+                    let attempted = tried_a_pull_request(outcome.pr.as_ref());
+                    apply_outcome(outcome.task, outcome.pr);
+                    attempted
+                }
                 Err(e) => {
                     error.try_set(Some(e));
+                    false
                 }
+            };
+            if let Some(d) = deliveries {
+                d.finish(task_id, attempted);
             }
             busy.try_set(false);
         });
@@ -303,6 +346,18 @@ pub fn HumanReviewPanel(
                     </div>
                 }
             }))}
+
+            // A pull request is being opened. Said here and on the card, so
+            // the 10 seconds or so it can take never look like nothing.
+            <Show when=in_flight>
+                <p data-testid="human-review-delivering" role="status" class="flex items-center gap-2 text-xs text-sky-200">
+                    <svg class="w-3.5 h-3.5 animate-spin" aria-hidden="true" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                    </svg>
+                    "Creating PR\u{2026}"
+                </p>
+            </Show>
 
             // Undecided: the decision itself.
             <Show when=move || in_review.get() && decision.get().is_none()>
@@ -422,14 +477,22 @@ pub fn HumanReviewPanel(
                         <div data-testid="human-review-delivery" data-delivery="failed" class="rounded-md border border-red-500/20 bg-red-500/[0.06] p-2 space-y-2">
                             <p class="text-xs font-semibold text-red-300">"The pull request was not created"</p>
                             <p data-testid="human-review-pr-error" class="text-xs text-red-200/90 whitespace-pre-wrap break-words">{reason}</p>
+                            {move || attempt().filter(|a| a.finished > 0).map(|a| {
+                                let when = a.last_finished_at.unwrap_or_default();
+                                view! {
+                                    <p data-testid="human-review-attempt" data-attempt=a.finished.to_string() class="text-xs text-white/55">
+                                        {format!("Attempt {} failed at {when}.", a.finished)}
+                                    </p>
+                                }
+                            })}
                             <p class="text-xs text-white/45">"Your approval is kept. Nothing was merged."</p>
                             <button
                                 data-testid="human-review-retry-pr"
                                 class="px-3 py-1.5 rounded-lg text-sm bg-blue-500/15 text-blue-200 hover:bg-blue-500/25 disabled:opacity-50"
-                                disabled=move || busy.get()
+                                disabled=move || busy.get() || in_flight()
                                 on:click=retry_pr
                             >
-                                {move || if busy.get() { "Creating…" } else { "Retry Create PR" }}
+                                {move || if busy.get() || in_flight() { "Creating…" } else { "Retry Create PR" }}
                             </button>
                         </div>
                     }.into_any(),
@@ -446,10 +509,10 @@ pub fn HumanReviewPanel(
                             <button
                                 data-testid="human-review-retry-pr"
                                 class="px-3 py-1.5 rounded-lg text-sm bg-blue-500/15 text-blue-200 hover:bg-blue-500/25 disabled:opacity-50"
-                                disabled=move || busy.get()
+                                disabled=move || busy.get() || in_flight()
                                 on:click=retry_pr
                             >
-                                {move || if busy.get() { "Creating…" } else { "Create PR" }}
+                                {move || if busy.get() || in_flight() { "Creating…" } else { "Create PR" }}
                             </button>
                         </div>
                     }.into_any(),
@@ -580,6 +643,14 @@ mod tests {
         let approved = AiReviewSummary::of(&signoff(QaStatus::Approved, &[]));
         assert_eq!(approved.verdict, "AI review approved the changes.");
         assert_eq!(approved.findings_heading, None);
+    }
+
+    #[test]
+    fn only_a_tried_pull_request_counts_as_an_attempt() {
+        assert!(tried_a_pull_request(Some(&PrDelivery::Failed { reason: "x".into() })));
+        assert!(tried_a_pull_request(Some(&PrDelivery::Created { url: "u".into() })));
+        assert!(!tried_a_pull_request(Some(&PrDelivery::Unavailable { reason: "x".into() })));
+        assert!(!tried_a_pull_request(None));
     }
 
     #[test]
