@@ -166,6 +166,7 @@ impl World {
             folder.to_string_lossy().to_string(),
             None,
             kind,
+            None,
         )
         .await?;
         let project = slashit_ui_lib::commands::create_project(
@@ -419,7 +420,21 @@ async fn a_colocated_jj_repository_with_a_detached_git_head_runs_tasks() {
     let report = world.readiness(&project).await;
     assert_eq!(report["vcs"]["kind"], "jj_colocated", "{report:#}");
     assert_eq!(report["head"]["kind"], "detached");
-    assert_eq!(report["project_base"], "trunk");
+    // Being the only bookmark does not make it the trunk: it is suggested,
+    // not captured, and nothing starts until the person confirms it.
+    assert_eq!(report["project_base"], Value::Null, "{report:#}");
+    assert_eq!(report["proposal"], "trunk");
+    assert!(report["proposal_reason"]
+        .as_str()
+        .unwrap()
+        .contains("only bookmark"));
+    world
+        .start_task(&project)
+        .await
+        .expect_err("no base until confirmed");
+    slashit_ui_lib::commands::set_project_base(world.state(), project.clone(), "trunk".to_string())
+        .await
+        .expect("confirmed");
 
     let task = world.start_task(&project).await.expect("task starts");
     assert_eq!(task.base_commit.as_deref(), Some(bookmark.as_str()));
@@ -593,8 +608,8 @@ async fn a_folder_without_version_control_needs_an_explicit_initialization() {
     for kind in ["git", "jujutsu"] {
         let folder = world.dir(&format!("plain-{kind}"));
         fs::write(folder.join("notes.md"), "notes\n").unwrap();
-        // Above JJ's default 1 MiB limit for new files, which the preview
-        // listed, so it must be in the first commit too.
+        // Above JJ's default 1 MiB limit for new files: Git records it,
+        // and Jujutsu initialization is refused rather than leave it out.
         fs::write(folder.join("large.bin"), vec![7u8; 2 * 1024 * 1024]).unwrap();
 
         let project = world.register(&folder, None).await.unwrap();
@@ -614,11 +629,41 @@ async fn a_folder_without_version_control_needs_an_explicit_initialization() {
             "starting never initializes"
         );
 
-        let kind_value = serde_json::from_value(Value::String(kind.to_string())).unwrap();
+        let kind_value = || serde_json::from_value(Value::String(kind.to_string())).unwrap();
+        if kind == "jujutsu" {
+            let refused = slashit_ui_lib::commands::initialize_project_vcs(
+                world.state(),
+                project.clone(),
+                kind_value(),
+                None,
+            )
+            .await
+            .expect_err("a file above JJ's limit would be left out");
+            assert!(
+                refused.contains("large.bin") && refused.contains("snapshot.max-new-file-size"),
+                "{refused}"
+            );
+            assert!(!folder.join(".jj").exists() && !folder.join(".git").exists());
+            fs::remove_file(folder.join("large.bin")).unwrap();
+        }
+        // A count other than what the folder holds means the person saw
+        // something else: refused, nothing changed.
+        let refused = slashit_ui_lib::commands::initialize_project_vcs(
+            world.state(),
+            project.clone(),
+            kind_value(),
+            Some(99),
+        )
+        .await
+        .expect_err("stale preview");
+        assert!(refused.contains("not the 99 shown"), "{refused}");
+        assert!(!folder.join(".jj").exists() && !folder.join(".git").exists());
+        let shown = if kind == "jujutsu" { 1 } else { 2 };
         let report = slashit_ui_lib::commands::initialize_project_vcs(
             world.state(),
             project.clone(),
-            kind_value,
+            kind_value(),
+            Some(shown),
         )
         .await
         .expect("initialized");
@@ -636,7 +681,12 @@ async fn a_folder_without_version_control_needs_an_explicit_initialization() {
                 &format!("refs/heads/{DEFAULT_BRANCH}"),
             ],
         );
-        assert_eq!(tree, "large.bin\nnotes.md", "{kind}");
+        let expected = if kind == "jujutsu" {
+            "notes.md"
+        } else {
+            "large.bin\nnotes.md"
+        };
+        assert_eq!(tree, expected, "{kind}");
         if kind == "jujutsu" {
             assert!(
                 folder.join(".jj").is_dir() && folder.join(".git").is_dir(),
@@ -669,14 +719,51 @@ async fn a_repository_without_commits_gets_its_first_commit_on_request() {
     assert!(refused.contains("no commits yet"), "{refused}");
 
     let kind = serde_json::from_value(Value::String("git".to_string())).unwrap();
-    let report =
-        slashit_ui_lib::commands::initialize_project_vcs(world.state(), project.clone(), kind)
-            .await
-            .expect("first commit");
+    let report = slashit_ui_lib::commands::initialize_project_vcs(
+        world.state(),
+        project.clone(),
+        kind,
+        None,
+    )
+    .await
+    .expect("first commit");
     assert_eq!(report.project_base.as_deref(), Some(DEFAULT_BRANCH));
     assert_eq!(
         git(&repo, &["ls-tree", "-r", "--name-only", "HEAD"]),
         "draft.txt"
     );
     world.start_task(&project).await.expect("task starts");
+}
+
+/// A colocated JJ repository whose own `trunk()` alias names a bookmark has
+/// that bookmark captured at registration, among several.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_colocated_jj_repository_whose_trunk_names_a_bookmark_captures_it() {
+    let world = World::new().await;
+    let repo = world.dir("jj-trunk");
+    fs::write(repo.join("lib.rs"), "// base\n").unwrap();
+    jj(&repo, &["git", "init", "--colocate"]);
+    jj(&repo, &["describe", "-m", "base"]);
+    jj(&repo, &["bookmark", "create", "stable", "-r", "@"]);
+    jj(&repo, &["new"]);
+    jj(&repo, &["describe", "-m", "feature"]);
+    jj(&repo, &["bookmark", "create", "feature", "-r", "@"]);
+    jj(&repo, &["new"]);
+    jj(
+        &repo,
+        &[
+            "config",
+            "set",
+            "--repo",
+            "revset-aliases.\"trunk()\"",
+            "stable",
+        ],
+    );
+    let stable = git(&repo, &["rev-parse", "refs/heads/stable"]);
+
+    let project = world.register(&repo, None).await.unwrap();
+    let report = world.readiness(&project).await;
+    assert_eq!(report["project_base"], "stable", "{report:#}");
+    let task = world.start_task(&project).await.expect("task starts");
+    assert_eq!(task.base_commit.as_deref(), Some(stable.as_str()));
 }

@@ -23,6 +23,13 @@
 //! says: Task Checkouts are Git worktrees added from the project root, which
 //! a non-colocated repository does not have (see [`super::vcs`]).
 //!
+//! Nothing is recorded that the preview did not account for: a folder
+//! holding another Git repository is refused (Git would record only an empty
+//! reference to it, Jujutsu would skip it), Jujutsu initialization is
+//! refused when a file exceeds the person's own
+//! `snapshot.max-new-file-size`, and a folder whose file count changed since
+//! it was shown is refused.
+//!
 //! No identity is ever invented: a commit needs `user.name` and
 //! `user.email`, and when either is missing nothing is changed and the
 //! message says how to set them.
@@ -49,10 +56,13 @@ pub enum VcsInitKind {
 /// What [`initialize`] would do in a folder, and whether it can.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InitPreview {
+    /// The folder this preview describes. What was shown for one folder
+    /// says nothing about another.
+    pub path: String,
     pub vcs: Vcs,
     /// What initializing would do here, in words; `None` when it cannot.
     pub action: Option<String>,
-    /// Why it cannot, when it cannot.
+    /// Why it cannot, with either tool, when it cannot.
     pub blocked: Option<String>,
     /// How many files the first commit would hold.
     pub files: usize,
@@ -62,8 +72,9 @@ pub struct InitPreview {
     pub git_identity_missing: Option<String>,
     /// Whether `jj` can be run at all.
     pub jj_available: bool,
-    /// Why Jujutsu cannot commit here (no identity), if it cannot.
-    pub jj_identity_missing: Option<String>,
+    /// Why Jujutsu cannot record the first commit here (no identity, or
+    /// files above its size limit for new files), if it cannot.
+    pub jj_blocked: Option<String>,
 }
 
 /// The first commit [`initialize`] made.
@@ -76,12 +87,45 @@ pub struct InitOutcome {
     pub files: usize,
 }
 
+/// What the first commit of a folder would hold.
+struct Candidates {
+    /// Files the ignore rules keep.
+    files: Vec<String>,
+    /// Directories holding a Git repository of their own, which the ignore
+    /// rules keep. `git add` would record each as an empty gitlink and JJ
+    /// would leave it out, so their contents would be in neither.
+    nested: Vec<String>,
+}
+
+impl Candidates {
+    fn split(listed: Vec<String>) -> Self {
+        // `ls-files --others` lists a nested repository as its directory,
+        // with a trailing slash, rather than the files inside it.
+        let (nested, files) = listed.into_iter().partition(|entry| entry.ends_with('/'));
+        Candidates { files, nested }
+    }
+
+    /// Why nothing may be recorded, if something nested would be lost.
+    fn nested_refusal(&self, path: &str) -> Option<String> {
+        (!self.nested.is_empty()).then(|| {
+            format!(
+                "{path} contains another Git repository ({}). Its files would not be recorded \
+                 in the first commit: Git would store only a reference to it, and Jujutsu would \
+                 leave it out. Move it out of the folder or add it to .gitignore, then try again. \
+                 Nothing was changed.",
+                self.nested.join(", ")
+            )
+        })
+    }
+}
+
 /// Say what [`initialize`] would do in `path`, writing nothing.
 pub async fn preview(path: &str) -> Result<InitPreview, String> {
     let dir = Path::new(path);
     let vcs = vcs::detect(dir).await?;
     let jj_available = vcs::jj_available().await;
     let mut preview = InitPreview {
+        path: path.to_string(),
         vcs: vcs.clone(),
         action: None,
         blocked: None,
@@ -89,25 +133,28 @@ pub async fn preview(path: &str) -> Result<InitPreview, String> {
         sample: Vec::new(),
         git_identity_missing: None,
         jj_available,
-        jj_identity_missing: None,
+        jj_blocked: None,
     };
-    let files = match &vcs {
-        Vcs::None => untracked_in_plain_folder(dir).await?,
-        Vcs::Git if !vcs::has_commits(dir).await => files_to_commit(dir).await?,
-        Vcs::Git | Vcs::JjColocated => {
-            preview.blocked = Some(format!("{path} already has version control with commits."));
-            return Ok(preview);
-        }
-        other => {
-            preview.blocked = other.refusal(path);
+    let candidates = match candidates(dir, &vcs).await? {
+        Ok(candidates) => candidates,
+        Err(blocked) => {
+            preview.blocked = Some(blocked);
             return Ok(preview);
         }
     };
+    let files = &candidates.files;
     preview.files = files.len();
     preview.sample = files.iter().take(SAMPLE).cloned().collect();
+    if let Some(refused) = candidates.nested_refusal(path) {
+        preview.blocked = Some(refused);
+        return Ok(preview);
+    }
     preview.git_identity_missing = git_identity_missing(dir).await;
     if jj_available && vcs == Vcs::None {
-        preview.jj_identity_missing = jj_identity_missing(dir).await;
+        preview.jj_blocked = match jj_identity_missing(dir).await {
+            Some(missing) => Some(missing),
+            None => jj_oversized(dir, files).await.err(),
+        };
     }
     let commit = if files.is_empty() {
         "an empty first commit, since the folder has no files to record".to_string()
@@ -129,10 +176,33 @@ pub async fn preview(path: &str) -> Result<InitPreview, String> {
     Ok(preview)
 }
 
+/// What a first commit in `dir` would hold, or why there is none to make.
+async fn candidates(dir: &Path, vcs: &Vcs) -> Result<Result<Candidates, String>, String> {
+    let path = dir.to_string_lossy();
+    Ok(Ok(Candidates::split(match vcs {
+        Vcs::None => untracked_in_plain_folder(dir).await?,
+        Vcs::Git if !vcs::has_commits(dir).await => files_to_commit(dir).await?,
+        Vcs::Git | Vcs::JjColocated => {
+            return Ok(Err(format!(
+                "{path} already has version control with commits."
+            )))
+        }
+        other => return Ok(Err(other.refusal(&path).unwrap_or_default())),
+    })))
+}
+
 /// Put `path` under `kind` version control with a first commit, or give
 /// the repository that exists there, with no commit yet, its first commit.
 /// See the module documentation.
-pub async fn initialize(path: &str, kind: VcsInitKind) -> Result<InitOutcome, String> {
+///
+/// `expected_files` is how many files the preview the person saw counted.
+/// When the folder no longer holds that many, nothing is changed: what
+/// would be recorded is not what was shown.
+pub async fn initialize(
+    path: &str,
+    kind: VcsInitKind,
+    expected_files: Option<usize>,
+) -> Result<InitOutcome, String> {
     let dir = Path::new(path);
     let vcs = vcs::detect(dir).await?;
     match (&vcs, kind) {
@@ -151,9 +221,22 @@ pub async fn initialize(path: &str, kind: VcsInitKind) -> Result<InitOutcome, St
         }
         (other, _) => return Err(other.refusal(path).unwrap_or_default()),
     }
+    let candidates = candidates(dir, &vcs).await??;
+    if let Some(refused) = candidates.nested_refusal(path) {
+        return Err(refused);
+    }
+    if let Some(expected) = expected_files {
+        if expected != candidates.files.len() {
+            return Err(format!(
+                "{path} now holds {} file(s) to record, not the {expected} shown, so nothing was \
+                 changed. Check the folder again before initializing.",
+                candidates.files.len()
+            ));
+        }
+    }
     match kind {
         VcsInitKind::Git => initialize_git(dir, path, vcs == Vcs::None).await,
-        VcsInitKind::Jujutsu => initialize_jj(dir, path).await,
+        VcsInitKind::Jujutsu => initialize_jj(dir, path, &candidates.files).await,
     }
 }
 
@@ -206,28 +289,20 @@ async fn initialize_git(dir: &Path, path: &str, create: bool) -> Result<InitOutc
     })
 }
 
-async fn initialize_jj(dir: &Path, path: &str) -> Result<InitOutcome, String> {
+async fn initialize_jj(dir: &Path, path: &str, files: &[String]) -> Result<InitOutcome, String> {
     if !vcs::jj_available().await {
         return Err("Jujutsu (`jj`) is not installed or cannot be run.".to_string());
     }
     if let Some(missing) = jj_identity_missing(dir).await {
         return Err(missing);
     }
-    // JJ refuses to record new files above `snapshot.max-new-file-size` and
-    // leaves them out with only a warning. The person was shown every file
-    // the ignore rules keep, so the limit is raised, for these commands
-    // only, to the largest of them.
-    let files = untracked_in_plain_folder(dir).await?;
-    let largest = files
-        .iter()
-        .filter_map(|file| std::fs::metadata(dir.join(file)).ok())
-        .map(|meta| meta.len())
-        .max()
-        .unwrap_or(0)
-        .max(1024 * 1024);
-    let limit = format!("snapshot.max-new-file-size={largest}");
+    // JJ leaves new files above its `snapshot.max-new-file-size` out of the
+    // snapshot with only a warning. The person's own limit is respected:
+    // Jujutsu initialization is refused instead of recording less than it
+    // said it would.
+    jj_oversized(dir, files).await?;
     let jj = |args: &[&str]| {
-        let mut all = vec!["--color=never", "--config", limit.as_str()];
+        let mut all = vec!["--color=never"];
         all.extend_from_slice(args);
         all.iter().map(|s| s.to_string()).collect::<Vec<_>>()
     };
@@ -264,6 +339,78 @@ async fn initialize_jj(dir: &Path, path: &str) -> Result<InitOutcome, String> {
         commit,
         files: recorded.lines().filter(|l| !l.is_empty()).count(),
     })
+}
+
+/// Refuse when any of `files` in `dir` is larger than the largest new file
+/// JJ records here (`snapshot.max-new-file-size`, as JJ itself reports it,
+/// which includes its built-in default).
+async fn jj_oversized(dir: &Path, files: &[String]) -> Result<(), String> {
+    let configured = run(
+        dir,
+        "jj",
+        &[
+            "--ignore-working-copy",
+            "--color=never",
+            "config",
+            "get",
+            "snapshot.max-new-file-size",
+        ],
+        &[],
+    )
+    .await?;
+    let limit = parse_size(&configured).ok_or_else(|| {
+        format!(
+            "Jujutsu's snapshot.max-new-file-size is {configured:?}, which SlashIt cannot read, so \
+             it cannot tell whether every file would be recorded. Initialize with Git instead, or \
+             set a plain byte count. Nothing was changed."
+        )
+    })?;
+    if limit == 0 {
+        return Ok(());
+    }
+    let mut oversized: Vec<String> = files
+        .iter()
+        .filter_map(|file| {
+            let size = std::fs::metadata(dir.join(file)).ok()?.len();
+            (size > limit).then(|| format!("{file} ({size} bytes)"))
+        })
+        .collect();
+    if oversized.is_empty() {
+        return Ok(());
+    }
+    oversized.truncate(SAMPLE);
+    Err(format!(
+        "Jujutsu would leave out files larger than its snapshot.max-new-file-size ({configured}): \
+         {}. Raise that setting (`jj config set --user snapshot.max-new-file-size <bytes>`), add \
+         the files to .gitignore, or initialize with Git instead. Nothing was changed.",
+        oversized.join(", ")
+    ))
+}
+
+/// A byte count as JJ's configuration writes it: a plain integer, or an
+/// integer with a unit (`B`, `KB`/`KiB`, `MB`/`MiB`, `GB`/`GiB`, `TB`/`TiB`;
+/// decimal units are powers of 1000, binary ones of 1024). Anything else,
+/// including a fraction, is `None`.
+fn parse_size(value: &str) -> Option<u64> {
+    let value = value.trim().trim_matches('"').trim();
+    let digits = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(digits);
+    let number: u64 = number.parse().ok()?;
+    let factor: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" | "k" => 1_000,
+        "kib" => 1 << 10,
+        "mb" | "m" => 1_000_000,
+        "mib" => 1 << 20,
+        "gb" | "g" => 1_000_000_000,
+        "gib" => 1 << 30,
+        "tb" | "t" => 1_000_000_000_000,
+        "tib" => 1 << 40,
+        _ => return None,
+    };
+    number.checked_mul(factor)
 }
 
 /// The commit `refs/heads/<branch>` names, which must exist now.
@@ -495,5 +642,144 @@ pub(crate) mod test_env {
             ),
             ("HOME".to_string(), root.to_string_lossy().to_string()),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// `isolated` configuration with `extra_jj` appended to JJ's.
+    fn env_with_jj(root: &Path, extra_jj: &str) -> Vec<(String, String)> {
+        let env = test_env::isolated(root, "trunk-xyz");
+        let jj_config = root.join("jjconfig.toml");
+        let mut text = std::fs::read_to_string(&jj_config).unwrap();
+        text.push_str(extra_jj);
+        std::fs::write(&jj_config, text).unwrap();
+        env
+    }
+
+    #[test]
+    fn sizes_are_read_the_way_jj_writes_them() {
+        assert_eq!(parse_size("1MiB"), Some(1 << 20));
+        assert_eq!(parse_size("\"2KB\""), Some(2_000));
+        assert_eq!(parse_size("2KiB"), Some(2_048));
+        assert_eq!(parse_size("3000"), Some(3_000));
+        assert_eq!(parse_size("0"), Some(0));
+        assert_eq!(parse_size("2.5KiB"), None);
+        assert_eq!(parse_size("lots"), None);
+    }
+
+    /// Another Git repository inside the folder would be recorded as an
+    /// empty reference by Git and skipped by JJ: both refuse, before
+    /// anything is written, naming it.
+    #[tokio::test]
+    async fn a_nested_repository_is_refused_for_both_tools() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(folder.join("vendor/lib")).unwrap();
+        std::fs::write(folder.join("notes.md"), "notes").unwrap();
+        run_git(&folder.join("vendor/lib"), &["init", "-q"]);
+        std::fs::write(folder.join("vendor/lib/code.rs"), "code").unwrap();
+        let path = folder.to_str().unwrap();
+        let env = test_env::isolated(temp.path(), "trunk-xyz");
+
+        let shown = test_env::scope(env.clone(), preview(path)).await.unwrap();
+        assert!(
+            shown
+                .blocked
+                .as_deref()
+                .is_some_and(|b| b.contains("vendor/lib/")),
+            "{shown:?}"
+        );
+        assert_eq!(shown.action, None);
+        for kind in [VcsInitKind::Git, VcsInitKind::Jujutsu] {
+            let refused = test_env::scope(env.clone(), initialize(path, kind, None))
+                .await
+                .expect_err("nested repository");
+            assert!(refused.contains("vendor/lib/"), "{kind:?}: {refused}");
+            assert!(
+                !folder.join(".git").exists() && !folder.join(".jj").exists(),
+                "{kind:?}"
+            );
+        }
+
+        // Ignored, it is not part of the first commit at all.
+        std::fs::write(folder.join(".gitignore"), "vendor/\n").unwrap();
+        let outcome = test_env::scope(env, initialize(path, VcsInitKind::Git, Some(2)))
+            .await
+            .expect("initialized");
+        assert_eq!(outcome.files, 2);
+    }
+
+    /// The person's own `snapshot.max-new-file-size` is respected: a file
+    /// above it refuses Jujutsu initialization, naming the file and the
+    /// setting, and changes nothing. Git is not affected by it.
+    #[tokio::test]
+    async fn a_file_above_the_users_jj_limit_refuses_jujutsu_initialization() {
+        // The real `jj`: other tests take it off `PATH` while they hold this.
+        let _path = crate::test_helpers::PATH_LOCK.lock().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("small.txt"), "ok").unwrap();
+        std::fs::write(folder.join("big.txt"), vec![b'x'; 200]).unwrap();
+        let path = folder.to_str().unwrap();
+        let env = env_with_jj(temp.path(), "[snapshot]\nmax-new-file-size = 100\n");
+
+        let shown = test_env::scope(env.clone(), preview(path)).await.unwrap();
+        let jj_blocked = shown.jj_blocked.clone().expect("jj refused in the preview");
+        assert!(jj_blocked.contains("big.txt (200 bytes)"), "{jj_blocked}");
+        assert!(jj_blocked.contains("initialize with Git"), "{jj_blocked}");
+        assert!(shown.blocked.is_none() && shown.git_identity_missing.is_none());
+
+        let refused = test_env::scope(env.clone(), initialize(path, VcsInitKind::Jujutsu, Some(2)))
+            .await
+            .expect_err("above the limit");
+        assert!(
+            refused.contains("big.txt") && refused.contains("snapshot.max-new-file-size"),
+            "{refused}"
+        );
+        assert!(!folder.join(".jj").exists() && !folder.join(".git").exists());
+
+        let outcome = test_env::scope(env, initialize(path, VcsInitKind::Git, Some(2)))
+            .await
+            .expect("Git records it");
+        assert_eq!(outcome.files, 2);
+    }
+
+    /// `git.colocate = false` in the person's configuration does not make a
+    /// repository SlashIt cannot create Task Checkouts from.
+    #[tokio::test]
+    async fn jujutsu_initialization_colocates_whatever_git_colocate_says() {
+        // The real `jj`: other tests take it off `PATH` while they hold this.
+        let _path = crate::test_helpers::PATH_LOCK.lock().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("notes.md"), "notes").unwrap();
+        let path = folder.to_str().unwrap();
+        let env = env_with_jj(temp.path(), "[git]\ncolocate = false\n");
+
+        let outcome = test_env::scope(env, initialize(path, VcsInitKind::Jujutsu, Some(1)))
+            .await
+            .expect("initialized");
+        assert_eq!(outcome.branch, "trunk-xyz");
+        assert_eq!(vcs::detect(&folder).await, Ok(Vcs::JjColocated));
+        assert!(folder.join(".git").is_dir());
     }
 }

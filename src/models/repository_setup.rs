@@ -84,6 +84,8 @@ pub enum VcsInitKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct InitPreview {
+    /// The folder this preview describes.
+    pub path: String,
     pub vcs: Vcs,
     pub action: Option<String>,
     pub blocked: Option<String>,
@@ -91,7 +93,7 @@ pub struct InitPreview {
     pub sample: Vec<String>,
     pub git_identity_missing: Option<String>,
     pub jj_available: bool,
-    pub jj_identity_missing: Option<String>,
+    pub jj_blocked: Option<String>,
 }
 
 impl InitPreview {
@@ -108,7 +110,77 @@ impl InitPreview {
             VcsInitKind::Jujutsu if self.vcs != Vcs::None => {
                 Some("This folder is already a Git repository; initialize it with Git.".to_string())
             }
-            VcsInitKind::Jujutsu => self.jj_identity_missing.clone(),
+            VcsInitKind::Jujutsu => self.jj_blocked.clone(),
         }
+    }
+}
+
+/// What Create Project asks the backend to initialize for the folder
+/// `submitted`: `(kind, number of files shown)`, or nothing.
+///
+/// Initializing is only ever what the person was shown: a preview of a
+/// different folder than the one submitted (the location changed after it
+/// was taken, or before a new one came back) is not consent for this one,
+/// and is refused rather than quietly dropped.
+pub fn initialization_for(
+    preview: Option<&InitPreview>,
+    submitted: &str,
+    chosen: bool,
+    kind: VcsInitKind,
+) -> Result<Option<(VcsInitKind, usize)>, String> {
+    if !chosen {
+        return Ok(None);
+    }
+    match preview {
+        Some(p) if p.path == submitted && p.action.is_some() && p.refusal(kind).is_none() => {
+            Ok(Some((kind, p.files)))
+        }
+        Some(p) if p.path == submitted => Ok(None),
+        _ => Err(
+            "The folder changed since SlashIt showed what initializing would do. Check the \
+             folder again (press Browse, or leave the Location field) before creating the project."
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preview(path: &str) -> InitPreview {
+        InitPreview {
+            path: path.to_string(),
+            vcs: Vcs::None,
+            action: Some("Create a repository".to_string()),
+            blocked: None,
+            files: 3,
+            sample: vec![],
+            git_identity_missing: None,
+            jj_available: true,
+            jj_blocked: Some("big.bin is too large".to_string()),
+        }
+    }
+
+    #[test]
+    fn initialization_is_bound_to_the_previewed_folder() {
+        let shown = preview("/work/a");
+        assert_eq!(
+            initialization_for(Some(&shown), "/work/a", true, VcsInitKind::Git),
+            Ok(Some((VcsInitKind::Git, 3)))
+        );
+        // Another folder submitted, or no preview back yet: refused.
+        assert!(initialization_for(Some(&shown), "/work/b", true, VcsInitKind::Git).is_err());
+        assert!(initialization_for(None, "/work/a", true, VcsInitKind::Git).is_err());
+        // Not chosen: nothing, whatever the preview.
+        assert_eq!(
+            initialization_for(None, "/work/b", false, VcsInitKind::Git),
+            Ok(None)
+        );
+        // A kind the preview refuses is not initialized.
+        assert_eq!(
+            initialization_for(Some(&shown), "/work/a", true, VcsInitKind::Jujutsu),
+            Ok(None)
+        );
     }
 }

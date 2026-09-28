@@ -90,7 +90,11 @@ impl Default for RepositoryState {
 /// Returns whether anything was initialized, so the caller can tell a fresh
 /// initialization apart from a folder that was already a repository — the
 /// two need different error framing if persistence fails afterward.
-async fn ensure_vcs_initialized(path: &Path, initialize: Option<VcsInitKind>) -> Result<bool, String> {
+async fn ensure_vcs_initialized(
+    path: &Path,
+    initialize: Option<VcsInitKind>,
+    expected_files: Option<usize>,
+) -> Result<bool, String> {
     if let GitLocation::InsideRepo { root } = git_location(path).await? {
         return Err(format!(
             "'{}' is already inside git repository '{}'. Select that folder directly, or choose a location that is not part of an existing repository.",
@@ -110,7 +114,7 @@ async fn ensure_vcs_initialized(path: &Path, initialize: Option<VcsInitKind>) ->
         return Ok(false);
     }
     let path_str = path.to_str().ok_or("The folder's path is not valid UTF-8")?;
-    vcs_init::initialize(path_str, kind).await?;
+    vcs_init::initialize(path_str, kind, expected_files).await?;
     Ok(true)
 }
 
@@ -120,6 +124,7 @@ pub async fn create_repository(
     local_path: String,
     remote_url: Option<String>,
     initialize: Option<VcsInitKind>,
+    expected_files: Option<usize>,
 ) -> Result<Repository, String> {
     create_repository_core(
         &state.repository.repositories,
@@ -127,6 +132,7 @@ pub async fn create_repository(
         local_path,
         remote_url,
         initialize,
+        expected_files,
     )
     .await
 }
@@ -143,13 +149,14 @@ async fn create_repository_core(
     local_path: String,
     remote_url: Option<String>,
     initialize: Option<VcsInitKind>,
+    expected_files: Option<usize>,
 ) -> Result<Repository, String> {
     let path = std::path::PathBuf::from(&local_path);
     if !path.is_dir() {
         return Err(format!("'{}' is not a directory", local_path));
     }
 
-    let git_freshly_initialized = ensure_vcs_initialized(&path, initialize).await?;
+    let git_freshly_initialized = ensure_vcs_initialized(&path, initialize, expected_files).await?;
 
     let id = Uuid::new_v4();
     let remote_type = remote_url.as_ref().and_then(|url| {
@@ -360,7 +367,7 @@ mod tests {
 
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git)),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -389,7 +396,7 @@ mod tests {
 
         vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git)),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await
         .expect("initialized");
@@ -411,7 +418,7 @@ mod tests {
 
         let refused = vcs_init::test_env::scope(
             vcs_init::test_env::without_identity(temp.path()),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git)),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await
         .expect_err("no identity");
@@ -430,7 +437,7 @@ mod tests {
 
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, None),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, None, None),
         )
         .await;
 
@@ -454,7 +461,7 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git)),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -490,7 +497,7 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, Some(VcsInitKind::Git)),
+            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -522,7 +529,7 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, None),
+            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, None, None),
         )
         .await;
 
@@ -553,7 +560,7 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, Some(VcsInitKind::Git)),
+            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -572,7 +579,7 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, nested.to_string_lossy().to_string(), None, Some(VcsInitKind::Git)),
+            create_repository_core(&repositories, &storage, nested.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -597,7 +604,7 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, worktree.to_string_lossy().to_string(), None, Some(VcsInitKind::Git)),
+            create_repository_core(&repositories, &storage, worktree.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -622,7 +629,7 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git)),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -652,7 +659,7 @@ mod tests {
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
         let result = vcs_init::test_env::scope(
             vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
-            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git)),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 

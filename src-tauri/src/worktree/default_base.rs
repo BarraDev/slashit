@@ -393,6 +393,14 @@ async fn refusal(repo: &Path, repo_path: &str) -> String {
              commit there yourself, then start the task again."
         );
     }
+    if !has_origin && vcs::local_branches(repo).await.is_empty() {
+        return format!(
+            "This project has no base branch for new tasks, and {repo_path} has neither a remote \
+             named origin nor a local branch to start from.{jj} Create a branch first (for \
+             example `git switch -c <name>`), then choose it in Settings > Repository and start \
+             the task again. A remote is not required."
+        );
+    }
     if has_origin {
         format!(
             "SlashIt could not tell which branch a new task should start from in {repo_path}: \

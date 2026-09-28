@@ -1773,7 +1773,7 @@ async fn create_prerequisites(
             json!({
                 "localPath": repository.path(),
                 "remoteUrl": Value::Null,
-                "initializeGit": false,
+                "initialize": Value::Null,
             }),
         )
         .await?,

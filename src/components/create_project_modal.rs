@@ -2,7 +2,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos::callback::Callback;
 use crate::models::{Repository, AgentType, Project};
-use crate::models::repository_setup::{InitPreview, Vcs, VcsInitKind};
+use crate::models::repository_setup::{initialization_for, InitPreview, Vcs, VcsInitKind};
 use crate::services::{create_project, create_repository, list_repositories, pick_folder, check_is_git_repo};
 use crate::services::repository_setup_service::{get_project_readiness, preview_vcs_initialization};
 use crate::components::toast;
@@ -210,10 +210,19 @@ pub fn CreateProjectModal(
 
             let on_created = on_project_created;
             let set_show_clone = set_show;
-            let initialize = init_preview
-                .get()
-                .filter(|preview| preview.action.is_some() && init_vcs.get())
-                .map(|_| init_kind.get());
+            let initialize = match initialization_for(
+                init_preview.get().as_ref(),
+                &folder_path_val,
+                init_vcs.get(),
+                init_kind.get(),
+            ) {
+                Ok(initialize) => initialize,
+                Err(e) => {
+                    set_error_msg.set(Some(e));
+                    set_submitting.set(false);
+                    return;
+                }
+            };
 
             spawn_local(async move {
                 // Create repository from folder path
@@ -459,7 +468,12 @@ pub fn CreateProjectModal(
                                         type="text"
                                         prop:value=move || folder_path.get()
                                         data-testid="create-project-location"
-                                        on:input=move |ev| set_folder_path.set(event_target_value(&ev))
+                                        on:input=move |ev| {
+                                            // What was shown was for another folder.
+                                            set_folder_path.set(event_target_value(&ev));
+                                            init_preview.set(None);
+                                            set_init_vcs.set(false);
+                                        }
                                         on:change=move |ev| inspect_folder(event_target_value(&ev))
                                         class="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-purple-500/50 transition-all"
                                         placeholder="Select a folder..."

@@ -132,18 +132,20 @@ pub async fn initialize_project_vcs(
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     kind: VcsInitKind,
+    expected_files: Option<usize>,
 ) -> Result<Readiness, String> {
     let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
-    initialize_project_vcs_core(&state, project_id, kind).await
+    initialize_project_vcs_core(&state, project_id, kind, expected_files).await
 }
 
 pub(crate) async fn initialize_project_vcs_core(
     state: &crate::AppState,
     project_id: Uuid,
     kind: VcsInitKind,
+    expected_files: Option<usize>,
 ) -> Result<Readiness, String> {
     let (_, path) = project_and_path(state, project_id).await?;
-    let outcome = vcs_init::initialize(&path, kind).await?;
+    let outcome = vcs_init::initialize(&path, kind, expected_files).await?;
     record_project_base(
         state,
         project_id,

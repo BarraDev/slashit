@@ -49,6 +49,28 @@ release will contain.
   makes it standalone again; the missing workspace is not recreated, and
   startup never rewrites the membership on its own.
 - PR comment review workflow with per-item approve, fix and skip.
+- **Projects without a remote run tasks.** A repository with commits and no
+  remote runs tasks end to end, AI Review and Human Review included; the pull
+  request it cannot have is explained where it would be offered. Each project
+  records a local base branch where new tasks start when `origin` names no
+  default branch: captured when the project is registered, only when that is
+  unambiguous (Git's `HEAD` on a branch that agrees with `origin`, or the
+  bookmark Jujutsu's `trunk()` names), otherwise chosen in the new
+  Settings > Repository tab. Checking out another branch does not move it.
+- **Explicit repository setup.** Settings > Repository shows whether a
+  project can run tasks and why not, and offers Detect default branch
+  (`git remote set-head origin --auto`, which reads `origin` and writes only
+  `refs/remotes/origin/HEAD`) and Initialize with Git or Jujutsu. Create
+  Project offers the same initialization, saying first what it will record.
+  Initializing never picks a branch name, records the folder's current files
+  (ignore rules applied) as the first commit, needs a configured commit
+  identity, colocates Jujutsu with Git, and refuses rather than record less
+  than it showed: a nested Git repository, a file above Jujutsu's own
+  `snapshot.max-new-file-size`, or a folder that changed since it was shown.
+  A folder is never initialized on its own, and starting a task in one
+  without version control is refused with what to do. A Jujutsu repository
+  that is not colocated with Git is recognised and refused, pointing to
+  `jj git colocation enable`.
 - Community health files for the public contribution flow.
 
 ### Changed
@@ -67,10 +89,9 @@ release will contain.
   primary checkout had checked out (a feature branch, or unpushed work in a
   Jujutsu-colocated repository). The default branch comes from
   `refs/remotes/origin/HEAD`, or from Jujutsu's `trunk()` alias when that is
-  exactly `<branch>@origin`, and nothing is fetched to find it. A repository
-  with neither now refuses to start the task and says to run
-  `git remote set-head origin --auto`; one without a remote named `origin` is
-  not supported. The new branch tracks nothing until SlashIt pushes it, and its
+  exactly `<branch>@origin`, and nothing is fetched to find it. Without
+  either, the branch starts at the project's local base branch (see Added);
+  a remote is not required. The new branch tracks nothing until SlashIt pushes it, and its
   pull request is opened against that default branch explicitly. Tasks created
   earlier keep the origin they recorded and open their pull requests as before.
 - **Task branches are named from the whole task id**, `task-<id>`, instead of

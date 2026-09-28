@@ -137,7 +137,10 @@ the branch is created, and never re-derived afterwards:
 2. Otherwise, the **Project's local base** (`Project.base`): a local branch
    (in a colocated JJ repository, a bookmark) captured when the Project was
    registered or its version control initialized, when that was
-   unambiguous, or chosen explicitly in Settings > Repository. Switching the
+   unambiguous (Git's `HEAD` on a branch that agrees with `origin`, the
+   bookmark JJ's `trunk()` names, or the bookmark Initialize with Jujutsu
+   created), or chosen explicitly in Settings > Repository. A colocated JJ
+   repository's only bookmark is suggested there, never captured on its own. Switching the
    primary checkout to another branch does not move it. The Task records it
    as starting from the local base; a pull request for it targets that
    branch on `origin` only once `origin` has it and contains the Task's
@@ -159,6 +162,10 @@ repository without choosing a branch name, so the tool's own configuration
 names it, and records the folder's current files, ignore rules applied, as
 the first commit. Jujutsu is initialized colocated with Git
 (`jj git init --colocate`), since Task Checkouts are Git worktrees.
+Initializing refuses, changing nothing, rather than record less than it
+showed: when the folder holds another Git repository, when a file exceeds
+Jujutsu's own `snapshot.max-new-file-size` (for Jujutsu), or when the folder
+no longer holds the files that were shown.
 
 Branches created by earlier versions may record no origin, or a default
 base with no branch, and keep what they recorded. Projects registered by

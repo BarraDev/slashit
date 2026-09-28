@@ -79,10 +79,15 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
         spawn_local(async move { apply(detect_remote_default_branch(id).await) });
     };
     let initialize = move |kind: VcsInitKind| {
+        // Only what the preview on screen showed is initialized; the backend
+        // refuses when the folder no longer holds that many files.
+        let Some(shown) = preview.get_untracked().map(|p| p.files) else {
+            return;
+        };
         busy.set(true);
         let id = pid.get_value();
         spawn_local(async move {
-            let answer = initialize_project_vcs(id, kind).await;
+            let answer = initialize_project_vcs(id, kind, shown).await;
             if answer.is_ok() {
                 toast::success("Version control initialized; tasks can start.".to_string());
             }

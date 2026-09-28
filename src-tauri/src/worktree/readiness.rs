@@ -29,10 +29,12 @@ pub struct Readiness {
     /// [`Self::blocked`] says why not.
     pub base: Option<ResolvedBase>,
     pub blocked: Option<String>,
-    /// For a project with no recorded base: the branch that could be
-    /// captured unambiguously, offered for an explicit confirmation.
+    /// For a project with no recorded base: the branch that can be told
+    /// (or only suggested, see [`Self::proposal_reason`]), offered for an
+    /// explicit confirmation.
     pub proposal: Option<String>,
-    /// Why nothing could be proposed, when nothing could.
+    /// Why nothing could be proposed, or why the proposal is only a
+    /// suggestion.
     pub proposal_reason: Option<String>,
     /// Local branches that can be chosen as the base, task branches aside.
     pub local_branches: Vec<String>,
@@ -65,6 +67,7 @@ pub async fn readiness(
     let (proposal, proposal_reason) = match (project_base, supported) {
         (None, true) => match project_base::propose(repo_path).await? {
             Proposal::Branch(branch) => (Some(branch), None),
+            Proposal::Suggested { branch, why } => (Some(branch), Some(why)),
             Proposal::Undecided(why) => (None, Some(why)),
         },
         _ => (None, None),

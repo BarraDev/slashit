@@ -9,9 +9,16 @@
 //!   different branch of origin's, the two disagree and nothing is captured.
 //! - Jujutsu colocated with Git, where Git's `HEAD` is normally detached: the
 //!   branch JJ's `trunk()` alias names, when it is exactly `<D>` or
-//!   `<D>@origin` and the local branch (bookmark) `D` exists; otherwise the
-//!   repository's only local bookmark, when there is exactly one. A
-//!   repository whose Git `HEAD` is attached is read as Git is.
+//!   `<D>@origin` and the local branch (bookmark) `D` exists: that is JJ's
+//!   own configuration saying which line is the trunk. A repository whose
+//!   Git `HEAD` is attached is read as Git is. (Initializing with Jujutsu
+//!   records the bookmark SlashIt itself just created; see
+//!   `commands::repository_setup`.)
+//!
+//! A colocated JJ repository with exactly one bookmark and no `trunk()`
+//! naming it gets that bookmark as a *suggestion*: offered for the person to
+//! confirm in the project's repository settings, never captured on its own,
+//! since having one bookmark does not make it the trunk.
 //!
 //! Anything else -- a detached Git `HEAD`, several candidate bookmarks, no
 //! commit at all -- is left undecided, with the reason, for the person to
@@ -29,6 +36,9 @@ use std::path::Path;
 pub enum Proposal {
     /// This local branch is, unambiguously, the project's base.
     Branch(String),
+    /// This local branch is the likely base, but only a person can say so;
+    /// why it is only suggested.
+    Suggested { branch: String, why: String },
     /// No branch can be told; why, in words a person can act on.
     Undecided(String),
 }
@@ -37,7 +47,7 @@ impl Proposal {
     pub fn into_base(self) -> Option<ProjectBase> {
         match self {
             Self::Branch(branch) => Some(ProjectBase::LocalBranch { branch }),
-            Self::Undecided(_) => None,
+            Self::Suggested { .. } | Self::Undecided(_) => None,
         }
     }
 }
@@ -59,6 +69,12 @@ pub async fn propose(repo_path: &str) -> Result<Proposal, String> {
     match vcs::head(repo).await {
         Head::Branch { branch } => attached(repo, repo_path, branch).await,
         _ if vcs == Vcs::JjColocated => jj_bookmark(repo).await,
+        Head::Detached if vcs::local_branches(repo).await.is_empty() => Ok(Proposal::Undecided(
+            "The primary checkout is on a detached HEAD and the repository has no local \
+                 branch, so there is nothing a task could start from. Create a branch first (for \
+                 example `git switch -c <name>`), then choose it as the project's base."
+                .to_string(),
+        )),
         Head::Detached => Ok(Proposal::Undecided(
             "The primary checkout is on a detached HEAD, so SlashIt cannot tell which branch is \
              the project's base. Choose it explicitly."
@@ -121,7 +137,17 @@ async fn jj_bookmark(repo: &Path) -> Result<Proposal, String> {
         }
     }
     Ok(match candidates.len() {
-        1 => Proposal::Branch(candidates.remove(0)),
+        1 => {
+            let branch = candidates.remove(0);
+            Proposal::Suggested {
+                why: format!(
+                    "{branch} is this Jujutsu repository's only bookmark, but JJ's trunk() alias \
+                     does not name it, so SlashIt will not assume it is the base. Confirm it, or \
+                     choose another."
+                ),
+                branch,
+            }
+        }
         0 => Proposal::Undecided(
             "This Jujutsu repository has no bookmark to start tasks from. Create one (for \
              example `jj bookmark create <name> -r @-`), then choose it as the project's base."
@@ -243,24 +269,53 @@ mod tests {
     }
 
     /// A colocated JJ repository (simulated: `.jj` beside `.git`) with a
-    /// detached Git `HEAD` takes its only bookmark, and refuses to pick
-    /// between several. Task branches never count.
+    /// detached Git `HEAD` only *suggests* its only bookmark, and refuses to
+    /// pick between several. Task branches never count.
     #[tokio::test]
-    async fn a_colocated_jj_repository_takes_its_only_bookmark() {
+    async fn a_colocated_jj_repository_only_suggests_its_only_bookmark() {
         let _no_jj = crate::test_helpers::FakeProgram::without(&["jj"]).await;
         let (_temp, repo) = repo_on("trunk-xyz");
         std::fs::create_dir_all(repo.join(".jj")).unwrap();
         let tip = git(&repo, &["rev-parse", "HEAD"]);
         git(&repo, &["update-ref", "refs/heads/task-12345678", &tip]);
         git(&repo, &["checkout", "-q", "--detach"]);
-        assert_eq!(
-            proposed(&repo).await,
-            Proposal::Branch("trunk-xyz".to_string())
+        let only = proposed(&repo).await;
+        assert!(
+            matches!(&only, Proposal::Suggested { branch, .. } if branch == "trunk-xyz"),
+            "{only:?}"
         );
+        assert_eq!(only.into_base(), None, "a suggestion is never captured");
 
         git(&repo, &["update-ref", "refs/heads/other", &tip]);
         assert!(
             matches!(proposed(&repo).await, Proposal::Undecided(why) if why.contains("2 bookmarks"))
+        );
+    }
+
+    /// JJ's own `trunk()` naming a local bookmark is captured.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_colocated_jj_repository_takes_the_bookmark_trunk_names() {
+        let _jj =
+            crate::test_helpers::FakeProgram::install("jj", "printf 'trunk-xyz@origin\\n'").await;
+        let (_temp, repo) = repo_on("trunk-xyz");
+        std::fs::create_dir_all(repo.join(".jj")).unwrap();
+        let tip = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["update-ref", "refs/heads/other", &tip]);
+        git(&repo, &["checkout", "-q", "--detach"]);
+        assert_eq!(
+            proposed(&repo).await,
+            Proposal::Branch("trunk-xyz".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detached_head_with_no_branch_says_to_create_one() {
+        let (_temp, repo) = repo_on("trunk-xyz");
+        git(&repo, &["checkout", "-q", "--detach"]);
+        git(&repo, &["branch", "-D", "trunk-xyz"]);
+        assert!(
+            matches!(proposed(&repo).await, Proposal::Undecided(why) if why.contains("git switch -c"))
         );
     }
 

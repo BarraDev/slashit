@@ -67,27 +67,31 @@ pub async fn preview_vcs_initialization(path: String) -> Result<InitPreview, Str
 pub async fn initialize_project_vcs(
     project_id: String,
     kind: VcsInitKind,
+    expected_files: usize,
 ) -> Result<Readiness, String> {
     call(
         "initialize_project_vcs",
-        serde_json::json!({ "projectId": project_id, "kind": kind }),
+        serde_json::json!({ "projectId": project_id, "kind": kind, "expectedFiles": expected_files }),
     )
     .await
 }
 
 /// Register `local_path` as a repository, initializing version control
-/// there first when `initialize` says so.
+/// there first when `initialize` says so: `(kind, number of files the
+/// person was shown)`. The backend refuses when the folder no longer holds
+/// that many.
 pub async fn create_repository(
     local_path: String,
     remote_url: Option<String>,
-    initialize: Option<VcsInitKind>,
+    initialize: Option<(VcsInitKind, usize)>,
 ) -> Result<Repository, String> {
     call(
         "create_repository",
         serde_json::json!({
             "localPath": local_path,
             "remoteUrl": remote_url,
-            "initialize": initialize,
+            "initialize": initialize.map(|(kind, _)| kind),
+            "expectedFiles": initialize.map(|(_, files)| files),
         }),
     )
     .await
