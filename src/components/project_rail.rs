@@ -1,9 +1,20 @@
+use std::collections::HashMap;
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos::callback::Callback;
+use uuid::Uuid;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use crate::models::Project;
 use crate::services::list_projects;
+use crate::services::human_review_service::get_attention_summary;
+use crate::components::attention::BoardAttention;
+use crate::components::task_live::ResponseOrder;
 use crate::components::CreateProjectModal;
+
+/// How often the rail reads "Needs you" for the projects not on screen.
+const ATTENTION_POLL_MS: i32 = 5_000;
 
 /// Vertical project switcher rail — sits on the far left edge of the window.
 /// Shows project initials in a narrow strip (~48px), expands on hover to reveal names.
@@ -31,6 +42,52 @@ pub fn ProjectRail(
         current
     });
 
+    // How many tasks need the user in each project. The open board's own
+    // count wins for its project, so the rail never disagrees with the
+    // header; the backend's summary covers the rest. Reads overlap (the
+    // poll, a project switch), so a late answer never replaces a newer one.
+    let summary = RwSignal::new(HashMap::<Uuid, usize>::new());
+    let order = StoredValue::new(ResponseOrder::default());
+    let read_attention = move || {
+        let Some(ticket) = order.try_update_value(|o| o.issue()) else {
+            return;
+        };
+        spawn_local(async move {
+            let Ok(projects) = get_attention_summary().await else {
+                return;
+            };
+            if order.try_update_value(|o| o.accept(ticket)) == Some(true) {
+                summary.try_set(projects.into_iter().map(|p| (p.project_id, p.tasks.len())).collect());
+            }
+        });
+    };
+    Effect::new(move |_| {
+        // Read again whenever the selection changes: the project being left
+        // stops being counted by its board.
+        selected_project.track();
+        read_attention();
+    });
+    {
+        let cb = Closure::wrap(Box::new(read_attention) as Box<dyn Fn()>);
+        let interval = web_sys::window().and_then(|w| {
+            w.set_interval_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), ATTENTION_POLL_MS)
+                .ok()
+        });
+        cb.forget();
+        on_cleanup(move || {
+            if let (Some(w), Some(id)) = (web_sys::window(), interval) {
+                w.clear_interval_with_handle(id);
+            }
+        });
+    }
+    let board = BoardAttention::get();
+    let needs_you = move |project: Uuid| -> usize {
+        match board.and_then(|b| b.0.get()) {
+            Some((open, count)) if open == project => count,
+            _ => summary.with(|s| s.get(&project).copied().unwrap_or(0)),
+        }
+    };
+
     let on_project_created = Callback::new(move |project: Project| {
         let pid = project.id.to_string();
         set_selected_project.set(pid);
@@ -56,6 +113,13 @@ pub fn ProjectRail(
                         let is_active = pid == active;
                         let name = project.name.clone();
                         let initial = name.chars().next().unwrap_or('?').to_uppercase().to_string();
+                        let project_uuid = project.id;
+                        let testid = format!("rail-attention-{pid}");
+                        let name_for_label = name.clone();
+                        let label = move || match needs_you(project_uuid) {
+                            0 => name_for_label.clone(),
+                            n => format!("{name_for_label}, needs you: {n}"),
+                        };
 
                         view! {
                             <button
@@ -63,13 +127,27 @@ pub fn ProjectRail(
                                 on:click=move |_| set_selected_project.set(pid_click.clone())
                                 class="rail-item"
                                 class:active=is_active
-                                title=name.clone()
+                                title=label.clone()
+                                aria-label=label
                             >
                                 {is_active.then(|| view! {
                                     <div class="rail-active-indicator"></div>
                                 })}
                                 <div class="rail-badge" class:active=is_active>
                                     <span>{initial}</span>
+                                    {move || {
+                                        let count = needs_you(project_uuid);
+                                        (count > 0).then(|| view! {
+                                            <span
+                                                data-testid=testid.clone()
+                                                data-count=count.to_string()
+                                                class="rail-attention"
+                                                aria-hidden="true"
+                                            >
+                                                {count}
+                                            </span>
+                                        })
+                                    }}
                                 </div>
                                 {is_expanded.then(|| view! {
                                     <span class="rail-label">{name.clone()}</span>

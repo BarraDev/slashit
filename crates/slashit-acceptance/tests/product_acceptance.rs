@@ -38,6 +38,8 @@ use thirtyfour::prelude::*;
 const EXECUTION_DEADLINE: Duration = Duration::from_secs(90);
 #[path = "product_acceptance/human_review.rs"]
 mod human_review;
+#[path = "product_acceptance/needs_you.rs"]
+mod needs_you;
 
 /// How long the board gets to render the finished task.
 const RENDER_DEADLINE: Duration = Duration::from_secs(30);

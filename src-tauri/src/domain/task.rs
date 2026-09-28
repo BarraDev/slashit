@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use slashit_attention as attention;
+pub use slashit_attention::AttentionReason;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -255,6 +257,40 @@ impl Task {
         self.status == TaskStatus::InProgress
             && self.phase == TaskPhase::Idle
             && !self.cleanup_in_flight
+    }
+
+    /// Whether the task cannot make progress without the user right now, and
+    /// why. The rule is [`slashit_attention::needs_you`]; this only describes
+    /// the task to it.
+    ///
+    /// `delivery_in_flight` is whether its pull request is being opened at
+    /// this moment, which the record cannot say.
+    pub fn needs_you(&self, delivery_in_flight: bool) -> Option<AttentionReason> {
+        attention::needs_you(self.attention_stage(), delivery_in_flight)
+    }
+
+    fn attention_stage(&self) -> attention::Stage {
+        match self.status {
+            TaskStatus::Error => attention::Stage::Failed,
+            TaskStatus::HumanReview => {
+                let review = match self.human_review.current_decision().map(|e| e.decision) {
+                    None => attention::Review::Undecided,
+                    Some(HumanReviewDecision::ChangesRequested) => attention::Review::ChangesRequested,
+                    Some(HumanReviewDecision::Approved) => attention::Review::Approved {
+                        pr_failed: self.human_review.pr_error.is_some(),
+                        pr_linked: self.pr_url.is_some()
+                            || self.external_refs.iter().any(ExternalRef::is_pr),
+                    },
+                };
+                attention::Stage::HumanReview(review)
+            }
+            TaskStatus::Backlog
+            | TaskStatus::Queue
+            | TaskStatus::InProgress
+            | TaskStatus::AiReview
+            | TaskStatus::PrCreated
+            | TaskStatus::Done => attention::Stage::Elsewhere,
+        }
     }
 }
 
@@ -1011,6 +1047,102 @@ mod tests {
         review.record_arrival();
         assert!(!review.is_approved());
         assert_eq!(review.pr_error, None);
+    }
+
+    /// A task a run has just carried into Human Review.
+    fn arrived_in_review() -> Task {
+        let mut task = startable_task();
+        task.status = TaskStatus::HumanReview;
+        task.human_review.record_arrival();
+        task
+    }
+
+    #[test]
+    fn attention_follows_the_review_through_every_decision() {
+        let mut task = arrived_in_review();
+        assert_eq!(task.needs_you(false), Some(AttentionReason::Review));
+
+        // Request Changes records the request and queues the task in one write.
+        task.human_review.push(HumanReviewDecision::ChangesRequested, Some("again".into()), chrono::Utc::now());
+        task.status = TaskStatus::Queue;
+        assert_eq!(task.needs_you(false), None, "queued");
+        task.status = TaskStatus::InProgress;
+        assert_eq!(task.needs_you(false), None, "running");
+        task.status = TaskStatus::AiReview;
+        assert_eq!(task.needs_you(false), None, "under AI review");
+
+        // The next run brings it back: a new arrival, undecided again.
+        task.status = TaskStatus::HumanReview;
+        task.human_review.record_arrival();
+        assert_eq!(task.needs_you(false), Some(AttentionReason::Review));
+
+        task.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        assert_eq!(task.needs_you(false), None, "approved, nothing failed");
+
+        task.human_review.pr_error = Some("gh: HTTP 422".into());
+        assert_eq!(task.needs_you(false), Some(AttentionReason::PrNotCreated));
+        assert_eq!(task.needs_you(true), None, "while a retry is opening the pull request");
+
+        task.pr_url = Some("https://github.com/o/r/pull/1".into());
+        assert_eq!(task.needs_you(false), None, "a linked pull request outranks the old failure");
+    }
+
+    /// A change request made on a task that was then moved back into Human
+    /// Review by hand is not an undecided review.
+    #[test]
+    fn human_review_with_changes_requested_is_not_an_undecided_review() {
+        let mut task = arrived_in_review();
+        task.human_review.push(HumanReviewDecision::ChangesRequested, Some("again".into()), chrono::Utc::now());
+        assert_eq!(task.needs_you(false), None);
+    }
+
+    #[test]
+    fn only_error_among_the_other_statuses_needs_the_user() {
+        for status in [
+            TaskStatus::Backlog,
+            TaskStatus::Queue,
+            TaskStatus::InProgress,
+            TaskStatus::AiReview,
+            TaskStatus::PrCreated,
+            TaskStatus::Done,
+        ] {
+            let mut task = startable_task();
+            task.status = status.clone();
+            assert_eq!(task.needs_you(false), None, "{status:?}");
+        }
+        let mut failed = startable_task();
+        failed.status = TaskStatus::Error;
+        assert_eq!(failed.needs_you(false), Some(AttentionReason::Failed));
+    }
+
+    /// Nothing about attention is stored, so a restart derives the same
+    /// answers from the task file alone.
+    #[test]
+    fn attention_is_derived_again_from_the_task_file_after_a_restart() {
+        #[derive(Serialize, Deserialize)]
+        struct File {
+            tasks: Vec<Task>,
+        }
+        let mut failed = startable_task();
+        failed.status = TaskStatus::Error;
+        let undecided = arrived_in_review();
+        let mut pr_failed = arrived_in_review();
+        pr_failed.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        pr_failed.human_review.pr_error = Some("gh failed".into());
+
+        let tasks = vec![failed, undecided, pr_failed];
+        let toml_text = toml::to_string_pretty(&File { tasks: tasks.clone() }).unwrap();
+        assert!(!toml_text.contains("attention") && !toml_text.contains("needs_you"), "{toml_text}");
+        let loaded: File = toml::from_str(&toml_text).unwrap();
+        let reasons: Vec<_> = loaded.tasks.iter().map(|t| t.needs_you(false)).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                Some(AttentionReason::Failed),
+                Some(AttentionReason::Review),
+                Some(AttentionReason::PrNotCreated)
+            ]
+        );
     }
 
     /// Both origins survive the task file (TOML) and IPC (JSON) unchanged.

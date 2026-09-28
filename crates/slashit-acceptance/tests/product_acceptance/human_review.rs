@@ -12,15 +12,15 @@ use super::*;
 use slashit_acceptance::fake_gh::{self, FakeGh};
 use thirtyfour::Key;
 
-const HR_PANEL: &str = "[data-testid=\"human-review\"]";
-const HR_APPROVE: &str = "[data-testid=\"human-review-approve\"]";
-const HR_REQUEST_CHANGES: &str = "[data-testid=\"human-review-request-changes\"]";
-const HR_FEEDBACK: &str = "[data-testid=\"human-review-feedback\"]";
-const HR_SEND_FEEDBACK: &str = "[data-testid=\"human-review-send-feedback\"]";
-const HR_APPROVED: &str = "[data-testid=\"human-review-approved\"]";
-const HR_DELIVERY: &str = "[data-testid=\"human-review-delivery\"]";
+pub(super) const HR_PANEL: &str = "[data-testid=\"human-review\"]";
+pub(super) const HR_APPROVE: &str = "[data-testid=\"human-review-approve\"]";
+pub(super) const HR_REQUEST_CHANGES: &str = "[data-testid=\"human-review-request-changes\"]";
+pub(super) const HR_FEEDBACK: &str = "[data-testid=\"human-review-feedback\"]";
+pub(super) const HR_SEND_FEEDBACK: &str = "[data-testid=\"human-review-send-feedback\"]";
+pub(super) const HR_APPROVED: &str = "[data-testid=\"human-review-approved\"]";
+pub(super) const HR_DELIVERY: &str = "[data-testid=\"human-review-delivery\"]";
 const HR_PR_ERROR: &str = "[data-testid=\"human-review-pr-error\"]";
-const HR_RETRY_PR: &str = "[data-testid=\"human-review-retry-pr\"]";
+pub(super) const HR_RETRY_PR: &str = "[data-testid=\"human-review-retry-pr\"]";
 const HR_PR_LINK: &str = "[data-testid=\"human-review-pr-link\"]";
 const HR_ITERATION: &str = "[data-testid=\"human-review-iteration\"]";
 const HR_HISTORY_ENTRY: &str = "[data-testid=\"human-review-history-entry\"]";
@@ -39,13 +39,13 @@ const FEEDBACK_END: &str = "----- END HUMAN REVIEW FEEDBACK -----";
 
 /// Lower case on purpose: WebDriver's typed text must come out exactly as
 /// written, and nothing here depends on a modifier key.
-const FEEDBACK: &str = "count blank lines separately and keep the output format (review-feedback-7f3a)";
+pub(super) const FEEDBACK: &str = "count blank lines separately and keep the output format (review-feedback-7f3a)";
 
 impl GitFixture {
     /// Make `origin` read as a GitHub repository, to `git remote get-url` and
     /// to `gh`, while every push still lands in the local bare repository
     /// beside the fixture. Nothing ever fetches from `origin`.
-    fn point_origin_at_github(&self) -> Result<()> {
+    pub(super) fn point_origin_at_github(&self) -> Result<()> {
         let push_url = self.origin_path();
         let push_url = push_url.to_str().context("the origin path is not UTF-8")?;
         git(&self.path, &["remote", "set-url", "origin", fake_gh::REPOSITORY_URL])?;
@@ -74,7 +74,7 @@ impl GitFixture {
 }
 
 /// The fake agent and the fake `gh`, both on the application's `PATH`.
-fn install_fakes(context: &TestContext, root: &Path) -> Result<(FakeAgent, FakeGh)> {
+pub(super) fn install_fakes(context: &TestContext, root: &Path) -> Result<(FakeAgent, FakeGh)> {
     let agent = FakeAgent::install(root)?;
     let gh = FakeGh::install(root, &agent)?;
     context.set_child_env("PATH", agent.path_value());
@@ -84,7 +84,7 @@ fn install_fakes(context: &TestContext, root: &Path) -> Result<(FakeAgent, FakeG
     Ok((agent, gh))
 }
 
-async fn read_task(driver: &WebDriver, executed: &ExecutedTask) -> Result<Value> {
+pub(super) async fn read_task(driver: &WebDriver, executed: &ExecutedTask) -> Result<Value> {
     let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": executed.project_id })).await?;
     find_task(&listed, &executed.id).with_context(|| format!("the product no longer lists {}", executed.id))
 }
@@ -116,16 +116,16 @@ fn review_entries(task: &Value) -> Vec<(String, Option<String>)> {
 }
 
 /// What the task file holds for one task's review.
-struct PersistedReview {
-    status: String,
+pub(super) struct PersistedReview {
+    pub(super) status: String,
     description: Option<String>,
     /// `(decision, feedback)`, oldest first.
-    entries: Vec<(String, Option<String>)>,
-    pr_error: Option<String>,
+    pub(super) entries: Vec<(String, Option<String>)>,
+    pub(super) pr_error: Option<String>,
 }
 
 /// The same record, as the task file holds it.
-fn persisted_review(root: &Path, task_id: &str) -> Result<PersistedReview> {
+pub(super) fn persisted_review(root: &Path, task_id: &str) -> Result<PersistedReview> {
     for file in toml_files(root)? {
         let Ok(contents) = std::fs::read_to_string(&file) else { continue };
         let Ok(document) = contents.parse::<toml::Value>() else { continue };
@@ -158,7 +158,7 @@ fn persisted_review(root: &Path, task_id: &str) -> Result<PersistedReview> {
 }
 
 /// Wait until the product reports the task with `accept` true of it.
-async fn await_task(
+pub(super) async fn await_task(
     driver: &WebDriver,
     executed: &ExecutedTask,
     what: &str,
@@ -177,11 +177,11 @@ async fn await_task(
     }
 }
 
-async fn attribute(driver: &WebDriver, selector: &str, name: &str) -> Result<Option<String>> {
+pub(super) async fn attribute(driver: &WebDriver, selector: &str, name: &str) -> Result<Option<String>> {
     Ok(ui::visible(driver, selector).await?.attr(name).await?)
 }
 
-async fn click(driver: &WebDriver, selector: &str, what: &str) -> Result<()> {
+pub(super) async fn click(driver: &WebDriver, selector: &str, what: &str) -> Result<()> {
     ui::visible(driver, selector)
         .await
         .with_context(|| format!("{what} is not offered"))?
@@ -201,7 +201,7 @@ async fn await_gone(driver: &WebDriver, selector: &str, what: &str) -> Result<()
     Ok(())
 }
 
-async fn open_reviewed_drawer(driver: &WebDriver, executed: &ExecutedTask) -> Result<()> {
+pub(super) async fn open_reviewed_drawer(driver: &WebDriver, executed: &ExecutedTask) -> Result<()> {
     open_drawer(driver, &executed.id, &executed.title).await?;
     ui::visible(driver, HR_PANEL).await.context("the drawer shows no Human Review section")?;
     Ok(())

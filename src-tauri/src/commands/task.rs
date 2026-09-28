@@ -37,12 +37,15 @@ pub type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
 #[derive(Clone)]
 pub struct TaskState {
     pub tasks: Tasks,
+    /// Tasks whose pull request is being opened right now.
+    pub deliveries: crate::commands::human_review::DeliveriesInFlight,
 }
 
 impl TaskState {
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
+            deliveries: Default::default(),
         }
     }
 }

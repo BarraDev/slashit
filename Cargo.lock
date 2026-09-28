@@ -5325,6 +5325,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "slashit-attention"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "slashit-frontend"
 version = "0.1.0"
 dependencies = [
@@ -5338,6 +5346,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "slashit-attention",
  "thiserror 2.0.18",
  "uuid",
  "vte",
@@ -5383,6 +5392,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "slashit-attention",
  "slashit-ipc",
  "sysinfo",
  "tauri",

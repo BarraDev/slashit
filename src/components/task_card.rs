@@ -1,5 +1,6 @@
 use leptos::prelude::*;
-use crate::models::{Task, TaskStatus, TaskCategory, TaskPriority, TaskPhase, QaStatus, ExternalRef, HumanReviewDecision};
+use crate::components::attention::{AttentionChip, DeliveringChip};
+use crate::models::{AttentionReason, Task, TaskStatus, TaskCategory, TaskPriority, TaskPhase, QaStatus, ExternalRef, HumanReviewDecision};
 
 /// Compact task card designed to fit well within Kanban columns
 /// Inspired by Auto Claude's clean, modern design
@@ -13,6 +14,17 @@ pub fn TaskCard(
     let is_stuck = task.stuck_since.is_some();
     let is_running = task.status == TaskStatus::InProgress;
     let show_review = matches!(task.status, TaskStatus::AiReview | TaskStatus::HumanReview);
+
+    // The record is fixed for this card; whether its pull request is being
+    // opened right now is not, so both answers are kept and chosen live.
+    let task_id = task.id;
+    let attention_idle = task.needs_you(false);
+    let attention_delivering = task.needs_you(true);
+    let delivering = move || crate::components::attention::delivery_in_flight(task_id);
+    // An approval whose pull request was not created must not read as a
+    // success: the amber chip is the card's signal, not a green "Approved".
+    let pr_not_created = attention_idle == Some(AttentionReason::PrNotCreated);
+    let task_status_in_review = task.status == TaskStatus::HumanReview;
 
     let card_class = move || {
         let mut classes = vec![
@@ -45,6 +57,20 @@ pub fn TaskCard(
             <h4 data-testid="task-title" class="font-medium text-white/90 text-[13px] leading-snug mb-2.5 pr-6 line-clamp-2">
                 {task.title.clone()}
             </h4>
+
+            // Needs you: first thing after the title, so it reads even when
+            // the column's own colour is off-screen.
+            {move || {
+                let delivering = delivering();
+                let reason = if delivering { attention_delivering } else { attention_idle };
+                let show_delivering = delivering && task_status_in_review;
+                (reason.is_some() || show_delivering).then(|| view! {
+                    <div class="flex flex-wrap items-center gap-1.5 mb-2">
+                        {reason.map(|reason| view! { <AttentionChip reason=reason /> })}
+                        {show_delivering.then(|| view! { <DeliveringChip /> })}
+                    </div>
+                })
+            }}
 
             // Badges row: Category + Priority (smaller, more subtle)
             <div class="flex items-center gap-1.5 mb-2.5">
@@ -165,7 +191,7 @@ pub fn TaskCard(
                             <span>{crate::components::task_review::ai_review_label(&qa.status)}</span>
                         </div>
                     })}
-                    {task.human_review.current_decision().map(|decision| {
+                    {task.human_review.current_decision().filter(|_| !pr_not_created).map(|decision| {
                         let approved = decision.decision == HumanReviewDecision::Approved;
                         view! {
                             <div

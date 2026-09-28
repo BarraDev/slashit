@@ -5,7 +5,9 @@
 # "opened" as files so a later `pr list` finds them the way GitHub would.
 #
 # A journey makes `pr create` fail by creating the file `fail-create` in the
-# fixture's directory, and makes it succeed again by removing it.
+# fixture's directory, and makes it succeed again by removing it. A file
+# `delay-create` holding a number of seconds makes `pr create` take that long
+# first, the way a real push and GitHub round trip does.
 set -e
 
 dir="$SLASHIT_FAKE_GH_DIR"
@@ -54,6 +56,9 @@ case "$1 $2" in
         fi
         ;;
     "pr create")
+        if [ -f "$dir/delay-create" ]; then
+            sleep "$(cat "$dir/delay-create")"
+        fi
         if [ -f "$dir/fail-create" ]; then
             echo "fake gh: creating the pull request was scripted to fail" >&2
             exit 1

@@ -49,6 +49,16 @@ pub fn changes_task_record(event: &AgentEvent) -> bool {
     )
 }
 
+/// Whether the board's "Running" count includes a task in `status`: coding,
+/// or under AI review.
+///
+/// Read from the status alone, like the rest of the board. An AI review that
+/// is waiting for a free slot is counted too; the record does not tell it
+/// apart from one that has started.
+pub fn counts_as_running(status: &TaskStatus) -> bool {
+    matches!(status, TaskStatus::InProgress | TaskStatus::AiReview)
+}
+
 /// Whether the card should show a live activity line for a task in `status`.
 pub fn shows_activity(status: &TaskStatus) -> bool {
     matches!(status, TaskStatus::InProgress | TaskStatus::AiReview)
@@ -193,6 +203,22 @@ impl RefreshGate {
 mod tests {
     use super::*;
     use crate::models::{ExecutionSnapshot, TaskPhase};
+
+    #[test]
+    fn running_counts_coding_and_ai_review() {
+        assert!(counts_as_running(&TaskStatus::InProgress));
+        assert!(counts_as_running(&TaskStatus::AiReview));
+        for status in [
+            TaskStatus::Backlog,
+            TaskStatus::Queue,
+            TaskStatus::HumanReview,
+            TaskStatus::PrCreated,
+            TaskStatus::Done,
+            TaskStatus::Error,
+        ] {
+            assert!(!counts_as_running(&status), "{status:?}");
+        }
+    }
 
     fn tool(tool: &str) -> AgentEvent {
         AgentEvent::ToolUse { task_id: "t".into(), tool: tool.into() }

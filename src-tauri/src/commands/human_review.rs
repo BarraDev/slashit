@@ -7,6 +7,7 @@
 //! and never undoes it. See [`crate::domain::task::HumanReviewRecord`].
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -19,6 +20,52 @@ use crate::domain::{Task, TaskStatus};
 /// The longest feedback a change request may carry, in characters. It goes
 /// into the next run's prompt whole.
 pub const MAX_FEEDBACK_CHARS: usize = 20_000;
+
+/// The tasks whose pull request is being opened right now.
+///
+/// Process memory only, and deliberately so: an attempt that is running is a
+/// fact about this process, and it ends with it. While a task is in here it
+/// is waiting on SlashIt, not on a person, even though its record may still
+/// carry the failure of an earlier attempt (see
+/// [`crate::domain::Task::needs_you`]).
+#[derive(Clone, Default)]
+pub struct DeliveriesInFlight(Arc<Mutex<HashMap<Uuid, u32>>>);
+
+impl DeliveriesInFlight {
+    pub fn contains(&self, task_id: Uuid) -> bool {
+        self.lock().contains_key(&task_id)
+    }
+
+    /// Mark `task_id` as being delivered until the returned guard is dropped.
+    /// Counted, so two overlapping attempts do not end each other's mark.
+    fn start(&self, task_id: Uuid) -> DeliveryMark {
+        *self.lock().entry(task_id).or_default() += 1;
+        DeliveryMark { deliveries: self.clone(), task_id }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, u32>> {
+        // The map is always left consistent, so a panic elsewhere while it
+        // was held is no reason to stop answering.
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct DeliveryMark {
+    deliveries: DeliveriesInFlight,
+    task_id: Uuid,
+}
+
+impl Drop for DeliveryMark {
+    fn drop(&mut self) {
+        let mut running = self.deliveries.lock();
+        if let Some(count) = running.get_mut(&self.task_id) {
+            *count -= 1;
+            if *count == 0 {
+                running.remove(&self.task_id);
+            }
+        }
+    }
+}
 
 /// What approving (or retrying delivery of) a task did.
 #[derive(Debug, Clone, Serialize)]
@@ -223,7 +270,12 @@ async fn request_changes(
 }
 
 /// Open the pull request for approved changes, and record how that went.
+///
+/// The task counts as being delivered from the first check until its
+/// outcome is recorded, so it never reads as needing the user while this
+/// runs, nor as settled before the outcome is on the record.
 async fn deliver(state: &crate::AppState, task_id: Uuid) -> PrDelivery {
+    let _in_flight = state.task.deliveries.start(task_id);
     match pr_availability(state, task_id).await {
         Ok(PrAvailability::Available) => {}
         Ok(PrAvailability::Unavailable { reason }) => return PrDelivery::Unavailable { reason },
@@ -485,5 +537,20 @@ mod tests {
         );
         assert_eq!(task.human_review.pending_feedback(), vec!["second round"]);
         assert_eq!(task.description.as_deref(), Some(DESCRIPTION));
+    }
+
+    /// An attempt marks its task until it ends, and one attempt ending never
+    /// clears another's mark on the same task.
+    #[test]
+    fn a_delivery_mark_lasts_exactly_as_long_as_its_attempts() {
+        let deliveries = DeliveriesInFlight::default();
+        let task_id = Uuid::new_v4();
+        assert!(!deliveries.contains(task_id));
+        let first = deliveries.start(task_id);
+        let second = deliveries.start(task_id);
+        drop(first);
+        assert!(deliveries.contains(task_id), "the second attempt is still running");
+        drop(second);
+        assert!(!deliveries.contains(task_id));
     }
 }

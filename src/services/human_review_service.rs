@@ -50,6 +50,25 @@ pub struct ApprovalOutcome {
     pub pr: Option<PrDelivery>,
 }
 
+/// Mirrors the backend `ProjectAttention`: the tasks in one project that need
+/// the user. Only projects with at least one are sent.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ProjectAttention {
+    pub project_id: uuid::Uuid,
+    pub tasks: Vec<TaskAttention>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TaskAttention {
+    pub task_id: uuid::Uuid,
+    pub reason: crate::models::AttentionReason,
+}
+
+/// Which tasks need the user, in every project, without reading any board.
+pub async fn get_attention_summary() -> Result<Vec<ProjectAttention>, String> {
+    invoke("get_attention_summary", serde_json::json!({})).await
+}
+
 pub async fn get_pr_availability(task_id: String) -> Result<PrAvailability, String> {
     invoke("get_pr_availability", serde_json::json!({ "taskId": task_id })).await
 }

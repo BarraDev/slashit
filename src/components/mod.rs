@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 
 pub mod app_layout;
+pub mod attention;
 pub mod sidebar;
 pub mod project_card;
 pub mod project_tabs;
