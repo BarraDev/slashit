@@ -12,15 +12,13 @@ use uuid::Uuid;
 
 use crate::components::diff_viewer::DiffViewer;
 use crate::components::task_live::{
-    format_elapsed, output_provenance, DrawerActions, OutputProvenance, RefreshGate,
+    format_elapsed, output_provenance, DrawerActions, OutputProvenance, RefreshGate, StartRequest,
 };
 use crate::components::task_review::{AiReviewSection, HumanReviewPanel};
 use crate::components::toast;
 use crate::models::{LogLevel, Task, TaskPhase, TaskRunSnapshot, TaskStatus};
-use crate::services::task_run_service::{
-    get_task_run, listen_agent_events, requeue_task, stop_task_execution,
-};
-use crate::services::{get_task_diff, get_task_diff_stat};
+use crate::services::task_run_service::{get_task_run, listen_agent_events, stop_task_execution};
+use crate::services::{enqueue_task, get_task_diff, get_task_diff_stat};
 
 /// The most output entries the drawer renders. The backend keeps more; this
 /// is "recent output", not a transcript.
@@ -116,6 +114,17 @@ pub fn TaskDrawer(
             .unwrap_or_default()
     });
 
+    let start = RwSignal::new(StartRequest::default());
+    // A failed Start is about the Backlog task it was pressed for; once the
+    // task is somewhere else, its reason no longer describes anything.
+    Effect::new(move |_| {
+        if status.get() != Some(TaskStatus::Backlog)
+            && start.with_untracked(|s| s.failure().is_some())
+        {
+            start.set(StartRequest::Idle);
+        }
+    });
+
     let stopping = RwSignal::new(false);
     let retrying = RwSignal::new(false);
     // The failure a retry was asked about, kept visible as the last attempt's
@@ -126,6 +135,26 @@ pub fn TaskDrawer(
             previous_error.set(None);
         }
     });
+
+    // Start enqueues, exactly as the card menu's "Add to Queue" does; the
+    // scheduler runs the task when there is capacity. The drawer shows what
+    // the task actually became, never a Running it assumed.
+    let on_start = move |_| {
+        if !start.try_update(|s| s.begin()).unwrap_or(false) {
+            return;
+        }
+        spawn_local(async move {
+            let outcome = enqueue_task(task_id.to_string()).await;
+            if let Some(Some(updated)) = start.try_update(|s| s.settle(outcome)) {
+                apply_task.try_run(updated);
+            }
+            // Read the task again either way: after a success the scheduler
+            // may already have moved it on, and after a failure the drawer
+            // must show where the task really is.
+            refresh_tasks.try_run(());
+            refresh_run();
+        });
+    };
 
     let on_stop = move |_| {
         if stopping.get_untracked() {
@@ -154,7 +183,7 @@ pub fn TaskDrawer(
         let failure = task.with_untracked(|t| t.as_ref().and_then(|t| t.error_message.clone()));
         retrying.set(true);
         spawn_local(async move {
-            match requeue_task(task_id.to_string()).await {
+            match enqueue_task(task_id.to_string()).await {
                 Ok(Some(updated)) => {
                     apply_task.try_run(updated);
                     previous_error.try_set(failure);
@@ -295,6 +324,18 @@ pub fn TaskDrawer(
 
                     // What can be done now.
                     <section class="flex flex-wrap gap-2">
+                        <Show when=move || actions.get().start || start.with(StartRequest::is_pending)>
+                            <button
+                                data-testid="task-drawer-start"
+                                class="px-3 py-1.5 rounded-lg text-sm bg-blue-500 text-white hover:bg-blue-400 disabled:opacity-50"
+                                title="Add this task to the queue. It runs when there is capacity."
+                                disabled=move || start.with(StartRequest::is_pending)
+                                aria-busy=move || if start.with(StartRequest::is_pending) { "true" } else { "false" }
+                                on:click=on_start
+                            >
+                                {move || if start.with(StartRequest::is_pending) { "Starting…" } else { "Start" }}
+                            </button>
+                        </Show>
                         <Show when=move || actions.get().stop>
                             <button
                                 data-testid="task-drawer-stop"
@@ -330,6 +371,12 @@ pub fn TaskDrawer(
                         </Show>
                     </section>
 
+                    {move || start.with(|s| s.failure().map(str::to_string)).map(|reason| view! {
+                        <p data-testid="task-drawer-start-error" role="alert" class="text-sm text-red-300 whitespace-pre-wrap break-words">
+                            {reason}
+                        </p>
+                    })}
+
                     // What happened, if it failed.
                     {move || task.get().filter(|t| t.status == TaskStatus::Error).map(|t| view! {
                         <section data-testid="task-drawer-failure" class="rounded-lg border border-red-500/20 bg-red-500/[0.06] p-3 space-y-2">
@@ -337,8 +384,8 @@ pub fn TaskDrawer(
                             <p data-testid="task-drawer-error" class="text-sm text-red-200 whitespace-pre-wrap break-words">
                                 {t.error_message.clone().unwrap_or_else(|| "The run failed without recording a reason.".to_string())}
                             </p>
-                            <p class="text-xs text-white/40">
-                                "This is the result of the last attempt. Retry puts the task back in the queue, and the next run continues from the work already done."
+                            <p data-testid="task-drawer-retry-note" class="text-xs text-white/40">
+                                {retry_note(&t)}
                             </p>
                         </section>
                     })}
@@ -497,6 +544,19 @@ fn TabButton(
     }
 }
 
+/// What Retry will do for a failed task.
+///
+/// The next run continues in the task's recorded checkout. A task that
+/// failed before a checkout was ever attached to it has none, so there is no
+/// earlier work for the next run to continue from.
+fn retry_note(task: &Task) -> &'static str {
+    if task.worktree_path.is_some() {
+        "This is the result of the last attempt. Retry puts the task back in the queue, and the next run continues from the work already done."
+    } else {
+        "This is the result of the last attempt. Retry puts the task back in the queue."
+    }
+}
+
 fn status_badge(status: &TaskStatus) -> (&'static str, &'static str) {
     match status {
         TaskStatus::Backlog => ("Backlog", "bg-white/10 text-white/60"),
@@ -519,5 +579,54 @@ fn phase_label(phase: &TaskPhase) -> &'static str {
         TaskPhase::QaFixing => "Fixing",
         TaskPhase::Complete => "Complete",
         TaskPhase::Failed => "Failed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed_task(worktree: Option<&str>) -> Task {
+        let mut task: Task = serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "project_id": Uuid::new_v4(),
+            "title": "t",
+            "description": null,
+            "status": "error",
+            "model": "default",
+            "planning_mode": false,
+            "dependencies": [],
+            "workspace_id": null,
+            "jj_change_id": null,
+            "category": "feature",
+            "priority": "medium",
+            "complexity": "moderate",
+            "impact": "medium",
+            "security_severity": "none",
+            "phase": "failed",
+            "phase_progress": 0,
+            "overall_progress": 0,
+            "subtasks": [],
+            "sequence_number": 0,
+            "github_issue_url": null,
+            "gitlab_issue_url": null,
+            "linear_ticket_id": null,
+            "pr_url": null,
+            "qa_signoff": null,
+            "stuck_since": null,
+            "created_at": chrono::Utc::now(),
+            "updated_at": chrono::Utc::now(),
+        }))
+        .expect("a failed task");
+        task.worktree_path = worktree.map(str::to_string);
+        task
+    }
+
+    #[test]
+    fn retry_promises_continuation_only_when_there_is_a_checkout_to_continue_in() {
+        assert!(retry_note(&failed_task(Some("/tmp/wt/task-1"))).contains("continues from the work already done"));
+        let note = retry_note(&failed_task(None));
+        assert!(!note.contains("continues"), "{note}");
+        assert!(note.contains("Retry puts the task back in the queue."));
     }
 }

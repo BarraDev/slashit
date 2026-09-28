@@ -3,7 +3,7 @@ use leptos::callback::Callback;
 use leptos::task::spawn_local;
 use wasm_bindgen::JsCast;
 use crate::models::{Task, TaskStatus};
-use crate::services::{delete_task, reorder_task, create_pr};
+use crate::services::{delete_task, enqueue_task, reorder_task, create_pr};
 use crate::components::toast;
 use uuid::Uuid;
 
@@ -84,14 +84,14 @@ pub fn TaskContextMenu(
                 let task_clone = t.clone();
 
                 spawn_local(async move {
-                    match reorder_task(task_clone.id.to_string(), Some(TaskStatus::Queue), 0).await {
+                    // The same enqueue the drawer's Start and Retry make.
+                    match enqueue_task(task_clone.id.to_string()).await {
                         Ok(Some(_)) => {
                             toast::success(format!("'{}' added to queue", task_clone.title));
                             on_move.run((task_clone, TaskStatus::Queue));
                         }
-                        _ => {
-                            toast::error("Failed to add to queue".to_string());
-                        }
+                        Ok(None) => toast::error("This task no longer exists".to_string()),
+                        Err(e) => toast::error(format!("Failed to add to queue: {e}")),
                     }
                     set_show.set(false);
                 });
@@ -187,6 +187,7 @@ pub fn TaskContextMenu(
 
                 // Add to Queue
                 <button
+                    data-testid="task-menu-add-to-queue"
                     class="w-full px-3 py-2 text-left text-sm text-white/80 hover:bg-white/10 flex items-center gap-2 transition-colors"
                     on:click=on_add_to_queue_click
                 >
