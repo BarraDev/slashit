@@ -172,7 +172,7 @@ mod tests {
                 pr_url: None,
                 external_refs: Vec::new(),
                 qa_signoff: None,
-                human_review: None,
+                human_review: Default::default(),
                 stuck_since: None,
                 error_message: None,
                 worktree_path: None,

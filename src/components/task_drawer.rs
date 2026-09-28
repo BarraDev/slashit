@@ -14,8 +14,9 @@ use crate::components::diff_viewer::DiffViewer;
 use crate::components::task_live::{
     format_elapsed, output_provenance, DrawerActions, OutputProvenance, RefreshGate,
 };
+use crate::components::task_review::{AiReviewSection, HumanReviewPanel};
 use crate::components::toast;
-use crate::models::{LogLevel, QaStatus, Task, TaskPhase, TaskRunSnapshot, TaskStatus};
+use crate::models::{LogLevel, Task, TaskPhase, TaskRunSnapshot, TaskStatus};
 use crate::services::task_run_service::{
     get_task_run, listen_agent_events, requeue_task, stop_task_execution,
 };
@@ -351,6 +352,16 @@ pub fn TaskDrawer(
 
                     {move || task.get().map(|t| view! { <TaskSummary task=t /> })}
 
+                    // The decision on these changes, and what became of it.
+                    <Show when=move || {
+                        task.with(|t| t.as_ref().is_some_and(|t| {
+                            t.status == TaskStatus::HumanReview
+                                || (t.status == TaskStatus::PrCreated && t.human_review.is_approved())
+                        }))
+                    }>
+                        <HumanReviewPanel task_id=task_id task=task apply_task=apply_task />
+                    </Show>
+
                     // Output and, where there are any, changes.
                     <section class="space-y-2">
                         <div role="tablist" class="flex items-center gap-1 border-b border-white/10">
@@ -453,33 +464,12 @@ fn DrawerHeader(task: Task, on_close: Callback<()>) -> impl IntoView {
 /// plumbing.
 #[component]
 fn TaskSummary(task: Task) -> impl IntoView {
-    let review = task.qa_signoff.as_ref().map(|qa| {
-        let verdict = match qa.status {
-            QaStatus::Approved => "AI review approved the changes.",
-            QaStatus::FixesApplied => "AI review applied fixes to the changes.",
-            QaStatus::Rejected => "AI review rejected the changes.",
-        };
-        (verdict, qa.issues_found.clone())
-    });
-    let awaiting_review = task.status == TaskStatus::HumanReview;
     view! {
         <section class="space-y-2 text-sm">
             {task.description.clone().filter(|d| !d.trim().is_empty()).map(|d| view! {
                 <p data-testid="task-drawer-description" class="text-white/60 whitespace-pre-wrap break-words line-clamp-6">{d}</p>
             })}
-            {review.map(|(verdict, issues)| view! {
-                <div data-testid="task-drawer-review" class="text-white/60 space-y-1">
-                    <p>{verdict}</p>
-                    {(!issues.is_empty()).then(|| view! {
-                        <ul class="list-disc pl-5 text-xs text-white/50 space-y-0.5">
-                            {issues.into_iter().take(5).map(|issue| view! { <li>{issue}</li> }).collect_view()}
-                        </ul>
-                    })}
-                </div>
-            })}
-            {awaiting_review.then(|| view! {
-                <p class="text-xs text-purple-300/80">"Waiting for your review. The changes are in the Changes tab."</p>
-            })}
+            {task.qa_signoff.clone().map(|signoff| view! { <AiReviewSection signoff=signoff /> })}
         </section>
     }
 }

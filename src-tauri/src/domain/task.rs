@@ -95,7 +95,9 @@ pub struct Task {
     pub external_refs: Vec<ExternalRef>,
 
     pub qa_signoff: Option<QaSignoff>,
-    pub human_review: Option<HumanReview>,
+    /// Decisions made at Human Review. See [`HumanReviewRecord`].
+    #[serde(default)]
+    pub human_review: HumanReviewRecord,
     pub stuck_since: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Last error message when task is in Error status
@@ -200,11 +202,16 @@ impl Task {
     /// survive: the next execution reattaches to that branch and continues
     /// from what is already there. Discarding a worktree is an explicit
     /// destructive action, never a side effect of a run ending.
+    ///
+    /// An approval of the changes under review stops being current too: the
+    /// task is going back to work, and whatever the next run commits is not
+    /// what was approved. See [`HumanReviewRecord::withdraw_approval`].
     pub fn reset_execution_state(&mut self) {
         self.phase = TaskPhase::Idle;
         self.phase_progress = 0;
         self.overall_progress = 0;
         self.error_message = None;
+        self.human_review.withdraw_approval();
     }
 
     /// The position a newly created task should take in `project_id`'s
@@ -603,13 +610,123 @@ pub enum QaStatus {
     Rejected,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HumanReview {
-    pub approved: bool,
-    pub approver: Option<String>,
-    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
+/// What people decided about a task at Human Review, in the order they
+/// decided it.
+///
+/// A decision is about the changes a run produced, so each one is tied to the
+/// Human Review *arrival* it was made in: [`Self::arrivals`] counts the times
+/// the executor has carried the task into Human Review after a run, and an
+/// entry records the count at the moment it was made. The current decision is
+/// therefore derived, never stored: it is the last entry made in the current
+/// arrival, if any. A new run that reaches Human Review again starts a new
+/// arrival, so an approval of the previous changes is not mistaken for an
+/// approval of these.
+///
+/// Approval is not delivery. It never moves the task to another column,
+/// never merges anything and never touches the checkout; opening a pull
+/// request is a separate step whose failure is recorded in
+/// [`Self::pr_error`] without undoing the approval.
+///
+/// A task written before this existed has no `human_review` table, or one in
+/// an earlier, never-populated shape whose keys are ignored, and loads as an
+/// empty record: no arrivals, no decisions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HumanReviewRecord {
+    /// How many times a run has carried the task into Human Review, plus
+    /// the times an approval was withdrawn because the task went back to
+    /// work (see [`Self::withdraw_approval`]).
+    #[serde(default)]
+    pub arrivals: u32,
+    /// Every decision, oldest first.
+    #[serde(default)]
+    pub entries: Vec<HumanReviewEntry>,
+    /// Why the last attempt to open a pull request for the approved changes
+    /// failed. Cleared when a later attempt succeeds, and when the task goes
+    /// back for another run.
+    #[serde(default)]
+    pub pr_error: Option<String>,
+}
+
+/// One decision a person made at Human Review.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HumanReviewEntry {
+    /// Position in the task's review history, starting at 1.
+    pub sequence: u32,
+    /// The [`HumanReviewRecord::arrivals`] count when the decision was made.
+    pub arrival: u32,
+    pub decision: HumanReviewDecision,
+    /// What the reviewer asked for. Present exactly when
+    /// `decision` is [`HumanReviewDecision::ChangesRequested`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
-    pub spec_hash: Option<String>,
+    pub decided_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanReviewDecision {
+    Approved,
+    ChangesRequested,
+}
+
+impl HumanReviewRecord {
+    /// The decision made in the current arrival, if one was.
+    pub fn current_decision(&self) -> Option<&HumanReviewEntry> {
+        self.entries.last().filter(|e| e.arrival == self.arrivals)
+    }
+
+    pub fn is_approved(&self) -> bool {
+        self.current_decision()
+            .is_some_and(|e| e.decision == HumanReviewDecision::Approved)
+    }
+
+    /// The feedback the next run has to address: every change request made
+    /// in the current arrival, oldest first. Empty once a run has carried the
+    /// task back into Human Review, because that run was the answer to it.
+    pub fn pending_feedback(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|e| e.arrival == self.arrivals)
+            .filter(|e| e.decision == HumanReviewDecision::ChangesRequested)
+            .filter_map(|e| e.feedback.as_deref())
+            .collect()
+    }
+
+    /// Record that a run carried the task into Human Review again.
+    pub fn record_arrival(&mut self) {
+        self.arrivals = self.arrivals.saturating_add(1);
+        self.pr_error = None;
+    }
+
+    /// The task is going back to work after its changes were approved, so
+    /// the approval no longer describes what the branch will hold. Closing
+    /// the current arrival is what retires it: the entry stays in the
+    /// history, and nothing is current until a run brings the task back.
+    ///
+    /// A change request is left alone. It is meant for the run the task is
+    /// going back to, which [`Self::pending_feedback`] reads.
+    pub fn withdraw_approval(&mut self) {
+        if self.is_approved() {
+            self.record_arrival();
+        }
+    }
+
+    /// Append a decision made now, in the current arrival.
+    pub fn push(
+        &mut self,
+        decision: HumanReviewDecision,
+        feedback: Option<String>,
+        decided_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let sequence = self.entries.last().map_or(1, |e| e.sequence.saturating_add(1));
+        self.entries.push(HumanReviewEntry {
+            sequence,
+            arrival: self.arrivals,
+            decision,
+            feedback,
+            decided_at,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -821,6 +938,79 @@ mod tests {
         let toml_text = toml::to_string(&resolved).unwrap();
         assert_eq!(toml_text, "[origin]\nkind = \"default_base\"\nbranch = \"main\"\n");
         assert_eq!(toml::from_str::<Holder>(&toml_text).unwrap(), resolved);
+    }
+
+    /// A board written before decisions were recorded -- with no
+    /// `human_review` at all, or with the earlier shape of that table that
+    /// nothing ever populated -- loads as a task nobody has reviewed yet.
+    #[test]
+    fn a_task_written_before_review_decisions_existed_has_an_empty_review_record() {
+        assert!(!LEGACY_TASK_TOML.contains("human_review"));
+        let task: Task = toml::from_str(LEGACY_TASK_TOML).expect("no human_review table");
+        assert_eq!(task.human_review, HumanReviewRecord::default());
+
+        let earlier_shape = format!(
+            "{LEGACY_TASK_TOML}\n[human_review]\napproved = true\napprover = \"someone\"\nfeedback = \"old\"\n"
+        );
+        let task: Task = toml::from_str(&earlier_shape).expect("the earlier, unused shape");
+        assert_eq!(task.human_review, HumanReviewRecord::default());
+        assert!(task.human_review.current_decision().is_none());
+        assert!(task.human_review.pending_feedback().is_empty());
+    }
+
+    #[test]
+    fn review_history_round_trips_through_the_task_file_and_ipc() {
+        #[derive(Serialize, Deserialize)]
+        struct File {
+            tasks: Vec<Task>,
+        }
+        let mut task = startable_task();
+        task.human_review.record_arrival();
+        task.human_review.push(
+            HumanReviewDecision::ChangesRequested,
+            Some("handle \"quotes\"\nand newlines".to_string()),
+            chrono::Utc::now(),
+        );
+        task.human_review.record_arrival();
+        task.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        task.human_review.pr_error = Some("gh failed".to_string());
+
+        let toml_text = toml::to_string_pretty(&File { tasks: vec![task.clone()] }).unwrap();
+        let loaded: File = toml::from_str(&toml_text).expect(&toml_text);
+        assert_eq!(loaded.tasks[0].human_review, task.human_review, "{toml_text}");
+
+        let json = serde_json::to_string(&task).unwrap();
+        let loaded: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.human_review, task.human_review);
+    }
+
+    #[test]
+    fn the_current_decision_belongs_to_the_current_arrival_only() {
+        let mut review = HumanReviewRecord::default();
+        review.record_arrival();
+        assert!(review.current_decision().is_none());
+
+        review.push(HumanReviewDecision::ChangesRequested, Some("fix it".into()), chrono::Utc::now());
+        assert_eq!(review.pending_feedback(), vec!["fix it"]);
+        assert!(!review.is_approved());
+
+        // The rerun that answered the request brings the task back.
+        review.record_arrival();
+        assert!(review.current_decision().is_none());
+        assert!(review.pending_feedback().is_empty());
+
+        review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        assert!(review.is_approved());
+        assert_eq!(
+            review.entries.iter().map(|e| (e.sequence, e.arrival)).collect::<Vec<_>>(),
+            vec![(1, 1), (2, 2)]
+        );
+
+        // An approval never carries over to changes a later run produced.
+        review.pr_error = Some("stale".into());
+        review.record_arrival();
+        assert!(!review.is_approved());
+        assert_eq!(review.pr_error, None);
     }
 
     /// Both origins survive the task file (TOML) and IPC (JSON) unchanged.

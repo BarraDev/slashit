@@ -8,6 +8,8 @@ pub mod kanban;
 pub mod task_card;
 pub mod task_drawer;
 pub mod task_live;
+pub mod task_review;
+pub mod close_without_merge_dialog;
 pub mod workspace_panel;
 pub mod agent_panel;
 pub mod log_viewer;

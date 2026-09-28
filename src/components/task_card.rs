@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use crate::models::{Task, TaskStatus, TaskCategory, TaskPriority, TaskPhase, QaStatus, ExternalRef};
+use crate::models::{Task, TaskStatus, TaskCategory, TaskPriority, TaskPhase, QaStatus, ExternalRef, HumanReviewDecision};
 
 /// Compact task card designed to fit well within Kanban columns
 /// Inspired by Auto Claude's clean, modern design
@@ -162,23 +162,29 @@ pub fn TaskCard(
                             <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
                             </svg>
-                            <span>{format!("{:?}", qa.status)}</span>
+                            <span>{crate::components::task_review::ai_review_label(&qa.status)}</span>
                         </div>
                     })}
-                    {task.human_review.as_ref().map(|hr| view! {
-                        <div class=format!(
-                            "flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-md {}",
-                            if hr.approved {
-                                "bg-green-500/10 text-green-400"
-                            } else {
-                                "bg-purple-500/10 text-purple-400"
-                            }
-                        )>
-                            <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-                            </svg>
-                            <span>{if hr.approved { "Approved" } else { "Pending Review" }}</span>
-                        </div>
+                    {task.human_review.current_decision().map(|decision| {
+                        let approved = decision.decision == HumanReviewDecision::Approved;
+                        view! {
+                            <div
+                                data-testid="task-card-human-decision"
+                                class=format!(
+                                    "flex items-center gap-1.5 text-[10px] px-2 py-1 rounded-md {}",
+                                    if approved {
+                                        "bg-green-500/10 text-green-400"
+                                    } else {
+                                        "bg-amber-500/10 text-amber-300"
+                                    }
+                                )
+                            >
+                                <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                                </svg>
+                                <span>{if approved { "Approved" } else { "Changes requested" }}</span>
+                            </div>
+                        }
                     })}
                 </div>
             })}

@@ -117,7 +117,7 @@ pub async fn create_task(
             pr_url: None,
             external_refs: Vec::new(),
             qa_signoff: None,
-            human_review: None,
+            human_review: Default::default(),
             stuck_since: None,
             error_message: None,
             worktree_path: None,
@@ -164,16 +164,24 @@ pub async fn list_tasks(
 /// directory that is being deleted, or be silently overwritten by the
 /// terminal commit that cleanup is about to make. The lease is what makes the
 /// two orderings the only two possible.
+///
+/// A task in Human Review is only moved to `Done` when `close_without_merge`
+/// is `Some(true)`; see [`refuse_unconfirmed_close`].
 #[tauri::command]
 pub async fn update_task_status(
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     status: TaskStatus,
+    close_without_merge: Option<bool>,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
     if matches!(status, TaskStatus::Done) {
-        return match crate::lifecycle::terminalize(
+        let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+        if let Some(old_status) = state.task.tasks.read().await.get(&task_id).map(|t| t.status.clone()) {
+            refuse_unconfirmed_close(&old_status, close_without_merge)?;
+        }
+        return match crate::lifecycle::terminalize_leased(
             terminalize_ctx(&state),
             task_id,
             crate::lifecycle::Origin::User,
@@ -539,6 +547,33 @@ pub async fn delete_task(
         .map_err(|refusal| refusal.to_string())
 }
 
+/// Refuse to finish a task in Human Review unless the caller says, explicitly,
+/// that it is closing the task without merging it.
+///
+/// `Done` from Human Review is not delivery: no pull request is opened,
+/// nothing reaches the default branch, and the task's checkout is removed,
+/// leaving its work only on its branch. The board used to do that silently
+/// for a drop onto the Done column. The frontend now asks first and passes
+/// `close_without_merge: Some(true)` only after the person confirmed; this
+/// check is what makes a path that forgot to ask fail instead of closing the
+/// task anyway. The command-line client is not covered here: it goes through
+/// `ipc::handlers`, where the move is typed out on purpose.
+pub(crate) fn refuse_unconfirmed_close(
+    old_status: &TaskStatus,
+    close_without_merge: Option<bool>,
+) -> Result<(), String> {
+    if *old_status == TaskStatus::HumanReview && close_without_merge != Some(true) {
+        return Err(CLOSE_WITHOUT_MERGE_REQUIRED.to_string());
+    }
+    Ok(())
+}
+
+/// Why [`refuse_unconfirmed_close`] refused.
+pub const CLOSE_WITHOUT_MERGE_REQUIRED: &str =
+    "Moving a task from Human Review to Done closes it without merging it: no pull request is \
+     created and nothing is merged. SlashIt only does that after you confirm it, so the task was \
+     left in Human Review.";
+
 /// Renumber `target_status`'s column so `task_id` sits at `new_position` and
 /// every card in that column has a distinct, gapless position.
 ///
@@ -549,7 +584,7 @@ pub async fn delete_task(
 /// time it finishes -- another card may have been dragged into the same column
 /// meanwhile -- and committing them would publish the card at a position that
 /// was correct a second ago.
-fn renumber_column(
+pub(crate) fn renumber_column(
     staged: &mut HashMap<Uuid, Task>,
     project_id: Uuid,
     task_id: Uuid,
@@ -593,12 +628,16 @@ fn renumber_column(
 /// so a drag classified as an ordinary move could become a move into `Done` by
 /// the time it was applied -- and would then write `Done` itself, with no
 /// cleanup, which is the one thing this design exists to make impossible.
+///
+/// Dropping a card from Human Review onto `Done` needs `close_without_merge`,
+/// as [`update_task_status`] does.
 #[tauri::command]
 pub async fn reorder_task(
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     new_status: Option<TaskStatus>,
     new_position: i32,
+    close_without_merge: Option<bool>,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
 
@@ -619,6 +658,7 @@ pub async fn reorder_task(
     };
 
     if effect == StatusTransitionEffect::CleanUpWorktree {
+        refuse_unconfirmed_close(&old_status, close_without_merge)?;
         let column = target_status.clone();
         let reposition = move |staged: &mut HashMap<Uuid, Task>| {
             renumber_column(staged, project_id, task_id, &column, new_position);
@@ -1681,6 +1721,64 @@ mod lifecycle_ownership {
         task_id
     }
 
+    /// Human Review to Done closes the task without merging it, so neither
+    /// front door does it unless the caller confirmed exactly that.
+    #[tokio::test]
+    async fn human_review_to_done_needs_an_explicit_close_without_merge() {
+        let (_tmp, state) = test_state().await;
+        let by_status = seed(&state, TaskStatus::HumanReview).await;
+        let by_drag = seed(&state, TaskStatus::HumanReview).await;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        for confirmed in [None, Some(false)] {
+            let refused = update_task_status(app.state(), by_status.to_string(), TaskStatus::Done, confirmed)
+                .await
+                .expect_err("not confirmed");
+            assert_eq!(refused, CLOSE_WITHOUT_MERGE_REQUIRED);
+            let refused = reorder_task(app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, confirmed)
+                .await
+                .expect_err("not confirmed");
+            assert_eq!(refused, CLOSE_WITHOUT_MERGE_REQUIRED);
+        }
+        let state: tauri::State<'_, crate::AppState> = app.state();
+        for id in [by_status, by_drag] {
+            assert_eq!(state.task.tasks.read().await[&id].status, TaskStatus::HumanReview);
+        }
+
+        let closed = update_task_status(app.state(), by_status.to_string(), TaskStatus::Done, Some(true))
+            .await
+            .expect("confirmed")
+            .expect("the task exists");
+        assert_eq!(closed.status, TaskStatus::Done);
+        let closed = reorder_task(app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, Some(true))
+            .await
+            .expect("confirmed")
+            .expect("the task exists");
+        assert_eq!(closed.status, TaskStatus::Done);
+    }
+
+    /// Only Human Review is guarded: every other move to Done is unchanged.
+    #[tokio::test]
+    async fn done_from_any_other_column_needs_no_confirmation() {
+        let (_tmp, state) = test_state().await;
+        let from_backlog = seed(&state, TaskStatus::Backlog).await;
+        let from_pr = seed(&state, TaskStatus::PrCreated).await;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let done = update_task_status(app.state(), from_backlog.to_string(), TaskStatus::Done, None)
+            .await
+            .expect("no guard")
+            .expect("exists");
+        assert_eq!(done.status, TaskStatus::Done);
+        let done = reorder_task(app.state(), from_pr.to_string(), Some(TaskStatus::Done), 0, None)
+            .await
+            .expect("no guard")
+            .expect("exists");
+        assert_eq!(done.status, TaskStatus::Done);
+    }
+
     #[tokio::test]
     async fn update_task_status_ends_a_running_execution_before_moving_the_task() {
         let (_tmp, state) = test_state().await;
@@ -1691,7 +1789,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog).await;
+        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
 
         assert!(result.is_ok(), "the transition must succeed: {result:?}");
         assert!(
@@ -1721,7 +1819,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog).await;
+        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
 
         assert!(result.is_ok(), "the transition must succeed: {result:?}");
         assert!(
@@ -1742,7 +1840,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog).await;
+        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
 
         assert!(
             result.is_err(),
@@ -1785,7 +1883,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog).await;
+        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
         assert!(result.is_ok(), "{result:?}");
 
         let live: &crate::AppState = app.state::<crate::AppState>().inner();
@@ -1815,7 +1913,7 @@ mod lifecycle_ownership {
         app.manage(state);
 
         // Same column: `new_status` names the column the task is already in.
-        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0).await;
+        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0, None).await;
 
         assert!(result.is_ok(), "{result:?}");
         assert!(
@@ -1839,7 +1937,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::Backlog), 0).await;
+        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::Backlog), 0, None).await;
 
         assert!(result.is_ok(), "{result:?}");
         assert!(

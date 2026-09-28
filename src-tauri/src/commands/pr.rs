@@ -398,6 +398,110 @@ pub async fn create_pr(
     create_pr_inner(&state, &task_id).await
 }
 
+/// [`create_pr`] for a task whose changes a person approved at Human Review.
+///
+/// The approval is checked under the same lease that reserves the task for
+/// the pull request flow, not before it: reserving ends whatever owns the
+/// task, so a task sent back to work since it was approved must be refused
+/// here rather than have its new run stopped and its branch published.
+pub(crate) async fn create_pr_for_approved_task(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<String, String> {
+    let reservation = {
+        let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+        let approved = state.task.tasks.read().await.get(&task_id).is_some_and(|t| {
+            t.status == TaskStatus::HumanReview && t.human_review.is_approved()
+        });
+        if !approved {
+            return Err(
+                "The task is no longer in Human Review with its changes approved, so no pull \
+                 request was opened."
+                    .to_string(),
+            );
+        }
+        match state.executor.get() {
+            Some(executor) => Some(executor.begin_pr_side_effect_under_lease(task_id).await?),
+            None => None,
+        }
+    };
+    create_pr_reserved(state, task_id, reservation).await
+}
+
+/// Whether SlashIt can open a pull request for a task's project at all.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrAvailability {
+    Available,
+    /// Why not, in words a person can act on.
+    Unavailable { reason: String },
+}
+
+/// Whether the task's repository has an `origin` remote on GitHub, which is
+/// what [`create_pr`] pushes to and what `gh` opens the pull request on.
+///
+/// Read from git on every call rather than from the repository record, whose
+/// `remote_url` is whatever was typed when the project was added and is not
+/// what the push uses. The remote's URL is never repeated in the answer: it
+/// can carry a credential.
+pub(crate) async fn pr_availability(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<PrAvailability, String> {
+    let working_dir = resolve_repository_dir(state, task_id).await?;
+    let mut args: Vec<String> = Vec::new();
+    if let Some(git_dir) = jj_git_dir_arg(&working_dir).await? {
+        args.push(git_dir);
+    }
+    args.extend(["remote", "get-url", "origin"].map(String::from));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    Ok(match run_cmd("git", &args, &working_dir).await {
+        Ok(url) if is_github_remote(&url) => PrAvailability::Available,
+        Ok(_) => PrAvailability::Unavailable {
+            reason: "This project's `origin` remote is not a GitHub repository, and SlashIt can \
+                     only open pull requests on GitHub."
+                .to_string(),
+        },
+        Err(_) => PrAvailability::Unavailable {
+            reason: "SlashIt could not read an `origin` remote for this project's repository, \
+                     so there is nowhere to open a pull request."
+                .to_string(),
+        },
+    })
+}
+
+#[tauri::command]
+pub async fn get_pr_availability(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<PrAvailability, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    pr_availability(&state, task_id).await
+}
+
+/// Whether a remote URL names a repository on github.com, in any of the forms
+/// git accepts: `https://github.com/o/r`, `ssh://git@github.com/o/r` or the
+/// scp-like `git@github.com:o/r`. Only the host decides; a GitHub Enterprise
+/// host is a different forge as far as this is concerned.
+fn is_github_remote(url: &str) -> bool {
+    let url = url.trim();
+    let authority = if let Some((scheme, rest)) = url.split_once("://") {
+        if !matches!(scheme.to_ascii_lowercase().as_str(), "https" | "http" | "ssh" | "git") {
+            return false;
+        }
+        rest.split('/').next().unwrap_or_default()
+    } else {
+        // scp-like syntax: `[user@]host:path`, with no slash before the colon.
+        match url.split_once(':') {
+            Some((host, _)) if !host.contains('/') => host,
+            _ => return false,
+        }
+    };
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let host = host.split(':').next().unwrap_or_default();
+    host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("www.github.com")
+}
+
 #[tauri::command]
 pub async fn bulk_create_prs(
     state: tauri::State<'_, crate::AppState>,
@@ -7066,6 +7170,289 @@ mod tests {
                 "refusing before anything runs means gh must never be invoked: {}",
                 mock.read_log()
             );
+        }
+
+        /// Approving at Human Review, then opening the pull request through
+        /// this same flow (`commands::human_review`).
+        #[cfg(unix)]
+        mod human_review_delivery {
+            use super::*;
+            use crate::commands::human_review::{approve, retry_delivery, PrDelivery};
+
+            const PR_URL: &str = "https://github.com/testorg/testrepo/pull/7";
+
+            /// `origin` reads as GitHub, as `gh` and the availability check
+            /// see it, while pushes still land in the fixture's local bare
+            /// repository.
+            fn point_origin_at_github(repo: &RepoFixture) {
+                git(&repo.checkout, &["remote", "set-url", "origin", "https://github.com/testorg/testrepo.git"]);
+                git(&repo.checkout, &["remote", "set-url", "--push", "origin", repo.remote.to_str().unwrap()]);
+            }
+
+            fn create_branch(repo: &RepoFixture, branch: &str) -> String {
+                git(&repo.checkout, &["branch", branch, "main"]);
+                git(&repo.checkout, &["rev-parse", branch])
+            }
+
+            fn on_disk(state: &crate::AppState, project_id: Uuid, task_id: Uuid) -> Task {
+                state
+                    .storage
+                    .load_project_tasks(project_id)
+                    .expect("read the board back")
+                    .into_iter()
+                    .find(|t| t.id == task_id)
+                    .expect("the task is on disk")
+            }
+
+            async fn project_of(state: &crate::AppState, task_id: Uuid) -> Uuid {
+                state.task.tasks.read().await.get(&task_id).unwrap().project_id
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn approving_with_a_pr_records_the_approval_and_links_the_pull_request() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let sha = create_branch(&repo, "task-approved");
+                let _mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-approved"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+
+                let outcome = approve(&state, task_id, true).await.expect("the approval is recorded");
+
+                assert_eq!(outcome.pr, Some(PrDelivery::Created { url: PR_URL.to_string() }));
+                assert_eq!(outcome.task.status, TaskStatus::PrCreated);
+                assert_eq!(outcome.task.pr_url.as_deref(), Some(PR_URL));
+                assert!(outcome.task.human_review.is_approved());
+                assert_eq!(outcome.task.human_review.entries.len(), 1);
+                assert_eq!(outcome.task.human_review.pr_error, None);
+                assert_eq!(repo.remote_has_branch("task-approved").as_deref(), Some(sha.as_str()));
+
+                let persisted = on_disk(&state, project_of(&state, task_id).await, task_id);
+                assert_eq!(persisted.status, TaskStatus::PrCreated);
+                assert!(persisted.human_review.is_approved());
+            }
+
+            /// A forge failure never erases the decision, and retrying the
+            /// pull request does not ask for, or record, a second approval.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_failed_pull_request_keeps_the_approval_and_a_retry_does_not_approve_again() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let _mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                // Recorded but not in the repository yet, so the push fails.
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-late"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let project_id = project_of(&state, task_id).await;
+
+                let outcome = approve(&state, task_id, true).await.expect("the approval is recorded");
+                let Some(PrDelivery::Failed { reason }) = outcome.pr.clone() else {
+                    panic!("the pull request cannot be opened yet: {:?}", outcome.pr);
+                };
+                assert_eq!(outcome.task.status, TaskStatus::HumanReview);
+                assert!(outcome.task.human_review.is_approved());
+                assert_eq!(outcome.task.human_review.pr_error.as_deref(), Some(reason.as_str()));
+                let persisted = on_disk(&state, project_id, task_id);
+                assert!(persisted.human_review.is_approved(), "the approval survives a restart");
+                assert_eq!(persisted.human_review.pr_error.as_deref(), Some(reason.as_str()));
+
+                // Asking to approve again records nothing new.
+                let again = approve(&state, task_id, false).await.expect("already approved");
+                assert_eq!(again.task.human_review.entries.len(), 1);
+
+                create_branch(&repo, "task-late");
+                let retried = retry_delivery(&state, task_id).await.expect("a retry is allowed");
+                assert_eq!(retried.pr, Some(PrDelivery::Created { url: PR_URL.to_string() }));
+                assert_eq!(retried.task.status, TaskStatus::PrCreated);
+                assert_eq!(retried.task.human_review.entries.len(), 1, "no second approval");
+                assert_eq!(retried.task.human_review.pr_error, None);
+                assert_eq!(on_disk(&state, project_id, task_id).human_review.pr_error, None);
+            }
+
+            /// Without a GitHub `origin`, approval still works; nothing is
+            /// pushed, nothing is merged, and the task stays in Human Review.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn without_a_github_origin_approval_is_recorded_and_nothing_is_pushed() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                create_branch(&repo, "task-local");
+                let main_before = git(&repo.checkout, &["rev-parse", "main"]);
+                let mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-local"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+
+                let outcome = approve(&state, task_id, true).await.expect("the approval is recorded");
+                let Some(PrDelivery::Unavailable { reason }) = outcome.pr.clone() else {
+                    panic!("a non-GitHub origin cannot take a pull request: {:?}", outcome.pr);
+                };
+                assert!(reason.contains("not a GitHub repository"), "{reason}");
+                assert!(!reason.contains(repo.remote.to_str().unwrap()), "the URL is never repeated");
+                assert_eq!(outcome.task.status, TaskStatus::HumanReview);
+                assert!(outcome.task.human_review.is_approved());
+                assert_eq!(outcome.task.human_review.pr_error, None);
+                assert!(mock.read_log().is_empty(), "gh was never asked: {}", mock.read_log());
+                assert_eq!(repo.remote_has_branch("task-local"), None, "nothing was pushed");
+                assert_eq!(git(&repo.checkout, &["rev-parse", "main"]), main_before, "nothing was merged");
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn only_a_task_in_human_review_can_be_approved() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    None,
+                    TaskStatus::InProgress,
+                )
+                .await;
+                let refused = approve(&state, task_id, false).await.expect_err("not in review");
+                assert!(refused.contains("Human Review"), "{refused}");
+                let task = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+                assert!(task.human_review.entries.is_empty());
+                let refused = retry_delivery(&state, task_id).await.expect_err("nothing approved");
+                assert!(refused.contains("approved"), "{refused}");
+            }
+
+            /// Delivery runs outside the task's lease. An approval withdrawn
+            /// while it is on its way makes the pull request refuse, and that
+            /// refusal must not be kept on the task as a delivery failure: the
+            /// approval it would describe is no longer current, and a task
+            /// moved back into Human Review by hand would show it as one.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_delivery_refused_because_its_approval_was_withdrawn_leaves_no_error_behind() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-withdrawn");
+                let mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-withdrawn"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let project_id = project_of(&state, task_id).await;
+                approve(&state, task_id, false).await.expect("approved");
+
+                // A `git` that holds the delivery at its first step, the
+                // availability check, until the test lets it go.
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let started = tmp.path().join("started");
+                let release = tmp.path().join("release");
+                let fake_git = tmp.path().join("git");
+                let real_git = String::from_utf8(
+                    StdCommand::new("sh").args(["-c", "command -v git"]).output().expect("find git").stdout,
+                )
+                .unwrap();
+                write_executable(
+                    &fake_git,
+                    &format!(
+                        "#!/bin/sh\ncase \"$*\" in *get-url*) touch {started:?}; while [ ! -f {release:?} ]; do sleep 0.02; done ;; esac\nexec {} \"$@\"\n",
+                        real_git.trim()
+                    ),
+                );
+
+                let delivery = test_programs::scope([("git", fake_git.clone())], retry_delivery(&state, task_id));
+                let withdraw = async {
+                    while !started.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    assert!(
+                        state.task.tasks.read().await[&task_id].human_review.is_approved(),
+                        "the approval is current when delivery starts"
+                    );
+                    // What every move back to work does.
+                    let to_queue = |staged: &mut HashMap<Uuid, Task>| {
+                        let t = staged.get_mut(&task_id).unwrap();
+                        t.status = TaskStatus::Queue;
+                        t.reset_execution_state();
+                    };
+                    crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &to_queue)
+                        .await
+                        .expect("sent back to work");
+                    std::fs::write(&release, "").unwrap();
+                };
+                let (outcome, ()) = tokio::join!(delivery, withdraw);
+
+                let outcome = outcome.expect("the delivery was attempted");
+                let Some(PrDelivery::Failed { reason }) = outcome.pr else {
+                    panic!("a withdrawn approval must not deliver: {:?}", outcome.pr);
+                };
+                assert!(reason.contains("no longer"), "the caller is told why: {reason}");
+                assert!(!mock.read_log().contains("create"), "no pull request was opened");
+
+                let task = state.task.tasks.read().await[&task_id].clone();
+                assert_eq!(task.human_review.pr_error, None, "a stale failure is not kept");
+                assert_eq!(on_disk(&state, project_id, task_id).human_review.pr_error, None);
+
+                // Moved back by hand: not approved, and nothing to show as a
+                // failed delivery.
+                let back = |staged: &mut HashMap<Uuid, Task>| {
+                    staged.get_mut(&task_id).unwrap().status = TaskStatus::HumanReview;
+                };
+                crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &back)
+                    .await
+                    .expect("moved back");
+                let task = state.task.tasks.read().await[&task_id].clone();
+                assert!(!task.human_review.is_approved());
+                assert_eq!(task.human_review.pr_error, None);
+            }
+
+            #[test]
+            fn github_remotes_are_recognised_by_host_alone() {
+                for url in [
+                    "https://github.com/o/r.git",
+                    "https://github.com/o/r",
+                    "http://GitHub.com/o/r",
+                    "https://x-access-token:secret@github.com/o/r.git",
+                    "ssh://git@github.com/o/r.git",
+                    "ssh://git@github.com:22/o/r.git",
+                    "git@github.com:o/r.git",
+                    "github.com:o/r.git",
+                ] {
+                    assert!(is_github_remote(url), "{url}");
+                }
+                for url in [
+                    "/srv/git/r.git",
+                    "file:///srv/git/r.git",
+                    "https://gitlab.com/o/r.git",
+                    "git@gitlab.com:o/r.git",
+                    "https://github.example.com/o/r.git",
+                    "https://evil.com/github.com/o/r.git",
+                    "https://github.com.evil.com/o/r.git",
+                    "../relative/github.com:o/r",
+                    "",
+                ] {
+                    assert!(!is_github_remote(url), "{url}");
+                }
+            }
         }
 
         /// Phase 6: a branch recorded on the task but not actually present in

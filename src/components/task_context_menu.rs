@@ -20,6 +20,8 @@ pub fn TaskContextMenu(
     on_pr_created: Callback<Task>,
     on_analyze_pr_comments: Callback<Task>,
     on_private_email_pr_error: Callback<Task>,
+    /// Ask for confirmation before a task leaves Human Review for Done.
+    on_request_close: Callback<Task>,
 ) -> impl IntoView {
     let (show_move_submenu, set_show_move_submenu) = signal(false);
     
@@ -102,6 +104,13 @@ pub fn TaskContextMenu(
         let on_move = on_move;
         move |_: web_sys::MouseEvent| {
             if let Some(t) = task.get() {
+                // Done from Human Review closes the task without merging it;
+                // the board asks first.
+                if t.status == TaskStatus::HumanReview && status == TaskStatus::Done {
+                    set_show.set(false);
+                    on_request_close.run(t);
+                    return;
+                }
                 let task_clone = t.clone();
                 let status = status.clone();
                 let on_move = on_move;
@@ -189,6 +198,7 @@ pub fn TaskContextMenu(
 
                 // Move to submenu
                 <div 
+                    data-testid="task-menu-move-to"
                     class="relative"
                     on:mouseenter=move |_| set_show_move_submenu.set(true)
                     on:mouseleave=move |_| set_show_move_submenu.set(false)
@@ -213,8 +223,10 @@ pub fn TaskContextMenu(
                             {STATUSES.iter().map(|(status, label, icon)| {
                                 let status = status.clone();
                                 let handler = create_move_handler(status.clone());
+                                let testid = format!("task-menu-move-{}", format!("{status:?}").to_lowercase());
                                 view! {
                                     <button
+                                        data-testid=testid
                                         class="w-full px-3 py-2 text-left text-sm text-white/80 hover:bg-white/10 flex items-center gap-2 transition-colors"
                                         on:click=handler
                                     >
@@ -227,7 +239,7 @@ pub fn TaskContextMenu(
                     </Show>
                 </div>
 
-                // Create PR (only for HumanReview/Done tasks without a PR)
+                // Create PR (only for Done or approved Human Review tasks without a PR)
                 {
                     let set_show = set_show;
                     let on_create_pr = move |_: leptos::ev::MouseEvent| {
@@ -256,7 +268,10 @@ pub fn TaskContextMenu(
                     };
                     move || {
                         let can_create_pr = task.get().map(|t| {
-                            matches!(t.status, TaskStatus::HumanReview | TaskStatus::Done)
+                            // In Human Review a pull request follows an
+                            // approval, which the drawer records.
+                            (t.status == TaskStatus::Done
+                                || (t.status == TaskStatus::HumanReview && t.human_review.is_approved()))
                                 && t.pr_url.is_none()
                                 && !t.external_refs.iter().any(|r| r.is_pr())
                         }).unwrap_or(false);

@@ -1,0 +1,84 @@
+#!/bin/sh
+# A stand-in for the GitHub CLI, used by the SlashIt acceptance journeys. It
+# never contacts GitHub. It records how it was called and answers the few
+# commands SlashIt's pull request flow runs, keeping the pull requests it
+# "opened" as files so a later `pr list` finds them the way GitHub would.
+#
+# A journey makes `pr create` fail by creating the file `fail-create` in the
+# fixture's directory, and makes it succeed again by removing it.
+set -e
+
+dir="$SLASHIT_FAKE_GH_DIR"
+if [ -z "$dir" ]; then
+    echo "fake gh: SLASHIT_FAKE_GH_DIR is not set" >&2
+    exit 97
+fi
+mkdir -p "$dir/prs"
+
+# Claim this invocation's place in start order; see the fake `claude` for why
+# `mkdir` is the lock.
+sequence="$dir/.sequence"
+mkdir -p "$sequence"
+position=1
+while ! mkdir "$sequence/$position" 2>/dev/null; do
+    position=$((position + 1))
+done
+record="$dir/invocation-$position"
+: > "$record.partial"
+for arg in "$@"; do
+    printf '%s\n' "$arg" >> "$record.partial"
+done
+mv "$record.partial" "$record"
+
+head=""
+take_head=""
+for arg in "$@"; do
+    if [ -n "$take_head" ]; then
+        head="$arg"
+        take_head=""
+        continue
+    fi
+    if [ "$arg" = "--head" ]; then
+        take_head="yes"
+    fi
+done
+
+repository="https://github.com/slashit-acceptance/fixture"
+
+case "$1 $2" in
+    "pr list")
+        if [ -n "$head" ] && [ -f "$dir/prs/$head" ]; then
+            printf '[{"url":"%s","isCrossRepository":false}]' "$(cat "$dir/prs/$head")"
+        else
+            printf '[]'
+        fi
+        ;;
+    "pr create")
+        if [ -f "$dir/fail-create" ]; then
+            echo "fake gh: creating the pull request was scripted to fail" >&2
+            exit 1
+        fi
+        if [ -z "$head" ]; then
+            echo "fake gh: pr create without --head" >&2
+            exit 2
+        fi
+        count=$(ls "$dir/prs" | wc -l)
+        url="$repository/pull/$((count + 1))"
+        printf '%s' "$url" > "$dir/prs/$head"
+        printf '%s\n' "$url"
+        ;;
+    "pr view")
+        printf '{"state":"OPEN","number":1,"mergeable":"MERGEABLE","reviewDecision":"","statusCheckRollup":[],"baseRefName":"main","isCrossRepository":false}'
+        ;;
+    "repo view")
+        printf '{"defaultBranchRef":{"name":"main"}}'
+        ;;
+    *)
+        if [ "$1" = "--version" ]; then
+            echo "gh version 0.0.0 (SlashIt acceptance fixture)"
+            exit 0
+        fi
+        echo "fake gh: unsupported invocation: $*" >&2
+        exit 1
+        ;;
+esac

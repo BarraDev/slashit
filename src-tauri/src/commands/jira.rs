@@ -140,7 +140,7 @@ pub async fn import_jira_issues(
                 key: issue.key,
             }],
             qa_signoff: None,
-            human_review: None,
+            human_review: Default::default(),
             stuck_since: None,
             error_message: None,
             worktree_path: None,

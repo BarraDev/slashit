@@ -36,6 +36,9 @@ use thirtyfour::prelude::*;
 /// ticks every three seconds and the fixture returns immediately, so this is
 /// mostly headroom for a loaded hosted runner.
 const EXECUTION_DEADLINE: Duration = Duration::from_secs(90);
+#[path = "product_acceptance/human_review.rs"]
+mod human_review;
+
 /// How long the board gets to render the finished task.
 const RENDER_DEADLINE: Duration = Duration::from_secs(30);
 /// How long a stopped task is watched for signs of being started again.
@@ -2576,13 +2579,15 @@ async fn finish_a_task(
 
     // --- The one action under test -----------------------------------------
     //
-    // What the board sends when a card is dropped into the Done column.
+    // What the board sends when a card is dropped into the Done column and
+    // the person confirms closing it without merging.
     ui::invoke(
         driver,
         "reorder_task",
         json!({
             "taskId": executed.id,
             "newStatus": "done",
+            "closeWithoutMerge": true,
             "newPosition": 0,
         }),
     )
@@ -3172,7 +3177,7 @@ async fn finish_a_refused_cleanup_by_asking_again(
     // --- The move onto Done has to be refused, not reported ----------------
     //
     // Exactly what the board sends when a card is dragged into the last
-    // column. Answering success here would tell the user their checkout had
+    // column and the close without merging is confirmed. Answering success here would tell the user their checkout had
     // been dealt with while it is still sitting on disk.
     let refusal = ui::invoke_expecting_refusal(
         driver,
@@ -3180,6 +3185,7 @@ async fn finish_a_refused_cleanup_by_asking_again(
         json!({
             "taskId": executed.id,
             "newStatus": "done",
+            "closeWithoutMerge": true,
             "newPosition": 0,
         }),
     )
@@ -3237,6 +3243,7 @@ async fn finish_a_refused_cleanup_by_asking_again(
         json!({
             "taskId": executed.id,
             "newStatus": "done",
+            "closeWithoutMerge": true,
             "newPosition": 0,
         }),
     )
@@ -3406,6 +3413,7 @@ async fn finish_a_cleanup_git_abandoned_by_asking_again(
         json!({
             "taskId": executed.id,
             "newStatus": "done",
+            "closeWithoutMerge": true,
             "newPosition": 0,
         }),
     )
@@ -3464,6 +3472,7 @@ async fn finish_a_cleanup_git_abandoned_by_asking_again(
         json!({
             "taskId": executed.id,
             "newStatus": "done",
+            "closeWithoutMerge": true,
             "newPosition": 0,
         }),
     )
@@ -3598,6 +3607,7 @@ async fn clean_up_beside_a_bystander(
         json!({
             "taskId": executed.id,
             "newStatus": "done",
+            "closeWithoutMerge": true,
             "newPosition": 0,
         }),
     )
@@ -3633,6 +3643,7 @@ async fn clean_up_beside_a_bystander(
         json!({
             "taskId": executed.id,
             "newStatus": "done",
+            "closeWithoutMerge": true,
             "newPosition": 0,
         }),
     )
