@@ -1057,10 +1057,12 @@ async fn await_text(
     let started = Instant::now();
     let mut last = None;
     loop {
-        last = text_of(driver, selector).await?.map(|t| t.trim().to_string()).or(last);
-        if let Some(text) = last.as_deref().filter(|text| accept(text)) {
+        // Judged only on what is shown now; `last` is kept for the report.
+        let current = text_of(driver, selector).await?.map(|t| t.trim().to_string());
+        if let Some(text) = current.as_deref().filter(|text| accept(text)) {
             return Ok(text.to_string());
         }
+        last = current.or(last);
         if started.elapsed() > RENDER_DEADLINE {
             bail!("the drawer never showed {what} in {selector}; it last showed {last:?}");
         }

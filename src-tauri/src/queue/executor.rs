@@ -1827,7 +1827,12 @@ impl TaskExecutor {
             running_handles.write().await.remove(&task_id);
 
             if let Some(exec) = executions.write().await.get_mut(&execution_id) {
-                exec.status = AgentStatus::Stopped;
+                // A run that ended in failure is recorded as one, as a run
+                // that failed to start already is.
+                exec.status = match &ending {
+                    Some(AgentEvent::Error { message, .. }) => AgentStatus::Failed(message.clone()),
+                    _ => AgentStatus::Stopped,
+                };
                 exec.stopped_at = Some(chrono::Utc::now());
             }
 
