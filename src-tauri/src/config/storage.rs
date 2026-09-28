@@ -1058,6 +1058,7 @@ baz = 123
             repository_id: None,
             scope: ProjectScope::Standalone,
             state_location: StateLocation::External,
+            base: None,
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
@@ -1109,6 +1110,7 @@ baz = 123
             repository_id: None,
             scope: crate::domain::ProjectScope::Standalone,
             state_location: crate::config::paths::StateLocation::External,
+            base: None,
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
@@ -1319,6 +1321,7 @@ user_name = "Test"
                 repository_id: Some(repository_id),
                 scope: crate::domain::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
+                base: None,
                 agent_type: AgentType::ClaudeCode,
                 agent_config: AgentConfig {
                     agent_type: AgentType::ClaudeCode,
@@ -1376,6 +1379,7 @@ user_name = "Test"
             repository_id: Some(repository_id),
             scope: crate::domain::ProjectScope::Standalone,
             state_location: crate::config::paths::StateLocation::External,
+            base: None,
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,

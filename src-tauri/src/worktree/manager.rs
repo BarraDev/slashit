@@ -1,6 +1,7 @@
 use super::checked_task_branch;
 use super::default_base::{resolve_default_base, ResolvedBase};
 use crate::config::paths::{AppPaths, ProjectKey};
+use crate::domain::ProjectBase;
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -753,8 +754,10 @@ impl WorktreeManager {
     /// Callers pass [`Self::branch_for_task`] here today, but the name is
     /// checked all the same, so that every way of acquiring a worktree holds
     /// its branch to the same contract before any process sees it.
+    /// Starts a new branch only at a remote default base: a project's local
+    /// base is not known here.
     pub async fn create(&self, repo_path: &str, branch: &str) -> Result<WorktreeInfo, String> {
-        self.create_or_adopt(repo_path, branch).await.map(|(info, _)| info)
+        self.create_or_adopt(repo_path, branch, None).await.map(|(info, _)| info)
     }
 
     /// [`Self::create`], also returning the default base the new branch was
@@ -765,7 +768,8 @@ impl WorktreeManager {
     /// [`Self::undo_created_checkout`] may take back.
     ///
     /// A new branch starts at exactly the commit [`resolve_default_base`]
-    /// resolves, never at the primary checkout's `HEAD`, and with no
+    /// resolves for a project whose local base is `project_base`, never at
+    /// the primary checkout's `HEAD`, and with no
     /// upstream: it is created with a create-only `git update-ref` at that
     /// object ID, which sets no tracking configuration whatever
     /// `branch.autoSetupMerge` says, and only then checked out with
@@ -778,13 +782,19 @@ impl WorktreeManager {
         &self,
         repo_path: &str,
         branch: &str,
+        project_base: Option<&ProjectBase>,
     ) -> Result<(WorktreeInfo, Option<ResolvedBase>), String> {
         let branch = checked_task_branch(branch)?;
+        // A folder git cannot create a worktree from is refused saying what
+        // to do about it, not with whatever `git worktree list` answers.
+        if let Some(refused) = super::vcs::detect(Path::new(repo_path)).await?.refusal(repo_path) {
+            return Err(refused);
+        }
         if let Some(path) = self.adoptable_worktree(repo_path, branch).await? {
             let info = WorktreeInfo { path, branch: branch.to_string() };
             return Ok((info, None));
         }
-        let base = resolve_default_base(repo_path).await?;
+        let base = resolve_default_base(repo_path, project_base).await?;
         Self::create_branch_at(repo_path, branch, &base.commit).await?;
         let worktree_path = self.managed_path(repo_path, branch);
         let info = match self.git_worktree_add(repo_path, &worktree_path, branch).await {
@@ -804,12 +814,12 @@ impl WorktreeManager {
         let expected = format!("refs/heads/{branch}");
         if head_ref.as_deref() != Some(expected.as_str()) || head != base.commit {
             return Err(format!(
-                "branch {branch} was created at {} ({}@origin), but its new worktree at {} has \
+                "branch {branch} was created at {} ({}), but its new worktree at {} has \
                  {} checked out at {} afterwards, which something other than SlashIt (a \
                  post-checkout hook?) must have done. The worktree and the branch were left as \
                  they are.",
                 base.commit,
-                base.branch,
+                base.describe(),
                 info.path,
                 head_ref.as_deref().unwrap_or("a detached HEAD"),
                 head,
@@ -5468,7 +5478,7 @@ branch refs/heads/some-other-branch
         let before = registered_worktrees(repo_path);
 
         let (info, created_from) = test_manager()
-            .create_or_adopt(repo_path, "task-c0ffee11")
+            .create_or_adopt(repo_path, "task-c0ffee11", None)
             .await
             .expect("the registered worktree is adopted");
 
@@ -5490,7 +5500,7 @@ branch refs/heads/some-other-branch
         run_git(repo_path, &["checkout", "-q", "-b", "task-c0ffee11"]);
 
         let reattached = test_manager().reattach(repo_path, "task-c0ffee11").await;
-        let acquired = test_manager().create_or_adopt(repo_path, "task-c0ffee11").await;
+        let acquired = test_manager().create_or_adopt(repo_path, "task-c0ffee11", None).await;
 
         assert!(reattached.is_err(), "{:?}", reattached.map(|i| i.path));
         assert!(acquired.is_err(), "{:?}", acquired.map(|(i, _)| i.path));
@@ -5510,7 +5520,7 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
         let (info, created_from) = mgr
-            .create_or_adopt(repo_path, "task-c0ffee11")
+            .create_or_adopt(repo_path, "task-c0ffee11", None)
             .await
             .expect("a new worktree");
 
@@ -5557,7 +5567,7 @@ branch refs/heads/some-other-branch
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let refused = test_manager()
-            .create_or_adopt(repo_path, "task-0a1b2c3d")
+            .create_or_adopt(repo_path, "task-0a1b2c3d", None)
             .await
             .map(|(info, base)| (info.path, base))
             .expect_err("a moved checkout is not a default-base start");
@@ -5586,7 +5596,7 @@ branch refs/heads/some-other-branch
 
         let reattached = mgr.reattach(project, "task-c0ffee11").await.map(|info| info.path);
         let acquired = mgr
-            .create_or_adopt(project, "task-c0ffee11")
+            .create_or_adopt(project, "task-c0ffee11", None)
             .await
             .map(|(info, _)| info.path);
 
@@ -5611,7 +5621,7 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
         let (info, created_from) = mgr
-            .create_or_adopt(repo_path, "task-c0ffee11")
+            .create_or_adopt(repo_path, "task-c0ffee11", None)
             .await
             .expect("a new worktree");
 
@@ -5700,7 +5710,7 @@ branch refs/heads/some-other-branch
         let repo_path = tmp.path().to_str().unwrap();
         let refs_before = all_refs(repo_path);
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d").await.expect("create");
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
         let created_at = base.expect("created, not adopted").commit;
 
         mgr.undo_created_checkout(repo_path, &info, &created_at).await.expect("taken back");
@@ -5717,7 +5727,7 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d").await.expect("create");
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
         let created_at = base.expect("created").commit;
         std::fs::write(Path::new(&info.path).join("notes.txt"), "unsaved\n").unwrap();
 
@@ -5735,7 +5745,7 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d").await.expect("create");
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
         let created_at = base.expect("created").commit;
         let work = commit_in(&info.path, "work nobody recorded");
 
@@ -5756,7 +5766,7 @@ branch refs/heads/some-other-branch
         let tmp = create_temp_git_repo();
         let repo_path = tmp.path().to_str().unwrap();
         let mgr = test_manager();
-        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d").await.expect("create");
+        let (info, base) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
         let created_at = base.expect("created").commit;
         let hook = tmp.path().join(".git").join("hooks").join("reference-transaction");
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();

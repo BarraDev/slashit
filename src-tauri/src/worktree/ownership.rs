@@ -62,6 +62,12 @@ pub async fn refuse_shared_task_branch(
     branch: &str,
     repo_path: &str,
 ) -> Result<(), String> {
+    // A folder git cannot create a Task Checkout from is refused here, first,
+    // saying what to do, rather than with whatever the branch lookups below
+    // would make of it.
+    if let Some(refused) = super::vcs::detect(std::path::Path::new(repo_path)).await?.refusal(repo_path) {
+        return Err(refused);
+    }
     let recorded = {
         let tasks = tasks.read().await;
         tasks.get(&task_id).and_then(|t| t.branch_name.clone())
@@ -327,6 +333,7 @@ mod tests {
                     repository_id: Some(*repository_id),
                     scope: crate::domain::ProjectScope::Standalone,
                     state_location: crate::config::paths::StateLocation::External,
+                    base: None,
                     agent_type: crate::domain::AgentType::ClaudeCode,
                     agent_config: crate::domain::AgentConfig {
                         agent_type: crate::domain::AgentType::ClaudeCode,
@@ -586,7 +593,9 @@ mod tests {
 
         let plain = temp.path().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
+        // Not a repository at all is refused before any branch is looked
+        // up, saying what the project needs.
         let refused = refuse(plain.to_string_lossy().to_string()).await.expect_err("not a repository");
-        assert!(refused.contains("Could not check for local branch"), "{refused}");
+        assert!(refused.contains("not under version control"), "{refused}");
     }
 }

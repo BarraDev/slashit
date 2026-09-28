@@ -114,8 +114,9 @@ pub struct Task {
     pub branch_name: Option<String>,
 
     /// The commit the task's worktree started from: the exact commit of the
-    /// default branch on `origin` (or the parent branch's tip, for a stacked
-    /// task) resolved once, at the moment the branch is created, and never
+    /// default branch on `origin`, of the project's local base branch when
+    /// there is no remote default (see [`BranchOrigin::LocalBase`]), or of
+    /// the parent branch's tip, for a stacked task, resolved once, at the moment the branch is created, and never
     /// re-derived afterward -- a retry reattaches to the same branch and
     /// must keep comparing against the same starting point, not wherever
     /// the branch tip has since moved to. `None` for a task persisted
@@ -316,6 +317,16 @@ pub enum BranchOrigin {
     /// it builds on that work, and not moved off it by SlashIt since. Its
     /// pull request targets `parent_branch` while the parent is still open.
     Stacked { parent_branch: String },
+    /// Starts from the project's local base branch `branch`
+    /// (`domain::ProjectBase`), at the exact commit `refs/heads/<branch>`
+    /// named when the branch was created, because the repository had no
+    /// usable remote default branch then.
+    ///
+    /// Nothing about a remote is claimed: a pull request for it targets
+    /// `branch` on `origin` only once `origin` has that branch and it
+    /// contains the commit the task started from, so that the pull request
+    /// carries only the task's own commits.
+    LocalBase { branch: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1140,7 +1151,7 @@ mod tests {
         );
     }
 
-    /// Both origins survive the task file (TOML) and IPC (JSON) unchanged.
+    /// Every origin survives the task file (TOML) and IPC (JSON) unchanged.
     #[test]
     fn branch_origin_round_trips_through_toml_and_json() {
         #[derive(Serialize, Deserialize)]
@@ -1151,6 +1162,7 @@ mod tests {
             BranchOrigin::DefaultBase { branch: None },
             BranchOrigin::DefaultBase { branch: Some("main".to_string()) },
             BranchOrigin::Stacked { parent_branch: "task-parent".to_string() },
+            BranchOrigin::LocalBase { branch: "trunk".to_string() },
         ] {
             let mut task = startable_task();
             task.branch_origin = Some(origin.clone());

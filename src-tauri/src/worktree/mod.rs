@@ -4,9 +4,14 @@ mod default_base;
 mod diff;
 mod manager;
 mod ownership;
+pub mod project_base;
+pub mod readiness;
+pub mod remote_head;
 pub mod restack;
+pub mod vcs;
+pub mod vcs_init;
 
-pub use branch::checked_task_branch;
+pub use branch::{checked_base_branch, checked_task_branch, looks_like_task_branch};
 pub use commit::{commit_checkout, commit_checkout_even_if_empty, CheckoutCommit};
 pub use diff::{task_diff, TaskDiff, TaskDiffError};
 pub use manager::{

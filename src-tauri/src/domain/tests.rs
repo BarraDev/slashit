@@ -67,6 +67,7 @@ mod project_tests {
             repository_id: None,
             scope: crate::domain::ProjectScope::Standalone,
             state_location: crate::config::paths::StateLocation::External,
+            base: None,
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
@@ -82,6 +83,36 @@ mod project_tests {
         
         assert_eq!(project.name, "Test Project");
         assert!(matches!(project.agent_type, AgentType::ClaudeCode));
+    }
+
+    /// A project stored before projects had a local base loads with none,
+    /// and writes back without one; a recorded base survives TOML and JSON.
+    #[test]
+    fn a_project_base_is_optional_and_round_trips() {
+        let legacy = r#"
+id = "7b0d6b0e-6d1c-4b3c-9f6e-0a1b2c3d4e5f"
+name = "legacy"
+agent_type = "claude_code"
+created_at = "2026-01-01T00:00:00Z"
+updated_at = "2026-01-01T00:00:00Z"
+
+[agent_config]
+agent_type = "claude_code"
+command = "claude"
+args = []
+env = {}
+"#;
+        let mut project: Project = toml::from_str(legacy).expect("a legacy project loads");
+        assert_eq!(project.base, None);
+        assert!(!toml::to_string(&project).unwrap().contains("base"));
+
+        project.base = Some(ProjectBase::LocalBranch { branch: "trunk-xyz".to_string() });
+        let written = toml::to_string(&project).unwrap();
+        assert!(written.contains("[base]\nkind = \"local_branch\"\nbranch = \"trunk-xyz\""), "{written}");
+        let read: Project = toml::from_str(&written).unwrap();
+        assert_eq!(read.base, project.base);
+        let read: Project = serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(read.base, project.base);
     }
 
     #[test]

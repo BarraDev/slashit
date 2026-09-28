@@ -463,8 +463,10 @@ pub(crate) async fn pr_availability(
                 .to_string(),
         },
         Err(_) => PrAvailability::Unavailable {
-            reason: "SlashIt could not read an `origin` remote for this project's repository, \
-                     so there is nowhere to open a pull request."
+            reason: "This project's repository has no `origin` remote, so there is nowhere to \
+                     open a pull request. Tasks still run, commit and are reviewed locally \
+                     without one; to open pull requests, add a GitHub repository as the \
+                     `origin` remote."
                 .to_string(),
         },
     })
@@ -2963,7 +2965,7 @@ async fn create_pr_reserved(
     // `restack_onto_landed_parent`.
     let working_dir = resolve_repository_dir(state, task_uuid).await?;
 
-    let (pr_title, pr_body, task_branch_name, branch_origin, has_dependencies) = {
+    let (pr_title, pr_body, task_branch_name, branch_origin, base_commit, has_dependencies) = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_uuid).ok_or("Task not found")?;
         (
@@ -2971,6 +2973,7 @@ async fn create_pr_reserved(
             build_pr_body(task),
             task.branch_name.clone(),
             task.branch_origin.clone(),
+            task.base_commit.clone(),
             !task.dependencies.is_empty(),
         )
     };
@@ -3005,7 +3008,7 @@ async fn create_pr_reserved(
 
     // Decided before the push, so a pull request that cannot be opened
     // truthfully leaves nothing half done on the remote.
-    let base = pr_base_for(&working_dir, branch_origin.as_ref(), has_dependencies).await?;
+    let base = pr_base_for(&working_dir, branch_origin.as_ref(), base_commit.as_deref(), has_dependencies).await?;
 
     // A stacked branch whose parent was merged into the default branch is
     // replayed onto it here, before its first push, when that is proven
@@ -3079,6 +3082,45 @@ async fn create_pr_reserved(
     Ok(pr_url)
 }
 
+/// The base of a pull request for a branch started from the project's local
+/// base branch `branch` at `base_commit` (see [`BranchOrigin::LocalBase`]):
+/// `branch` on origin, but only once origin has it and it contains
+/// `base_commit`. Otherwise the pull request would also carry local commits
+/// that were never pushed, under this task's title, so it is refused before
+/// anything is pushed, saying what to push first.
+async fn local_base_pr_base(
+    working_dir: &str,
+    branch: &str,
+    base_commit: Option<&str>,
+) -> Result<PrBase, String> {
+    let branch = checked_task_branch(branch)
+        .map_err(|e| format!("The local base branch this task was started from is unusable: {e}"))?;
+    let base_commit = base_commit.ok_or_else(|| {
+        format!(
+            "This task was started from the local branch {branch}, but the commit it started \
+             from is not recorded, so SlashIt cannot tell what its pull request would carry."
+        )
+    })?;
+    let remote_tip = remote_branch_commit(working_dir, branch).await?.ok_or_else(|| {
+        format!(
+            "This task was started from the local branch {branch}, which origin does not have. \
+             Push {branch} to origin first, then create the pull request again."
+        )
+    })?;
+    let dir = std::path::Path::new(working_dir);
+    let published = crate::worktree::restack::has_commit(dir, &remote_tip).await?
+        && crate::worktree::restack::is_ancestor(dir, base_commit, &remote_tip).await?;
+    if !published {
+        return Err(format!(
+            "This task was started from the local branch {branch} at {base_commit}, which is not \
+             on origin's {branch} as far as this repository knows, so a pull request would also \
+             carry commits that were never pushed. Push {branch} (or fetch origin, if it was \
+             pushed from elsewhere), then create the pull request again."
+        ));
+    }
+    Ok(PrBase { base: Some(branch.to_string()), landed_parent: None })
+}
+
 /// How many pull requests [`pr_base_for`] follows from a stacked task's
 /// parent to where its work landed before giving up.
 const MAX_MERGE_HOPS: usize = 5;
@@ -3124,9 +3166,13 @@ const MAX_MERGE_HOPS: usize = 5;
 async fn pr_base_for(
     working_dir: &str,
     origin: Option<&BranchOrigin>,
+    base_commit: Option<&str>,
     has_dependencies: bool,
 ) -> Result<PrBase, String> {
     let parent = match origin {
+        Some(BranchOrigin::LocalBase { branch }) => {
+            return local_base_pr_base(working_dir, branch, base_commit).await;
+        }
         Some(BranchOrigin::DefaultBase { branch: Some(branch) }) => {
             let branch = checked_task_branch(branch)
                 .map_err(|e| format!("The default branch this task was started from is unusable: {e}"))?;
@@ -7052,6 +7098,7 @@ mod tests {
                 repository_id: Some(repo_id),
                 scope: crate::domain::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
+                base: None,
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,

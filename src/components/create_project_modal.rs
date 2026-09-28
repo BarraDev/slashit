@@ -2,8 +2,23 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos::callback::Callback;
 use crate::models::{Repository, AgentType, Project};
+use crate::models::repository_setup::{InitPreview, Vcs, VcsInitKind};
 use crate::services::{create_project, create_repository, list_repositories, pick_folder, check_is_git_repo};
+use crate::services::repository_setup_service::{get_project_readiness, preview_vcs_initialization};
 use crate::components::toast;
+
+/// Tell the person when a project was created that cannot run tasks yet,
+/// and where to set it up. A project is never initialized behind their back.
+async fn announce_setup_needed(project: &Project) {
+    if let Ok(readiness) = get_project_readiness(project.id.to_string()).await {
+        if let Some(blocked) = readiness.blocked {
+            toast::info(format!(
+                "'{}' needs repository setup before tasks can run: {blocked}",
+                project.name
+            ));
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WizardStep {
@@ -22,7 +37,11 @@ pub fn CreateProjectModal(
     let (folder_path, set_folder_path) = signal(String::new());
     let (is_git_repo, set_is_git_repo) = signal(false);
     let (ancestor_repo_root, set_ancestor_repo_root) = signal(Option::<String>::None);
-    let (init_git, set_init_git) = signal(true);
+    // Initializing version control is an explicit choice, shown with what it
+    // will do (see `InitPreview`).
+    let (init_vcs, set_init_vcs) = signal(false);
+    let init_kind = RwSignal::new(VcsInitKind::Git);
+    let init_preview = RwSignal::new(None::<InitPreview>);
     let (selected_repository_id, set_selected_repository_id) = signal(Option::<String>::None);
     let (repositories, set_repositories) = signal(Vec::<Repository>::new());
     let (loading, set_loading) = signal(false);
@@ -48,7 +67,9 @@ pub fn CreateProjectModal(
             set_folder_path.set(String::new());
             set_is_git_repo.set(false);
             set_ancestor_repo_root.set(None);
-            set_init_git.set(true);
+            set_init_vcs.set(false);
+            init_kind.set(VcsInitKind::Git);
+            init_preview.set(None);
             set_selected_repository_id.set(None);
             set_error_msg.set(None);
         }
@@ -71,12 +92,13 @@ pub fn CreateProjectModal(
 
                         // Create repository from folder. "Open Folder" has no
                         // init-git affordance — it always opens the folder as-is.
-                        match create_repository(path, None, false).await {
+                        match create_repository(path, None, None).await {
                             Ok(repo) => {
                                 // Create project with the new repository
                                 match create_project(project_name.clone(), Some(repo.id.to_string()), AgentType::ClaudeCode).await {
                                     Ok(project) => {
                                         toast::success(format!("Project '{}' created successfully!", project_name));
+                                        announce_setup_needed(&project).await;
                                         set_show_clone.set(false);
                                         if let Some(callback) = on_created {
                                             callback.run(project);
@@ -106,6 +128,46 @@ pub fn CreateProjectModal(
         }
     };
 
+    // What the picked (or typed) folder is, and what initializing version
+    // control there would do. UX only; `create_repository` re-derives it.
+    let inspect_folder = move |path: String| {
+        spawn_local(async move {
+            // Check if it's a git repo (or lives inside one) — this is
+            // UX only; `create_repository` re-derives the same
+            // classification authoritatively at submit time, since
+            // this result can be stale by then.
+            match check_is_git_repo(path.clone()).await {
+                Ok(detection) => {
+                    set_is_git_repo.set(detection.is_git_repo);
+                    set_ancestor_repo_root.set(detection.ancestor_root);
+                }
+                Err(_) => {
+                    set_is_git_repo.set(false);
+                    set_ancestor_repo_root.set(None);
+                }
+            }
+            // What initializing would do here. An empty folder (a
+            // brand new project) starts with it chosen; a folder
+            // that already holds files is only snapshotted when the
+            // person ticks the box.
+            match preview_vcs_initialization(path).await {
+                Ok(preview) => {
+                    let empty_new_folder = preview.vcs == Vcs::None && preview.files == 0;
+                    set_init_vcs.set(
+                        empty_new_folder && preview.refusal(VcsInitKind::Git).is_none(),
+                    );
+                    init_kind.set(VcsInitKind::Git);
+                    init_preview.set(Some(preview));
+                }
+                Err(e) => {
+                    set_init_vcs.set(false);
+                    init_preview.set(None);
+                    leptos::logging::warn!("Could not preview version control setup: {}", e);
+                }
+            }
+        });
+    };
+
     // Handle folder picker in create form
     let handle_folder_pick = move |_| {
         spawn_local(async move {
@@ -118,23 +180,7 @@ pub fn CreateProjectModal(
                             set_name.set(folder_name.to_string());
                         }
                     }
-                    // Check if it's a git repo (or lives inside one) — this is
-                    // UX only; `create_repository` re-derives the same
-                    // classification authoritatively at submit time, since
-                    // this result can be stale by then.
-                    match check_is_git_repo(path).await {
-                        Ok(detection) => {
-                            set_is_git_repo.set(detection.is_git_repo);
-                            set_ancestor_repo_root.set(detection.ancestor_root);
-                            if detection.is_git_repo {
-                                set_init_git.set(false); // Don't init if already git-backed
-                            }
-                        }
-                        Err(_) => {
-                            set_is_git_repo.set(false);
-                            set_ancestor_repo_root.set(None);
-                        }
-                    }
+                    inspect_folder(path);
                 }
                 Ok(None) => {} // User cancelled
                 Err(e) => {
@@ -164,11 +210,14 @@ pub fn CreateProjectModal(
 
             let on_created = on_project_created;
             let set_show_clone = set_show;
-            let init_git_val = init_git.get();
+            let initialize = init_preview
+                .get()
+                .filter(|preview| preview.action.is_some() && init_vcs.get())
+                .map(|_| init_kind.get());
 
             spawn_local(async move {
                 // Create repository from folder path
-                let repository_id = match create_repository(folder_path_val, None, init_git_val).await {
+                let repository_id = match create_repository(folder_path_val, None, initialize).await {
                     Ok(repo) => Some(repo.id.to_string()),
                     Err(e) => {
                         set_error_msg.set(Some(format!("Failed to create repository: {}", e)));
@@ -181,6 +230,7 @@ pub fn CreateProjectModal(
                 match create_project(name_val.clone(), repository_id, AgentType::ClaudeCode).await {
                     Ok(project) => {
                         toast::success(format!("Project '{}' created successfully!", name_val));
+                        announce_setup_needed(&project).await;
                         set_submitting.set(false);
                         set_show_clone.set(false);
                         if let Some(callback) = on_created {
@@ -244,6 +294,7 @@ pub fn CreateProjectModal(
                                 // Create Project Card
                                 <button
                                     type="button"
+                                    data-testid="wizard-create-project"
                                     on:click=move |_| set_wizard_step.set(WizardStep::CreateForm)
                                     class="group p-6 rounded-xl bg-white/5 border border-white/10 hover:border-purple-500/50 hover:bg-purple-500/10 transition-all duration-300 text-left"
                                 >
@@ -395,6 +446,7 @@ pub fn CreateProjectModal(
                                     }
                                     class="w-full px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-purple-500/50 focus:border-purple-500/50 transition-all"
                                     placeholder="My Awesome Project"
+                                    data-testid="create-project-name"
                                     disabled=move || submitting.get()
                                 />
                             </div>
@@ -406,7 +458,9 @@ pub fn CreateProjectModal(
                                     <input
                                         type="text"
                                         prop:value=move || folder_path.get()
+                                        data-testid="create-project-location"
                                         on:input=move |ev| set_folder_path.set(event_target_value(&ev))
+                                        on:change=move |ev| inspect_folder(event_target_value(&ev))
                                         class="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-purple-500/50 transition-all"
                                         placeholder="Select a folder..."
                                         disabled=move || submitting.get()
@@ -446,23 +500,73 @@ pub fn CreateProjectModal(
                                 }}
                             </div>
 
-                            // Initialize Git Checkbox
-                            <Show when=move || !is_git_repo.get()>
-                                <label class="flex items-center gap-3 p-4 rounded-xl bg-white/5 border border-white/10 cursor-pointer hover:bg-white/[0.07] transition-colors">
-                                    <input
-                                        type="checkbox"
-                                        prop:checked=move || init_git.get()
-                                        on:change=move |ev| set_init_git.set(event_target_checked(&ev))
-                                        class="w-5 h-5 rounded-md bg-white/10 border-white/20 text-purple-500 focus:ring-purple-500/50 focus:ring-offset-0"
-                                        disabled=move || submitting.get()
-                                    />
-                                    <div>
-                                        <div class="text-sm font-medium text-white/80">"Initialize git repository"</div>
-                                        <div class="text-xs text-white/40">"Create a new git repo in this folder"</div>
+                            // Version control setup: what it would do, and an
+                            // explicit choice to do it.
+                            {move || init_preview.get().filter(|p| {
+                                // Offered, or refused for a reason worth
+                                // saying: not for a repository that is fine
+                                // as it is, nor one inside another (said above).
+                                p.action.is_some()
+                                    || !matches!(p.vcs, Vcs::Git | Vcs::JjColocated | Vcs::InsideRepository { .. })
+                            }).map(|preview| {
+                                let action = preview.action.clone().unwrap_or_default();
+                                let sample = preview.sample.clone();
+                                let more = preview.files.saturating_sub(sample.len());
+                                let offers_jj = preview.vcs == Vcs::None && preview.jj_available;
+                                let refusal_preview = preview.clone();
+                                let refusal = Signal::derive(move || refusal_preview.refusal(init_kind.get()));
+                                view! {
+                                    <div class="p-4 rounded-xl bg-white/5 border border-white/10 space-y-3" data-testid="vcs-setup">
+                                        <label class="flex items-start gap-3 cursor-pointer">
+                                            <input
+                                                type="checkbox"
+                                                data-testid="vcs-init-toggle"
+                                                prop:checked=move || init_vcs.get() && refusal.get().is_none()
+                                                on:change=move |ev| set_init_vcs.set(event_target_checked(&ev))
+                                                class="mt-0.5 w-5 h-5 rounded-md bg-white/10 border-white/20 text-purple-500 focus:ring-purple-500/50 focus:ring-offset-0"
+                                                disabled=move || submitting.get() || refusal.get().is_some()
+                                            />
+                                            <div>
+                                                <div class="text-sm font-medium text-white/80">"Initialize version control"</div>
+                                                <div class="text-xs text-white/50" data-testid="vcs-init-action">{action}</div>
+                                            </div>
+                                        </label>
+                                        {(!sample.is_empty()).then(|| view! {
+                                            <details class="text-xs text-white/40">
+                                                <summary class="cursor-pointer">"Files the first commit would hold"</summary>
+                                                <ul class="mt-1 ml-4 list-disc font-mono">
+                                                    {sample.into_iter().map(|f| view! { <li>{f}</li> }).collect::<Vec<_>>()}
+                                                </ul>
+                                                {(more > 0).then(|| view! { <p class="mt-1">{format!("and {more} more")}</p> })}
+                                            </details>
+                                        })}
+                                        {offers_jj.then(|| view! {
+                                            <div class="flex gap-4 text-sm text-white/70">
+                                                <label class="flex items-center gap-2 cursor-pointer">
+                                                    <input type="radio" name="vcs-kind" data-testid="vcs-kind-git"
+                                                        prop:checked=move || init_kind.get() == VcsInitKind::Git
+                                                        on:change=move |_| init_kind.set(VcsInitKind::Git) />
+                                                    "Git"
+                                                </label>
+                                                <label class="flex items-center gap-2 cursor-pointer">
+                                                    <input type="radio" name="vcs-kind" data-testid="vcs-kind-jujutsu"
+                                                        prop:checked=move || init_kind.get() == VcsInitKind::Jujutsu
+                                                        on:change=move |_| init_kind.set(VcsInitKind::Jujutsu) />
+                                                    "Jujutsu (colocated with Git)"
+                                                </label>
+                                            </div>
+                                        })}
+                                        {move || refusal.get().map(|why| view! {
+                                            <p class="text-xs text-amber-400" data-testid="vcs-init-blocked">{why}</p>
+                                        })}
+                                        <Show when=move || !init_vcs.get() || refusal.get().is_some()>
+                                            <p class="text-xs text-white/40" data-testid="vcs-init-skipped">
+                                                "Without it the project is created in a setup-required state: tasks cannot run until version control is initialized in Settings > Repository. A remote is never required."
+                                            </p>
+                                        </Show>
                                     </div>
-                                </label>
-                            </Show>
-
+                                }
+                            })}
                             // AI Agent (hardcoded to Claude Code)
                             <div class="flex items-center gap-3 p-4 rounded-xl bg-blue-500/10 border border-blue-500/30">
                                 <svg class="w-5 h-5 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -485,6 +589,7 @@ pub fn CreateProjectModal(
                                 "Back"
                             </button>
                             <button
+                                data-testid="create-project-submit"
                                 on:click=submit
                                 class="flex items-center gap-2 px-6 py-2.5 rounded-xl bg-gradient-to-r from-purple-500 to-pink-500 hover:from-purple-600 hover:to-pink-600 disabled:from-white/5 disabled:to-white/5 disabled:text-white/30 text-white font-medium transition-all shadow-lg shadow-purple-500/20"
                                 disabled=move || submitting.get()

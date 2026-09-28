@@ -1,15 +1,18 @@
-//! The default base an ordinary task branch starts from.
+//! The base an ordinary task branch starts from.
 //!
-//! Resolved once, before the branch exists, from local refs only: nothing
-//! here fetches, runs `git remote set-head --auto`, or asks GitHub. What is
-//! resolved is one default branch `D` and the exact commit
-//! `refs/remotes/origin/<D>` names, which is then where the branch is
-//! created and what the task records as its base. The primary checkout's
-//! `HEAD` is never a substitute: it is wherever the user happens to be,
-//! which may be a feature branch or, in a JJ-colocated repository, a
-//! detached commit holding work nobody pushed.
+//! A task needs a safe, explicit version-control base; a remote is optional.
+//! The base is resolved once, before the branch exists, from local refs and
+//! the project's own record only: nothing here fetches, runs `git remote
+//! set-head --auto`, or asks GitHub. What is resolved is one branch `D` and
+//! the exact commit it named, which is then where the task branch is created
+//! and what the task records as its base. The primary checkout's `HEAD` is
+//! never consulted: it is wherever the user happens to be, which may be a
+//! feature branch or, in a JJ-colocated repository, a detached commit
+//! holding work nobody pushed.
 //!
-//! In order:
+//! The folder must first be a Git repository root, or a Jujutsu repository
+//! colocated with Git (see [`super::vcs`]); anything else is refused saying
+//! what to do. Then, in order:
 //!
 //! 1. `refs/remotes/origin/HEAD`, read as the exact ref, when it is a
 //!    symbolic ref that resolves to `refs/remotes/origin/<D>` and that ref
@@ -18,37 +21,81 @@
 //!    a chain of symbolic refs ends, so one that reaches
 //!    `refs/remotes/origin/<D>` through another symbolic ref resolves to
 //!    `<D>`, that final branch of origin's; one that ends anywhere else is
-//!    refused as below.
+//!    refused. A remote-backed repository therefore behaves exactly as it
+//!    did before projects had a local base: origin's default branch wins
+//!    whenever it can be read.
 //! 2. When that ref is missing, dangling or not symbolic, and the repository
 //!    is also a JJ repository (`<repo>/.jj`), JJ's `trunk()` alias, but only
 //!    when it is exactly `<D>@origin` and `refs/remotes/origin/<D>` resolves
 //!    as above. Anything else it can be -- the built-in default expression,
 //!    another remote, a revset -- is not a branch SlashIt can name. `jj` not
 //!    being installed is the same as this step not answering.
-//! 3. Otherwise the task is refused with a message saying what to run. A
-//!    repository whose remote is not called `origin`, a fork layout, and a
-//!    repository with no remote at all are not supported.
+//! 3. The project's local base branch (`domain::ProjectBase`), when it has
+//!    one: the commit `refs/heads/<D>` names now. It was captured when the
+//!    project was registered or initialized, or chosen explicitly, so
+//!    switching the primary checkout to another branch does not move it. A
+//!    base branch that is gone or unusable is refused, not skipped.
+//! 4. Otherwise the task is refused with a message saying what to do. A
+//!    remote not called `origin` is never read as a remote default branch.
+//!
+//! A malformed `refs/remotes/origin/HEAD` (pointing outside `origin`, or at a
+//! ref no branch can start from) is refused at step 1 even when the project
+//! has a local base: it is a repository setup that needs fixing, not an
+//! absent remote.
 
 use super::checked_task_branch;
 use super::restack::{exact_ref, has_commit};
+use super::vcs;
+use crate::domain::{BranchOrigin, ProjectBase};
+use serde::Serialize;
 use std::path::Path;
 
-/// The default branch an ordinary task branch starts from, and the commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where a resolved base came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseSource {
+    /// Origin's default branch, from `refs/remotes/origin/HEAD` or JJ's
+    /// `trunk()`: `refs/remotes/origin/<D>`.
+    Remote,
+    /// The project's local base branch: `refs/heads/<D>`.
+    Local,
+}
+
+/// The branch an ordinary task branch starts from, and the commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedBase {
-    /// `D`, the branch `refs/remotes/origin/<D>` tracks on `origin`. A
-    /// branch name [`checked_task_branch`] accepts.
+    /// `D`: a branch of origin's, or a local branch, per [`Self::source`].
+    /// A branch name [`checked_task_branch`] accepts.
     pub branch: String,
-    /// The full object ID of the commit `refs/remotes/origin/<D>` named when
-    /// it was resolved.
+    /// The full object ID of the commit the ref named when it was resolved.
     pub commit: String,
+    pub source: BaseSource,
+}
+
+impl ResolvedBase {
+    /// What a task branch created at this base records as its origin.
+    pub fn branch_origin(&self) -> BranchOrigin {
+        match self.source {
+            BaseSource::Remote => BranchOrigin::DefaultBase { branch: Some(self.branch.clone()) },
+            BaseSource::Local => BranchOrigin::LocalBase { branch: self.branch.clone() },
+        }
+    }
+
+    /// The ref this base was read from, for messages.
+    pub fn describe(&self) -> String {
+        match self.source {
+            BaseSource::Remote => format!("{}@origin", self.branch),
+            BaseSource::Local => format!("the project's base branch {}", self.branch),
+        }
+    }
 }
 
 const ORIGIN_HEAD: &str = "refs/remotes/origin/HEAD";
 const ORIGIN_BRANCHES: &str = "refs/remotes/origin/";
+const LOCAL_BRANCHES: &str = "refs/heads/";
 
 /// What `refs/remotes/origin/HEAD` is, read as that exact ref.
-enum OriginHead {
+pub(super) enum OriginHead {
     /// A symbolic ref to `refs/remotes/origin/<D>`, which exists.
     Branch(String),
     /// A symbolic ref to a ref outside `refs/remotes/origin/`.
@@ -57,10 +104,32 @@ enum OriginHead {
     Missing,
 }
 
-/// Resolve the default base of the repository at `repo_path`, or say why
-/// there is none SlashIt can use. See the module documentation.
-pub async fn resolve_default_base(repo_path: &str) -> Result<ResolvedBase, String> {
+/// Resolve the base of the repository at `repo_path` for a project whose
+/// local base is `project_base`, or say why there is none SlashIt can use.
+/// See the module documentation.
+pub async fn resolve_default_base(
+    repo_path: &str,
+    project_base: Option<&ProjectBase>,
+) -> Result<ResolvedBase, String> {
     let repo = Path::new(repo_path);
+    if let Some(refused) = vcs::detect(repo).await?.refusal(repo_path) {
+        return Err(refused);
+    }
+    if let Some(base) = resolve_remote_base(repo, repo_path).await? {
+        return Ok(base);
+    }
+    match project_base {
+        Some(base) => resolve_local_base(repo, repo_path, base.branch()).await,
+        None => Err(refusal(repo, repo_path).await),
+    }
+}
+
+/// Steps 1 and 2 of the module documentation: origin's default branch, or
+/// `None` when neither `refs/remotes/origin/HEAD` nor JJ names one.
+pub(super) async fn resolve_remote_base(
+    repo: &Path,
+    repo_path: &str,
+) -> Result<Option<ResolvedBase>, String> {
     match origin_head(repo).await? {
         OriginHead::Branch(branch) => {
             let branch = checked_task_branch(&branch).map_err(|e| {
@@ -70,13 +139,13 @@ pub async fn resolve_default_base(repo_path: &str) -> Result<ResolvedBase, Strin
                 )
             })?;
             match at_origin_branch(repo, branch).await? {
-                OriginBranch::Found(base) => return Ok(base),
+                OriginBranch::Found(base) => return Ok(Some(base)),
                 OriginBranch::Unusable(why) => {
                     return Err(format!(
                         "{ORIGIN_HEAD} in {repo_path} names {ORIGIN_BRANCHES}{branch}, which \
                          {why}, so a task's branch cannot start there. Fetch origin again, or \
-                         run `git remote set-head origin <default branch>` there, then start \
-                         the task again."
+                         use Detect default branch in Settings > Repository (`git remote \
+                         set-head origin --auto`), then start the task again."
                     ));
                 }
                 OriginBranch::Missing => {}
@@ -84,10 +153,10 @@ pub async fn resolve_default_base(repo_path: &str) -> Result<ResolvedBase, Strin
         }
         OriginHead::Elsewhere(target) => {
             return Err(format!(
-                "{ORIGIN_HEAD} in {repo_path} points at {target}, not at a branch of origin. \
-                 SlashIt starts a task's branch from origin's default branch and does not \
-                 support other layouts. Run `git remote set-head origin <default branch>` \
-                 there, then start the task again."
+                "{ORIGIN_HEAD} in {repo_path} points at {target}, not at a branch of origin, so \
+                 SlashIt cannot tell which branch a task should start from. Use Detect default \
+                 branch in Settings > Repository (`git remote set-head origin --auto`), or run \
+                 `git remote set-head origin <default branch>` there, then start the task again."
             ));
         }
         OriginHead::Missing => {}
@@ -96,7 +165,7 @@ pub async fn resolve_default_base(repo_path: &str) -> Result<ResolvedBase, Strin
     if repo.join(".jj").is_dir() {
         if let Some(branch) = jj_trunk_branch(repo).await {
             match at_origin_branch(repo, &branch).await? {
-                OriginBranch::Found(base) => return Ok(base),
+                OriginBranch::Found(base) => return Ok(Some(base)),
                 OriginBranch::Unusable(why) => {
                     return Err(format!(
                         "{ORIGIN_HEAD} is not set in {repo_path}, and JJ's trunk() alias names \
@@ -109,8 +178,39 @@ pub async fn resolve_default_base(repo_path: &str) -> Result<ResolvedBase, Strin
             }
         }
     }
+    Ok(None)
+}
 
-    Err(refusal(repo, repo_path).await)
+/// Step 3: the commit the project's local base branch names now.
+async fn resolve_local_base(
+    repo: &Path,
+    repo_path: &str,
+    branch: &str,
+) -> Result<ResolvedBase, String> {
+    let branch = super::checked_base_branch(branch)?;
+    match at_branch(repo, LOCAL_BRANCHES, branch).await? {
+        Found::Commit(commit) => {
+            Ok(ResolvedBase { branch: branch.to_string(), commit, source: BaseSource::Local })
+        }
+        Found::Missing => Err(format!(
+            "This project's base branch {branch} does not exist in {repo_path} any more, so \
+             SlashIt cannot tell where a new task should start. Choose the base branch again in \
+             Settings > Repository."
+        )),
+        Found::Unusable(why) => Err(format!(
+            "This project's base branch {branch} in {repo_path} {why}, so a task's branch cannot \
+             start there. Choose another base branch in Settings > Repository."
+        )),
+    }
+}
+
+/// Whether a local branch `branch` is one a task branch can start at, and
+/// its commit. For choosing and capturing a project's base.
+pub(super) async fn local_branch_commit(repo: &Path, branch: &str) -> Result<Option<String>, String> {
+    Ok(match at_branch(repo, LOCAL_BRANCHES, branch).await? {
+        Found::Commit(commit) => Some(commit),
+        Found::Missing | Found::Unusable(_) => None,
+    })
 }
 
 /// What `for-each-ref` says about exactly `refname`.
@@ -158,7 +258,7 @@ async fn listed(repo: &Path, refname: &str) -> Result<Listed, String> {
 }
 
 /// Read `refs/remotes/origin/HEAD`; see [`listed`].
-async fn origin_head(repo: &Path) -> Result<OriginHead, String> {
+pub(super) async fn origin_head(repo: &Path) -> Result<OriginHead, String> {
     Ok(match listed(repo, ORIGIN_HEAD).await? {
         Listed::Absent | Listed::Direct => OriginHead::Missing,
         Listed::Symbolic(target) => match target.strip_prefix(ORIGIN_BRANCHES) {
@@ -168,37 +268,57 @@ async fn origin_head(repo: &Path) -> Result<OriginHead, String> {
     })
 }
 
-/// What `refs/remotes/origin/<branch>` is.
-enum OriginBranch {
+/// What `<prefix><branch>` is.
+enum Found {
     /// A ref naming a commit object the repository has.
-    Found(ResolvedBase),
+    Commit(String),
     /// There is no such ref.
     Missing,
     /// There is, but no branch can start at it, for the reason given.
     Unusable(&'static str),
 }
 
-/// Read `refs/remotes/origin/<branch>` as that exact ref. Only a ref that
-/// names a commit object directly, which the repository has, is a base; a
-/// symbolic ref is not, since it says nothing about origin's own branch.
+/// What `refs/remotes/origin/<branch>` is.
+enum OriginBranch {
+    Found(ResolvedBase),
+    Missing,
+    Unusable(&'static str),
+}
+
+/// Read `refs/remotes/origin/<branch>` as that exact ref; see [`at_branch`].
 async fn at_origin_branch(repo: &Path, branch: &str) -> Result<OriginBranch, String> {
     let branch = checked_task_branch(branch)?;
-    let refname = format!("{ORIGIN_BRANCHES}{branch}");
+    Ok(match at_branch(repo, ORIGIN_BRANCHES, branch).await? {
+        Found::Commit(commit) => OriginBranch::Found(ResolvedBase {
+            branch: branch.to_string(),
+            commit,
+            source: BaseSource::Remote,
+        }),
+        Found::Missing => OriginBranch::Missing,
+        Found::Unusable(why) => OriginBranch::Unusable(why),
+    })
+}
+
+/// Read `<prefix><branch>` as that exact ref. Only a ref that names a commit
+/// object directly, which the repository has, is a base; a symbolic ref is
+/// not, since it says nothing about the branch itself.
+async fn at_branch(repo: &Path, prefix: &str, branch: &str) -> Result<Found, String> {
+    let refname = format!("{prefix}{branch}");
     match listed(repo, &refname).await? {
-        Listed::Absent => return Ok(OriginBranch::Missing),
-        Listed::Symbolic(_) => return Ok(OriginBranch::Unusable("is itself a symbolic ref")),
+        Listed::Absent => return Ok(Found::Missing),
+        Listed::Symbolic(_) => return Ok(Found::Unusable("is itself a symbolic ref")),
         Listed::Direct => {}
     }
     let Some(commit) = exact_ref(repo, &refname).await? else {
-        return Ok(OriginBranch::Missing);
+        return Ok(Found::Missing);
     };
     if !has_commit(repo, &commit).await? {
-        return Ok(OriginBranch::Unusable("names a commit this repository does not have"));
+        return Ok(Found::Unusable("names a commit this repository does not have"));
     }
     if !is_commit_object(repo, &commit).await? {
-        return Ok(OriginBranch::Unusable("names a tag object, not a commit"));
+        return Ok(Found::Unusable("names a tag object, not a commit"));
     }
-    Ok(OriginBranch::Found(ResolvedBase { branch: branch.to_string(), commit }))
+    Ok(Found::Commit(commit))
 }
 
 /// Whether `oid` is itself a commit, rather than a tag that peels to one: a
@@ -215,13 +335,20 @@ async fn is_commit_object(repo: &Path, oid: &str) -> Result<bool, String> {
 }
 
 /// `D` when JJ's `trunk()` alias is exactly `<D>@origin`.
+async fn jj_trunk_branch(repo: &Path) -> Option<String> {
+    let value = jj_trunk_alias(repo).await?;
+    let branch = value.strip_suffix("@origin")?;
+    checked_task_branch(branch).ok().map(str::to_string)
+}
+
+/// The value of JJ's `trunk()` revset alias in the repository at `repo`.
 ///
 /// `--ignore-working-copy` keeps JJ from snapshotting the primary checkout.
 /// Reading the configuration can still move a repository's legacy
 /// configuration into JJ's per-user configuration directory, which is JJ's
 /// own migration and harmless. Any failure, including `jj` not being on
 /// `PATH`, answers `None`.
-async fn jj_trunk_branch(repo: &Path) -> Option<String> {
+pub(super) async fn jj_trunk_alias(repo: &Path) -> Option<String> {
     let output = tokio::process::Command::new("jj")
         .args([
             "--ignore-working-copy",
@@ -239,12 +366,11 @@ async fn jj_trunk_branch(repo: &Path) -> Option<String> {
         return None;
     }
     let value = String::from_utf8(output.stdout).ok()?;
-    let value = value.strip_suffix('\n').unwrap_or(&value);
-    let branch = value.strip_suffix("@origin")?;
-    checked_task_branch(branch).ok().map(str::to_string)
+    Some(value.strip_suffix('\n').unwrap_or(&value).to_string())
 }
 
-/// Why no default base could be resolved, and what to run about it.
+/// Why no base could be resolved for a project with no local base branch,
+/// and what to do about it.
 async fn refusal(repo: &Path, repo_path: &str) -> String {
     let has_origin = tokio::process::Command::new("git")
         .args(["config", "--get", "remote.origin.url"])
@@ -259,20 +385,28 @@ async fn refusal(repo: &Path, repo_path: &str) -> String {
     } else {
         ""
     };
+    let no_commits = !vcs::has_commits(repo).await;
+    if no_commits {
+        return format!(
+            "The repository at {repo_path} has no commits yet, so there is nothing a task's \
+             branch can start from. Create an initial snapshot from Settings > Repository, or \
+             commit there yourself, then start the task again."
+        );
+    }
     if has_origin {
         format!(
-            "SlashIt could not tell which branch of origin a new task branch should start \
-             from in {repo_path}: {ORIGIN_HEAD} is not set, or names a branch that has not \
-             been fetched.{jj} Run `git remote set-head origin --auto` (or `git remote \
-             set-head origin <default branch>`) there, then start the task again. SlashIt \
-             does not fetch or ask the network on its own."
+            "SlashIt could not tell which branch a new task should start from in {repo_path}: \
+             {ORIGIN_HEAD} is not set, or names a branch that has not been fetched, and this \
+             project has no local base branch.{jj} In Settings > Repository, use Detect default \
+             branch (`git remote set-head origin --auto`, which asks origin) or choose a local \
+             base branch, then start the task again. SlashIt does not fetch or ask the network \
+             on its own."
         )
     } else {
         format!(
-            "{repo_path} has no remote named origin, so there is no default branch to start a \
-             task's branch from.{jj} SlashIt does not support local-only repositories or \
-             remotes with another name. Add the remote as origin, fetch it, and run `git remote \
-             set-head origin --auto`, then start the task again."
+            "This project has no base branch for new tasks, and {repo_path} has no remote named \
+             origin to take one from.{jj} Choose the local branch tasks should start from in \
+             Settings > Repository, then start the task again. A remote is not required."
         )
     }
 }
@@ -313,7 +447,7 @@ mod tests {
     }
 
     async fn resolve(repo: &Path) -> Result<ResolvedBase, String> {
-        resolve_default_base(repo.to_str().unwrap()).await
+        resolve_default_base(repo.to_str().unwrap(), None).await
     }
 
     #[tokio::test]
@@ -325,7 +459,7 @@ mod tests {
 
         assert_eq!(
             resolve(&repo).await,
-            Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip })
+            Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip, source: BaseSource::Remote })
         );
     }
 
@@ -340,7 +474,7 @@ mod tests {
 
         assert_eq!(
             resolve(&repo).await,
-            Ok(ResolvedBase { branch: "release/v2".to_string(), commit: tip })
+            Ok(ResolvedBase { branch: "release/v2".to_string(), commit: tip, source: BaseSource::Remote })
         );
     }
 
@@ -394,7 +528,7 @@ mod tests {
 
         assert_eq!(
             resolve(&repo).await,
-            Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip.clone() })
+            Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip.clone(), source: BaseSource::Remote })
         );
 
         git(&repo, &["update-ref", "refs/remotes/upstream/trunk", &tip]);
@@ -427,7 +561,8 @@ mod tests {
     }
 
     /// No remote named `origin`, whether a local-only repository or one
-    /// whose remote has another name, is refused as unsupported.
+    /// whose remote has another name, and no project base: refused, saying
+    /// to choose a base branch. A remote of another name is never read.
     #[tokio::test]
     async fn a_repository_without_origin_is_refused() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -447,6 +582,84 @@ mod tests {
         assert!(refused.contains("no remote named origin"), "{refused}");
     }
 
+    fn local(branch: &str) -> ProjectBase {
+        ProjectBase::LocalBranch { branch: branch.to_string() }
+    }
+
+    async fn resolve_with(repo: &Path, base: &ProjectBase) -> Result<ResolvedBase, String> {
+        resolve_default_base(repo.to_str().unwrap(), Some(base)).await
+    }
+
+    /// A local-only repository starts tasks from the project's base branch,
+    /// at the commit it names now, wherever the primary checkout has gone.
+    #[tokio::test]
+    async fn a_local_only_repository_starts_from_the_project_base() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "trunk-xyz"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        let tip = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "-q", "-b", "feature"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "feature work"]);
+
+        let base = resolve_with(&repo, &local("trunk-xyz")).await.expect("local base");
+        assert_eq!(
+            base,
+            ResolvedBase { branch: "trunk-xyz".to_string(), commit: tip, source: BaseSource::Local }
+        );
+        assert_eq!(base.branch_origin(), BranchOrigin::LocalBase { branch: "trunk-xyz".to_string() });
+
+        let refused = resolve_with(&repo, &local("gone")).await.expect_err("missing base");
+        assert!(refused.contains("does not exist"), "{refused}");
+        let refused = resolve_with(&repo, &local("-evil")).await.expect_err("unsafe name");
+        assert!(refused.contains("will not use it"), "{refused}");
+    }
+
+    /// Origin's default branch wins over the project's local base whenever it
+    /// can be read, so remote-backed projects start where they always did;
+    /// with `origin/HEAD` gone the local base answers; with it malformed the
+    /// task is refused rather than quietly falling back.
+    #[tokio::test]
+    async fn origin_head_takes_precedence_over_the_project_base() {
+        let (_temp, repo, tip) = cloned_repo();
+        git(&repo, &["checkout", "-q", "-b", "local-base"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "local only"]);
+        let local_tip = git(&repo, &["rev-parse", "HEAD"]);
+        let base = local("local-base");
+
+        assert_eq!(resolve_with(&repo, &base).await.map(|b| (b.commit, b.source)), Ok((tip, BaseSource::Remote)));
+
+        git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
+        assert_eq!(resolve_with(&repo, &base).await.map(|b| (b.commit, b.source)), Ok((local_tip.clone(), BaseSource::Local)));
+
+        git(&repo, &["update-ref", "refs/remotes/upstream/trunk", &local_tip]);
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/upstream/trunk"]);
+        let refused = resolve_with(&repo, &base).await.expect_err("origin/HEAD outside origin");
+        assert!(refused.contains("not at a branch of origin"), "{refused}");
+    }
+
+    /// No version control, a Jujutsu repository without Git colocation, and
+    /// a repository with no commit are each refused saying what to do.
+    #[tokio::test]
+    async fn folders_that_cannot_hold_a_task_checkout_are_refused_with_what_to_do() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let plain = temp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let refused = resolve_with(&plain, &local("trunk")).await.expect_err("no vcs");
+        assert!(refused.contains("not under version control"), "{refused}");
+
+        std::fs::create_dir_all(plain.join(".jj")).unwrap();
+        let refused = resolve_with(&plain, &local("trunk")).await.expect_err("jj without git");
+        assert!(refused.contains("not colocated with Git"), "{refused}");
+
+        let empty = temp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        git(&empty, &["init", "-q"]);
+        let refused = resolve_default_base(empty.to_str().unwrap(), None).await.expect_err("no commit");
+        assert!(refused.contains("no commits yet"), "{refused}");
+    }
+
     /// The JJ fallback, with a fake `jj` answering `config get` with
     /// `answer`, in a repository whose `origin/HEAD` is gone.
     #[cfg(unix)]
@@ -463,7 +676,7 @@ mod tests {
     #[tokio::test]
     async fn jj_trunk_naming_a_fetched_origin_branch_is_the_default_base() {
         let (resolved, invocations, tip) = with_jj_answering("trunk@origin").await;
-        assert_eq!(resolved, Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip }));
+        assert_eq!(resolved, Ok(ResolvedBase { branch: "trunk".to_string(), commit: tip, source: BaseSource::Remote }));
         assert_eq!(
             invocations,
             "jj --ignore-working-copy --color=never config get revset-aliases.\"trunk()\"\n",

@@ -51,6 +51,7 @@ pub use agent_panel::*;
 pub use log_viewer::*;
 pub use jj_status::*;
 pub mod storage_settings;
+pub mod repository_setup;
 
 pub use badge::*;
 pub use progress_bar::*;
@@ -73,4 +74,5 @@ pub use project_rail::*;
 pub use quit_dialog::*;
 pub use diff_viewer::*;
 pub use storage_settings::*;
+pub use repository_setup::*;
 pub use update_banner::*;

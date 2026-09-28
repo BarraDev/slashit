@@ -9,6 +9,7 @@ pub mod agent;
 pub mod roadmap;
 pub mod github;
 pub mod state_location;
+pub mod repository_setup;
 
 pub use project::*;
 pub use repository::*;

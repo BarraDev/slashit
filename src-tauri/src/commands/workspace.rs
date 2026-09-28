@@ -124,6 +124,7 @@ mod tests {
             repository_id: None,
             scope,
             state_location: StateLocation::External,
+            base: None,
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,
