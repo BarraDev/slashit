@@ -207,8 +207,8 @@ pub struct WorktreeState {
     pub head_ref: Option<String>,
     /// The commit `HEAD` is at.
     pub head: String,
-    /// A rebase, merge, cherry-pick or revert this worktree is in the middle
-    /// of, by name.
+    /// A rebase, merge, cherry-pick, revert or bisect this worktree is in
+    /// the middle of, by name.
     pub in_progress: Option<&'static str>,
     /// `git status --porcelain`, one entry per line, untracked files included.
     pub uncommitted: Vec<String>,
@@ -229,6 +229,7 @@ async fn operation_in_progress(dir: &Path) -> Result<Option<&'static str>, Strin
         ("MERGE_HEAD", "merge"),
         ("CHERRY_PICK_HEAD", "cherry-pick"),
         ("REVERT_HEAD", "revert"),
+        ("BISECT_LOG", "bisect"),
     ] {
         if git_path(dir, name).await?.exists() {
             return Ok(Some(operation));

@@ -4,7 +4,7 @@ use crate::domain::task::ExternalRef;
 use crate::queue::admission::{Admission, AdmissionPermit};
 use crate::queue::prompt::{build_task_prompt, build_review_prompt, build_fix_prompt};
 use crate::queue::QueueManager;
-use crate::worktree::{WorktreeInfo, WorktreeManager};
+use crate::worktree::{CheckoutCommit, WorktreeInfo, WorktreeManager};
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::events::{EventSink, SharedEventSink};
@@ -66,6 +66,15 @@ fn review_verdict(run: &AgentRun) -> ReviewVerdict {
         ReviewVerdict::Failed("the reviewer gave no verdict".to_string())
     }
 }
+
+/// Why nothing is committed for a task that records no branch. Every
+/// checkout SlashIt acquires or adopts records its branch alongside its
+/// path, so only a task record written by hand or by a much older version
+/// can lack it, and committing to whatever the checkout has out could put
+/// the work on a branch the task never names.
+const NO_TASK_BRANCH: &str =
+    "this task records no branch, so SlashIt cannot tell which branch its work belongs on, and \
+     nothing was committed";
 
 /// What a fix-agent run means for the review's signoff.
 #[derive(Debug, PartialEq, Eq)]
@@ -1646,9 +1655,20 @@ impl TaskExecutor {
 
                 result = runner.wait() => {
                     match result {
-                        Ok(_) => {
-                            // Commit changes in the worktree/working dir
-                            Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await;
+                        Ok(_) => 'finished: {
+                            // A run whose work could not be committed has
+                            // not finished its task: it fails the same way a
+                            // failed run does, and is not reviewed.
+                            if let Err(message) =
+                                Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await
+                            {
+                                events.agent_event(AgentEvent::Error {
+                                    task_id: task_id.to_string(),
+                                    message: message.clone(),
+                                });
+                                Self::set_task_error_static(&tasks, &storage, &events, task_id, &message).await;
+                                break 'finished;
+                            }
 
                             // Move to AiReview for automated review before human review
                             Self::update_task_phase_static(&tasks, task_id, TaskPhase::QaReview, 80).await;
@@ -2331,7 +2351,7 @@ impl TaskExecutor {
         // this) could see `is_task_running() == false` a moment before this
         // registers into `reviewing_handles`, remove the checkout, and leave
         // this function's already-scheduled future to run its diff/reviewer/
-        // fix-agent/`jj describe` sequence against a directory that is gone.
+        // fix-agent/commit sequence against a directory that is gone.
         // Released as soon as the run is registered (this lease is a local
         // of this synchronous portion of the function, not moved into the
         // spawned future), the same trade `spawn_task_execution` makes:
@@ -2355,8 +2375,8 @@ impl TaskExecutor {
         //
         // This used to fall back to the repository path, and a review is not a
         // read-only operation: the fix agent runs in this directory and the
-        // block below finishes by running `jj describe` in it. Against the
-        // user's own checkout that rewrites their current change description
+        // block below finishes by committing every change in it. Against the
+        // user's own checkout that commits whatever they had uncommitted
         // under a task title. A task with no worktree has nothing of its own to
         // review, and saying so is the only safe answer.
         //
@@ -2684,21 +2704,56 @@ impl TaskExecutor {
                 // Why the fixes were not applied, when they were not.
                 let fix_failure = match fix_outcome(fix_run) {
                     FixOutcome::Applied => {
-                        // Re-describe in jj after fixes
-                        let _ = tokio::process::Command::new("jj")
-                            .args(["describe", "-m", &format!("task: {} (with review fixes)", {
-                                let tasks_r = tasks.read().await;
-                                tasks_r.get(&task_id).map(|t| t.title.clone()).unwrap_or_default()
-                            })])
-                            .current_dir(&working_dir)
-                            .output()
-                            .await;
-                        let _ = tokio::process::Command::new("jj")
-                            .args(["git", "export"])
-                            .current_dir(&working_dir)
-                            .output()
-                            .await;
-                        None
+                        // A stop that arrived while the fix agent finished
+                        // owns the checkout now: commit nothing into it.
+                        if *cancelled.borrow() {
+                            reviewing_handles.write().await.remove(&task_id);
+                            return;
+                        }
+                        let (title, branch) = {
+                            let tasks_r = tasks.read().await;
+                            tasks_r
+                                .get(&task_id)
+                                .map(|t| (t.title.clone(), t.branch_name.clone()))
+                                .unwrap_or_default()
+                        };
+                        let message = format!("task: {title} (with review fixes)");
+                        let committed = match &branch {
+                            Some(branch) => crate::worktree::commit_checkout(&working_dir, branch, &message).await,
+                            None => Err(NO_TASK_BRANCH.to_string()),
+                        };
+                        match committed {
+                            Ok(CheckoutCommit::Committed { commit }) => {
+                                events.agent_event(AgentEvent::Log {
+                                    task_id: task_id_str.clone(),
+                                    level: LogLevel::Info,
+                                    message: format!("Review fixes committed as {commit}"),
+                                });
+                                None
+                            }
+                            Ok(CheckoutCommit::NothingToCommit) => {
+                                events.agent_event(AgentEvent::Log {
+                                    task_id: task_id_str.clone(),
+                                    level: LogLevel::Info,
+                                    message: "The fix agent changed no files, so there was \
+                                              nothing to commit"
+                                        .to_string(),
+                                });
+                                None
+                            }
+                            Err(e) => {
+                                let message = format!(
+                                    "The review fixes could not be committed: {e}. They remain \
+                                     as uncommitted edits in the task checkout."
+                                );
+                                events.agent_event(AgentEvent::Log {
+                                    task_id: task_id_str.clone(),
+                                    level: LogLevel::Error,
+                                    message: message.clone(),
+                                });
+                                Some(message)
+                            }
+                        }
                     }
                     FixOutcome::Cancelled => {
                         // Cancelled during the fix agent's run: it has
@@ -2897,76 +2952,44 @@ impl TaskExecutor {
         Ok(repo.local_path.clone())
     }
 
-    /// Commit agent changes in the worktree/working directory.
+    /// Commit the agent's work in its task checkout, on the task branch.
+    ///
+    /// Always a Git commit, even when the agent changed nothing, so a
+    /// finished task ends with its own commit on its branch (see
+    /// [`crate::worktree::commit_checkout`] for why jj is not used and what
+    /// is refused). The error says why nothing was committed; the caller
+    /// fails the run with it.
     async fn commit_changes(
         tasks: &Tasks,
         task_id: Uuid,
         working_dir: &str,
         events: &SharedEventSink,
-    ) {
-        let title = {
+    ) -> Result<(), String> {
+        let (title, branch) = {
             let tasks_r = tasks.read().await;
-            tasks_r.get(&task_id).map(|t| t.title.clone()).unwrap_or_default()
+            tasks_r
+                .get(&task_id)
+                .map(|t| (t.title.clone(), t.branch_name.clone()))
+                .unwrap_or_default()
         };
-        let task_id_str = task_id.to_string();
-
-        // Try jj first (for jj-managed repos)
-        let jj_ok = if let Ok(output) = tokio::process::Command::new("jj")
-            .args(["describe", "-m", &format!("task: {}", title)])
-            .current_dir(working_dir)
-            .output()
-            .await
-        {
-            if output.status.success() {
-                let _ = tokio::process::Command::new("jj")
-                    .args(["git", "export"])
-                    .current_dir(working_dir)
-                    .output()
-                    .await;
-                events.agent_event(AgentEvent::Log {
-                    task_id: task_id_str.clone(),
-                    level: LogLevel::Info,
-                    message: "Committed via jj".to_string(),
-                });
-                true
-            } else {
-                false
+        let committed = match &branch {
+            Some(branch) => {
+                crate::worktree::commit_checkout_even_if_empty(working_dir, branch, &format!("task: {title}")).await
             }
-        } else {
-            false
+            None => Err(NO_TASK_BRANCH.to_string()),
         };
-
-        // Fallback to git (for worktrees or git-only repos)
-        if !jj_ok {
-            let _ = tokio::process::Command::new("git")
-                .args(["add", "-A"])
-                .current_dir(working_dir)
-                .output()
-                .await;
-
-            let commit_msg = format!("task: {}", title);
-            match tokio::process::Command::new("git")
-                .args(["commit", "-m", &commit_msg, "--allow-empty"])
-                .current_dir(working_dir)
-                .output()
-                .await
-            {
-                Ok(output) if output.status.success() => {
-                    events.agent_event(AgentEvent::Log {
-                        task_id: task_id_str,
-                        level: LogLevel::Info,
-                        message: "Committed via git".to_string(),
-                    });
-                }
-                _ => {
-                    events.agent_event(AgentEvent::Log {
-                        task_id: task_id_str,
-                        level: LogLevel::Warn,
-                        message: "Git commit skipped (no changes or error)".to_string(),
-                    });
-                }
-            }
-        }
+        let commit = committed.map_err(|e| {
+            format!(
+                "The agent's work could not be committed: {e}. It remains as uncommitted edits \
+                 in the task checkout."
+            )
+        })?;
+        events.agent_event(AgentEvent::Log {
+            task_id: task_id.to_string(),
+            level: LogLevel::Info,
+            message: format!("Committed the agent's work as {commit}"),
+        });
+        Ok(())
     }
 
     async fn update_task_phase(&self, task_id: Uuid, phase: TaskPhase, progress: u8) {
@@ -5078,8 +5101,8 @@ mod tests {
     /// does not borrow the repository instead.
     ///
     /// A review is not a read-only pass over a diff: the fix agent runs in this
-    /// directory and the run finishes with `jj describe` in it. Pointed at the
-    /// user's checkout that rewrites their current change description under a
+    /// directory and the run finishes by committing every change in it. Pointed
+    /// at the user's checkout that commits whatever they had uncommitted under a
     /// task title, and the task never had a worktree of its own to review. The
     /// honest outcome is the one a person can act on -- send it to human review
     /// and say why.
@@ -5666,7 +5689,7 @@ mod tests {
             let status = std::process::Command::new("git").args(args).current_dir(path).status().unwrap();
             assert!(status.success(), "git {args:?} failed");
         };
-        git(&["init", "-q"]);
+        git(&["init", "-q", "-b", "task"]);
         git(&["config", "user.email", "t@example.com"]);
         git(&["config", "user.name", "T"]);
         std::fs::write(path.join("seed.txt"), "seed\n").unwrap();
@@ -5686,14 +5709,15 @@ mod tests {
         // leaves the worktree right before calling `commit_changes`.
         std::fs::write(path.join("agent_change.txt"), "the agent's work\n").unwrap();
 
-        let task = create_test_task_full("t", Uuid::new_v4(), TaskStatus::InProgress, 0);
+        let mut task = create_test_task_full("t", Uuid::new_v4(), TaskStatus::InProgress, 0);
+        task.branch_name = Some("task".to_string());
         let task_id = task.id;
         let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
         let events = crate::events::null_sink();
 
         // The real production commit step -- this is what made the old
         // `git diff HEAD` fallback empty.
-        TaskExecutor::commit_changes(&tasks, task_id, path.to_str().unwrap(), &events).await;
+        TaskExecutor::commit_changes(&tasks, task_id, path.to_str().unwrap(), &events).await.expect("committed");
 
         let status_after = std::process::Command::new("git")
             .args(["status", "--porcelain"])
@@ -5835,7 +5859,7 @@ mod tests {
                     std::process::Command::new("git").args(args).current_dir(path).status().unwrap();
                 assert!(status.success(), "git {args:?} failed");
             };
-            git(&["init", "-q"]);
+            git(&["init", "-q", "-b", "task"]);
             git(&["config", "user.email", "t@example.com"]);
             git(&["config", "user.name", "T"]);
             std::fs::write(path.join("seed.txt"), "seed\n").unwrap();
@@ -5857,6 +5881,7 @@ mod tests {
             let mut task = create_test_task_full("under review", project_id, TaskStatus::AiReview, 0);
             task.phase = TaskPhase::QaReview;
             task.worktree_path = Some(worktree_path.to_string());
+            task.branch_name = Some("task".to_string());
             task.base_commit = Some(base_commit.to_string());
             task
         }
@@ -5886,6 +5911,33 @@ mod tests {
                 /// run is the fix agent, which prints `fix_result` and exits
                 /// with `fix_exit`.
                 fn install_with_fixer(result: &str, exit: i32, fix_result: &str, fix_exit: i32) -> Self {
+                    Self::build(result, exit, fix_result, fix_exit, "", false)
+                }
+
+                /// A reviewer that asks for changes and a fix agent that
+                /// makes one: it runs `before_fix` (shell), then writes
+                /// `review-fix.txt` into its working directory and succeeds.
+                /// With `without_jj`, no `jj` can be found on `PATH`, whatever
+                /// this machine has installed.
+                fn install_editing_fixer(without_jj: bool, before_fix: &str) -> Self {
+                    Self::build(
+                        "VERDICT: CHANGES_REQUESTED\n- ISSUE: [high] a.rs:1 - broken",
+                        0,
+                        "Fixed everything.",
+                        0,
+                        &format!("{before_fix}\nprintf 'fixed\\n' > review-fix.txt\n"),
+                        without_jj,
+                    )
+                }
+
+                fn build(
+                    result: &str,
+                    exit: i32,
+                    fix_result: &str,
+                    fix_exit: i32,
+                    fix_script: &str,
+                    without_jj: bool,
+                ) -> Self {
                     let tmp = tempfile::tempdir().expect("tempdir");
                     let bin_dir = tmp.path().join("bin");
                     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -5905,11 +5957,13 @@ mod tests {
                          exit {exit} ;;\n\
                          esac\n\
                          cat > {fix_prompt:?}\n\
+                         {fix_edit}\
                          printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"result\":{fix_result_json}}}'\n\
                          exit {fix_exit}\n",
                         args = args_file,
                         review_prompt = review_prompt_file,
                         fix_prompt = fix_prompt_file,
+                        fix_edit = fix_script,
                     );
                     let bin = bin_dir.join("claude");
                     std::fs::write(&bin, &script).unwrap();
@@ -5917,6 +5971,15 @@ mod tests {
                     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
                     let saved_path = std::env::var("PATH").ok();
                     let new_path = match &saved_path {
+                        Some(p) if without_jj => {
+                            let mut entries = vec![bin_dir.clone()];
+                            entries.extend(crate::test_helpers::path_entries_without(
+                                p.as_ref(),
+                                &["jj"],
+                                &tmp.path().join("shadows"),
+                            ));
+                            std::env::join_paths(entries).unwrap().into_string().unwrap()
+                        }
                         Some(p) => format!("{}:{}", bin_dir.display(), p),
                         None => bin_dir.display().to_string(),
                     };
@@ -5957,6 +6020,13 @@ mod tests {
 
             /// Run one AI review to completion and return the recorded signoff.
             async fn review_once(mock: &MockReviewer) -> QaSignoff {
+                let (repo, base_commit) = git_repo_with_change();
+                review_in(mock, repo.path().to_str().unwrap(), &base_commit).await
+            }
+
+            /// Run one AI review of the task checkout at `working_dir` to
+            /// completion and return the recorded signoff.
+            async fn review_in(mock: &MockReviewer, working_dir: &str, base_commit: &str) -> QaSignoff {
                 let (executor, _temps) = test_executor();
                 // Only the Claude reviewer is under test, not a CodeRabbit CLI
                 // that may or may not be installed on this machine.
@@ -5965,8 +6035,7 @@ mod tests {
                     ..Default::default()
                 };
                 executor.queue_manager.write().await.set_config(config).await;
-                let (repo, base_commit) = git_repo_with_change();
-                let task = reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+                let task = reviewing_task(Uuid::new_v4(), working_dir, base_commit);
                 let task_id = task.id;
                 executor.tasks.write().await.insert(task_id, task);
 
@@ -6104,6 +6173,274 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                     !args.iter().any(|a| a.contains("a.rs:1") || a.contains("under review")),
                     "no prompt text in argv: {args:?}"
                 );
+            }
+
+            /// The fix agent's edits become a real Git commit on the task
+            /// branch, whatever version control is installed. A Task
+            /// Checkout is always a Git worktree, so `jj describe` there
+            /// either finds no jj repository or, for a checkout nested in
+            /// one, describes that repository's own change instead.
+            mod review_fix_commit {
+                use super::*;
+                use std::path::{Path, PathBuf};
+                use std::process::Command as StdCommand;
+
+                fn run_ok(program: &str, dir: &Path, args: &[&str]) -> String {
+                    let output = StdCommand::new(program)
+                        .args(args)
+                        .current_dir(dir)
+                        .output()
+                        .unwrap_or_else(|e| panic!("run {program}: {e}"));
+                    assert!(
+                        output.status.success(),
+                        "{program} {args:?} failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    String::from_utf8_lossy(&output.stdout).trim().to_string()
+                }
+
+                /// The `jj` on `PATH`, when there is one that runs.
+                fn installed_jj() -> bool {
+                    StdCommand::new("jj").arg("--version").output().is_ok_and(|o| o.status.success())
+                }
+
+                /// A repository whose task branch `task` is checked out in a
+                /// Git worktree, the shape of every Task Checkout, with the
+                /// task's own work already committed there. The identity is
+                /// repository-local, so committing works where none is set
+                /// globally.
+                struct TaskCheckout {
+                    _tmp: tempfile::TempDir,
+                    repo: PathBuf,
+                    checkout: PathBuf,
+                    base_commit: String,
+                }
+
+                impl TaskCheckout {
+                    /// `colocated` runs `jj git init --colocate` in the
+                    /// repository first; `nested` places the checkout inside
+                    /// the repository's working tree rather than beside it.
+                    fn new(colocated: bool, nested: bool) -> Self {
+                        let tmp = tempfile::tempdir().expect("tempdir");
+                        let repo = tmp.path().join("repo");
+                        std::fs::create_dir_all(&repo).unwrap();
+                        run_ok("git", &repo, &["init", "-q", "-b", "main"]);
+                        run_ok("git", &repo, &["config", "user.email", "t@example.com"]);
+                        run_ok("git", &repo, &["config", "user.name", "T"]);
+                        std::fs::write(repo.join("seed.txt"), "seed\n").unwrap();
+                        run_ok("git", &repo, &["add", "-A"]);
+                        run_ok("git", &repo, &["commit", "-q", "-m", "seed"]);
+                        if colocated {
+                            run_ok("jj", &repo, &["git", "init", "--colocate"]);
+                        }
+                        let base_commit = run_ok("git", &repo, &["rev-parse", "main"]);
+                        let checkout = if nested {
+                            repo.join("task-checkout")
+                        } else {
+                            tmp.path().join("task-checkout")
+                        };
+                        run_ok(
+                            "git",
+                            &repo,
+                            &["worktree", "add", "-q", "-b", "task", checkout.to_str().unwrap(), "main"],
+                        );
+                        std::fs::write(checkout.join("agent_change.txt"), "the agent's work\n").unwrap();
+                        run_ok("git", &checkout, &["add", "-A"]);
+                        run_ok("git", &checkout, &["commit", "-q", "-m", "task: under review"]);
+                        TaskCheckout { _tmp: tmp, repo, checkout, base_commit }
+                    }
+
+                    fn path(&self) -> &str {
+                        self.checkout.to_str().unwrap()
+                    }
+
+                    /// Make every commit in this repository fail.
+                    fn reject_commits(&self) {
+                        let hooks = PathBuf::from(run_ok(
+                            "git",
+                            &self.repo,
+                            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                        ))
+                        .join("hooks");
+                        std::fs::create_dir_all(&hooks).unwrap();
+                        let hook = hooks.join("pre-commit");
+                        std::fs::write(&hook, "#!/bin/sh\necho 'commits are refused here' >&2\nexit 1\n").unwrap();
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+                    }
+
+                    /// The fix is in the task branch's tip commit and nothing
+                    /// is left uncommitted in the checkout.
+                    fn assert_fix_committed(&self) {
+                        let has_fix = StdCommand::new("git")
+                            .args(["cat-file", "-e", "task:review-fix.txt"])
+                            .current_dir(&self.checkout)
+                            .status()
+                            .unwrap()
+                            .success();
+                        assert!(
+                            has_fix,
+                            "the review fix must be a commit on the task branch; status: {:?}",
+                            run_ok("git", &self.checkout, &["status", "--porcelain"])
+                        );
+                        assert_eq!(
+                            run_ok("git", &self.checkout, &["log", "-1", "--format=%s", "task"]),
+                            "task: under review (with review fixes)"
+                        );
+                        assert_eq!(run_ok("git", &self.checkout, &["status", "--porcelain"]), "");
+                    }
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn review_fixes_are_committed_on_the_task_branch_without_jj() {
+                    let _path_guard = PATH_LOCK.lock().await;
+                    let checkout = TaskCheckout::new(false, false);
+                    let mock = MockReviewer::install_editing_fixer(true, "");
+                    let signoff = review_in(&mock, checkout.path(), &checkout.base_commit).await;
+                    assert_eq!(signoff.status, QaStatus::FixesApplied, "{:?}", signoff.issues_found);
+                    checkout.assert_fix_committed();
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn review_fixes_in_a_jj_colocated_repository_are_a_git_commit_jj_sees() {
+                    let _path_guard = PATH_LOCK.lock().await;
+                    if !installed_jj() {
+                        eprintln!("skipped: no jj is installed");
+                        return;
+                    }
+                    let checkout = TaskCheckout::new(true, false);
+                    let mock = MockReviewer::install_editing_fixer(false, "");
+                    let signoff = review_in(&mock, checkout.path(), &checkout.base_commit).await;
+                    assert_eq!(signoff.status, QaStatus::FixesApplied, "{:?}", signoff.issues_found);
+                    checkout.assert_fix_committed();
+
+                    // jj imports the moved branch from Git on its next command.
+                    let tip = run_ok("git", &checkout.repo, &["rev-parse", "task"]);
+                    let seen_by_jj = run_ok(
+                        "jj",
+                        &checkout.repo,
+                        &["log", "--no-graph", "-r", "exactly(bookmarks(exact:\"task\"), 1)", "-T", "commit_id"],
+                    );
+                    assert_eq!(seen_by_jj, tip, "jj's task bookmark must name the fix commit");
+                }
+
+                /// A Task Checkout inside a jj repository's working tree: jj
+                /// run in it finds the enclosing repository, so `jj describe`
+                /// used to rewrite that repository's current change under the
+                /// task title and report success, while the fix stayed
+                /// uncommitted.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn review_fixes_in_a_checkout_nested_in_a_jj_repository_leave_that_repository_alone() {
+                    let _path_guard = PATH_LOCK.lock().await;
+                    if !installed_jj() {
+                        eprintln!("skipped: no jj is installed");
+                        return;
+                    }
+                    let checkout = TaskCheckout::new(true, true);
+                    let enclosing = |repo: &Path| {
+                        run_ok("jj", repo, &["log", "--no-graph", "-r", "@", "-T", "change_id ++ \"|\" ++ description"])
+                    };
+                    let before = enclosing(&checkout.repo);
+                    let mock = MockReviewer::install_editing_fixer(false, "");
+                    let signoff = review_in(&mock, checkout.path(), &checkout.base_commit).await;
+                    assert_eq!(signoff.status, QaStatus::FixesApplied, "{:?}", signoff.issues_found);
+                    checkout.assert_fix_committed();
+                    assert_eq!(
+                        enclosing(&checkout.repo),
+                        before,
+                        "the enclosing repository's change must not be described"
+                    );
+                }
+
+                /// The agent's own work, committed after its run, is a Git
+                /// commit in the checkout for the same reason, and jj in a
+                /// nested checkout never describes the enclosing change.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_agent_s_work_in_a_checkout_nested_in_a_jj_repository_is_a_git_commit() {
+                    let _path_guard = PATH_LOCK.lock().await;
+                    if !installed_jj() {
+                        eprintln!("skipped: no jj is installed");
+                        return;
+                    }
+                    let checkout = TaskCheckout::new(true, true);
+                    let enclosing = |repo: &Path| {
+                        run_ok("jj", repo, &["log", "--no-graph", "-r", "@", "-T", "change_id ++ \"|\" ++ description"])
+                    };
+                    let before = enclosing(&checkout.repo);
+                    std::fs::write(checkout.checkout.join("more_work.txt"), "more\n").unwrap();
+                    let mut task = create_test_task_full("nested", Uuid::new_v4(), TaskStatus::InProgress, 0);
+                    task.branch_name = Some("task".to_string());
+                    let task_id = task.id;
+                    let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(task_id, task)])));
+
+                    TaskExecutor::commit_changes(&tasks, task_id, checkout.path(), &crate::events::null_sink()).await.expect("committed");
+
+                    assert_eq!(run_ok("git", &checkout.checkout, &["status", "--porcelain"]), "");
+                    assert_eq!(
+                        run_ok("git", &checkout.checkout, &["log", "-1", "--format=%s", "task"]),
+                        "task: nested"
+                    );
+                    assert_eq!(enclosing(&checkout.repo), before, "the enclosing change must not be described");
+                }
+
+                /// Shell run by the fix agent before it writes its fix, each
+                /// leaving the checkout somewhere other than on the task
+                /// branch, with what the refusal must name.
+                const OFF_BRANCH: [(&str, &str, &str); 3] = [
+                    ("detached HEAD", "git checkout -q --detach", "not the task branch"),
+                    ("another branch", "git checkout -q -b elsewhere", "not the task branch"),
+                    (
+                        "a conflicted rebase",
+                        "git checkout -q -b conflicting main && printf 'other\\n' > agent_change.txt \\
+                         && git add -A && git commit -q -m conflicting && git checkout -q task \\
+                         && git rebase -q conflicting; true",
+                        "in the middle of a rebase",
+                    ),
+                ];
+
+                /// Fixes made anywhere but on the task branch are refused:
+                /// nothing is committed (the fix is still untracked, the task
+                /// branch has not moved) and the signoff says why.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn review_fixes_left_off_the_task_branch_are_not_committed() {
+                    let _path_guard = PATH_LOCK.lock().await;
+                    for (label, before_fix, reason) in OFF_BRANCH {
+                        let checkout = TaskCheckout::new(false, false);
+                        let tip = run_ok("git", &checkout.checkout, &["rev-parse", "task"]);
+                        let mock = MockReviewer::install_editing_fixer(true, before_fix);
+                        let signoff = review_in(&mock, checkout.path(), &checkout.base_commit).await;
+                        drop(mock);
+                        assert_eq!(signoff.status, QaStatus::Rejected, "{label}: {:?}", signoff.issues_found);
+                        assert!(
+                            signoff.issues_found.iter().any(|i| i.contains("could not be committed") && i.contains(reason)),
+                            "{label}: {:?}", signoff.issues_found
+                        );
+                        assert_eq!(run_ok("git", &checkout.checkout, &["rev-parse", "task"]), tip, "{label}");
+                        let status = run_ok("git", &checkout.checkout, &["status", "--porcelain"]);
+                        assert!(status.contains("?? review-fix.txt"), "{label}: nothing is staged: {status}");
+                    }
+                }
+
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_review_fix_commit_git_refuses_is_reported_on_the_task() {
+                    let _path_guard = PATH_LOCK.lock().await;
+                    let checkout = TaskCheckout::new(false, false);
+                    checkout.reject_commits();
+                    let mock = MockReviewer::install_editing_fixer(true, "");
+                    let signoff = review_in(&mock, checkout.path(), &checkout.base_commit).await;
+                    assert_eq!(signoff.status, QaStatus::Rejected, "{:?}", signoff.issues_found);
+                    assert!(
+                        signoff.issues_found.iter().any(|i| {
+                            i.contains("could not be committed") && i.contains("commits are refused here")
+                        }),
+                        "the signoff must say the fixes were not committed, and why: {:?}",
+                        signoff.issues_found
+                    );
+                    assert!(
+                        signoff.issues_found.iter().any(|i| i.contains("a.rs:1 - broken")),
+                        "the reviewer's issues are kept: {:?}", signoff.issues_found
+                    );
+                }
             }
 
             #[tokio::test(flavor = "multi_thread")]
@@ -7154,6 +7491,50 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             };
             assert_eq!((recorded.base_commit, recorded.branch_origin), expected, "{class:?}");
             assert_eq!(recorded.branch_name, Some(WorktreeManager::branch_for_task(w.task_id)));
+        }
+
+        /// An agent run that succeeded but whose work could not be
+        /// committed is a failed run: the task records why, in memory and
+        /// on disk, and does not move on to AI review as if it were done.
+        #[tokio::test]
+        async fn a_run_whose_work_cannot_be_committed_fails_the_task() {
+            let w = world(Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
+            let hook = w.repo.join(".git/hooks/pre-commit");
+            std::fs::write(&hook, "#!/bin/sh\necho 'commits are refused here' >&2\nexit 1\n").unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let _agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                "cat >/dev/null; printf 'work\\n' > agent_work.txt; \
+                 printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'",
+            )
+            .await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            let mut settled = None;
+            for _ in 0..200 {
+                let task = w.in_memory().await;
+                if matches!(task.status, TaskStatus::Error | TaskStatus::AiReview) {
+                    settled = Some(task);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let task = settled.expect("the run settles");
+
+            assert_eq!(task.status, TaskStatus::Error, "{:?}", task.error_message);
+            let error = task.error_message.clone().unwrap_or_default();
+            assert!(
+                error.contains("could not be committed") && error.contains("commits are refused here"),
+                "{error}"
+            );
+            let on_disk = w.on_disk();
+            assert_eq!(on_disk.status, TaskStatus::Error);
+            assert_eq!(on_disk.error_message, task.error_message);
         }
 
         #[tokio::test]

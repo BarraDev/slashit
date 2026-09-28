@@ -198,6 +198,9 @@ pub struct PrReviewItem {
     pub user_note: String,
     #[serde(default)]
     pub fix_done: bool,
+    /// Mirrors the backend field: a fix on disk not yet committed.
+    #[serde(default)]
+    pub fix_uncommitted: bool,
     #[serde(default)]
     pub reply_posted: bool,
     #[serde(default)]

@@ -1,4 +1,5 @@
 mod branch;
+mod commit;
 mod default_base;
 mod diff;
 mod manager;
@@ -6,6 +7,7 @@ mod ownership;
 pub mod restack;
 
 pub use branch::checked_task_branch;
+pub use commit::{commit_checkout, commit_checkout_even_if_empty, CheckoutCommit};
 pub use diff::{task_diff, TaskDiff, TaskDiffError};
 pub use manager::{
     carries_locked_registration_notice, locked_registration_notice, CheckoutRegistration,

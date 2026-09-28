@@ -133,6 +133,24 @@ A JJ workspace is not an available Task Checkout backend. A Jujutsu
 Project gets Git worktrees for its Tasks only when its repository is
 colocated with Git; a Jujutsu-only repository cannot get a Task Checkout.
 
+Work in a Task Checkout is recorded as a Git commit on its branch: the
+coding agent's work when its run ends, and the fixes applied by AI review
+and by PR review. This does not depend on `jj` being installed, and `jj`
+is not run for it; a colocated jj repository sees the commit when jj next
+imports from Git. Nothing is committed while the checkout does not have
+the Task's branch checked out, is in the middle of a rebase, merge,
+cherry-pick, revert or bisect, or has unresolved conflicts. A commit that
+fails is reported on the Task: the agent's own work that cannot be
+committed fails the Task, and PR review fixes that could not be committed
+are not pushed. An apply in which any fix fails commits and pushes none
+of its fixes, since the failed fix may have left partial edits anywhere in
+the checkout; every edit stays on disk for the user to review. Applying the
+PR review again commits and pushes the fixes an earlier apply made but did
+not commit (because the commit failed, was cancelled, or was withheld after
+a failed fix), without making them again. A fix already committed is
+never committed again, and an apply that made no new fix and has no such
+uncommitted fix commits nothing.
+
 Workspace and Task Checkout are distinct concepts at different levels:
 
 | | Workspace | Task Checkout |
