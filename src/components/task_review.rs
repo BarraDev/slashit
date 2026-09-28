@@ -55,6 +55,21 @@ impl Delivery {
     }
 }
 
+impl Delivery {
+    /// This state, unless the last delivery answer says more: a pull request
+    /// the record shows is final, and otherwise the answer is what just
+    /// happened.
+    pub fn or_answer(self, answer: Option<&PrDelivery>) -> Self {
+        match (self, answer) {
+            (created @ Self::Created { .. }, _) => created,
+            (_, Some(PrDelivery::Failed { reason })) => Self::Failed { reason: reason.clone() },
+            (_, Some(PrDelivery::Unavailable { reason })) => Self::Unavailable { reason: reason.clone() },
+            (_, Some(PrDelivery::Created { url })) => Self::Created { url: Some(url.clone()) },
+            (state, None) => state,
+        }
+    }
+}
+
 /// How the AI review's aggregate outcome reads, without claiming anything
 /// about a single finding that the aggregate does not prove.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +171,11 @@ pub fn HumanReviewPanel(
         availability.try_set(Some(answer));
     });
 
+    // What the last delivery attempt in this drawer answered. Preferred over
+    // what the record says until the record agrees, so an answer is never
+    // lost to a write that did not land or to an availability read that is
+    // out of date.
+    let last_delivery = RwSignal::new(None::<PrDelivery>);
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let composing = RwSignal::new(false);
@@ -163,13 +183,13 @@ pub fn HumanReviewPanel(
 
     let apply_outcome = move |task: Task, pr: Option<PrDelivery>| {
         apply_task.try_run(task);
-        match pr {
-            Some(PrDelivery::Created { url }) => {
-                crate::components::toast::success(format!("Pull request created: {url}"));
-            }
-            // Shown in place, from the record the backend kept.
-            Some(PrDelivery::Failed { .. }) | Some(PrDelivery::Unavailable { .. }) | None => {}
+        if let Some(PrDelivery::Created { url }) = &pr {
+            crate::components::toast::success(format!("Pull request created: {url}"));
         }
+        if let Some(PrDelivery::Unavailable { reason }) = &pr {
+            availability.try_set(Some(PrAvailability::Unavailable { reason: reason.clone() }));
+        }
+        last_delivery.try_set(pr);
     };
 
     let approve = move |create_pr: bool| {
@@ -182,7 +202,7 @@ pub fn HumanReviewPanel(
             match approve_task(task_id.to_string(), create_pr).await {
                 Ok(outcome) => apply_outcome(outcome.task, outcome.pr),
                 Err(e) => {
-                    error.try_set(Some(format!("The approval was not recorded: {e}")));
+                    error.try_set(Some(e));
                 }
             }
             busy.try_set(false);
@@ -237,7 +257,12 @@ pub fn HumanReviewPanel(
     });
     let in_review = Memo::new(move |_| task.with(|t| t.as_ref().is_some_and(|t| t.status == TaskStatus::HumanReview)));
     let delivery = Memo::new(move |_| {
-        task.with(|t| t.as_ref().map(|t| availability.with(|a| Delivery::for_task(t, a.as_ref()))))
+        task.with(|t| {
+            t.as_ref().map(|t| {
+                let recorded = availability.with(|a| Delivery::for_task(t, a.as_ref()));
+                last_delivery.with(|last| recorded.or_answer(last.as_ref()))
+            })
+        })
     });
 
     view! {
@@ -517,6 +542,24 @@ mod tests {
             Delivery::for_task(&t, None),
             Delivery::Created { url: Some("https://github.com/o/r/pull/1".into()) }
         );
+    }
+
+    #[test]
+    fn the_last_answer_is_shown_until_the_record_catches_up() {
+        let failed = PrDelivery::Failed { reason: "push rejected".into() };
+        assert_eq!(
+            Delivery::NotAttempted.or_answer(Some(&failed)),
+            Delivery::Failed { reason: "push rejected".into() },
+            "a failure whose write did not land is still shown"
+        );
+        let unavailable = PrDelivery::Unavailable { reason: "origin moved".into() };
+        assert_eq!(
+            Delivery::Failed { reason: "old".into() }.or_answer(Some(&unavailable)),
+            Delivery::Unavailable { reason: "origin moved".into() }
+        );
+        let created = Delivery::Created { url: Some("u".into()) };
+        assert_eq!(created.clone().or_answer(Some(&failed)), created, "a recorded PR wins");
+        assert_eq!(Delivery::Checking.or_answer(None), Delivery::Checking);
     }
 
     #[test]

@@ -17,7 +17,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use crate::models::Task;
+use crate::models::{Task, TaskStatus};
 use crate::services::human_review_service::close_without_merging;
 
 /// A move to Done waiting for the person to confirm it.
@@ -84,7 +84,7 @@ pub fn CloseWithoutMergeDialog(
         error.set(None);
         spawn_local(async move {
             match close_without_merging(request.task.id.to_string(), request.position).await {
-                Ok(Some(task)) => {
+                Ok(Some(task)) if task.status == TaskStatus::Done => {
                     apply_task.try_run(task);
                     refresh_tasks.try_run(());
                     pending.try_set(None);
@@ -93,12 +93,22 @@ pub fn CloseWithoutMergeDialog(
                         request.task.title
                     ));
                 }
+                // Git kept the checkout (uncommitted changes, most often), so
+                // the task is still in Human Review and the answer says why.
+                Ok(Some(task)) => {
+                    let reason = task.error_message.clone().unwrap_or_else(|| {
+                        "The task was not closed, and SlashIt recorded no reason.".to_string()
+                    });
+                    apply_task.try_run(task);
+                    error.try_set(Some(format!("The task was not closed: {reason}")));
+                }
                 Ok(None) => {
                     error.try_set(Some("This task no longer exists.".to_string()));
                 }
-                // The task is where it was; say why, here.
+                // The task is where it was; say why, here. A checkout Git
+                // would not remove comes back this way too.
                 Err(e) => {
-                    error.try_set(Some(e));
+                    error.try_set(Some(format!("The task was not closed: {e}")));
                 }
             }
             closing.try_set(false);
@@ -126,7 +136,9 @@ pub fn CloseWithoutMergeDialog(
                         <ul data-testid="close-without-merge-consequences" class="list-disc pl-5 space-y-1 text-sm text-white/70">
                             {lines.into_iter().map(|line| view! { <li class="break-words">{line}</li> }).collect_view()}
                         </ul>
-                        <p class="text-xs text-white/45">"To deliver the work instead, cancel and approve it in the task drawer."</p>
+                        {(!request.task.human_review.is_approved()).then(|| view! {
+                            <p class="text-xs text-white/45">"To deliver the work instead, cancel and approve it in the task drawer."</p>
+                        })}
                         {move || error.get().map(|e| view! {
                             <p data-testid="close-without-merge-error" class="text-sm text-red-300 whitespace-pre-wrap break-words">{e}</p>
                         })}

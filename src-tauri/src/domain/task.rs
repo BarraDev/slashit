@@ -202,11 +202,16 @@ impl Task {
     /// survive: the next execution reattaches to that branch and continues
     /// from what is already there. Discarding a worktree is an explicit
     /// destructive action, never a side effect of a run ending.
+    ///
+    /// An approval of the changes under review stops being current too: the
+    /// task is going back to work, and whatever the next run commits is not
+    /// what was approved. See [`HumanReviewRecord::withdraw_approval`].
     pub fn reset_execution_state(&mut self) {
         self.phase = TaskPhase::Idle;
         self.phase_progress = 0;
         self.overall_progress = 0;
         self.error_message = None;
+        self.human_review.withdraw_approval();
     }
 
     /// The position a newly created task should take in `project_id`'s
@@ -627,7 +632,9 @@ pub enum QaStatus {
 /// empty record: no arrivals, no decisions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct HumanReviewRecord {
-    /// How many times a run has carried the task into Human Review.
+    /// How many times a run has carried the task into Human Review, plus
+    /// the times an approval was withdrawn because the task went back to
+    /// work (see [`Self::withdraw_approval`]).
     #[serde(default)]
     pub arrivals: u32,
     /// Every decision, oldest first.
@@ -689,6 +696,19 @@ impl HumanReviewRecord {
     pub fn record_arrival(&mut self) {
         self.arrivals = self.arrivals.saturating_add(1);
         self.pr_error = None;
+    }
+
+    /// The task is going back to work after its changes were approved, so
+    /// the approval no longer describes what the branch will hold. Closing
+    /// the current arrival is what retires it: the entry stays in the
+    /// history, and nothing is current until a run brings the task back.
+    ///
+    /// A change request is left alone. It is meant for the run the task is
+    /// going back to, which [`Self::pending_feedback`] reads.
+    pub fn withdraw_approval(&mut self) {
+        if self.is_approved() {
+            self.record_arrival();
+        }
     }
 
     /// Append a decision made now, in the current arrival.

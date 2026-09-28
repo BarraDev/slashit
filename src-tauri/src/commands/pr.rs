@@ -398,13 +398,34 @@ pub async fn create_pr(
     create_pr_inner(&state, &task_id).await
 }
 
-/// [`create_pr`], for another command that delivers a task through the same
-/// flow.
-pub(crate) async fn create_pr_for_task(
+/// [`create_pr`] for a task whose changes a person approved at Human Review.
+///
+/// The approval is checked under the same lease that reserves the task for
+/// the pull request flow, not before it: reserving ends whatever owns the
+/// task, so a task sent back to work since it was approved must be refused
+/// here rather than have its new run stopped and its branch published.
+pub(crate) async fn create_pr_for_approved_task(
     state: &crate::AppState,
     task_id: Uuid,
 ) -> Result<String, String> {
-    create_pr_inner(state, &task_id.to_string()).await
+    let reservation = {
+        let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+        let approved = state.task.tasks.read().await.get(&task_id).is_some_and(|t| {
+            t.status == TaskStatus::HumanReview && t.human_review.is_approved()
+        });
+        if !approved {
+            return Err(
+                "The task is no longer in Human Review with its changes approved, so no pull \
+                 request was opened."
+                    .to_string(),
+            );
+        }
+        match state.executor.get() {
+            Some(executor) => Some(executor.begin_pr_side_effect_under_lease(task_id).await?),
+            None => None,
+        }
+    };
+    create_pr_reserved(state, task_id, reservation).await
 }
 
 /// Whether SlashIt can open a pull request for a task's project at all.
@@ -442,8 +463,8 @@ pub(crate) async fn pr_availability(
                 .to_string(),
         },
         Err(_) => PrAvailability::Unavailable {
-            reason: "This project's repository has no `origin` remote, so there is nowhere to \
-                     open a pull request."
+            reason: "SlashIt could not read an `origin` remote for this project's repository, \
+                     so there is nowhere to open a pull request."
                 .to_string(),
         },
     })

@@ -28,6 +28,7 @@ const CLOSE_DIALOG: &str = "[data-testid=\"close-without-merge-dialog\"]";
 const CLOSE_CONSEQUENCES: &str = "[data-testid=\"close-without-merge-consequences\"]";
 const CLOSE_CANCEL: &str = "[data-testid=\"close-without-merge-cancel\"]";
 const CLOSE_CONFIRM: &str = "[data-testid=\"close-without-merge-confirm\"]";
+const CLOSE_ERROR: &str = "[data-testid=\"close-without-merge-error\"]";
 const PR_CREATED_COLUMN: &str = "[data-testid=\"column-prcreated\"]";
 
 /// The lines the coding prompt fences each piece of feedback with
@@ -673,7 +674,8 @@ async fn history_after_restart(driver: &WebDriver, executed: &ExecutedTask) -> R
 // --- Journey D ----------------------------------------------------------------
 
 /// Done from Human Review asks first, says what it does, changes nothing
-/// when cancelled, and when confirmed closes the task without merging: the
+/// when cancelled, reports a close Git refused as not done, and when
+/// confirmed over a clean checkout closes the task without merging: the
 /// checkout is removed and the work stays on its branch.
 #[tokio::test(flavor = "multi_thread")]
 async fn closing_a_reviewed_task_without_merging_is_confirmed_first_and_keeps_its_work() {
@@ -722,14 +724,7 @@ async fn close_without_merging(
     }
 
     // --- First attempt: the card menu, Move to, Done; then Cancel ------------
-    open_card_menu(driver, &executed.title).await?;
-    page(
-        driver,
-        "document.querySelector('[data-testid=\"task-menu-move-to\"]').dispatchEvent(new MouseEvent('mouseenter')); return true;",
-        Vec::new(),
-    )
-    .await?;
-    click(driver, "[data-testid=\"task-menu-move-done\"]", "Move to Done").await?;
+    move_to_done_from_the_menu(driver, &executed.title).await?;
     assert_consequences_explained(driver, &executed, &work).await?;
     click(driver, CLOSE_CANCEL, "Cancel").await?;
     await_gone(driver, CLOSE_DIALOG, "the confirmation, after Cancel").await?;
@@ -743,8 +738,30 @@ async fn close_without_merging(
     }
     assert_card_in_column(driver, HUMAN_REVIEW_COLUMN, &executed.title).await?;
 
-    // --- Second attempt: a drop on the Done column; then confirm ------------
+    // --- Second attempt: a drop on Done, confirmed over a dirty checkout ---
+    //
+    // Git refuses to remove a checkout holding uncommitted work, so nothing
+    // is closed, and the dialog has to say so rather than report success.
+    let stray = executed.worktree_path.join("uncommitted-note.txt");
+    std::fs::write(&stray, "not committed\n").context("could not dirty the checkout")?;
     drag_card_to(driver, &executed.title, DONE_COLUMN).await?;
+    assert_consequences_explained(driver, &executed, &work).await?;
+    click(driver, CLOSE_CONFIRM, "Close without merging").await?;
+    let refused = await_text(driver, CLOSE_ERROR, |t| !t.is_empty(), "why the task was not closed").await?;
+    if !refused.contains("was not closed") || !refused.contains("modified or untracked files") {
+        bail!("a refused close was reported as {refused:?}");
+    }
+    ui::visible(driver, CLOSE_DIALOG).await.context("a refused close dismissed the dialog")?;
+    let task = read_task(driver, &executed).await?;
+    if status_of(&task) != Some("human_review") || !stray.is_file() {
+        bail!("a refused close changed the task or its checkout: {task}");
+    }
+    click(driver, CLOSE_CANCEL, "Cancel").await?;
+    await_gone(driver, CLOSE_DIALOG, "the confirmation, after Cancel").await?;
+    std::fs::remove_file(&stray).context("could not clean the checkout")?;
+
+    // --- Third attempt: the menu again, confirmed over a clean checkout ----
+    move_to_done_from_the_menu(driver, &executed.title).await?;
     assert_consequences_explained(driver, &executed, &work).await?;
     click(driver, CLOSE_CONFIRM, "Close without merging").await?;
     await_gone(driver, CLOSE_DIALOG, "the confirmation, after closing").await?;
@@ -788,6 +805,19 @@ async fn assert_consequences_explained(
         }
     }
     Ok(())
+}
+
+/// Move to, Done, from the card's own menu.
+async fn move_to_done_from_the_menu(driver: &WebDriver, title: &str) -> Result<()> {
+    open_card_menu(driver, title).await?;
+    // The submenu opens on hover; `mouseenter` is what its handler listens to.
+    page(
+        driver,
+        "document.querySelector('[data-testid=\"task-menu-move-to\"]').dispatchEvent(new MouseEvent('mouseenter')); return true;",
+        Vec::new(),
+    )
+    .await?;
+    click(driver, "[data-testid=\"task-menu-move-done\"]", "Move to Done").await
 }
 
 /// Open a card's menu through its options button.

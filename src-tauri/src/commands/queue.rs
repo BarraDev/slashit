@@ -104,6 +104,9 @@ async fn enqueue_durably(
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
             task.status = TaskStatus::Queue;
+            // Queued to run again: an approval of the current changes no
+            // longer covers what the branch will hold.
+            task.human_review.withdraw_approval();
         }
     };
     match crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await?

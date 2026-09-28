@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::commands::pr::{create_pr_for_task, pr_availability, PrAvailability};
+use crate::commands::pr::{create_pr_for_approved_task, pr_availability, PrAvailability};
 use crate::commands::task::renumber_column;
 use crate::domain::task::HumanReviewDecision;
 use crate::domain::{Task, TaskStatus};
@@ -229,7 +229,7 @@ async fn deliver(state: &crate::AppState, task_id: Uuid) -> PrDelivery {
         Ok(PrAvailability::Unavailable { reason }) => return PrDelivery::Unavailable { reason },
         Err(reason) => return record_pr_failure(state, task_id, reason).await,
     }
-    match create_pr_for_task(state, task_id).await {
+    match create_pr_for_approved_task(state, task_id).await {
         Ok(url) => {
             // Best effort: the pull request is linked either way, and a stale
             // failure next to it is only shown while no PR is recorded.
@@ -387,6 +387,56 @@ mod tests {
         request_changes(&state, sent_back, "change it").await.expect("recorded");
         let refused = approve(&state, sent_back, false).await.expect_err("queued now");
         assert!(refused.contains("Human Review"), "{refused}");
+    }
+
+    /// Sending approved changes back to work retires the approval, through
+    /// every front door that does it, so a manual move back into Human
+    /// Review cannot open a pull request for commits nobody reviewed.
+    #[tokio::test]
+    async fn an_approval_does_not_survive_the_task_going_back_to_work() {
+        use tauri::Manager;
+        let (_tmp, state) = test_state().await;
+        let (_p, moved) = seed_in_review(&state).await;
+        let (_p, queued) = seed_in_review(&state).await;
+        approve(&state, moved, false).await.expect("approved");
+        approve(&state, queued, false).await.expect("approved");
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        for status in [TaskStatus::Queue, TaskStatus::HumanReview] {
+            crate::commands::task::update_task_status(app.state(), moved.to_string(), status, None)
+                .await
+                .expect("moved");
+        }
+        crate::commands::queue::add_to_queue(app.state(), queued.to_string()).await.expect("queued");
+        crate::commands::task::update_task_status(app.state(), queued.to_string(), TaskStatus::HumanReview, None)
+            .await
+            .expect("moved back");
+
+        let state: tauri::State<'_, crate::AppState> = app.state();
+        for id in [moved, queued] {
+            let task = current(&state, id).await.unwrap();
+            assert_eq!(task.status, TaskStatus::HumanReview);
+            assert!(!task.human_review.is_approved(), "the approval was of other changes");
+            assert!(task.human_review.current_decision().is_none());
+            assert_eq!(task.human_review.entries.len(), 1, "the history keeps it");
+            assert!(retry_delivery(&state, id).await.is_err());
+            let refused = crate::commands::pr::create_pr_for_approved_task(&state, id)
+                .await
+                .expect_err("not approved any more");
+            assert!(refused.contains("no longer"), "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_already_requested_in_this_review_cannot_also_be_approved() {
+        let (_tmp, state) = test_state().await;
+        let (_p, task_id) = seed_in_review(&state).await;
+        request_changes(&state, task_id, "fix it").await.expect("recorded");
+        // Put back in Human Review without a run, as a manual move would.
+        state.task.tasks.write().await.get_mut(&task_id).unwrap().status = TaskStatus::HumanReview;
+        let refused = approve(&state, task_id, false).await.expect_err("changes were requested");
+        assert!(refused.contains("already requested"), "{refused}");
     }
 
     /// A task that comes back from the rerun is a new review: nothing is

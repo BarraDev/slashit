@@ -239,7 +239,7 @@ pub fn TaskContextMenu(
                     </Show>
                 </div>
 
-                // Create PR (only for HumanReview/Done tasks without a PR)
+                // Create PR (only for Done or approved Human Review tasks without a PR)
                 {
                     let set_show = set_show;
                     let on_create_pr = move |_: leptos::ev::MouseEvent| {
@@ -268,7 +268,10 @@ pub fn TaskContextMenu(
                     };
                     move || {
                         let can_create_pr = task.get().map(|t| {
-                            matches!(t.status, TaskStatus::HumanReview | TaskStatus::Done)
+                            // In Human Review a pull request follows an
+                            // approval, which the drawer records.
+                            (t.status == TaskStatus::Done
+                                || (t.status == TaskStatus::HumanReview && t.human_review.is_approved()))
                                 && t.pr_url.is_none()
                                 && !t.external_refs.iter().any(|r| r.is_pr())
                         }).unwrap_or(false);
