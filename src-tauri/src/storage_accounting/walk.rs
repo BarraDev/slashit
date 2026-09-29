@@ -15,10 +15,12 @@
 //!   walk does not descend into a directory on another device.
 //! - On Windows the walk goes by path, as the standard library does, and
 //!   does not enter any entry it sees as a reparse point (junctions, mounted
-//!   volumes, cloud placeholders, symbolic links). A directory replaced by a
-//!   junction after it was seen is caught by checking it again once it has
-//!   been listed, and its contents are then discarded as changed. A swap
-//!   that is undone before that check is not caught; see
+//!   volumes, cloud placeholders, symbolic links). After a directory is
+//!   listed its path is checked again: a listing is discarded as changed if
+//!   the path is no longer a plain directory, or its creation time (where
+//!   the filesystem reports one) differs. That catches many replacements,
+//!   but it is not identity: a swap undone before the check, or a
+//!   replacement that looks the same, is not caught; see
 //!   `docs/architecture/state-locations.md`.
 //!
 //! A file that disappears mid-walk is simply not counted; any other entry
@@ -478,7 +480,8 @@ mod portable {
     }
 
     /// What a directory looked like when it was listed, to tell whether it
-    /// is still the same one after being read.
+    /// visibly changed while being read. A heuristic, not its identity:
+    /// creation time can be unavailable or set to anything.
     fn fingerprint(meta: &Metadata) -> (bool, bool, Option<std::time::SystemTime>) {
         (meta.is_dir(), is_link_meta(meta), meta.created().ok())
     }
@@ -525,7 +528,7 @@ mod portable {
         while let Some((dir, depth, before)) = pending.pop() {
             hooks.list(&dir);
             let listing: Vec<fs::DirEntry> = match fs::read_dir(&dir) {
-                Ok(entries) => entries.filter_map(Result::ok).collect(),
+                Ok(entries) => listed(entries, &mut size, &relative(path, &dir)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound && depth > 0 => continue,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(WalkError::NotFound),
                 Err(e) if depth == 0 => return Err(WalkError::Unreadable(e.to_string())),
@@ -534,8 +537,9 @@ mod portable {
                     continue;
                 }
             };
-            // Read by path, so check the directory is still the one that was
-            // listed: a junction put in its place would have been followed.
+            // Read by path, so check the directory still looks like the one
+            // that was listed: a junction put in its place would have been
+            // followed.
             let unchanged = fs::symlink_metadata(&dir).is_ok_and(|after| fingerprint(&after) == fingerprint(&before));
             if !unchanged {
                 if depth == 0 {
@@ -576,6 +580,22 @@ mod portable {
             }
         }
         Ok(size)
+    }
+
+    /// The entries a directory listing produced. An entry the listing
+    /// failed to produce is counted as skipped, as the Unix walk does: on
+    /// Windows a failed `FindNextFileW` also ends the listing, so the rest
+    /// of the directory is never seen and the result must not read as
+    /// complete.
+    pub(super) fn listed<T>(entries: impl IntoIterator<Item = io::Result<T>>, size: &mut TreeSize, dir: &str) -> Vec<T> {
+        let mut kept = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) => kept.push(entry),
+                Err(e) => size.skip(format!("{dir}: {e}")),
+            }
+        }
+        kept
     }
 
     #[cfg(windows)]
@@ -771,6 +791,23 @@ mod tests {
 
         assert!(size.is_complete(), "{size:?}");
         assert!(size.bytes >= 10_000 && size.bytes < 100_000, "{size:?}");
+    }
+
+    /// The portable walk's handling of a listing that fails part way, which
+    /// `std::fs::ReadDir` cannot be made to do on demand: the entries
+    /// already listed are kept, and the directory's size is partial rather
+    /// than a smaller number that reads as complete.
+    #[test]
+    fn a_listing_that_fails_part_way_is_partial_not_smaller() {
+        let mut size = TreeSize { bytes: 30_000, entries: 3, ..TreeSize::default() };
+        assert!(size.is_complete());
+        let entries = vec![Ok("a"), Ok("b"), Err(io::Error::other("enumeration failed")), Ok("c")];
+        let kept = portable::listed(entries, &mut size, "d");
+        assert_eq!(kept, ["a", "b", "c"]);
+        assert!(!size.is_complete());
+        assert_eq!(size.skipped, 1);
+        assert_eq!((size.bytes, size.entries), (30_000, 3));
+        assert_eq!(size.first_skip_reason.as_deref(), Some("d: enumeration failed"));
     }
 }
 
