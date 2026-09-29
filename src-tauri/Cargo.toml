@@ -31,6 +31,9 @@ thiserror = "2"
 anyhow = "1"
 sysinfo = "0.32"
 directories = "5"
+# Filesystem total and available space: `statvfs` on Unix,
+# `GetDiskFreeSpaceExW` on Windows.
+fs4 = "1.1"
 toml = "0.8"
 walkdir = "2.5.0"
 portable-pty = "0.8"

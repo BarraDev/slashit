@@ -44,6 +44,8 @@ mod human_review;
 mod local_first;
 #[path = "product_acceptance/needs_you.rs"]
 mod needs_you;
+#[path = "product_acceptance/storage.rs"]
+mod storage;
 
 /// How long the board gets to render the finished task.
 const RENDER_DEADLINE: Duration = Duration::from_secs(30);

@@ -129,7 +129,7 @@ impl SessionStore {
         fs::create_dir_all(data_dir).context("Failed to create data directory")?;
 
         Ok(Self {
-            store_path: data_dir.join("terminal_sessions.toml"),
+            store_path: paths.terminal_sessions_file(),
         })
     }
 

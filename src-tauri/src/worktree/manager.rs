@@ -387,7 +387,7 @@ impl WorktreeManager {
     pub fn new(paths: Arc<AppPaths>) -> Self {
         println!(
             "SlashIt: managing worktrees under {}",
-            paths.data_dir().join("worktrees").display()
+            paths.worktrees_dir().display()
         );
         Self { paths }
     }

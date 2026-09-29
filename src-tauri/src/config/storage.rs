@@ -12,11 +12,6 @@ use uuid::Uuid;
 /// Task file name inside a project's own state directory.
 const TASKS_FILE: &str = "tasks.toml";
 
-/// Pre-`AppPaths` task location: one `<project-uuid>.toml` per project, all of
-/// them under a single global directory. Still read, and still written for
-/// projects that cannot be routed to a state directory of their own.
-const LEGACY_TASKS_DIR: &str = "tasks";
-
 /// Structure for storing tasks per project in TOML files
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectTasksFile {
@@ -451,7 +446,7 @@ impl Storage {
     }
 
     fn legacy_tasks_dir(&self) -> PathBuf {
-        self.paths.config_dir().join(LEGACY_TASKS_DIR)
+        self.paths.legacy_tasks_dir()
     }
 
     fn legacy_tasks_path(&self, project_id: Uuid) -> PathBuf {

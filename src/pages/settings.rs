@@ -194,7 +194,10 @@ pub fn Settings(
                                 }.into_any(),
 
                                 SettingsTab::Storage => view! {
-                                    <crate::components::StorageSettings project_id=project_id.clone() />
+                                    <div class="space-y-10">
+                                        <crate::components::DiskUsage />
+                                        <crate::components::StorageSettings project_id=project_id.clone() />
+                                    </div>
                                 }.into_any(),
 
                                 SettingsTab::Jujutsu => view! {
