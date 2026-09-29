@@ -117,6 +117,43 @@ impl DiskPressure {
     }
 }
 
+/// Why SlashIt is not beginning new task executions right now. Mirrors the
+/// backend's `domain::storage_usage::StartBlock`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StartBlock {
+    CriticalDisk {
+        available_bytes: u64,
+        critical_below_bytes: u64,
+    },
+    DiskSpaceUnavailable {
+        reason: String,
+    },
+}
+
+impl StartBlock {
+    pub fn headline(&self) -> &'static str {
+        match self {
+            Self::CriticalDisk { .. } => "New work paused: critically low disk space",
+            Self::DiskSpaceUnavailable { .. } => "New work paused: SlashIt couldn't verify free disk space",
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        match self {
+            Self::CriticalDisk { available_bytes, critical_below_bytes } => format!(
+                "{} free. New tasks can start again once {} is free; running tasks carry on. \
+                 Settings > Storage shows what SlashIt uses.",
+                iec_bytes(*available_bytes),
+                iec_bytes(*critical_below_bytes),
+            ),
+            Self::DiskSpaceUnavailable { reason } => format!(
+                "{reason}. New tasks can start again once the check succeeds; running tasks carry on."
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressureThresholds {
     pub warning_below_bytes: u64,
@@ -245,5 +282,27 @@ mod tests {
             Some(CheckoutLifecycle::Task { status: TaskStatus::HumanReview, agent_attached: false })
         );
         assert_eq!(summary.unmeasured[0].bytes, None);
+    }
+
+    #[test]
+    fn a_start_block_reads_the_backend_shape_and_explains_itself() {
+        let critical: StartBlock = serde_json::from_value(serde_json::json!({
+            "kind": "critical_disk",
+            "available_bytes": 12u64 * 1024 * 1024 * 1024,
+            "critical_below_bytes": 40u64 * 1024 * 1024 * 1024,
+        }))
+        .unwrap();
+        assert_eq!(critical.headline(), "New work paused: critically low disk space");
+        assert!(critical.detail().starts_with("12.0 GiB free."), "{}", critical.detail());
+        assert!(critical.detail().contains("40.0 GiB"), "{}", critical.detail());
+        assert!(critical.detail().contains("Settings > Storage"), "{}", critical.detail());
+
+        let unknown: StartBlock = serde_json::from_value(serde_json::json!({
+            "kind": "disk_space_unavailable",
+            "reason": "permission denied",
+        }))
+        .unwrap();
+        assert_eq!(unknown.headline(), "New work paused: SlashIt couldn't verify free disk space");
+        assert!(unknown.detail().starts_with("permission denied."), "{}", unknown.detail());
     }
 }

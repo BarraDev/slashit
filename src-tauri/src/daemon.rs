@@ -168,6 +168,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
             worktree_manager: state.worktree_manager.clone(),
             events: events.clone(),
             lifecycle: state.task_lifecycle_locks.clone(),
+            start_guard: state.start_guard.clone(),
         },
     ));
     let _ = state.executor.set(executor.clone());
@@ -196,6 +197,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
         executor: state.executor.clone(),
         feature_diagnostics,
         paths: state.paths.clone(),
+        start_guard: state.start_guard.clone(),
     });
 
     // Serving the endpoints claimed at the top of this function. Nothing is

@@ -139,9 +139,11 @@ impl World {
             tmp.path().join("cache"),
             tmp.path().join("runtime"),
         ));
-        let (state, _) = slashit_ui_lib::app_core::build_state_with_paths(paths)
+        let (mut state, _) = slashit_ui_lib::app_core::build_state_with_paths(paths)
             .await
             .expect("state");
+        // Not about disk pressure: independent of the host's free space.
+        state.start_guard = slashit_ui_lib::test_helpers::plenty_of_disk();
         let app = tauri::test::mock_app();
         app.manage(state);
         World { tmp, app }

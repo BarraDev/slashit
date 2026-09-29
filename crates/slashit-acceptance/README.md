@@ -44,6 +44,9 @@ roots, artifact pruning — need none of that and run in the ordinary
 | `SLASHIT_ACCEPTANCE_BIN` | The application binary to test. Defaults to `target/debug/slashit-ui`. |
 | `SLASHIT_ACCEPTANCE_NATIVE_DRIVER` | Path to `WebKitWebDriver`. Optional; `tauri-driver` searches `PATH` otherwise. |
 
+The harness also sets `SLASHIT_DEBUG_DISK_SPACE_FILE` for the application
+itself; see Isolation below.
+
 ### Arch Linux
 
 Arch ships no `WebKitWebDriver` binary at all: `webkit2gtk-4.1` installs no
@@ -66,6 +69,11 @@ export SLASHIT_ACCEPTANCE_NATIVE_DRIVER=/tmp/WebKitWebDriver
 - **Isolation.** Every run gets a fresh `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
   `XDG_CACHE_HOME` and `XDG_RUNTIME_DIR` under a temporary directory. The
   developer's real SlashIt state is never read or written.
+  The application's free disk space is faked too: every run starts with a
+  file reporting plenty of space, which debug builds of SlashIt read through
+  `SLASHIT_DEBUG_DISK_SPACE_FILE` instead of the real filesystem when they
+  decide whether to start a task. On a host with little free space, a
+  release binary ignores it and pauses every start, so test a debug build.
 - **Dynamic ports.** No fixed 4444/4445. Ports come from the kernel, are held
   until the moment the provider is spawned, and are re-checked afterwards.
 - **Ownership.** The provider runs as the leader of its own process group, and

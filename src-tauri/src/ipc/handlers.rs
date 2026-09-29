@@ -285,6 +285,12 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         None => return IpcResponse::error(format!("Task {task_id} not found")),
     };
 
+    // Same as the desktop `update_task_status`: a move into In Progress is
+    // refused while new work is paused for disk space, before anything else.
+    if let Err(e) = ctx.start_guard.check_move(&old_status, &new_status).await {
+        return IpcResponse::error(e);
+    }
+
     // Same rule as the desktop `update_task_status`: any status this handler
     // reaches actually changes the task's lifecycle column (`Done` returned
     // above, through the same `terminalize` that already refuses under an
@@ -1192,5 +1198,54 @@ mod lifecycle_ownership {
             ctx.tasks.read().await.get(&task_id).unwrap().status,
             TaskStatus::Queue
         );
+    }
+}
+
+/// `slashit move <task> in_progress` is held to the same disk-pressure pause
+/// as the desktop front doors.
+#[cfg(test)]
+mod disk_pressure {
+    use super::*;
+    use crate::domain::storage_usage::GIB;
+    use crate::test_helpers::{create_test_task_full, ipc_test_context, FakeDisk};
+    use slashit_ipc::Endpoint;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn ipc_move_into_in_progress_is_refused_on_a_critical_disk() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let disk = FakeDisk::with_available(10 * GIB);
+        let mut ctx = ipc_test_context(paths);
+        ctx.start_guard = disk.guard();
+        let project_id = Uuid::new_v4();
+        let task = create_test_task_full("under test", project_id, TaskStatus::Queue, 0);
+        let task_id = task.id;
+        ctx.tasks.write().await.insert(task_id, task.clone());
+        ctx.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        // This platform's own local endpoint -- a Unix socket or a named
+        // pipe -- so the test describes a caller that can exist here. The
+        // handler reads it only to answer `Ping`.
+        let peer = PeerContext { endpoint: Endpoint::local_default(), os_verified: true };
+        let move_to = |status: &str| IpcRequest::MoveTask { task_id: task_id.to_string(), status: status.to_string() };
+
+        let answer = dispatch(move_to("in_progress"), &ctx, &peer).await.response;
+        assert!(!answer.ok, "{answer:?}");
+        assert!(format!("{answer:?}").contains("New work paused"), "{answer:?}");
+        assert_eq!(ctx.tasks.read().await[&task_id].status, TaskStatus::Queue);
+
+        // Other moves are not starts.
+        let answer = dispatch(move_to("backlog"), &ctx, &peer).await.response;
+        assert!(answer.ok, "{answer:?}");
+
+        disk.set_available(300 * GIB);
+        let answer = dispatch(move_to("in_progress"), &ctx, &peer).await.response;
+        assert!(answer.ok, "{answer:?}");
+        assert_eq!(ctx.tasks.read().await[&task_id].status, TaskStatus::InProgress);
     }
 }

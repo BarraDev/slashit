@@ -143,10 +143,31 @@ fn with_worktree_roots(paths: &AppPaths, recorded: Vec<(RecordedCheckout, Option
         .collect()
 }
 
-fn filesystem_space(path: &Path) -> std::io::Result<FilesystemSpace> {
+pub(crate) fn filesystem_space(path: &Path) -> std::io::Result<FilesystemSpace> {
     let stats = fs4::statvfs(path)?;
-    Ok(FilesystemSpace {
-        total_bytes: stats.total_space(),
-        available_bytes: stats.available_space(),
-    })
+    space_of(stats.total_space(), stats.available_space())
+}
+
+/// A filesystem reporting no size at all is a failed reading, not an empty
+/// disk: every pressure threshold is a share of the size, so it would
+/// otherwise read as Normal.
+fn space_of(total_bytes: u64, available_bytes: u64) -> std::io::Result<FilesystemSpace> {
+    if total_bytes == 0 {
+        return Err(std::io::Error::other("the filesystem reported a size of zero"));
+    }
+    Ok(FilesystemSpace { total_bytes, available_bytes })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_filesystem_of_size_zero_is_a_failed_reading() {
+        assert!(space_of(0, 0).is_err());
+        assert_eq!(
+            space_of(10, 4).unwrap(),
+            FilesystemSpace { total_bytes: 10, available_bytes: 4 }
+        );
+    }
 }

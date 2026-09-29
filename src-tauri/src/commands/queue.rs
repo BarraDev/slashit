@@ -166,6 +166,9 @@ pub async fn get_queue_position(
 pub async fn promote_next_task(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Option<String>, String> {
+    // Promotion asks the executor to start the task, so it waits while new
+    // work is paused for disk space; the task stays queued.
+    state.start_guard.check().await.map_err(|block| block.to_string())?;
     let manager = state.queue.manager.read().await;
     let select = |tasks: &HashMap<Uuid, Task>| manager.select_promotable(tasks);
     let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {

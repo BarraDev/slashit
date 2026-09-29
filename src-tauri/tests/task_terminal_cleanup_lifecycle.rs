@@ -497,9 +497,11 @@ async fn build_fixture(name: &str) -> (Fixture, AppState) {
     let storage = slashit_ui_lib::config::Storage::with_paths((*paths).clone());
     storage.save_config(&config).expect("seed config");
 
-    let (state, _report) = slashit_ui_lib::app_core::build_state_with_paths(paths)
+    let (mut state, _report) = slashit_ui_lib::app_core::build_state_with_paths(paths)
         .await
         .expect("state must build under a tempdir");
+    // Not about disk pressure: independent of the host's free space.
+    state.start_guard = slashit_ui_lib::test_helpers::plenty_of_disk();
 
     // The product's own worktree creation, so the checkout under test sits
     // exactly where the product would put it.

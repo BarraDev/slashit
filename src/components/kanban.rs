@@ -9,6 +9,7 @@ use crate::models::task::{
 };
 use crate::components::{TaskCard, TaskDrawer, TaskEditModal, TaskEditMode, toast, TaskContextMenu, DiffModal};
 use crate::components::close_without_merge_dialog::{CloseWithoutMergeDialog, PendingClose};
+use crate::components::new_work_pause::{provide_new_work_pause, NewWorkPauseNotice};
 use crate::components::attention::{attention_order, next_after, reveal_card, BoardAttention, Deliveries};
 use crate::components::task_live::{activity_from_event, changes_task_record, counts_as_running, shows_activity, ActivityUpdate};
 use crate::services::task_run_service::listen_agent_events;
@@ -283,6 +284,10 @@ pub fn Kanban(
         })));
         on_cleanup(move || listener.dispose());
     }
+
+    // Whether queued work is waiting for disk space, for the Queue column
+    // and the drawer.
+    provide_new_work_pause();
 
     // The task whose drawer is open, if any.
     let drawer_task = RwSignal::new(None::<Uuid>);
@@ -2195,6 +2200,7 @@ fn KanbanColumn(
                         </div>
                     </div>
                     <p class="text-xs text-white/40 mt-1">{column_clone.description}</p>
+                    {(status == TaskStatus::Queue).then(|| view! { <NewWorkPauseNotice testid="new-work-paused"/> })}
                 </div>
             </div>
 

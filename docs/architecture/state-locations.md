@@ -300,10 +300,17 @@ Startup runs no git command that changes anything.
 ## Disk usage
 
 Settings > Storage shows how much space SlashIt uses and how full the disk
-holding its data directory is. It is informational: nothing is deleted,
-cleaned, pruned or refused because of it. The code is
-`src-tauri/src/storage_accounting/`; what each total means is documented on
-`domain::storage_usage`.
+holding its data directory is. Nothing is deleted, cleaned or pruned because
+of it. The code is `src-tauri/src/storage_accounting/`; what each total means
+is documented on `domain::storage_usage`.
+
+When that disk is critically low, SlashIt pauses new task executions
+(`queue/start_guard.rs`). Each start asks the filesystem afresh with one
+`statvfs`-style call rather than reading the last measurement, and a check
+that fails pauses new work too. Queued tasks stay queued and start on a later
+scheduler pass once space returns. Warning pauses nothing, and running tasks,
+AI reviews, Human Review decisions and pull request work are never stopped
+or refused by it.
 
 Only SlashIt's own roots are measured: the config, data, cache and runtime
 directories above. Every path comes from `AppPaths`; nothing a task or board
@@ -380,7 +387,10 @@ time: a Refresh that arrives while one is running waits for it instead of
 starting another, and the previous result stays visible meanwhile.
 
 Disk pressure is Warning below the larger of 15% of the filesystem and
-120 GiB available, and Critical below the larger of 5% and 40 GiB.
+120 GiB available, and Critical below the larger of 5% and 40 GiB, where the
+40 GiB floor is capped at 20% of the filesystem: a 100 GiB disk is Critical
+below 20 GiB, not 40. Critical pauses new task executions, and Settings >
+Storage and that pause read the same threshold.
 
 ## Directories by platform
 

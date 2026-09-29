@@ -36,6 +36,8 @@ use thirtyfour::prelude::*;
 /// ticks every three seconds and the fixture returns immediately, so this is
 /// mostly headroom for a loaded hosted runner.
 const EXECUTION_DEADLINE: Duration = Duration::from_secs(90);
+#[path = "product_acceptance/disk_pressure.rs"]
+mod disk_pressure;
 #[path = "product_acceptance/git_fixture.rs"]
 mod git_fixture;
 #[path = "product_acceptance/human_review.rs"]

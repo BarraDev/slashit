@@ -100,6 +100,14 @@ pub async fn build_state_with_paths(
             executor: executor.clone(),
         },
     ));
+    // Unit tests build state under a tempdir on whatever disk the machine
+    // has; see `test_helpers::plenty_of_disk`.
+    #[cfg(test)]
+    let start_guard = crate::test_helpers::plenty_of_disk();
+    #[cfg(not(test))]
+    let start_guard = Arc::new(crate::queue::start_guard::StartGuard::for_data_dir(
+        paths.data_dir().to_path_buf(),
+    ));
     let app_state = AppState {
         repository: repository_state,
         project: project_state,
@@ -133,6 +141,7 @@ pub async fn build_state_with_paths(
         state_location_locks: Arc::new(commands::state_location::StateLocationLocks::new()),
         task_lifecycle_locks: Arc::new(lifecycle::TaskLifecycleLocks::new()),
         storage_accounting,
+        start_guard,
     };
 
     let mut report = StartupReport::default();

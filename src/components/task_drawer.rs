@@ -11,6 +11,7 @@ use leptos::task::spawn_local;
 use uuid::Uuid;
 
 use crate::components::diff_viewer::DiffViewer;
+use crate::components::new_work_pause::NewWorkPauseNotice;
 use crate::components::task_live::{
     format_elapsed, output_provenance, DrawerActions, OutputProvenance, RefreshGate, StartRequest,
 };
@@ -393,6 +394,14 @@ pub fn TaskDrawer(
                             </button>
                         </Show>
                     </section>
+
+                    // Waiting to start: say so when the reason is disk space.
+                    <Show when=move || task.with(|t| t.as_ref().is_some_and(|t| {
+                        t.status == TaskStatus::Queue
+                            || (t.status == TaskStatus::InProgress && t.phase == TaskPhase::Idle)
+                    }))>
+                        <NewWorkPauseNotice testid="task-drawer-new-work-paused"/>
+                    </Show>
 
                     {move || start.with(|s| s.failure_for(status.get().as_ref()).map(str::to_string)).map(|reason| view! {
                         <p data-testid="task-drawer-start-error" role="alert" class="text-sm text-red-300 whitespace-pre-wrap break-words">

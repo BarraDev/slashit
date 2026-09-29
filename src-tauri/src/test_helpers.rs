@@ -281,7 +281,78 @@ pub fn ipc_test_context(paths: std::sync::Arc<crate::config::paths::AppPaths>) -
         executor: Arc::new(tokio::sync::OnceCell::new()),
         feature_diagnostics: None,
         paths,
+        start_guard: plenty_of_disk(),
     }
+}
+
+/// A filesystem a test controls, for tests about disk pressure. 500 GiB in
+/// total, so the default policy's thresholds are its floors: Warning below
+/// 120 GiB free and Critical below 40 GiB.
+#[derive(Clone)]
+pub struct FakeDisk {
+    available: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    failing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FakeDisk {
+    pub const TOTAL: u64 = 500 * crate::domain::storage_usage::GIB;
+
+    pub fn with_available(bytes: u64) -> Self {
+        Self {
+            available: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(bytes)),
+            failing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// What the next reading reports as available.
+    pub fn available(&self) -> u64 {
+        self.available.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_available(&self, bytes: u64) {
+        self.available.store(bytes, std::sync::atomic::Ordering::SeqCst);
+        self.failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make every reading fail, as a `statvfs` error would.
+    pub fn fail(&self) {
+        self.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many times the filesystem has been read.
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn guard(&self) -> std::sync::Arc<crate::queue::start_guard::StartGuard> {
+        let disk = self.clone();
+        std::sync::Arc::new(crate::queue::start_guard::StartGuard::new(std::sync::Arc::new(move || {
+            use std::sync::atomic::Ordering;
+            disk.reads.fetch_add(1, Ordering::SeqCst);
+            if disk.failing.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("statvfs failed"));
+            }
+            Ok(crate::domain::storage_usage::FilesystemSpace {
+                total_bytes: Self::TOTAL,
+                available_bytes: disk.available.load(Ordering::SeqCst),
+            })
+        })))
+    }
+}
+
+/// A start guard that always finds plenty of free space.
+///
+/// Tests build state on whatever disk the machine has, and a CI runner's is
+/// below the critical floor, so a test that is not about disk pressure must
+/// not depend on it. Tests that are about it build their own
+/// [`crate::queue::start_guard::StartGuard`].
+pub fn plenty_of_disk() -> std::sync::Arc<crate::queue::start_guard::StartGuard> {
+    use crate::domain::storage_usage::{FilesystemSpace, GIB};
+    std::sync::Arc::new(crate::queue::start_guard::StartGuard::new(std::sync::Arc::new(|| {
+        Ok(FilesystemSpace { total_bytes: 1000 * GIB, available_bytes: 900 * GIB })
+    })))
 }
 
 /// A real [`crate::queue::TaskExecutor`], wired to an already-built
@@ -315,6 +386,7 @@ pub fn attach_test_executor(state: &crate::AppState) -> std::sync::Arc<crate::qu
             worktree_manager: state.worktree_manager.clone(),
             events: state.events(),
             lifecycle: state.task_lifecycle_locks.clone(),
+            start_guard: state.start_guard.clone(),
         },
     ));
     let _ = state.executor.set(executor.clone());
@@ -348,6 +420,7 @@ pub async fn attach_test_executor_ipc(ctx: &IpcContext) -> std::sync::Arc<crate:
             worktree_manager: ctx.worktree_manager.clone(),
             events: ctx.events.clone(),
             lifecycle: ctx.task_lifecycle_locks.clone(),
+            start_guard: ctx.start_guard.clone(),
         },
     ));
     let _ = ctx.executor.set(executor.clone());
