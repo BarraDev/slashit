@@ -67,6 +67,9 @@ pub fn shows_activity(status: &TaskStatus) -> bool {
 /// What a person can do from the drawer, given the task and its run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DrawerActions {
+    /// The task is waiting in Backlog with nothing running: put it in the
+    /// queue, where the scheduler starts it when there is capacity.
+    pub start: bool,
     /// The task's execution is live, so stopping has something to end.
     pub stop: bool,
     /// The task failed and nothing is running: re-queue it.
@@ -81,6 +84,7 @@ impl DrawerActions {
     pub fn for_task(status: &TaskStatus, run: &TaskRunSnapshot) -> Self {
         let live = run.live;
         Self {
+            start: *status == TaskStatus::Backlog && !live,
             // Only a running execution. Stopping an AI review would also
             // send the task back to Backlog, which is a decision this surface
             // does not offer yet.
@@ -92,6 +96,76 @@ impl DrawerActions {
                 TaskStatus::AiReview | TaskStatus::HumanReview | TaskStatus::Done | TaskStatus::PrCreated
             ),
         }
+    }
+}
+
+/// The drawer's Start request, from press to answer.
+///
+/// Start only enqueues. Whether and when the task then runs is the
+/// scheduler's decision, so this tracks nothing past the enqueue's answer;
+/// what the task became is read from the task itself.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StartRequest {
+    #[default]
+    Idle,
+    /// The enqueue was sent and has not answered yet.
+    Pending,
+    /// The last enqueue failed, for this reason. Start can be pressed again.
+    Failed(String),
+}
+
+impl StartRequest {
+    /// Begin a request, or refuse to while one is in flight.
+    ///
+    /// A second enqueue is not harmless: by the time it lands the scheduler
+    /// may already have started the task, and moving a running task back to
+    /// the queue ends its agent.
+    pub fn begin(&mut self) -> bool {
+        if *self == Self::Pending {
+            return false;
+        }
+        *self = Self::Pending;
+        true
+    }
+
+    /// Settle on the enqueue's answer, handing back the task's current record
+    /// to apply if there is one: the one just queued, or the task as it now
+    /// is if it had already moved on.
+    pub fn settle<T>(&mut self, outcome: Result<Option<T>, String>) -> Option<T> {
+        match outcome {
+            Ok(Some(task)) => {
+                *self = Self::Idle;
+                Some(task)
+            }
+            Ok(None) => {
+                *self = Self::Failed("This task no longer exists.".to_string());
+                None
+            }
+            Err(e) => {
+                *self = Self::Failed(format!("Could not start the task: {e}"));
+                None
+            }
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        *self == Self::Pending
+    }
+
+    pub fn failure(&self) -> Option<&str> {
+        match self {
+            Self::Failed(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// The failure to show for a task now in `status`, if any.
+    ///
+    /// A failed Start is about the Backlog task it was pressed for. The task
+    /// can leave Backlog while the request is still in flight, and a failure
+    /// that lands after that no longer describes where the task is.
+    pub fn failure_for(&self, status: Option<&TaskStatus>) -> Option<&str> {
+        self.failure().filter(|_| status == Some(&TaskStatus::Backlog))
     }
 }
 
@@ -302,7 +376,74 @@ mod tests {
     #[test]
     fn human_review_is_read_only_apart_from_its_changes() {
         let actions = DrawerActions::for_task(&TaskStatus::HumanReview, &run(false, Some(true)));
-        assert_eq!(actions, DrawerActions { stop: false, retry: false, edit: false, changes: true });
+        assert_eq!(actions, DrawerActions { start: false, stop: false, retry: false, edit: false, changes: true });
+    }
+
+    #[test]
+    fn start_is_offered_only_for_a_backlog_task_with_nothing_running() {
+        assert!(DrawerActions::for_task(&TaskStatus::Backlog, &run(false, None)).start);
+        assert!(DrawerActions::for_task(&TaskStatus::Backlog, &run(false, Some(true))).start);
+        // A stop settles the task in Backlog; its agent may not be gone yet.
+        assert!(!DrawerActions::for_task(&TaskStatus::Backlog, &run(true, Some(false))).start);
+        for status in [
+            TaskStatus::Queue,
+            TaskStatus::InProgress,
+            TaskStatus::AiReview,
+            TaskStatus::HumanReview,
+            TaskStatus::Done,
+            TaskStatus::PrCreated,
+            TaskStatus::Error,
+        ] {
+            assert!(!DrawerActions::for_task(&status, &run(false, None)).start, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_start_in_flight_refuses_a_second_press() {
+        let mut start = StartRequest::default();
+        assert!(start.begin());
+        assert!(start.is_pending());
+        assert!(!start.begin(), "a second press while the first is in flight must not enqueue again");
+        assert_eq!(start.settle(Ok(Some(7))), Some(7));
+        assert_eq!(start, StartRequest::Idle);
+    }
+
+    #[test]
+    fn a_failed_start_keeps_its_reason_and_can_be_pressed_again() {
+        let mut start = StartRequest::default();
+        assert!(start.begin());
+        assert_eq!(start.settle::<()>(Err("the board could not be saved".into())), None);
+        assert_eq!(start.failure(), Some("Could not start the task: the board could not be saved"));
+        assert!(!start.is_pending());
+
+        // Retrying clears the old reason while the new request is in flight.
+        assert!(start.begin());
+        assert_eq!(start.failure(), None);
+        assert_eq!(start.settle(Ok(Some(()))), Some(()));
+        assert_eq!(start.failure(), None);
+    }
+
+    #[test]
+    fn a_failed_start_is_shown_only_while_the_task_is_in_backlog() {
+        let mut start = StartRequest::default();
+        assert!(start.begin());
+        // The task moved on while the request was in flight, then it failed.
+        assert_eq!(start.settle::<()>(Err("refused".into())), None);
+        assert_eq!(start.failure_for(Some(&TaskStatus::Queue)), None);
+        assert_eq!(start.failure_for(Some(&TaskStatus::InProgress)), None);
+        assert_eq!(start.failure_for(None), None);
+        assert_eq!(
+            start.failure_for(Some(&TaskStatus::Backlog)),
+            Some("Could not start the task: refused")
+        );
+    }
+
+    #[test]
+    fn a_start_for_a_task_that_is_gone_says_so() {
+        let mut start = StartRequest::default();
+        assert!(start.begin());
+        assert_eq!(start.settle::<()>(Ok(None)), None);
+        assert_eq!(start.failure(), Some("This task no longer exists."));
     }
 
     #[test]

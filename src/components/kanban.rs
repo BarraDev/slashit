@@ -34,6 +34,11 @@ fn column_rank(status: &TaskStatus) -> usize {
     COLUMNS.iter().position(|c| c.status == *status).unwrap_or(COLUMNS.len())
 }
 
+/// The name of a status's column, as the board titles it.
+pub(crate) fn column_title(status: &TaskStatus) -> &'static str {
+    COLUMNS.iter().find(|c| c.status == *status).map_or("another column", |c| c.title)
+}
+
 /// Per-item live status updated as `pr-review-progress` events arrive during
 /// an apply or dry-run. Reset whenever the user starts a fresh run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -657,6 +662,7 @@ pub fn Kanban(
                 on_edit=on_context_edit
                 on_delete=on_task_delete
                 on_move=on_context_move
+                apply_task=apply_task
                 on_pr_created=on_pr_created
                 on_analyze_pr_comments=on_analyze_pr_comments
                 on_private_email_pr_error=on_private_email_pr_error

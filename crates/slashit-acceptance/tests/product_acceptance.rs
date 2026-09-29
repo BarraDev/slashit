@@ -919,6 +919,514 @@ async fn fail_and_retry_in_the_drawer(
     })
 }
 
+const DRAWER_START: &str = "[data-testid=\"task-drawer-start\"]";
+const DRAWER_START_ERROR: &str = "[data-testid=\"task-drawer-start-error\"]";
+/// How long a queued task is watched to prove it waits for capacity: three
+/// passes of the executor's three-second tick, each a chance to start it.
+const QUEUED_WINDOW: Duration = Duration::from_secs(10);
+
+/// Prove the drawer's Start puts a Backlog task in the queue, and that the
+/// queue, not the drawer, decides when it runs.
+///
+/// One journey covers the whole contract, because each part needs the state
+/// the previous one left:
+///
+/// - A Start that fails keeps the task in Backlog, says why in the drawer,
+///   and can be pressed again. The failure is real: the task store's
+///   directory is made read-only, so the backend's own durable write refuses.
+/// - Pressed twice in the same instant, Start sends exactly one enqueue. Every
+///   `reorder_task` the window sends is counted at the IPC boundary.
+/// - With the only execution slot taken, the started task stays visibly
+///   Queued and no agent runs for it.
+/// - Once the slot frees, the scheduler starts it on its own: the fixture
+///   records a real agent process running in the task's own worktree, and
+///   the open drawer follows the task to Running and on to Human Review.
+/// - A Start sent from a view that still shows Backlog after that changes
+///   nothing: the agent keeps running and is not started again.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_task_drawer_starts_a_backlog_task_through_the_queue() {
+    let context = TestContext::new("task_drawer_start").expect("harness setup");
+    let outcome = drawer_start_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn drawer_start_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+
+    let agent = FakeAgent::install(&root)?;
+    // Runs stay open until released, so the task holding the slot is
+    // really running while the started task waits.
+    let release = agent.block_agent_runs()?;
+    context.set_child_env("PATH", agent.path_value());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
+    context.set_child_env(fake_agent::BLOCK_DIR_VAR, &release);
+
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("drawer-start").await?;
+    let outcome = start_from_the_drawer(session.driver(), &agent, &repository, &root).await;
+    if outcome.is_err() {
+        // A journey that stopped early can leave a run blocked, and a blocked
+        // run outlives the application. Let it end, so the failure reported is
+        // the journey's own rather than a leaked process.
+        let _ = agent.release_blocked_runs();
+    }
+    context
+        .close_session(session, "drawer-start", &outcome)
+        .await?;
+    let started = outcome?;
+
+    assert_persisted(&root, &started, "human_review")?;
+    // The occupier's one run, and the started task's one run: no duplicate
+    // enqueue or promotion ever launched a second agent for it.
+    assert_agent_roles(&agent, "drawer_start_journey", 2, 0, 0)?;
+    Ok(())
+}
+
+async fn start_from_the_drawer(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    repository: &GitFixture,
+    root: &Path,
+) -> Result<ExecutedTask> {
+    ui::assert_frontend_is_real(driver).await?;
+
+    let Prerequisites {
+        project_id,
+        task_id,
+        title,
+    } = create_prerequisites(
+        driver,
+        repository,
+        "Drawer start journey",
+        "Started from its drawer while another task holds the only slot.",
+    )
+    .await?;
+    let occupier = created_id(
+        ui::invoke(
+            driver,
+            "create_task",
+            json!({
+                "params": {
+                    "projectId": project_id,
+                    "title": format!("Slot holder for {title}"),
+                    "description": "Holds the only execution slot until it is stopped.",
+                    "model": "default",
+                    "planningMode": false,
+                    "dependencies": [],
+                }
+            }),
+        )
+        .await?,
+        "create_task",
+    )?;
+
+    // One slot, so a second task has to wait for it.
+    ui::invoke(
+        driver,
+        "update_queue_config",
+        json!({ "parallelTaskLimit": 1 }),
+    )
+    .await?;
+
+    open_board(driver, &project_id).await?;
+    count_enqueues(driver).await?;
+    open_drawer(driver, &task_id, &title).await?;
+    await_drawer_status(driver, "backlog").await?;
+    ui::visible(driver, DRAWER_START)
+        .await
+        .context("a Backlog task offers Start")?;
+    assert_not_offered(driver, DRAWER_STOP, "Stop, for a task that never ran").await?;
+
+    // --- A Start the backend refuses -----------------------------------------
+    let store = task_store_dir(root, &task_id)?;
+    let read_only = ReadOnlyDir::hold(&store)?;
+    ui::visible(driver, DRAWER_START)
+        .await?
+        .click()
+        .await
+        .context("could not press Start in the drawer")?;
+    let reason = await_text(
+        driver,
+        DRAWER_START_ERROR,
+        |text| !text.is_empty(),
+        "why Start failed",
+    )
+    .await?;
+    read_only.release()?;
+    if !reason.starts_with("Could not start the task:") {
+        bail!("the drawer explains the failed Start as {reason:?}");
+    }
+    await_drawer_status(driver, "backlog").await?;
+    let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
+    let status = find_task(&listed, &task_id)
+        .as_ref()
+        .and_then(|t| status_of(t).map(str::to_string));
+    if status.as_deref() != Some("backlog") {
+        bail!("a refused Start left the task at {status:?} instead of backlog");
+    }
+    let retry = await_text(
+        driver,
+        DRAWER_START,
+        |text| text == "Start",
+        "Start, ready again",
+    )
+    .await?;
+    if disabled(driver, DRAWER_START).await? {
+        bail!("after a failed Start the drawer shows {retry:?} but will not let it be pressed");
+    }
+    if enqueues_for(driver, &task_id).await? != 1 {
+        bail!(
+            "one press of Start sent {} enqueues",
+            enqueues_for(driver, &task_id).await?
+        );
+    }
+
+    // --- Take the only slot ---------------------------------------------------
+    ui::invoke(
+        driver,
+        "update_task_status",
+        json!({ "taskId": occupier, "status": "in_progress" }),
+    )
+    .await?;
+    let occupier_pid = await_one_blocked_agent(agent).await?;
+
+    // --- The action under test: Start, pressed repeatedly at once ------------
+    //
+    // The first press disables the button before anything else can run. The
+    // presses after it are forced through that anyway, as a keyboard repeat
+    // or an activation racing the render could be, so what is proven is that
+    // the drawer itself sends one enqueue however many presses reach it.
+    let disabled_at_once = page(
+        driver,
+        r#"
+        const b = document.querySelector(arguments[0]);
+        b.click();
+        const disabled = b.disabled;
+        b.disabled = false;
+        b.click();
+        b.click();
+        return disabled;
+        "#,
+        vec![Value::String(DRAWER_START.to_string())],
+    )
+    .await?;
+    if disabled_at_once != Value::Bool(true) {
+        bail!("Start was still enabled right after it was pressed: {disabled_at_once}");
+    }
+    await_drawer_status(driver, "queue").await?;
+    await_absent_from_drawer(driver, DRAWER_START, "Start, once the task is queued").await?;
+    if count(driver, DRAWER_START_ERROR).await? != 0 {
+        bail!("a Start that succeeded still shows the earlier failure");
+    }
+    let sent = enqueues_for(driver, &task_id).await?;
+    if sent != 2 {
+        bail!(
+            "pressing Start three times at once sent {} enqueues, expected exactly one after the \
+             one refused earlier",
+            sent.saturating_sub(1)
+        );
+    }
+
+    // --- Queued while the slot is taken --------------------------------------
+    let waited = Instant::now();
+    while waited.elapsed() < QUEUED_WINDOW {
+        let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
+        let status = find_task(&listed, &task_id)
+            .as_ref()
+            .and_then(|t| status_of(t).map(str::to_string));
+        if status.as_deref() != Some("queue") {
+            bail!(
+                "with the only slot taken, the started task went to {status:?} instead of waiting"
+            );
+        }
+        await_drawer_status(driver, "queue").await?;
+        tokio::time::sleep(POLL).await;
+    }
+    let runs = agent_runs(agent)?.len();
+    if runs != 1 {
+        bail!(
+            "{runs} agent runs started while the only slot was taken, expected just the occupier's"
+        );
+    }
+
+    // --- The slot frees, and the queue starts the task on its own -------------
+    ui::invoke(driver, "stop_task_execution", json!({ "taskId": occupier })).await?;
+    let occupier_worktree = resolve(&agent_runs(agent)?[0].working_dir);
+
+    let runs = await_agent_runs(agent, 2).await?;
+    let started_run = &runs[1];
+    let worktree = resolve(&started_run.working_dir);
+    if worktree == occupier_worktree {
+        bail!(
+            "the started task's agent ran in the occupier's worktree {}",
+            worktree.display()
+        );
+    }
+    if !worktree.starts_with(resolve(repository.state_root())) {
+        bail!(
+            "the started task's agent ran outside this run's state root: {}",
+            worktree.display()
+        );
+    }
+    let pid = await_blocked_agent_other_than(agent, occupier_pid).await?;
+    await_drawer_status(driver, "inprogress").await?;
+    ui::visible(driver, DRAWER_STOP)
+        .await
+        .context("a running task offers Stop")?;
+    let running = await_status(driver, &project_id, &task_id, &["in_progress"]).await?;
+    let recorded = running
+        .get("worktree_path")
+        .and_then(Value::as_str)
+        .map(|p| resolve(Path::new(p)));
+    if recorded.as_deref() != Some(worktree.as_path()) {
+        bail!(
+            "the agent ran in {}, but the task records its worktree as {recorded:?}",
+            worktree.display()
+        );
+    }
+    if !agent.is_running(pid) {
+        bail!("the started task's agent {pid} is not running while the task shows Running");
+    }
+
+    // --- A Start from a view that is behind ------------------------------------
+    //
+    // Exactly what a drawer still showing Backlog sends. The task has left
+    // Backlog, so the backend must change nothing: the agent keeps running,
+    // the task stays in progress, and nothing starts it a second time.
+    let answered = ui::invoke(
+        driver,
+        "reorder_task",
+        json!({
+            "taskId": task_id,
+            "newStatus": "queue",
+            "newPosition": 0,
+            "expectedStatus": "backlog",
+        }),
+    )
+    .await?;
+    if status_of(&answered) != Some("in_progress") {
+        bail!("a stale Start was answered with {answered} instead of the running task as it is");
+    }
+    let watched = Instant::now();
+    while watched.elapsed() < QUEUED_WINDOW {
+        let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
+        let status = find_task(&listed, &task_id)
+            .as_ref()
+            .and_then(|t| status_of(t).map(str::to_string));
+        if status.as_deref() != Some("in_progress") {
+            bail!("after a stale Start the running task went to {status:?}");
+        }
+        if !agent.is_running(pid) {
+            bail!("a stale Start ended the running agent {pid}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    let runs = agent_runs(agent)?.len();
+    if runs != 2 {
+        bail!("{runs} agent runs after a stale Start, expected the same 2 as before it");
+    }
+    await_drawer_status(driver, "inprogress").await?;
+
+    // --- And the run carries on as any other ---------------------------------
+    let settled = Instant::now();
+    loop {
+        agent.release_blocked_runs()?;
+        let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
+        let status = find_task(&listed, &task_id)
+            .as_ref()
+            .and_then(|t| status_of(t).map(str::to_string));
+        match status.as_deref() {
+            Some("human_review") => break,
+            Some("error") => bail!("the started task failed: {listed}"),
+            _ => {}
+        }
+        if settled.elapsed() > EXECUTION_DEADLINE {
+            bail!("the started task never reached human review; it is at {status:?}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    await_drawer_status(driver, "humanreview").await?;
+    close_drawer(driver).await?;
+    assert_card_in_column(driver, HUMAN_REVIEW_COLUMN, &title).await?;
+
+    // The occupier stopped where a stop leaves a task, and nothing started it
+    // again.
+    let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
+    let occupier_status = find_task(&listed, &occupier)
+        .as_ref()
+        .and_then(|t| status_of(t).map(str::to_string));
+    if occupier_status.as_deref() != Some("backlog") {
+        bail!("the stopped occupier is at {occupier_status:?} instead of backlog");
+    }
+
+    Ok(ExecutedTask {
+        id: task_id,
+        project_id,
+        title,
+        worktree_path: worktree,
+    })
+}
+
+/// Count every `reorder_task` this window sends from now on, by task.
+///
+/// Counted on the wire, below Tauri's own entry points (which it defines
+/// read-only): every command leaves the window as a `fetch` to the IPC
+/// protocol, named in its URL and carrying its arguments as the body, or as
+/// a `window.ipc.postMessage` when that protocol is unavailable. Both are
+/// watched, so this sees exactly what crosses the boundary whichever part of
+/// the frontend sent it. Starting a task is `reorder_task` to the queue. The
+/// counts are read before the journey sends a `reorder_task` of its own (the
+/// stale Start), so every one they hold came from the drawer.
+async fn count_enqueues(driver: &WebDriver) -> Result<()> {
+    let installed = page(
+        driver,
+        r#"
+        const counts = (window.__slashitEnqueues = {});
+        const note = (command, args) => {
+            if (command !== "reorder_task" || !args) return;
+            let taskId;
+            try { taskId = (typeof args === "string" ? JSON.parse(args) : args).taskId; } catch (_) { return; }
+            if (taskId) counts[taskId] = (counts[taskId] || 0) + 1;
+        };
+        let watched = 0;
+        const fetch = window.fetch;
+        window.fetch = function (resource, init) {
+            const url = String(resource && resource.url ? resource.url : resource);
+            if (/^(ipc:|https?:\/\/ipc\.localhost)/.test(url)) {
+                note(decodeURIComponent(url.split("?")[0].split("/").pop()), init && init.body);
+            }
+            return fetch.apply(this, arguments);
+        };
+        if (window.fetch !== fetch) watched += 1;
+        if (window.ipc && typeof window.ipc.postMessage === "function") {
+            const post = window.ipc.postMessage;
+            try {
+                window.ipc.postMessage = function (data) {
+                    try {
+                        const message = JSON.parse(data);
+                        note(message.cmd, message.payload);
+                    } catch (_) {}
+                    return post.apply(this, arguments);
+                };
+                if (window.ipc.postMessage !== post) watched += 1;
+            } catch (_) {}
+        }
+        return watched;
+        "#,
+        Vec::new(),
+    )
+    .await?;
+    if installed.as_u64().unwrap_or_default() == 0 {
+        bail!("could not count the commands the window sends: neither IPC transport is writable");
+    }
+    Ok(())
+}
+
+async fn enqueues_for(driver: &WebDriver, task_id: &str) -> Result<u64> {
+    let sent = page(
+        driver,
+        "return (window.__slashitEnqueues || {})[arguments[0]] || 0;",
+        vec![Value::String(task_id.to_string())],
+    )
+    .await?;
+    Ok(sent.as_u64().unwrap_or_default())
+}
+
+async fn disabled(driver: &WebDriver, selector: &str) -> Result<bool> {
+    let found = page(
+        driver,
+        "const e = document.querySelector(arguments[0]); return e ? e.disabled : null;",
+        vec![Value::String(selector.to_string())],
+    )
+    .await?;
+    found
+        .as_bool()
+        .with_context(|| format!("{selector} is not on the page"))
+}
+
+/// Wait for a blocked agent run other than `other`, and return its process.
+async fn await_blocked_agent_other_than(agent: &FakeAgent, other: u32) -> Result<u32> {
+    let started = Instant::now();
+    loop {
+        if let Some(pid) = agent.blocked_pids()?.into_iter().find(|pid| *pid != other) {
+            return Ok(pid);
+        }
+        if started.elapsed() > EXECUTION_DEADLINE {
+            bail!(
+                "no second agent run announced itself within {}s",
+                EXECUTION_DEADLINE.as_secs()
+            );
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The directory holding the task store that records `task_id`.
+fn task_store_dir(root: &Path, task_id: &str) -> Result<PathBuf> {
+    for file in toml_files(root)? {
+        let Ok(contents) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Ok(document) = contents.parse::<toml::Value>() else {
+            continue;
+        };
+        if task_record(&document, task_id).is_some() {
+            return file
+                .parent()
+                .map(Path::to_path_buf)
+                .context("a task store with no parent directory");
+        }
+    }
+    bail!(
+        "no task store under {} records task {task_id}",
+        root.display()
+    )
+}
+
+/// A directory the application may read but not write, until released or
+/// dropped.
+struct ReadOnlyDir {
+    path: PathBuf,
+    restore: u32,
+}
+
+impl ReadOnlyDir {
+    fn hold(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let restore = std::fs::metadata(path)
+            .with_context(|| format!("could not read the mode of {}", path.display()))?
+            .permissions()
+            .mode();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500))
+            .with_context(|| format!("could not make {} read-only", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            restore,
+        })
+    }
+
+    fn release(self) -> Result<()> {
+        let path = self.path.clone();
+        let restore = self.restore;
+        std::mem::forget(self);
+        Self::restore_mode(&path, restore)
+    }
+
+    fn restore_mode(path: &Path, mode: u32) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("could not make {} writable again", path.display()))
+    }
+}
+
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        let _ = Self::restore_mode(&self.path, self.restore);
+    }
+}
+
 /// Create one more task in an existing project, through the product's own
 /// command. Returns its id and title.
 async fn create_task_in(driver: &WebDriver, project_id: &str, title_prefix: &str) -> Result<(String, String)> {

@@ -3,7 +3,8 @@ use leptos::callback::Callback;
 use leptos::task::spawn_local;
 use wasm_bindgen::JsCast;
 use crate::models::{Task, TaskStatus};
-use crate::services::{delete_task, reorder_task, create_pr};
+use crate::services::{delete_task, enqueue_task, reorder_task, create_pr, EnqueueOutcome};
+use crate::components::kanban::column_title;
 use crate::components::toast;
 use uuid::Uuid;
 
@@ -17,6 +18,8 @@ pub fn TaskContextMenu(
     on_edit: Callback<Task>,
     on_delete: Callback<Uuid>,
     on_move: Callback<(Task, TaskStatus)>,
+    /// Apply a task record a command returned, superseding older reads.
+    apply_task: Callback<Task>,
     on_pr_created: Callback<Task>,
     on_analyze_pr_comments: Callback<Task>,
     on_private_email_pr_error: Callback<Task>,
@@ -84,14 +87,26 @@ pub fn TaskContextMenu(
                 let task_clone = t.clone();
 
                 spawn_local(async move {
-                    match reorder_task(task_clone.id.to_string(), Some(TaskStatus::Queue), 0).await {
-                        Ok(Some(_)) => {
+                    // The same enqueue the drawer's Start and Retry make,
+                    // expecting the task where this card showed it.
+                    let seen_in = task_clone.status.clone();
+                    match enqueue_task(task_clone.id.to_string(), seen_in).await {
+                        Ok(EnqueueOutcome::Queued(_)) => {
                             toast::success(format!("'{}' added to queue", task_clone.title));
                             on_move.run((task_clone, TaskStatus::Queue));
                         }
-                        _ => {
-                            toast::error("Failed to add to queue".to_string());
+                        // The card was behind: nothing was changed. Show the
+                        // task where it really is.
+                        Ok(EnqueueOutcome::AlreadyMoved(current)) => {
+                            toast::info(format!(
+                                "'{}' was not queued: it is already in {}",
+                                task_clone.title,
+                                column_title(&current.status)
+                            ));
+                            apply_task.run(current);
                         }
+                        Ok(EnqueueOutcome::Missing) => toast::error("This task no longer exists".to_string()),
+                        Err(e) => toast::error(format!("Failed to add to queue: {e}")),
                     }
                     set_show.set(false);
                 });
@@ -119,7 +134,7 @@ pub fn TaskContextMenu(
                 spawn_local(async move {
                     match reorder_task(task_clone.id.to_string(), Some(status.clone()), 0).await {
                         Ok(Some(_)) => {
-                            toast::success(format!("Moved to {:?}", status));
+                            toast::success(format!("Moved to {}", column_title(&status)));
                             on_move.run((task_clone, status));
                         }
                         _ => {

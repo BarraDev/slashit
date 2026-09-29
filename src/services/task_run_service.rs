@@ -1,6 +1,6 @@
 //! What a Task's agent is doing: the live `agent-event` stream, the run
-//! snapshot behind it, and the two controls a person has over a run (stop it,
-//! or re-queue a failed one).
+//! snapshot behind it, and stopping a run. Re-queuing a task is
+//! [`crate::services::queue_service::enqueue_task`].
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -9,7 +9,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
-use crate::models::{AgentEvent, Task, TaskRunSnapshot, TaskStatus};
+use crate::models::{AgentEvent, TaskRunSnapshot};
 
 #[wasm_bindgen]
 extern "C" {
@@ -165,20 +165,4 @@ pub async fn get_task_run(task_id: String) -> Result<TaskRunSnapshot, String> {
 pub async fn stop_task_execution(task_id: String) -> Result<(), String> {
     invoke("stop_task_execution", serde_json::json!({ "taskId": task_id })).await?;
     Ok(())
-}
-
-/// Put a failed task back in the queue: the same move the board's "Add to
-/// Queue" menu item makes. Leaving Error resets the attempt's execution state
-/// and keeps its work, and the queue starts the task again on its own.
-pub async fn requeue_task(task_id: String) -> Result<Option<Task>, String> {
-    let value = invoke(
-        "reorder_task",
-        serde_json::json!({
-            "taskId": task_id,
-            "newStatus": TaskStatus::Queue,
-            "newPosition": 0,
-        }),
-    )
-    .await?;
-    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }
