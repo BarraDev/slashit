@@ -597,9 +597,10 @@ impl RunEventDrain {
     /// agent. An event the channel dropped because the forwarder fell more than
     /// its capacity behind is lost, and forwarding carries on with the next.
     ///
-    /// The one `wait` that returns before joining the reader is a failure to
-    /// wait for the process at all. Joining there could wait on a process
-    /// that is still running, so the run fails with the calls handled so far.
+    /// Two ends drain without the reader joined, and so keep only the calls
+    /// sent before the drain: a stopped run, whose process was killed
+    /// mid-output, and a `wait` that failed to wait for the process at all,
+    /// where joining could wait on a process that is still running.
     async fn drain(self) {
         let _ = self.request.send(());
         let _ = self.forwarder.await;
@@ -1975,7 +1976,7 @@ impl TaskExecutor {
 
             // Forward the run's events to the frontend, buffering its tool
             // calls for the write that ends the run.
-            let event_drain = RunEventForwarder {
+            let mut event_drain = Some(RunEventForwarder {
                 task_id,
                 run,
                 execution_id,
@@ -1985,7 +1986,7 @@ impl TaskExecutor {
                 run_tools: run_tools.clone(),
                 working_dir: working_dir.clone(),
             }
-            .spawn(runner.subscribe());
+            .spawn(runner.subscribe()));
 
             // Wait for the run to finish, or for a stop to end it early.
             //
@@ -2006,7 +2007,9 @@ impl TaskExecutor {
                     // event of this run is already sent. Handling them all
                     // before the run's end is recorded is what puts its last
                     // tool calls on the timeline.
-                    event_drain.drain().await;
+                    if let Some(drain) = event_drain.take() {
+                        drain.drain().await;
+                    }
                     match result {
                         Ok(_) => 'finished: {
                             // A run whose work could not be committed has
@@ -2123,6 +2126,11 @@ impl TaskExecutor {
             // Cleanup — the one path every outcome reaches, cancellation
             // included.
             let _ = runner.kill().await;
+            // A stopped run's calls are recorded by `stop_task` once this
+            // future has ended, so the ones already sent are handled first.
+            if let Some(drain) = event_drain.take() {
+                drain.drain().await;
+            }
             running_handles.write().await.remove(&task_id);
 
             if let Some(exec) = executions.write().await.get_mut(&execution_id) {
