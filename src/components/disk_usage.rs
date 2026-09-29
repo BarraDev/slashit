@@ -15,6 +15,7 @@ use crate::models::storage_usage::{
 use crate::services::storage_usage_service;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use std::future::Future;
 use wasm_bindgen::JsValue;
 
 #[component]
@@ -28,11 +29,10 @@ pub fn DiskUsage() -> impl IntoView {
         }
         refreshing.set(true);
         spawn_local(async move {
-            match storage_usage_service::refresh_storage_usage().await {
-                Ok(latest) => status.set(Some(latest)),
-                Err(e) => toast::error(format!("Could not measure disk usage: {e}")),
+            let measured = storage_usage_service::refresh_storage_usage();
+            if let Err(e) = refresh_into(measured, status, refreshing).await {
+                toast::error(format!("Could not measure disk usage: {e}"));
             }
-            refreshing.set(false);
         });
     };
 
@@ -41,22 +41,9 @@ pub fn DiskUsage() -> impl IntoView {
             return true;
         }
         spawn_local(async move {
-            match storage_usage_service::get_storage_usage().await {
-                Ok(current) => {
-                    // Nothing measured yet, or a measurement already running
-                    // that this view should wait for: either way, refresh
-                    // (which joins a running one rather than starting another).
-                    let wait = current.summary.is_none() || current.measuring;
-                    // A Refresh pressed while this read was in flight
-                    // answers with something at least as new.
-                    if refreshing.get_untracked() {
-                        return;
-                    }
-                    status.set(Some(current));
-                    if wait {
-                        refresh();
-                    }
-                }
+            match load_into(storage_usage_service::get_storage_usage(), status, refreshing).await {
+                Ok(true) => refresh(),
+                Ok(false) => {}
                 Err(e) => toast::error(format!("Could not read disk usage: {e}")),
             }
         });
@@ -104,6 +91,41 @@ pub fn DiskUsage() -> impl IntoView {
             }}
         </div>
     }
+}
+
+/// Show the measurement a Refresh answers with, then let Refresh be pressed
+/// again.
+async fn refresh_into(
+    measured: impl Future<Output = Result<StorageStatus, String>>,
+    status: RwSignal<Option<StorageStatus>>,
+    refreshing: RwSignal<bool>,
+) -> Result<(), String> {
+    let shown = measured.await.map(|latest| status.set(Some(latest)));
+    refreshing.set(false);
+    shown
+}
+
+/// Show the latest measurement when the section opens. Returns whether the
+/// view should refresh.
+async fn load_into(
+    read: impl Future<Output = Result<StorageStatus, String>>,
+    status: RwSignal<Option<StorageStatus>>,
+    refreshing: RwSignal<bool>,
+) -> Result<bool, String> {
+    let current = read.await?;
+    // Nothing measured yet, or a measurement already running that this view
+    // should wait for: either way, refresh (which joins a running one rather
+    // than starting another).
+    let wait = current.summary.is_none() || current.measuring;
+    // A Refresh pressed while this read was in flight answers with something
+    // at least as new, whether it is still running or has already shown its
+    // result. Only this read and a Refresh set `status`, so anything already
+    // there came from that Refresh.
+    if refreshing.get_untracked() || status.with_untracked(Option::is_some) {
+        return Ok(false);
+    }
+    status.set(Some(current));
+    Ok(wait)
 }
 
 fn summary_view(summary: StorageSummary) -> impl IntoView {
@@ -310,4 +332,101 @@ fn pressure_style(pressure: DiskPressure) -> (&'static str, &'static str) {
 fn local_time(at: &chrono::DateTime<chrono::Utc>) -> String {
     let date = js_sys::Date::new(&JsValue::from_f64(at.timestamp_millis() as f64));
     String::from(date.to_locale_string("en-US", &JsValue::UNDEFINED))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::channel::oneshot;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+
+    /// A status measured at `at`, or with nothing measured yet.
+    fn status_at(at: Option<&str>, measuring: bool) -> StorageStatus {
+        let summary = at.map(|at| {
+            serde_json::from_value(serde_json::json!({
+                "measured_at": at,
+                "duration_ms": 1,
+                "filesystem": null,
+                "filesystem_error": null,
+                "pressure": null,
+                "thresholds": null,
+                "slashit_owned_bytes": 0,
+                "active_workspace_bytes": 0,
+                "rebuildable_bytes": 0,
+                "reclaimable_bytes": 0,
+                "unknown_managed_bytes": 0,
+                "incomplete": false,
+                "links_not_followed": 0,
+                "mounts_not_entered": 0,
+                "external_checkouts": 0,
+                "largest_consumers": [],
+                "unmeasured": []
+            }))
+            .expect("a summary")
+        });
+        StorageStatus { summary, measuring, last_error: None }
+    }
+
+    #[test]
+    fn an_opening_read_answering_after_a_refresh_does_not_replace_it() {
+        let status = RwSignal::new(None::<StorageStatus>);
+        let refreshing = RwSignal::new(false);
+        let mut pool = LocalPool::new();
+        let spawner = pool.spawner();
+
+        // The section opens; its read is held while a measurement is running.
+        let (answer_read, read) = oneshot::channel();
+        let opening = std::rc::Rc::new(std::cell::Cell::new(None));
+        let opened = opening.clone();
+        spawner
+            .spawn_local(async move {
+                let read = async { read.await.expect("the read is answered") };
+                opened.set(Some(load_into(read, status, refreshing).await));
+            })
+            .unwrap();
+        pool.run_until_stalled();
+        assert_eq!(opening.take(), None, "the read is still in flight");
+
+        // Refresh is pressed and finishes with a newer measurement.
+        let newer = status_at(Some("2026-09-29T12:00:00Z"), false);
+        refreshing.set(true);
+        let measured = futures::future::ready(Ok(newer.clone()));
+        spawner
+            .spawn_local(async move {
+                refresh_into(measured, status, refreshing).await.unwrap();
+            })
+            .unwrap();
+        pool.run_until_stalled();
+        assert!(!refreshing.get_untracked());
+        assert_eq!(status.get_untracked(), Some(newer.clone()));
+
+        // Only now does the opening read answer, with what it saw before.
+        answer_read.send(Ok(status_at(None, true))).unwrap();
+        pool.run_until_stalled();
+        assert_eq!(status.get_untracked(), Some(newer), "the newer measurement stays");
+        assert_eq!(opening.take(), Some(Ok(false)), "no second refresh");
+    }
+
+    #[test]
+    fn an_opening_read_is_shown_when_nothing_else_answered_first() {
+        let status = RwSignal::new(None::<StorageStatus>);
+        let refreshing = RwSignal::new(false);
+        let current = status_at(Some("2026-09-29T12:00:00Z"), false);
+        let wait = futures::executor::block_on(load_into(
+            futures::future::ready(Ok(current.clone())),
+            status,
+            refreshing,
+        ));
+        assert_eq!(wait, Ok(false));
+        assert_eq!(status.get_untracked(), Some(current));
+
+        let status = RwSignal::new(None::<StorageStatus>);
+        let wait = futures::executor::block_on(load_into(
+            futures::future::ready(Ok(status_at(None, false))),
+            status,
+            refreshing,
+        ));
+        assert_eq!(wait, Ok(true), "nothing measured yet, so refresh");
+    }
 }
