@@ -8,6 +8,13 @@
 //! the walk anywhere. Checkouts tasks record elsewhere, adopted or from
 //! before SlashIt kept its own directory, are counted but not measured.
 //!
+//! Bytes are only ever counted by [`walk::measure`], anchored at the root
+//! being enumerated, which on Unix reaches every directory below it by
+//! handle without following links. The listings and checks here go by path
+//! and only decide what a directory is called and how it is classified, so
+//! a tree rearranged mid-measurement can be misattributed but, on Unix, not
+//! measured from outside the root.
+//!
 //! Ownership comes from the task record, not from what a directory is
 //! called. A checkout exactly one task records is that task's; any other
 //! directory under the worktree root is [`StorageClassification::Unknown`].
@@ -183,6 +190,7 @@ pub fn measure(inputs: &Inputs<'_>) -> StorageSummary {
     census.roots = roots.iter().map(|(path, _)| path.clone()).collect();
 
     for (root, kind) in &roots {
+        census.anchor = root.clone();
         match kind {
             RootKind::State => census.state_root(root),
             RootKind::Whole(kind, label) => {
@@ -270,6 +278,9 @@ struct Census<'a> {
     inputs: &'a Inputs<'a>,
     /// Every root being measured, so no root is also counted inside another.
     roots: Vec<PathBuf>,
+    /// The root being measured now. Every walk starts from it, and nothing
+    /// below it is followed if it is a link.
+    anchor: PathBuf,
     /// The fixed entries SlashIt writes in its data and configuration
     /// directories, and what each is.
     known: Vec<(PathBuf, ConsumerKind, &'static str)>,
@@ -298,6 +309,7 @@ impl<'a> Census<'a> {
         Self {
             inputs,
             roots: Vec::new(),
+            anchor: PathBuf::new(),
             known,
             consumers: Vec::new(),
             unlisted: false,
@@ -408,7 +420,7 @@ impl<'a> Census<'a> {
         let mut source = Spec::new(ConsumerKind::TaskCheckout, owner.task_title.clone(), StorageClassification::WorkspaceSource)
             .lifecycle(lifecycle.clone());
         source.detail = owner.project_name.clone();
-        self.push(walk::measure(path, &outputs, self.inputs.limits), source);
+        self.push(walk::measure(&self.anchor, path, &outputs, self.inputs.limits), source);
 
         let reclaimable = !lifecycle.may_be_in_use();
         for name in outputs {
@@ -416,12 +428,12 @@ impl<'a> Census<'a> {
                 .detail(format!("{name}/ build output"))
                 .lifecycle(lifecycle.clone())
                 .reclaimable(reclaimable);
-            self.push(walk::measure(&path.join(name), &[], self.inputs.limits), spec);
+            self.push(walk::measure(&self.anchor, &path.join(name), &[], self.inputs.limits), spec);
         }
     }
 
     fn whole(&mut self, path: &Path, spec: Spec) {
-        self.push(walk::measure(path, &[], self.inputs.limits), spec)
+        self.push(walk::measure(&self.anchor, path, &[], self.inputs.limits), spec)
     }
 
     fn push(&mut self, size: Result<TreeSize, WalkError>, spec: Spec) {

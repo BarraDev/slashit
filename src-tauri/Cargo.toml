@@ -62,6 +62,11 @@ tauri-plugin-wdio-webdriver = { version = "1.4", optional = true }
 # one bound syscall source instead of several hand-rolled `extern "C"`
 # declarations.
 libc = "0.2"
+# Directory-handle traversal for storage accounting (`openat` with
+# `O_NOFOLLOW`, `fstatat`), so a measurement cannot be steered out of the
+# tree it measures by a directory swapped for a link. Already built for
+# `fs4`.
+rustix = { version = "1", features = ["fs"] }
 
 [features]
 # ACCEPTANCE BUILDS ONLY. Never enable this for a release.

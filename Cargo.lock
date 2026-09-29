@@ -5390,6 +5390,7 @@ dependencies = [
  "libc",
  "mockall",
  "portable-pty",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

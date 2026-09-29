@@ -334,9 +334,32 @@ What each thing is:
 - A checkout whose cleanup was interrupted is measured but neither broken
   down nor offered, because a removal may be taking it apart.
 
-The walk never follows a symbolic link, never enters a Windows reparse
-point (junctions, mounted volumes, cloud placeholders), and on Unix does
-not cross into another filesystem. It counts allocated space where the
+Links are not followed, with a guarantee that differs by platform:
+
+- On Unix the walk goes by directory handle, not by path. From SlashIt's
+  root down, each directory is opened relative to its parent with
+  `O_NOFOLLOW`, each entry is stat'ed relative to that handle, and a
+  directory must still be the one that was listed (same device and inode)
+  when it is opened. A directory swapped for a link, or for another
+  directory, while the walk is running is reported as changed, never
+  measured through its new target. The walk does not cross into another
+  filesystem.
+- On Windows the walk goes by path, as the standard library does. It
+  enters no entry it sees as a reparse point (junctions, mounted volumes,
+  cloud placeholders), refuses a reparse point between SlashIt's root and
+  the item, and checks each directory again after listing it, discarding
+  what it listed if the directory has become a reparse point or another
+  directory. A directory replaced by a junction and restored between the
+  listing and that check is not caught: its target's entries can be
+  counted as its own. Closing that needs handle-relative enumeration.
+
+Which item a byte is attributed to, and whether it counts as rebuildable,
+is decided by path at one moment; a tree rearranged during a measurement
+can be attributed differently, but on Unix never includes bytes from
+outside SlashIt's root. None of this makes a measurement a basis for
+deleting anything: a cleanup must establish what it removes for itself.
+
+It counts allocated space where the
 platform reports it (Unix) and file length otherwise (Windows), counting
 hard-linked files once on Unix. An entry that cannot be read makes the
 item *partial*, and one that cannot be measured at all is listed as such,
