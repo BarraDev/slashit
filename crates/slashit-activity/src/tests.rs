@@ -316,3 +316,130 @@ fn a_rows_kind_name_is_its_stored_type() {
     let keys: Vec<String> = timeline(t(0), [], &entries).iter().map(Item::key).collect();
     assert_eq!(keys[..3], ["created", "entry-1", "entry-2"]);
 }
+
+#[test]
+fn reasons_keep_no_credential() {
+    let reasons = [
+        Kind::RunFailed {
+            run: Some(1),
+            reason: "Exit code 128 — fatal: unable to access \
+                     'https://x-access-token:ghs_0123456789abcdefghij@github.com/o/r.git/': 403"
+                .into(),
+        },
+        Kind::DeliveryFailed { reason: "gh: HTTP 401 (Authorization: token gho_0123456789abcdefghij)".into() },
+        Kind::AiReviewFailed { review: 1, reason: "API error: invalid x-api-key sk-ant-0123456789abcdef".into() },
+        Kind::AiFixFailed { review: 1, reason: "Fix agent failed: curl -H Authorization:Bearer eyJhbGciOiJIUzI1NiJ9".into() },
+        Kind::AiReviewSkipped {
+            review: 2,
+            reason: "the task's changes could not be read: GET https://h/x?X-Amz-Signature=deadbeef1234 failed".into(),
+        },
+    ];
+    let mut entries = Vec::new();
+    for kind in reasons {
+        record(&mut entries, t(1), kind);
+    }
+    let written = serde_json::to_string(&entries).unwrap();
+    for secret in ["ghs_", "gho_", "sk-ant", "eyJhbGci", "deadbeef1234", "X-Amz-Signature"] {
+        assert!(!written.contains(secret), "{secret} kept: {written}");
+    }
+    assert!(written.contains("https://***@github.com/o/r.git/"), "{written}");
+    assert!(written.contains("GET https://h/x failed"), "{written}");
+}
+
+#[test]
+fn tool_details_keep_no_credential() {
+    let mut entries = Vec::new();
+    record_tool(&mut entries, t(1), 1, "WebSearch", Some("why is ghp_0123456789abcdefghij rejected"));
+    record_tool(&mut entries, t(1), 1, "Bash", Some("curl -H \"Authorization:Bearer abc\" https://x"));
+    let details: Vec<_> = entries
+        .iter()
+        .map(|e| match &e.kind {
+            Kind::ToolUsed { detail, .. } => detail.clone().unwrap(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(details, ["why is *** rejected", "curl -H \"Authorization:*** ***\" https://x"]);
+}
+
+#[test]
+fn sanitizing_twice_changes_nothing_more() {
+    for text in [
+        "curl -H 'Authorization: Bearer abc' -u me:pw https://u:p@h/p?q=1",
+        "TOKEN=\"a b c\" run",
+        "rust token parser basic usage",
+    ] {
+        let once = sanitize(text, 300);
+        assert_eq!(sanitize(&once, 300), once, "{text}");
+    }
+    assert_eq!(sanitize("TOKEN=\"a b c\" run", 300), "TOKEN=\"*** *** ***\" run");
+    assert_eq!(sanitize("TOKEN=\"abc\" run", 300), "TOKEN=\"***\" run");
+}
+
+#[test]
+fn a_value_after_any_flag_or_assignment_is_masked_too() {
+    for (text, expected) in [
+        ("wget --header=X-Api-Key:abc123 https://api", "wget --header=X-Api-Key:*** https://api"),
+        ("curl --header=Authorization:Bearer abc123 https://x", "curl --header=Authorization:*** *** https://x"),
+        ("app --endpoint=https://h/cb?access_token=abc123", "app --endpoint=https://h/cb"),
+        ("gh api /x --raw-field=password=hunter2", "gh api /x --raw-field=password=***"),
+        ("tool --header=Authorization:ghp_0123456789abcdefghij", "tool --header=Authorization:***"),
+        ("CALLBACK=https://u:p@h/x run", "CALLBACK=https://***@h/x run"),
+        ("DB_PASS=hunter2 ./run", "DB_PASS=*** ./run"),
+        ("gpg --passphrase hunter2 -d f", "gpg --passphrase *** -d f"),
+        ("OPENAI_KEY=abc123 MY_SERVICE_KEY=abc", "OPENAI_KEY=*** MY_SERVICE_KEY=***"),
+        ("curl -H \"Ocp-Apim-Subscription-Key: abc\" x", "curl -H \"Ocp-Apim-Subscription-Key: ***\" x"),
+        ("curl -ualice:hunter2 https://x", "curl -u*** https://x"),
+        ("curl --user=alice:hunter2 https://x", "curl --user=*** https://x"),
+        ("git log --author=rui --since=2.weeks", "git log --author=rui --since=2.weeks"),
+    ] {
+        assert_eq!(redact(text), expected, "{text}");
+    }
+}
+
+#[test]
+fn every_url_in_a_word_loses_its_credentials() {
+    assert_eq!(
+        redact("[\"https://a.com\",\"https://u:tok@b.com/p\"]"),
+        "[\"https://a.com\",\"https://***@b.com/p\"]"
+    );
+    assert_eq!(redact("https://a.com,https://u:tok@b.com"), "https://a.com,https://***@b.com");
+}
+
+#[test]
+fn a_token_cut_short_by_a_truncation_is_still_masked() {
+    assert_eq!(redact("error: bad credentials ghp_abcdefgh…"), "error: bad credentials ***");
+    // Without the cut, as short a word is only a name.
+    assert_eq!(redact("see ghp_abcd"), "see ghp_abcd");
+}
+
+#[test]
+fn names_that_only_start_like_a_token_are_kept() {
+    for text in ["npm_config_cache=/tmp npm ci", "hf_hub_download(repo)", "ASIA-Pacific-region", "sk-learn"] {
+        assert_eq!(redact(text), text);
+    }
+}
+
+#[test]
+fn appended_tool_rows_and_linked_urls_are_sanitized_too() {
+    let mut entries = Vec::new();
+    let raw = Entry {
+        seq: 1,
+        at: t(1),
+        kind: Kind::ToolUsed { run: 1, tool: "Bash".into(), detail: Some("TOKEN=abc run".into()), count: 1 },
+    };
+    append(&mut entries, vec![raw]);
+    record(&mut entries, t(2), Kind::PrLinked { url: "https://u:p@github.com/o/r/pull/1?t=x".into(), number: Some(1) });
+    assert_eq!(
+        entries.iter().map(|e| e.kind.clone()).collect::<Vec<_>>(),
+        [
+            Kind::ToolUsed { run: 1, tool: "Bash".into(), detail: Some("TOKEN=*** run".into()), count: 1 },
+            Kind::PrLinked { url: "https://***@github.com/o/r/pull/1".into(), number: Some(1) },
+        ]
+    );
+}
+
+#[test]
+fn the_next_run_counts_past_a_start_dropped_from_a_full_timeline() {
+    let entries = vec![Entry { seq: 1, at: t(1), kind: Kind::RunFailed { run: Some(7), reason: "x".into() } }];
+    assert_eq!(next_run(&entries), 8);
+}

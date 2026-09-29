@@ -7,25 +7,23 @@
 //! is not.
 //!
 //! Nothing here is ever the tool's full input. A command keeps its first
-//! line, with anything that looks like a credential masked, and a path
-//! outside the checkout keeps only its file name, so neither a secret nor the
-//! layout of the user's machine is written into the task file.
+//! line, a path outside the checkout keeps only its file name, and every
+//! detail has anything that looks like a credential masked and URLs cut to
+//! their path, so neither a secret nor the layout of the user's machine is
+//! written into the task file.
 //!
 //! Calls are buffered per run in memory and reach the task only in the write
 //! that ends the run (see [`crate::queue::TaskExecutor`]): the board never
 //! shows a timeline row the task file does not have.
 
 use chrono::{DateTime, Utc};
-use slashit_activity::{one_line, Entry};
+use slashit_activity::Entry;
 
 use crate::domain::Task;
 
-/// The longest detail kept for a tool call, in characters.
-const MAX_DETAIL_CHARS: usize = 120;
-
 /// The tool calls one run has made so far, compacted and capped exactly as
 /// they will be on the task.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RunTools {
     run: u32,
     entries: Vec<Entry>,
@@ -47,37 +45,44 @@ impl RunTools {
         }
     }
 
-    /// Append the calls to `task`'s timeline.
-    pub fn apply_to(self, task: &mut Task) {
-        slashit_activity::append(&mut task.activity, self.entries);
+    /// Append the calls to `task`'s timeline. Takes `&self` so a write that
+    /// stages them and then fails leaves the buffer to the caller.
+    pub fn apply_to(&self, task: &mut Task) {
+        slashit_activity::append(&mut task.activity, self.entries.clone());
     }
 }
 
 /// The name and detail a tool call is shown with, or `None` for a tool the
 /// timeline does not keep.
+///
+/// Every detail is free text the agent chose, so every one takes the same
+/// path: reduced to the one field worth showing, with the checkout and home
+/// directory written as `.` and `~`, then [`slashit_activity::sanitize`]d.
 pub fn describe(tool: &str, input: &serde_json::Value, working_dir: &str) -> Option<(&'static str, Option<String>)> {
     let field = |key: &str| input.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
     let (name, detail) = match tool {
-        "Bash" => ("Bash", field("command").map(|c| without_private_paths(&first_command_line(c), working_dir))),
+        "Bash" => ("Bash", field("command").map(first_line)),
         "Read" => ("Read", field("file_path").map(|p| display_path(p, working_dir))),
         "Edit" => ("Edit", field("file_path").map(|p| display_path(p, working_dir))),
         "MultiEdit" => ("Edit", field("file_path").map(|p| display_path(p, working_dir))),
         "Write" => ("Write", field("file_path").map(|p| display_path(p, working_dir))),
         "NotebookEdit" => ("Edit", field("notebook_path").map(|p| display_path(p, working_dir))),
-        "Glob" => ("Glob", field("pattern").map(|p| without_private_paths(p, working_dir))),
-        "Grep" => ("Grep", field("pattern").map(|p| without_private_paths(p, working_dir))),
-        "WebFetch" => ("WebFetch", field("url").map(without_query)),
+        "Glob" => ("Glob", field("pattern").map(str::to_string)),
+        "Grep" => ("Grep", field("pattern").map(str::to_string)),
+        "WebFetch" => ("WebFetch", field("url").map(str::to_string)),
         "WebSearch" => ("WebSearch", field("query").map(str::to_string)),
         "Task" | "Agent" => ("Subagent", field("description").map(str::to_string)),
         _ => return None,
     };
-    Some((name, detail.map(|d| one_line(&d, MAX_DETAIL_CHARS)).filter(|d| !d.is_empty())))
+    let detail = detail.map(|d| {
+        slashit_activity::sanitize(&without_private_paths(&d, working_dir), slashit_activity::MAX_DETAIL_CHARS)
+    });
+    Some((name, detail.filter(|d| !d.is_empty())))
 }
 
-/// The first non-blank line of a shell command, with credentials masked.
-fn first_command_line(command: &str) -> String {
-    let line = command.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
-    redact(line)
+/// The first non-blank line of a shell command.
+fn first_line(command: &str) -> String {
+    command.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default().to_string()
 }
 
 /// `text` with the task's checkout written as `.` and the home directory as
@@ -85,14 +90,8 @@ fn first_command_line(command: &str) -> String {
 /// does not record the layout of the user's machine.
 fn without_private_paths(text: &str, working_dir: &str) -> String {
     let root = working_dir.trim_end_matches('/');
-    let mut out = if root.is_empty() { text.to_string() } else { text.replace(root, ".") };
-    if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
-        let home = home.trim_end_matches('/');
-        if home.len() > 1 {
-            out = out.replace(home, "~");
-        }
-    }
-    out
+    let text = if root.is_empty() { text.to_string() } else { text.replace(root, ".") };
+    crate::domain::task::without_home_dir(&text)
 }
 
 /// A path as the timeline shows it: relative to the task's checkout when it
@@ -106,120 +105,6 @@ fn display_path(path: &str, working_dir: &str) -> String {
         return path.to_string();
     }
     path.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or(path).to_string()
-}
-
-/// A URL without its query, fragment or credentials, any of which can carry
-/// a token.
-fn without_query(url: &str) -> String {
-    let url = url.split(['?', '#']).next().unwrap_or(url);
-    mask_url_credentials(url)
-}
-
-/// Words that mark an assignment, flag or header as carrying a secret.
-const SECRET_WORDS: &[&str] = &[
-    "token", "secret", "password", "passwd", "pwd", "apikey", "api_key", "api-key", "auth", "credential",
-    "cookie", "private_key", "access_key",
-];
-
-/// Prefixes of well-known credential formats.
-const SECRET_PREFIXES: &[&str] = &[
-    "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "sk-", "xoxb-", "xoxp-", "xoxa-", "AKIA",
-];
-
-const MASK: &str = "***";
-
-fn names_secret(word: &str) -> bool {
-    let word = word.to_ascii_lowercase();
-    SECRET_WORDS.iter().any(|s| word.contains(s))
-}
-
-/// Mask what looks like a credential in one shell command line: the value
-/// of an assignment or flag whose name mentions one, the word after
-/// `Bearer`/`Basic`, a token in a well-known format, and credentials in a
-/// URL. Best effort by construction -- which is why the rest of the input is
-/// never kept at all.
-pub fn redact(line: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    let mut mask_next = false;
-    // After `-u`/`--user`: masked when it is `user:password`.
-    let mut user_next = false;
-    // Inside a quoted header whose name mentions a secret: every word up to
-    // the closing quote is its value.
-    let mut in_secret_header = false;
-    for word in line.split_whitespace() {
-        let closes_quote = word.ends_with(['"', '\'']);
-        if in_secret_header {
-            out.push(if closes_quote { format!("{MASK}{}", &word[word.len() - 1..]) } else { MASK.to_string() });
-            in_secret_header = !closes_quote;
-            continue;
-        }
-        if mask_next {
-            out.push(MASK.to_string());
-            mask_next = false;
-            continue;
-        }
-        if std::mem::take(&mut user_next) && word.contains(':') {
-            out.push(MASK.to_string());
-            continue;
-        }
-        let bare = word.trim_matches(|c| c == '"' || c == '\'');
-        let lower = bare.to_ascii_lowercase();
-        if lower == "bearer" || lower == "basic" || lower == "token" {
-            out.push(word.to_string());
-            mask_next = true;
-            continue;
-        }
-        if let Some((name, _)) = bare.split_once('=') {
-            if names_secret(name) {
-                out.push(format!("{name}={MASK}"));
-                continue;
-            }
-        }
-        // `curl -u user:secret`: the value after a user flag carries the
-        // password when it has one.
-        if matches!(bare, "-u" | "--user") {
-            out.push(word.to_string());
-            user_next = true;
-            continue;
-        }
-        if bare.starts_with('-') && names_secret(bare) {
-            out.push(word.to_string());
-            mask_next = true;
-            continue;
-        }
-        if let Some((name, value)) = bare.split_once(':') {
-            if !bare.contains("://") && names_secret(name) {
-                if value.is_empty() {
-                    // `"Authorization: Bearer x"`: the value is in the
-                    // following words.
-                    out.push(word.to_string());
-                    in_secret_header = word.starts_with(['"', '\'']) && !closes_quote;
-                    mask_next = !in_secret_header;
-                } else {
-                    out.push(format!("{name}:{MASK}"));
-                }
-                continue;
-            }
-        }
-        if SECRET_PREFIXES.iter().any(|p| bare.starts_with(p) && bare.len() > p.len() + 8) {
-            out.push(MASK.to_string());
-            continue;
-        }
-        out.push(mask_url_credentials(word));
-    }
-    out.join(" ")
-}
-
-fn mask_url_credentials(word: &str) -> String {
-    let Some(scheme_end) = word.find("://") else {
-        return word.to_string();
-    };
-    let rest = &word[scheme_end + 3..];
-    let host_end = rest.find('/').unwrap_or(rest.len());
-    match rest[..host_end].rfind('@') {
-        Some(at) => format!("{}{MASK}@{}", &word[..scheme_end + 3], &rest[at + 1..]),
-        None => word.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -241,7 +126,7 @@ mod tests {
         );
         let long = "echo ".to_string() + &"x".repeat(500);
         let (_, d) = detail("Bash", json!({ "command": long })).unwrap();
-        assert_eq!(d.unwrap().chars().count(), MAX_DETAIL_CHARS);
+        assert_eq!(d.unwrap().chars().count(), slashit_activity::MAX_DETAIL_CHARS);
     }
 
     #[test]
@@ -293,6 +178,82 @@ mod tests {
         for (input, expected) in cases {
             let (_, d) = detail("Bash", json!({ "command": input })).unwrap();
             assert_eq!(d.as_deref(), Some(expected), "{input}");
+        }
+    }
+
+    #[test]
+    fn authorization_headers_are_masked_however_they_are_written() {
+        let cases = [
+            ("curl -H \"Authorization:Bearer abc\" https://x", "curl -H \"Authorization:*** ***\" https://x"),
+            ("curl -H 'Authorization:Basic dXNlcjpw' https://x", "curl -H 'Authorization:*** ***' https://x"),
+            ("curl -H \"Authorization:token abc def\" https://x", "curl -H \"Authorization:*** *** ***\" https://x"),
+            ("curl -H Authorization:Bearer abc https://x", "curl -H Authorization:*** *** https://x"),
+            ("curl -H Authorization:token abc https://x", "curl -H Authorization:*** *** https://x"),
+            ("curl -H Authorization: Bearer abc https://x", "curl -H Authorization: *** *** https://x"),
+            ("curl -H Authorization: Basic abc https://x", "curl -H Authorization: *** *** https://x"),
+            ("curl -H Authorization: token abc https://x", "curl -H Authorization: *** *** https://x"),
+            ("curl -H \"Authorization: Basic abc\" https://x", "curl -H \"Authorization: *** ***\" https://x"),
+        ];
+        for (input, expected) in cases {
+            let (_, d) = detail("Bash", json!({ "command": input })).unwrap();
+            assert_eq!(d.as_deref(), Some(expected), "{input}");
+            assert!(!d.unwrap().contains("abc"), "{input}");
+        }
+    }
+
+    #[test]
+    fn every_free_text_detail_is_sanitized() {
+        let token = "ghp_0123456789abcdefghij";
+        for (tool, input) in [
+            ("WebSearch", json!({ "query": format!("why does {token} fail") })),
+            ("Grep", json!({ "pattern": format!("GITHUB_TOKEN={token}") })),
+            ("Grep", json!({ "pattern": token })),
+            ("Glob", json!({ "pattern": format!("**/{token}/*.rs") })),
+            ("Task", json!({ "description": format!("check the key {token}") })),
+            ("Agent", json!({ "description": format!("use Bearer {token}") })),
+            ("Read", json!({ "file_path": format!("{WD}/{token}.txt") })),
+        ] {
+            let (_, d) = detail(tool, input.clone()).unwrap();
+            let d = d.unwrap();
+            assert!(!d.contains(token), "{tool} {input}: {d}");
+            assert!(d.contains("***"), "{tool} {input}: {d}");
+        }
+    }
+
+    #[test]
+    fn signed_urls_keep_neither_query_nor_fragment() {
+        let url = "https://bucket.s3.amazonaws.com/o?X-Amz-Signature=abc123&X-Amz-Credential=AKIA0123456789ABCDEF#k";
+        assert_eq!(
+            detail("Bash", json!({ "command": format!("curl -o out \"{url}\"") })),
+            Some(("Bash", Some("curl -o out \"https://bucket.s3.amazonaws.com/o\"".to_string())))
+        );
+        assert_eq!(
+            detail("WebSearch", json!({ "query": format!("{url} expired") })),
+            Some(("WebSearch", Some("https://bucket.s3.amazonaws.com/o expired".to_string())))
+        );
+    }
+
+    #[test]
+    fn ordinary_text_stays_useful() {
+        for (tool, input, expected) in [
+            ("WebSearch", json!({"query": "rust token parser basic usage"}), "rust token parser basic usage"),
+            ("Task", json!({"description": "Explore the auth module"}), "Explore the auth module"),
+            ("Grep", json!({"pattern": "fn record_tool"}), "fn record_tool"),
+            ("Bash", json!({"command": "git log --author=rui -5"}), "git log --author=rui -5"),
+            ("WebFetch", json!({"url": "https://docs.rs/chrono/latest/chrono/"}), "https://docs.rs/chrono/latest/chrono/"),
+        ] {
+            assert_eq!(detail(tool, input), Some((describe_name(tool), Some(expected.to_string()))), "{tool}");
+        }
+    }
+
+    fn describe_name(tool: &str) -> &'static str {
+        match tool {
+            "Task" | "Agent" => "Subagent",
+            "WebSearch" => "WebSearch",
+            "Grep" => "Grep",
+            "Bash" => "Bash",
+            "WebFetch" => "WebFetch",
+            _ => unreachable!(),
         }
     }
 

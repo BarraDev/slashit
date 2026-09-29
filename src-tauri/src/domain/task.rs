@@ -208,6 +208,15 @@ pub struct Task {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// `text` with the user's home directory written as `~`, for text the task
+/// file keeps that may name a path on this machine.
+pub(crate) fn without_home_dir(text: &str) -> String {
+    match std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
+        Some(home) if home.trim_end_matches('/').len() > 1 => text.replace(home.trim_end_matches('/'), "~"),
+        _ => text.to_string(),
+    }
+}
+
 impl Task {
     /// Return the task to a state work can start from again, keeping the work
     /// it has already produced.
@@ -280,7 +289,19 @@ impl Task {
     }
 
     /// [`Self::record_activity`] for a milestone that happened at `at`.
-    pub fn record_activity_at(&mut self, at: chrono::DateTime<chrono::Utc>, kind: ActivityKind) -> bool {
+    ///
+    /// A reason is subprocess or agent text, so the home directory in it is
+    /// written as `~` here; the timeline masks credentials in it on the way
+    /// in (see [`slashit_activity::sanitize`]).
+    pub fn record_activity_at(&mut self, at: chrono::DateTime<chrono::Utc>, mut kind: ActivityKind) -> bool {
+        match &mut kind {
+            ActivityKind::RunFailed { reason, .. }
+            | ActivityKind::AiReviewFailed { reason, .. }
+            | ActivityKind::AiReviewSkipped { reason, .. }
+            | ActivityKind::AiFixFailed { reason, .. }
+            | ActivityKind::DeliveryFailed { reason } => *reason = without_home_dir(reason),
+            _ => {}
+        }
         slashit_activity::record(&mut self.activity, at, kind)
     }
 
@@ -1232,6 +1253,28 @@ mod tests {
 
     /// Recorded milestones are what the task file holds, and read back the
     /// same after a restart, in TOML and over IPC.
+    /// A failure reason names no path under the user's home and keeps no
+    /// credential, whichever producer wrote it.
+    #[test]
+    fn failure_reasons_do_not_record_the_home_directory_or_credentials() {
+        let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()).filter(|h| h.len() > 1) else {
+            return;
+        };
+        let mut task = crate::test_helpers::create_test_task("t");
+        task.record_activity(ActivityKind::DeliveryFailed {
+            reason: format!(
+                "git push failed in {home}/.local/share/slashit/worktrees/t: \
+                 https://oauth2:glpat-0123456789abcdefghij@gitlab.com/o/r.git"
+            ),
+        });
+        assert_eq!(
+            task.activity[0].kind,
+            ActivityKind::DeliveryFailed {
+                reason: "git push failed in ~/.local/share/slashit/worktrees/t: https://***@gitlab.com/o/r.git".into()
+            }
+        );
+    }
+
     #[test]
     fn activity_round_trips_through_the_task_file_and_ipc() {
         #[derive(Serialize, Deserialize)]

@@ -17,12 +17,16 @@
 //! from these entries; that stays with its status, phase and review record.
 //!
 //! Raw agent output is never an entry. The one kind of agent activity kept is
-//! a tool call, reduced by the backend to the tool's name and a short,
-//! sanitized detail (a command's first line, a path relative to the task's
-//! checkout), with repeats compacted and each run's share capped.
+//! a tool call, reduced by the backend to the tool's name and a short detail
+//! (a command's first line, a path relative to the task's checkout), with
+//! repeats compacted and each run's share capped. Every detail and reason is
+//! [`sanitize`]d on the way in.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+mod sanitize;
+pub use sanitize::{redact, sanitize, MASK};
 
 /// The most entries one task keeps. When a new entry would exceed it, tool
 /// calls are dropped first, oldest first, and milestones only when no tool
@@ -37,6 +41,9 @@ pub const MAX_TOOL_ENTRIES_PER_RUN: usize = 20;
 /// keeps, in characters. The full text stays where it always was, on the
 /// task's error or review record.
 pub const MAX_REASON_CHARS: usize = 300;
+
+/// The longest detail a tool call keeps, in characters.
+pub const MAX_DETAIL_CHARS: usize = 120;
 
 /// A task's column, as the timeline names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,23 +215,26 @@ enum Identity<'a> {
 /// Append `kind` at `at`, unless it is a once-only milestone already
 /// recorded. Returns whether anything was added.
 ///
-/// Reasons are cut to one bounded line here, so no caller can store a
+/// Reasons, tool details and pull request URLs are [`sanitize`]d here, and
+/// reasons cut to one bounded line, so no caller can store a credential or a
 /// transcript by passing one in.
 pub fn record(entries: &mut Vec<Entry>, at: DateTime<Utc>, mut kind: Kind) -> bool {
+    sanitize_text(&mut kind);
     if let Some(identity) = kind.identity() {
         if entries.iter().any(|e| e.kind.identity().as_ref() == Some(&identity)) {
             return false;
         }
     }
-    bound_reason(&mut kind);
     push(entries, at, kind);
     true
 }
 
 /// Record one tool call in `run`: a repeat of the run's last call (same tool,
 /// same detail) adds to its count, and calls past the run's cap are counted
-/// rather than listed.
+/// rather than listed. The detail is [`sanitize`]d first.
 pub fn record_tool(entries: &mut Vec<Entry>, at: DateTime<Utc>, run: u32, tool: &str, detail: Option<&str>) {
+    let detail = detail.map(|d| sanitize(d, MAX_DETAIL_CHARS)).filter(|d| !d.is_empty());
+    let detail = detail.as_deref();
     let last_tool = entries.iter_mut().rev().find(|e| match &e.kind {
         Kind::ToolUsed { run: r, .. } => *r == run,
         _ => false,
@@ -259,10 +269,12 @@ pub fn record_tool(entries: &mut Vec<Entry>, at: DateTime<Utc>, run: u32, tool: 
 
 /// Append entries recorded elsewhere -- a run's tool calls, buffered until
 /// the run ends -- keeping their times and giving them the next positions.
-/// Once-only milestones among them are skipped if already recorded.
+/// Their text is [`sanitize`]d again, and once-only milestones among them are
+/// skipped if already recorded.
 pub fn append(entries: &mut Vec<Entry>, recorded: Vec<Entry>) {
-    for entry in recorded {
+    for mut entry in recorded {
         if entry.kind.is_tool() {
+            sanitize_text(&mut entry.kind);
             push(entries, entry.at, entry.kind);
         } else {
             record(entries, entry.at, entry.kind);
@@ -279,13 +291,16 @@ fn push(entries: &mut Vec<Entry>, at: DateTime<Utc>, kind: Kind) {
     }
 }
 
-fn bound_reason(kind: &mut Kind) {
+/// Every piece of free text `kind` carries, [`sanitize`]d.
+fn sanitize_text(kind: &mut Kind) {
     match kind {
         Kind::RunFailed { reason, .. }
         | Kind::AiReviewFailed { reason, .. }
         | Kind::AiReviewSkipped { reason, .. }
         | Kind::AiFixFailed { reason, .. }
-        | Kind::DeliveryFailed { reason } => *reason = one_line(reason, MAX_REASON_CHARS),
+        | Kind::DeliveryFailed { reason } => *reason = sanitize(reason, MAX_REASON_CHARS),
+        Kind::ToolUsed { detail: Some(detail), .. } => *detail = sanitize(detail, MAX_DETAIL_CHARS),
+        Kind::PrLinked { url, .. } => *url = redact(url),
         _ => {}
     }
 }
@@ -302,12 +317,18 @@ pub fn one_line(text: &str, max: usize) -> String {
     cut
 }
 
-/// The number the next coding run gets.
+/// The number the next coding run gets: one past any run recorded, so a
+/// run whose start was dropped to keep the timeline bounded still has its
+/// number.
 pub fn next_run(entries: &[Entry]) -> u32 {
     entries
         .iter()
         .filter_map(|e| match e.kind {
-            Kind::RunStarted { run, .. } => Some(run),
+            Kind::RunStarted { run, .. }
+            | Kind::RunCompleted { run }
+            | Kind::RunFailed { run: Some(run), .. }
+            | Kind::ToolUsed { run, .. }
+            | Kind::ToolsOmitted { run, .. } => Some(run),
             _ => None,
         })
         .max()
