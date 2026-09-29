@@ -339,9 +339,9 @@ fn reasons_keep_no_credential() {
         record(&mut entries, t(1), kind);
     }
     let written = serde_json::to_string(&entries).unwrap();
-    for secret in ["ghs_", "gho_", "sk-ant", "eyJhbGci", "deadbeef1234", "X-Amz-Signature"] {
-        assert!(!written.contains(secret), "{secret} kept: {written}");
-    }
+    let fragments = ["ghs_", "gho_", "sk-ant", "eyJhbGci", "deadbeef1234", "X-Amz-Signature"];
+    let kept: Vec<usize> = (0..fragments.len()).filter(|&i| written.contains(fragments[i])).collect();
+    assert!(kept.is_empty(), "fragments at {kept:?} were kept");
     assert!(written.contains("https://***@github.com/o/r.git/"), "{written}");
     assert!(written.contains("GET https://h/x failed"), "{written}");
 }

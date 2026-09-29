@@ -267,7 +267,7 @@ mod tests {
             detail("Glob", json!({"pattern": format!("{WD}/**/*.rs")})),
             Some(("Glob", Some("./**/*.rs".to_string())))
         );
-        if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()).filter(|h| h.len() > 1) {
+        if let Some(home) = dirs::home_dir().and_then(|h| h.into_os_string().into_string().ok()).filter(|h| h.len() > 1) {
             assert_eq!(
                 detail("Grep", json!({"pattern": format!("{home}/notes")})),
                 Some(("Grep", Some("~/notes".to_string())))

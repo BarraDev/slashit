@@ -211,8 +211,10 @@ pub struct Task {
 /// `text` with the user's home directory written as `~`, for text the task
 /// file keeps that may name a path on this machine.
 pub(crate) fn without_home_dir(text: &str) -> String {
-    match std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
-        Some(home) if home.trim_end_matches('/').len() > 1 => text.replace(home.trim_end_matches('/'), "~"),
+    match dirs::home_dir().and_then(|h| h.into_os_string().into_string().ok()) {
+        Some(home) if home.trim_end_matches(['/', '\\']).len() > 1 => {
+            text.replace(home.trim_end_matches(['/', '\\']), "~")
+        }
         _ => text.to_string(),
     }
 }
@@ -1257,9 +1259,11 @@ mod tests {
     /// credential, whichever producer wrote it.
     #[test]
     fn failure_reasons_do_not_record_the_home_directory_or_credentials() {
-        let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()).filter(|h| h.len() > 1) else {
-            return;
-        };
+        let home = dirs::home_dir()
+            .and_then(|h| h.into_os_string().into_string().ok())
+            .expect("a home directory")
+            .trim_end_matches(['/', '\\'])
+            .to_string();
         let mut task = crate::test_helpers::create_test_task("t");
         task.record_activity(ActivityKind::DeliveryFailed {
             reason: format!(
