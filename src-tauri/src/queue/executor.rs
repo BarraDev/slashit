@@ -3,6 +3,8 @@ use crate::domain::{Task, TaskStatus, TaskPhase, AgentExecution, AgentStatus, Ag
 use crate::domain::task::ExternalRef;
 use crate::queue::admission::{Admission, AdmissionPermit};
 use crate::queue::start_guard::StartGuard;
+use crate::queue::tool_activity::RunTools;
+use crate::domain::task::ActivityKind;
 use crate::queue::prompt::{build_task_prompt, build_review_prompt, build_fix_prompt};
 use crate::queue::QueueManager;
 use crate::worktree::{CheckoutCommit, WorktreeInfo, WorktreeManager};
@@ -12,6 +14,13 @@ use crate::events::{EventSink, SharedEventSink};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+/// A coding run that has ended, for the write that records how.
+struct RunEnd {
+    run: u32,
+    /// Its tool calls, if any were buffered.
+    tools: Option<RunTools>,
+}
 
 /// A finished agent run inside the review flow.
 struct AgentRun {
@@ -530,6 +539,17 @@ pub struct TaskExecutor {
     /// Whether there is disk space to begin a new execution. Asked before
     /// anything a start does, and never about work already running.
     start_guard: Arc<StartGuard>,
+    /// The tool calls of each task's current coding run, held until the
+    /// write that ends the run records them on the task. See
+    /// [`crate::queue::tool_activity`].
+    run_tools: SharedRunTools,
+}
+
+type SharedRunTools = Arc<std::sync::Mutex<HashMap<Uuid, RunTools>>>;
+
+/// Take the buffered tool calls of `task_id`'s run, if it made any.
+fn take_run_tools(run_tools: &SharedRunTools, task_id: Uuid) -> Option<RunTools> {
+    run_tools.lock().unwrap_or_else(|p| p.into_inner()).remove(&task_id)
 }
 
 pub struct TaskExecutorConfig {
@@ -581,6 +601,7 @@ impl TaskExecutor {
             pr_check_counter: std::sync::atomic::AtomicU32::new(0),
             unrecorded_acquisitions: std::sync::Mutex::new(HashMap::new()),
             start_guard: config.start_guard,
+            run_tools: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -973,6 +994,7 @@ impl TaskExecutor {
 
     /// Write a PR's remote state onto the task's matching external ref.
     fn record_pr_state(task: &mut Task, number: u32, state: &str) {
+        task.record_pr_state(number, state);
         for r in &mut task.external_refs {
             if let crate::domain::task::ExternalRef::GithubPr { number: n, state: ref mut s, .. } = r {
                 if *n == number {
@@ -1588,7 +1610,7 @@ impl TaskExecutor {
                     task_id: task_id.to_string(),
                     message: format!("Cannot resolve working directory: {}", e),
                 });
-                Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &e).await;
+                Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &e, None).await;
                 return Err(format!("Cannot resolve working directory: {e}"));
             }
         };
@@ -1607,7 +1629,7 @@ impl TaskExecutor {
                     task_id: task_id.to_string(),
                     message: message.clone(),
                 });
-                Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &message).await;
+                Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &message, None).await;
                 return Err(message);
             }
         };
@@ -1640,7 +1662,7 @@ impl TaskExecutor {
                 // record, which leaves the task pending; the backoff is what
                 // then keeps the poller from creating and taking back a
                 // checkout on every pass.
-                Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &message).await;
+                Self::set_task_error_static(&self.tasks, &self.storage, &self.events, task_id, &message, None).await;
                 let mut backoff = self.unrecorded_backoff_lock();
                 // Entries otherwise leave only when their own task is looked
                 // up again; this drops the expired ones of tasks that never
@@ -1671,6 +1693,12 @@ impl TaskExecutor {
             }
         };
 
+        let run = self.record_run_started(task_id).await;
+        self.run_tools
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(task_id, RunTools::new(run));
+
         // Update phase
         self.update_task_phase(task_id, TaskPhase::Coding, 5).await;
 
@@ -1687,6 +1715,7 @@ impl TaskExecutor {
         let events = self.events.clone();
         let storage = self.storage.clone();
         let working_dir_for_commit = working_dir.clone();
+        let run_tools = self.run_tools.clone();
         let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
 
         // The lock is taken before the spawn and held across the insert so
@@ -1754,7 +1783,8 @@ impl TaskExecutor {
                 Err(e) => {
                     let msg = format!("Failed to start claude: {}", e);
                     record_output(&logs, execution_id, LogLevel::Error, msg.clone()).await;
-                    Self::set_task_error_static(&tasks, &storage, &events, task_id, &msg).await;
+                    let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id) };
+                    Self::set_task_error_static(&tasks, &storage, &events, task_id, &msg, Some(ended)).await;
                     // This early return skips the removal after `runner.wait()`
                     // below, so it must remove itself here or this slot never
                     // frees up.
@@ -1790,6 +1820,8 @@ impl TaskExecutor {
             let logs_events = logs.clone();
             let execution_id_events = execution_id;
             let tasks_for_events = tasks.clone();
+            let run_tools_events = run_tools.clone();
+            let tools_dir = working_dir.clone();
 
             tokio::spawn(async move {
                 while let Ok(event) = event_rx.recv().await {
@@ -1813,7 +1845,16 @@ impl TaskExecutor {
                                 });
                             }
                         }
-                        ClaudeEvent::ToolUse { tool, .. } => {
+                        ClaudeEvent::ToolUse { tool, input } => {
+                            // Only a complete call is buffered: a partial
+                            // stream announces the same call once without
+                            // its input before the whole message repeats it.
+                            if let Some(input) = input {
+                                let mut buffered = run_tools_events.lock().unwrap_or_else(|p| p.into_inner());
+                                if let Some(tools) = buffered.get_mut(&task_id).filter(|t| t.run() == run) {
+                                    tools.push(chrono::Utc::now(), tool, input, &tools_dir);
+                                }
+                            }
                             record_output(&logs_events, execution_id_events, LogLevel::Info, format!("Using tool: {}", tool)).await;
                             events_stream.agent_event(AgentEvent::ToolUse {
                                 task_id: task_id_str.clone(),
@@ -1873,7 +1914,8 @@ impl TaskExecutor {
                                 Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await
                             {
                                 record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
-                                Self::set_task_error_static(&tasks, &storage, &events, task_id, &message).await;
+                                let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id) };
+                                Self::set_task_error_static(&tasks, &storage, &events, task_id, &message, Some(ended)).await;
                                 ending = Some(AgentEvent::Error {
                                     task_id: task_id.to_string(),
                                     message,
@@ -1883,17 +1925,41 @@ impl TaskExecutor {
 
                             // Move to AiReview for automated review before human review
                             Self::update_task_phase_static(&tasks, task_id, TaskPhase::QaReview, 80).await;
-                            {
-                                let mut tasks_w = tasks.write().await;
-                                if let Some(t) = tasks_w.get_mut(&task_id) {
+                            // The move and the run's timeline rows are one
+                            // durable write, published only once it is on disk.
+                            let tools = std::sync::Mutex::new(take_run_tools(&run_tools, task_id));
+                            let amend = |staged: &mut HashMap<Uuid, Task>| {
+                                if let Some(t) = staged.get_mut(&task_id) {
                                     t.status = TaskStatus::AiReview;
                                     t.overall_progress = 80;
-                                    t.updated_at = chrono::Utc::now();
+                                    if let Some(tools) = tools.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                                        tools.apply_to(t);
+                                    }
+                                    t.record_activity(ActivityKind::RunCompleted { run });
                                 }
-                            }
+                            };
                             let completed = "Agent completed — moving to AI review".to_string();
                             record_output(&logs, execution_id, LogLevel::Info, completed.clone()).await;
-                            Self::persist_task_static(&tasks, &storage, task_id).await;
+                            if let Err(e) = crate::lifecycle::record(&tasks, &storage, task_id, &amend).await {
+                                // As before this write was made durable-first:
+                                // the task still moves on to review in memory,
+                                // and its timeline rows, which would describe a
+                                // write the file does not have, are dropped.
+                                events.agent_event(AgentEvent::Log {
+                                    task_id: task_id.to_string(),
+                                    level: LogLevel::Warn,
+                                    message: format!("Recording the finished run failed: {e}"),
+                                });
+                                {
+                                    let mut tasks_w = tasks.write().await;
+                                    if let Some(t) = tasks_w.get_mut(&task_id) {
+                                        t.status = TaskStatus::AiReview;
+                                        t.overall_progress = 80;
+                                        t.updated_at = chrono::Utc::now();
+                                    }
+                                }
+                                Self::persist_task_static(&tasks, &storage, task_id).await;
+                            }
                             ending = Some(AgentEvent::Completed {
                                 task_id: task_id.to_string(),
                                 success: true,
@@ -1921,7 +1987,8 @@ impl TaskExecutor {
                                 err_msg.clone()
                             };
                             record_output(&logs, execution_id, LogLevel::Error, full_msg.clone()).await;
-                            Self::set_task_error_static(&tasks, &storage, &events, task_id, &full_msg).await;
+                            let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id) };
+                            Self::set_task_error_static(&tasks, &storage, &events, task_id, &full_msg, Some(ended)).await;
                             ending = Some(AgentEvent::Error {
                                 task_id: task_id.to_string(),
                                 message: full_msg,
@@ -2119,7 +2186,8 @@ impl TaskExecutor {
         // outcome may have left the task stranded `InProgress` with no live
         // owner, and that is the one case this settles to `Backlog`.
         let from_status = ended.unwrap_or(TaskStatus::InProgress);
-        Self::settle_stopped_static(&self.tasks, &self.storage, task_id, from_status).await
+        let tools = take_run_tools(&self.run_tools, task_id);
+        Self::settle_stopped_static(&self.tasks, &self.storage, task_id, from_status, tools).await
     }
 
     /// End whatever execution or AI review/fix ownership currently exists for
@@ -2419,6 +2487,7 @@ impl TaskExecutor {
         storage: &crate::config::Storage,
         task_id: Uuid,
         from_status: TaskStatus,
+        tools: Option<RunTools>,
     ) -> Result<(), String> {
         let mut tasks_w = tasks.write().await;
 
@@ -2434,6 +2503,10 @@ impl TaskExecutor {
             let mut stopped = task.clone();
             stopped.status = TaskStatus::Backlog;
             stopped.reset_execution_state();
+            if let Some(tools) = tools {
+                tools.apply_to(&mut stopped);
+            }
+            stopped.record_activity(ActivityKind::Stopped { from: from_status.column() });
             stopped.updated_at = chrono::Utc::now();
             stopped
         };
@@ -2587,6 +2660,10 @@ impl TaskExecutor {
             return;
         }
 
+        // This review's number on the task's timeline. Only one review runs
+        // for a task at a time, under this lease, so no other can take it.
+        let review = self.tasks.read().await.get(&task_id).map_or(1, Task::next_review);
+
         // The task's own worktree, or no review at all.
         //
         // This used to fall back to the repository path, and a review is not a
@@ -2620,12 +2697,17 @@ impl TaskExecutor {
                 timestamp: chrono::Utc::now(),
                 session_id: Uuid::new_v4(),
             };
+            let trail = vec![(
+                chrono::Utc::now(),
+                ActivityKind::AiReviewSkipped { review, reason: "this task has no worktree of its own".to_string() },
+            )];
             Self::transition_to_human_review(
                 &self.tasks,
                 &self.storage,
                 &self.events,
                 task_id,
                 Some(signoff),
+                trail,
             )
             .await;
             return;
@@ -2666,6 +2748,7 @@ impl TaskExecutor {
             let _permit = permit;
 
             let task_id_str = task_id.to_string();
+            let started = (chrono::Utc::now(), ActivityKind::AiReviewStarted { review });
 
             events.agent_event(AgentEvent::Log {
                 task_id: task_id_str.clone(),
@@ -2699,7 +2782,11 @@ impl TaskExecutor {
                         timestamp: chrono::Utc::now(),
                         session_id: Uuid::new_v4(),
                     };
-                    Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff)).await;
+                    let trail = vec![(
+                        chrono::Utc::now(),
+                        ActivityKind::AiReviewSkipped { review, reason: format!("the task's changes could not be read: {e}") },
+                    )];
+                    Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff), trail).await;
                     reviewing_handles.write().await.remove(&task_id);
                     return;
                 }
@@ -2716,7 +2803,11 @@ impl TaskExecutor {
                     level: LogLevel::Info,
                     message: "No changes detected, skipping review".to_string(),
                 });
-                Self::transition_to_human_review(&tasks, &storage, &events, task_id, None).await;
+                let trail = vec![(
+                    chrono::Utc::now(),
+                    ActivityKind::AiReviewSkipped { review, reason: "no changes to review".to_string() },
+                )];
+                Self::transition_to_human_review(&tasks, &storage, &events, task_id, None, trail).await;
                 reviewing_handles.write().await.remove(&task_id);
                 return;
             }
@@ -2845,7 +2936,11 @@ impl TaskExecutor {
                         timestamp: chrono::Utc::now(),
                         session_id: Uuid::new_v4(),
                     };
-                    Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff)).await;
+                    let trail = vec![
+                        started.clone(),
+                        (chrono::Utc::now(), ActivityKind::AiReviewFailed { review, reason: reason.clone() }),
+                    ];
+                    Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff), trail).await;
                     reviewing_handles.write().await.remove(&task_id);
                     return;
                 }
@@ -2858,6 +2953,7 @@ impl TaskExecutor {
                 && !coderabbit_result.starts_with("CodeRabbit warning:");
 
             if has_claude_issues || has_coderabbit_issues {
+                let verdict_at = chrono::Utc::now();
                 events.agent_event(AgentEvent::Log {
                     task_id: task_id_str.clone(),
                     level: LogLevel::Info,
@@ -2889,6 +2985,7 @@ impl TaskExecutor {
                     }
                 };
 
+                let fix_started = chrono::Utc::now();
                 let fix_run = Self::run_cancellable_agent(
                     ClaudeRunConfig {
                         prompt: fix_prompt,
@@ -2917,6 +3014,8 @@ impl TaskExecutor {
                 )
                 .await;
 
+                // Whether the fix agent changed any file, when it succeeded.
+                let mut fix_changed_nothing = false;
                 // Why the fixes were not applied, when they were not.
                 let fix_failure = match fix_outcome(fix_run) {
                     FixOutcome::Applied => {
@@ -2955,6 +3054,7 @@ impl TaskExecutor {
                                               nothing to commit"
                                         .to_string(),
                                 });
+                                fix_changed_nothing = true;
                                 None
                             }
                             Err(e) => {
@@ -2999,6 +3099,12 @@ impl TaskExecutor {
                     return;
                 }
 
+                let issue_count = findings
+                    .lines()
+                    .filter(|l| l.starts_with("- ISSUE:") || l.starts_with("ISSUE:"))
+                    .count()
+                    .try_into()
+                    .unwrap_or(u32::MAX);
                 let issues: Vec<String> = fix_failure.iter().cloned()
                     .chain(
                         findings.lines()
@@ -3014,7 +3120,20 @@ impl TaskExecutor {
                     session_id: Uuid::new_v4(),
                 };
 
-                Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff)).await;
+                let trail = vec![
+                    started.clone(),
+                    (verdict_at, ActivityKind::AiReviewChangesRequested { review, issues: issue_count }),
+                    (fix_started, ActivityKind::AiFixStarted { review }),
+                    (
+                        chrono::Utc::now(),
+                        match &fix_failure {
+                            None if fix_changed_nothing => ActivityKind::AiFixUnchanged { review },
+                            None => ActivityKind::AiFixApplied { review },
+                            Some(reason) => ActivityKind::AiFixFailed { review, reason: reason.clone() },
+                        },
+                    ),
+                ];
+                Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff), trail).await;
             } else {
                 // All clear — no issues
                 events.agent_event(AgentEvent::Log {
@@ -3030,7 +3149,8 @@ impl TaskExecutor {
                     session_id: Uuid::new_v4(),
                 };
 
-                Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff)).await;
+                let trail = vec![started.clone(), (chrono::Utc::now(), ActivityKind::AiReviewApproved { review })];
+                Self::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff), trail).await;
             }
 
             reviewing_handles.write().await.remove(&task_id);
@@ -3055,9 +3175,13 @@ impl TaskExecutor {
         events: &SharedEventSink,
         task_id: Uuid,
         signoff: Option<QaSignoff>,
+        trail: Vec<(chrono::DateTime<chrono::Utc>, ActivityKind)>,
     ) {
         let amend = move |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
+                for (at, kind) in &trail {
+                    t.record_activity_at(*at, kind.clone());
+                }
                 t.status = TaskStatus::HumanReview;
                 t.phase = TaskPhase::Complete;
                 t.phase_progress = 95;
@@ -3068,6 +3192,8 @@ impl TaskExecutor {
                 // showing an earlier run's verdict would describe other code.
                 t.qa_signoff = signoff.clone();
                 t.human_review.record_arrival();
+                let arrival = t.human_review.arrivals;
+                t.record_activity(ActivityKind::ReadyForReview { arrival });
             }
         };
         if let Err(e) = crate::lifecycle::record(tasks, storage, task_id, &amend).await {
@@ -3238,6 +3364,32 @@ impl TaskExecutor {
         Ok(())
     }
 
+    /// Put a new coding run on the task's timeline, durably, and return its
+    /// number. A run that could not be recorded still runs: the number is
+    /// then the one it would have had, and its end is recorded as usual.
+    async fn record_run_started(&self, task_id: Uuid) -> u32 {
+        let recorded = std::sync::atomic::AtomicU32::new(0);
+        let amend = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
+                let run = t.next_run();
+                let addressing_feedback = !t.human_review.pending_feedback().is_empty();
+                t.record_activity(ActivityKind::RunStarted { run, addressing_feedback });
+                recorded.store(run, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        if let Err(e) = crate::lifecycle::record(&self.tasks, &self.storage, task_id, &amend).await {
+            self.events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message: format!("The start of this run could not be recorded on the task's activity: {e}"),
+            });
+        }
+        match recorded.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => self.tasks.read().await.get(&task_id).map_or(1, Task::next_run),
+            run => run,
+        }
+    }
+
     async fn update_task_phase(&self, task_id: Uuid, phase: TaskPhase, progress: u8) {
         Self::update_task_phase_static(&self.tasks, task_id, phase.clone(), progress).await;
         self.events.agent_event(AgentEvent::PhaseChange {
@@ -3263,19 +3415,29 @@ impl TaskExecutor {
     /// #8. The payload here is only a diagnostic rather than a record of
     /// irreversible work, but a lost write would still silently strand the
     /// task off every automatic path with nothing on disk explaining why.
+    ///
+    /// `ended` is the coding run the failure ended, with its tool calls;
+    /// `None` when the task failed before a run could start.
     async fn set_task_error_static(
         tasks: &Tasks,
         storage: &crate::config::Storage,
         events: &SharedEventSink,
         task_id: Uuid,
         msg: &str,
+        ended: Option<RunEnd>,
     ) {
         let msg_owned = msg.to_string();
+        let run = ended.as_ref().map(|e| e.run);
+        let tools = std::sync::Mutex::new(ended.and_then(|e| e.tools));
         let amend = move |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
                 t.status = TaskStatus::Error;
                 t.phase = TaskPhase::Failed;
                 t.error_message = Some(msg_owned.clone());
+                if let Some(tools) = tools.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    tools.apply_to(t);
+                }
+                t.record_activity(ActivityKind::RunFailed { run, reason: msg_owned.clone() });
             }
         };
         if let Err(e) = crate::lifecycle::record(tasks, storage, task_id, &amend).await {
@@ -4057,6 +4219,7 @@ mod tests {
             &executor.events,
             id,
             Some(signoff),
+            Vec::new(),
         )
         .await;
 
@@ -4098,6 +4261,7 @@ mod tests {
             &executor.events,
             id,
             Some(signoff),
+            Vec::new(),
         )
         .await;
 
@@ -4145,6 +4309,7 @@ mod tests {
             &executor.events,
             id,
             "agent could not start",
+            None,
         )
         .await;
 
@@ -4175,6 +4340,7 @@ mod tests {
             &executor.events,
             id,
             "agent could not start",
+            None,
         )
         .await;
 
@@ -6957,7 +7123,7 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                     timestamp: chrono::Utc::now(),
                     session_id: Uuid::new_v4(),
                 };
-                TaskExecutor::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff))
+                TaskExecutor::transition_to_human_review(&tasks, &storage, &events, task_id, Some(signoff), Vec::new())
                     .await;
             });
             executor
@@ -7896,6 +8062,147 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             let on_disk = w.on_disk();
             assert_eq!(on_disk.status, TaskStatus::Error);
             assert_eq!(on_disk.error_message, task.error_message);
+        }
+
+        /// Wait for the run to leave In Progress, and return the task.
+        async fn settled(w: &World) -> Task {
+            for _ in 0..200 {
+                let task = w.in_memory().await;
+                if matches!(task.status, TaskStatus::Error | TaskStatus::AiReview) {
+                    return task;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("the run did not settle");
+        }
+
+        fn kinds(task: &Task) -> Vec<ActivityKind> {
+            task.activity.iter().map(|e| e.kind.clone()).collect()
+        }
+
+        /// One stream-json line per argument, for a stand-in agent to print.
+        fn stream(lines: &[serde_json::Value]) -> String {
+            lines
+                .iter()
+                .map(|l| format!("printf '%s\\n' '{}'; ", l.to_string().replace('\'', "")))
+                .collect()
+        }
+
+        /// A run's timeline holds its start, its tool calls -- named, with a
+        /// sanitized detail -- and its end, in the task file. What the agent
+        /// wrote, its session and its bookkeeping tools never become rows.
+        #[tokio::test]
+        async fn a_run_records_its_milestones_and_tool_calls_but_not_its_output() {
+            let w = world(Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
+            let tool = |name: &str, input: serde_json::Value| {
+                serde_json::json!({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "t", "name": name, "input": input}
+                ]}})
+            };
+            let script = stream(&[
+                serde_json::json!({"type": "system", "subtype": "init", "session_id": "SESSION-abc123", "model": "m"}),
+                serde_json::json!({"type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "THE AGENT SAYS THIS"}
+                ]}}),
+                tool("Bash", serde_json::json!({"command": "GITHUB_TOKEN=ghp_0123456789abcdef cargo test -p slashit-ui"})),
+                tool("Bash", serde_json::json!({"command": "GITHUB_TOKEN=ghp_0123456789abcdef cargo test -p slashit-ui"})),
+                tool("TodoWrite", serde_json::json!({"todos": []})),
+                tool("Read", serde_json::json!({"file_path": "src/lib.rs"})),
+            ]);
+            let _agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &format!(
+                    "cat >/dev/null; {script}printf 'work\\n' > agent_work.txt; \
+                     printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'"
+                ),
+            )
+            .await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            let task = settled(&w).await;
+            assert_eq!(task.status, TaskStatus::AiReview, "{:?}", task.error_message);
+
+            let on_disk = w.on_disk();
+            assert_eq!(on_disk.activity, task.activity, "the board shows exactly what the file has");
+            assert_eq!(
+                kinds(&on_disk),
+                [
+                    ActivityKind::RunStarted { run: 1, addressing_feedback: false },
+                    ActivityKind::ToolUsed {
+                        run: 1,
+                        tool: "Bash".into(),
+                        detail: Some("GITHUB_TOKEN=*** cargo test -p slashit-ui".into()),
+                        count: 2,
+                    },
+                    ActivityKind::ToolUsed { run: 1, tool: "Read".into(), detail: Some("src/lib.rs".into()), count: 1 },
+                    ActivityKind::RunCompleted { run: 1 },
+                ]
+            );
+            let written = serde_json::to_string(&on_disk.activity).unwrap();
+            for leaked in ["THE AGENT SAYS THIS", "SESSION-abc123", "ghp_", "TodoWrite", "Session started"] {
+                assert!(!written.contains(leaked), "{leaked} reached the timeline: {written}");
+            }
+        }
+
+        /// A failed run stays in the history after a retry, and the retry is
+        /// a new, numbered run.
+        #[tokio::test]
+        async fn a_failed_run_then_a_retry_reads_as_two_runs() {
+            let w = world(Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
+            {
+                let _agent = crate::test_helpers::FakeProgram::install(
+                    "claude",
+                    "cat >/dev/null; echo 'the model is unavailable' >&2; exit 1",
+                )
+                .await;
+                assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+                assert_eq!(settled(&w).await.status, TaskStatus::Error);
+            }
+            let failed = kinds(&w.on_disk());
+            assert!(
+                matches!(&failed[..], [
+                    ActivityKind::RunStarted { run: 1, .. },
+                    ActivityKind::RunFailed { run: Some(1), reason },
+                ] if reason.contains("the model is unavailable")),
+                "{failed:?}"
+            );
+
+            // Retry: what the drawer's Retry and the scheduler do.
+            {
+                let mut tasks_w = w.executor.tasks.write().await;
+                let t = tasks_w.get_mut(&w.task_id).unwrap();
+                let from = t.status.clone();
+                t.status = TaskStatus::Queue;
+                t.record_move(&from);
+                t.reset_execution_state();
+                QueueManager::apply_promotion(t);
+            }
+            let _agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                "cat >/dev/null; printf 'more\\n' > agent_work.txt; \
+                 printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'",
+            )
+            .await;
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            assert_eq!(settled(&w).await.status, TaskStatus::AiReview);
+
+            let retried = kinds(&w.on_disk());
+            assert_eq!(retried[..2], failed[..]);
+            assert_eq!(
+                retried[2..],
+                [
+                    ActivityKind::Moved {
+                        from: crate::domain::task::ActivityColumn::Error,
+                        to: crate::domain::task::ActivityColumn::Queue,
+                    },
+                    ActivityKind::RunStarted { run: 2, addressing_feedback: false },
+                    ActivityKind::RunCompleted { run: 2 },
+                ]
+            );
         }
 
         #[tokio::test]

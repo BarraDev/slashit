@@ -212,6 +212,7 @@ async fn handle_create_task(
             branch_origin: None,
             cleanup_in_flight: false,
             pr_review_plan: None,
+            activity: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -316,7 +317,9 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
     let effect = crate::lifecycle::classify_status_transition(&old_status, &new_status_for_amend);
     let amend = move |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
+            let from = task.status.clone();
             task.status = new_status_for_amend.clone();
+            task.record_move(&from);
             if let crate::lifecycle::StatusTransitionEffect::ResetExecutionState = effect {
                 task.reset_execution_state();
             }
@@ -466,7 +469,9 @@ async fn handle_enqueue_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
     // before persistence was attempted at all.
     let amend = move |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
+            let from = task.status.clone();
             task.status = TaskStatus::Queue;
+            task.record_move(&from);
         }
     };
 

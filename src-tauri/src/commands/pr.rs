@@ -4412,6 +4412,14 @@ async fn link_pr_to_task_reserved(
 /// destructive runs, and the ordinary path can apply it directly.
 fn apply_pr_link(task: &mut Task, pr_url: &str, remote_state: Option<&str>) {
     task.pr_url = Some(pr_url.to_string());
+    let number = match parse_pr_url_to_ref(pr_url) {
+        Some(ExternalRef::GithubPr { number, .. }) => Some(number),
+        _ => None,
+    };
+    task.record_activity(crate::domain::task::ActivityKind::PrLinked { url: pr_url.to_string(), number });
+    if let (Some(number), Some(remote)) = (number, remote_state) {
+        task.record_pr_state(number, remote);
+    }
     let Some(mut ref_) = parse_pr_url_to_ref(pr_url) else {
         return;
     };
@@ -4504,12 +4512,17 @@ pub async fn refresh_task_pr_state(
     let target = pr_url.clone();
     let apply = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_uuid) {
+            let mut numbers = Vec::new();
             for r in task.external_refs.iter_mut() {
-                if let ExternalRef::GithubPr { url, state: s, .. } = r {
+                if let ExternalRef::GithubPr { url, number, state: s, .. } = r {
                     if url == &target {
                         *s = Some(refreshed.clone());
+                        numbers.push(*number);
                     }
                 }
+            }
+            for number in numbers {
+                task.record_pr_state(number, &refreshed);
             }
             // `MERGED` implies `Done`, which the terminalization below writes
             // only after the cleanup it depends on has succeeded.
@@ -12033,5 +12046,32 @@ mod tests {
             }
 
         }
+    }
+}
+
+#[cfg(test)]
+mod activity {
+    use super::*;
+    use crate::domain::task::ActivityKind;
+
+    /// Linking the same pull request again -- a retry that rediscovers it,
+    /// the merged path applying its fact a second time -- adds nothing to the
+    /// timeline.
+    #[test]
+    fn linking_a_pull_request_is_one_milestone_however_often_it_is_applied() {
+        let mut task = crate::test_helpers::create_test_task("linked");
+        let url = "https://github.com/o/r/pull/92";
+        apply_pr_link(&mut task, url, Some("OPEN"));
+        apply_pr_link(&mut task, url, Some("OPEN"));
+        apply_pr_link(&mut task, url, Some("MERGED"));
+        apply_pr_link(&mut task, url, Some("MERGED"));
+        let kinds: Vec<_> = task.activity.iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            [
+                ActivityKind::PrLinked { url: url.to_string(), number: Some(92) },
+                ActivityKind::PrMerged { number: 92 },
+            ]
+        );
     }
 }

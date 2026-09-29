@@ -103,7 +103,9 @@ async fn enqueue_durably(
 
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
+            let from = task.status.clone();
             task.status = TaskStatus::Queue;
+            task.record_move(&from);
             // Queued to run again: an approval of the current changes no
             // longer covers what the branch will hold.
             task.human_review.withdraw_approval();

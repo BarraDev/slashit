@@ -5,6 +5,8 @@ use slashit_attention as attention;
 pub use slashit_attention::AttentionReason;
 use uuid::Uuid;
 
+pub use slashit_activity::{Column as ActivityColumn, Entry as ActivityEntry, Kind as ActivityKind};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "ref_type")]
 pub enum ExternalRef {
@@ -191,6 +193,17 @@ pub struct Task {
     #[serde(default)]
     pub pr_review_plan: Option<PrReviewPlan>,
 
+    /// Milestones nothing else on the record keeps, oldest first: runs, AI
+    /// reviews, delivery, moves. Each is appended in the durable write of the
+    /// transition it describes. History only -- nothing decides what the
+    /// task may do from it. See [`slashit_activity`].
+    ///
+    /// A task written before this existed has none, and its timeline shows
+    /// only what the rest of its record proves. An entry a newer version
+    /// wrote is skipped rather than failing the load.
+    #[serde(default, deserialize_with = "slashit_activity::lenient", skip_serializing_if = "Vec::is_empty")]
+    pub activity: Vec<ActivityEntry>,
+
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -258,6 +271,46 @@ impl Task {
         self.status == TaskStatus::InProgress
             && self.phase == TaskPhase::Idle
             && !self.cleanup_in_flight
+    }
+
+    /// Record a milestone on the task's timeline now, unless it is a
+    /// once-only milestone already there. Returns whether it was added.
+    pub fn record_activity(&mut self, kind: ActivityKind) -> bool {
+        self.record_activity_at(chrono::Utc::now(), kind)
+    }
+
+    /// [`Self::record_activity`] for a milestone that happened at `at`.
+    pub fn record_activity_at(&mut self, at: chrono::DateTime<chrono::Utc>, kind: ActivityKind) -> bool {
+        slashit_activity::record(&mut self.activity, at, kind)
+    }
+
+    /// Record that the task moved from `from` to its current status, when
+    /// that is a move at all.
+    pub fn record_move(&mut self, from: &TaskStatus) {
+        if *from != self.status {
+            let kind = ActivityKind::Moved { from: from.column(), to: self.status.column() };
+            self.record_activity(kind);
+        }
+    }
+
+    /// Record what a pull request's remote state says happened to it, when
+    /// that is a milestone: merged, or closed without merging.
+    pub fn record_pr_state(&mut self, number: u32, state: &str) {
+        if state.eq_ignore_ascii_case("MERGED") {
+            self.record_activity(ActivityKind::PrMerged { number });
+        } else if state.eq_ignore_ascii_case("CLOSED") {
+            self.record_activity(ActivityKind::PrClosed { number });
+        }
+    }
+
+    /// The number the task's next coding run gets.
+    pub fn next_run(&self) -> u32 {
+        slashit_activity::next_run(&self.activity)
+    }
+
+    /// The number the task's next AI review gets.
+    pub fn next_review(&self) -> u32 {
+        slashit_activity::next_review(&self.activity)
     }
 
     /// Whether the task cannot make progress without the user right now, and
@@ -552,6 +605,22 @@ pub enum TaskStatus {
     Done,
     PrCreated,
     Error,
+}
+
+impl TaskStatus {
+    /// The column, as the activity timeline names it.
+    pub fn column(&self) -> ActivityColumn {
+        match self {
+            Self::Backlog => ActivityColumn::Backlog,
+            Self::Queue => ActivityColumn::Queue,
+            Self::InProgress => ActivityColumn::InProgress,
+            Self::AiReview => ActivityColumn::AiReview,
+            Self::HumanReview => ActivityColumn::HumanReview,
+            Self::Done => ActivityColumn::Done,
+            Self::PrCreated => ActivityColumn::PrCreated,
+            Self::Error => ActivityColumn::Error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1149,6 +1218,68 @@ mod tests {
                 Some(AttentionReason::PrNotCreated)
             ]
         );
+    }
+
+    /// A board written before activity was recorded loads with none, and is
+    /// written back without an `activity` key until something happens.
+    #[test]
+    fn a_task_written_before_activity_existed_loads_with_none() {
+        assert!(!LEGACY_TASK_TOML.contains("activity"));
+        let task: Task = toml::from_str(LEGACY_TASK_TOML).expect("no activity");
+        assert!(task.activity.is_empty());
+        assert!(!toml::to_string(&task).unwrap().contains("activity"));
+    }
+
+    /// Recorded milestones are what the task file holds, and read back the
+    /// same after a restart, in TOML and over IPC.
+    #[test]
+    fn activity_round_trips_through_the_task_file_and_ipc() {
+        #[derive(Serialize, Deserialize)]
+        struct File {
+            tasks: Vec<Task>,
+        }
+        let mut task = startable_task();
+        let run = task.next_run();
+        task.record_activity(ActivityKind::RunStarted { run, addressing_feedback: false });
+        task.record_activity(ActivityKind::RunFailed { run: Some(run), reason: "exit 1".into() });
+        let from = task.status.clone();
+        task.status = TaskStatus::Queue;
+        task.record_move(&from);
+        assert_eq!(task.next_run(), 2);
+
+        let toml_text = toml::to_string_pretty(&File { tasks: vec![task.clone()] }).unwrap();
+        let loaded: File = toml::from_str(&toml_text).expect(&toml_text);
+        assert_eq!(loaded.tasks[0].activity, task.activity, "{toml_text}");
+        let json = serde_json::to_string(&task).unwrap();
+        let loaded: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.activity, task.activity);
+    }
+
+    #[test]
+    fn a_move_is_recorded_only_when_the_column_changes() {
+        let mut task = startable_task();
+        task.record_move(&TaskStatus::InProgress);
+        assert!(task.activity.is_empty());
+        task.status = TaskStatus::Queue;
+        task.record_move(&TaskStatus::Error);
+        assert_eq!(
+            task.activity[0].kind,
+            ActivityKind::Moved { from: ActivityColumn::Error, to: ActivityColumn::Queue }
+        );
+    }
+
+    /// A merged or closed pull request is a milestone once, however often
+    /// its state is observed; an open one is none.
+    #[test]
+    fn pull_request_states_are_recorded_once() {
+        let mut task = startable_task();
+        for _ in 0..3 {
+            task.record_pr_state(7, "OPEN");
+            task.record_pr_state(7, "MERGED");
+            task.record_pr_state(7, "merged");
+        }
+        assert_eq!(task.activity.len(), 1);
+        assert_eq!(task.activity[0].kind, ActivityKind::PrMerged { number: 7 });
     }
 
     /// Every origin survives the task file (TOML) and IPC (JSON) unchanged.

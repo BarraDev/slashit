@@ -5325,6 +5325,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "slashit-activity"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "toml 0.8.2",
+]
+
+[[package]]
 name = "slashit-attention"
 version = "0.1.0"
 dependencies = [
@@ -5346,6 +5356,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "slashit-activity",
  "slashit-attention",
  "thiserror 2.0.18",
  "uuid",
@@ -5394,6 +5405,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "slashit-activity",
  "slashit-attention",
  "slashit-ipc",
  "sysinfo",

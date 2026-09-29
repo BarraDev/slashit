@@ -816,7 +816,9 @@ async fn commit(
 
         match &kept {
             None => {
+                let from = task.status.clone();
                 task.status = request.desired.clone();
+                task.record_move(&from);
                 // Cleared together, in the same write, because either alone is
                 // a lie: a `Done` task holding a `worktree_path` claims a
                 // checkout that is gone, and a cleared path on a non-terminal

@@ -182,6 +182,7 @@ mod tests {
                 cleanup_in_flight: false,
                 position: 0,
                 pr_review_plan: None,
+                activity: Vec::new(),
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };

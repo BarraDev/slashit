@@ -564,7 +564,9 @@ fn migrate_task(task: &mut Task) -> bool {
             "SlashIt: Resetting orphaned task '{}' from {:?} back to Queue",
             task.title, task.status
         );
+        let from = task.status.column();
         task.status = domain::TaskStatus::Queue;
+        task.record_activity(domain::task::ActivityKind::Interrupted { from });
         changed = true;
     }
 
@@ -795,6 +797,14 @@ mod tests {
         assert_eq!(task.status, domain::TaskStatus::Queue);
         // Queue implies Idle, so the phase reset applies in the same pass.
         assert_eq!(task.phase, domain::TaskPhase::Idle);
+        // The run the restart abandoned stays visible on the timeline.
+        assert_eq!(
+            task.activity.iter().map(|e| e.kind.clone()).collect::<Vec<_>>(),
+            [domain::task::ActivityKind::Interrupted { from: domain::task::ActivityColumn::InProgress }]
+        );
+        // A second pass finds nothing left to do and records nothing more.
+        assert!(!migrate_task(&mut task));
+        assert_eq!(task.activity.len(), 1);
     }
 
     #[test]

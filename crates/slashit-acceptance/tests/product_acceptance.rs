@@ -547,6 +547,7 @@ const DRAWER_ERROR: &str = "[data-testid=\"task-drawer-error\"]";
 const DRAWER_ELAPSED: &str = "[data-testid=\"task-drawer-elapsed\"]";
 const DRAWER_CHANGES_TAB: &str = "[data-testid=\"task-drawer-tab-changes\"]";
 const DRAWER_CHANGES: &str = "[data-testid=\"task-drawer-changes\"]";
+const DRAWER_TIMELINE_ROW: &str = "[data-testid=\"task-drawer-timeline-row\"]";
 /// How many times the drawer is opened and closed before its listener
 /// hygiene is judged.
 const DRAWER_CYCLES: usize = 5;
@@ -900,6 +901,12 @@ async fn fail_and_retry_in_the_drawer(
     if count(driver, DRAWER_ERROR).await? != 0 {
         bail!("a task in human review still shows a failure");
     }
+
+    // The failure is gone from the current state, but not from the history:
+    // Activity tells how the task got here, the failed run and the retry
+    // included, from what the task file records.
+    let timeline = await_timeline_reaching(driver, "ready_for_review").await?;
+    assert_timeline_story(&timeline)?;
 
     // Human Review is read-only here: its changes are reachable, and nothing
     // else is offered.
@@ -1566,6 +1573,88 @@ async fn output_lines(driver: &WebDriver) -> Result<Vec<String>> {
         .as_array()
         .map(|lines| lines.iter().filter_map(Value::as_str).map(str::to_string).collect())
         .unwrap_or_default())
+}
+
+/// The drawer's Activity rows, oldest first, as `(kind, title, detail)`.
+async fn timeline_rows(driver: &WebDriver) -> Result<Vec<(String, String, String)>> {
+    let found = page(
+        driver,
+        "return Array.from(document.querySelectorAll(arguments[0])).map(row => [\
+           row.dataset.kind || '', \
+           (row.querySelector('[data-testid=\"task-drawer-timeline-title\"]') || {}).textContent || '', \
+           (row.querySelector('[data-testid=\"task-drawer-timeline-detail\"]') || {}).textContent || '']);",
+        vec![Value::String(DRAWER_TIMELINE_ROW.to_string())],
+    )
+    .await?;
+    Ok(found
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_array)
+                .map(|cells| {
+                    let cell = |i: usize| cells.get(i).and_then(Value::as_str).unwrap_or_default().trim().to_string();
+                    (cell(0), cell(1), cell(2))
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Wait until the drawer's Activity shows a row of `kind`, and return all
+/// its rows.
+async fn await_timeline_reaching(driver: &WebDriver, kind: &str) -> Result<Vec<(String, String, String)>> {
+    let started = Instant::now();
+    loop {
+        let rows = timeline_rows(driver).await?;
+        if rows.iter().any(|(k, _, _)| k == kind) {
+            return Ok(rows);
+        }
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("the drawer's Activity never showed a {kind} row; it showed {rows:?}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// A failed run, a retry and a successful run, in that order and each once,
+/// with the failure's reason and without the agent's own words.
+fn assert_timeline_story(rows: &[(String, String, String)]) -> Result<()> {
+    let kinds: Vec<&str> = rows.iter().map(|(k, _, _)| k.as_str()).collect();
+    let story = [
+        "created",
+        "run_started",
+        "run_failed",
+        "moved",
+        "run_started",
+        "run_completed",
+        // The stand-in agent changes nothing, so there is nothing to review.
+        "ai_review_skipped",
+        "ready_for_review",
+    ];
+    let milestones: Vec<&str> = kinds.iter().copied().filter(|k| story.contains(k)).collect();
+    // A move into In Progress before the first run is how this journey
+    // starts the task; everything after it is the story under test.
+    let from_first_run = milestones.iter().position(|k| *k == "run_started").unwrap_or(0);
+    let told: Vec<&str> = std::iter::once("created").chain(milestones[from_first_run..].iter().copied()).collect();
+    if told != story {
+        bail!("the drawer's Activity tells {told:?}, not {story:?}; all rows: {rows:?}");
+    }
+    let failure = rows.iter().find(|(k, _, _)| k == "run_failed").expect("checked above");
+    if failure.1 != "Coding failed" || !failure.2.contains(fake_agent::DETAILED_FAILURE[0]) {
+        bail!("the failed run reads {failure:?}");
+    }
+    if !rows.iter().any(|(k, title, _)| k == "moved" && title == "Retried") {
+        bail!("the retry is not shown as one: {rows:?}");
+    }
+    if !rows.iter().any(|(k, title, _)| k == "tool_used" && *title == format!("Used {}", fake_agent::PROGRESS_FIRST_TOOL)) {
+        bail!("the agent's tool call is not on the timeline: {rows:?}");
+    }
+    for (_, title, detail) in rows {
+        if title.contains(fake_agent::PROGRESS_FIRST_TEXT) || detail.contains(fake_agent::PROGRESS_FIRST_TEXT) {
+            bail!("the agent's own output became a timeline row: {rows:?}");
+        }
+    }
+    Ok(())
 }
 
 /// Wait until the element's text satisfies `accept`, and return it.

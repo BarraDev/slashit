@@ -1,0 +1,18 @@
+[package]
+name = "slashit-activity"
+version = "0.1.0"
+edition = "2021"
+authors = ["Barradev Digital Services <admin@barradev.com>"]
+license = "Apache-2.0"
+description = "What happened to a SlashIt task: the milestones the backend records and the timeline the app shows"
+repository = "https://github.com/BarraDev/slashit"
+
+# Compiled into both the native backend and the WASM frontend, so it depends
+# on nothing that cannot build for either.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
+
+[dev-dependencies]
+serde_json = "1"
+toml = "0.8"

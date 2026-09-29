@@ -60,6 +60,7 @@ how to run it on Arch, which ships no `WebKitWebDriver`.
 slashit-app/
 ├── crates/
 │   ├── slashit-acceptance/  # Desktop acceptance harness
+│   ├── slashit-activity/    # What happened to a task: its timeline (shared by backend and frontend)
 │   ├── slashit-attention/   # Which tasks need the user (shared by backend and frontend)
 │   ├── slashit-cli/         # The `slashit` command-line client
 │   └── slashit-ipc/         # CLI control-channel protocol and transports

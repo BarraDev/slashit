@@ -467,6 +467,7 @@ pub fn create_test_task(title: &str) -> Task {
         cleanup_in_flight: false,
         position: 0,
         pr_review_plan: None,
+        activity: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
