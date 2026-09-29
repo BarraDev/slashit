@@ -15,11 +15,25 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+/// A coding run whose start is on disk.
+struct RunStart {
+    working_dir: String,
+    /// The run's number, as its recorded [`ActivityKind::RunStarted`] has it.
+    run: u32,
+}
+
+/// The phase progress a task shows from the moment its run starts.
+const RUN_START_PROGRESS: u8 = 5;
+
 /// A coding run that has ended, for the write that records how.
 struct RunEnd {
     run: u32,
     /// Its tool calls, if any were buffered.
     tools: Option<RunTools>,
+    /// Why it failed, as its timeline row says it, when that is not the
+    /// error the task records: that error can quote the agent's output, and
+    /// the timeline never keeps any.
+    timeline_reason: Option<String>,
 }
 
 /// A finished agent run inside the review flow.
@@ -550,6 +564,133 @@ type SharedRunTools = Arc<std::sync::Mutex<HashMap<Uuid, RunTools>>>;
 /// Take the buffered tool calls of `task_id`'s run, if it made any.
 fn take_run_tools(run_tools: &SharedRunTools, task_id: Uuid) -> Option<RunTools> {
     run_tools.lock().unwrap_or_else(|p| p.into_inner()).remove(&task_id)
+}
+
+/// What a coding run's events are forwarded with: its output to the logs and
+/// the frontend, its tool calls to the run's [`RunTools`].
+struct RunEventForwarder {
+    task_id: Uuid,
+    run: u32,
+    execution_id: Uuid,
+    logs: ExecutionLogs,
+    events: SharedEventSink,
+    tasks: Tasks,
+    run_tools: SharedRunTools,
+    working_dir: String,
+}
+
+/// A running [`RunEventForwarder`], to be drained before its run's end is
+/// recorded. Dropping it drains it too, without waiting.
+struct RunEventDrain {
+    request: tokio::sync::oneshot::Sender<()>,
+    forwarder: JoinHandle<()>,
+}
+
+impl RunEventDrain {
+    /// Wait until every event the run has already sent is handled, then stop
+    /// forwarding.
+    ///
+    /// Only for once nothing more will be sent -- after
+    /// [`ClaudeRunner::wait`] has joined the stdout reader -- because the
+    /// channel itself stays open as long as the runner does. What is left to
+    /// handle is then only what is already queued, so this never waits on the
+    /// agent. An event the channel dropped because the forwarder fell more than
+    /// its capacity behind is lost, and forwarding carries on with the next.
+    ///
+    /// The one `wait` that returns before joining the reader is a failure to
+    /// wait for the process at all. Joining there could wait on a process
+    /// that is still running, so the run fails with the calls handled so far.
+    async fn drain(self) {
+        let _ = self.request.send(());
+        let _ = self.forwarder.await;
+    }
+}
+
+impl RunEventForwarder {
+    fn spawn(self, events: tokio::sync::broadcast::Receiver<ClaudeEvent>) -> RunEventDrain {
+        let (request, drain) = tokio::sync::oneshot::channel();
+        RunEventDrain { request, forwarder: tokio::spawn(self.forward(events, drain)) }
+    }
+
+    async fn forward(
+        self,
+        mut events: tokio::sync::broadcast::Receiver<ClaudeEvent>,
+        mut drain: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+        loop {
+            tokio::select! {
+                received = events.recv() => match received {
+                    Ok(event) => self.handle(event).await,
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                },
+                // Asked to drain, or dropped by a run that ended without
+                // asking: handle what is queued and stop.
+                _ = &mut drain => loop {
+                    match events.try_recv() {
+                        Ok(event) => self.handle(event).await,
+                        Err(TryRecvError::Lagged(_)) => {}
+                        Err(TryRecvError::Empty | TryRecvError::Closed) => return,
+                    }
+                },
+            }
+        }
+    }
+
+    async fn handle(&self, event: ClaudeEvent) {
+        let task_id = self.task_id;
+        let task_id_str = task_id.to_string();
+        // Each entry is recorded before its event is emitted, so a listener
+        // that reacts to the event by reading the output back finds the entry
+        // already there.
+        match &event {
+            ClaudeEvent::TextDelta { text } => {
+                record_output(&self.logs, self.execution_id, LogLevel::Info, text.clone()).await;
+                self.events.agent_event(AgentEvent::Output { task_id: task_id_str, text: text.clone() });
+            }
+            ClaudeEvent::AssistantMessage { content } => {
+                for text in assistant_text_blocks(content) {
+                    record_output(&self.logs, self.execution_id, LogLevel::Info, text.clone()).await;
+                    self.events.agent_event(AgentEvent::Output { task_id: task_id_str.clone(), text });
+                }
+            }
+            ClaudeEvent::ToolUse { tool, input } => {
+                // Only a complete call is buffered: a partial stream announces
+                // the same call once without its input before the whole
+                // message repeats it.
+                if let Some(input) = input {
+                    let mut buffered = self.run_tools.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(tools) = buffered.get_mut(&task_id).filter(|t| t.run() == self.run) {
+                        tools.push(chrono::Utc::now(), tool, input, &self.working_dir);
+                    }
+                }
+                record_output(&self.logs, self.execution_id, LogLevel::Info, format!("Using tool: {}", tool)).await;
+                self.events.agent_event(AgentEvent::ToolUse { task_id: task_id_str, tool: tool.clone() });
+            }
+            ClaudeEvent::SystemInit { session_id, model, .. } => {
+                // Capture actual model on the task
+                if let Some(m) = model {
+                    let mut tasks_w = self.tasks.write().await;
+                    if let Some(t) = tasks_w.get_mut(&task_id) {
+                        t.model = m.clone();
+                    }
+                }
+                record_output(
+                    &self.logs,
+                    self.execution_id,
+                    LogLevel::Info,
+                    format!("Session started: {} (model: {})", session_id, model.as_deref().unwrap_or("unknown")),
+                )
+                .await;
+            }
+            ClaudeEvent::Error { message } => {
+                record_output(&self.logs, self.execution_id, LogLevel::Error, message.clone()).await;
+                self.events.agent_event(AgentEvent::Error { task_id: task_id_str, message: message.clone() });
+            }
+            _ => {}
+        }
+    }
 }
 
 pub struct TaskExecutorConfig {
@@ -1394,8 +1535,14 @@ impl TaskExecutor {
         self.projects.read().await.get(&project_id)?.base.clone()
     }
 
-    /// Record the worktree a starting task was given on the task, durably
-    /// before the board shows it, returning the worktree's path.
+    /// Record a run's start on the task, durably before the board shows it:
+    /// the worktree it was given, the `Coding` phase, and the run's
+    /// [`ActivityKind::RunStarted`] with the number it is given here.
+    ///
+    /// One write, so a run has a number only if its start is on disk: an agent
+    /// is never launched for a run the timeline does not have, and the next
+    /// run's number, counted from the recorded starts, is never one already
+    /// used.
     ///
     /// The starting commit and the branch's origin are written only when
     /// this start created (or resumed) the branch. A reattach leaves the ones
@@ -1408,12 +1555,13 @@ impl TaskExecutor {
     /// the next start would adopt it, and an adopted checkout records no
     /// starting commit and no origin. The message says what was kept, if
     /// anything.
-    async fn record_acquired_worktree(
+    async fn record_run_start(
         &self,
         task_id: Uuid,
         repo_path: &str,
         acquired: Acquired,
-    ) -> Result<String, String> {
+    ) -> Result<RunStart, String> {
+        let run = std::sync::atomic::AtomicU32::new(0);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
                 t.worktree_path = Some(acquired.info.path.clone());
@@ -1424,10 +1572,21 @@ impl TaskExecutor {
                 if let Some(origin) = &acquired.origin {
                     t.branch_origin = Some(origin.clone());
                 }
+                t.phase = TaskPhase::Coding;
+                t.phase_progress = RUN_START_PROGRESS;
+                let next = t.next_run();
+                let addressing_feedback = !t.human_review.pending_feedback().is_empty();
+                t.record_activity(ActivityKind::RunStarted { run: next, addressing_feedback });
+                run.store(next, std::sync::atomic::Ordering::Relaxed);
             }
         };
         match crate::lifecycle::record(&self.tasks, &self.storage, task_id, &amend).await {
-            Ok(()) => Ok(acquired.info.path),
+            // `record` fails for a task that is not on the board, so a
+            // successful write always ran the amend on it.
+            Ok(()) => Ok(RunStart {
+                working_dir: acquired.info.path,
+                run: run.load(std::sync::atomic::Ordering::Relaxed),
+            }),
             Err(e) => {
                 let outcome = self
                     .worktree_manager
@@ -1648,10 +1807,10 @@ impl TaskExecutor {
                     .to_string(),
             });
         }
-        let working_dir = match self.record_acquired_worktree(task_id, &repo_path, acquired).await {
-            Ok(working_dir) => {
+        let RunStart { working_dir, run } = match self.record_run_start(task_id, &repo_path, acquired).await {
+            Ok(start) => {
                 self.unrecorded_backoff_lock().remove(&task_id);
-                working_dir
+                start
             }
             Err(message) => {
                 self.events.agent_event(AgentEvent::Error {
@@ -1693,14 +1852,15 @@ impl TaskExecutor {
             }
         };
 
-        let run = self.record_run_started(task_id).await;
         self.run_tools
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(task_id, RunTools::new(run));
-
-        // Update phase
-        self.update_task_phase(task_id, TaskPhase::Coding, 5).await;
+        self.events.agent_event(AgentEvent::PhaseChange {
+            task_id: task_id.to_string(),
+            phase: TaskPhase::Coding,
+            progress: RUN_START_PROGRESS,
+        });
 
         // If the project is attached to a workspace, run Claude from the
         // workspace root and expose the task's working dir via --add-dir so
@@ -1783,7 +1943,7 @@ impl TaskExecutor {
                 Err(e) => {
                     let msg = format!("Failed to start claude: {}", e);
                     record_output(&logs, execution_id, LogLevel::Error, msg.clone()).await;
-                    let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id) };
+                    let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id), timeline_reason: None };
                     Self::set_task_error_static(&tasks, &storage, &events, task_id, &msg, Some(ended)).await;
                     // This early return skips the removal after `runner.wait()`
                     // below, so it must remove itself here or this slot never
@@ -1813,82 +1973,19 @@ impl TaskExecutor {
                 progress: 10,
             });
 
-            // Subscribe to events and forward to frontend
-            let mut event_rx = runner.subscribe();
-            let events_stream = events.clone();
-            let task_id_str = task_id.to_string();
-            let logs_events = logs.clone();
-            let execution_id_events = execution_id;
-            let tasks_for_events = tasks.clone();
-            let run_tools_events = run_tools.clone();
-            let tools_dir = working_dir.clone();
-
-            tokio::spawn(async move {
-                while let Ok(event) = event_rx.recv().await {
-                    // Each entry is recorded before its event is emitted, so a
-                    // listener that reacts to the event by reading the output
-                    // back finds the entry already there.
-                    match &event {
-                        ClaudeEvent::TextDelta { text } => {
-                            record_output(&logs_events, execution_id_events, LogLevel::Info, text.clone()).await;
-                            events_stream.agent_event(AgentEvent::Output {
-                                task_id: task_id_str.clone(),
-                                text: text.clone(),
-                            });
-                        }
-                        ClaudeEvent::AssistantMessage { content } => {
-                            for text in assistant_text_blocks(content) {
-                                record_output(&logs_events, execution_id_events, LogLevel::Info, text.clone()).await;
-                                events_stream.agent_event(AgentEvent::Output {
-                                    task_id: task_id_str.clone(),
-                                    text,
-                                });
-                            }
-                        }
-                        ClaudeEvent::ToolUse { tool, input } => {
-                            // Only a complete call is buffered: a partial
-                            // stream announces the same call once without
-                            // its input before the whole message repeats it.
-                            if let Some(input) = input {
-                                let mut buffered = run_tools_events.lock().unwrap_or_else(|p| p.into_inner());
-                                if let Some(tools) = buffered.get_mut(&task_id).filter(|t| t.run() == run) {
-                                    tools.push(chrono::Utc::now(), tool, input, &tools_dir);
-                                }
-                            }
-                            record_output(&logs_events, execution_id_events, LogLevel::Info, format!("Using tool: {}", tool)).await;
-                            events_stream.agent_event(AgentEvent::ToolUse {
-                                task_id: task_id_str.clone(),
-                                tool: tool.clone(),
-                            });
-                        }
-                        ClaudeEvent::SystemInit { session_id, model, .. } => {
-                            // Capture actual model on the task
-                            if let Some(m) = model {
-                                let mut tasks_w = tasks_for_events.write().await;
-                                if let Some(t) = tasks_w.get_mut(&task_id) {
-                                    t.model = m.clone();
-                                }
-                            }
-                            record_output(
-                                &logs_events,
-                                execution_id_events,
-                                LogLevel::Info,
-                                format!("Session started: {} (model: {})",
-                                    session_id,
-                                    model.as_deref().unwrap_or("unknown")),
-                            ).await;
-                        }
-                        ClaudeEvent::Error { message } => {
-                            record_output(&logs_events, execution_id_events, LogLevel::Error, message.clone()).await;
-                            events_stream.agent_event(AgentEvent::Error {
-                                task_id: task_id_str.clone(),
-                                message: message.clone(),
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-            });
+            // Forward the run's events to the frontend, buffering its tool
+            // calls for the write that ends the run.
+            let event_drain = RunEventForwarder {
+                task_id,
+                run,
+                execution_id,
+                logs: logs.clone(),
+                events: events.clone(),
+                tasks: tasks.clone(),
+                run_tools: run_tools.clone(),
+                working_dir: working_dir.clone(),
+            }
+            .spawn(runner.subscribe());
 
             // Wait for the run to finish, or for a stop to end it early.
             //
@@ -1905,6 +2002,11 @@ impl TaskExecutor {
                 biased;
 
                 result = runner.wait() => {
+                    // `wait` has joined the run's stdout reader, so every
+                    // event of this run is already sent. Handling them all
+                    // before the run's end is recorded is what puts its last
+                    // tool calls on the timeline.
+                    event_drain.drain().await;
                     match result {
                         Ok(_) => 'finished: {
                             // A run whose work could not be committed has
@@ -1914,7 +2016,7 @@ impl TaskExecutor {
                                 Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await
                             {
                                 record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
-                                let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id) };
+                                let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id), timeline_reason: None };
                                 Self::set_task_error_static(&tasks, &storage, &events, task_id, &message, Some(ended)).await;
                                 ending = Some(AgentEvent::Error {
                                     task_id: task_id.to_string(),
@@ -1923,48 +2025,39 @@ impl TaskExecutor {
                                 break 'finished;
                             }
 
-                            // Move to AiReview for automated review before human review
-                            Self::update_task_phase_static(&tasks, task_id, TaskPhase::QaReview, 80).await;
-                            // The move and the run's timeline rows are one
-                            // durable write, published only once it is on disk.
-                            let tools = std::sync::Mutex::new(take_run_tools(&run_tools, task_id));
-                            let amend = |staged: &mut HashMap<Uuid, Task>| {
-                                if let Some(t) = staged.get_mut(&task_id) {
-                                    t.status = TaskStatus::AiReview;
-                                    t.overall_progress = 80;
-                                    if let Some(tools) = tools.lock().unwrap_or_else(|p| p.into_inner()).take() {
-                                        tools.apply_to(t);
+                            // The move to AI review, the run's end and its
+                            // tool calls are one durable write, published
+                            // only once it is on disk.
+                            let tools = take_run_tools(&run_tools, task_id);
+                            ending = Some(
+                                match Self::record_run_completed(&tasks, &storage, task_id, run, tools.as_ref()).await {
+                                    Ok(()) => {
+                                        let completed = "Agent completed — moving to AI review".to_string();
+                                        record_output(&logs, execution_id, LogLevel::Info, completed.clone()).await;
+                                        AgentEvent::Completed {
+                                            task_id: task_id.to_string(),
+                                            success: true,
+                                            message: Some(completed),
+                                        }
                                     }
-                                    t.record_activity(ActivityKind::RunCompleted { run });
-                                }
-                            };
-                            let completed = "Agent completed — moving to AI review".to_string();
-                            record_output(&logs, execution_id, LogLevel::Info, completed.clone()).await;
-                            if let Err(e) = crate::lifecycle::record(&tasks, &storage, task_id, &amend).await {
-                                // As before this write was made durable-first:
-                                // the task still moves on to review in memory,
-                                // and its timeline rows, which would describe a
-                                // write the file does not have, are dropped.
-                                events.agent_event(AgentEvent::Log {
-                                    task_id: task_id.to_string(),
-                                    level: LogLevel::Warn,
-                                    message: format!("Recording the finished run failed: {e}"),
-                                });
-                                {
-                                    let mut tasks_w = tasks.write().await;
-                                    if let Some(t) = tasks_w.get_mut(&task_id) {
-                                        t.status = TaskStatus::AiReview;
-                                        t.overall_progress = 80;
-                                        t.updated_at = chrono::Utc::now();
+                                    Err(e) => {
+                                        // Nothing was published: memory and
+                                        // disk both still have the run in
+                                        // progress. A finish that cannot be
+                                        // recorded ends the run as a failure,
+                                        // the durable transition every other
+                                        // unfinished run takes.
+                                        let message = format!(
+                                            "The agent finished and its work was committed, but moving the \
+                                             task to AI review could not be saved, so it was not reviewed: {e}"
+                                        );
+                                        record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
+                                        let ended = RunEnd { run, tools, timeline_reason: None };
+                                        Self::set_task_error_static(&tasks, &storage, &events, task_id, &message, Some(ended)).await;
+                                        AgentEvent::Error { task_id: task_id.to_string(), message }
                                     }
-                                }
-                                Self::persist_task_static(&tasks, &storage, task_id).await;
-                            }
-                            ending = Some(AgentEvent::Completed {
-                                task_id: task_id.to_string(),
-                                success: true,
-                                message: Some(completed),
-                            });
+                                },
+                            );
                         }
                         Err(err_msg) => {
                             // Nothing on stderr or in the result event said
@@ -1987,7 +2080,13 @@ impl TaskExecutor {
                                 err_msg.clone()
                             };
                             record_output(&logs, execution_id, LogLevel::Error, full_msg.clone()).await;
-                            let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id) };
+                            // The quoted output stays on the task's error; the
+                            // timeline keeps only why the run ended.
+                            let ended = RunEnd {
+                                run,
+                                tools: take_run_tools(&run_tools, task_id),
+                                timeline_reason: (full_msg != err_msg).then(|| err_msg.clone()),
+                            };
                             Self::set_task_error_static(&tasks, &storage, &events, task_id, &full_msg, Some(ended)).await;
                             ending = Some(AgentEvent::Error {
                                 task_id: task_id.to_string(),
@@ -3364,41 +3463,6 @@ impl TaskExecutor {
         Ok(())
     }
 
-    /// Put a new coding run on the task's timeline, durably, and return its
-    /// number. A run that could not be recorded still runs: the number is
-    /// then the one it would have had, and its end is recorded as usual.
-    async fn record_run_started(&self, task_id: Uuid) -> u32 {
-        let recorded = std::sync::atomic::AtomicU32::new(0);
-        let amend = |staged: &mut HashMap<Uuid, Task>| {
-            if let Some(t) = staged.get_mut(&task_id) {
-                let run = t.next_run();
-                let addressing_feedback = !t.human_review.pending_feedback().is_empty();
-                t.record_activity(ActivityKind::RunStarted { run, addressing_feedback });
-                recorded.store(run, std::sync::atomic::Ordering::Relaxed);
-            }
-        };
-        if let Err(e) = crate::lifecycle::record(&self.tasks, &self.storage, task_id, &amend).await {
-            self.events.agent_event(AgentEvent::Log {
-                task_id: task_id.to_string(),
-                level: LogLevel::Warn,
-                message: format!("The start of this run could not be recorded on the task's activity: {e}"),
-            });
-        }
-        match recorded.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => self.tasks.read().await.get(&task_id).map_or(1, Task::next_run),
-            run => run,
-        }
-    }
-
-    async fn update_task_phase(&self, task_id: Uuid, phase: TaskPhase, progress: u8) {
-        Self::update_task_phase_static(&self.tasks, task_id, phase.clone(), progress).await;
-        self.events.agent_event(AgentEvent::PhaseChange {
-            task_id: task_id.to_string(),
-            phase,
-            progress,
-        });
-    }
-
     async fn update_task_phase_static(tasks: &Tasks, task_id: Uuid, phase: TaskPhase, progress: u8) {
         let mut tasks = tasks.write().await;
         if let Some(t) = tasks.get_mut(&task_id) {
@@ -3406,6 +3470,33 @@ impl TaskExecutor {
             t.phase_progress = progress;
             t.updated_at = chrono::Utc::now();
         }
+    }
+
+    /// Move a task whose run finished and whose work is committed on to AI
+    /// review, durably before the board can show it: the status, the review
+    /// phase, the run's tool calls and its [`ActivityKind::RunCompleted`] are
+    /// one write. `Err` means nothing was written or published, and `tools`
+    /// is still the caller's to record elsewhere.
+    async fn record_run_completed(
+        tasks: &Tasks,
+        storage: &crate::config::Storage,
+        task_id: Uuid,
+        run: u32,
+        tools: Option<&RunTools>,
+    ) -> Result<(), String> {
+        let amend = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
+                t.status = TaskStatus::AiReview;
+                t.phase = TaskPhase::QaReview;
+                t.phase_progress = 80;
+                t.overall_progress = 80;
+                if let Some(tools) = tools {
+                    tools.apply_to(t);
+                }
+                t.record_activity(ActivityKind::RunCompleted { run });
+            }
+        };
+        crate::lifecycle::record(tasks, storage, task_id, &amend).await
     }
 
     /// Move a task to `Error`/`Failed`, durably before the board can show it.
@@ -3427,17 +3518,20 @@ impl TaskExecutor {
         ended: Option<RunEnd>,
     ) {
         let msg_owned = msg.to_string();
-        let run = ended.as_ref().map(|e| e.run);
-        let tools = std::sync::Mutex::new(ended.and_then(|e| e.tools));
+        let (run, tools, timeline_reason) = match ended {
+            Some(RunEnd { run, tools, timeline_reason }) => (Some(run), tools, timeline_reason),
+            None => (None, None, None),
+        };
+        let reason = timeline_reason.unwrap_or_else(|| msg_owned.clone());
         let amend = move |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
                 t.status = TaskStatus::Error;
                 t.phase = TaskPhase::Failed;
                 t.error_message = Some(msg_owned.clone());
-                if let Some(tools) = tools.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                if let Some(tools) = &tools {
                     tools.apply_to(t);
                 }
-                t.record_activity(ActivityKind::RunFailed { run, reason: msg_owned.clone() });
+                t.record_activity(ActivityKind::RunFailed { run, reason: reason.clone() });
             }
         };
         if let Err(e) = crate::lifecycle::record(tasks, storage, task_id, &amend).await {
@@ -3453,25 +3547,6 @@ impl TaskExecutor {
         }
     }
 
-    async fn persist_task_static(tasks: &Tasks, storage: &crate::config::Storage, task_id: Uuid) {
-        let tasks_r = tasks.read().await;
-        if let Some(task) = tasks_r.get(&task_id) {
-            let project_id = task.project_id;
-            let project_tasks: Vec<Task> = tasks_r.values()
-                .filter(|t| t.project_id == project_id)
-                .cloned()
-                .collect();
-            // Reported rather than discarded, as the command-side
-            // `persist_project_tasks` already does. A board that disagrees
-            // with the disk is recoverable while someone knows it happened.
-            // Where the disagreement would be acted on rather than merely
-            // displayed, publishing waits for the write instead: see
-            // `settle_stopped_static`.
-            if let Err(e) = storage.save_project_tasks(project_id, &project_tasks) {
-                eprintln!("[executor] failed to persist tasks for project {project_id}: {e}");
-            }
-        }
-    }
 }
 
 /// The queue is what knows whether an agent is attached to a task, so it is
@@ -3494,8 +3569,16 @@ impl crate::lifecycle::ExecutionOwnership for TaskExecutor {
     /// under the same bound, then, so neither an execution/review nor a
     /// PR-helper flow can outlive a transition that is about to move,
     /// terminalize, or PR-link this task out from under it.
+    ///
+    /// A coding run ended this way records no end of its own, so the tool
+    /// calls it buffered are dropped here rather than left in memory until
+    /// the task's next run replaces them. [`Self::stop_task`] does not come
+    /// through here: it records its run's calls with the stop.
     async fn end_ownership_under_lease(&self, task_id: Uuid) -> Result<(), String> {
         self.end_task_owners_under_lease(task_id).await?;
+        // Under the lease no run of this task can start, and the one that
+        // was running has ended, so the buffer can only be that run's.
+        take_run_tools(&self.run_tools, task_id);
         self.end_pr_helper_owner_under_lease(task_id).await?;
         Ok(())
     }
@@ -3705,6 +3788,7 @@ impl TaskExecutor {
 mod tests {
     use super::*;
     use crate::config::WorkspaceRegistry;
+    use crate::domain::task::ActivityEntry;
     use crate::domain::{AgentConfig, AgentType, Project, ProjectScope, Workspace, WorkspaceRoot};
     use crate::test_helpers::create_test_task_full;
 
@@ -4133,6 +4217,184 @@ mod tests {
                     .and_then(|v| v.as_str())
                     .is_some_and(|m| m.contains(needle))
         })
+    }
+
+    // --- a run's end, its tool calls and their buffer ---
+
+    fn tool_use(detail: &str) -> ClaudeEvent {
+        ClaudeEvent::ToolUse { tool: "Bash".into(), input: Some(serde_json::json!({ "command": detail })) }
+    }
+
+    fn buffered_tool_rows(executor: &TaskExecutor, task_id: Uuid) -> Option<usize> {
+        let mut task = crate::test_helpers::create_test_task("probe");
+        let tools = take_run_tools(&executor.run_tools, task_id)?;
+        tools.apply_to(&mut task);
+        Some(task.activity.len())
+    }
+
+    fn forwarder(executor: &TaskExecutor, task_id: Uuid, run: u32) -> RunEventForwarder {
+        RunEventForwarder {
+            task_id,
+            run,
+            execution_id: Uuid::new_v4(),
+            logs: executor.logs.clone(),
+            events: executor.events.clone(),
+            tasks: executor.tasks.clone(),
+            run_tools: executor.run_tools.clone(),
+            working_dir: "/nowhere".into(),
+        }
+    }
+
+    /// Every tool call the run's reader sent before the run ended is in its
+    /// buffer once the forwarder is drained, however far behind it was.
+    #[tokio::test]
+    async fn draining_the_forwarder_handles_every_event_already_sent() {
+        let (executor, _temps) = test_executor();
+        let task_id = Uuid::new_v4();
+        executor.run_tools.lock().unwrap().insert(task_id, RunTools::new(1));
+        let (sender, receiver) = tokio::sync::broadcast::channel(512);
+        let drain = forwarder(&executor, task_id, 1).spawn(receiver);
+
+        for n in 0..10 {
+            sender.send(tool_use(&format!("step {n}"))).unwrap();
+        }
+        // The forwarder has not run yet: on this runtime nothing else does
+        // until the test yields, which is the window between the reader's
+        // last send and the run's end being recorded.
+        {
+            let mut probe = crate::test_helpers::create_test_task("probe");
+            executor.run_tools.lock().unwrap()[&task_id].apply_to(&mut probe);
+            assert!(probe.activity.is_empty(), "the calls are still queued, not handled");
+        }
+
+        drain.drain().await;
+        assert_eq!(buffered_tool_rows(&executor, task_id), Some(10));
+        drop(sender);
+    }
+
+    /// A forwarder that fell further behind than the channel holds loses the
+    /// calls the channel dropped, and still handles the ones after them.
+    #[tokio::test]
+    async fn a_forwarder_that_lagged_keeps_forwarding() {
+        let (executor, _temps) = test_executor();
+        let task_id = Uuid::new_v4();
+        executor.run_tools.lock().unwrap().insert(task_id, RunTools::new(1));
+        let (sender, receiver) = tokio::sync::broadcast::channel(4);
+        let drain = forwarder(&executor, task_id, 1).spawn(receiver);
+
+        for n in 0..10 {
+            sender.send(tool_use(&format!("step {n}"))).unwrap();
+        }
+        tokio::task::yield_now().await;
+        sender.send(tool_use("after the lag")).unwrap();
+        drain.drain().await;
+
+        let rows = buffered_tool_rows(&executor, task_id).expect("still buffered");
+        assert!(rows >= 1, "the forwarder must not stop at a lag");
+        drop(sender);
+    }
+
+    /// A run whose finish cannot be recorded changes nothing, and its tool
+    /// calls are still the caller's, so the failure that follows records
+    /// them.
+    #[tokio::test]
+    async fn a_finish_that_cannot_be_recorded_leaves_the_tool_calls_for_the_failure() {
+        let (executor, temps) = test_executor();
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        let before = executor.tasks.read().await[&id].clone();
+        let mut tools = RunTools::new(1);
+        tools.push(chrono::Utc::now(), "Bash", &serde_json::json!({"command": "cargo test"}), "/nowhere");
+        block_persistence(&temps[0]);
+
+        let refused =
+            TaskExecutor::record_run_completed(&executor.tasks, &executor.storage, id, 1, Some(&tools)).await;
+
+        assert!(refused.is_err());
+        let held = executor.tasks.read().await[&id].clone();
+        assert_eq!(
+            (&held.status, &held.phase, held.phase_progress, held.overall_progress, &held.activity),
+            (&before.status, &before.phase, before.phase_progress, before.overall_progress, &before.activity),
+            "nothing is published for a write that did not happen"
+        );
+
+        std::fs::remove_file(temps[0].path().join("config").join("tasks")).expect("unblock persistence");
+        let ended = RunEnd { run: 1, tools: Some(tools), timeline_reason: None };
+        TaskExecutor::set_task_error_static(&executor.tasks, &executor.storage, &executor.events, id, "x", Some(ended))
+            .await;
+        let failed = on_disk_task(&executor, project_id, id);
+        assert_eq!(failed.status, TaskStatus::Error);
+        assert!(matches!(
+            &failed.activity[..],
+            [
+                ActivityEntry { kind: ActivityKind::ToolUsed { run: 1, .. }, .. },
+                ActivityEntry { kind: ActivityKind::RunFailed { run: Some(1), .. }, .. },
+            ]
+        ), "{:?}", failed.activity);
+        assert_eq!(executor.tasks.read().await[&id].activity, failed.activity);
+    }
+
+    /// The failure's timeline row says why the run ended, not what the agent
+    /// printed, even when the task's error quotes it.
+    #[tokio::test]
+    async fn a_failure_quoting_agent_output_keeps_it_off_the_timeline() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        let ended = RunEnd { run: 1, tools: None, timeline_reason: Some("Exit code 1 — no details".into()) };
+        TaskExecutor::set_task_error_static(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            "Exit code 1 — no details — THE AGENT SAID THIS",
+            Some(ended),
+        )
+        .await;
+        let failed = on_disk_task(&executor, project_id, id);
+        assert!(failed.error_message.as_deref().unwrap().contains("THE AGENT SAID THIS"));
+        assert_eq!(
+            failed.activity.last().map(|e| &e.kind),
+            Some(&ActivityKind::RunFailed { run: Some(1), reason: "Exit code 1 — no details".into() })
+        );
+    }
+
+    /// A run a lifecycle move ended records no end, so its buffered calls
+    /// are dropped rather than kept until the task runs again.
+    #[tokio::test]
+    async fn a_run_ended_by_a_move_leaves_no_tool_buffer_behind() {
+        let (executor, _temps) = test_executor();
+        let (id, _project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        let cleaned_up = executor.register_fake_running_execution_for_test(id).await;
+        executor.run_tools.lock().unwrap().insert(id, RunTools::new(1));
+
+        crate::lifecycle::ExecutionOwnership::end_ownership_under_lease(executor.as_ref(), id)
+            .await
+            .expect("ended");
+
+        assert!(cleaned_up.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!executor.run_tools.lock().unwrap().contains_key(&id));
+    }
+
+    /// A stop records the calls its run buffered with the stop.
+    #[tokio::test]
+    async fn a_stop_records_the_runs_tool_calls() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        executor.register_fake_running_execution_for_test(id).await;
+        let mut tools = RunTools::new(1);
+        tools.push(chrono::Utc::now(), "Bash", &serde_json::json!({"command": "cargo test"}), "/nowhere");
+        executor.run_tools.lock().unwrap().insert(id, tools);
+
+        executor.stop_task(id).await.expect("stopped");
+
+        let stopped = on_disk_task(&executor, project_id, id);
+        assert!(matches!(
+            &stopped.activity[..],
+            [
+                ActivityEntry { kind: ActivityKind::ToolUsed { run: 1, .. }, .. },
+                ActivityEntry { kind: ActivityKind::Stopped { .. }, .. },
+            ]
+        ), "{:?}", stopped.activity);
+        assert!(!executor.run_tools.lock().unwrap().contains_key(&id));
     }
 
     // --- record_pr_poll_state("CLOSED") ---
@@ -5183,7 +5445,7 @@ mod tests {
         let (_, acquired) = executor
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
             .await;
-        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired.expect("a stacked worktree")).await.expect("recorded");
+        executor.record_run_start(task_id, repo.to_str().unwrap(), acquired.expect("a stacked worktree")).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         let persisted = persisted_task(&executor, project_id, task_id);
@@ -5218,7 +5480,7 @@ mod tests {
         let acquired = acquired.expect("an ordinary worktree");
         assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()));
         assert_eq!(acquired.origin, Some(on_main()));
-        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
+        executor.record_run_start(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         let persisted = persisted_task(&executor, project_id, task_id);
@@ -5254,7 +5516,7 @@ mod tests {
         );
         assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()));
         assert_eq!(acquired.origin, Some(on_main()));
-        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
+        executor.record_run_start(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         let persisted = persisted_task(&executor, project_id, task_id);
@@ -5373,7 +5635,7 @@ mod tests {
         );
         assert_eq!(acquired.what_happened, "Adopted worktree");
         assert_eq!(acquired.origin, None);
-        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
+        executor.record_run_start(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         assert_eq!(persisted_task(&executor, project_id, task_id).branch_origin, None);
@@ -5404,7 +5666,7 @@ mod tests {
         assert_eq!(acquired.what_happened, "Adopted worktree");
         assert_eq!(acquired.base_commit, None);
         assert_eq!(acquired.origin, None);
-        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
+        executor.record_run_start(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         let persisted = persisted_task(&executor, project_id, task_id);
@@ -5442,7 +5704,7 @@ mod tests {
         let (_, acquired) = executor
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
             .await;
-        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired.expect("adopted")).await.expect("recorded");
+        executor.record_run_start(task_id, repo.to_str().unwrap(), acquired.expect("adopted")).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         let persisted = persisted_task(&executor, project_id, task_id);
@@ -5507,7 +5769,7 @@ mod tests {
         let acquired = acquired.expect("the recorded branch is reattached");
         assert_eq!(acquired.what_happened, "Reattached worktree");
         assert_eq!(acquired.origin, None);
-        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
+        executor.record_run_start(task_id, repo.to_str().unwrap(), acquired).await.expect("recorded");
 
         let project_id = executor.tasks.read().await[&task_id].project_id;
         assert_eq!(persisted_task(&executor, project_id, task_id).branch_origin, None);
@@ -5529,8 +5791,8 @@ mod tests {
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
             .await;
         let path = executor
-            .record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired.expect("a stacked worktree"))
-            .await.expect("recorded");
+            .record_run_start(task_id, repo.to_str().unwrap(), acquired.expect("a stacked worktree"))
+            .await.expect("recorded").working_dir;
 
         // The worktree is removed and the process restarts from disk; the
         // dependency has since moved on to another branch.
@@ -5547,7 +5809,7 @@ mod tests {
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
             .await;
         assert_eq!(existing, Some(WorktreeManager::branch_for_task(task_id)));
-        executor.record_acquired_worktree(task_id, repo.to_str().unwrap(), acquired.expect("reattached")).await.expect("recorded");
+        executor.record_run_start(task_id, repo.to_str().unwrap(), acquired.expect("reattached")).await.expect("recorded");
 
         assert_eq!(
             persisted_task(&executor, project_id, task_id).branch_origin,
@@ -6050,7 +6312,9 @@ mod tests {
         // above would have been the forbidden pairing -- success told to the
         // user, runnable work left on disk.
         std::fs::remove_file(&blocker).expect("unblock persistence");
-        TaskExecutor::persist_task_static(&executor.tasks, &executor.storage, task_id).await;
+        let held: Vec<Task> =
+            executor.tasks.read().await.values().filter(|t| t.project_id == project_id).cloned().collect();
+        executor.storage.save_project_tasks(project_id, &held).expect("persist the held state");
         let residual = executor
             .storage
             .load_project_tasks(project_id)
@@ -7780,7 +8044,7 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                 let acquired = acquired.unwrap_or_else(|e| panic!("{task}: {e}"));
                 assert_eq!(acquired.what_happened, "Created worktree");
                 assert_eq!(acquired.info.branch, WorktreeManager::branch_for_task(task));
-                paths.push(executor.record_acquired_worktree(task, repo.to_str().unwrap(), acquired).await.expect("recorded"));
+                paths.push(executor.record_run_start(task, repo.to_str().unwrap(), acquired).await.expect("recorded").working_dir);
             }
             assert!(!same_path(&paths[0], &paths[1]));
             for task in [A, B] {
@@ -8203,6 +8467,136 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                     ActivityKind::RunCompleted { run: 2 },
                 ]
             );
+        }
+
+        /// Every run's end on the timeline has its start there too.
+        fn every_end_has_its_start(kinds: &[ActivityKind]) {
+            for kind in kinds {
+                if let ActivityKind::RunCompleted { run } | ActivityKind::RunFailed { run: Some(run), .. } = kind {
+                    assert!(
+                        kinds.iter().any(|k| matches!(k, ActivityKind::RunStarted { run: r, .. } if r == run)),
+                        "run {run} ended without starting: {kinds:?}"
+                    );
+                }
+            }
+        }
+
+        /// A start that cannot be recorded launches no agent and numbers no
+        /// run, so the next start is run 1 and its end has its start.
+        #[tokio::test]
+        async fn a_start_that_cannot_be_recorded_numbers_no_run() {
+            let w = world(Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
+            let agent = fake_agent().await;
+            let Some(unwritable) = crate::test_helpers::UnwritableDir::new(&w.tasks_dir()) else {
+                eprintln!("skipped: the tasks directory stays writable (running as root?)");
+                return;
+            };
+
+            let refused = w.executor.spawn_task_execution(w.task_id, None).await;
+
+            assert!(refused.is_err(), "{refused:?}");
+            assert!(!agent_invoked(&agent).await, "no agent may start without a recorded run");
+            let (memory, disk) = (w.in_memory().await, w.on_disk());
+            assert_eq!(memory.activity, disk.activity);
+            assert_eq!((&memory.status, &memory.phase), (&disk.status, &disk.phase));
+            assert!(!memory.activity.iter().any(|e| matches!(e.kind, ActivityKind::RunStarted { .. })));
+            assert!(w.executor.run_tools.lock().unwrap().is_empty());
+            drop(unwritable);
+            drop(agent);
+
+            w.restart().await;
+            let _agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                "cat >/dev/null; printf 'work\\n' > agent_work.txt; \
+                 printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'",
+            )
+            .await;
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            assert_eq!(settled(&w).await.status, TaskStatus::AiReview);
+            let recorded = kinds(&w.on_disk());
+            assert_eq!(
+                recorded,
+                [
+                    ActivityKind::RunStarted { run: 1, addressing_feedback: false },
+                    ActivityKind::RunCompleted { run: 1 },
+                ]
+            );
+            every_end_has_its_start(&recorded);
+        }
+
+        /// A run that finished, but whose move to AI review could not be
+        /// saved, is not published as finished: the board keeps exactly what
+        /// the file has, and no success is announced.
+        #[tokio::test]
+        async fn a_finish_that_cannot_be_recorded_is_not_published() {
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let w = world_with(test_executor_with_events(recording.clone()), Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
+            let gate = tempfile::tempdir().unwrap();
+            let (started, go) = (gate.path().join("started"), gate.path().join("go"));
+            let tool = serde_json::json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t", "name": "Bash", "input": {"command": "cargo test"}}
+            ]}});
+            let _agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &format!(
+                    "cat >/dev/null; {}printf 'work\\n' > agent_work.txt; : > '{}'; \
+                     while [ ! -e '{}' ]; do sleep 0.05; done; \
+                     printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'",
+                    stream(&[tool]),
+                    started.display(),
+                    go.display(),
+                ),
+            )
+            .await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            for _ in 0..200 {
+                if started.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(started.exists(), "the agent ran");
+            let unwritable = crate::test_helpers::UnwritableDir::new(&w.tasks_dir());
+            std::fs::write(&go, b"").unwrap();
+            let Some(unwritable) = unwritable else {
+                w.end_run().await;
+                eprintln!("skipped: the tasks directory stays writable (running as root?)");
+                return;
+            };
+
+            let ended = |recording: &crate::events::RecordingEventSink| {
+                recording.recorded().into_iter().find(|(name, payload)| {
+                    name == "agent-event"
+                        && matches!(payload.get("type").and_then(|v| v.as_str()), Some("completed" | "error"))
+                })
+            };
+            let mut ending = None;
+            for _ in 0..200 {
+                ending = ended(&recording);
+                if ending.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let (_, ending) = ending.expect("the run announced how it ended");
+
+            assert_eq!(ending.get("type").and_then(|v| v.as_str()), Some("error"), "{ending}");
+            assert!(ending.to_string().contains("could not be saved"), "{ending}");
+            let (memory, disk) = (w.in_memory().await, w.on_disk());
+            assert_eq!(memory.status, TaskStatus::InProgress, "{:?}", memory.error_message);
+            assert_eq!(
+                (&memory.status, &memory.phase, memory.phase_progress, memory.overall_progress, &memory.error_message),
+                (&disk.status, &disk.phase, disk.phase_progress, disk.overall_progress, &disk.error_message),
+                "the board shows exactly what the file has"
+            );
+            assert_eq!(memory.activity, disk.activity);
+            assert_eq!(kinds(&disk), [ActivityKind::RunStarted { run: 1, addressing_feedback: false }]);
+            drop(unwritable);
         }
 
         #[tokio::test]
