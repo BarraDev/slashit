@@ -212,11 +212,42 @@ pub struct Task {
 /// file keeps that may name a path on this machine.
 pub(crate) fn without_home_dir(text: &str) -> String {
     match dirs::home_dir().and_then(|h| h.into_os_string().into_string().ok()) {
-        Some(home) if home.trim_end_matches(['/', '\\']).len() > 1 => {
-            text.replace(home.trim_end_matches(['/', '\\']), "~")
-        }
-        _ => text.to_string(),
+        Some(home) => with_home_as_tilde(text, &home),
+        None => text.to_string(),
     }
+}
+
+/// `text` with every path under `home` starting `~` instead.
+///
+/// Matched the way Windows compares paths as well as exactly -- ignoring
+/// ASCII case, with `/` and `\` alike -- because a tool may write the
+/// profile as `C:/Users/me` or `c:\users\me`. Only a whole path component
+/// matches, so `/home/me` leaves `/home/meg` alone. A home at a filesystem
+/// or drive root is left alone rather than turning every path into `~`.
+fn with_home_as_tilde(text: &str, home: &str) -> String {
+    let home = home.strip_prefix(r"\\?\").unwrap_or(home).trim_end_matches(['/', '\\']);
+    if home.is_empty() || home.len() == 2 && home.ends_with(':') {
+        return text.to_string();
+    }
+    let (bytes, needle) = (text.as_bytes(), home.as_bytes());
+    let same = |a: u8, b: u8| a.eq_ignore_ascii_case(&b) || matches!(a, b'/' | b'\\') && matches!(b, b'/' | b'\\');
+    let mut out = String::with_capacity(text.len());
+    let (mut at, mut copied) = (0, 0);
+    // A match starts on `needle`'s first byte and ends on its last, both
+    // character boundaries, so the slices below never split a character.
+    while at + needle.len() <= bytes.len() {
+        let end = at + needle.len();
+        let whole = bytes.get(end).is_none_or(|&c| !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')));
+        if whole && bytes[at..end].iter().zip(needle).all(|(&a, &b)| same(a, b)) {
+            out.push_str(&text[copied..at]);
+            out.push('~');
+            (at, copied) = (end, end);
+        } else {
+            at += 1;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 impl Task {
@@ -1255,15 +1286,33 @@ mod tests {
 
     /// Recorded milestones are what the task file holds, and read back the
     /// same after a restart, in TOML and over IPC.
+    #[test]
+    fn a_home_directory_is_found_however_the_path_is_written() {
+        for (home, text, expected) in [
+            ("/home/me", "in /home/me/src and /home/meg/x", "in ~/src and /home/meg/x"),
+            ("/home/me/", "cd /home/me", "cd ~"),
+            (r"C:\Users\Me", r"at C:\Users\Me\repo", r"at ~\repo"),
+            (r"C:\Users\Me", "at C:/Users/Me/repo and c:\\users\\me\\x", "at ~/repo and ~\\x"),
+            (r"\\?\C:\Users\Me", r"at C:\Users\Me\repo", r"at ~\repo"),
+            (r"C:\", r"C:\Program Files and ABC:", r"C:\Program Files and ABC:"),
+            ("/", "/etc/hosts", "/etc/hosts"),
+            ("/home/mé", "in /home/mé/ü", "in ~/ü"),
+        ] {
+            assert_eq!(with_home_as_tilde(text, home), expected, "{home}: {text}");
+        }
+    }
+
     /// A failure reason names no path under the user's home and keeps no
     /// credential, whichever producer wrote it.
     #[test]
     fn failure_reasons_do_not_record_the_home_directory_or_credentials() {
-        let home = dirs::home_dir()
+        let Some(home) = dirs::home_dir()
             .and_then(|h| h.into_os_string().into_string().ok())
-            .expect("a home directory")
-            .trim_end_matches(['/', '\\'])
-            .to_string();
+            .map(|h| h.trim_end_matches(['/', '\\']).to_string())
+            .filter(|h| h.contains(['/', '\\']))
+        else {
+            return;
+        };
         let mut task = crate::test_helpers::create_test_task("t");
         task.record_activity(ActivityKind::DeliveryFailed {
             reason: format!(
