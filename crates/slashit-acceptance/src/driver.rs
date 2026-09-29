@@ -139,7 +139,7 @@ impl Session {
             bail!(
                 "the application under test is a development build: it is loading {url} \
                  instead of the embedded frontend. Rebuild it with\n    \
-                 cargo tauri build --debug --no-bundle\n\
+                 scripts/build-acceptance-app.sh\n\
                  An ordinary cargo build, test or clippy for `slashit-ui` overwrites the \
                  same path with a binary that has no frontend embedded."
             );

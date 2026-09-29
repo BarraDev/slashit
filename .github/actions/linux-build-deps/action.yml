@@ -27,8 +27,9 @@ runs:
         if [ "${{ inputs.webdriver }}" = "true" ]; then
           # webkit2gtk-driver provides WebKitWebDriver, which tauri-driver
           # drives. xvfb provides the display the application renders into --
-          # hosted runners have none.
-          packages+=(webkit2gtk-driver xvfb)
+          # hosted runners have none -- and dbus its private session bus
+          # (scripts/run-desktop-acceptance.sh).
+          packages+=(webkit2gtk-driver xvfb dbus)
         fi
         sudo apt-get update
         sudo apt-get install -y "${packages[@]}"

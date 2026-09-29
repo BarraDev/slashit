@@ -38,7 +38,7 @@ impl Environment {
         if !app_binary.is_file() {
             bail!(
                 "no application binary at {}. Build one first:\n    \
-                 cargo tauri build --debug --no-bundle\n\
+                 scripts/build-acceptance-app.sh\n\
                  or point SLASHIT_ACCEPTANCE_BIN at an existing custom-protocol build.",
                 app_binary.display()
             );

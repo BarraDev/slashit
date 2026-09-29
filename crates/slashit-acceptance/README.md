@@ -10,28 +10,55 @@ No Node, npm, pnpm, Bun or WebdriverIO is involved at any point. The client is
 ## Running the journeys
 
 ```bash
-# 1. Build the application under test. This step is not optional: a plain
-#    `cargo build` produces a binary that loads http://localhost:1420 and
-#    shows a connection-error page. `cargo tauri build` enables
-#    `custom-protocol`, which embeds dist/ and loads tauri://localhost.
-cargo tauri build --debug --no-bundle
+# 1. Build the application under test. CI runs the same script.
+scripts/build-acceptance-app.sh
 
-# 2. Run them.
-cargo test -p slashit-acceptance --features run-acceptance
+# 2. Run them: every product journey, one exact journey, one journey on your
+#    own display, or the harness's two journeys.
+scripts/run-desktop-acceptance.sh
+scripts/run-desktop-acceptance.sh --exact storage::storage_settings_measure_disk_usage_and_offer_nothing_destructive
+scripts/run-desktop-acceptance.sh --visible --exact <name>
+scripts/run-desktop-acceptance.sh --harness
 ```
 
-The journeys need a graphical session, `tauri-driver` on `PATH`, and a
-`WebKitWebDriver`. The provider is installed with
-`cargo install tauri-driver --version "^2" --locked`; on Debian and Ubuntu the
-native driver is `apt install webkit2gtk-driver`.
+`--list` prints the selected test names, and arguments after `--` go to the
+test binary unchanged. Journeys always run one at a time.
+
+The build step is not optional: a plain `cargo build` produces a binary that
+loads http://localhost:1420 and shows a connection-error page. The script runs
+`cargo tauri build --debug --no-bundle`, which enables `custom-protocol`,
+embeds dist/ and loads tauri://localhost. Before embedding, it removes the
+frontend module's WebAssembly `name` section. In a debug build that section
+is about nine tenths of the module, and it holds function names for stack
+traces, which the harness never collects. Keeping it costs seconds on every
+application start. The removal is verified: every other section, code and
+data included, must be byte-identical, or the build fails
+(`src/wasm_names.rs`). The Subresource Integrity pin Trunk writes for the
+module in `dist/index.html` moves to the stripped module, and nothing else in
+the page changes. The profile, debug assertions and `trunk serve` are
+unchanged. The script records the binary it built, and the runner refuses a
+binary that has changed since.
+
+**Display.** By default the runner starts a private Xvfb display and a private
+D-Bus session for the run and points only the test process tree at them
+(`GDK_BACKEND=x11`, no `WAYLAND_DISPLAY`). The private bus activates no
+services, so none of your desktop's services start with your real HOME. No window opens on your desktop,
+and the application's tray icon does not reach your panel. `--visible` uses
+your own session instead. Hidden mode never falls back to it: without Xvfb it
+stops and says what to install (Arch `xorg-server-xvfb`, Debian and Ubuntu
+`xvfb`).
+
+The journeys also need `tauri-driver` on `PATH` and a `WebKitWebDriver`. The
+provider is installed with `cargo install tauri-driver --version "^2" --locked`;
+on Debian and Ubuntu the native driver is `apt install webkit2gtk-driver`.
 
 > **Rebuild after any ordinary cargo command that touches `slashit-ui`.**
 > `cargo build`, `cargo test -p slashit-ui` and `cargo clippy` all write
 > `target/debug/slashit-ui` without `custom-protocol`, silently replacing the
-> acceptance binary with one that has no frontend embedded. The two are
-> indistinguishable on disk, so the harness detects it at runtime and says so
-> rather than timing out. CI is unaffected: the compile job and the acceptance
-> job are separate checkouts.
+> acceptance binary with one that has no frontend embedded. The runner notices
+> the changed binary before starting, and the harness also detects a
+> development build at runtime rather than timing out. CI is unaffected: the
+> compile job and the acceptance job are separate checkouts.
 
 The harness's own unit tests — port reservation, process-group teardown, state
 roots, artifact pruning — need none of that and run in the ordinary

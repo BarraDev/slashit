@@ -5317,8 +5317,10 @@ name = "slashit-acceptance"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "libc",
  "serde_json",
+ "sha2",
  "thirtyfour",
  "tokio",
  "toml 0.8.2",
