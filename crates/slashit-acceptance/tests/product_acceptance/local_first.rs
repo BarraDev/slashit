@@ -64,6 +64,7 @@ impl GitFixture {
         Ok(Self {
             path: path.to_path_buf(),
             state_root,
+            origin: None,
         })
     }
 }

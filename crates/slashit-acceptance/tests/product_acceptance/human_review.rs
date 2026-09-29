@@ -46,21 +46,23 @@ impl GitFixture {
     /// to `gh`, while every push still lands in the local bare repository
     /// beside the fixture. Nothing ever fetches from `origin`.
     pub(super) fn point_origin_at_github(&self) -> Result<()> {
-        let push_url = self.origin_path();
+        let push_url = self.origin_path()?;
         let push_url = push_url.to_str().context("the origin path is not UTF-8")?;
         git(&self.path, &["remote", "set-url", "origin", fake_gh::REPOSITORY_URL])?;
         git(&self.path, &["remote", "set-url", "--push", "origin", push_url])
     }
 
-    fn origin_path(&self) -> PathBuf {
-        self.state_root.join("fixture-origin.git")
+    fn origin_path(&self) -> Result<&Path> {
+        self.origin
+            .as_deref()
+            .context("this fixture was created without an origin")
     }
 
     /// What `branch` points at in the bare `origin`, if it is there at all.
     fn origin_tip(&self, branch: &str) -> Result<Option<String>> {
         let output = std::process::Command::new("git")
             .arg("--git-dir")
-            .arg(self.origin_path())
+            .arg(self.origin_path()?)
             .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
