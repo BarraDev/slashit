@@ -34,15 +34,19 @@ pub struct ActivityRow {
     pub tool: bool,
 }
 
-/// The task's timeline as rows, in `offset`'s local time.
-pub fn activity_rows(task: &Task, offset: FixedOffset, now: DateTime<Utc>) -> Vec<ActivityRow> {
+/// The local offset from UTC in effect at an instant. An instant's own
+/// offset, not today's: a zone with daylight saving time has two.
+pub type OffsetAt<'a> = &'a dyn Fn(DateTime<Utc>) -> FixedOffset;
+
+/// The task's timeline as rows, in local time.
+pub fn activity_rows(task: &Task, offset_at: OffsetAt<'_>, now: DateTime<Utc>) -> Vec<ActivityRow> {
     task.timeline()
         .iter()
         .map(|item| ActivityRow {
             key: item.key(),
             kind: item.kind_name(),
-            when: compact_time(item.at, offset, now),
-            exact: item.at.with_timezone(&offset).format("%Y-%m-%d %H:%M:%S").to_string(),
+            when: compact_time(item.at, offset_at, now),
+            exact: item.at.with_timezone(&offset_at(item.at)).format("%Y-%m-%d %H:%M:%S").to_string(),
             title: item.title(),
             detail: item.detail(),
             tone: item.tone(),
@@ -53,9 +57,9 @@ pub fn activity_rows(task: &Task, offset: FixedOffset, now: DateTime<Utc>) -> Ve
 
 /// `14:32` today, `Sep 28 14:32` earlier this year, `2025-09-28 14:32`
 /// before that.
-pub fn compact_time(at: DateTime<Utc>, offset: FixedOffset, now: DateTime<Utc>) -> String {
-    let local = at.with_timezone(&offset);
-    let today = now.with_timezone(&offset);
+pub fn compact_time(at: DateTime<Utc>, offset_at: OffsetAt<'_>, now: DateTime<Utc>) -> String {
+    let local = at.with_timezone(&offset_at(at));
+    let today = now.with_timezone(&offset_at(now));
     if local.date_naive() == today.date_naive() {
         local.format("%H:%M").to_string()
     } else if local.year() == today.year() {
@@ -72,10 +76,12 @@ pub fn visible_rows(rows: &[ActivityRow], expanded: bool) -> (&[ActivityRow], us
     (&rows[hidden..], hidden)
 }
 
-/// The user's local offset from UTC, as the webview reports it.
-fn local_offset() -> FixedOffset {
+/// The user's local offset from UTC at `at`, as the webview's time zone has
+/// it then.
+fn local_offset_at(at: DateTime<Utc>) -> FixedOffset {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(at.timestamp_millis() as f64));
     // `getTimezoneOffset` is UTC minus local, in minutes.
-    let minutes = js_sys::Date::new_0().get_timezone_offset();
+    let minutes = date.get_timezone_offset();
     FixedOffset::west_opt((minutes * 60.0) as i32).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap())
 }
 
@@ -92,10 +98,9 @@ fn tone_class(tone: Tone) -> &'static str {
 #[component]
 pub fn TaskActivity(task: Memo<Option<Task>>) -> impl IntoView {
     let expanded = RwSignal::new(false);
-    let offset = local_offset();
     // Recomputed only when the task record changes, not on a clock.
     let rows = Memo::new(move |_| {
-        task.with(|t| t.as_ref().map(|t| activity_rows(t, offset, Utc::now())).unwrap_or_default())
+        task.with(|t| t.as_ref().map(|t| activity_rows(t, &local_offset_at, Utc::now())).unwrap_or_default())
     });
 
     view! {
@@ -177,7 +182,7 @@ mod tests {
         .unwrap()
     }
 
-    fn utc() -> FixedOffset {
+    fn utc(_: DateTime<Utc>) -> FixedOffset {
         FixedOffset::east_opt(0).unwrap()
     }
 
@@ -202,7 +207,7 @@ mod tests {
             "arrivals": 1,
             "entries": [{ "sequence": 1, "arrival": 1, "decision": "approved", "decided_at": "2026-09-29T15:03:00Z" }]
         });
-        let rows = activity_rows(&task(activity, review), utc(), now());
+        let rows = activity_rows(&task(activity, review), &utc, now());
         let lines: Vec<(String, String, Option<String>)> =
             rows.iter().map(|r| (r.when.clone(), r.title.clone(), r.detail.clone())).collect();
         assert_eq!(
@@ -235,7 +240,7 @@ mod tests {
         let mut json = serde_json::to_value(task(serde_json::json!([]), review)).unwrap();
         json.as_object_mut().unwrap().remove("activity");
         let old: Task = serde_json::from_value(json).unwrap();
-        let rows = activity_rows(&old, utc(), now());
+        let rows = activity_rows(&old, &utc, now());
         let titles: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(titles, ["Task created", "You requested changes"]);
         assert_eq!(rows[1].detail.as_deref(), Some("add tests"));
@@ -247,10 +252,30 @@ mod tests {
         let lisbon = FixedOffset::east_opt(3600).unwrap();
         // 00:30 the next day in Lisbon, which is "today" there at 01:00.
         let later = Utc.with_ymd_and_hms(2026, 9, 30, 0, 0, 0).unwrap();
-        assert_eq!(compact_time(at, lisbon, later), "00:30");
-        assert_eq!(compact_time(at, utc(), later), "Sep 29 23:30");
+        assert_eq!(compact_time(at, &|_| lisbon, later), "00:30");
+        assert_eq!(compact_time(at, &utc, later), "Sep 29 23:30");
         let next_year = Utc.with_ymd_and_hms(2027, 1, 2, 0, 0, 0).unwrap();
-        assert_eq!(compact_time(at, utc(), next_year), "2026-09-29 23:30");
+        assert_eq!(compact_time(at, &utc, next_year), "2026-09-29 23:30");
+    }
+
+    /// Each time is shown with the offset in effect when it happened, so a
+    /// winter row viewed in summer does not move by the hour saving adds.
+    #[test]
+    fn times_keep_their_own_daylight_saving_offset() {
+        // Lisbon: UTC in winter, UTC+1 from 2026-03-29 01:00 UTC.
+        let summer_starts = Utc.with_ymd_and_hms(2026, 3, 29, 1, 0, 0).unwrap();
+        let lisbon = |at: DateTime<Utc>| {
+            FixedOffset::east_opt(if at >= summer_starts { 3600 } else { 0 }).unwrap()
+        };
+        let winter = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        let summer = Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 15, 18, 0, 0).unwrap();
+        assert_eq!(compact_time(winter, &lisbon, now), "Jan 15 12:00");
+        assert_eq!(compact_time(summer, &lisbon, now), "13:00");
+        // The instant saving starts: 00:59 is followed by 02:00.
+        let before = summer_starts - chrono::Duration::minutes(1);
+        assert_eq!(compact_time(before, &lisbon, now), "Mar 29 00:59");
+        assert_eq!(compact_time(summer_starts, &lisbon, now), "Mar 29 02:00");
     }
 
     #[test]
@@ -264,7 +289,7 @@ mod tests {
         }
         let rows = activity_rows(
             &task(serde_json::to_value(&entries).unwrap(), serde_json::json!({ "arrivals": 0 })),
-            utc(),
+            &utc,
             now(),
         );
         assert_eq!(rows.len(), 91);
