@@ -143,7 +143,7 @@ fn with_worktree_roots(paths: &AppPaths, recorded: Vec<(RecordedCheckout, Option
         .collect()
 }
 
-fn filesystem_space(path: &Path) -> std::io::Result<FilesystemSpace> {
+pub(crate) fn filesystem_space(path: &Path) -> std::io::Result<FilesystemSpace> {
     let stats = fs4::statvfs(path)?;
     Ok(FilesystemSpace {
         total_bytes: stats.total_space(),

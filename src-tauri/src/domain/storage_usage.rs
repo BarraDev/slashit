@@ -1,10 +1,11 @@
 //! How much disk SlashIt uses, and how much of it it could prove is safe to
 //! give back.
 //!
-//! Informational only. Nothing here deletes, moves or prunes anything, and no
-//! behavior elsewhere depends on these numbers yet. They are the foundation a
-//! later disk-pressure guard or cleanup policy would be built on, so every
-//! figure errs toward claiming less: bytes SlashIt cannot prove it owns are
+//! Nothing here deletes, moves or prunes anything, and no behavior depends on
+//! a measurement: the one thing that acts on disk pressure, pausing new task
+//! executions ([`StartBlock`]), asks the filesystem afresh each time rather
+//! than reading a [`StorageSummary`]. Every figure errs toward claiming
+//! less: bytes SlashIt cannot prove it owns are
 //! [`StorageClassification::Unknown`], never owned, and never reclaimable.
 //!
 //! The totals do not overlap in the way their names might suggest:
@@ -164,8 +165,9 @@ pub enum DiskPressure {
 ///
 /// A level applies when available space is strictly below the larger of a
 /// share of the filesystem and a fixed floor, so small disks reach it by the
-/// floor and large disks by the share. Informational only: nothing refuses
-/// or throttles work on it yet.
+/// floor and large disks by the share. Warning is informational. Critical
+/// pauses new task executions (see [`StartBlock`]); it never stops work
+/// already running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressurePolicy {
     pub warning_percent: u8,
@@ -220,6 +222,63 @@ fn share(total: u64, percent: u8) -> u64 {
     // The product needs u128. A share above 100% of the largest filesystem
     // does not fit in u64 and saturates.
     u64::try_from(u128::from(total) * u128::from(percent) / 100).unwrap_or(u64::MAX)
+}
+
+/// Why SlashIt is not beginning new task executions right now.
+///
+/// Environmental, not a task failure: a task refused for this stays where it
+/// is and starts on a later attempt once the condition clears. Work already
+/// running is never affected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StartBlock {
+    /// Free space is below the policy's critical threshold.
+    CriticalDisk {
+        available_bytes: u64,
+        critical_below_bytes: u64,
+    },
+    /// The filesystem could not be asked, so free space is unknown. Treated
+    /// as a reason not to start, never as `Critical`.
+    DiskSpaceUnavailable { reason: String },
+}
+
+impl PressurePolicy {
+    /// Whether a new task execution may begin, given a fresh reading of the
+    /// filesystem. Only [`DiskPressure::Critical`] blocks; Warning does not.
+    pub fn start_block(&self, space: Result<FilesystemSpace, String>) -> Option<StartBlock> {
+        match space {
+            Ok(space) => (self.classify(space) == DiskPressure::Critical).then(|| {
+                StartBlock::CriticalDisk {
+                    available_bytes: space.available_bytes,
+                    critical_below_bytes: self.thresholds(space.total_bytes).critical_below_bytes,
+                }
+            }),
+            Err(reason) => Some(StartBlock::DiskSpaceUnavailable { reason }),
+        }
+    }
+}
+
+impl std::fmt::Display for StartBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartBlock::CriticalDisk { available_bytes, critical_below_bytes } => write!(
+                f,
+                "New work paused: critically low disk space ({} free; new tasks can start \
+                 again at {} free). Settings > Storage shows what SlashIt uses.",
+                gib(*available_bytes),
+                gib(*critical_below_bytes),
+            ),
+            StartBlock::DiskSpaceUnavailable { reason } => write!(
+                f,
+                "New work paused: SlashIt couldn't verify free disk space ({reason})."
+            ),
+        }
+    }
+}
+
+/// Bytes as GiB with one decimal, for a message.
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / GIB as f64)
 }
 
 /// One complete measurement.
@@ -308,6 +367,49 @@ mod tests {
         assert_eq!(policy.classify(space(total, 300 * GIB - 1)), DiskPressure::Warning);
         assert_eq!(policy.classify(space(total, 100 * GIB)), DiskPressure::Warning);
         assert_eq!(policy.classify(space(total, 100 * GIB - 1)), DiskPressure::Critical);
+    }
+
+    #[test]
+    fn only_critical_pressure_blocks_a_start_and_its_boundary_does_not() {
+        let policy = PressurePolicy::default();
+        let total = 500 * GIB;
+        // Normal and Warning, including Warning's lowest byte, start.
+        assert_eq!(policy.start_block(Ok(space(total, 300 * GIB))), None);
+        assert_eq!(policy.start_block(Ok(space(total, 120 * GIB - 1))), None);
+        // Exactly at the critical threshold is not Critical.
+        assert_eq!(policy.start_block(Ok(space(total, 40 * GIB))), None);
+        assert_eq!(
+            policy.start_block(Ok(space(total, 40 * GIB - 1))),
+            Some(StartBlock::CriticalDisk {
+                available_bytes: 40 * GIB - 1,
+                critical_below_bytes: 40 * GIB,
+            })
+        );
+    }
+
+    #[test]
+    fn an_unreadable_filesystem_blocks_a_start_without_claiming_critical() {
+        let block = PressurePolicy::default().start_block(Err("permission denied".to_string()));
+        assert_eq!(
+            block,
+            Some(StartBlock::DiskSpaceUnavailable { reason: "permission denied".to_string() })
+        );
+        let message = block.unwrap().to_string();
+        assert!(message.contains("couldn't verify free disk space"), "{message}");
+        assert!(!message.contains("critically"), "{message}");
+    }
+
+    #[test]
+    fn a_critical_block_says_how_much_is_free_and_where_to_look() {
+        let message = StartBlock::CriticalDisk {
+            available_bytes: 12 * GIB + GIB / 2,
+            critical_below_bytes: 40 * GIB,
+        }
+        .to_string();
+        assert!(message.starts_with("New work paused: critically low disk space"), "{message}");
+        assert!(message.contains("12.5 GiB free"), "{message}");
+        assert!(message.contains("40.0 GiB"), "{message}");
+        assert!(message.contains("Settings > Storage"), "{message}");
     }
 
     #[test]

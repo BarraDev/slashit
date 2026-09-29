@@ -41,6 +41,9 @@ pub async fn start_agent(
 ) -> Result<AgentExecution, String> {
     let worktree_id = Uuid::parse_str(&worktree_id).map_err(|e| e.to_string())?;
     let task_id = task_id.and_then(|t| Uuid::parse_str(&t).ok());
+    // A new agent run, like a queued one, waits while new work is paused for
+    // disk space. Checked before anything is recorded.
+    state.start_guard.check().await.map_err(|block| block.to_string())?;
     let id = Uuid::new_v4();
     let now = chrono::Utc::now();
 

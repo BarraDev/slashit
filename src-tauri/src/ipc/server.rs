@@ -114,6 +114,10 @@ pub struct IpcContext {
     /// which is where the TCP bearer token is minted and read.
     pub paths: Arc<crate::config::paths::AppPaths>,
 
+    /// Whether there is disk space to begin new task executions; the same
+    /// guard the desktop commands and the executor use.
+    pub start_guard: Arc<crate::queue::start_guard::StartGuard>,
+
     /// The handles a lifecycle transition needs.
     ///
     /// `slashit move <task> done` is the same terminal claim as dragging the

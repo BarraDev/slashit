@@ -67,9 +67,11 @@ fn legacy_tasks_dir(paths: &AppPaths) -> std::path::PathBuf {
 async fn desktop_mutation_refuses_to_publish_when_the_durable_write_fails() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let paths = make_paths(&tmp);
-    let (state, _report) = slashit_ui_lib::app_core::build_state_with_paths(paths.clone())
+    let (mut state, _report) = slashit_ui_lib::app_core::build_state_with_paths(paths.clone())
         .await
         .expect("state should build under a fresh tempdir");
+    // Not about disk pressure: independent of the host's free space.
+    state.start_guard = slashit_ui_lib::test_helpers::plenty_of_disk();
 
     let project_id = Uuid::new_v4();
     let mut task = create_test_task_full("subject", project_id, TaskStatus::Queue, 0);

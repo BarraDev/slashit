@@ -76,6 +76,10 @@ pub struct AppState {
     /// How much disk SlashIt uses. Measured only when asked, one
     /// measurement at a time.
     pub storage_accounting: Arc<storage_accounting::StorageAccounting>,
+    /// Whether there is disk space to begin new task executions. Shared with
+    /// the executor and the IPC handlers, so every way of starting a task
+    /// asks the same question.
+    pub start_guard: Arc<queue::start_guard::StartGuard>,
 }
 
 impl AppState {
@@ -193,6 +197,7 @@ pub fn run() {
                     worktree_manager: state.worktree_manager.clone(),
                     events: events.clone(),
                     lifecycle: state.task_lifecycle_locks.clone(),
+                    start_guard: state.start_guard.clone(),
                 },
             ));
             let _ = state.executor.set(executor.clone());
@@ -221,6 +226,7 @@ pub fn run() {
                     executor: state.executor.clone(),
                     feature_diagnostics: None,
                     paths: state.paths.clone(),
+                    start_guard: state.start_guard.clone(),
                 });
                 // Serving the endpoints claimed before hydration. Nothing is
                 // bound here, so this can no longer fail because another
@@ -361,6 +367,7 @@ pub fn run() {
             get_attention_summary,
             get_storage_usage,
             refresh_storage_usage,
+            get_new_work_pause,
             create_worktree,
             cleanup_worktree,
             check_worktree_exists,

@@ -4,7 +4,7 @@
 //! command reaches the view as an error instead of an empty result that
 //! would read as "nothing measured".
 
-use crate::models::storage_usage::StorageStatus;
+use crate::models::storage_usage::{StartBlock, StorageStatus};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
@@ -14,7 +14,7 @@ extern "C" {
     fn raw_invoke(cmd: &str, args: JsValue) -> js_sys::Promise;
 }
 
-async fn invoke(cmd: &str) -> Result<StorageStatus, String> {
+async fn invoke<T: serde::de::DeserializeOwned>(cmd: &str) -> Result<T, String> {
     let response = JsFuture::from(raw_invoke(cmd, JsValue::NULL))
         .await
         .map_err(|value| {
@@ -36,4 +36,10 @@ pub async fn get_storage_usage() -> Result<StorageStatus, String> {
 /// Measure now, or wait for the measurement already running.
 pub async fn refresh_storage_usage() -> Result<StorageStatus, String> {
     invoke("refresh_storage_usage").await
+}
+
+/// Why new task executions are paused, or `None` when they are not. A fresh
+/// reading of the filesystem, not the last measurement.
+pub async fn get_new_work_pause() -> Result<Option<StartBlock>, String> {
+    invoke("get_new_work_pause").await
 }

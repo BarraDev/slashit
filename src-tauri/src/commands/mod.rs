@@ -40,7 +40,7 @@ pub use queue::*;
 pub use qa::*;
 pub use human_review::*;
 pub use attention::get_attention_summary;
-pub use storage_usage::{get_storage_usage, refresh_storage_usage};
+pub use storage_usage::{get_new_work_pause, get_storage_usage, refresh_storage_usage};
 pub use worktree::*;
 pub use pr::*;
 pub use roadmap::*;

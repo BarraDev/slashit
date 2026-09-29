@@ -6,6 +6,7 @@ pub mod sidebar;
 pub mod project_card;
 pub mod project_tabs;
 pub mod kanban;
+pub mod new_work_pause;
 pub mod task_card;
 pub mod task_drawer;
 pub mod task_live;

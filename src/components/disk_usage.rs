@@ -1,8 +1,9 @@
 //! Disk usage: how much space SlashIt uses, and how full the disk is.
 //!
-//! Informational only. There is deliberately no action here that deletes,
-//! cleans or prunes anything; the numbers exist so the user can see them,
-//! and so later policies have something trustworthy to stand on.
+//! There is deliberately no action here that deletes, cleans or prunes
+//! anything; the numbers exist so the user can see them. Pausing new work on
+//! a critically full disk does not read them: it asks the filesystem afresh
+//! (see the backend's `queue::start_guard`).
 //!
 //! Measuring walks SlashIt's directories, so it runs only when asked: once
 //! when the section first opens with nothing measured yet, then on Refresh.
@@ -58,7 +59,7 @@ pub fn DiskUsage() -> impl IntoView {
                 <div>
                     <h2 class="text-lg font-semibold text-white/90 mb-1">"Disk usage"</h2>
                     <p class="text-sm text-white/50">
-                        "What SlashIt stores on this computer. Informational only: SlashIt does not delete, clean up or limit anything based on these numbers."
+                        "What SlashIt stores on this computer. SlashIt does not delete or clean up anything based on these numbers. When free space is critically low, new tasks wait to start until space returns; running tasks carry on."
                     </p>
                 </div>
                 <button
@@ -320,11 +321,11 @@ fn pressure_style(pressure: DiskPressure) -> (&'static str, &'static str) {
         DiskPressure::Normal => ("bg-green-500/20 text-green-300", "Plenty of free space."),
         DiskPressure::Warning => (
             "bg-amber-500/20 text-amber-300",
-            "Free space is getting low. Nothing is limited because of it.",
+            "Free space is getting low. Nothing is limited because of it yet.",
         ),
         DiskPressure::Critical => (
             "bg-red-500/20 text-red-300",
-            "Free space is very low. Nothing is limited because of it.",
+            "Free space is very low. New tasks wait to start until space returns; running tasks carry on.",
         ),
     }
 }

@@ -2,6 +2,7 @@ use crate::agents::runner::{ClaudeRunner, ClaudeRunConfig, ClaudeEvent, ToolAcce
 use crate::domain::{Task, TaskStatus, TaskPhase, AgentExecution, AgentStatus, AgentLogEntry, LogLevel, QaSignoff, QaStatus, BranchOrigin};
 use crate::domain::task::ExternalRef;
 use crate::queue::admission::{Admission, AdmissionPermit};
+use crate::queue::start_guard::StartGuard;
 use crate::queue::prompt::{build_task_prompt, build_review_prompt, build_fix_prompt};
 use crate::queue::QueueManager;
 use crate::worktree::{CheckoutCommit, WorktreeInfo, WorktreeManager};
@@ -515,6 +516,9 @@ pub struct TaskExecutor {
     /// When a start of each task last failed to record the worktree it was
     /// given. See [`TaskExecutor::refuse_while_unrecorded_backoff`].
     unrecorded_acquisitions: std::sync::Mutex<HashMap<Uuid, UnrecordedBackoff>>,
+    /// Whether there is disk space to begin a new execution. Asked before
+    /// anything a start does, and never about work already running.
+    start_guard: Arc<StartGuard>,
 }
 
 pub struct TaskExecutorConfig {
@@ -529,6 +533,7 @@ pub struct TaskExecutorConfig {
     pub worktree_manager: Arc<WorktreeManager>,
     pub events: SharedEventSink,
     pub lifecycle: Arc<crate::lifecycle::TaskLifecycleLocks>,
+    pub start_guard: Arc<StartGuard>,
 }
 
 impl TaskExecutor {
@@ -564,6 +569,7 @@ impl TaskExecutor {
             events: config.events,
             pr_check_counter: std::sync::atomic::AtomicU32::new(0),
             unrecorded_acquisitions: std::sync::Mutex::new(HashMap::new()),
+            start_guard: config.start_guard,
         }
     }
 
@@ -770,7 +776,16 @@ impl TaskExecutor {
         // crashed before its next explicit save would come back `Queue` on
         // disk while every other part of the running process still believed
         // it was `InProgress`. See `lifecycle::commit_selected`.
-        let auto_promote = self.queue_manager.read().await.config().auto_promote;
+        // New work waits while disk space is critically low or cannot be
+        // checked: nothing is promoted, so queued tasks stay `Queue`, and the
+        // next pass asks again. Checked before any capacity is reserved, so
+        // a paused pass holds no permit. Reviews above are continuations of
+        // work already started and are not paused. Space running out between
+        // this check and the start below leaves a promoted task `InProgress`
+        // and idle; `spawn_task_execution` refuses it without an error, and a
+        // later pass starts it once space returns.
+        let auto_promote = self.queue_manager.read().await.config().auto_promote
+            && self.start_guard.check().await.is_ok();
         if auto_promote {
             loop {
                 let Some(permit) = self.admission.try_acquire() else {
@@ -1419,7 +1434,9 @@ impl TaskExecutor {
     /// `Ok(true)` means an execution was registered, `Ok(false)` that this
     /// pass declined and the task is left for a later one, and `Err` that
     /// the task was refused, saying why, so a caller that answers a person
-    /// can say what happened rather than assume it worked.
+    /// can say what happened rather than assume it worked. A refusal for disk
+    /// space leaves the task exactly as it was; most others record an error
+    /// on it.
     async fn spawn_task_execution(
         &self,
         task_id: Uuid,
@@ -1443,6 +1460,14 @@ impl TaskExecutor {
             return Ok(false); // one agent per task
         }
         self.refuse_while_unrecorded_backoff(task_id)?;
+
+        // Disk space, before capacity and before anything below creates a
+        // checkout, a branch or an agent. A refusal changes nothing about the
+        // task, and drops `external_permit` unused, so a paused task holds no
+        // capacity and starts on a later pass once space is back.
+        if let Err(block) = self.start_guard.check().await {
+            return Err(block.to_string());
+        }
 
         // Capacity, before any of the worktree/prompt work below runs: a
         // reservation already made for this exact task is honored outright;
@@ -1927,6 +1952,10 @@ impl TaskExecutor {
                 );
             }
         }
+        // Before the task is touched. `spawn_task_execution` asks again, and
+        // is the authority; this only keeps a paused start from moving the
+        // task to `InProgress` first.
+        self.start_guard.check().await.map_err(|block| block.to_string())?;
         {
             let mut tasks = self.tasks.write().await;
             if let Some(t) = tasks.get_mut(&task_id) {
@@ -3642,6 +3671,7 @@ mod tests {
             )),
             events: crate::events::null_sink(),
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
+            start_guard: crate::test_helpers::plenty_of_disk(),
         });
 
         let guard = Unwritable::on(&storage_temp.path().join("config").join("tasks"));
@@ -4197,6 +4227,15 @@ mod tests {
     fn test_executor_with_events(
         events: SharedEventSink,
     ) -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {
+        test_executor_with(events, crate::test_helpers::plenty_of_disk())
+    }
+
+    /// Same as [`test_executor_with_events`], with a caller-supplied start
+    /// guard, for tests about disk pressure.
+    fn test_executor_with(
+        events: SharedEventSink,
+        start_guard: Arc<StartGuard>,
+    ) -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {
         let (storage, storage_temp) = test_storage();
         let (registry, reg_temp) = test_registry();
         let paths_temp = tempfile::TempDir::new().expect("paths temp dir");
@@ -4224,6 +4263,7 @@ mod tests {
             )),
             events,
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
+            start_guard,
         }));
         (executor, vec![storage_temp, reg_temp, paths_temp])
     }
@@ -4355,6 +4395,7 @@ mod tests {
             )),
             events: crate::events::null_sink(),
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
+            start_guard: crate::test_helpers::plenty_of_disk(),
         }));
 
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -4419,6 +4460,7 @@ mod tests {
             )),
             events: crate::events::null_sink(),
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
+            start_guard: crate::test_helpers::plenty_of_disk(),
         });
 
         let task_id = Uuid::new_v4();
@@ -7914,6 +7956,260 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
 
             assert!(refused.contains("could not be recorded"), "{refused}");
             assert!(!refused.contains("stays queued"), "{refused}");
+        }
+    }
+
+    /// Disk pressure pauses new executions at the executor's own start
+    /// boundaries, and nothing else.
+    mod disk_pressure {
+        use super::*;
+        use crate::domain::storage_usage::GIB;
+        use crate::events::RecordingEventSink;
+        use crate::test_helpers::FakeDisk;
+
+        /// Levels on [`FakeDisk`]'s 500 GiB filesystem.
+        const CRITICAL: u64 = 10 * GIB;
+        const CRITICAL_BOUNDARY: u64 = 40 * GIB;
+        const WARNING: u64 = 100 * GIB;
+        const NORMAL: u64 = 300 * GIB;
+
+        struct World {
+            executor: Arc<TaskExecutor>,
+            _temps: Vec<tempfile::TempDir>,
+            disk: FakeDisk,
+            recording: Arc<RecordingEventSink>,
+            repo: std::path::PathBuf,
+            task_id: Uuid,
+            project_id: Uuid,
+        }
+
+        /// One task in `status`, idle, in a project whose repository is a
+        /// real git repository when `git` is set. When it is not, a start
+        /// that gets past the guard fails at the checkout, which is how these
+        /// tests see that a start was allowed without launching an agent.
+        async fn world(available: u64, status: TaskStatus, git: bool) -> World {
+            let disk = FakeDisk::with_available(available);
+            let recording = Arc::new(RecordingEventSink::new());
+            let (executor, temps) = test_executor_with(recording.clone(), disk.guard());
+
+            let repo = temps[0].path().join("repository");
+            std::fs::create_dir_all(&repo).unwrap();
+            if git {
+                git_in(&repo, &["init", "-q", "-b", "main"]);
+                git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
+            }
+            let project_id = Uuid::new_v4();
+            let repository_id = Uuid::new_v4();
+            executor.repositories.write().await.insert(
+                repository_id,
+                crate::domain::Repository {
+                    id: repository_id,
+                    local_path: repo.to_string_lossy().to_string(),
+                    remote_url: None,
+                    remote_type: None,
+                    created_at: chrono::Utc::now(),
+                },
+            );
+            let mut project = test_project(project_id, ProjectScope::Standalone);
+            project.repository_id = Some(repository_id);
+            executor.projects.write().await.insert(project_id, project);
+
+            let mut task = create_test_task_full("fresh work", project_id, status, 0);
+            task.phase = TaskPhase::Idle;
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task.clone());
+            executor.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+
+            World { executor, _temps: temps, disk, recording, repo, task_id, project_id }
+        }
+
+        impl World {
+            /// The task in memory and on disk, compared whole.
+            async fn records(&self) -> (serde_json::Value, serde_json::Value) {
+                let memory = self.executor.tasks.read().await.get(&self.task_id).cloned().unwrap();
+                let disk = on_disk_task(&self.executor, self.project_id, self.task_id);
+                (serde_json::to_value(memory).unwrap(), serde_json::to_value(disk).unwrap())
+            }
+
+            async fn task(&self) -> Task {
+                self.executor.tasks.read().await.get(&self.task_id).cloned().unwrap()
+            }
+
+            /// Capacity nothing holds right now.
+            async fn free_permits(&self) -> usize {
+                self.executor.reconcile_admission().await;
+                let mut held = Vec::new();
+                while let Some(permit) = self.executor.admission.try_acquire() {
+                    held.push(permit);
+                }
+                held.len()
+            }
+
+            fn agent_events(&self) -> Vec<serde_json::Value> {
+                self.recording
+                    .recorded()
+                    .into_iter()
+                    .filter(|(name, _)| name == "agent-event")
+                    .map(|(_, payload)| payload)
+                    .collect()
+            }
+
+            fn events_saying(&self, needle: &str) -> usize {
+                self.agent_events()
+                    .iter()
+                    .filter(|e| e.get("message").and_then(|m| m.as_str()).is_some_and(|m| m.contains(needle)))
+                    .count()
+            }
+        }
+
+        const LIMIT: usize = 3; // `QueueConfig::default().parallel_task_limit`
+
+        #[tokio::test]
+        async fn critical_disk_refuses_a_fresh_execution_before_anything_changes() {
+            let w = world(CRITICAL, TaskStatus::InProgress, true).await;
+            let before = w.records().await;
+            // A reservation made at promotion is handed in, as the poller does.
+            w.executor.reconcile_admission().await;
+            let reserved = w.executor.admission.try_acquire();
+            assert!(reserved.is_some());
+
+            let refused = w.executor.spawn_task_execution(w.task_id, reserved).await;
+
+            let message = refused.expect_err("a start with critically low disk is refused");
+            assert!(message.starts_with("New work paused: critically low disk space"), "{message}");
+            assert_eq!(w.records().await, before, "the task is not touched, in memory or on disk");
+            assert_eq!(w.task().await.status, TaskStatus::InProgress, "not Error");
+            assert_eq!(worktree_count(&w.repo), 1, "no checkout was created");
+            assert_eq!(git_in(&w.repo, &["branch", "--format=%(refname:short)"]), "main", "no task branch");
+            assert!(w.executor.running_handles.read().await.is_empty(), "no agent was spawned");
+            assert!(w.agent_events().is_empty(), "nothing was logged on the task: {:?}", w.agent_events());
+            assert_eq!(w.free_permits().await, LIMIT, "the reservation handed in was returned");
+        }
+
+        #[tokio::test]
+        async fn a_failed_disk_check_refuses_a_fresh_execution_without_an_error() {
+            let w = world(NORMAL, TaskStatus::InProgress, true).await;
+            w.disk.fail();
+            let before = w.records().await;
+
+            let refused = w.executor.spawn_task_execution(w.task_id, None).await;
+
+            let message = refused.expect_err("a start that cannot check the disk is refused");
+            assert!(message.contains("couldn't verify free disk space"), "{message}");
+            assert!(!message.contains("critically"), "unknown is not reported as critical: {message}");
+            assert_eq!(w.records().await, before);
+            let task = w.task().await;
+            assert_eq!(task.status, TaskStatus::InProgress);
+            assert!(task.error_message.is_none());
+            assert_eq!(worktree_count(&w.repo), 1);
+            assert!(w.executor.running_handles.read().await.is_empty());
+            assert_eq!(w.free_permits().await, LIMIT);
+
+            // The next attempt asks again rather than remembering the failure.
+            let reads = w.disk.reads();
+            w.disk.set_available(NORMAL);
+            let _ = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(w.disk.reads() > reads);
+        }
+
+        #[tokio::test]
+        async fn normal_warning_and_the_exact_critical_threshold_let_a_start_proceed() {
+            for available in [NORMAL, WARNING, CRITICAL_BOUNDARY] {
+                let w = world(available, TaskStatus::InProgress, false).await;
+                let outcome = w.executor.spawn_task_execution(w.task_id, None).await;
+                // Past the guard, the start reaches the checkout, which this
+                // fixture cannot provide.
+                let message = outcome.expect_err("the fixture has no repository to check out");
+                assert!(message.contains("worktree"), "{available}: {message}");
+                assert!(!message.contains("New work paused"), "{available}: {message}");
+                assert_eq!(w.task().await.status, TaskStatus::Error, "{available}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_queued_task_waits_while_disk_is_critical_and_starts_once_when_space_returns() {
+            let w = world(CRITICAL, TaskStatus::Queue, false).await;
+            let before = w.records().await;
+
+            for pass in 0..3 {
+                let reads = w.disk.reads();
+                w.executor.check_and_execute().await;
+                assert!(w.disk.reads() > reads, "pass {pass} read the disk afresh");
+            }
+
+            assert_eq!(w.records().await, before, "still Queue, nothing written");
+            assert!(w.agent_events().is_empty(), "a paused pass logs nothing: {:?}", w.agent_events());
+            assert!(w.executor.reserved_permits.read().await.is_empty(), "no capacity reserved");
+            assert_eq!(w.free_permits().await, LIMIT);
+
+            w.disk.set_available(NORMAL);
+            w.executor.check_and_execute().await;
+            w.executor.check_and_execute().await;
+
+            assert_eq!(w.events_saying("Auto-promoted from queue"), 1, "{:?}", w.agent_events());
+            // One start got past the guard, and reached the checkout this
+            // fixture cannot provide.
+            assert_eq!(w.events_saying("No worktree could be attached"), 1, "{:?}", w.agent_events());
+            assert_ne!(w.task().await.status, TaskStatus::Queue);
+        }
+
+        #[tokio::test]
+        async fn a_direct_start_is_refused_before_it_moves_the_task() {
+            let w = world(CRITICAL, TaskStatus::Queue, true).await;
+            let before = w.records().await;
+
+            let refused = w.executor.execute_task(w.task_id).await;
+
+            assert!(refused.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{refused:?}");
+            assert_eq!(w.records().await, before, "not moved to In Progress, even in memory");
+            assert_eq!(worktree_count(&w.repo), 1);
+            assert!(w.executor.running_handles.read().await.is_empty());
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn running_work_is_untouched_when_disk_becomes_critical() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            let running = create_test_task_full("already running", w.project_id, TaskStatus::InProgress, 1);
+            let running_id = running.id;
+            {
+                let mut running = running;
+                running.phase = TaskPhase::Coding;
+                w.executor.tasks.write().await.insert(running_id, running);
+            }
+            let cleaned_up = w.executor.register_fake_running_execution_holding_permit_for_test(running_id).await;
+
+            w.disk.set_available(CRITICAL);
+            for _ in 0..3 {
+                w.executor.check_and_execute().await;
+            }
+
+            assert!(!cleaned_up.load(std::sync::atomic::Ordering::SeqCst), "not cancelled");
+            assert!(
+                w.executor.running_handles.read().await.get(&running_id).is_some_and(|r| !r.handle.is_finished()),
+                "still running"
+            );
+            let still = w.executor.tasks.read().await.get(&running_id).cloned().unwrap();
+            assert_eq!((still.status, still.phase), (TaskStatus::InProgress, TaskPhase::Coding));
+            assert_eq!(w.free_permits().await, LIMIT - 1, "it keeps its permit; capacity is not resized");
+            assert_eq!(w.task().await.status, TaskStatus::Queue, "only the new work waits");
+        }
+
+        #[tokio::test]
+        async fn ai_review_of_existing_work_is_not_paused() {
+            let w = world(CRITICAL, TaskStatus::AiReview, false).await;
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let task = tasks.get_mut(&w.task_id).unwrap();
+                task.phase = TaskPhase::QaReview;
+                task.worktree_path = None;
+            }
+
+            w.executor.check_and_execute().await;
+
+            // The review ran: with no checkout to review it hands the task to
+            // a person, which a paused review would not have done.
+            assert_eq!(w.task().await.status, TaskStatus::HumanReview);
         }
     }
 }

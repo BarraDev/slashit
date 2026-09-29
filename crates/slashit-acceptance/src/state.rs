@@ -16,6 +16,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// under the isolated `XDG_CONFIG_HOME`.
 const APP_DIR: &str = "slashit-app";
 
+/// Read by debug builds of the application in place of the real filesystem
+/// when it decides whether there is disk space to start a task. Mirrors
+/// `queue::start_guard::DEBUG_DISK_SPACE_FILE`.
+const DISK_SPACE_VAR: &str = "SLASHIT_DEBUG_DISK_SPACE_FILE";
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// The disk every run starts with: 1 TiB, nearly all free, so no journey
+/// depends on how full the host's disk is.
+pub const PLENTY_OF_DISK: (u64, u64) = (1024 * GIB, 900 * GIB);
+
 /// A private XDG tree for one acceptance run.
 ///
 /// Removed on drop unless [`StateRoot::keep`] was called, which is how a
@@ -122,6 +133,7 @@ impl StateRoot {
             .context("could not restrict the runtime directory")?;
         }
 
+        root.set_disk_space(PLENTY_OF_DISK.0, PLENTY_OF_DISK.1)?;
         Ok(root)
     }
 
@@ -159,10 +171,36 @@ impl StateRoot {
         self.config_home().join(APP_DIR).join("workspaces.toml")
     }
 
+    /// The file the application under test reads its free disk space from.
+    pub fn disk_space_file(&self) -> PathBuf {
+        self.path.join("disk-space")
+    }
+
+    /// Make the application see a disk of `total` bytes with `available`
+    /// free, from its next check on.
+    pub fn set_disk_space(&self, total: u64, available: u64) -> Result<()> {
+        self.write_disk_space(&format!("{total} {available}\n"))
+    }
+
+    /// Make the application's next disk-space checks fail.
+    pub fn fail_disk_space_check(&self) -> Result<()> {
+        self.write_disk_space("unreadable\n")
+    }
+
+    /// Replaced whole, so the application never reads half a write.
+    fn write_disk_space(&self, contents: &str) -> Result<()> {
+        let staged = self.path.join("disk-space.next");
+        std::fs::write(&staged, contents)
+            .with_context(|| format!("could not write {}", staged.display()))?;
+        std::fs::rename(&staged, self.disk_space_file())
+            .with_context(|| format!("could not replace {}", self.disk_space_file().display()))
+    }
+
     /// Point a child process — and therefore everything it spawns — at this
     /// root.
     pub fn apply_to(&self, command: &mut Command) {
         command
+            .env(DISK_SPACE_VAR, self.disk_space_file())
             .env("XDG_CONFIG_HOME", self.config_home())
             .env("XDG_DATA_HOME", self.data_home())
             .env("XDG_CACHE_HOME", self.cache_home())
@@ -238,6 +276,27 @@ mod tests {
             assert!(root.config_file().starts_with(root.config_home()));
         }
         assert!(!path.exists(), "a dropped root should leave nothing behind");
+    }
+
+    /// Every run sees plenty of free disk unless a journey says otherwise, and
+    /// the application is pointed at the file that says so.
+    #[test]
+    fn a_root_gives_the_application_a_disk_it_controls() {
+        let root = StateRoot::create(&std::env::temp_dir(), "unit-disk").expect("create a root");
+        let read = || std::fs::read_to_string(root.disk_space_file()).unwrap();
+        assert_eq!(read(), format!("{} {}\n", PLENTY_OF_DISK.0, PLENTY_OF_DISK.1));
+        root.set_disk_space(500, 10).unwrap();
+        assert_eq!(read(), "500 10\n");
+        root.fail_disk_space_check().unwrap();
+        assert_eq!(read(), "unreadable\n");
+
+        let mut command = Command::new("true");
+        root.apply_to(&mut command);
+        let pointed = command
+            .get_envs()
+            .find(|(name, _)| *name == DISK_SPACE_VAR)
+            .and_then(|(_, value)| value.map(PathBuf::from));
+        assert_eq!(pointed, Some(root.disk_space_file()));
     }
 
     /// `Drop` cannot report, so a run that finishes normally has to be able to

@@ -20,6 +20,10 @@ async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result
     // a removal is midway through deleting.
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
+    // Creating a checkout is what grows the disk, so it waits while new work
+    // is paused for disk space, before anything is read or created.
+    state.start_guard.check().await.map_err(|block| block.to_string())?;
+
     // A cleanup that a previous process never finished leaves the recorded
     // checkout untrustworthy: nothing on disk says how much of it a dead
     // `git worktree remove` already took apart. Reattaching to it would hand an

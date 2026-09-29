@@ -207,6 +207,11 @@ pub async fn update_task_status(
         return Ok(None);
     };
 
+    // A move into In Progress asks for a new execution; while new work is
+    // paused for disk space it is refused here, before a current owner is
+    // ended or anything is written.
+    state.start_guard.check_move(&old_status, &status).await?;
+
     // Any status this branch can be asked for actually changes the task's
     // lifecycle column (`Done` returned above, through `terminalize`, which
     // has its own dedicated refuse-rather-than-end contract). A previous
@@ -672,6 +677,10 @@ pub async fn reorder_task(
     }
 
     let target_status = new_status.unwrap_or_else(|| old_status.clone());
+
+    // Same as `update_task_status`: refused before anything is ended or
+    // written while new work is paused for disk space.
+    state.start_guard.check_move(&old_status, &target_status).await?;
 
     let effect = if old_status == target_status {
         StatusTransitionEffect::None
@@ -2078,5 +2087,211 @@ mod lifecycle_ownership {
         .expect("enqueue")
         .expect("the task exists");
         assert_eq!(answered.status, TaskStatus::Queue);
+    }
+}
+
+/// While new work is paused for disk space, every desktop front door that
+/// would begin a task execution is refused before it ends an owner or writes
+/// anything, and every other move -- queuing in particular -- still works.
+#[cfg(test)]
+mod disk_pressure {
+    use super::*;
+    use crate::domain::storage_usage::GIB;
+    use crate::test_helpers::{attach_test_executor, create_test_task_full, FakeDisk};
+    use tauri::Manager;
+
+    async fn state_on(disk: &FakeDisk) -> (tempfile::TempDir, crate::AppState) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (mut state, _report) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state should build under a fresh tempdir");
+        state.start_guard = disk.guard();
+        (tmp, state)
+    }
+
+    async fn seed(state: &crate::AppState, status: TaskStatus) -> (Uuid, Uuid) {
+        let project_id = Uuid::new_v4();
+        let task = create_test_task_full("under test", project_id, status, 0);
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        (task_id, project_id)
+    }
+
+    fn on_disk(state: &crate::AppState, project_id: Uuid, task_id: Uuid) -> Task {
+        state
+            .storage
+            .load_project_tasks(project_id)
+            .expect("the board must be readable")
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("the task must be on disk")
+    }
+
+    fn paused(result: &Result<Option<Task>, String>) -> bool {
+        result.as_ref().is_err_and(|m| m.starts_with("New work paused"))
+    }
+
+    #[tokio::test]
+    async fn moving_a_task_into_in_progress_is_refused_on_a_critical_disk() {
+        let disk = FakeDisk::with_available(10 * GIB);
+        let (_tmp, state) = state_on(&disk).await;
+        let (by_status, project_a) = seed(&state, TaskStatus::Backlog).await;
+        let (by_drag, project_b) = seed(&state, TaskStatus::Error).await;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state: &crate::AppState = app.state::<crate::AppState>().inner();
+
+        let result = update_task_status(app.state(), by_status.to_string(), TaskStatus::InProgress, None).await;
+        assert!(paused(&result), "{result:?}");
+        assert_eq!(on_disk(state, project_a, by_status).status, TaskStatus::Backlog);
+        assert_eq!(state.task.tasks.read().await[&by_status].status, TaskStatus::Backlog);
+
+        let result =
+            reorder_task(app.state(), by_drag.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
+        assert!(paused(&result), "{result:?}");
+        let task = on_disk(state, project_b, by_drag);
+        assert_eq!(task.status, TaskStatus::Error, "not reset, not moved");
+    }
+
+    #[tokio::test]
+    async fn a_refused_move_leaves_a_running_review_alone() {
+        let disk = FakeDisk::with_available(10 * GIB);
+        let (_tmp, state) = state_on(&disk).await;
+        let executor = attach_test_executor(&state);
+        let (task_id, _) = seed(&state, TaskStatus::AiReview).await;
+        let review_ended = executor.register_fake_reviewing_owner_for_test(task_id).await;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let result =
+            reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
+
+        assert!(paused(&result), "{result:?}");
+        assert!(!review_ended.load(std::sync::atomic::Ordering::SeqCst), "the review keeps running");
+        assert!(executor.is_task_running(task_id).await);
+    }
+
+    #[tokio::test]
+    async fn a_failed_disk_check_refuses_the_move_the_same_way() {
+        let disk = FakeDisk::with_available(300 * GIB);
+        disk.fail();
+        let (_tmp, state) = state_on(&disk).await;
+        let (task_id, project_id) = seed(&state, TaskStatus::Queue).await;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state: &crate::AppState = app.state::<crate::AppState>().inner();
+
+        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::InProgress, None).await;
+
+        assert!(
+            result.as_ref().is_err_and(|m| m.contains("couldn't verify free disk space")),
+            "{result:?}"
+        );
+        let task = on_disk(state, project_id, task_id);
+        assert_eq!(task.status, TaskStatus::Queue);
+        assert!(task.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_still_queues_the_task_and_warning_blocks_nothing() {
+        let disk = FakeDisk::with_available(10 * GIB);
+        let (_tmp, state) = state_on(&disk).await;
+        let (started, _) = seed(&state, TaskStatus::Backlog).await;
+        let (dragged, _) = seed(&state, TaskStatus::Backlog).await;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        // The drawer's Start: enqueue, as seen in Backlog.
+        let queued = reorder_task(
+            app.state(),
+            started.to_string(),
+            Some(TaskStatus::Queue),
+            0,
+            None,
+            Some(TaskStatus::Backlog),
+        )
+        .await
+        .expect("queuing is not a start")
+        .expect("the task exists");
+        assert_eq!(queued.status, TaskStatus::Queue, "it waits in the queue");
+
+        disk.set_available(100 * GIB); // Warning
+        let moved = update_task_status(app.state(), dragged.to_string(), TaskStatus::InProgress, None)
+            .await
+            .expect("Warning does not pause new work")
+            .expect("the task exists");
+        assert_eq!(moved.status, TaskStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn promoting_from_the_queue_waits_for_disk_space() {
+        let disk = FakeDisk::with_available(10 * GIB);
+        let (_tmp, state) = state_on(&disk).await;
+        let (task_id, project_id) = seed(&state, TaskStatus::Queue).await;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state: &crate::AppState = app.state::<crate::AppState>().inner();
+
+        let result = crate::commands::queue::promote_next_task(app.state()).await;
+        assert!(result.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{result:?}");
+        assert_eq!(on_disk(state, project_id, task_id).status, TaskStatus::Queue);
+
+        disk.set_available(300 * GIB);
+        let promoted = crate::commands::queue::promote_next_task(app.state()).await.expect("promoted");
+        assert_eq!(promoted, Some(task_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn attaching_a_checkout_or_starting_an_agent_directly_is_refused_on_a_critical_disk() {
+        let disk = FakeDisk::with_available(10 * GIB);
+        let (_tmp, state) = state_on(&disk).await;
+        let (task_id, project_id) = seed(&state, TaskStatus::Backlog).await;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let state: &crate::AppState = app.state::<crate::AppState>().inner();
+
+        let refused = crate::commands::worktree::create_worktree(app.state(), task_id.to_string()).await;
+        assert!(refused.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{refused:?}");
+        assert!(on_disk(state, project_id, task_id).worktree_path.is_none());
+
+        let refused = crate::commands::agent::start_agent(
+            app.state(),
+            Uuid::new_v4().to_string(),
+            Some(task_id.to_string()),
+        )
+        .await;
+        assert!(refused.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{refused:?}");
+        assert!(state.agent.executions.read().await.is_empty(), "nothing was recorded");
+    }
+
+    #[tokio::test]
+    async fn the_pause_is_reported_from_a_fresh_reading() {
+        let disk = FakeDisk::with_available(10 * GIB);
+        let (_tmp, state) = state_on(&disk).await;
+        let app = tauri::test::mock_app();
+        app.manage(state);
+
+        let pause = crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap();
+        assert_eq!(
+            pause,
+            Some(crate::domain::storage_usage::StartBlock::CriticalDisk {
+                available_bytes: 10 * GIB,
+                critical_below_bytes: 40 * GIB,
+            })
+        );
+        disk.set_available(100 * GIB);
+        assert_eq!(crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap(), None);
+        disk.fail();
+        assert!(matches!(
+            crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap(),
+            Some(crate::domain::storage_usage::StartBlock::DiskSpaceUnavailable { .. })
+        ));
     }
 }
