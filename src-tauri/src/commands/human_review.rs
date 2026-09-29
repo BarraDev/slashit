@@ -414,6 +414,34 @@ mod tests {
         assert!(prompt.contains("Also count lines."));
     }
 
+    /// Requesting changes is a decision, not new work, so it is recorded on
+    /// a critically low disk. The rerun it asks for is new coding work, and
+    /// waits in Queue like any other until space returns.
+    #[tokio::test]
+    async fn changes_can_be_requested_on_a_critical_disk_and_the_rerun_waits() {
+        use crate::domain::storage_usage::GIB;
+        use tauri::Manager;
+        let disk = crate::test_helpers::FakeDisk::with_available(10 * GIB);
+        let (_tmp, mut state) = test_state().await;
+        state.start_guard = disk.guard();
+        let (project_id, task_id) = seed_in_review(&state).await;
+
+        let task = request_changes(&state, task_id, "Also count lines.").await.expect("recorded while paused");
+        assert_eq!(task.status, TaskStatus::Queue);
+        assert_eq!(on_disk(&state, project_id, task_id).status, TaskStatus::Queue);
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let waiting = crate::commands::queue::promote_next_task(app.state()).await;
+        assert!(waiting.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{waiting:?}");
+        let state: tauri::State<'_, crate::AppState> = app.state();
+        assert_eq!(on_disk(&state, project_id, task_id).status, TaskStatus::Queue);
+
+        disk.set_available(300 * GIB);
+        let promoted = crate::commands::queue::promote_next_task(app.state()).await.expect("promoted");
+        assert_eq!(promoted, Some(task_id.to_string()));
+    }
+
     #[tokio::test]
     async fn blank_feedback_is_refused_and_nothing_changes() {
         let (_tmp, state) = test_state().await;

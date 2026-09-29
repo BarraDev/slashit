@@ -306,6 +306,11 @@ impl FakeDisk {
         }
     }
 
+    /// What the next reading reports as available.
+    pub fn available(&self) -> u64 {
+        self.available.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn set_available(&self, bytes: u64) {
         self.available.store(bytes, std::sync::atomic::Ordering::SeqCst);
         self.failing.store(false, std::sync::atomic::Ordering::SeqCst);

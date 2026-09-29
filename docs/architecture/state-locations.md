@@ -387,7 +387,10 @@ time: a Refresh that arrives while one is running waits for it instead of
 starting another, and the previous result stays visible meanwhile.
 
 Disk pressure is Warning below the larger of 15% of the filesystem and
-120 GiB available, and Critical below the larger of 5% and 40 GiB.
+120 GiB available, and Critical below the larger of 5% and 40 GiB, where the
+40 GiB floor is capped at 20% of the filesystem: a 100 GiB disk is Critical
+below 20 GiB, not 40. Critical pauses new task executions, and Settings >
+Storage and that pause read the same threshold.
 
 ## Directories by platform
 

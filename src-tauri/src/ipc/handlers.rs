@@ -1228,10 +1228,10 @@ mod disk_pressure {
         let task_id = task.id;
         ctx.tasks.write().await.insert(task_id, task.clone());
         ctx.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
-        let peer = PeerContext {
-            endpoint: Endpoint::Unix { path: std::path::PathBuf::from("/nonexistent-for-tests") },
-            os_verified: true,
-        };
+        // This platform's own local endpoint -- a Unix socket or a named
+        // pipe -- so the test describes a caller that can exist here. The
+        // handler reads it only to answer `Ping`.
+        let peer = PeerContext { endpoint: Endpoint::local_default(), os_verified: true };
         let move_to = |status: &str| IpcRequest::MoveTask { task_id: task_id.to_string(), status: status.to_string() };
 
         let answer = dispatch(move_to("in_progress"), &ctx, &peer).await.response;

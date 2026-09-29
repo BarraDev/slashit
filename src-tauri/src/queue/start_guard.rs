@@ -178,6 +178,28 @@ mod tests {
         assert_eq!(guard.check().await, Ok(()));
     }
 
+    /// The guard pauses at the threshold [`PressurePolicy`] sets -- the one
+    /// Settings > Storage reports -- including the cap on a small disk.
+    #[tokio::test]
+    async fn a_small_disk_pauses_at_the_capped_critical_threshold() {
+        for (total, critical) in [(20 * GIB, 4 * GIB), (100 * GIB, 20 * GIB), (500 * GIB, 40 * GIB)] {
+            assert_eq!(PressurePolicy::default().thresholds(total).critical_below_bytes, critical);
+            let available = Arc::new(AtomicU64::new(critical));
+            let reading = available.clone();
+            let guard = StartGuard::new(Arc::new(move || {
+                Ok(FilesystemSpace { total_bytes: total, available_bytes: reading.load(Ordering::SeqCst) })
+            }));
+
+            assert_eq!(guard.check().await, Ok(()), "{total}: exactly at the threshold");
+            available.store(critical - 1, Ordering::SeqCst);
+            assert_eq!(
+                guard.check().await,
+                Err(StartBlock::CriticalDisk { available_bytes: critical - 1, critical_below_bytes: critical }),
+                "{total}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_failed_reading_pauses_new_work_as_unknown_not_critical() {
         let guard = StartGuard::new(Arc::new(|| Err(io::Error::other("statvfs failed"))));

@@ -1061,6 +1061,34 @@ mod tests {
         assert_eq!(fx.measure_with(&GitBuildOutputProbe, 10 * GIB).pressure, Some(DiskPressure::Critical));
     }
 
+    /// Settings > Storage reports the threshold [`PressurePolicy`] sets, the
+    /// same one the start guard pauses new work at, including the cap on a
+    /// small disk.
+    #[test]
+    fn a_small_disk_reports_the_capped_critical_threshold() {
+        let fx = Fixture::new();
+        let total = 100 * GIB;
+        let critical = 20 * GIB;
+        let at = |available: u64| {
+            let space = move |_: &Path| Ok(FilesystemSpace { total_bytes: total, available_bytes: available });
+            measure(&Inputs {
+                paths: &fx.paths,
+                checkouts: &[],
+                probe: &GitBuildOutputProbe,
+                space: &space,
+                policy: PressurePolicy::default(),
+                limits: WalkLimits::default(),
+            })
+        };
+
+        let summary = at(critical);
+        let thresholds = summary.thresholds.expect("thresholds for a readable filesystem");
+        assert_eq!(thresholds, PressurePolicy::default().thresholds(total));
+        assert_eq!(thresholds.critical_below_bytes, critical);
+        assert_eq!(summary.pressure, Some(DiskPressure::Warning), "exactly at the threshold");
+        assert_eq!(at(critical - 1).pressure, Some(DiskPressure::Critical));
+    }
+
     #[test]
     fn roots_that_are_one_directory_are_counted_once() {
         let tmp = tempfile::tempdir().unwrap();

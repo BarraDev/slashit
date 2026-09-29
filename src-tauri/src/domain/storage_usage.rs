@@ -168,12 +168,17 @@ pub enum DiskPressure {
 /// floor and large disks by the share. Warning is informational. Critical
 /// pauses new task executions (see [`StartBlock`]); it never stops work
 /// already running.
+///
+/// Because Critical stops new work, its floor is itself capped at
+/// `critical_floor_cap_percent` of the filesystem: a fixed floor alone would
+/// hold a disk smaller than it at Critical forever, however empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PressurePolicy {
     pub warning_percent: u8,
     pub warning_floor_bytes: u64,
     pub critical_percent: u8,
     pub critical_floor_bytes: u64,
+    pub critical_floor_cap_percent: u8,
 }
 
 impl Default for PressurePolicy {
@@ -183,6 +188,7 @@ impl Default for PressurePolicy {
             warning_floor_bytes: 120 * GIB,
             critical_percent: 5,
             critical_floor_bytes: 40 * GIB,
+            critical_floor_cap_percent: 20,
         }
     }
 }
@@ -200,8 +206,10 @@ impl PressurePolicy {
         PressureThresholds {
             warning_below_bytes: share(total_bytes, self.warning_percent)
                 .max(self.warning_floor_bytes),
-            critical_below_bytes: share(total_bytes, self.critical_percent)
-                .max(self.critical_floor_bytes),
+            critical_below_bytes: share(total_bytes, self.critical_percent).max(
+                self.critical_floor_bytes
+                    .min(share(total_bytes, self.critical_floor_cap_percent)),
+            ),
         }
     }
 
@@ -367,6 +375,45 @@ mod tests {
         assert_eq!(policy.classify(space(total, 300 * GIB - 1)), DiskPressure::Warning);
         assert_eq!(policy.classify(space(total, 100 * GIB)), DiskPressure::Warning);
         assert_eq!(policy.classify(space(total, 100 * GIB - 1)), DiskPressure::Critical);
+    }
+
+    /// The critical floor is capped at a fifth of the filesystem, so a disk
+    /// smaller than the floor is not held at Critical however empty it is.
+    /// Byte-exact: a share is rounded down.
+    #[test]
+    fn the_critical_floor_is_capped_at_a_fifth_of_a_small_disk() {
+        let policy = PressurePolicy::default();
+        for (total, critical) in [
+            (20 * GIB, 4 * GIB),             // 20% of 20 GiB, below the 40 GiB floor
+            (64 * GIB, 13_743_895_347),      // 20% of 64 GiB, 12.8 GiB
+            (100 * GIB, 20 * GIB),           // 20% of 100 GiB
+            (200 * GIB, 40 * GIB),           // 20% is exactly the floor
+            (500 * GIB, 40 * GIB),           // the floor; 5% is 25 GiB
+            (1024 * GIB, 54_975_581_388),    // 5% of 1 TiB, 51.2 GiB, above the floor
+            (2000 * GIB, 100 * GIB),         // 5% of 2000 GiB
+        ] {
+            let label = format!("{} GiB", total / GIB);
+            assert_eq!(policy.thresholds(total).critical_below_bytes, critical, "{label}");
+            // Warning is unchanged by the cap.
+            assert_eq!(
+                policy.thresholds(total).warning_below_bytes,
+                share(total, 15).max(120 * GIB),
+                "{label}"
+            );
+
+            // Exactly at the threshold is not Critical; one byte below is.
+            assert_eq!(policy.classify(space(total, critical)), DiskPressure::Warning, "{label}");
+            assert_eq!(policy.classify(space(total, critical - 1)), DiskPressure::Critical, "{label}");
+            assert_eq!(policy.start_block(Ok(space(total, critical))), None, "{label}");
+            assert_eq!(
+                policy.start_block(Ok(space(total, critical - 1))),
+                Some(StartBlock::CriticalDisk {
+                    available_bytes: critical - 1,
+                    critical_below_bytes: critical,
+                }),
+                "{label}"
+            );
+        }
     }
 
     #[test]
