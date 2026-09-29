@@ -1301,10 +1301,11 @@ impl TaskExecutor {
         } else {
             // An ordinary branch starts at the exact commit
             // `refs/remotes/origin/<D>` names for the repository's default
-            // branch `D`, resolved once before the branch is created (see
-            // `worktree::default_base::resolve_default_base`), and records both. A
-            // repository with no such base refuses the task instead of
-            // starting it from wherever the primary checkout happens to be.
+            // branch `D`, or, with no remote default, at the project's local
+            // base branch, resolved once before the branch is created (see
+            // `worktree::default_base::resolve_default_base`), and records
+            // both. A repository with no such base refuses the task instead
+            // of starting it from wherever the primary checkout happens to be.
             // An adopted worktree gets neither a starting commit nor an
             // origin, and whatever the task already recorded is kept: its
             // `HEAD` may hold the task's own commits, or whatever a hook
@@ -1312,13 +1313,18 @@ impl TaskExecutor {
             // never recorded it may have stacked it. A task with no starting
             // commit has no known diff boundary, as for one recorded before
             // starting commits were kept.
-            match self.worktree_manager.create_or_adopt(repo_path, &branch_name).await {
+            let project_base = self.project_base_of(task_id).await;
+            match self
+                .worktree_manager
+                .create_or_adopt(repo_path, &branch_name, project_base.as_ref())
+                .await
+            {
                 Ok((info, Some(base))) => Ok(Acquired {
                     info,
                     what_happened: "Created worktree",
                     created_at: Some(base.commit.clone()),
+                    origin: Some(base.branch_origin()),
                     base_commit: Some(base.commit),
-                    origin: Some(BranchOrigin::DefaultBase { branch: Some(base.branch) }),
                 }),
                 Ok((info, None)) => Ok(Acquired {
                     info,
@@ -1331,6 +1337,13 @@ impl TaskExecutor {
             }
         };
         (existing_branch, acquired)
+    }
+
+    /// The local base (`domain::ProjectBase`) of the project `task_id`
+    /// belongs to, as recorded now.
+    async fn project_base_of(&self, task_id: Uuid) -> Option<crate::domain::ProjectBase> {
+        let project_id = self.tasks.read().await.get(&task_id)?.project_id;
+        self.projects.read().await.get(&project_id)?.base.clone()
     }
 
     /// Record the worktree a starting task was given on the task, durably
@@ -3429,6 +3442,7 @@ mod tests {
             repository_id: None,
             scope,
             state_location: crate::config::paths::StateLocation::External,
+            base: None,
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,

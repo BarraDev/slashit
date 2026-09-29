@@ -479,6 +479,7 @@ async fn build_fixture(name: &str) -> (Fixture, AppState) {
             repository_id: Some(repository_id),
             scope: ProjectScope::Standalone,
             state_location: StateLocation::External,
+            base: None,
             agent_type: AgentType::ClaudeCode,
             agent_config: AgentConfig {
                 agent_type: AgentType::ClaudeCode,

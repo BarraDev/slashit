@@ -113,25 +113,78 @@ the concrete backend, "Git worktree", when the implementation matters.
 
 Today every Task Checkout is a Git worktree on its own branch, recorded on
 the Task as its checkout path, branch name and base commit, and whether the
-branch starts from the default base or is stacked on a dependency's branch
-(which the Task's pull request then targets). An ordinary branch starts at
-the exact commit of the repository's default branch on `origin`, resolved
-from local refs when the branch is created, and records which branch that was;
-its pull request targets that branch. Branches created by earlier versions
-may record no origin, or a default base with no branch, and keep what they
-recorded. The record describes where the branch starts now, and
-changes only when SlashIt itself rewrites the branch onto another base: a
-stacked branch that was never pushed, whose dependency's pull request was
-merged into the default branch, is replayed onto the default branch before
-its first pull request is opened, and from then on is recorded as starting
-there, at the exact commit it was replayed onto. SlashIt places
-it under its data directory, and adopts a Git worktree of the Task's branch
-that already exists elsewhere (see
+branch starts from the default base, from the Project's local base, or is
+stacked on a dependency's branch (which the Task's pull request then
+targets). SlashIt places it under its data directory, and adopts a Git
+worktree of the Task's branch that already exists elsewhere (see
 [state-locations.md](state-locations.md#worktrees)).
+
+### Base of a Task's branch
+
+A Task needs a safe, explicit version-control base. A remote is optional:
+running a Task, its checkout, its commits, AI Review and Human Review work
+in a repository with no remote at all. Pushing and pull requests are
+additional, and are offered only where a supported remote exists.
+
+An ordinary branch starts at an exact commit resolved from local refs when
+the branch is created, and never re-derived afterwards:
+
+1. **Origin's default branch**, when `refs/remotes/origin/HEAD` names a
+   fetched branch of `origin` (or, in a JJ repository without it, JJ's
+   `trunk()` is exactly `<branch>@origin`). The Task records it as starting
+   from the default base, and its pull request targets that branch. A
+   remote-backed repository behaves as it always did.
+2. Otherwise, the **Project's local base** (`Project.base`): a local branch
+   (in a colocated JJ repository, a bookmark) captured when the Project was
+   registered or its version control initialized, when that was unambiguous
+   (Git's `HEAD` on a branch that agrees with `origin`, the bookmark JJ's
+   `trunk()` names, or the bookmark Initialize with Jujutsu created), or
+   chosen explicitly in Settings > Repository. A colocated JJ repository's
+   only bookmark is suggested there, never captured on its own. Switching the
+   primary checkout to another branch does not move it. The Task records it as
+   starting from the local base; a pull request for it targets that branch on
+   `origin` only once `origin` has it and contains the Task's starting commit.
+3. Otherwise the Task is refused with what to do. The primary checkout's
+   `HEAD` is never used.
+
+A malformed `refs/remotes/origin/HEAD` (pointing outside `origin`) is
+refused rather than skipped. "Detect default branch" in Settings >
+Repository runs the equivalent of `git remote set-head origin --auto` on
+explicit request: it reads origin over the network and writes only
+`refs/remotes/origin/HEAD`, and refuses when origin's default branch is
+ambiguous.
+
+A folder with no version control, or a Git repository with no commit, is
+registered in a setup-required state. It is never initialized on its own;
+Initialize (in Create Project or Settings > Repository) creates the repository
+without choosing a branch name, so the tool's own configuration names it, and
+records the folder's current files, ignore rules applied, as the first commit.
+Jujutsu is initialized colocated with Git (`jj git init --colocate`), since
+Task Checkouts are Git worktrees. Initializing refuses, changing nothing,
+rather than record less than it showed: when the folder holds another
+repository (Git, or Jujutsu without Git colocation), when a file exceeds
+Jujutsu's own `snapshot.max-new-file-size` (for Jujutsu), or when the folder
+no longer holds the files that were shown. A Jujutsu initialization that fails
+after `jj git init` removes the `.jj` and `.git` it created (and nothing
+else), leaving the folder as it was; if even that fails, the error names what
+was left behind. A Git initialization whose first commit fails leaves a
+repository with no commit, which initializing again completes.
+
+Branches created by earlier versions may record no origin, or a default
+base with no branch, and keep what they recorded. Projects registered by
+earlier versions have no local base until one is chosen. The record
+describes where the branch starts now, and changes only when SlashIt itself
+rewrites the branch onto another base: a stacked branch that was never
+pushed, whose dependency's pull request was merged into the default branch,
+is replayed onto the default branch before its first pull request is
+opened, and from then on is recorded as starting there, at the exact commit
+it was replayed onto.
 
 A JJ workspace is not an available Task Checkout backend. A Jujutsu
 Project gets Git worktrees for its Tasks only when its repository is
-colocated with Git; a Jujutsu-only repository cannot get a Task Checkout.
+colocated with Git; a Jujutsu repository that is not (`jj git init
+--no-colocate`) is recognised and refused, with `jj git colocation enable`
+as the way forward, and cannot get a Task Checkout.
 
 Work in a Task Checkout is recorded as a Git commit on its branch: the
 coding agent's work when its run ends, and the fixes applied by AI review
@@ -183,6 +236,8 @@ The procedure is in [development-workflow.md](../development-workflow.md).
 | Project, ProjectScope | `domain::Project`, `domain::ProjectScope` (`Project.scope`); attach/detach in `commands/project.rs` |
 | Task | `domain::Task` |
 | Task Checkout | `Task.worktree_path`, `branch_name`, `base_commit`, `branch_origin` (`domain::BranchOrigin`); `worktree::WorktreeManager` |
+| Base of a Task's branch | `worktree::default_base`, `Project.base` (`domain::ProjectBase`), `worktree::project_base` |
+| Repository readiness and setup | `worktree::readiness`, `worktree::remote_head`, `worktree::vcs_init`; `commands/repository_setup.rs` |
 | Workspace root as agent context | `TaskExecutor::resolve_workspace_launch` in `queue/executor.rs` |
 | Task Checkout lifecycle | `lifecycle.rs` |
 | Jujutsu integration | `jj/`, `commands/jj.rs` |

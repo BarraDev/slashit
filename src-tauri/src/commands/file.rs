@@ -138,6 +138,7 @@ pub async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String
 /// checkout look uninitialized. `.exists()` (not `.is_dir()`) is required
 /// because a linked git worktree's `.git` is a *file* pointing at the real
 /// gitdir, not a directory.
+#[cfg(test)]
 pub(crate) fn is_git_repo_root(path: &Path) -> bool {
     path.join(".git").exists()
 }

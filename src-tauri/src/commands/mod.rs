@@ -1,4 +1,5 @@
 pub mod repository;
+pub mod repository_setup;
 pub mod project;
 pub mod workspace;
 pub mod task;
@@ -27,6 +28,7 @@ pub mod state_location;
 pub mod updater;
 
 pub use repository::*;
+pub use repository_setup::*;
 pub use project::*;
 pub use workspace::*;
 pub use task::*;

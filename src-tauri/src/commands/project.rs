@@ -97,6 +97,15 @@ pub async fn create_project(
     let agent_config = get_default_agent_config(&agent_type);
     let now = chrono::Utc::now();
 
+    // A repository that says unambiguously which branch it is on gives the
+    // project its local base now, so that tasks keep starting there however
+    // the primary checkout moves later. See `worktree::project_base`.
+    let repository_path = match repository_id {
+        Some(id) => state.repository.repositories.read().await.get(&id).map(|r| r.local_path.clone()),
+        None => None,
+    };
+    let base = crate::commands::repository_setup::captured_base(repository_path.as_deref()).await;
+
     let project = Project {
         id,
         name,
@@ -105,6 +114,7 @@ pub async fn create_project(
         // New projects keep the repository pristine. Storing the board inside
         // the project is a deliberate opt-in, never the default.
         state_location: crate::config::paths::StateLocation::External,
+        base,
         agent_type,
         agent_config,
         created_at: now,
@@ -387,6 +397,7 @@ mod tests {
             repository_id: None,
             scope: ProjectScope::Standalone,
             state_location: StateLocation::External,
+            base: None,
             agent_type: AgentType::ClaudeCode,
             agent_config: get_default_agent_config(&AgentType::ClaudeCode),
             created_at: chrono::Utc::now(),

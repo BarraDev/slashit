@@ -161,16 +161,20 @@ machine that has it; set `"managed"` first if that matters.
 
 ### Where a new task branch starts
 
-An ordinary task branch starts at the exact commit
-`refs/remotes/origin/<default>` names, never at whatever the primary checkout
-has checked out. The default branch is read, from local refs only, from
-`refs/remotes/origin/HEAD`, as `git clone` or `git remote set-head origin`
-records it. In a Jujutsu-colocated repository where that ref is missing,
-Jujutsu's `trunk()` alias is used instead, but only when it is exactly
-`<branch>@origin` and that branch has been fetched. Otherwise the task is
-refused with the command to run, typically `git remote set-head origin --auto`.
-SlashIt never fetches to find out. A repository without a remote named
-`origin` cannot start ordinary tasks.
+An ordinary task branch starts at an exact commit resolved from local refs,
+never at whatever the primary checkout has checked out, and SlashIt never
+fetches to find it. When `refs/remotes/origin/HEAD` names a fetched branch of
+`origin` (as `git clone` or `git remote set-head origin` records it), the
+branch starts at the commit `refs/remotes/origin/<default>` names. In a
+Jujutsu-colocated repository where that ref is missing, Jujutsu's `trunk()`
+alias is used instead, but only when it is exactly `<branch>@origin` and that
+branch has been fetched. Otherwise the branch starts at the project's local
+base branch, `refs/heads/<base>`, recorded on the project when it was
+registered or initialized, or chosen in Settings > Repository. A repository
+with no remote at all runs tasks this way. With none of these the task is
+refused, saying what to do: choose a base branch, or use Detect default
+branch (`git remote set-head origin --auto`, run only when asked). See
+[product-model.md](product-model.md#base-of-a-tasks-branch).
 
 The branch is created with no upstream, whatever `branch.autoSetupMerge`
 says, so SlashIt never points a bare `git push` or `git pull` in a task's

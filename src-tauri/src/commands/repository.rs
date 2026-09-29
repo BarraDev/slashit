@@ -1,6 +1,8 @@
 use crate::domain::Repository;
 use crate::config::Storage;
-use crate::commands::file::{is_git_repo_root, git_location, GitLocation};
+use crate::commands::file::{git_location, GitLocation};
+use crate::worktree::vcs::{self, Vcs};
+use crate::worktree::vcs_init::{self, VcsInitKind};
 use uuid::Uuid;
 use std::collections::HashMap;
 use std::path::Path;
@@ -60,7 +62,7 @@ impl Default for RepositoryState {
 }
 
 /// Classify `path` against real git semantics and, if the caller asked for
-/// git initialization, act on that classification.
+/// version control to be initialized, act on that classification.
 ///
 /// The frontend's own git-detection runs when the folder is picked, which
 /// can be stale by the time the user submits the form (the folder could have
@@ -70,7 +72,7 @@ impl Default for RepositoryState {
 /// check authoritative instead of decorative.
 ///
 /// A path inside an ancestor repository (no `.git` of its own) is refused
-/// outright, whether or not `initialize_git` was requested: `local_path` is
+/// outright, whether or not initialization was requested: `local_path` is
 /// used downstream as the working directory for every git/jj operation, PR
 /// action, and task execution, so silently registering a subdirectory would
 /// make those operations quietly diverge from what git itself reports as the
@@ -79,50 +81,41 @@ impl Default for RepositoryState {
 /// from repository root" concept the rest of the codebase has no support
 /// for.
 ///
-/// Deliberately does not force an initial branch name when running `git
-/// init`: that would override the user's own `init.defaultBranch` git
-/// config, which this feature has no reason to second-guess.
+/// Initializing is `worktree::vcs_init::initialize`: a repository *and* a
+/// first commit, since a task cannot start in a repository with no commit.
+/// It never forces a branch name, so the user's own `init.defaultBranch`
+/// decides it. A folder that already has version control with commits is
+/// left exactly as it is.
 ///
-/// Returns whether `git init` actually ran, so the caller can tell a fresh
+/// Returns whether anything was initialized, so the caller can tell a fresh
 /// initialization apart from a folder that was already a repository — the
 /// two need different error framing if persistence fails afterward.
-async fn ensure_git_initialized(path: &Path, initialize_git: bool) -> Result<bool, String> {
-    match git_location(path).await? {
-        GitLocation::RepoRoot => Ok(false),
-        GitLocation::InsideRepo { root } => Err(format!(
+async fn ensure_vcs_initialized(
+    path: &Path,
+    initialize: Option<VcsInitKind>,
+    expected_files: Option<usize>,
+) -> Result<bool, String> {
+    if let GitLocation::InsideRepo { root } = git_location(path).await? {
+        return Err(format!(
             "'{}' is already inside git repository '{}'. Select that folder directly, or choose a location that is not part of an existing repository.",
             path.display(),
             root.display()
-        )),
-        GitLocation::NotARepo => {
-            if !initialize_git {
-                return Ok(false);
-            }
-
-            let output = tokio::process::Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(path)
-                .output()
-                .await
-                .map_err(|e| format!("Failed to run git init: {e}"))?;
-
-            if !output.status.success() {
-                return Err(format!(
-                    "git init failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
-            }
-
-            if !is_git_repo_root(path) {
-                return Err(format!(
-                    "git init reported success but '{}' is still not a git repository",
-                    path.display()
-                ));
-            }
-
-            Ok(true)
-        }
+        ));
     }
+    let Some(kind) = initialize else {
+        return Ok(false);
+    };
+    let needs_init = match vcs::detect(path).await? {
+        Vcs::None => true,
+        Vcs::Git => !vcs::has_commits(path).await,
+        _ => false,
+    };
+    if !needs_init {
+        return Ok(false);
+    }
+    let path_str = path.to_str().ok_or("The folder's path is not valid UTF-8")?;
+    vcs_init::initialize(path_str, kind, expected_files).await?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -130,14 +123,16 @@ pub async fn create_repository(
     state: tauri::State<'_, crate::AppState>,
     local_path: String,
     remote_url: Option<String>,
-    initialize_git: bool,
+    initialize: Option<VcsInitKind>,
+    expected_files: Option<usize>,
 ) -> Result<Repository, String> {
     create_repository_core(
         &state.repository.repositories,
         &state.storage,
         local_path,
         remote_url,
-        initialize_git,
+        initialize,
+        expected_files,
     )
     .await
 }
@@ -146,21 +141,22 @@ pub async fn create_repository(
 /// can call it without a `tauri::State`.
 ///
 /// Ordering is deliberate: validate the path, then (if asked) initialize
-/// git, then verify git actually took, then persist — only after all of
-/// that succeeds is anything reported to the caller as done.
+/// version control, then verify it actually took, then persist — only after
+/// all of that succeeds is anything reported to the caller as done.
 async fn create_repository_core(
     repositories: &RwLock<HashMap<Uuid, Repository>>,
     storage: &Storage,
     local_path: String,
     remote_url: Option<String>,
-    initialize_git: bool,
+    initialize: Option<VcsInitKind>,
+    expected_files: Option<usize>,
 ) -> Result<Repository, String> {
     let path = std::path::PathBuf::from(&local_path);
     if !path.is_dir() {
         return Err(format!("'{}' is not a directory", local_path));
     }
 
-    let git_freshly_initialized = ensure_git_initialized(&path, initialize_git).await?;
+    let git_freshly_initialized = ensure_vcs_initialized(&path, initialize, expected_files).await?;
 
     let id = Uuid::new_v4();
     let remote_type = remote_url.as_ref().and_then(|url| {
@@ -192,7 +188,7 @@ async fn create_repository_core(
                 // would destroy real repository state to manufacture a
                 // rollback that was never atomic to begin with.
                 format!(
-                    "Git repository was initialized at '{local_path}', but registering the project failed: {e}"
+                    "Version control was initialized at '{local_path}', but registering the project failed: {e}"
                 )
             } else {
                 e
@@ -247,6 +243,7 @@ mod tests {
     use crate::config::paths::AppPaths;
     use crate::config::storage::AppConfig;
     use tempfile::TempDir;
+    use crate::commands::file::is_git_repo_root;
 
     fn create_test_storage() -> (Storage, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -368,12 +365,9 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
 
-        let result = create_repository_core(
-            &repositories,
-            &storage,
-            folder.to_string_lossy().to_string(),
-            None,
-            true,
+        let result = vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -381,6 +375,57 @@ mod tests {
         assert!(is_git_repo_root(&folder), "folder must be a real git repository");
         let toplevel = git(&folder, &["rev-parse", "--is-inside-work-tree"]);
         assert!(toplevel.status.success(), "git must recognize the folder as a work tree");
+        // Git named the branch, from the (isolated) `init.defaultBranch`,
+        // and it has a first commit a task can start from.
+        let head = git(&folder, &["symbolic-ref", "HEAD"]);
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "refs/heads/trunk-xyz");
+        assert!(git(&folder, &["rev-parse", "--verify", "refs/heads/trunk-xyz"]).status.success());
+    }
+
+    /// A folder holding files gets them as its first commit, ignore rules
+    /// applied; what they exclude stays on disk, uncommitted.
+    #[tokio::test]
+    async fn initializing_a_folder_with_files_commits_what_its_ignore_rules_keep() {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(folder.join("build")).unwrap();
+        std::fs::write(folder.join("notes.txt"), "notes").unwrap();
+        std::fs::write(folder.join(".gitignore"), "build/\n").unwrap();
+        std::fs::write(folder.join("build/out.bin"), "artifact").unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+
+        vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+        )
+        .await
+        .expect("initialized");
+
+        let tree = git(&folder, &["ls-tree", "-r", "--name-only", "HEAD"]);
+        assert_eq!(String::from_utf8_lossy(&tree.stdout).lines().collect::<Vec<_>>(), [".gitignore", "notes.txt"]);
+        assert!(folder.join("build/out.bin").is_file(), "an ignored file stays where it was");
+    }
+
+    /// With no commit identity configured nothing is initialized and
+    /// nothing is registered: SlashIt does not invent an identity.
+    #[tokio::test]
+    async fn initializing_without_a_commit_identity_changes_nothing() {
+        let (storage, temp) = create_test_storage();
+        let folder = temp.path().join("project");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("notes.txt"), "notes").unwrap();
+        let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
+
+        let refused = vcs_init::test_env::scope(
+            vcs_init::test_env::without_identity(temp.path()),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
+        )
+        .await
+        .expect_err("no identity");
+
+        assert!(refused.contains("user.name and user.email"), "{refused}");
+        assert!(!folder.join(".git").exists());
+        assert!(repositories.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -390,12 +435,9 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
 
-        let result = create_repository_core(
-            &repositories,
-            &storage,
-            folder.to_string_lossy().to_string(),
-            None,
-            false,
+        let result = vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, None, None),
         )
         .await;
 
@@ -417,12 +459,9 @@ mod tests {
         let head_before = git(&folder, &["rev-parse", "HEAD"]).stdout;
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        let result = create_repository_core(
-            &repositories,
-            &storage,
-            folder.to_string_lossy().to_string(),
-            None,
-            true,
+        let result = vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -456,12 +495,9 @@ mod tests {
         std::fs::create_dir_all(&child).unwrap();
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        let result = create_repository_core(
-            &repositories,
-            &storage,
-            child.to_string_lossy().to_string(),
-            None,
-            true,
+        let result = vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -491,12 +527,9 @@ mod tests {
         std::fs::create_dir_all(&child).unwrap();
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        let result = create_repository_core(
-            &repositories,
-            &storage,
-            child.to_string_lossy().to_string(),
-            None,
-            false,
+        let result = vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, None, None),
         )
         .await;
 
@@ -525,12 +558,9 @@ mod tests {
         );
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        let result = create_repository_core(
-            &repositories,
-            &storage,
-            child.to_string_lossy().to_string(),
-            None,
-            true,
+        let result = vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, child.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -547,12 +577,9 @@ mod tests {
         let head_before = git(&nested, &["rev-parse", "HEAD"]).stdout;
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        let result = create_repository_core(
-            &repositories,
-            &storage,
-            nested.to_string_lossy().to_string(),
-            None,
-            true,
+        let result = vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, nested.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -575,12 +602,9 @@ mod tests {
         assert!(worktree.join(".git").is_file(), "sanity check: worktree .git must be a file");
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        let result = create_repository_core(
-            &repositories,
-            &storage,
-            worktree.to_string_lossy().to_string(),
-            None,
-            true,
+        let result = vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, worktree.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -603,12 +627,9 @@ mod tests {
         std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o500)).unwrap();
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        let result = create_repository_core(
-            &repositories,
-            &storage,
-            folder.to_string_lossy().to_string(),
-            None,
-            true,
+        let result = vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -636,12 +657,9 @@ mod tests {
         std::fs::set_permissions(storage.paths().config_file(), std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let repositories: RwLock<HashMap<Uuid, Repository>> = RwLock::new(HashMap::new());
-        let result = create_repository_core(
-            &repositories,
-            &storage,
-            folder.to_string_lossy().to_string(),
-            None,
-            true,
+        let result = vcs_init::test_env::scope(
+            vcs_init::test_env::isolated(temp.path(), "trunk-xyz"),
+            create_repository_core(&repositories, &storage, folder.to_string_lossy().to_string(), None, Some(VcsInitKind::Git), None),
         )
         .await;
 
@@ -649,7 +667,7 @@ mod tests {
 
         let err = result.expect_err("persistence failure must be reported, not swallowed as success");
         assert!(
-            err.contains("Git repository was initialized"),
+            err.contains("Version control was initialized"),
             "error must make clear git init already happened: {err}"
         );
         assert!(

@@ -38,6 +38,8 @@ use thirtyfour::prelude::*;
 const EXECUTION_DEADLINE: Duration = Duration::from_secs(90);
 #[path = "product_acceptance/human_review.rs"]
 mod human_review;
+#[path = "product_acceptance/local_first.rs"]
+mod local_first;
 #[path = "product_acceptance/needs_you.rs"]
 mod needs_you;
 
@@ -2279,7 +2281,7 @@ async fn create_prerequisites(
             json!({
                 "localPath": repository.path(),
                 "remoteUrl": Value::Null,
-                "initializeGit": false,
+                "initialize": Value::Null,
             }),
         )
         .await?,

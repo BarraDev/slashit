@@ -14,12 +14,40 @@
 /// quoting, revision or revset operators, or glob metacharacters. A refused
 /// value is reported, never rewritten into something else.
 pub fn checked_task_branch(branch: &str) -> Result<&str, String> {
-    let refuse = |why: &str| {
-        Err(format!(
+    checked_branch(branch).map_err(|why| {
+        format!(
             "The task's recorded branch {branch:?} {why}, so SlashIt will not pass it to \
              git, jj or gh. Check the task's board file for an unexpected change."
-        ))
+        )
+    })
+}
+
+/// [`checked_task_branch`]'s rules for a project's base branch
+/// (`domain::ProjectBase`), which is read back from the configuration file
+/// and chosen from the repository's own branch names.
+pub fn checked_base_branch(branch: &str) -> Result<&str, String> {
+    checked_branch(branch).map_err(|why| {
+        format!(
+            "The branch {branch:?} {why}, so SlashIt will not use it as the project's base \
+             branch. Choose another branch in Settings > Repository."
+        )
+    })
+}
+
+/// Whether `name` is a branch SlashIt names after a task: `task-<task id>`,
+/// or `task-<first 8 hex digits>` as earlier versions named them. Such a
+/// branch is never offered as a project's base.
+pub fn looks_like_task_branch(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("task-") else {
+        return false;
     };
+    let hex8 = |s: &str| s.len() == 8 && s.chars().all(|c| c.is_ascii_hexdigit());
+    hex8(rest) || uuid::Uuid::try_parse(rest).is_ok_and(|id| id.hyphenated().to_string() == rest)
+}
+
+/// Why `branch` is not a plain branch name, if it is not.
+fn checked_branch(branch: &str) -> Result<&str, &'static str> {
+    let refuse = |why: &'static str| Err(why);
 
     if branch.is_empty() {
         return refuse("is empty");
@@ -48,6 +76,19 @@ pub fn checked_task_branch(branch: &str) -> Result<&str, String> {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// Only the names SlashIt gives task branches count as task branches;
+    /// a person's branch that merely starts with `task-` does not.
+    #[test]
+    fn task_branch_names_are_recognised_exactly() {
+        let generated = super::super::WorktreeManager::branch_for_task(Uuid::new_v4());
+        assert!(looks_like_task_branch(&generated));
+        assert!(looks_like_task_branch("task-c0ffee11"));
+        for other in ["task-login-page", "task-c0ffee1", "task-", "main-task-c0ffee11", "trunk"] {
+            assert!(!looks_like_task_branch(other), "{other}");
+        }
+        assert!(checked_base_branch("-x").unwrap_err().contains("project's base branch"));
+    }
 
     #[test]
     fn checked_task_branch_accepts_the_names_slashit_generates() {

@@ -643,6 +643,7 @@ mod tests {
             repository_id: Some(repository.id),
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
+            base: None,
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -896,6 +897,7 @@ mod tests {
             repository_id: Some(repository.id),
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
+            base: None,
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -986,6 +988,7 @@ mod tests {
             repository_id: Some(repository.id),
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
+            base: None,
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -1074,6 +1077,7 @@ mod tests {
             repository_id: Some(repository.id),
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
+            base: None,
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -1177,6 +1181,7 @@ mod tests {
             repository_id: Some(repository.id),
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
+            base: None,
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -1429,6 +1434,7 @@ mod tests {
             repository_id: None,
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
+            base: None,
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -1545,6 +1551,7 @@ mod tests {
             repository_id: Some(repository.id),
             scope: domain::ProjectScope::Standalone,
             state_location: config::paths::StateLocation::External,
+            base: None,
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,
@@ -1970,6 +1977,7 @@ mod tests {
             repository_id: None,
             scope: domain::ProjectScope::InWorkspace { workspace_id: lost_workspace },
             state_location: config::paths::StateLocation::External,
+            base: None,
             agent_type: domain::AgentType::ClaudeCode,
             agent_config: domain::AgentConfig {
                 agent_type: domain::AgentType::ClaudeCode,

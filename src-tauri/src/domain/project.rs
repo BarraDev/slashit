@@ -25,6 +25,24 @@ impl ProjectScope {
     }
 }
 
+/// Where a project's new task branches start when no remote says so.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectBase {
+    /// The local branch `refs/heads/<branch>`, read afresh when each task
+    /// branch is created. In a Jujutsu repository colocated with Git this
+    /// is the bookmark of that name, which JJ exports to that ref.
+    LocalBranch { branch: String },
+}
+
+impl ProjectBase {
+    pub fn branch(&self) -> &str {
+        match self {
+            Self::LocalBranch { branch } => branch,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: Uuid,
@@ -42,6 +60,19 @@ pub struct Project {
     /// while a project with no `.slashit/` resolves to external.
     #[serde(default = "StateLocation::auto")]
     pub state_location: StateLocation,
+    /// The local branch a new task's branch starts from when the repository
+    /// has no usable remote default branch (see
+    /// `worktree::default_base::resolve_default_base` for the order).
+    ///
+    /// Captured once, when the project is registered or its version control
+    /// is initialized, and only when that is unambiguous; otherwise set by an
+    /// explicit choice in the project's repository settings. Never re-derived
+    /// from wherever the primary checkout happens to be when a task starts,
+    /// so switching that checkout to another branch does not move where new
+    /// tasks start. Projects stored before this field existed, and projects
+    /// whose base could not be told, load as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<ProjectBase>,
     pub agent_type: AgentType,
     pub agent_config: AgentConfig,
     pub created_at: chrono::DateTime<chrono::Utc>,

@@ -671,6 +671,7 @@ mod tests {
                 repository_id: Some(repository_id),
                 scope: crate::domain::project::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
+                base: None,
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::project::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,
@@ -797,6 +798,7 @@ mod tests {
                 repository_id: None,
                 scope: crate::domain::project::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
+                base: None,
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::project::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,
@@ -894,6 +896,7 @@ mod tests {
                 repository_id: None,
                 scope: crate::domain::project::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
+                base: None,
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::project::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,
@@ -977,6 +980,7 @@ mod tests {
             repository_id,
             scope: crate::domain::project::ProjectScope::Standalone,
             state_location: crate::config::paths::StateLocation::External,
+            base: None,
             agent_type: crate::domain::AgentType::ClaudeCode,
             agent_config: crate::domain::project::AgentConfig {
                 agent_type: crate::domain::AgentType::ClaudeCode,

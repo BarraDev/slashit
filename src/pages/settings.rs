@@ -18,6 +18,7 @@ fn event_target_checked(ev: &leptos::ev::Event) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SettingsTab {
     General,
+    Repository,
     Storage,
     Jujutsu,
     Theme,
@@ -28,6 +29,7 @@ impl SettingsTab {
     fn title(&self) -> &'static str {
         match self {
             SettingsTab::General => "General",
+            SettingsTab::Repository => "Repository",
             SettingsTab::Storage => "Storage",
             SettingsTab::Jujutsu => "Jujutsu",
             SettingsTab::Theme => "Theme",
@@ -38,6 +40,8 @@ impl SettingsTab {
     fn icon(&self) -> &'static str {
         match self {
             SettingsTab::General => "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z",
+            // Branching fork: a repository's history.
+            SettingsTab::Repository => "M6 3v12m0 0a3 3 0 103 3m-3-3a3 3 0 013 3m0 0h3a6 6 0 006-6V9m0 0a3 3 0 10-3-3 3 3 0 003 3z",
             // Database / stacked-discs outline.
             SettingsTab::Storage => "M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4",
             SettingsTab::Jujutsu => "M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15",
@@ -113,6 +117,7 @@ pub fn Settings(
                         <div class="p-2 space-y-1">
                             {[
                                 SettingsTab::General,
+                                SettingsTab::Repository,
                                 SettingsTab::Storage,
                                 SettingsTab::Jujutsu,
                                 SettingsTab::Theme,
@@ -122,6 +127,7 @@ pub fn Settings(
                                 let tab_clone = tab;
                                 view! {
                                     <button
+                                        data-testid=format!("settings-tab-{}", tab.title().to_lowercase())
                                         on:click=move |_| set_active_tab.set(tab_clone)
                                         class=format!(
                                             "w-full flex items-center gap-3 px-4 py-3 rounded-lg text-left transition-all {}",
@@ -181,6 +187,10 @@ pub fn Settings(
                                             </div>
                                         </div>
                                     </div>
+                                }.into_any(),
+
+                                SettingsTab::Repository => view! {
+                                    <crate::components::RepositorySetup project_id=project_id.clone() />
                                 }.into_any(),
 
                                 SettingsTab::Storage => view! {

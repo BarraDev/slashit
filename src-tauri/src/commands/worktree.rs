@@ -1,5 +1,5 @@
 use uuid::Uuid;
-use crate::domain::BranchOrigin;
+use crate::domain::{BranchOrigin, ProjectBase};
 use crate::worktree::{WorktreeInfo, WorktreeManager};
 
 #[tauri::command]
@@ -35,8 +35,8 @@ async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result
         }
     }
 
-    // Resolve repo path
-    let repo_path = {
+    // Resolve repo path, and the project's local base
+    let (repo_path, project_base) = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_id).ok_or("Task not found")?;
         let project_id = task.project_id;
@@ -45,11 +45,12 @@ async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result
         let projects = state.project.projects.read().await;
         let project = projects.get(&project_id).ok_or("Project not found")?;
         let repo_id = project.repository_id.ok_or("No repository linked")?;
+        let project_base = project.base.clone();
         drop(projects);
 
         let repos = state.repository.repositories.read().await;
         let repo = repos.get(&repo_id).ok_or("Repository not found")?;
-        repo.local_path.clone()
+        (repo.local_path.clone(), project_base)
     };
 
     // Check if task already has a branch (reattach) or needs a new one
@@ -75,6 +76,7 @@ async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result
         &state.worktree_manager,
         &repo_path,
         existing_branch.as_deref(),
+        project_base.as_ref(),
         task_id,
     )
     .await?;
@@ -130,6 +132,7 @@ async fn acquire_checkout(
     manager: &WorktreeManager,
     repo_path: &str,
     existing_branch: Option<&str>,
+    project_base: Option<&ProjectBase>,
     task_id: Uuid,
 ) -> Result<AcquiredCheckout, String> {
     // A reattach keeps the starting commit and origin recorded when the
@@ -142,14 +145,14 @@ async fn acquire_checkout(
     // default base, exactly as the executor's ordinary branches do (see
     // `WorktreeManager::create_or_adopt`), whatever the task depends on.
     match manager
-        .create_or_adopt(repo_path, &WorktreeManager::branch_for_task(task_id))
+        .create_or_adopt(repo_path, &WorktreeManager::branch_for_task(task_id), project_base)
         .await?
     {
         (info, Some(base)) => Ok(AcquiredCheckout {
             info,
             created_at: Some(base.commit.clone()),
+            origin: Some(base.branch_origin()),
             base_commit: Some(base.commit),
-            origin: Some(BranchOrigin::DefaultBase { branch: Some(base.branch) }),
         }),
         // An adopted worktree claims no start: its `HEAD` is not where the
         // branch started, and whatever the task already recorded is kept.
@@ -269,7 +272,7 @@ mod tests {
         git(&repo, &["checkout", "-q", "-b", "feature-f"]);
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "feature work"]);
 
-        let acquired = acquire_checkout(&manager, repo.to_str().unwrap(), None, Uuid::new_v4())
+        let acquired = acquire_checkout(&manager, repo.to_str().unwrap(), None, None, Uuid::new_v4())
             .await
             .expect("a worktree");
 
@@ -290,7 +293,7 @@ mod tests {
         git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
         let refs_before = git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
 
-        let refused = acquire_checkout(&manager, repo.to_str().unwrap(), None, Uuid::new_v4())
+        let refused = acquire_checkout(&manager, repo.to_str().unwrap(), None, None, Uuid::new_v4())
             .await
             .err()
             .expect("refused");
@@ -311,7 +314,7 @@ mod tests {
         let custom = temp.path().join("elsewhere").join(&branch);
         git(&repo, &["worktree", "add", "-q", "-b", &branch, "--", custom.to_str().unwrap()]);
 
-        let acquired = acquire_checkout(&manager, repo.to_str().unwrap(), None, task_id)
+        let acquired = acquire_checkout(&manager, repo.to_str().unwrap(), None, None, task_id)
             .await
             .expect("adopted");
 
@@ -332,7 +335,7 @@ mod tests {
         git(&repo, &["branch", "task-legacy"]);
 
         let acquired =
-            acquire_checkout(&manager, repo.to_str().unwrap(), Some("task-legacy"), Uuid::new_v4())
+            acquire_checkout(&manager, repo.to_str().unwrap(), Some("task-legacy"), None, Uuid::new_v4())
                 .await
                 .expect("a worktree");
 
@@ -379,6 +382,7 @@ mod tests {
                 repository_id: Some(repository_id),
                 scope: crate::domain::ProjectScope::Standalone,
                 state_location: crate::config::paths::StateLocation::External,
+                base: None,
                 agent_type: crate::domain::AgentType::ClaudeCode,
                 agent_config: crate::domain::AgentConfig {
                     agent_type: crate::domain::AgentType::ClaudeCode,
@@ -715,6 +719,7 @@ mod tests {
                     repository_id: Some(repository_id),
                     scope: crate::domain::ProjectScope::Standalone,
                     state_location: crate::config::paths::StateLocation::External,
+                    base: None,
                     agent_type: crate::domain::AgentType::ClaudeCode,
                     agent_config: crate::domain::AgentConfig {
                         agent_type: crate::domain::AgentType::ClaudeCode,

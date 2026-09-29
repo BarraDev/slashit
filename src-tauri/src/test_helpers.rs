@@ -57,9 +57,19 @@ pub struct FakeProgram {
     dir: tempfile::TempDir,
     log: std::path::PathBuf,
     saved_path: Option<std::ffi::OsString>,
-    /// Directories standing in for `PATH` entries, see [`Self::without`].
-    _shadows: Option<tempfile::TempDir>,
 }
+
+/// Where [`FakeProgram::without`] puts the directories standing in for
+/// `PATH` entries. They are never removed while the process runs: a program
+/// a test that does not take [`PATH_LOCK`] started while `PATH` named them
+/// (a `git` shell script looking up `sed`, say) may still be resolving
+/// programs there after the test that made them has finished. Deleting them
+/// then made such runs fail with "command not found" on machines where a
+/// hidden program shares a directory with everything else (`wt` in
+/// `/usr/bin`). The directory is left behind when the process exits.
+#[cfg(all(test, unix))]
+static SHADOW_ROOT: std::sync::LazyLock<tempfile::TempDir> =
+    std::sync::LazyLock::new(|| tempfile::tempdir().expect("shadow root"));
 
 #[cfg(all(test, unix))]
 impl FakeProgram {
@@ -78,7 +88,7 @@ impl FakeProgram {
         unsafe {
             std::env::set_var("PATH", new_path);
         }
-        FakeProgram { _lock: lock, dir, log, saved_path, _shadows: None }
+        FakeProgram { _lock: lock, dir, log, saved_path }
     }
 
     /// An executable `name` at the front of `PATH`. `body` runs after
@@ -101,14 +111,20 @@ impl FakeProgram {
     /// directory holding a hidden program is replaced by one that links
     /// every other entry in it.
     pub async fn without(hidden: &[&str]) -> Self {
-        let shadows = tempfile::tempdir().expect("tempdir");
-        let mut fake = Self::take_path(|saved| {
+        let shadows = SHADOW_ROOT.path().join(uuid::Uuid::new_v4().to_string());
+        Self::take_path(|saved| {
             let Some(saved) = saved else { return Vec::new() };
-            path_entries_without(saved, hidden, shadows.path())
+            path_entries_without(saved, hidden, &shadows)
         })
-        .await;
-        fake._shadows = Some(shadows);
-        fake
+        .await
+    }
+
+    /// Where `name` is on the `PATH` this value replaced, which no other
+    /// test could have been changing while it was read: the program a fake
+    /// can hand the calls it does not intercept to.
+    pub fn original(&self, name: &str) -> Option<std::path::PathBuf> {
+        let saved = self.saved_path.as_ref()?;
+        std::env::split_paths(saved).map(|dir| dir.join(name)).find(|p| p.is_file())
     }
 
     /// Install one more fake program `name` beside the others.
