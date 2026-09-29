@@ -1850,16 +1850,27 @@ mod tests {
     // Unit tests (no external tools required)
     // -------------------------------------------------------
 
-    /// Roots under a unique temp path. Nothing is created on disk — these
-    /// tests only exercise path computation.
-    fn test_paths() -> Arc<AppPaths> {
-        let root = std::env::temp_dir().join(format!("slashit-wt-test-{}", Uuid::new_v4()));
-        Arc::new(AppPaths::with_roots(
-            root.join("config"),
-            root.join("data"),
-            root.join("cache"),
-            root.join("runtime"),
-        ))
+    /// A manager whose state lives in a temporary directory of its own.
+    ///
+    /// Worktrees it creates are written under that directory, and dropping
+    /// the manager removes the directory with everything in it, also while
+    /// a failing test unwinds. Nothing else is removed: the directory is the
+    /// one this manager created, and removal does not follow symbolic links
+    /// out of it. None of these tests keeps its state; one that must, for
+    /// inspection, can destructure the value and call `TempDir::keep` on the
+    /// root.
+    struct TestManager {
+        manager: WorktreeManager,
+        // Declared after `manager`, so it is dropped after it.
+        _root: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestManager {
+        type Target = WorktreeManager;
+
+        fn deref(&self) -> &WorktreeManager {
+            &self.manager
+        }
     }
 
     /// A `git worktree list --porcelain` listing written with newlines, in
@@ -1873,8 +1884,103 @@ mod tests {
     const PRIMARY: &str =
         "worktree /elsewhere/primary-checkout\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/main\n\n";
 
-    fn test_manager() -> WorktreeManager {
-        WorktreeManager::new(test_paths())
+    fn test_manager() -> TestManager {
+        let root = tempfile::Builder::new()
+            .prefix("slashit-wt-test-")
+            .tempdir()
+            .expect("create the test's state directory");
+        let paths = AppPaths::with_roots(
+            root.path().join("config"),
+            root.path().join("data"),
+            root.path().join("cache"),
+            root.path().join("runtime"),
+        );
+        TestManager { manager: WorktreeManager::new(Arc::new(paths)), _root: root }
+    }
+
+    /// The directory a test manager keeps its state under.
+    fn state_root(mgr: &WorktreeManager) -> PathBuf {
+        mgr.paths.data_dir().parent().expect("the data root has a parent").to_path_buf()
+    }
+
+    /// A test manager's worktrees are gone with it: a test that passes
+    /// leaves nothing of its own under the temporary directory.
+    #[tokio::test]
+    async fn a_test_manager_removes_its_worktrees_when_dropped() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap();
+        let mgr = test_manager();
+        let root = state_root(&mgr);
+        let info = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
+        assert!(Path::new(&info.path).starts_with(&root), "the worktree is under the root");
+
+        drop(mgr);
+
+        assert!(!root.exists(), "{} was left behind", root.display());
+    }
+
+    /// Managers made from concurrent tasks get roots of their own, and each
+    /// is removed with its manager.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_managers_made_in_parallel_each_remove_their_own_root() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let runs: Vec<_> = (0..8)
+            .map(|i| {
+                let repo_path = repo_path.clone();
+                tokio::spawn(async move {
+                    let mgr = test_manager();
+                    let root = state_root(&mgr);
+                    mgr.create(&repo_path, &format!("task-0000000{i}")).await.expect("create");
+                    assert!(root.exists());
+                    root
+                })
+            })
+            .collect();
+        let mut roots = Vec::new();
+        for run in runs {
+            roots.push(run.await.expect("the run completes"));
+        }
+
+        let distinct: std::collections::HashSet<_> = roots.iter().collect();
+        assert_eq!(distinct.len(), roots.len(), "every manager has a root of its own");
+        let left: Vec<_> = roots.iter().filter(|root| root.exists()).collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
+    /// A test that panics still removes the root: the owner is dropped
+    /// while the panic unwinds.
+    #[test]
+    fn a_test_manager_removes_its_root_when_the_test_panics() {
+        let root = std::sync::Mutex::new(None);
+        let outcome = std::panic::catch_unwind(|| {
+            let mgr = test_manager();
+            std::fs::create_dir_all(mgr.paths.data_dir().join("worktrees")).unwrap();
+            *root.lock().unwrap() = Some(state_root(&mgr));
+            panic!("the test fails after writing under its root");
+        });
+
+        assert!(outcome.is_err());
+        let root = root.into_inner().unwrap().expect("the root was recorded");
+        assert!(!root.exists(), "{} was left behind", root.display());
+    }
+
+    /// Removing the root removes what is in it, never what a link in it
+    /// points at.
+    #[cfg(unix)]
+    #[test]
+    fn a_test_manager_does_not_follow_links_out_of_its_root() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep.txt"), "not the test's").unwrap();
+        let mgr = test_manager();
+        let root = state_root(&mgr);
+        std::fs::create_dir_all(mgr.paths.data_dir()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), mgr.paths.data_dir().join("link")).unwrap();
+
+        drop(mgr);
+
+        assert!(!root.exists(), "{} was left behind", root.display());
+        assert!(outside.path().join("keep.txt").exists(), "the link target must survive");
     }
 
     /// A recorded checkout path that is not on disk and that no hand-written
@@ -5164,7 +5270,7 @@ branch refs/heads/some-other-branch
         let main_tip = run_git(repo_path, &["rev-parse", "main"]);
         assert_ne!(dependency_tip, main_tip, "the fixture must tell the two bases apart");
 
-        let mgr = WorktreeManager::new(test_paths());
+        let mgr = test_manager();
         let stacked = mgr
             .create_stacked_branch(repo_path, "stacked", "dependency")
             .await
@@ -5332,7 +5438,8 @@ branch refs/heads/some-other-branch
         let feature = commit_in(repo_path, "feature work");
         assert_ne!(feature, base, "the fixture must tell the two starts apart");
 
-        let info = test_manager().create(repo_path, "task-0a1b2c3d").await.expect("create");
+        let mgr = test_manager();
+        let info = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
 
         assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), base);
         assert_eq!(run_git(&info.path, &["symbolic-ref", "HEAD"]), "refs/heads/task-0a1b2c3d");
@@ -5357,7 +5464,8 @@ branch refs/heads/some-other-branch
         run_git(repo_path, &["checkout", "-q", "--detach"]);
         let local = commit_in(repo_path, "local work ahead of origin");
 
-        let info = test_manager().create(repo_path, "task-0a1b2c3d").await.expect("create");
+        let mgr = test_manager();
+        let info = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
 
         assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), base);
         assert_eq!(run_git(repo_path, &["rev-parse", "HEAD"]), local, "the primary is untouched");
@@ -5376,7 +5484,8 @@ branch refs/heads/some-other-branch
             run_git(repo_path, &["branch", "--set-upstream-to=origin/main", "main"]);
             run_git(repo_path, &["config", "branch.autoSetupMerge", setting]);
 
-            let info = test_manager()
+            let mgr = test_manager();
+            let info = mgr
                 .create(repo_path, "task-0a1b2c3d")
                 .await
                 .unwrap_or_else(|e| panic!("{setting}: {e}"));
@@ -5400,7 +5509,8 @@ branch refs/heads/some-other-branch
         let base = origin_main(repo_path);
         run_git(repo_path, &["branch", "--set-upstream-to=origin/main", "main"]);
         run_git(repo_path, &["config", "branch.autoSetupMerge", "inherit"]);
-        let info = test_manager().create(repo_path, "task-0a1b2c3d").await.expect("create");
+        let mgr = test_manager();
+        let info = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
         commit_work(&info.path, "agent-work.txt");
 
         let _ = std::process::Command::new("git")
@@ -5436,7 +5546,8 @@ branch refs/heads/some-other-branch
             run_git(repo_path, &["update-ref", &hijack, &other]);
         }
 
-        let info = test_manager().create(repo_path, "task-0a1b2c3d").await.expect("create");
+        let mgr = test_manager();
+        let info = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
 
         assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), base);
         assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), base);
@@ -5455,7 +5566,8 @@ branch refs/heads/some-other-branch
         run_git(repo_path, &["worktree", "add", "-q", "-b", "task-c0ffee11", "--", custom.to_str().unwrap()]);
         let before = registered_worktrees(repo_path);
 
-        let info = test_manager()
+        let mgr = test_manager();
+        let info = mgr
             .reattach(repo_path, "task-c0ffee11")
             .await
             .expect("the registered worktree is reattached");
@@ -5477,7 +5589,8 @@ branch refs/heads/some-other-branch
         run_git(repo_path, &["worktree", "add", "-q", "-b", "task-c0ffee11", "--", custom.to_str().unwrap()]);
         let before = registered_worktrees(repo_path);
 
-        let (info, created_from) = test_manager()
+        let mgr = test_manager();
+        let (info, created_from) = mgr
             .create_or_adopt(repo_path, "task-c0ffee11", None)
             .await
             .expect("the registered worktree is adopted");
@@ -5661,7 +5774,7 @@ branch refs/heads/some-other-branch
             let tmp = create_temp_git_repo();
             let repo_path = tmp.path().to_str().unwrap();
             let base = origin_main(repo_path);
-            let mgr = WorktreeManager::new(test_paths());
+            let mgr = test_manager();
 
             let created = mgr.create(repo_path, "task-0a1b2c3d").await.expect("create");
             assert_eq!(run_git(&created.path, &["rev-parse", "HEAD"]), base);
