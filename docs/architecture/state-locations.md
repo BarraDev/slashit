@@ -297,6 +297,91 @@ cleanup is asked for again, and says so, naming the lock if there is one.
 
 Startup runs no git command that changes anything.
 
+## Disk usage
+
+Settings > Storage shows how much space SlashIt uses and how full the disk
+holding its data directory is. It is informational: nothing is deleted,
+cleaned, pruned or refused because of it. The code is
+`src-tauri/src/storage_accounting/`; what each total means is documented on
+`domain::storage_usage`.
+
+Only SlashIt's own roots are measured: the config, data, cache and runtime
+directories above. Every path comes from `AppPaths`; nothing a task or board
+records is walked on its say-so. Task Checkouts are found by listing
+`<data_dir>/worktrees/<project-key>/` and then matched against the paths
+tasks record, so a recorded path cannot point the walk anywhere else.
+Checkouts recorded elsewhere (adopted, or at the legacy sibling path) are
+counted but not measured. Repositories, boards kept inside a project, git's
+own data in `.git/`, and shared tool caches are not measured either.
+
+What each thing is:
+
+- A checkout exactly one task records, under the worktree root of that
+  task's own project, is that task's, and its files are *task files*. Any
+  other directory under the worktree root, including one two tasks record
+  or one a task of another project records, is *unrecognized*, as is any
+  entry in SlashIt's directories that no version of SlashIt writes.
+- Inside a checkout a task owns, a top-level `target/` or `dist/` is
+  *rebuildable* only when it is a real directory on the same filesystem,
+  is not a repository of its own, git reports it as ignored, and git tracks
+  nothing inside it. The name alone never qualifies. Git is asked with
+  `core.fsmonitor` off and optional locks off, so the question starts no
+  hook or daemon and writes nothing, and each answer is bounded in time.
+- Rebuildable output *could be freed* only while no agent (an execution,
+  an AI review or a pull request helper) is attached to the task and the
+  task is not In Progress, in AI Review or queued. What the user runs in a
+  checkout themselves is not known. Nothing frees it today.
+- A checkout whose cleanup was interrupted is measured but neither broken
+  down nor offered, because a removal may be taking it apart.
+
+Links are not followed, with a guarantee that differs by platform:
+
+- On Unix the walk goes by directory handle, not by path. From SlashIt's
+  root down, each directory is opened relative to its parent with
+  `O_NOFOLLOW`, each entry is stat'ed relative to that handle, and a
+  directory must still be the one that was listed (same device and inode)
+  when it is opened. A directory swapped for a link, or for another
+  directory, while the walk is running is reported as changed, never
+  measured through its new target. A directory the walk has already
+  opened is walked as that object, even if it is renamed out of the tree
+  meanwhile. The walk does not cross into another filesystem.
+- On Windows the walk goes by path, as the standard library does. It
+  enters no entry it sees as a reparse point (junctions, mounted volumes,
+  cloud placeholders), and refuses a reparse point between SlashIt's root
+  and the item. After listing a directory it checks the path again and
+  discards the listing if the path is no longer a plain directory or its
+  creation time, where the filesystem reports one, has changed. That
+  catches many replacements, but it is not a check of identity: creation
+  time can be missing or set to anything. A directory swapped and
+  restored between the listing and that check, or replaced by one that
+  looks the same, is not caught, and its entries can be counted as the
+  original's. Closing that needs handle-relative enumeration.
+
+Which item a byte is attributed to, and whether it counts as rebuildable,
+is decided by path at one moment; a tree rearranged during a measurement
+can be attributed differently. On Unix no link or path swap can steer the
+walk out of the tree below SlashIt's root, though a directory already
+opened is followed as that object wherever it is moved. None of this
+makes a measurement a basis for deleting anything: a cleanup must
+establish what it removes for itself.
+
+The measurement counts allocated space where the
+platform reports it (Unix) and file length otherwise (Windows), counting
+a hard-linked file once per walk on Unix; a file linked into two items is
+counted in each. An entry that cannot be read makes the
+item *partial*, and one that cannot be measured at all is listed as such,
+never as zero bytes. So does an item that is itself a link (a worktree
+root moved to another disk, say) or that holds another filesystem: what it
+points to is not measured, and the totals say they are lower bounds. The
+links and mounts not followed are counted and shown.
+
+Measuring runs only when asked, off the UI thread, one measurement at a
+time: a Refresh that arrives while one is running waits for it instead of
+starting another, and the previous result stays visible meanwhile.
+
+Disk pressure is Warning below the larger of 15% of the filesystem and
+120 GiB available, and Critical below the larger of 5% and 40 GiB.
+
 ## Directories by platform
 
 | Root | Linux | macOS | Windows |

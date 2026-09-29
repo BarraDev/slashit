@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod memory;
 pub mod appearance;
 pub mod jira;
+pub mod storage_usage;
 
 pub use repository::*;
 pub use project::*;

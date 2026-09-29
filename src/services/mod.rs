@@ -17,6 +17,7 @@ pub mod workflow_service;
 pub mod github_service;
 pub mod opener_service;
 pub mod state_service;
+pub mod storage_usage_service;
 pub mod updater_service;
 pub mod task_run_service;
 pub mod human_review_service;

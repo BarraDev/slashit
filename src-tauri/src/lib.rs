@@ -10,6 +10,7 @@ mod session;
 mod queue;
 mod pty;
 mod worktree;
+mod storage_accounting;
 /// Building `AppState` once, for whichever front end wants it.
 pub mod lifecycle;
 pub mod app_core;
@@ -72,6 +73,9 @@ pub struct AppState {
     /// the queue executor and the IPC handlers, so a card dragged in the app, a
     /// `slashit` command and an agent starting all queue behind the same lease.
     pub task_lifecycle_locks: Arc<lifecycle::TaskLifecycleLocks>,
+    /// How much disk SlashIt uses. Measured only when asked, one
+    /// measurement at a time.
+    pub storage_accounting: Arc<storage_accounting::StorageAccounting>,
 }
 
 impl AppState {
@@ -355,6 +359,8 @@ pub fn run() {
             create_approved_task_pr,
             request_task_changes,
             get_attention_summary,
+            get_storage_usage,
+            refresh_storage_usage,
             create_worktree,
             cleanup_worktree,
             check_worktree_exists,

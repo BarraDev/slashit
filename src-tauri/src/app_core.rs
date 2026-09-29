@@ -18,7 +18,7 @@ use crate::config::paths::AppPaths;
 use crate::config::Storage;
 use crate::domain::{self, Task};
 use crate::pty::PtyState;
-use crate::{commands, config, lifecycle, worktree, AppState};
+use crate::{commands, config, lifecycle, storage_accounting, worktree, AppState};
 
 /// What hydration found and did, for the caller to log.
 ///
@@ -88,9 +88,21 @@ pub async fn build_state_with_paths(
 
     let task_state = commands::task::TaskState::new();
     let queue_state = commands::queue::QueueState::new(task_state.tasks.clone());
+    let project_state = commands::project::ProjectState::new();
+    let repository_state = commands::repository::RepositoryState::new();
+    let executor = Arc::new(tokio::sync::OnceCell::new());
+    let storage_accounting = Arc::new(storage_accounting::for_app(
+        paths.clone(),
+        storage_accounting::Sources {
+            tasks: task_state.tasks.clone(),
+            projects: project_state.projects.clone(),
+            repositories: repository_state.repositories.clone(),
+            executor: executor.clone(),
+        },
+    ));
     let app_state = AppState {
-        repository: commands::repository::RepositoryState::new(),
-        project: commands::project::ProjectState::new(),
+        repository: repository_state,
+        project: project_state,
         workspace: commands::workspace::WorkspaceState::load(&paths)?,
         task: task_state,
         agent: commands::agent::AgentState::new(),
@@ -117,9 +129,10 @@ pub async fn build_state_with_paths(
             config::features::resolve_startup_flags(&paths),
         )),
         paths,
-        executor: Arc::new(tokio::sync::OnceCell::new()),
+        executor,
         state_location_locks: Arc::new(commands::state_location::StateLocationLocks::new()),
         task_lifecycle_locks: Arc::new(lifecycle::TaskLifecycleLocks::new()),
+        storage_accounting,
     };
 
     let mut report = StartupReport::default();

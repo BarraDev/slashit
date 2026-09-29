@@ -49,4 +49,5 @@ test_only = ["RecordingEventSink"]
 "src-tauri/src/pty" = "covered-by:src-tauri/src/AGENTS.md"
 "src-tauri/src/queue" = "covered-by:src-tauri/src/AGENTS.md"
 "src-tauri/src/session" = "covered-by:src-tauri/src/AGENTS.md"
+"src-tauri/src/storage_accounting" = "covered-by:src-tauri/src/AGENTS.md"
 "src-tauri/src/worktree" = "covered-by:src-tauri/src/AGENTS.md"

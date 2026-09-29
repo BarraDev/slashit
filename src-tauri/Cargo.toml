@@ -31,6 +31,9 @@ thiserror = "2"
 anyhow = "1"
 sysinfo = "0.32"
 directories = "5"
+# Filesystem total and available space: `statvfs` on Unix,
+# `GetDiskFreeSpaceExW` on Windows.
+fs4 = "1.1"
 toml = "0.8"
 walkdir = "2.5.0"
 portable-pty = "0.8"
@@ -59,6 +62,11 @@ tauri-plugin-wdio-webdriver = { version = "1.4", optional = true }
 # one bound syscall source instead of several hand-rolled `extern "C"`
 # declarations.
 libc = "0.2"
+# Directory-handle traversal for storage accounting (`openat` with
+# `O_NOFOLLOW`, `fstatat`), so a measurement cannot be steered out of the
+# tree it measures by a directory swapped for a link. Already built for
+# `fs4`.
+rustix = { version = "1", features = ["fs"] }
 
 [features]
 # ACCEPTANCE BUILDS ONLY. Never enable this for a release.

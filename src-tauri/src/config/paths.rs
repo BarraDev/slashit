@@ -360,11 +360,30 @@ impl AppPaths {
         self.data_dir.join("pr-helper-logs")
     }
 
+    // --- Machine-local files -----------------------------------------------
+
+    /// Terminal session metadata. Machine-local, so always under `data_dir`.
+    pub fn terminal_sessions_file(&self) -> PathBuf {
+        self.data_dir.join("terminal_sessions.toml")
+    }
+
+    /// Pre-`AppPaths` task location: one `<project-uuid>.toml` per project, all
+    /// of them under a single global directory. Still read, and still written
+    /// for projects that cannot be routed to a state directory of their own.
+    pub fn legacy_tasks_dir(&self) -> PathBuf {
+        self.config_dir.join("tasks")
+    }
+
     // --- Project state -----------------------------------------------------
+
+    /// Parent of every project's external state root.
+    pub fn external_projects_dir(&self) -> PathBuf {
+        self.data_dir.join("projects")
+    }
 
     /// External root for one project's shareable state.
     pub fn external_project_state(&self, key: &ProjectKey) -> PathBuf {
-        self.data_dir.join("projects").join(key.as_str())
+        self.external_projects_dir().join(key.as_str())
     }
 
     /// In-project root for one project's shareable state.
@@ -393,12 +412,18 @@ impl AppPaths {
 
     // --- Worktrees ---------------------------------------------------------
 
+    /// Parent of every project's worktree root. SlashIt creates every Task
+    /// Checkout it places itself somewhere below this directory.
+    pub fn worktrees_dir(&self) -> PathBuf {
+        self.data_dir.join("worktrees")
+    }
+
     /// Root for all SlashIt-managed worktrees of one project.
     ///
     /// Keyed by [`ProjectKey`], so two repositories that merely share a
     /// directory name cannot collide.
     pub fn worktrees_root(&self, key: &ProjectKey) -> PathBuf {
-        self.data_dir.join("worktrees").join(key.as_str())
+        self.worktrees_dir().join(key.as_str())
     }
 
     /// Full path for one worktree.
@@ -804,6 +829,8 @@ mod tests {
             p.pid_file(),
             p.logs_dir(),
             p.pr_helper_logs_dir(),
+            p.terminal_sessions_file(),
+            p.legacy_tasks_dir(),
         ] {
             assert!(
                 !path.starts_with(&project),
