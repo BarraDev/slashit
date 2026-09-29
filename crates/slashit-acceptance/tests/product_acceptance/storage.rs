@@ -58,6 +58,8 @@ async fn measure_and_refresh(driver: &WebDriver, context: &TestContext) -> Resul
     let owned_before = await_text(driver, OWNED, |t| !t.is_empty(), "SlashIt's total").await?;
 
     // Nothing here may delete, clean or prune: the only control is Refresh.
+    // Read once the first measurement has let go of the button.
+    await_text(driver, REFRESH, |t| t == "Refresh", "Refresh offered again").await?;
     let controls = page(
         driver,
         "return Array.from(document.querySelectorAll(arguments[0] + ' button, ' + arguments[0] + ' a'))\

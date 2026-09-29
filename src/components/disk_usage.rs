@@ -47,6 +47,11 @@ pub fn DiskUsage() -> impl IntoView {
                     // that this view should wait for: either way, refresh
                     // (which joins a running one rather than starting another).
                     let wait = current.summary.is_none() || current.measuring;
+                    // A Refresh pressed while this read was in flight
+                    // answers with something at least as new.
+                    if refreshing.get_untracked() {
+                        return;
+                    }
                     status.set(Some(current));
                     if wait {
                         refresh();

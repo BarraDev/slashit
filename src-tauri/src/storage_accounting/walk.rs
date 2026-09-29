@@ -149,6 +149,7 @@ fn walk(root: &Path, exclude: &[&str], limits: WalkLimits, hooks: &mut Hooks<'_>
             }
             if size.entries >= limits.max_entries {
                 size.hit_limit = true;
+                size.skip(format!("{}: more than {} entries", relative(root, &dir), limits.max_entries));
                 return Ok(size);
             }
             // Never follows a link: on every platform `DirEntry::metadata`
@@ -394,6 +395,8 @@ mod tests {
         assert!(size.hit_limit);
         assert!(!size.is_complete());
         assert_eq!(size.entries, 5);
+        assert_eq!(size.skipped, 1);
+        assert!(size.first_skip_reason.unwrap().contains("more than 5 entries"));
 
         write(&tmp.path().join("a/b/c/d"), 10);
         let shallow = measure(

@@ -217,9 +217,9 @@ impl PressurePolicy {
 
 /// `percent`% of `total`, rounded down, without overflowing.
 fn share(total: u64, percent: u8) -> u64 {
-    // At most u64::MAX * 255 / 100, which fits in u64 once divided; the
-    // product needs u128.
-    (u128::from(total) * u128::from(percent) / 100) as u64
+    // The product needs u128. A share above 100% of the largest filesystem
+    // does not fit in u64 and saturates.
+    u64::try_from(u128::from(total) * u128::from(percent) / 100).unwrap_or(u64::MAX)
 }
 
 /// One complete measurement.
@@ -316,6 +316,7 @@ mod tests {
         let thresholds = policy.thresholds(u64::MAX);
         assert_eq!(thresholds.warning_below_bytes, u64::MAX / 100 * 15 + 15 * (u64::MAX % 100) / 100);
         assert_eq!(policy.classify(space(u64::MAX, u64::MAX)), DiskPressure::Normal);
+        assert_eq!(share(u64::MAX, 255), u64::MAX, "saturates rather than wrapping");
     }
 
     #[test]
