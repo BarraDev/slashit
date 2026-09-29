@@ -204,7 +204,7 @@ stale='\[G\] src-tauri/src/agents/AGENTS.md:[0-9]+: `ClaudeRunner` names nothing
 probe "cited symbol removed" 1 '\[G\] src-tauri/src/AGENTS.md:[0-9]+: `NullEventSink` names nothing defined' \
   'edit "/^pub struct NullEventSink;$/d" src-tauri/src/events.rs'
 probe "cited symbol renamed" 1 "$stale" "$gone"
-probe "cited enum variant renamed in a dependency crate" 1 '`CreateTask` names nothing defined in crate slashit-ui or its dependency slashit-attention, slashit-ipc' \
+probe "cited enum variant renamed in a dependency crate" 1 '`CreateTask` names nothing defined in crate slashit-ui or its dependency slashit-activity, slashit-attention, slashit-ipc' \
   'edit "s/^    CreateTask {/    NewTask {/" crates/slashit-ipc/src/protocol.rs'
 probe "uncited symbol renamed" 0 'agent-docs: OK' \
   'edit "s/^pub const PROTOCOL_VERSION/pub const WIRE_VERSION/" crates/slashit-ipc/src/protocol.rs'

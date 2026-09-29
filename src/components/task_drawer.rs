@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::components::diff_viewer::DiffViewer;
 use crate::components::new_work_pause::NewWorkPauseNotice;
+use crate::components::task_activity::TaskActivity;
 use crate::components::task_live::{
     format_elapsed, output_provenance, DrawerActions, OutputProvenance, RefreshGate, StartRequest,
 };
@@ -440,6 +441,9 @@ pub fn TaskDrawer(
                     }>
                         <HumanReviewPanel task_id=task_id task=task apply_task=apply_task />
                     </Show>
+
+                    // How the task got here.
+                    <TaskActivity task=task />
 
                     // Output and, where there are any, changes.
                     <section class="space-y-2">

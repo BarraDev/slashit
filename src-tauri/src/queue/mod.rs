@@ -3,6 +3,7 @@ pub mod start_guard;
 pub mod manager;
 pub mod executor;
 pub mod prompt;
+pub mod tool_activity;
 pub mod workflow;
 
 pub use manager::*;

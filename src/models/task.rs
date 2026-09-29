@@ -101,11 +101,28 @@ pub struct Task {
     #[serde(default)]
     pub pr_review_plan: Option<PrReviewPlan>,
 
+    /// Milestones the backend recorded, oldest first. See
+    /// `slashit_activity`; the drawer's timeline reads them together with
+    /// `created_at` and `human_review`.
+    #[serde(default, deserialize_with = "slashit_activity::lenient")]
+    pub activity: Vec<slashit_activity::Entry>,
+
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl Task {
+    /// What happened to the task, oldest first.
+    pub fn timeline(&self) -> Vec<slashit_activity::Item<'_>> {
+        let decisions = self.human_review.entries.iter().map(|e| slashit_activity::Decision {
+            sequence: e.sequence,
+            at: e.decided_at,
+            approved: e.decision == HumanReviewDecision::Approved,
+            feedback: e.feedback.as_deref(),
+        });
+        slashit_activity::timeline(self.created_at, decisions, &self.activity)
+    }
+
     /// Whether the task cannot make progress without the user right now, and
     /// why. The rule is `slashit_attention::Facts::needs_you`, the same one
     /// the backend answers with; this only copies the task's facts into it.

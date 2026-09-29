@@ -129,6 +129,7 @@ pub async fn create_task(
             branch_origin: None,
             cleanup_in_flight: false,
             pr_review_plan: None,
+            activity: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -230,7 +231,9 @@ pub async fn update_task_status(
     let effect = classify_status_transition(&old_status, &status);
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
+            let from = task.status.clone();
             task.status = status.clone();
+            task.record_move(&from);
 
             match effect {
                 StatusTransitionEffect::ResetExecutionState => {
@@ -733,7 +736,9 @@ pub async fn reorder_task(
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if effect != StatusTransitionEffect::None || status_changed {
             if let Some(task) = staged.get_mut(&task_id) {
+                let from = task.status.clone();
                 task.status = target_status.clone();
+                task.record_move(&from);
                 if effect == StatusTransitionEffect::ResetExecutionState {
                     // Worktree and branch preserved; see `StatusTransitionEffect`.
                     task.reset_execution_state();

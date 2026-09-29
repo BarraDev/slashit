@@ -312,6 +312,9 @@ async fn record_pr_failure(state: &crate::AppState, task_id: Uuid, reason: Strin
         if let Some(t) = staged.get_mut(&task_id) {
             if t.status == TaskStatus::HumanReview && t.human_review.is_approved() {
                 t.human_review.pr_error = Some(note.clone());
+                t.record_activity(crate::domain::task::ActivityKind::DeliveryFailed {
+                    reason: note.clone(),
+                });
             }
         }
     };
@@ -384,6 +387,71 @@ mod tests {
             .into_iter()
             .find(|t| t.id == task_id)
             .expect("the task is on disk")
+    }
+
+    /// What the executor does when a run carries the task back into Human
+    /// Review, for tests that do not run one.
+    async fn arrive_again(state: &crate::AppState, task_id: Uuid) {
+        let amend = move |staged: &mut HashMap<Uuid, Task>| {
+            let t = staged.get_mut(&task_id).unwrap();
+            t.status = TaskStatus::HumanReview;
+            t.human_review.record_arrival();
+            let arrival = t.human_review.arrivals;
+            t.record_activity(crate::domain::task::ActivityKind::ReadyForReview { arrival });
+        };
+        crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &amend).await.unwrap();
+    }
+
+    /// Two review cycles, then an approval whose pull request fails twice:
+    /// the timeline read from the task file shows each decision once, in
+    /// order, and the failed deliveries as failures, never as approvals.
+    #[tokio::test]
+    async fn review_cycles_and_delivery_retries_read_truthfully_on_the_timeline() {
+        let (_tmp, state) = test_state().await;
+        let (project_id, task_id) = seed_in_review(&state).await;
+
+        request_changes(&state, task_id, "Also count lines.").await.expect("first request");
+        arrive_again(&state, task_id).await;
+        request_changes(&state, task_id, "And bytes.").await.expect("second request");
+        arrive_again(&state, task_id).await;
+        approve(&state, task_id, false).await.expect("approved");
+        approve(&state, task_id, false).await.expect("approving again changes nothing");
+        record_pr_failure(&state, task_id, "gh: HTTP 422".to_string()).await;
+        record_pr_failure(&state, task_id, "gh: HTTP 422".to_string()).await;
+
+        let task = on_disk(&state, project_id, task_id);
+        let timeline = task_timeline(&task);
+        assert_eq!(
+            timeline,
+            [
+                "Task created",
+                "You requested changes: Also count lines.",
+                "Ready for your review",
+                "You requested changes: And bytes.",
+                "Ready for your review",
+                "You approved the changes",
+                "Pull request not created: gh: HTTP 422",
+                "Pull request not created: gh: HTTP 422",
+            ]
+        );
+        assert!(task.needs_you(false).is_some(), "current state still comes from the record");
+    }
+
+    /// The timeline the drawer shows, one line per row, from the record.
+    fn task_timeline(task: &Task) -> Vec<String> {
+        let decisions = task.human_review.entries.iter().map(|e| slashit_activity::Decision {
+            sequence: e.sequence,
+            at: e.decided_at,
+            approved: e.decision == HumanReviewDecision::Approved,
+            feedback: e.feedback.as_deref(),
+        });
+        slashit_activity::timeline(task.created_at, decisions, &task.activity)
+            .iter()
+            .map(|item| match item.detail() {
+                Some(detail) => format!("{}: {detail}", item.title()),
+                None => item.title(),
+            })
+            .collect()
     }
 
     #[tokio::test]
