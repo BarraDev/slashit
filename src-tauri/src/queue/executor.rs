@@ -593,8 +593,8 @@ impl RunEventDrain {
     /// Only for once nothing more will be sent -- after
     /// [`ClaudeRunner::wait`] has joined the stdout reader -- because the
     /// channel itself stays open as long as the runner does. What is left to
-    /// handle is then only what is already queued, so this never waits on the
-    /// agent. An event the channel dropped because the forwarder fell more than
+    /// handle is then only what is queued when the drain is asked for, so
+    /// this never waits on the agent or on anything still writing. An event the channel dropped because the forwarder fell more than
     /// its capacity behind is lost, and forwarding carries on with the next.
     ///
     /// Two ends drain without the reader joined, and so keep only the calls
@@ -627,14 +627,19 @@ impl RunEventForwarder {
                     Err(RecvError::Closed) => return,
                 },
                 // Asked to drain, or dropped by a run that ended without
-                // asking: handle what is queued and stop.
-                _ = &mut drain => loop {
-                    match events.try_recv() {
-                        Ok(event) => self.handle(event).await,
-                        Err(TryRecvError::Lagged(_)) => {}
-                        Err(TryRecvError::Empty | TryRecvError::Closed) => return,
+                // asking: handle what is queued now and stop. Only what is
+                // queued now, so a writer that outlived the agent's process
+                // cannot keep the drain going.
+                _ = &mut drain => {
+                    for _ in 0..events.len() {
+                        match events.try_recv() {
+                            Ok(event) => self.handle(event).await,
+                            Err(TryRecvError::Lagged(_)) => {}
+                            Err(TryRecvError::Empty | TryRecvError::Closed) => return,
+                        }
                     }
-                },
+                    return;
+                }
             }
         }
     }
