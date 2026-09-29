@@ -36,6 +36,8 @@ use thirtyfour::prelude::*;
 /// ticks every three seconds and the fixture returns immediately, so this is
 /// mostly headroom for a loaded hosted runner.
 const EXECUTION_DEADLINE: Duration = Duration::from_secs(90);
+#[path = "product_acceptance/git_fixture.rs"]
+mod git_fixture;
 #[path = "product_acceptance/human_review.rs"]
 mod human_review;
 #[path = "product_acceptance/local_first.rs"]
@@ -2659,6 +2661,8 @@ fn start_on_the_legacy_auto_placement(config_file: &Path) -> Result<()> {
 struct GitFixture {
     path: PathBuf,
     state_root: PathBuf,
+    /// This fixture's own bare `origin`, if it has one.
+    origin: Option<PathBuf>,
 }
 
 impl GitFixture {
@@ -2693,16 +2697,33 @@ impl GitFixture {
         // recorded locally the way `git clone` leaves it. The product starts
         // every ordinary task branch at `refs/remotes/origin/<default>` and
         // refuses a repository that has none, without ever fetching.
-        let origin = state_root.join("fixture-origin.git");
-        let origin = origin.to_str().context("the origin path is not UTF-8")?;
-        git(path, &["init", "--quiet", "--bare", origin])?;
-        git(path, &["remote", "add", "origin", origin])?;
+        //
+        // Named after this fixture, because a journey can make several in one
+        // state root, and taken with `create_dir`, which fails rather than
+        // hand over a directory somebody already has. A shared origin would
+        // receive every fixture's unrelated `main`, and all but the first
+        // push would be rejected unless the commits happened to be identical.
+        let name = path
+            .file_name()
+            .context("the fixture has no directory name")?
+            .to_str()
+            .context("the fixture's name is not UTF-8")?;
+        if name.ends_with(".origin.git") {
+            bail!("{name} is where another fixture would keep its origin");
+        }
+        let origin = state_root.join(format!("{name}.origin.git"));
+        std::fs::create_dir(&origin)
+            .with_context(|| format!("could not create {}", origin.display()))?;
+        let url = origin.to_str().context("the origin path is not UTF-8")?;
+        git(path, &["init", "--quiet", "--bare", url])?;
+        git(path, &["remote", "add", "origin", url])?;
         git(path, &["push", "--quiet", "origin", "main"])?;
         git(path, &["remote", "set-head", "origin", "main"])?;
 
         Ok(Self {
             path: path.to_path_buf(),
             state_root,
+            origin: Some(origin),
         })
     }
 
