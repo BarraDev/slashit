@@ -209,8 +209,9 @@ pub async fn list_pr_statuses(project_id: String) -> Result<Vec<crate::models::P
 }
 
 /// Ask GitHub about a task's open pull requests now. What follows is what
-/// the background poll would do; the task is never moved off its column or
-/// its work. Answers with the refreshed entries, a failure inside each.
+/// the background poll would do: an open pull request never moves the task
+/// or ends its work, and a merge or closure acts only on a task in a delivery
+/// column. Answers with the refreshed entries, a failure inside each.
 pub async fn refresh_pr_status(task_id: String) -> Result<Vec<crate::models::PrStatusEntry>, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "taskId": task_id })).unwrap();
     let response = invoke("refresh_pr_status", args).await?;

@@ -4656,7 +4656,7 @@ pub async fn refresh_task_pr_state(
     // Same live hole `link_pr_to_task` had before this unit, and the same
     // fix: this is a second, independent place that can write
     // `TaskStatus::PrCreated` (see the `apply` closure below), reachable from
-    // the frontend (`kanban.rs`'s poll/refresh call sites) for any task that
+    // the frontend (`kanban.rs`'s PR-review apply and reply-sync) for any task that
     // already has a `pr_url` -- including one still `InProgress`/`AiReview`
     // with a live owner, since nothing above checks that. Ended under the
     // lease already held, before the write, not a second acquire.
@@ -12269,5 +12269,32 @@ mod activity {
                 ActivityKind::PrMerged { number: 92 },
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod relink {
+    use super::*;
+
+    /// A recorded closure is final to the poll, so a pull request reopened
+    /// on GitHub is picked up again only by linking it again (Create PRs
+    /// rediscovers it by branch): the link records what GitHub says now.
+    #[test]
+    fn linking_a_reopened_pull_request_again_records_it_open() {
+        let mut task = crate::test_helpers::create_test_task("reopened");
+        let url = "https://github.com/o/r/pull/92";
+        apply_pr_link(&mut task, url, Some("CLOSED"));
+
+        apply_pr_link(&mut task, url, Some("OPEN"));
+
+        let states: Vec<_> = task
+            .external_refs
+            .iter()
+            .filter_map(|r| match r {
+                ExternalRef::GithubPr { state, .. } => Some(state.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states, [Some("OPEN")], "one reference, open again");
     }
 }

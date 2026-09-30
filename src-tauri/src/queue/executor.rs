@@ -1214,6 +1214,12 @@ impl TaskExecutor {
         let Some(recorded) = state.as_recorded() else {
             return;
         };
+        // Answers are applied once a whole batch has settled, so a newer
+        // reading may have landed in the meantime, say an open after a
+        // reopen. Only what the cache still says is acted on.
+        if self.pr_statuses.get(key).and_then(|e| e.status).is_some_and(|s| s.state != state) {
+            return;
+        }
         let lifecycle = {
             let tasks = self.tasks.read().await;
             match tasks.get(&task_id) {
@@ -4942,6 +4948,31 @@ mod tests {
             assert_eq!(recorded_pr_state(&after).as_deref(), Some("CLOSED"), "{status:?}");
             assert_eq!(after.status, status, "a closure never moves the task");
             assert_eq!(after.error_message.is_some(), fails, "{status:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answer_a_newer_reading_replaced_is_not_acted_on() {
+        use crate::pr_status::PrState;
+        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program("unused", Duration::from_secs(1)));
+        let (executor, _temps) = test_executor_with_prs(statuses.clone());
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        // The pull request was reopened, and a newer reading says so.
+        statuses.remember(&key, polled_status(PrState::Open));
+        for (status, stale) in [
+            (TaskStatus::PrCreated, PrState::Closed),
+            (TaskStatus::InProgress, PrState::Closed),
+            (TaskStatus::PrCreated, PrState::Merged),
+        ] {
+            let (id, _) = seed_with_pr(&executor, status.clone(), pr_ref("owner/repo", 7, Some("OPEN"))).await;
+
+            executor.apply_polled_pr_state(id, &key, stale).await;
+
+            let after = executor.tasks.read().await[&id].clone();
+            assert_eq!(recorded_pr_state(&after).as_deref(), Some("OPEN"), "{status:?} {stale:?}");
+            assert_eq!(after.status, status, "{stale:?}");
+            assert_eq!(after.error_message, None, "{stale:?}");
         }
     }
 
