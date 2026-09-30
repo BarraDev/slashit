@@ -43,8 +43,8 @@ pub async fn assert_frontend_is_real(driver: &WebDriver) -> Result<()> {
     if url.starts_with(DEV_URL_PREFIX) {
         bail!(
             "the application is loading the Trunk dev server ({url}). This is a plain \
-             `cargo build` binary; acceptance needs `cargo tauri build --debug --no-bundle`, \
-             which enables `custom-protocol` and embeds the frontend."
+             `cargo build` binary; acceptance needs `scripts/build-acceptance-app.sh`, \
+             whose `cargo tauri build` enables `custom-protocol` and embeds the frontend."
         );
     }
     if !(url.starts_with("tauri://") || url.contains("tauri.localhost")) {

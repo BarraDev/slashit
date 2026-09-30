@@ -9,16 +9,17 @@
 //! # Running the journeys
 //!
 //! ```text
-//! cargo tauri build --debug --no-bundle
-//! cargo test -p slashit-acceptance --features run-acceptance
+//! scripts/build-acceptance-app.sh
+//! scripts/run-desktop-acceptance.sh
 //! ```
 //!
 //! The build step is not optional and not something a test should do for you:
 //! a plain `cargo build` produces a binary that loads `devUrl`
 //! ([`DEV_URL_PREFIX`]) and shows a connection-error page unless a Trunk
-//! server happens to be running. `cargo tauri build` enables the
-//! `custom-protocol` feature, which embeds `dist/` and makes the application
-//! load `tauri://localhost` with no server at all.
+//! server happens to be running. The build script runs `cargo tauri build`,
+//! which enables the `custom-protocol` feature, embeds `dist/` and makes the
+//! application load `tauri://localhost` with no server at all. It also strips
+//! the frontend module's `name` section; see [`wasm_names`].
 //! [`ui::assert_frontend_is_real`] asserts that difference rather than
 //! trusting it.
 //!
@@ -53,11 +54,14 @@
 pub mod diagnostics;
 pub mod ports;
 pub mod ui;
+pub mod wasm_names;
 
 // The acceptance runtime. See the platform note above before adding to this
 // list -- anything here is a promise that the platform is implemented.
 #[cfg(target_os = "linux")]
 pub mod context;
+#[cfg(target_os = "linux")]
+pub mod developer_tools;
 #[cfg(target_os = "linux")]
 pub mod driver;
 #[cfg(target_os = "linux")]

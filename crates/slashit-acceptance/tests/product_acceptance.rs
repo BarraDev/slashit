@@ -38,6 +38,8 @@ use thirtyfour::prelude::*;
 const EXECUTION_DEADLINE: Duration = Duration::from_secs(90);
 #[path = "product_acceptance/disk_pressure.rs"]
 mod disk_pressure;
+#[path = "product_acceptance/developer_tools.rs"]
+mod developer_tools;
 #[path = "product_acceptance/git_fixture.rs"]
 mod git_fixture;
 #[path = "product_acceptance/human_review.rs"]

@@ -44,11 +44,14 @@ cargo run -p slashit-ui
 # Validate agent documentation structure (the same check CI runs)
 scripts/check-agent-docs.sh
 
-# Desktop acceptance against the real application (Linux; needs a display and
-# WebKitWebDriver). The build step is required: a plain `cargo build` binary
-# points at localhost:1420 and never loads the embedded frontend.
-cargo tauri build --debug --no-bundle
-cargo test -p slashit-acceptance --features run-acceptance
+# Desktop acceptance against the real application (Linux; needs Xvfb,
+# dbus-run-session, tauri-driver and WebKitWebDriver). Build with the script
+# CI uses: a plain `cargo build` binary never loads the embedded frontend.
+# Journeys run on a private display; --visible uses yours, --exact <name>
+# picks one journey. The harness's own journeys are a separate target.
+scripts/build-acceptance-app.sh
+scripts/run-desktop-acceptance.sh --harness
+scripts/run-desktop-acceptance.sh
 ```
 
 See `crates/slashit-acceptance/README.md` for what the harness guarantees and

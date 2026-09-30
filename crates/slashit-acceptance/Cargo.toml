@@ -10,7 +10,11 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+# Recomputing the Subresource Integrity value Trunk writes for the frontend
+# module, after the acceptance build strips it (src/wasm_names.rs).
+base64 = "0.22"
 serde_json = "1"
+sha2 = "0.10"
 # Default features. Trimming them to `["reqwest", "rustls"]` looks tempting --
 # `manager` can download browser drivers, which this harness never wants -- but
 # it makes every session creation hang until the timeout, and it does not even
@@ -33,11 +37,12 @@ libc = "0.2"
 toml = "0.8"
 
 [features]
-# The acceptance journeys drive the REAL desktop application: they need a
-# `cargo tauri build --debug --no-bundle` binary, a WebKitWebDriver and a
-# graphical session. None of that belongs in a plain `cargo test --workspace`,
-# so the test target below is not even built without this feature. The
-# harness's own unit tests carry no such requirement and always run.
+# The acceptance journeys drive the REAL desktop application: they need the
+# binary scripts/build-acceptance-app.sh builds, a WebKitWebDriver and a
+# display (scripts/run-desktop-acceptance.sh provides a private one). None of
+# that belongs in a plain `cargo test --workspace`, so the test target below
+# is not even built without this feature. The harness's own unit tests carry
+# no such requirement and always run.
 run-acceptance = []
 
 [[test]]

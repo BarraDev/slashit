@@ -175,31 +175,27 @@ jobs:
           cargo install tauri-cli --version "^2.10" --locked
           cargo install tauri-driver --version "^2" --locked
 
-      # Not `cargo build`. That produces a binary pointing at devUrl
-      # (http://localhost:1420) which renders a connection-error page with no
-      # Trunk server running; `cargo tauri build` enables `custom-protocol` and
-      # embeds the frontend. The journeys assert the difference rather than
-      # trusting this comment.
+      # The same script developers run. It is `cargo tauri build --debug
+      # --no-bundle` -- not `cargo build`, whose binary points at devUrl and
+      # embeds no frontend -- with the frontend module's WebAssembly `name`
+      # section removed and a check that no code or data byte changed. The
+      # journeys assert the custom-protocol difference rather than trusting
+      # this comment.
       - name: Build the application under test
-        run: cargo tauri build --debug --no-bundle
+        run: scripts/build-acceptance-app.sh
 
-      # Hosted runners have no display, so the application renders into Xvfb.
+      # Hosted runners have no display; the script starts a private Xvfb and
+      # D-Bus session for the run, exactly as it does on a developer machine.
       # One test at a time: two desktop applications competing for one virtual
       # display buys nothing and makes a failure harder to read.
       - name: Acceptance journeys
-        run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" \
-            cargo test -p slashit-acceptance --features run-acceptance \
-            --test acceptance -- --test-threads=1
+        run: scripts/run-desktop-acceptance.sh --harness
 
       # Run as its own step, not as a second test target in the one above, so
       # the log says which kind of thing broke: the harness's ability to drive
       # the application, or the application's own behaviour.
       - name: Product acceptance journeys
-        run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" \
-            cargo test -p slashit-acceptance --features run-acceptance \
-            --test product_acceptance -- --test-threads=1
+        run: scripts/run-desktop-acceptance.sh
 
       # Only failures leave anything behind: screenshots, page source and the
       # provider log, captured while the application was still alive.

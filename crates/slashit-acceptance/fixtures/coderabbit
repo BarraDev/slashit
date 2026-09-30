@@ -1,0 +1,12 @@
+#!/bin/sh
+# Stands in for a CodeRabbit CLI a developer installed, in the journey that
+# proves the application never reaches one. It reviews nothing. It only
+# leaves evidence that it ran, in the directory it was found in, so the
+# evidence does not depend on any variable the application might not pass on.
+marker="$(dirname "$0")/coderabbit-invoked"
+{
+  echo "pid $$"
+  echo "cwd $PWD"
+  for arg in "$@"; do echo "arg $arg"; done
+} >>"$marker"
+echo "fake coderabbit: no findings"
