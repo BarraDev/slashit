@@ -4551,10 +4551,10 @@ async fn pr_statuses_for_project(
 }
 
 /// Ask GitHub about `task_id`'s open pull requests now, and act on what it
-/// says exactly as the background poll would: a merge finishes the task and
-/// a closure is recorded only where a delivered pull request lives, and an
-/// unchanged state writes nothing. Never moves a task between columns and
-/// never ends the work running on it.
+/// says exactly as the background poll would: a merge finishes the task, and
+/// a closure is explained as its error, only where a delivered pull request
+/// lives, and an unchanged state writes nothing. Never moves a task between
+/// columns and never ends the work running on it.
 ///
 /// Answers with the refreshed cache entries; a failed refresh is in its
 /// entry's `error`, beside the last good status.
@@ -4579,11 +4579,11 @@ pub async fn refresh_pr_status(
             })
             .collect()
     };
-    for key in &keys {
-        if let Ok(status) = state.pr_statuses.refresh(key).await {
-            if let Some(executor) = state.executor.get() {
-                executor.apply_polled_pr_state(task_uuid, key, status.state).await;
-            }
+    // Asked a few at a time, like the poll; applied in order afterwards, each
+    // on its own answer, so a timeout on one never drops another's.
+    for (key, answer) in state.pr_statuses.refresh_each(keys.clone()).await {
+        if let (Ok(status), Some(executor)) = (answer, state.executor.get()) {
+            executor.apply_polled_pr_state(task_uuid, &key, status.state).await;
         }
     }
     Ok(state.pr_statuses.entries_for(keys.iter()))

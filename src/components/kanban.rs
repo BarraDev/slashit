@@ -402,10 +402,14 @@ pub fn Kanban(
             .map(|t| (t.id.to_string(), crate::components::pr_status::open_prs(t)))
             .filter(|(_, keys)| !keys.is_empty())
             .collect();
+        let ticket = board.issue();
         spawn_local(async move {
-            let cached = crate::services::list_pr_statuses(project_id).await.unwrap_or_default();
+            let cached = crate::services::list_pr_statuses(project_id).await;
             let now = chrono::Utc::now();
-            board.replace(cached.clone(), now);
+            if let (Ok(cached), Some(ticket)) = (&cached, ticket) {
+                board.replace(ticket, cached.clone(), now);
+            }
+            let cached = cached.unwrap_or_default();
             let fresh: std::collections::HashSet<crate::models::PrKey> = cached
                 .iter()
                 .filter(|e| !crate::components::pr_status::is_stale(e, now))
@@ -417,9 +421,7 @@ pub fn Kanban(
                     continue;
                 }
                 asked = true;
-                if let Ok(entries) = crate::services::refresh_pr_status(task_id).await {
-                    board.merge(entries, chrono::Utc::now());
-                }
+                let _ = crate::components::pr_status::refresh_task_prs(Some(board), task_id).await;
             }
             // A check may have finished a task whose pull request merged.
             if asked {
@@ -633,6 +635,7 @@ pub fn Kanban(
                             show_pr_candidates_modal=show_pr_candidates_modal
                             pr_candidate_task=pr_candidate_task
                             pr_candidates=pr_candidates
+                            refresh_tasks=refresh_tasks
                             request_close=request_close
                         />
                     }
@@ -1940,6 +1943,8 @@ fn KanbanColumn(
     show_pr_candidates_modal: RwSignal<bool>,
     pr_candidate_task: RwSignal<Option<Task>>,
     pr_candidates: RwSignal<Vec<PrCandidate>>,
+    /// Read the task list again, after something may have changed a task.
+    refresh_tasks: Callback<()>,
     /// Ask for confirmation before a card leaves Human Review for Done.
     request_close: Callback<(String, i32)>,
 ) -> impl IntoView {
@@ -2258,6 +2263,7 @@ fn KanbanColumn(
                                                 show_pr_candidates_modal=show_pr_candidates_modal
                                                 pr_candidate_task=pr_candidate_task
                                                 pr_candidates=pr_candidates
+                                                refresh_tasks=refresh_tasks
                                             />
                                         }
                                     }).collect::<Vec<_>>()}
@@ -2315,6 +2321,8 @@ fn KanbanTaskCard(
     show_pr_candidates_modal: RwSignal<bool>,
     pr_candidate_task: RwSignal<Option<Task>>,
     pr_candidates: RwSignal<Vec<PrCandidate>>,
+    /// Read the task list again, after something may have changed a task.
+    refresh_tasks: Callback<()>,
 ) -> impl IntoView {
     let task_for_click = task.clone();
     let task_for_context = task.clone();
@@ -2735,24 +2743,16 @@ fn KanbanTaskCard(
                                             on:click=move |e: web_sys::MouseEvent| {
                                                 e.stop_propagation();
                                                 let task_id = task_for_refresh.id.to_string();
+                                                // Observation only, like the drawer's Refresh: the
+                                                // backend acts on the answer as its poll would, and
+                                                // the task list is read again for anything that did.
                                                 spawn_local(async move {
-                                                    let result = refresh_task_pr_state(task_id).await;
-                                                    if let Some(board) = pr_board {
-                                                        board.reload();
-                                                    }
-                                                    match result {
-                                                        Ok(Some(updated)) => {
-                                                            let new_status = updated.status.clone();
-                                                            on_pr_created.run(updated);
-                                                            if matches!(new_status, TaskStatus::Done) {
-                                                                toast::success("PR merged — moved to Done".to_string());
-                                                            } else {
-                                                                toast::info("PR state refreshed".to_string());
-                                                            }
-                                                        }
-                                                        Ok(None) => {}
+                                                    let refreshed = crate::components::pr_status::refresh_task_prs(pr_board, task_id).await;
+                                                    match refreshed.as_deref().map_err(String::clone).and_then(crate::components::pr_status::refresh_outcome) {
+                                                        Ok(said) => toast::info(said.to_string()),
                                                         Err(e) => toast::error(format!("Failed to refresh PR: {}", e)),
                                                     }
+                                                    refresh_tasks.try_run(());
                                                 });
                                             }
                                             data-testid="task-card-pr-refresh"

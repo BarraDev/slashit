@@ -109,13 +109,18 @@ async fn follow_the_checks(driver: &WebDriver, gh: &FakeGh, repository: &GitFixt
         bail!("the drawer names the failing checks {names:?}, expected only \"unit tests\"");
     }
 
-    // The checks pass on a new push. The card's own Refresh shows it.
+    // The checks pass on a new push. The card's own Refresh shows it, from
+    // a column that is not waiting on the pull request: Refresh observes, and
+    // must not move the task to PR Created or otherwise take it back.
     gh.script_pr_view(&passing())?;
     close_drawer(driver).await?;
+    ui::invoke(driver, "update_task_status", json!({ "taskId": task_id, "status": "backlog" })).await?;
     let asked = gh.view_count()?;
     click(
         driver,
-        &format!("[data-card-task-id=\"{task_id}\"] [data-testid=\"task-card-pr-refresh\"]"),
+        // Found in the Backlog column, so the board has redrawn the card
+        // there before it is pressed.
+        &format!("{BACKLOG_COLUMN} [data-card-task-id=\"{task_id}\"] [data-testid=\"task-card-pr-refresh\"]"),
         "the card's Refresh",
     )
     .await?;
@@ -127,12 +132,11 @@ async fn follow_the_checks(driver: &WebDriver, gh: &FakeGh, repository: &GitFixt
         bail!("the drawer still names a failing check after the checks passed");
     }
 
-    // Refreshing is not a change to the task: its column and its recorded
-    // state are what they were.
+    // Refreshing is not a change to the task: its column is what it was.
     let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
     let task = find_task(&listed, &task_id).context("the task disappeared")?;
-    if status_of(&task) != Some("pr_created") {
-        bail!("refreshing moved the task to {:?}", status_of(&task));
+    if status_of(&task) != Some("backlog") {
+        bail!("the card's Refresh moved the task to {:?}", status_of(&task));
     }
     Ok(())
 }

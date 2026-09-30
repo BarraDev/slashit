@@ -26,9 +26,14 @@ use std::time::Duration;
 /// Measured against GitHub on the development machine, the status query
 /// takes about 1.3 s warm and took 9.8 s once, cold. Twenty seconds is about
 /// twice that worst case, so a single slow answer is not mistaken for a hang.
-/// The executor asks about a few pull requests at a time, so a pass with
-/// hung `gh` processes is held up for at most this long per batch.
+/// Several pull requests are asked about at a time (see [`CONCURRENCY`]), so
+/// a pass with hung `gh` processes is held up for at most this long per
+/// batch.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How many pull requests [`PrStatuses::refresh_each`] asks about at once, for
+/// the background poll and an explicit refresh alike.
+pub const CONCURRENCY: usize = 4;
 
 /// How many failing check names a status keeps. The drawer shows these and
 /// summarizes the rest as a count.
@@ -95,10 +100,6 @@ impl PrState {
             Self::Merged => Some("MERGED"),
             Self::Unknown => None,
         }
-    }
-
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Merged | Self::Closed)
     }
 }
 
@@ -378,6 +379,20 @@ impl PrStatuses {
         result
     }
 
+    /// [`Self::refresh`] each of `keys`, [`CONCURRENCY`] at a time, answering
+    /// in `keys`' order.
+    ///
+    /// Each is its own attempt, with its own timeout and its own cache entry,
+    /// so one that hangs or fails holds up a single slot and never takes a
+    /// sibling's answer with it.
+    pub async fn refresh_each(&self, keys: Vec<PrKey>) -> Vec<(PrKey, Result<PrStatus, PrFetchError>)> {
+        in_order_bounded(keys, CONCURRENCY, |key| async move {
+            let answer = self.refresh(&key).await;
+            (key, answer)
+        })
+        .await
+    }
+
     /// The cached entry for `key`, without asking anyone.
     pub fn get(&self, key: &PrKey) -> Option<PrStatusEntry> {
         self.entries.read().unwrap_or_else(|e| e.into_inner()).get(key).cloned()
@@ -528,6 +543,17 @@ async fn run_bounded(program: &OsString, args: &[&str], timeout: Duration) -> Re
             ))
         }
     }
+}
+
+/// Run `work` on each of `items`, at most `limit` at once, and answer in
+/// `items`' order however they finish.
+async fn in_order_bounded<I, F, Fut>(items: Vec<I>, limit: usize, work: F) -> Vec<Fut::Output>
+where
+    F: FnMut(I) -> Fut,
+    Fut: std::future::Future,
+{
+    use futures::StreamExt;
+    futures::stream::iter(items).map(work).buffered(limit).collect().await
 }
 
 #[cfg(test)]
@@ -791,6 +817,30 @@ mod tests {
         assert_eq!(cache.entries_for([&key, &key, &PrKey::new("o/r", 3)]).len(), 1);
     }
 
+    #[tokio::test]
+    async fn refreshes_overlap_up_to_the_limit_and_answer_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let running = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        let answers = in_order_bounded((0..10).collect(), CONCURRENCY, |i: usize| {
+            let (running, most) = (&running, &most);
+            async move {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                // Later items finish first, so finishing order is not input
+                // order.
+                for _ in 0..(10 - i) {
+                    tokio::task::yield_now().await;
+                }
+                running.fetch_sub(1, Ordering::SeqCst);
+                i
+            }
+        })
+        .await;
+        assert_eq!(answers, (0..10).collect::<Vec<_>>());
+        assert_eq!(most.load(Ordering::SeqCst), CONCURRENCY, "overlapping, and never more than the limit");
+    }
+
     #[cfg(unix)]
     mod process {
         use super::super::*;
@@ -831,6 +881,34 @@ mod tests {
             assert_eq!(statuses.get(&key).unwrap().status, Some(status));
             let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
             assert_eq!(args.trim(), format!("pr view 42 --repo owner/repo --json {FIELDS}"));
+        }
+
+        #[tokio::test]
+        async fn refreshing_several_asks_at_once_and_keeps_every_answer() {
+            let dir = tempfile::tempdir().unwrap();
+            // #1 and #2 each answer only once the other has been asked, so
+            // asking one after the other would time both out. #3 hangs.
+            let gh = script(
+                dir.path(),
+                r#"d="$(dirname "$0")"; touch "$d/asked-$3"
+case "$3" in
+1) while [ ! -e "$d/asked-2" ]; do sleep 0.05; done; echo 'HTTP 404: Not Found' >&2; exit 1 ;;
+2) while [ ! -e "$d/asked-1" ]; do sleep 0.05; done; printf '{"state":"OPEN","statusCheckRollup":[],"reviewDecision":"","mergeable":"MERGEABLE"}' ;;
+*) sleep 300 ;;
+esac"#,
+            );
+            let statuses = PrStatuses::with_program(gh, Duration::from_secs(3));
+            let keys: Vec<PrKey> = (1..=3).map(|n| PrKey::new("o/r", n)).collect();
+
+            let answers = statuses.refresh_each(keys.clone()).await;
+
+            assert_eq!(answers.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), keys, "answered in order");
+            assert!(answers[0].1.is_err());
+            assert_eq!(answers[1].1.as_ref().map(|s| s.state), Ok(PrState::Open));
+            assert_eq!(answers[2].1.as_ref().map_err(|e| e.kind), Err(PrFetchErrorKind::Timeout));
+            assert!(statuses.get(&keys[0]).unwrap().error.is_some());
+            assert!(statuses.get(&keys[1]).unwrap().status.is_some(), "a sibling's failure keeps this answer");
+            assert_eq!(statuses.get(&keys[2]).unwrap().error.map(|e| e.kind), Some(PrFetchErrorKind::Timeout));
         }
 
         #[tokio::test]

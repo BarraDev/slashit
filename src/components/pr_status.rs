@@ -25,9 +25,14 @@ use crate::services::{list_pr_statuses, refresh_pr_status};
 pub const STALE_AFTER_SECONDS: i64 = 120;
 
 /// The board's copy of the backend cache, for one project.
+///
+/// Every write goes through [`WriteOrder`]: the periodic reload of the whole
+/// cache and each explicit Refresh overlap, and an answer that arrives late
+/// must not put back what a newer one replaced.
 #[derive(Clone, Copy)]
 pub struct PrStatusBoard {
     entries: RwSignal<HashMap<PrKey, ShownPr>>,
+    order: StoredValue<WriteOrder>,
     project_id: StoredValue<String>,
 }
 
@@ -41,10 +46,21 @@ pub struct ShownPr {
     pub stale: bool,
 }
 
+impl ShownPr {
+    fn at(entry: PrStatusEntry, now: DateTime<Utc>) -> Self {
+        let stale = is_stale(&entry, now);
+        Self { entry, stale }
+    }
+}
+
 impl PrStatusBoard {
     /// Provide an empty board for `project_id`.
     pub fn provide(project_id: String) -> Self {
-        let board = Self { entries: RwSignal::new(HashMap::new()), project_id: StoredValue::new(project_id) };
+        let board = Self {
+            entries: RwSignal::new(HashMap::new()),
+            order: StoredValue::new(WriteOrder::default()),
+            project_id: StoredValue::new(project_id),
+        };
         provide_context(board);
         board
     }
@@ -58,6 +74,13 @@ impl PrStatusBoard {
         self.entries.with(|m| m.get(key).cloned())
     }
 
+    /// A ticket for a request about to be sent, whose answer is then given
+    /// to [`Self::replace`] or [`Self::merge`]. Taken before the request, so
+    /// the answer is ordered by when it was asked.
+    pub fn issue(self) -> Option<u64> {
+        self.order.try_update_value(WriteOrder::issue)
+    }
+
     /// Read the backend cache again. Memory only on the backend side.
     pub fn reload(self) {
         let Some(project_id) = self.project_id.try_get_value() else {
@@ -66,40 +89,172 @@ impl PrStatusBoard {
         if project_id.is_empty() {
             return;
         }
+        let Some(ticket) = self.issue() else {
+            return;
+        };
         spawn_local(async move {
             if let Ok(entries) = list_pr_statuses(project_id).await {
-                self.replace(entries, Utc::now());
+                self.replace(ticket, entries, Utc::now());
             }
         });
     }
 
-    /// Take `entries` as the whole picture, publishing only a real change.
-    pub fn replace(self, entries: Vec<PrStatusEntry>, now: DateTime<Utc>) {
-        let next: HashMap<PrKey, ShownPr> = entries
-            .into_iter()
-            .map(|entry| {
-                let stale = is_stale(&entry, now);
-                (entry.key(), ShownPr { entry, stale })
-            })
-            .collect();
-        if self.entries.try_with_untracked(|current| *current != next) == Some(true) {
+    /// Take `entries`, the answer to `ticket`, as the whole cache.
+    pub fn replace(self, ticket: u64, entries: Vec<PrStatusEntry>, now: DateTime<Utc>) {
+        self.write(|order, current| order.replace(ticket, current, entries, now));
+    }
+
+    /// Take `entries`, the answer to `ticket`, as some of the cache.
+    pub fn merge(self, ticket: u64, entries: Vec<PrStatusEntry>, now: DateTime<Utc>) {
+        self.write(|order, current| order.merge(ticket, current, entries, now));
+    }
+
+    /// Publish what `write` makes of the board, only if it is a real change.
+    fn write(self, write: impl FnOnce(&mut WriteOrder, &HashMap<PrKey, ShownPr>) -> HashMap<PrKey, ShownPr>) {
+        let Some(current) = self.entries.try_get_untracked() else {
+            return;
+        };
+        let Some(next) = self.order.try_update_value(|order| write(order, &current)) else {
+            return;
+        };
+        if next != current {
             self.entries.try_set(next);
         }
     }
+}
 
-    /// Take `entries` as newer than what the board has, publishing only a
-    /// real change.
-    pub fn merge(self, entries: Vec<PrStatusEntry>, now: DateTime<Utc>) {
-        let Some(mut next) = self.entries.try_get_untracked() else {
-            return;
-        };
+/// Ask GitHub about `task_id`'s open pull requests now and show the answer on
+/// `board`. Observation only: the backend acts on it exactly as its
+/// background poll would, and never moves the task or ends its work.
+///
+/// Answers with the refreshed entries; a pull request GitHub could not be
+/// asked about has its reason in its entry's `error`.
+pub async fn refresh_task_prs(board: Option<PrStatusBoard>, task_id: String) -> Result<Vec<PrStatusEntry>, String> {
+    let ticket = board.and_then(PrStatusBoard::issue);
+    let entries = refresh_pr_status(task_id).await?;
+    if let (Some(board), Some(ticket)) = (board, ticket) {
+        board.merge(ticket, entries.clone(), Utc::now());
+    }
+    Ok(entries)
+}
+
+/// What a Refresh that answered `entries` tells the person who pressed it.
+pub fn refresh_outcome(entries: &[PrStatusEntry]) -> Result<&'static str, String> {
+    if let Some(error) = entries.iter().find_map(|e| e.error.as_ref()) {
+        return Err(error.message.clone());
+    }
+    Ok(if entries.is_empty() { "No open pull request to refresh" } else { "PR state refreshed" })
+}
+
+/// Orders the answers written to the board.
+///
+/// Two things are ordered, each by what can actually tell:
+///
+/// - Which reading of a pull request is newer is the backend's to say. Its
+///   cache never stores an older attempt over a newer one, so an entry with
+///   a later `attempted_at` is newer whenever it was asked for, and one with
+///   an earlier one is older, even in the answer to a later request.
+/// - Whether a pull request is on the board at all is said by the answers
+///   themselves: a full snapshot that leaves one out removes it, and any
+///   answer that includes one keeps it. Those are ordered by ticket, taken
+///   when the request was sent, so a snapshot asked for before a newer
+///   answer spoke about a pull request neither removes it nor brings back
+///   one that newer answer removed.
+///
+/// A ticket orders when a request was sent, not when the backend read its
+/// cache. So a pull request's very first reading, from a Refresh sent just
+/// before a reload that read the cache before that reading landed, can be
+/// removed by the reload's answer; the next reload shows it again.
+#[derive(Debug, Default)]
+pub struct WriteOrder {
+    issued: u64,
+    /// For each pull request any answer has spoken about, the latest ticket
+    /// among them, including one that removed it.
+    spoken: HashMap<PrKey, u64>,
+}
+
+impl WriteOrder {
+    pub fn issue(&mut self) -> u64 {
+        self.issued += 1;
+        self.issued
+    }
+
+    /// Whether the answer to `ticket` is the latest word on whether `key` is
+    /// on the board; if so, it becomes that.
+    fn speaks(&mut self, key: &PrKey, ticket: u64) -> bool {
+        let spoken = self.spoken.entry(key.clone()).or_default();
+        let latest = ticket > *spoken;
+        *spoken = (*spoken).max(ticket);
+        latest
+    }
+
+    /// The board after `entries`, the answer to `ticket`, which is the whole
+    /// cache.
+    pub fn replace(
+        &mut self,
+        ticket: u64,
+        current: &HashMap<PrKey, ShownPr>,
+        entries: Vec<PrStatusEntry>,
+        now: DateTime<Utc>,
+    ) -> HashMap<PrKey, ShownPr> {
+        let mut incoming: HashMap<PrKey, PrStatusEntry> = entries.into_iter().map(|e| (e.key(), e)).collect();
+        let mut next = HashMap::new();
+        for (key, shown) in current {
+            match incoming.remove(key) {
+                Some(entry) => {
+                    self.speaks(key, ticket);
+                    next.insert(key.clone(), newer(shown, entry, now));
+                }
+                // Left out: removed, unless a later answer has spoken about it.
+                None => {
+                    if !self.speaks(key, ticket) {
+                        next.insert(key.clone(), ShownPr::at(shown.entry.clone(), now));
+                    }
+                }
+            }
+        }
+        for (key, entry) in incoming {
+            // New to the board: added, unless a later answer removed it.
+            if self.speaks(&key, ticket) {
+                next.insert(key, ShownPr::at(entry, now));
+            }
+        }
+        next
+    }
+
+    /// The board after `entries`, the answer to `ticket`, which is some of
+    /// the cache.
+    pub fn merge(
+        &mut self,
+        ticket: u64,
+        current: &HashMap<PrKey, ShownPr>,
+        entries: Vec<PrStatusEntry>,
+        now: DateTime<Utc>,
+    ) -> HashMap<PrKey, ShownPr> {
+        let mut next = current.clone();
         for entry in entries {
-            let stale = is_stale(&entry, now);
-            next.insert(entry.key(), ShownPr { entry, stale });
+            let key = entry.key();
+            let latest = self.speaks(&key, ticket);
+            match current.get(&key) {
+                Some(shown) => {
+                    next.insert(key, newer(shown, entry, now));
+                }
+                None if latest => {
+                    next.insert(key, ShownPr::at(entry, now));
+                }
+                None => {}
+            }
         }
-        if self.entries.try_with_untracked(|current| *current != next) == Some(true) {
-            self.entries.try_set(next);
-        }
+        next
+    }
+}
+
+/// Whichever of what is shown and `entry` the backend read later.
+fn newer(shown: &ShownPr, entry: PrStatusEntry, now: DateTime<Utc>) -> ShownPr {
+    if entry.attempted_at > shown.entry.attempted_at {
+        ShownPr::at(entry, now)
+    } else {
+        ShownPr::at(shown.entry.clone(), now)
     }
 }
 
@@ -420,13 +575,8 @@ pub fn PullRequestSection(
         }
         refreshing.set(true);
         spawn_local(async move {
-            match refresh_pr_status(task_id.to_string()).await {
-                Ok(entries) => {
-                    if let Some(board) = board {
-                        board.merge(entries, Utc::now());
-                    }
-                }
-                Err(e) => toast::error(format!("Could not refresh the pull request: {e}")),
+            if let Err(e) = refresh_task_prs(board, task_id.to_string()).await {
+                toast::error(format!("Could not refresh the pull request: {e}"));
             }
             refresh_tasks.try_run(());
             refreshing.try_set(false);
@@ -583,6 +733,99 @@ mod tests {
             attempted_at: at(fetched.unwrap_or(0)),
             error: error.then(|| PrFetchError { kind: PrFetchErrorKind::Failed, message: "GitHub is down".to_string() }),
         }
+    }
+
+    /// Pull request `number`, as the backend read it at `read`, with `checks`.
+    fn read(number: u32, read: i64, checks: ChecksState) -> PrStatusEntry {
+        PrStatusEntry { number, ..entry(Some(status(checks, None, None)), Some(read), false) }
+    }
+
+    fn checks_of(board: &HashMap<PrKey, ShownPr>, number: u32) -> Option<ChecksState> {
+        board
+            .get(&PrKey { repo: "o/r".to_string(), number })
+            .and_then(|s| s.entry.status.as_ref())
+            .map(|s| s.checks)
+    }
+
+    #[test]
+    fn a_reload_answered_after_a_newer_refresh_does_not_undo_it() {
+        let mut order = WriteOrder::default();
+        let now = at(100);
+        let first = order.issue();
+        let board = order.replace(first, &HashMap::new(), vec![read(1, 0, ChecksState::Pending)], now);
+
+        // 1. The periodic reload is sent.
+        let reload = order.issue();
+        // 2. A Refresh is sent after it and answered first, with a newer
+        //    reading of #1 and #2, which the cache did not have yet.
+        let refresh = order.issue();
+        let board = order.merge(
+            refresh,
+            &board,
+            vec![read(1, 50, ChecksState::Failing), read(2, 50, ChecksState::Passing)],
+            now,
+        );
+        // 3. The reload arrives with the cache as it was before the Refresh.
+        let board = order.replace(reload, &board, vec![read(1, 0, ChecksState::Pending)], now);
+
+        // 4. The Refresh's answer is still what the board shows.
+        assert_eq!(checks_of(&board, 1), Some(ChecksState::Failing), "an older value does not replace a newer one");
+        assert_eq!(checks_of(&board, 2), Some(ChecksState::Passing), "an older snapshot does not remove a newer key");
+    }
+
+    #[test]
+    fn a_reload_sent_during_a_refresh_does_not_undo_it_either() {
+        let mut order = WriteOrder::default();
+        let now = at(100);
+        let first = order.issue();
+        let board = order.replace(first, &HashMap::new(), vec![read(1, 0, ChecksState::Pending)], now);
+
+        // The Refresh is sent first; the reload after it, but it reads the
+        // cache before the Refresh's answer lands there.
+        let refresh = order.issue();
+        let reload = order.issue();
+        let board = order.merge(refresh, &board, vec![read(1, 50, ChecksState::Failing)], now);
+        let board = order.replace(reload, &board, vec![read(1, 0, ChecksState::Pending)], now);
+        assert_eq!(checks_of(&board, 1), Some(ChecksState::Failing), "the backend's reading time decides");
+
+        // Answered in the other order, the Refresh's newer reading still wins.
+        let refresh = order.issue();
+        let reload = order.issue();
+        let board = order.replace(reload, &board, vec![read(1, 50, ChecksState::Failing)], now);
+        let board = order.merge(refresh, &board, vec![read(1, 80, ChecksState::Passing)], now);
+        assert_eq!(checks_of(&board, 1), Some(ChecksState::Passing));
+    }
+
+    #[test]
+    fn which_pull_requests_are_on_the_board_follows_the_latest_answer() {
+        let mut order = WriteOrder::default();
+        let now = at(100);
+        // Sent first, answered last.
+        let late = order.issue();
+        let first = order.issue();
+        let board = order.replace(first, &HashMap::new(), vec![read(1, 0, ChecksState::Pending)], now);
+        // Since then #1 was unlinked and #2 linked.
+        let later = order.issue();
+        let board = order.replace(later, &board, vec![read(2, 10, ChecksState::Passing)], now);
+        assert_eq!((checks_of(&board, 1), checks_of(&board, 2)), (None, Some(ChecksState::Passing)));
+
+        let board = order.replace(late, &board, vec![read(1, 0, ChecksState::Pending)], now);
+        assert_eq!(checks_of(&board, 1), None, "a late snapshot does not bring back what a newer one removed");
+        assert_eq!(checks_of(&board, 2), Some(ChecksState::Passing), "nor remove what a newer one added");
+        let board = order.merge(late, &board, vec![read(1, 90, ChecksState::Failing)], now);
+        assert_eq!(checks_of(&board, 1), None, "nor does a late Refresh answer");
+
+        let newest = order.issue();
+        let board = order.merge(newest, &board, vec![read(1, 95, ChecksState::Failing)], now);
+        assert_eq!(checks_of(&board, 1), Some(ChecksState::Failing), "a newer answer does");
+    }
+
+    #[test]
+    fn a_refresh_says_whether_github_answered() {
+        assert_eq!(refresh_outcome(&[]), Ok("No open pull request to refresh"));
+        assert_eq!(refresh_outcome(&[read(1, 0, ChecksState::Passing)]), Ok("PR state refreshed"));
+        let failed = entry(Some(status(ChecksState::Passing, None, None)), Some(0), true);
+        assert_eq!(refresh_outcome(&[read(2, 0, ChecksState::Passing), failed]), Err("GitHub is down".to_string()));
     }
 
     #[test]
