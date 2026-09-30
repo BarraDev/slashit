@@ -876,7 +876,9 @@ pub async fn triage_pr_comments(
 /// skip a comment that now says something different, believing it already
 /// addressed. `comments` (the freshly-fetched set for this analysis) is
 /// checked for each matched id and the merge is skipped when its
-/// `updated_at` is newer than the apply the prior lifecycle came from.
+/// `updated_at` is newer than the apply the prior lifecycle came from --
+/// except `fix_uncommitted`, which describes the checkout rather than the
+/// comment and is always carried.
 fn carry_forward_reanalysis_lifecycle(
     items: &mut [PrReviewItem],
     prior_items: &[PrReviewItem],
@@ -886,6 +888,13 @@ fn carry_forward_reanalysis_lifecycle(
     for item in items.iter_mut() {
         let Some(cid) = item.comment_id else { continue; };
         let Some(prev_item) = prior_items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
+
+        // An undelivered fix is a fact about the checkout, not about the
+        // comment's wording, so it survives an edit: dropping it would let
+        // `backfill_lifecycle_from_last_apply` restore `fix_done` without
+        // it, and a reply would then call a fix that was never pushed
+        // delivered (see #79).
+        if prev_item.fix_uncommitted { item.fix_uncommitted = true; }
 
         // GitHub's `updated_at` has whole-second precision; `applied_at`
         // (from `chrono::Utc::now()`) almost never does. Comparing them
@@ -908,7 +917,6 @@ fn carry_forward_reanalysis_lifecycle(
         }
 
         if prev_item.fix_done { item.fix_done = true; }
-        if prev_item.fix_uncommitted { item.fix_uncommitted = true; }
         if prev_item.reply_posted { item.reply_posted = true; }
         if item.last_error.is_none() { item.last_error = prev_item.last_error.clone(); }
         if item.last_agent_summary.is_none() { item.last_agent_summary = prev_item.last_agent_summary.clone(); }
@@ -1112,9 +1120,12 @@ pub async fn address_pr_review(
 ///
 /// Each approved Fix item is sent to claude in its own invocation, so a single
 /// max-turns blowout no longer wipes the whole batch. Failures are recorded
-/// per-item; subsequent items still run. Push and replies only happen if at
-/// least one item succeeded, and nothing is committed or pushed when any
-/// item's fix failed.
+/// per-item; subsequent items still run. Push only happens if at least one
+/// item succeeded, and nothing is committed or pushed when any item's fix
+/// failed. A reply is posted only after its item's fix has actually reached
+/// the pull request -- committed and, when a push was needed, pushed too --
+/// which this function only knows once the commit and push above have both
+/// resolved; see the reply delivery pass near the end (#79).
 pub async fn address_pr_review_inner(
     task: Task,
     working_dir: String,
@@ -1314,53 +1325,12 @@ pub async fn address_pr_review_inner(
         }
 
         // A cancellation that arrived while this item's fix ran (or after
-        // it) ends the flow here: no reply is begun on its behalf. The fix
-        // itself is already recorded above, so a later apply only owes the
-        // reply.
+        // it) ends the flow here: no further fix agent runs. Its reply is
+        // posted in the delivery pass below, which itself declines to run
+        // while cancelled (see `cancelled` there) — so a later apply owes it
+        // instead.
         if *cancel_rx.borrow() {
             break;
-        }
-
-        // --- Reply step (only if enabled and not yet posted) -----------------
-        if options.auto_reply && !item.reply_posted {
-            let item_for_body = &updated_plan.items[orig_idx];
-            let body = build_reply_body(item_for_body);
-            progress(PrReviewProgress {
-                task_id: task_id_str.clone(),
-                kind: "reply_started".to_string(),
-                current: Some(current),
-                total: Some(total),
-                comment_id: item.comment_id,
-                message: None,
-            });
-            match post_pr_reply(&reply_repo, &reply_number, item.comment_id, &body).await {
-                Ok(reply_id) => {
-                    replies_posted += 1;
-                    updated_plan.items[orig_idx].reply_posted = true;
-                    if reply_id.is_some() {
-                        updated_plan.items[orig_idx].reply_comment_id = reply_id;
-                    }
-                    progress(PrReviewProgress {
-                        task_id: task_id_str.clone(),
-                        kind: "reply_done".to_string(),
-                        current: Some(current),
-                        total: Some(total),
-                        comment_id: item.comment_id,
-                        message: None,
-                    });
-                }
-                Err(e) => {
-                    reply_errors.push(format!("comment {}: {}", label, e));
-                    progress(PrReviewProgress {
-                        task_id: task_id_str.clone(),
-                        kind: "reply_failed".to_string(),
-                        current: Some(current),
-                        total: Some(total),
-                        comment_id: item.comment_id,
-                        message: Some(e),
-                    });
-                }
-            }
         }
     }
 
@@ -1378,12 +1348,13 @@ pub async fn address_pr_review_inner(
     // has begun is waited on, bounded, like every other owner-ending path.
     let cancelled = *cancel_rx.borrow();
 
-    // The approved fixes on disk that no commit records yet: the ones this
-    // apply made, and any an earlier apply made whose commit failed or was
-    // cancelled (`fix_uncommitted`). Fixes an earlier apply committed are
-    // not among them, so they are never committed again, and nothing is
-    // committed when this set is empty. The replies note counts only the
-    // posted replies of these.
+    // The approved fixes not yet delivered (`fix_uncommitted`): the ones this
+    // apply made, and any an earlier apply made whose commit or push failed,
+    // was cancelled, or was withheld. Those an earlier apply already
+    // committed are recommitted as nothing new, and only pushed; fixes
+    // already delivered are not among them, and nothing is committed or
+    // pushed when this set is empty. The replies note counts only the posted
+    // replies of these.
     let uncommitted: Vec<usize> = updated_plan.items.iter().enumerate()
         .filter(|(_, i)| {
             i.approved && matches!(i.decision, PrReviewDecision::Fix) && i.fix_done && i.fix_uncommitted
@@ -1451,11 +1422,7 @@ pub async fn address_pr_review_inner(
                  commit and push them.{unpushed_replies_note}"
             )
         };
-        if committed.is_ok() {
-            for &idx in &uncommitted {
-                updated_plan.items[idx].fix_uncommitted = false;
-            }
-        }
+        let committed_ok = committed.is_ok();
         let needs_push = match committed {
             Ok(crate::worktree::CheckoutCommit::Committed { .. }) => true,
             Ok(crate::worktree::CheckoutCommit::NothingToCommit) => {
@@ -1509,6 +1476,84 @@ pub async fn address_pr_review_inner(
                         current: None,
                         total: None,
                         comment_id: None,
+                        message: Some(e),
+                    });
+                }
+            }
+        }
+
+        // A fix only counts as delivered -- safe to reply "fixed" about --
+        // once it is committed and, if this apply needed to push it, the
+        // push succeeded. `needs_push` is false when the commit found
+        // nothing new and the branch is where `origin` was last seen: the
+        // fixes are already on `origin`. See #79: a reply
+        // must never precede the content it describes reaching the remote
+        // the pull request reads.
+        if committed_ok && (!needs_push || pushed) {
+            for &idx in &uncommitted {
+                updated_plan.items[idx].fix_uncommitted = false;
+            }
+        }
+    }
+
+    // --- Reply delivery pass ----------------------------------------------
+    //
+    // Runs once, after every commit and push this apply is going to attempt
+    // has already resolved, over every approved item -- not just the ones
+    // this apply fixed -- so it also posts the reply an earlier apply left
+    // owing once its fix is finally delivered. `reply_posted` makes it
+    // idempotent across applies; `fix_uncommitted` is what makes it
+    // truthful: an item stays excluded for as long as its fix sits only in
+    // this apply's failed or withheld commit, or an earlier apply's, and is
+    // picked up the first time a later apply actually delivers it. Disabled
+    // for a dry run (no real side effects) and when this flow was cancelled
+    // before its commit (the same `cancelled` the commit and push above
+    // follow). Because an item still owing delivery is not in
+    // `reply_errors`, `backfill_lifecycle_from_last_apply` must not read
+    // its absence there as a posted reply; it skips `fix_uncommitted` items.
+    if options.auto_reply && !options.dry_run && !cancelled {
+        for (loop_idx, &orig_idx) in approved_indices.iter().enumerate() {
+            let item = updated_plan.items[orig_idx].clone();
+            if item.reply_posted || !item.fix_done || item.fix_uncommitted {
+                continue;
+            }
+            let current = loop_idx + 1;
+            let label = item.comment_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "<none>".to_string());
+            let body = build_reply_body(&item);
+            progress(PrReviewProgress {
+                task_id: task_id_str.clone(),
+                kind: "reply_started".to_string(),
+                current: Some(current),
+                total: Some(total),
+                comment_id: item.comment_id,
+                message: None,
+            });
+            match post_pr_reply(&reply_repo, &reply_number, item.comment_id, &body).await {
+                Ok(reply_id) => {
+                    replies_posted += 1;
+                    updated_plan.items[orig_idx].reply_posted = true;
+                    if reply_id.is_some() {
+                        updated_plan.items[orig_idx].reply_comment_id = reply_id;
+                    }
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "reply_done".to_string(),
+                        current: Some(current),
+                        total: Some(total),
+                        comment_id: item.comment_id,
+                        message: None,
+                    });
+                }
+                Err(e) => {
+                    reply_errors.push(format!("comment {}: {}", label, e));
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "reply_failed".to_string(),
+                        current: Some(current),
+                        total: Some(total),
+                        comment_id: item.comment_id,
                         message: Some(e),
                     });
                 }
@@ -1610,12 +1655,16 @@ pub struct SyncPrRepliesResult {
     pub unmatched: u32,
     pub errors: Vec<String>,
     /// Number of approved Fix items still missing a fix on disk
-    /// (`fix_done=false`). These are NOT replied to — the user must run Apply
-    /// for them. Carried back so the UI can warn instead of silently dropping.
+    /// (`fix_done=false`), or whose fix is on disk but not yet committed and
+    /// pushed (`fix_uncommitted=true`). These are NOT replied to — a reply
+    /// claiming a fix that has not reached the pull request would be false
+    /// (see #79) — the user must run Apply for them. Carried back so the UI
+    /// can warn instead of silently dropping.
     pub fix_pending: u32,
 }
 
-/// Catch-up reply pass: post replies for items where `fix_done=true` but
+/// Catch-up reply pass: post replies for items where `fix_done=true`,
+/// `fix_uncommitted=false` (the fix is actually delivered — see #79) and
 /// `reply_posted=false`, without invoking the agent and without pushing.
 ///
 /// This is the recovery path for partial runs: when the agent fixed something
@@ -1643,8 +1692,10 @@ pub async fn sync_pr_review_replies(
 
 /// Core logic of `sync_pr_review_replies` extracted for testability. Walks
 /// the plan's approved Fix items, posts a reply for each one with
-/// `fix_done=true && reply_posted=false`, and returns the updated plan with
-/// `reply_posted` flipped on whatever succeeded.
+/// `fix_done=true && !fix_uncommitted && reply_posted=false` (see #79 —
+/// `fix_uncommitted` is excluded so this never claims a fix is done before
+/// it has actually reached the pull request), and returns the updated plan
+/// with `reply_posted` flipped on whatever succeeded.
 pub async fn sync_pr_review_replies_inner(
     task: Task,
     plan: PrReviewPlan,
@@ -1668,7 +1719,11 @@ pub async fn sync_pr_review_replies_inner(
 
     for orig_idx in approved_indices {
         let item = updated_plan.items[orig_idx].clone();
-        if !item.fix_done {
+        // A fix that is not on disk yet, or is on disk but not yet
+        // committed and pushed, is not delivered to the pull request: a
+        // reply claiming it was fixed would be false (see #79). Both wait
+        // for Apply, not Sync.
+        if !item.fix_done || item.fix_uncommitted {
             fix_pending += 1;
             continue;
         }
@@ -6066,6 +6121,60 @@ mod tests {
 
         assert!(!items[0].fix_done, "a same-second update must be treated as a possible edit, not assumed safe");
         assert!(!items[0].reply_posted);
+    }
+
+    /// A fix whose push failed stays undelivered when its comment is edited
+    /// before the next apply: the backfill from that apply restores
+    /// `fix_done` but claims no reply, so neither Apply nor Sync can post
+    /// "fixed" before the fix is pushed. See #79.
+    #[test]
+    fn an_edited_comment_keeps_its_undelivered_fix_undelivered() {
+        let applied_at = "2024-06-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let prev_item = PrReviewItem { fix_done: true, fix_uncommitted: true, ..fresh_item(42) };
+        let edited_comment = PrReviewComment {
+            updated_at: Some("2024-06-02T00:00:00Z".parse().unwrap()),
+            ..comment(42)
+        };
+
+        for auto_reply in [true, false] {
+            let mut items = vec![fresh_item(42)];
+            carry_forward_reanalysis_lifecycle(
+                &mut items,
+                std::slice::from_ref(&prev_item),
+                std::slice::from_ref(&edited_comment),
+                Some(applied_at),
+            );
+            assert!(items[0].fix_uncommitted, "the fix is still not pushed");
+            assert!(!items[0].fix_done, "re-analysis itself does not carry the edited item's fix_done");
+
+            let mut plan = PrReviewPlan {
+                generated_at: applied_at,
+                pr_url: String::new(),
+                review_decision: None,
+                comments: vec![edited_comment.clone()],
+                items,
+                raw_plan: String::new(),
+                last_apply: Some(PrReviewApplyResult {
+                    applied_at,
+                    agent_summary: String::new(),
+                    fixed_ids: vec![42],
+                    skipped_ids: Vec::new(),
+                    pushed: false,
+                    push_branch: None,
+                    replies_posted: 0,
+                    reply_errors: Vec::new(),
+                    dry_run: false,
+                    failed_ids: Vec::new(),
+                    fix_errors: Vec::new(),
+                    push_error: Some("the push was rejected".to_string()),
+                    auto_reply: Some(auto_reply),
+                }),
+            };
+            plan.backfill_lifecycle_from_last_apply();
+            let item = &plan.items[0];
+            assert!(item.fix_done && item.fix_uncommitted, "auto_reply={auto_reply}: {item:?}");
+            assert!(!item.reply_posted, "auto_reply={auto_reply}: no reply was ever posted");
+        }
     }
 
     // ──────────────────────────────────────────────
@@ -11151,6 +11260,14 @@ mod tests {
                 hook
             }
 
+            /// Make every push to `repo`'s remote fail, until the returned
+            /// hook is removed.
+            fn reject_push(repo: &RepoFixture) -> PathBuf {
+                let hook = repo.remote.join("hooks/pre-receive");
+                write_executable(&hook, "#!/bin/sh\necho 'pushes are refused here' >&2\nexit 1\n");
+                hook
+            }
+
             /// A task for `worktree` with a pull request, and a plan of one
             /// approved fix item.
             async fn task_with_one_fix(
@@ -11185,16 +11302,18 @@ mod tests {
                 (task, plan)
             }
 
-            /// Apply `plan` in `worktree` with `auto_push`. `jj` is what the
-            /// flow runs as `jj`: a missing program stands in for a machine
-            /// without jj.
+            /// Apply `plan` in `worktree` with `auto_push`, backfilling it
+            /// from its last apply first as `address_pr_review` does. `jj`
+            /// is what the flow runs as `jj`: a missing program stands in
+            /// for a machine without jj.
             async fn apply(
                 task: &Task,
-                plan: PrReviewPlan,
+                mut plan: PrReviewPlan,
                 worktree: &Path,
                 jj: PathBuf,
                 auto_reply: bool,
             ) -> (PrReviewApplyResult, PrReviewPlan) {
+                plan.backfill_lifecycle_from_last_apply();
                 let options = AddressPrReviewOptions { auto_push: true, auto_reply, dry_run: false };
                 let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 test_programs::scope(
@@ -11684,11 +11803,12 @@ mod tests {
                 assert!(status.contains("?? stray.txt"), "the local edit stays uncommitted: {status}");
             }
 
-            /// After a commit failure, the note about posted replies counts
-            /// only the replies for fixes that are not committed, not those
-            /// for fixes an earlier apply committed and pushed.
+            /// A commit failure defers the new item's reply -- it is never
+            /// posted for a fix that did not reach the pull request -- while
+            /// leaving an earlier item's own delivered-and-replied state
+            /// alone. See #79.
             #[tokio::test(flavor = "multi_thread")]
-            async fn the_replies_note_counts_only_uncommitted_fixes() {
+            async fn a_commit_failure_defers_the_new_items_reply() {
                 let _guard = PATH_LOCK.lock().await;
                 let repo = RepoFixture::new();
                 let worktree = task_checkout_for_review(&repo, false);
@@ -11702,22 +11822,30 @@ mod tests {
                 assert_eq!(first.replies_posted, 1);
                 reject_commits(&repo);
 
-                let (second, _plan) = apply(&task, with_item(plan, 2), &worktree, no_jj, true).await;
+                let (second, plan) = apply(&task, with_item(plan, 2), &worktree, no_jj.clone(), true).await;
 
                 assert_eq!(second.fixed_ids, vec![2], "{second:?}");
-                assert_eq!(second.replies_posted, 1);
+                assert_eq!(second.replies_posted, 0, "the undelivered fix's reply is not posted");
+                assert!(plan.items[1].fix_done && plan.items[1].fix_uncommitted, "{:?}", plan.items[1]);
+                assert!(!plan.items[1].reply_posted, "{:?}", plan.items[1]);
+                assert!(plan.items[0].reply_posted, "the earlier item's delivered reply is untouched");
                 let error = second.push_error.as_deref().unwrap_or_default();
                 assert!(error.contains("could not be committed"), "{error:?}");
-                assert!(
-                    error.contains("1 reply already posted says its item was fixed"),
-                    "only the uncommitted item's reply counts: {error:?}"
-                );
+
+                // Once the checkout accepts commits again, the deferred
+                // reply is posted -- once, not a second time for the item
+                // that was already delivered and replied.
+                std::fs::remove_file(repo.checkout.join(".git/hooks/pre-commit")).unwrap();
+                let (third, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                assert!(third.pushed, "{:?}", third.push_error);
+                assert_eq!(third.replies_posted, 1, "only the newly-delivered item's reply is posted");
+                assert!(plan.items[1].reply_posted && !plan.items[1].fix_uncommitted, "{:?}", plan.items[1]);
             }
 
-            /// Replies already posted say the items were fixed; a commit
-            /// that then fails says so.
+            /// A commit failure posts no reply claiming the fix is done: the
+            /// fix never reached the pull request. See #79.
             #[tokio::test(flavor = "multi_thread")]
-            async fn a_commit_failure_after_replies_says_the_replies_claim_fixes_not_pushed() {
+            async fn a_commit_failure_posts_no_fixed_replies() {
                 let _guard = PATH_LOCK.lock().await;
                 let repo = RepoFixture::new();
                 let worktree = task_checkout_for_review(&repo, false);
@@ -11726,15 +11854,88 @@ mod tests {
                 let (state, tmp) = build_test_state().await;
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
 
-                let (result, _plan) = apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+                let (result, plan) = apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
 
-                assert_eq!(result.replies_posted, 1, "{result:?}");
+                assert_eq!(result.replies_posted, 0, "{result:?}");
                 assert!(!result.pushed);
+                assert!(plan.items[0].fix_done && plan.items[0].fix_uncommitted, "{:?}", plan.items[0]);
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
                 let error = result.push_error.as_deref().unwrap_or_default();
                 assert!(
-                    error.contains("1 reply already posted says its item was fixed"),
-                    "the result must say a posted reply claims a fix that was not pushed: {error:?}"
+                    error.contains("could not be committed"),
+                    "the result must say the fix was not committed: {error:?}"
                 );
+            }
+
+            /// A push failure posts no reply claiming the fix is done
+            /// either: the fix is committed locally, but has not reached
+            /// the pull request's branch on GitHub. See #79.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_push_failure_posts_no_fixed_replies() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                reject_push(&repo);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (result, plan) = apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+
+                assert_eq!(result.replies_posted, 0, "{result:?}");
+                assert!(!result.pushed, "{:?}", result.push_error);
+                assert!(result.push_error.is_some(), "a rejected push must be reported");
+                assert!(plan.items[0].fix_done && plan.items[0].fix_uncommitted, "{:?}", plan.items[0]);
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+            }
+
+            /// After a push failure, Sync replies still posts nothing for the
+            /// committed-but-unpushed fix, and neither Sync nor the next
+            /// apply mistakes the reply it never attempted for a posted one:
+            /// the apply that finally pushes the existing commit -- without a
+            /// second commit -- posts the reply, exactly once. See #79.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_reply_deferred_by_a_push_failure_is_posted_once_the_retry_pushes() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_push(&repo);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert!(!first.pushed && first.replies_posted == 0, "{first:?}");
+                let head_after_first = git(&worktree, &["rev-parse", "HEAD"]);
+
+                // Sync runs the same backfill as the real command first.
+                let mut for_sync = plan;
+                for_sync.backfill_lifecycle_from_last_apply();
+                let (synced, plan) = sync_pr_review_replies_inner(task.clone(), for_sync).await.unwrap();
+                assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+
+                std::fs::remove_file(hook).unwrap();
+                let (second, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                assert!(second.pushed, "{:?}", second.push_error);
+                assert_eq!(second.replies_posted, 1, "{second:?}");
+                assert!(plan.items[0].reply_posted && !plan.items[0].fix_uncommitted, "{:?}", plan.items[0]);
+                assert_eq!(
+                    git(&worktree, &["rev-parse", "HEAD"]),
+                    head_after_first,
+                    "the retry pushes the existing commit, it does not commit again"
+                );
+                assert_eq!(
+                    git(&repo.remote, &["rev-parse", "refs/heads/task-branch"]),
+                    head_after_first,
+                    "the reply follows the push of the commit that holds the fix"
+                );
+
+                let mut for_sync = plan;
+                for_sync.backfill_lifecycle_from_last_apply();
+                let (synced, _plan) = sync_pr_review_replies_inner(task.clone(), for_sync).await.unwrap();
+                assert_eq!((synced.replied, synced.fix_pending), (0, 0), "no duplicate reply: {synced:?}");
             }
 
             /// A fake `gh` for the PR side-effect ownership tests. `pr list`

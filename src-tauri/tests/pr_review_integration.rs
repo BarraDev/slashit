@@ -9,9 +9,11 @@
 //!
 //! The working directory is a real Git repository with one commit on the
 //! tasks' branch, `test-branch`, because a real apply commits the fixes
-//! there and reports a commit that fails. The
-//! mock `claude` edits nothing, so there is nothing to commit. Committing is
-//! covered in `worktree::commit` and the `commands::pr` unit tests.
+//! there and reports a commit that fails. That commit is already on a bare
+//! `origin`, as a pull request's branch is. The mock `claude` edits nothing,
+//! so there is nothing to commit and nothing to push: the fixes count as
+//! delivered, and replies may be posted. Committing and pushing are covered
+//! in `worktree::commit` and the `commands::pr` unit tests.
 
 #[cfg(unix)]
 use std::fs;
@@ -80,11 +82,16 @@ impl MockEnv {
         fs::create_dir_all(&bin_dir).unwrap();
         let working_dir = tmp.path().join("work");
         fs::create_dir_all(&working_dir).unwrap();
+        let origin = tmp.path().join("origin.git");
+        let origin = origin.to_str().expect("a UTF-8 temp path");
         for args in [
-            &["init", "-q", "-b", "test-branch"][..],
+            &["init", "-q", "--bare", origin][..],
+            &["init", "-q", "-b", "test-branch"],
             &["config", "user.email", "t@example.com"],
             &["config", "user.name", "T"],
             &["commit", "-q", "--allow-empty", "-m", "initial"],
+            &["remote", "add", "origin", origin],
+            &["push", "-q", "-u", "origin", "test-branch"],
         ] {
             let status = std::process::Command::new("git")
                 .args(args)
@@ -312,7 +319,7 @@ async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
     let (task, plan) = create_test_pr_review_setup();
 
     let opts = AddressPrReviewOptions {
-        auto_push: false,  // skip push (no remote in test)
+        auto_push: false,  // nothing to push: the branch is already on origin
         auto_reply: true,
         dry_run: false,
     };
@@ -983,6 +990,41 @@ async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
     assert_eq!(result.fix_pending, 2);
     assert_eq!(result.discovered, 0);
     assert_eq!(result.rewritten, 0);
+}
+
+/// A fix committed but not on `origin` has not reached the pull request, so
+/// with pushing turned off no reply claims it is fixed -- neither from the
+/// apply nor from Sync. See #79.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unpushed_fix_gets_no_reply_from_apply_or_sync() {
+    use slashit_ui_lib::commands::pr::sync_pr_review_replies_inner;
+
+    let _guard = PATH_LOCK.lock().await;
+    let env = MockEnv::setup("FIXED: item #0\nDONE");
+    let status = std::process::Command::new("git")
+        .args(["commit", "-q", "--allow-empty", "-m", "not pushed"])
+        .current_dir(&env.working_dir)
+        .status()
+        .expect("run git");
+    assert!(status.success());
+    let (task, plan) = create_test_pr_review_setup();
+    let opts = AddressPrReviewOptions { auto_push: false, auto_reply: true, dry_run: false };
+
+    let (result, mut plan) =
+        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
+            .await
+            .expect("full apply succeeds");
+    assert_eq!(result.fixed_ids, vec![101]);
+    assert!(!result.pushed);
+    assert_eq!(result.replies_posted, 0, "{result:?}");
+    assert!(plan.items[0].fix_uncommitted && !plan.items[0].reply_posted, "{:?}", plan.items[0]);
+
+    plan.backfill_lifecycle_from_last_apply();
+    assert!(!plan.items[0].reply_posted, "the backfill does not invent the reply");
+    let (synced, _plan) = sync_pr_review_replies_inner(task, plan).await.expect("sync succeeds");
+    assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+    assert_eq!(env.gh_invocations(), 0, "gh log:\n{}", env.read_gh_log());
 }
 
 #[test]

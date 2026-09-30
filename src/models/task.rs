@@ -188,7 +188,12 @@ impl PrReviewPlan {
                 if !item.fix_done {
                     item.fix_done = true;
                 }
-                if last.auto_reply == Some(true) && !item.reply_posted && !failed_reply_ids.contains(&cid) {
+                // Replies wait for delivery: see the backend helper.
+                if last.auto_reply == Some(true)
+                    && !item.reply_posted
+                    && !item.fix_uncommitted
+                    && !failed_reply_ids.contains(&cid)
+                {
                     item.reply_posted = true;
                 }
             }
@@ -249,7 +254,7 @@ pub struct PrReviewItem {
     pub user_note: String,
     #[serde(default)]
     pub fix_done: bool,
-    /// Mirrors the backend field: a fix on disk not yet committed.
+    /// Mirrors the backend field: a fix not yet committed and pushed.
     #[serde(default)]
     pub fix_uncommitted: bool,
     #[serde(default)]
