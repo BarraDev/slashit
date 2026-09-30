@@ -18,8 +18,9 @@
 //! forwarded into a refused connection, which `tauri-driver` turns into a
 //! broken connection back to us -- this is exactly the failure a hosted run
 //! hit once, session creation itself, before this wait existed. Waiting on
-//! [`ports::wait_until_http_ready`] against `WebKitWebDriver`'s own `/status`
-//! turns that race into an ordinary, bounded wait.
+//! [`ports::wait_until_webdriver_ready`] against `WebKitWebDriver`'s own
+//! `/status` -- specifically its `value.ready` field, not merely an HTTP 2xx
+//! -- turns that race into an ordinary, bounded wait.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
@@ -305,7 +306,7 @@ impl Provider {
         // here, against the native driver directly, is what keeps the first
         // real request (`New Session`) from racing a driver that only just
         // started.
-        ports::wait_until_http_ready(
+        ports::wait_until_webdriver_ready(
             native_port,
             "/status",
             deadline.saturating_duration_since(Instant::now()),

@@ -321,6 +321,71 @@ async fn a_native_driver_that_starts_late_is_still_waited_for() {
     let _ = std::fs::remove_dir_all(log_path.parent().expect("log has a parent directory"));
 }
 
+/// The corrected half of the readiness contract: a native driver that is
+/// listening and answering 2xx, but has not yet reported `ready:true`, must
+/// still be waited for -- not raced the moment its first response arrives.
+///
+/// RED against the code before this fix: `wait_until_http_ready` treated any
+/// 2xx as readiness, so it returned on the very first `ready:false` poll, and
+/// `New Session` followed immediately -- before `fake-native-driver` ever
+/// reported itself actually ready. Against that code, the assertions below
+/// fail: no `ready=true` line ever appears in the log, because the harness
+/// stops polling after its first (still-`ready:false`) response.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_native_driver_reporting_not_ready_is_waited_for_rather_than_raced() {
+    let fake = PathBuf::from(env!("CARGO_BIN_EXE_fake-native-driver"));
+    let log_path = scratch_log("not-ready-polls");
+    let deadline = Instant::now() + Duration::from_secs(20);
+
+    let mut provider = Provider::spawn(Some(&fake), &log_path, deadline, |command| {
+        // A handful of not-ready polls at the wait's 100ms poll interval:
+        // enough to prove the wait actually polled more than once, small
+        // enough to keep the test fast.
+        command.env("FAKE_NATIVE_DRIVER_NOT_READY_POLLS", "5");
+        Ok(())
+    })
+    .await
+    .expect("a native driver that reports ready:false at first must still be waited for");
+
+    let driver = provider
+        .create_session(
+            fake_capabilities(),
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .await
+        .expect("session creation must succeed once the native driver reports ready:true");
+
+    let _ = driver.quit().await;
+    provider
+        .shutdown()
+        .expect("the provider tree must tear down cleanly");
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        log.matches("ready=false").count() >= 1,
+        "the wait must have observed at least one not-ready poll: log was:\n{log}"
+    );
+    assert!(
+        log.contains("ready=true"),
+        "the wait must have observed an explicit ready=true poll before creating a session: log was:\n{log}"
+    );
+    let ready_true_pos = log.find("ready=true").expect("checked above");
+    let session_pos = log
+        .find("POST /session")
+        .unwrap_or_else(|| panic!("a session must have been created: log was:\n{log}"));
+    assert!(
+        ready_true_pos < session_pos,
+        "New Session must not be sent until the native driver reports ready=true: log was:\n{log}"
+    );
+    assert_eq!(
+        log.matches("POST /session").count(),
+        1,
+        "session creation must be attempted exactly once: log was:\n{log}"
+    );
+
+    let _ = std::fs::remove_dir_all(log_path.parent().expect("log has a parent directory"));
+}
+
 /// A native driver that never starts must still fail inside its own bound,
 /// not hang, and not be retried against SESSION_TIMEOUT's full length.
 #[tokio::test(flavor = "multi_thread")]

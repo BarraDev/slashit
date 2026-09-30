@@ -21,6 +21,12 @@
 //! - `FAKE_NATIVE_DRIVER_REJECT_SESSION`: if set, `POST /session` always
 //!   returns a real (non-transient) WebDriver protocol error instead of
 //!   creating a session, and the port never stops accepting.
+//! - `FAKE_NATIVE_DRIVER_NOT_READY_POLLS`: how many `GET /status` requests to
+//!   answer with a well-formed, successful `{"value":{"ready":false,...}}`
+//!   before switching (permanently) to `ready:true`. Defaults to 0, i.e.
+//!   ready from the first poll. Models the other half of the readiness
+//!   contract: a process that is listening and answering 2xx, but that has
+//!   not yet said it can accept a session.
 //!
 //! Protocol coverage is deliberately minimal: `GET /status` (the readiness
 //! endpoint this regression exists to wait for), `POST /session` (the one
@@ -32,7 +38,14 @@ use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+/// How many `GET /status` requests have been answered so far, across every
+/// connection this process serves. `/status` polls are always sequential --
+/// one client, one poll at a time -- so a plain counter is enough to model
+/// "not ready for the first N polls, then ready".
+static STATUS_POLLS: AtomicUsize = AtomicUsize::new(0);
 
 fn main() -> ExitCode {
     let mut port: Option<u16> = None;
@@ -54,6 +67,10 @@ fn main() -> ExitCode {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let reject_session = env::var_os("FAKE_NATIVE_DRIVER_REJECT_SESSION").is_some();
+    let not_ready_polls: usize = env::var("FAKE_NATIVE_DRIVER_NOT_READY_POLLS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     // The exact condition under test: this process exists (it is past
     // argument parsing and could already have been waited on by a process
@@ -70,7 +87,7 @@ fn main() -> ExitCode {
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        serve_connection(stream, reject_session);
+        serve_connection(stream, reject_session, not_ready_polls);
     }
     ExitCode::SUCCESS
 }
@@ -79,7 +96,9 @@ fn main() -> ExitCode {
 /// it. Every `POST /session` this process ever answers is printed to stderr
 /// (the provider log), so a test that cares whether one was retried can grep
 /// for it instead of trusting an in-process count the harness never sees.
-fn serve_connection(mut stream: TcpStream, reject_session: bool) {
+/// Every `GET /status` poll's outcome is printed the same way, so a test can
+/// prove the order readiness was observed in relative to `POST /session`.
+fn serve_connection(mut stream: TcpStream, reject_session: bool, not_ready_polls: usize) {
     let peer = stream.try_clone().expect("clone stream for reading");
     let mut reader = BufReader::new(peer);
 
@@ -124,7 +143,11 @@ fn serve_connection(mut stream: TcpStream, reject_session: bool) {
 
         let result = match (method.as_str(), path.as_str()) {
             ("GET", "/status") => {
-                respond(&mut stream, 200, r#"{"value":{"ready":true,"message":"fake"}}"#)
+                let poll = STATUS_POLLS.fetch_add(1, Ordering::SeqCst);
+                let ready = poll >= not_ready_polls;
+                eprintln!("fake-native-driver: GET /status ready={ready}");
+                let body = format!(r#"{{"value":{{"ready":{ready},"message":"fake"}}}}"#);
+                respond(&mut stream, 200, &body)
             }
             ("POST", "/session") => {
                 eprintln!("fake-native-driver: POST /session");
