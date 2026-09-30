@@ -375,8 +375,30 @@ impl PrStatuses {
     pub async fn refresh(&self, key: &PrKey) -> Result<PrStatus, PrFetchError> {
         let started = Utc::now();
         let result = self.fetch(key).await;
-        self.record(key, started, Utc::now(), &result);
-        result
+        self.settle(key, started, Utc::now(), result)
+    }
+
+    /// Record an attempt, and answer with what its caller may act on.
+    ///
+    /// An attempt a newer one has already answered is not recorded, and its
+    /// answer is not handed back either: a caller would otherwise write an
+    /// older state onto the task, say a closure after the pull request was
+    /// reopened, which the cache itself refused.
+    fn settle(
+        &self,
+        key: &PrKey,
+        started: DateTime<Utc>,
+        finished: DateTime<Utc>,
+        result: Result<PrStatus, PrFetchError>,
+    ) -> Result<PrStatus, PrFetchError> {
+        if self.record(key, started, finished, &result) {
+            result
+        } else {
+            Err(PrFetchError::new(
+                PrFetchErrorKind::Failed,
+                "a newer reading of this pull request arrived first",
+            ))
+        }
     }
 
     /// [`Self::refresh`] each of `keys`, [`CONCURRENCY`] at a time, answering
@@ -425,7 +447,7 @@ impl PrStatuses {
         started: DateTime<Utc>,
         finished: DateTime<Utc>,
         result: &Result<PrStatus, PrFetchError>,
-    ) {
+    ) -> bool {
         let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let entry = entries.entry(key.clone()).or_insert_with(|| PrStatusEntry {
             repo: key.repo.clone(),
@@ -436,7 +458,7 @@ impl PrStatuses {
             error: None,
         });
         if started < entry.attempted_at {
-            return;
+            return false;
         }
         entry.attempted_at = started;
         match result {
@@ -447,6 +469,7 @@ impl PrStatuses {
             }
             Err(e) => entry.error = Some(e.clone()),
         }
+        true
     }
 
     async fn fetch(&self, key: &PrKey) -> Result<PrStatus, PrFetchError> {
@@ -794,9 +817,12 @@ mod tests {
         let entry = cache.get(&key).unwrap();
         assert_eq!((entry.status, entry.fetched_at, entry.error), (Some(newer.clone()), Some(t(61)), None));
 
-        // An older attempt answering late does not put its reading back.
-        cache.record(&key, t(45), t(90), &Ok(good_again()));
-        assert_eq!(cache.get(&key).unwrap().status, Some(newer));
+        // An older attempt answering late does not put its reading back, and
+        // its caller is not handed it to act on.
+        let late = cache.settle(&key, t(45), t(90), Ok(good_again()));
+        assert_eq!(late.map_err(|e| e.kind), Err(PrFetchErrorKind::Failed));
+        assert_eq!(cache.get(&key).unwrap().status, Some(newer.clone()));
+        assert_eq!(cache.settle(&key, t(70), t(71), Ok(newer.clone())), Ok(newer));
 
         fn good_again() -> PrStatus {
             status(PrState::Open, ChecksState::Passing)
