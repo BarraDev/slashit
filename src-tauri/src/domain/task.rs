@@ -477,7 +477,14 @@ impl PrReviewPlan {
                 if !item.fix_done {
                     item.fix_done = true;
                 }
-                if last.auto_reply == Some(true) && !item.reply_posted && !failed_reply_ids.contains(&cid) {
+                // A fix not yet delivered (`fix_uncommitted`) had no reply
+                // attempted -- replies wait for delivery -- so its absence
+                // from `reply_errors` says nothing about a reply being posted.
+                if last.auto_reply == Some(true)
+                    && !item.reply_posted
+                    && !item.fix_uncommitted
+                    && !failed_reply_ids.contains(&cid)
+                {
                     item.reply_posted = true;
                 }
             }
@@ -555,13 +562,17 @@ pub struct PrReviewItem {
     /// across modal reopens. A re-run with `fix_done=true` skips the agent.
     #[serde(default)]
     pub fix_done: bool,
-    /// True while this item's fix is on disk but not recorded in a commit:
+    /// True while this item's fix is not yet delivered to the pull request:
     /// set when the fix agent succeeds, cleared once an apply commits the
-    /// checkout or finds nothing left to commit. A commit that fails, is
+    /// checkout (or finds nothing left to commit) and, when the branch is
+    /// ahead of its remote, pushes it. A commit or push that fails, is
     /// cancelled, or is withheld because another fix agent failed in the
-    /// same apply leaves it set, so the next apply commits it without
-    /// running the agent again. Only these fixes are ever committed by an
-    /// apply; a fix committed earlier is never committed again.
+    /// same apply leaves it set, as does a needed push skipped because
+    /// `auto_push=false`, so the next apply commits or pushes it without
+    /// running the agent again. It survives an edit to the item's comment.
+    /// No reply claiming the fix is posted while it is set. Only these
+    /// fixes are ever committed by an apply; a fix already delivered is
+    /// never committed again.
     #[serde(default)]
     pub fix_uncommitted: bool,
     /// True once a reply (inline or fallback PR comment) was posted on GitHub

@@ -876,7 +876,9 @@ pub async fn triage_pr_comments(
 /// skip a comment that now says something different, believing it already
 /// addressed. `comments` (the freshly-fetched set for this analysis) is
 /// checked for each matched id and the merge is skipped when its
-/// `updated_at` is newer than the apply the prior lifecycle came from.
+/// `updated_at` is newer than the apply the prior lifecycle came from --
+/// except `fix_uncommitted`, which describes the checkout rather than the
+/// comment and is always carried.
 fn carry_forward_reanalysis_lifecycle(
     items: &mut [PrReviewItem],
     prior_items: &[PrReviewItem],
@@ -886,6 +888,13 @@ fn carry_forward_reanalysis_lifecycle(
     for item in items.iter_mut() {
         let Some(cid) = item.comment_id else { continue; };
         let Some(prev_item) = prior_items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
+
+        // An undelivered fix is a fact about the checkout, not about the
+        // comment's wording, so it survives an edit: dropping it would let
+        // `backfill_lifecycle_from_last_apply` restore `fix_done` without
+        // it, and a reply would then call a fix that was never pushed
+        // delivered (see #79).
+        if prev_item.fix_uncommitted { item.fix_uncommitted = true; }
 
         // GitHub's `updated_at` has whole-second precision; `applied_at`
         // (from `chrono::Utc::now()`) almost never does. Comparing them
@@ -908,7 +917,6 @@ fn carry_forward_reanalysis_lifecycle(
         }
 
         if prev_item.fix_done { item.fix_done = true; }
-        if prev_item.fix_uncommitted { item.fix_uncommitted = true; }
         if prev_item.reply_posted { item.reply_posted = true; }
         if item.last_error.is_none() { item.last_error = prev_item.last_error.clone(); }
         if item.last_agent_summary.is_none() { item.last_agent_summary = prev_item.last_agent_summary.clone(); }
@@ -1340,12 +1348,13 @@ pub async fn address_pr_review_inner(
     // has begun is waited on, bounded, like every other owner-ending path.
     let cancelled = *cancel_rx.borrow();
 
-    // The approved fixes on disk that no commit records yet: the ones this
-    // apply made, and any an earlier apply made whose commit failed or was
-    // cancelled (`fix_uncommitted`). Fixes an earlier apply committed are
-    // not among them, so they are never committed again, and nothing is
-    // committed when this set is empty. The replies note counts only the
-    // posted replies of these.
+    // The approved fixes not yet delivered (`fix_uncommitted`): the ones this
+    // apply made, and any an earlier apply made whose commit or push failed,
+    // was cancelled, or was withheld. Those an earlier apply already
+    // committed are recommitted as nothing new, and only pushed; fixes
+    // already delivered are not among them, and nothing is committed or
+    // pushed when this set is empty. The replies note counts only the posted
+    // replies of these.
     let uncommitted: Vec<usize> = updated_plan.items.iter().enumerate()
         .filter(|(_, i)| {
             i.approved && matches!(i.decision, PrReviewDecision::Fix) && i.fix_done && i.fix_uncommitted
@@ -1475,9 +1484,9 @@ pub async fn address_pr_review_inner(
 
         // A fix only counts as delivered -- safe to reply "fixed" about --
         // once it is committed and, if this apply needed to push it, the
-        // push also succeeded too. `needs_push` is false when the commit
-        // found nothing new because the branch already carries these fixes,
-        // which is itself a form of already delivered. See #79: a reply
+        // push succeeded. `needs_push` is false when the commit found
+        // nothing new and the branch is where `origin` was last seen: the
+        // fixes are already on `origin`. See #79: a reply
         // must never precede the content it describes reaching the remote
         // the pull request reads.
         if committed_ok && (!needs_push || pushed) {
@@ -1497,9 +1506,11 @@ pub async fn address_pr_review_inner(
     // truthful: an item stays excluded for as long as its fix sits only in
     // this apply's failed or withheld commit, or an earlier apply's, and is
     // picked up the first time a later apply actually delivers it. Disabled
-    // for a dry run (no real side effects) and once this flow has been
-    // cancelled (no new remote side effect at all -- same rule the commit
-    // and push above follow).
+    // for a dry run (no real side effects) and when this flow was cancelled
+    // before its commit (the same `cancelled` the commit and push above
+    // follow). Because an item still owing delivery is not in
+    // `reply_errors`, `backfill_lifecycle_from_last_apply` must not read
+    // its absence there as a posted reply; it skips `fix_uncommitted` items.
     if options.auto_reply && !options.dry_run && !cancelled {
         for (loop_idx, &orig_idx) in approved_indices.iter().enumerate() {
             let item = updated_plan.items[orig_idx].clone();
@@ -6110,6 +6121,60 @@ mod tests {
 
         assert!(!items[0].fix_done, "a same-second update must be treated as a possible edit, not assumed safe");
         assert!(!items[0].reply_posted);
+    }
+
+    /// A fix whose push failed stays undelivered when its comment is edited
+    /// before the next apply: the backfill from that apply restores
+    /// `fix_done` but claims no reply, so neither Apply nor Sync can post
+    /// "fixed" before the fix is pushed. See #79.
+    #[test]
+    fn an_edited_comment_keeps_its_undelivered_fix_undelivered() {
+        let applied_at = "2024-06-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let prev_item = PrReviewItem { fix_done: true, fix_uncommitted: true, ..fresh_item(42) };
+        let edited_comment = PrReviewComment {
+            updated_at: Some("2024-06-02T00:00:00Z".parse().unwrap()),
+            ..comment(42)
+        };
+
+        for auto_reply in [true, false] {
+            let mut items = vec![fresh_item(42)];
+            carry_forward_reanalysis_lifecycle(
+                &mut items,
+                std::slice::from_ref(&prev_item),
+                std::slice::from_ref(&edited_comment),
+                Some(applied_at),
+            );
+            assert!(items[0].fix_uncommitted, "the fix is still not pushed");
+            assert!(!items[0].fix_done, "re-analysis itself does not carry the edited item's fix_done");
+
+            let mut plan = PrReviewPlan {
+                generated_at: applied_at,
+                pr_url: String::new(),
+                review_decision: None,
+                comments: vec![edited_comment.clone()],
+                items,
+                raw_plan: String::new(),
+                last_apply: Some(PrReviewApplyResult {
+                    applied_at,
+                    agent_summary: String::new(),
+                    fixed_ids: vec![42],
+                    skipped_ids: Vec::new(),
+                    pushed: false,
+                    push_branch: None,
+                    replies_posted: 0,
+                    reply_errors: Vec::new(),
+                    dry_run: false,
+                    failed_ids: Vec::new(),
+                    fix_errors: Vec::new(),
+                    push_error: Some("the push was rejected".to_string()),
+                    auto_reply: Some(auto_reply),
+                }),
+            };
+            plan.backfill_lifecycle_from_last_apply();
+            let item = &plan.items[0];
+            assert!(item.fix_done && item.fix_uncommitted, "auto_reply={auto_reply}: {item:?}");
+            assert!(!item.reply_posted, "auto_reply={auto_reply}: no reply was ever posted");
+        }
     }
 
     // ──────────────────────────────────────────────
@@ -11237,16 +11302,18 @@ mod tests {
                 (task, plan)
             }
 
-            /// Apply `plan` in `worktree` with `auto_push`. `jj` is what the
-            /// flow runs as `jj`: a missing program stands in for a machine
-            /// without jj.
+            /// Apply `plan` in `worktree` with `auto_push`, backfilling it
+            /// from its last apply first as `address_pr_review` does. `jj`
+            /// is what the flow runs as `jj`: a missing program stands in
+            /// for a machine without jj.
             async fn apply(
                 task: &Task,
-                plan: PrReviewPlan,
+                mut plan: PrReviewPlan,
                 worktree: &Path,
                 jj: PathBuf,
                 auto_reply: bool,
             ) -> (PrReviewApplyResult, PrReviewPlan) {
+                plan.backfill_lifecycle_from_last_apply();
                 let options = AddressPrReviewOptions { auto_push: true, auto_reply, dry_run: false };
                 let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 test_programs::scope(
@@ -11820,6 +11887,55 @@ mod tests {
                 assert!(result.push_error.is_some(), "a rejected push must be reported");
                 assert!(plan.items[0].fix_done && plan.items[0].fix_uncommitted, "{:?}", plan.items[0]);
                 assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+            }
+
+            /// After a push failure, Sync replies still posts nothing for the
+            /// committed-but-unpushed fix, and neither Sync nor the next
+            /// apply mistakes the reply it never attempted for a posted one:
+            /// the apply that finally pushes the existing commit -- without a
+            /// second commit -- posts the reply, exactly once. See #79.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_reply_deferred_by_a_push_failure_is_posted_once_the_retry_pushes() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_push(&repo);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert!(!first.pushed && first.replies_posted == 0, "{first:?}");
+                let head_after_first = git(&worktree, &["rev-parse", "HEAD"]);
+
+                // Sync runs the same backfill as the real command first.
+                let mut for_sync = plan;
+                for_sync.backfill_lifecycle_from_last_apply();
+                let (synced, plan) = sync_pr_review_replies_inner(task.clone(), for_sync).await.unwrap();
+                assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+
+                std::fs::remove_file(hook).unwrap();
+                let (second, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                assert!(second.pushed, "{:?}", second.push_error);
+                assert_eq!(second.replies_posted, 1, "{second:?}");
+                assert!(plan.items[0].reply_posted && !plan.items[0].fix_uncommitted, "{:?}", plan.items[0]);
+                assert_eq!(
+                    git(&worktree, &["rev-parse", "HEAD"]),
+                    head_after_first,
+                    "the retry pushes the existing commit, it does not commit again"
+                );
+                assert_eq!(
+                    git(&repo.remote, &["rev-parse", "refs/heads/task-branch"]),
+                    head_after_first,
+                    "the reply follows the push of the commit that holds the fix"
+                );
+
+                let mut for_sync = plan;
+                for_sync.backfill_lifecycle_from_last_apply();
+                let (synced, _plan) = sync_pr_review_replies_inner(task.clone(), for_sync).await.unwrap();
+                assert_eq!((synced.replied, synced.fix_pending), (0, 0), "no duplicate reply: {synced:?}");
             }
 
             /// A fake `gh` for the PR side-effect ownership tests. `pr list`
