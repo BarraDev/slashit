@@ -91,6 +91,15 @@ jobs:
       - name: Clippy (acceptance harness)
         run: cargo clippy -p slashit-acceptance --all-targets --features run-acceptance -- -D warnings
 
+      # Proves crates/slashit-acceptance/shard-manifest.txt exactly covers
+      # `cargo test --list` for the product acceptance journeys: every test
+      # in exactly one of the three shards the acceptance-product matrix
+      # below runs. This needs only the test binary (already built for the
+      # clippy step above); it boots no display and no application, so it
+      # lives here rather than in the acceptance job it guards.
+      - name: Desktop acceptance shard manifest covers every journey
+        run: scripts/check-acceptance-shards.sh
+
       # `commands::pr::tests` exercises real `jj` behavior (not a mock), so
       # the runner needs an actual `jj` binary on PATH before this step.
       - name: Install jj
@@ -143,9 +152,34 @@ jobs:
   # changes -- not on every commit, where it would buy repetition rather than
   # signal and would compete for scarce macOS capacity. Neither is wired to run
   # automatically here; the existing compile checks below are unchanged.
-  acceptance:
+  #
+  # It runs as four independent jobs on four separate hosted runners rather
+  # than one job running everything serially: `--test-threads>1` inside one
+  # process was tried and reproduced three distinct races (port reservation,
+  # artifact-directory pruning, shared-display focus) because those journeys
+  # share kernel ports, one `target/acceptance` directory and one X display.
+  # Separate runners remove all three by construction -- separate checkout,
+  # display, ports and state root -- with no harness change, so each shard
+  # below still runs its own journeys one at a time
+  # (`run-desktop-acceptance.sh` fixes `--test-threads=1`). Building the
+  # application independently in each job, rather than building once and
+  # passing the binary to the others, measured faster in wall-clock: the four
+  # builds run concurrently instead of serializing in front of every shard.
+  #
+  # `acceptance-harness` covers the harness's own regression tests
+  # (`tests/acceptance.rs`, including the native-WebDriver-readiness tests
+  # added alongside this comment) once, on its own runner; those are not
+  # product journeys and are not part of the shard manifest below.
+  # `acceptance-product` runs the actual product journeys
+  # (`tests/product_acceptance.rs`), split three ways by
+  # `crates/slashit-acceptance/shard-manifest.txt`, which the "Lint, test and
+  # build" job's "Desktop acceptance shard manifest covers every journey"
+  # step proves is a complete, non-overlapping assignment of every journey
+  # `cargo test --list` reports. No journey's assertions, timeouts or
+  # negative-observation windows changed to make this split possible.
+  acceptance-harness:
     runs-on: ubuntu-22.04
-    name: Desktop acceptance (ubuntu-22.04)
+    name: Desktop acceptance / harness
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -188,14 +222,8 @@ jobs:
       # D-Bus session for the run, exactly as it does on a developer machine.
       # One test at a time: two desktop applications competing for one virtual
       # display buys nothing and makes a failure harder to read.
-      - name: Acceptance journeys
+      - name: Harness acceptance tests
         run: scripts/run-desktop-acceptance.sh --harness
-
-      # Run as its own step, not as a second test target in the one above, so
-      # the log says which kind of thing broke: the harness's ability to drive
-      # the application, or the application's own behaviour.
-      - name: Product acceptance journeys
-        run: scripts/run-desktop-acceptance.sh
 
       # Only failures leave anything behind: screenshots, page source and the
       # provider log, captured while the application was still alive.
@@ -203,7 +231,73 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v7.0.1
         with:
-          name: acceptance-failure-artifacts
+          name: acceptance-failure-artifacts-harness
+          path: target/acceptance
+          if-no-files-found: ignore
+          retention-days: 7
+
+  acceptance-product:
+    runs-on: ubuntu-22.04
+    name: Desktop acceptance / product shard ${{ matrix.shard }}
+    strategy:
+      # One shard's failure must not hide another's: each is independent
+      # product coverage, not a retry of the same thing.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install Linux dependencies
+        uses: ./.github/actions/linux-build-deps
+        with:
+          webdriver: 'true'
+
+      # All three matrix instances share one job name, so without a per-shard
+      # key they would race to save a cache under the same key; the cache
+      # backend is save-once-wins, so two of the three shards would save
+      # nothing. The three shards build the identical binary from the
+      # identical Cargo.lock, so this only affects which jobs get a cache hit
+      # on their own timeline, never correctness.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: acceptance-product-shard-${{ matrix.shard }}
+
+      - name: Install trunk
+        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
+        with:
+          version: latest
+
+      - name: Install the Tauri CLI and tauri-driver
+        run: |
+          cargo install tauri-cli --version "^2.10" --locked
+          cargo install tauri-driver --version "^2" --locked
+
+      - name: Build the application under test
+        run: scripts/build-acceptance-app.sh
+
+      # `--shard` reads crates/slashit-acceptance/shard-manifest.txt for this
+      # shard's exact test names, the same file the coverage check in "Lint,
+      # test and build" validates against `cargo test --list`.
+      - name: Product acceptance journeys (shard ${{ matrix.shard }})
+        run: scripts/run-desktop-acceptance.sh --shard ${{ matrix.shard }}
+
+      # Artifact names carry the shard ID so three concurrent jobs cannot
+      # overwrite each other's evidence.
+      - name: Preserve failure evidence
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v7.0.1
+        with:
+          name: acceptance-failure-artifacts-shard-${{ matrix.shard }}
           path: target/acceptance
           if-no-files-found: ignore
           retention-days: 7

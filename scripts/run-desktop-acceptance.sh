@@ -13,17 +13,21 @@
 set -euo pipefail
 
 usage() {
-  cat <<'EOF'
+  cat <<EOF
 usage: scripts/run-desktop-acceptance.sh [options] [-- <libtest args>]
 
   (no options)      every product journey, on a private display
   --exact <name>    only the journey with this exact test name
+  --shard <N>       only the journeys $manifest assigns to shard N
   --harness         the harness suite (tests/acceptance.rs) instead
   --visible         use your real display instead of a private one
   --list            list the selected tests without running them
 
-Arguments after -- go to the test binary unchanged. --test-threads is fixed
-at 1. Build the application first with scripts/build-acceptance-app.sh.
+--shard is what the CI product-shard jobs run; use it locally to reproduce
+one exactly (\`--shard 1\`, \`--shard 2\`, \`--shard 3\`). It reads
+$manifest, so shard membership never has to be typed out by hand. Arguments
+after -- go to the test binary unchanged. --test-threads is fixed at 1.
+Build the application first with scripts/build-acceptance-app.sh.
 EOF
 }
 
@@ -35,10 +39,14 @@ fail() {
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 
+manifest=crates/slashit-acceptance/shard-manifest.txt
+
 visible=0
 list=0
 target=product_acceptance
 filter=
+shard=
+shard_set=0
 libtest=()
 while (($#)); do
   case $1 in
@@ -48,6 +56,12 @@ while (($#)); do
     --exact)
       (($# >= 2)) || fail "--exact needs a test name"
       filter=$2
+      shift
+      ;;
+    --shard)
+      (($# >= 2)) || fail "--shard needs a number"
+      shard=$2
+      shard_set=1
       shift
       ;;
     -h | --help)
@@ -67,13 +81,24 @@ for arg in ${libtest[@]+"${libtest[@]}"}; do
   [[ $arg == --test-threads* ]] && fail "journeys run one at a time; --test-threads is fixed at 1"
 done
 
+shard_names=()
+if ((shard_set)); then
+  [[ $shard =~ ^[0-9]+$ ]] || fail "--shard needs a number, got '$shard'"
+  [[ -n $filter ]] && fail "--shard and --exact are mutually exclusive"
+  [[ $target == product_acceptance ]] || fail "--shard only selects product acceptance journeys; drop --harness"
+  [[ -f $manifest ]] || fail "$manifest is missing"
+  mapfile -t shard_names < <(awk -F'\t' -v s="$shard" '!/^[[:space:]]*#/ && NF == 2 && $1 == s {print $2}' "$manifest")
+  ((${#shard_names[@]} > 0)) || fail "no tests are assigned to shard $shard in $manifest"
+fi
+
 test_args=(--test-threads=1)
 [[ -n $filter ]] && test_args+=(--exact "$filter")
+((${#shard_names[@]})) && test_args+=(--exact "${shard_names[@]}")
 ((list)) && test_args+=(--list)
 test_args+=(${libtest[@]+"${libtest[@]}"})
 cargo_test=(cargo test -p slashit-acceptance --features run-acceptance --test "$target" -- "${test_args[@]}")
 
-echo "target:  $target${filter:+ (--exact $filter)}"
+echo "target:  $target${filter:+ (--exact $filter)}${shard:+ (shard $shard, ${#shard_names[@]} tests from $manifest)}"
 
 # Listing launches nothing, so it needs neither a display nor a build.
 if ((list)); then
@@ -85,6 +110,12 @@ fi
 if [[ -n $filter ]]; then
   listed=$(cargo test -q -p slashit-acceptance --features run-acceptance --test "$target" -- --list --exact "$filter")
   [[ $listed == *": test"* ]] || fail "no test in $target is named exactly '$filter' (see --list)"
+fi
+if ((${#shard_names[@]})); then
+  listed_count=$(cargo test -q -p slashit-acceptance --features run-acceptance --test "$target" -- \
+    --list --exact "${shard_names[@]}" | grep -c ': test$' || true)
+  ((listed_count == ${#shard_names[@]})) ||
+    fail "shard $shard in $manifest names ${#shard_names[@]} tests but only $listed_count exist under that exact name; run scripts/check-acceptance-shards.sh"
 fi
 
 # The application under test. scripts/build-acceptance-app.sh records the

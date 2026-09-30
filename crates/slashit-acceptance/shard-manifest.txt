@@ -1,0 +1,57 @@
+# Desktop acceptance product-journey shard manifest.
+#
+# Every test name printed by:
+#   cargo test -p slashit-acceptance --features run-acceptance --test product_acceptance -- --list
+# must appear here exactly once, in exactly one shard. scripts/check-acceptance-shards.sh
+# enforces that in CI (the "Lint, test and build" job): a new journey with no entry here, a
+# stale entry for a renamed or removed journey, or a journey listed under more than one shard
+# all fail that check. scripts/run-desktop-acceptance.sh --shard <N> reads this file to pick
+# which journeys a shard runs, both in CI and locally.
+#
+# The harness suite (tests/acceptance.rs) is not sharded; it always runs whole, in its own CI
+# job ("Desktop acceptance / harness"), and does not belong in this file.
+#
+# Shards are balanced by measured hosted-CI duration, not by test count, using the
+# `--test-threads=1` per-test timings from CI run 36669879622 (commit b1313670, the run this
+# manifest was built against): shard totals are 163.8s / 165.6s / 165.3s out of 494.7s. The two
+# ~78s cleanup-refusal journeys (NO_RETRY_WINDOW) are deliberately split across different
+# shards. Rebalance by editing this file; the coverage check does not care about balance, only
+# about complete, non-overlapping assignment.
+
+1	a_cleanup_git_abandons_partway_keeps_everything_and_only_an_explicit_retry_finishes_it
+1	a_task_moved_into_progress_runs_its_agent_and_reaches_human_review
+1	cleaning_up_one_task_leaves_another_worktree_registered
+1	deleting_a_task_removes_its_worktree_without_destroying_its_work
+1	git_fixture::a_fixture_created_in_a_later_second_still_pushes_its_own_main
+1	git_fixture::a_fixture_never_takes_over_an_origin_that_already_exists
+1	git_fixture::fixtures_created_together_in_one_state_root_each_get_their_own_origin
+1	human_review::a_failed_pull_request_keeps_the_approval_and_retrying_needs_no_second_approval
+1	human_review::closing_a_reviewed_task_without_merging_is_confirmed_first_and_keeps_its_work
+1	stopping_a_running_task_ends_its_agent_and_does_not_restart_it
+1	tests::a_record_carrying_the_id_title_and_status_together_is_the_proof
+1	tests::a_record_that_does_not_match_is_not_the_proof
+1	tests::no_run_without_an_identity_of_its_own_is_taken_as_the_retry
+1	tests::the_retry_is_found_by_session_whatever_order_the_records_arrive_in
+1	tests::values_split_across_two_records_are_not_a_persisted_task
+1	the_task_drawer_shows_a_running_task_live_and_stops_it
+
+2	a_done_cleanup_that_fails_keeps_everything_and_only_an_explicit_retry_finishes_it
+2	a_failed_agent_run_is_recorded_and_retrying_the_task_reaches_human_review
+2	finishing_a_task_removes_its_worktree_without_destroying_its_work
+2	human_review::approving_a_task_opens_its_pull_request_and_the_decision_survives_a_restart
+2	human_review::approving_without_a_github_remote_records_the_decision_and_merges_nothing
+2	human_review::requested_changes_reach_the_next_run_and_the_review_history_survives_a_restart
+2	local_first::projects_without_version_control_are_set_up_explicitly
+2	needs_you::the_rail_shows_every_project_and_the_header_only_the_current_one
+2	storage::storage_settings_measure_disk_usage_and_offer_nothing_destructive
+
+3	a_project_attached_to_a_workspace_stays_a_member_across_restart_until_detached
+3	a_project_whose_workspace_is_lost_is_shown_unresolved_and_can_be_detached
+3	developer_tools::a_developer_installed_coderabbit_is_never_run
+3	disk_pressure::a_critically_full_disk_pauses_new_work_until_space_returns
+3	local_first::a_repository_without_a_remote_runs_a_task_through_review
+3	needs_you::a_pull_request_that_was_not_created_needs_you_until_a_retry_opens_it
+3	needs_you::only_an_undecided_review_needs_you
+3	needs_you::the_header_counts_what_needs_you_and_takes_you_to_it
+3	the_task_drawer_shows_a_failure_in_full_and_retries_it
+3	the_task_drawer_starts_a_backlog_task_through_the_queue

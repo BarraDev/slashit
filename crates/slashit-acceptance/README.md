@@ -14,15 +14,28 @@ No Node, npm, pnpm, Bun or WebdriverIO is involved at any point. The client is
 scripts/build-acceptance-app.sh
 
 # 2. Run them: every product journey, one exact journey, one journey on your
-#    own display, or the harness's two journeys.
+#    own display, one CI shard, or the harness suite.
 scripts/run-desktop-acceptance.sh
 scripts/run-desktop-acceptance.sh --exact storage::storage_settings_measure_disk_usage_and_offer_nothing_destructive
 scripts/run-desktop-acceptance.sh --visible --exact <name>
+scripts/run-desktop-acceptance.sh --shard 1
 scripts/run-desktop-acceptance.sh --harness
 ```
 
 `--list` prints the selected test names, and arguments after `--` go to the
 test binary unchanged. Journeys always run one at a time.
+
+**CI shards.** Hosted CI splits the product journeys across three runners
+(`Desktop acceptance / product shard 1..3`) so they run concurrently instead
+of one 11-12 minute job; a separate `Desktop acceptance / harness` job runs
+`tests/acceptance.rs` once and is not sharded. `--shard <N>` reads
+[`shard-manifest.txt`](shard-manifest.txt) and runs exactly the journeys CI's
+shard `N` runs, so a shard failure reproduces locally without retyping test
+names. `scripts/check-acceptance-shards.sh` (run in the "Lint, test and
+build" job) proves the manifest assigns every journey `cargo test --list`
+reports to exactly one shard; editing the manifest to rebalance shards or add
+a newly-written journey to one is normal, but leaving a journey unassigned or
+in two shards fails that check.
 
 The build step is not optional: a plain `cargo build` produces a binary that
 loads http://localhost:1420 and shows a connection-error page. The script runs
