@@ -101,6 +101,19 @@ export SLASHIT_ACCEPTANCE_NATIVE_DRIVER=/tmp/WebKitWebDriver
   `SLASHIT_DEBUG_DISK_SPACE_FILE` instead of the real filesystem when they
   decide whether to start a task. On a host with little free space, a
   release binary ignores it and pauses every start, so test a debug build.
+- **No developer-installed CodeRabbit.** The application never finds a
+  `coderabbit` CLI in any directory named on its `PATH`, so AI Review takes
+  the same "CLI not found" path locally that it takes in CI, and no journey
+  calls the CodeRabbit service or touches your credentials for it. Every
+  `PATH` entry that holds `coderabbit` is replaced, for the WebDriver
+  provider and the application it launches, by a mirror of that directory
+  without it, and empty or relative entries are dropped
+  (`src/developer_tools.rs`).
+  This is the only tool isolated this way, and it is removed only by that
+  name. The rest of `PATH` is still yours, not hermetic: `git`, `jj` and
+  everything else resolve as they do in your shell, except `claude` and
+  `gh`, which the journeys that use them shadow with fixtures. Your shell and
+  your installation are not changed.
 - **Dynamic ports.** No fixed 4444/4445. Ports come from the kernel, are held
   until the moment the provider is spawned, and are re-checked afterwards.
 - **Ownership.** The provider runs as the leader of its own process group, and

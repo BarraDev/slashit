@@ -61,6 +61,8 @@ pub mod wasm_names;
 #[cfg(target_os = "linux")]
 pub mod context;
 #[cfg(target_os = "linux")]
+pub mod developer_tools;
+#[cfg(target_os = "linux")]
 pub mod driver;
 #[cfg(target_os = "linux")]
 pub mod fake_agent;

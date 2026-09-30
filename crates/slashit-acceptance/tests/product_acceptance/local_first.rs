@@ -18,7 +18,7 @@ use thirtyfour::Key;
 
 /// The branch the local-only fixture commits on. Deliberately not a name
 /// anything in SlashIt could assume.
-const LOCAL_BRANCH: &str = "trunk-local";
+pub(super) const LOCAL_BRANCH: &str = "trunk-local";
 /// The branch `git init` picks for the application in the setup journey,
 /// from the Git configuration this journey gives it.
 const GIT_DEFAULT_BRANCH: &str = "trunk-xyz";
@@ -40,7 +40,7 @@ const REPOSITORY_REMOTE_NONE: &str = "[data-testid=\"repository-remote-none\"]";
 impl GitFixture {
     /// [`GitFixture::create`] without any remote: one commit on
     /// [`LOCAL_BRANCH`], and nothing else.
-    fn create_local_only(path: &Path) -> Result<Self> {
+    pub(super) fn create_local_only(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)
             .with_context(|| format!("could not create {}", path.display()))?;
         git(
@@ -122,7 +122,7 @@ async fn local_only_journey(context: &TestContext) -> Result<()> {
     Ok(())
 }
 
-async fn run_and_approve_locally(
+pub(super) async fn run_and_approve_locally(
     driver: &WebDriver,
     agent: &FakeAgent,
     repository: &GitFixture,

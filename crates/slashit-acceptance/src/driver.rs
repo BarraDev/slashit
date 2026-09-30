@@ -18,6 +18,7 @@ use std::time::Duration;
 use thirtyfour::prelude::*;
 
 use crate::context::Environment;
+use crate::developer_tools;
 use crate::ports::{self, ReservedPort};
 use crate::process::OwnedProcess;
 use crate::state::StateRoot;
@@ -76,6 +77,13 @@ impl Session {
         // environment. Setting it here is what keeps the run off the
         // developer's real SlashIt state.
         state.apply_to(&mut command);
+        // Last, for the same reason: whatever PATH the journey asked for, the
+        // application must not find a review tool the developer installed.
+        let path = developer_tools::requested_path(child_env, std::env::var_os("PATH"));
+        command.env(
+            "PATH",
+            developer_tools::isolate(&path, &state.path().join("isolated-path"))?,
+        );
         command
             .stdout(Stdio::from(log.try_clone().context("clone the log handle")?))
             .stderr(Stdio::from(log));
