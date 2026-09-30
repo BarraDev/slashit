@@ -4342,7 +4342,7 @@ async fn link_pr_to_task_reserved(
     pr_url: &str,
     reservation: Option<crate::queue::PrHelperLease>,
 ) -> Result<(), PrLinkFailure> {
-    let remote_state = fetch_pr_state(pr_url).await;
+    let remote_state = fetch_pr_state(&state.pr_statuses, pr_url).await;
     let merged = matches!(remote_state.as_deref(), Some("MERGED"));
 
     let not_linked = || {
@@ -4494,22 +4494,109 @@ fn apply_pr_link(task: &mut Task, pr_url: &str, remote_state: Option<&str>) {
     }
 }
 
-/// Fetch the GitHub-reported state ("OPEN" | "CLOSED" | "MERGED") for a PR URL.
-/// Returns None if `gh` fails or the response is unparseable.
-async fn fetch_pr_state(pr_url: &str) -> Option<String> {
-    let (repo, number) = parse_pr_url(pr_url).ok()?;
-    let output = tokio::process::Command::new("gh")
-        .args(["pr", "view", &number, "--repo", &repo, "--json", "state"])
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// The pull request a GitHub pull request URL names.
+fn pr_key_for_url(pr_url: &str) -> Option<crate::pr_status::PrKey> {
+    match parse_pr_url_to_ref(pr_url)? {
+        ExternalRef::GithubPr { repo, number, .. } => Some(crate::pr_status::PrKey::new(repo, number)),
+        _ => None,
     }
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    json.get("state")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_uppercase())
+}
+
+/// Ask GitHub about the pull request at `pr_url`, through the same owner the
+/// background poll uses, so the board's cache gets the whole answer too.
+async fn refresh_pr_url(
+    statuses: &crate::pr_status::PrStatuses,
+    pr_url: &str,
+) -> Result<crate::pr_status::PrStatus, String> {
+    let key = pr_key_for_url(pr_url).ok_or_else(|| format!("{pr_url} is not a GitHub pull request URL"))?;
+    statuses.refresh(&key).await.map_err(|e| e.message)
+}
+
+/// The state ("OPEN" | "CLOSED" | "MERGED") GitHub reports for `pr_url`, or
+/// `None` when it cannot be read or is not one of those.
+async fn fetch_pr_state(statuses: &crate::pr_status::PrStatuses, pr_url: &str) -> Option<String> {
+    let status = refresh_pr_url(statuses, pr_url).await.ok()?;
+    status.state.as_recorded().map(str::to_string)
+}
+
+/// What GitHub last said about the pull requests linked to `project_id`'s
+/// tasks, from memory. Never runs `gh` and never reads the disk, so the board
+/// can ask on every refresh.
+#[tauri::command]
+pub async fn list_pr_statuses(
+    state: tauri::State<'_, crate::AppState>,
+    project_id: String,
+) -> Result<Vec<crate::pr_status::PrStatusEntry>, String> {
+    let project_uuid = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
+    Ok(pr_statuses_for_project(&state.task.tasks, &state.pr_statuses, project_uuid).await)
+}
+
+async fn pr_statuses_for_project(
+    tasks: &Tasks,
+    statuses: &crate::pr_status::PrStatuses,
+    project_id: Uuid,
+) -> Vec<crate::pr_status::PrStatusEntry> {
+    let keys: Vec<crate::pr_status::PrKey> = tasks
+        .read()
+        .await
+        .values()
+        .filter(|t| t.project_id == project_id)
+        .flat_map(|t| t.external_refs.iter())
+        .filter_map(|r| match r {
+            ExternalRef::GithubPr { repo, number, .. } => Some(crate::pr_status::PrKey::new(repo.clone(), *number)),
+            _ => None,
+        })
+        .collect();
+    statuses.entries_for(keys.iter())
+}
+
+/// Ask GitHub about `task_id`'s open pull requests now, and act on what it
+/// says exactly as the background poll would: a merge finishes the task and
+/// a closure is recorded only where a delivered pull request lives, and an
+/// unchanged state writes nothing. Never moves a task between columns and
+/// never ends the work running on it.
+///
+/// Answers with the refreshed cache entries; a failed refresh is in its
+/// entry's `error`, beside the last good status.
+#[tauri::command]
+pub async fn refresh_pr_status(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<Vec<crate::pr_status::PrStatusEntry>, String> {
+    let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    let keys: Vec<crate::pr_status::PrKey> = {
+        let tasks = state.task.tasks.read().await;
+        let task = tasks.get(&task_uuid).ok_or("Task not found")?;
+        task.external_refs
+            .iter()
+            .filter_map(|r| match r {
+                ExternalRef::GithubPr { repo, number, state, .. }
+                    if !state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("MERGED") || s.eq_ignore_ascii_case("CLOSED")) =>
+                {
+                    Some(crate::pr_status::PrKey::new(repo.clone(), *number))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    for key in &keys {
+        if let Ok(status) = state.pr_statuses.refresh(key).await {
+            if let Some(executor) = state.executor.get() {
+                executor.apply_polled_pr_state(task_uuid, key, status.state).await;
+            }
+        }
+    }
+    Ok(state.pr_statuses.entries_for(keys.iter()))
+}
+
+/// Whether recording `remote` for `pr_url` would change `task`: a reference
+/// to that pull request records another state, or the task would move.
+fn pr_refresh_changes(task: &Task, pr_url: &str, remote: &str) -> bool {
+    let moves = matches!(remote, "CLOSED" | "OPEN") && task.status != TaskStatus::PrCreated;
+    let restates = task.external_refs.iter().any(|r| {
+        matches!(r, ExternalRef::GithubPr { url, state, .. } if url == pr_url && state.as_deref() != Some(remote))
+    });
+    moves || restates
 }
 
 #[tauri::command]
@@ -4530,9 +4617,24 @@ pub async fn refresh_task_pr_state(
             .ok_or("Task has no PR linked")?
     };
 
-    let Some(remote_state) = fetch_pr_state(&pr_url).await else {
-        return Err("Failed to fetch PR state from gh".to_string());
+    let status = refresh_pr_url(&state.pr_statuses, &pr_url)
+        .await
+        .map_err(|e| format!("Could not read the pull request from GitHub: {e}"))?;
+    let Some(remote_state) = status.state.as_recorded().map(str::to_string) else {
+        return Err("GitHub reported a pull request state SlashIt does not recognize".to_string());
     };
+
+    // Asking again is not a change. A pull request whose state and task are
+    // already what GitHub says is answered from the record, without taking
+    // the task from whatever is working on it and without a write. A merge is
+    // never skipped: finishing the task is what it asks for.
+    if remote_state != "MERGED" {
+        let tasks = state.task.tasks.read().await;
+        let task = tasks.get(&task_uuid).ok_or("Task not found")?;
+        if !pr_refresh_changes(task, &pr_url, &remote_state) {
+            return Ok(Some(task.clone()));
+        }
+    }
 
     // The refreshed state is recorded first and unconditionally, for the same
     // reason `link_pr_to_task` does it: what GitHub reports is true regardless
@@ -4813,143 +4915,6 @@ async fn jj_backing_git_dir(working_dir: &str) -> Result<String, String> {
         ));
     }
     Ok(git_dir)
-}
-
-/// PR status from GitHub
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PrStatus {
-    pub state: PrState,
-    pub checks_passing: Option<bool>,
-    pub review_decision: Option<ReviewDecision>,
-    pub mergeable: Option<Mergeability>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrState {
-    Open,
-    Closed,
-    Merged,
-    Unknown,
-}
-
-impl PrState {
-    fn from_gh(s: &str) -> Self {
-        match s {
-            "OPEN" => Self::Open,
-            "CLOSED" => Self::Closed,
-            "MERGED" => Self::Merged,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReviewDecision {
-    Approved,
-    ChangesRequested,
-    ReviewRequired,
-}
-
-impl ReviewDecision {
-    fn from_gh(s: &str) -> Option<Self> {
-        match s {
-            "APPROVED" => Some(Self::Approved),
-            "CHANGES_REQUESTED" => Some(Self::ChangesRequested),
-            "REVIEW_REQUIRED" => Some(Self::ReviewRequired),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mergeability {
-    Mergeable,
-    Conflicting,
-    Unknown,
-}
-
-impl Mergeability {
-    fn from_gh(s: &str) -> Option<Self> {
-        match s {
-            "MERGEABLE" => Some(Self::Mergeable),
-            "CONFLICTING" => Some(Self::Conflicting),
-            "UNKNOWN" => Some(Self::Unknown),
-            _ => None,
-        }
-    }
-}
-
-#[tauri::command]
-pub async fn get_pr_status(
-    pr_url: String,
-) -> Result<PrStatus, String> {
-    // Parse PR URL: https://github.com/{owner}/{repo}/pull/{number}
-    let parts: Vec<&str> = pr_url.trim_end_matches('/').split('/').collect();
-
-    let pull_idx = parts.iter().position(|&p| p == "pull")
-        .ok_or("Not a GitHub PR URL (missing /pull/ segment)")?;
-
-    if pull_idx + 1 >= parts.len() {
-        return Err("PR URL missing number after /pull/".to_string());
-    }
-
-    let number = parts[pull_idx + 1];
-    if !number.chars().all(|c| c.is_ascii_digit()) {
-        return Err(format!("Invalid PR number: {}", number));
-    }
-
-    let repo_idx = parts.iter().position(|&p| p == "github.com")
-        .ok_or("Not a GitHub URL")?;
-
-    if repo_idx + 2 >= pull_idx {
-        return Err("Invalid GitHub PR URL format".to_string());
-    }
-
-    let owner = parts[repo_idx + 1];
-    let repo = parts[repo_idx + 2];
-
-    let output = tokio::process::Command::new("gh")
-        .args([
-            "pr", "view", number,
-            "--repo", &format!("{}/{}", owner, repo),
-            "--json", "state,statusCheckRollup,reviewDecision,mergeable",
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run gh: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh pr view failed: {}", stderr));
-    }
-
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Failed to parse gh output: {}", e))?;
-
-    let state = PrState::from_gh(json["state"].as_str().unwrap_or("UNKNOWN"));
-    let review_decision = json["reviewDecision"].as_str().and_then(ReviewDecision::from_gh);
-    let mergeable = json["mergeable"].as_str().and_then(Mergeability::from_gh);
-
-    // Check passes if all conclusions are SUCCESS or NEUTRAL (SKIPPED is also OK)
-    let checks_passing = json["statusCheckRollup"].as_array().map(|checks| {
-        if checks.is_empty() {
-            return true;
-        }
-        checks.iter().all(|c| {
-            let conclusion = c["conclusion"].as_str().unwrap_or("");
-            matches!(conclusion, "SUCCESS" | "NEUTRAL" | "SKIPPED")
-        })
-    });
-
-    Ok(PrStatus {
-        state,
-        checks_passing,
-        review_decision,
-        mergeable,
-    })
 }
 
 #[cfg(test)]
@@ -5509,31 +5474,58 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────
-    // PrState / ReviewDecision / Mergeability parsing
+    // Pull request status: refresh no-ops and the board's cache read
     // ──────────────────────────────────────────────
 
-    #[test]
-    fn pr_state_from_gh_known_values() {
-        assert_eq!(PrState::from_gh("OPEN"), PrState::Open);
-        assert_eq!(PrState::from_gh("CLOSED"), PrState::Closed);
-        assert_eq!(PrState::from_gh("MERGED"), PrState::Merged);
-        assert_eq!(PrState::from_gh("garbage"), PrState::Unknown);
+    fn with_pr(status: TaskStatus, state: Option<&str>) -> Task {
+        let mut task = create_test_task_full("t", Uuid::new_v4(), status, 0);
+        task.external_refs.push(ExternalRef::GithubPr {
+            url: "https://github.com/o/r/pull/5".to_string(),
+            number: 5,
+            repo: "o/r".to_string(),
+            state: state.map(str::to_string),
+        });
+        task
     }
 
     #[test]
-    fn review_decision_from_gh_known_values() {
-        assert_eq!(ReviewDecision::from_gh("APPROVED"), Some(ReviewDecision::Approved));
-        assert_eq!(ReviewDecision::from_gh("CHANGES_REQUESTED"), Some(ReviewDecision::ChangesRequested));
-        assert_eq!(ReviewDecision::from_gh("REVIEW_REQUIRED"), Some(ReviewDecision::ReviewRequired));
-        assert_eq!(ReviewDecision::from_gh("OTHER"), None);
+    fn a_refresh_changes_the_task_only_when_the_state_or_the_column_would() {
+        let url = "https://github.com/o/r/pull/5";
+        assert!(!pr_refresh_changes(&with_pr(TaskStatus::PrCreated, Some("OPEN")), url, "OPEN"));
+        assert!(pr_refresh_changes(&with_pr(TaskStatus::PrCreated, None), url, "OPEN"));
+        assert!(pr_refresh_changes(&with_pr(TaskStatus::PrCreated, Some("OPEN")), url, "CLOSED"));
+        assert!(pr_refresh_changes(&with_pr(TaskStatus::HumanReview, Some("OPEN")), url, "OPEN"));
+        assert!(!pr_refresh_changes(&with_pr(TaskStatus::PrCreated, Some("OPEN")), "https://github.com/o/r/pull/6", "OPEN"));
     }
 
-    #[test]
-    fn mergeability_from_gh_known_values() {
-        assert_eq!(Mergeability::from_gh("MERGEABLE"), Some(Mergeability::Mergeable));
-        assert_eq!(Mergeability::from_gh("CONFLICTING"), Some(Mergeability::Conflicting));
-        assert_eq!(Mergeability::from_gh("UNKNOWN"), Some(Mergeability::Unknown));
-        assert_eq!(Mergeability::from_gh("other"), None);
+    #[tokio::test]
+    async fn the_board_reads_its_projects_pull_requests_from_memory_only() {
+        let statuses = crate::test_helpers::no_github();
+        let mine = with_pr(TaskStatus::PrCreated, Some("OPEN"));
+        let mut theirs = with_pr(TaskStatus::PrCreated, Some("OPEN"));
+        if let Some(ExternalRef::GithubPr { number, .. }) = theirs.external_refs.first_mut() {
+            *number = 6;
+        }
+        let project = mine.project_id;
+        let status = crate::pr_status::PrStatus {
+            state: crate::pr_status::PrState::Open,
+            checks: crate::pr_status::ChecksState::Pending,
+            failing_checks: vec![],
+            failing_check_count: 0,
+            review_decision: None,
+            mergeable: None,
+        };
+        statuses.remember(&crate::pr_status::PrKey::new("o/r", 5), status.clone());
+        statuses.remember(&crate::pr_status::PrKey::new("o/r", 6), status.clone());
+        let tasks: Tasks = Arc::new(RwLock::new(HashMap::from([(mine.id, mine), (theirs.id, theirs)])));
+
+        let entries = pr_statuses_for_project(&tasks, &statuses, project).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!((entries[0].number, entries[0].status.clone()), (5, Some(status)));
+        // `no_github` cannot run anything: had this asked GitHub, the entry
+        // would carry its "not installed" error.
+        assert!(entries[0].error.is_none());
+        assert!(pr_statuses_for_project(&tasks, &statuses, Uuid::new_v4()).await.is_empty());
     }
 
     // ──────────────────────────────────────────────

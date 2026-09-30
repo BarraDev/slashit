@@ -389,39 +389,43 @@ pub fn Kanban(
         }
     });
 
-    // Refresh PR state for any task with a linked PR on mount, so PrCreated
-    // tasks whose PR was merged externally get moved to Done.
-    {
-        let initial_pr_task_ids: Vec<String> = tasks_signal
+    // On mount, check any open pull request the background poll has no
+    // fresh reading for, so a PR merged while SlashIt was not looking
+    // finishes its task now rather than at the next poll. Pull requests with
+    // a fresh reading are left to the poll, which owns asking GitHub.
+    let pr_board = crate::components::pr_status::PrStatusBoard::get();
+    if let Some(board) = pr_board {
+        let project_id = project_id.clone();
+        let candidates: Vec<(String, Vec<crate::models::PrKey>)> = tasks_signal
             .get_untracked()
             .iter()
-            .filter(|t| t.pr_url.is_some() || t.external_refs.iter().any(|r| r.is_pr()))
-            .map(|t| t.id.to_string())
+            .map(|t| (t.id.to_string(), crate::components::pr_status::open_prs(t)))
+            .filter(|(_, keys)| !keys.is_empty())
             .collect();
-        for tid in initial_pr_task_ids {
-            spawn_local(async move {
-                if let Ok(Some(updated)) = refresh_task_pr_state(tid).await {
-                    // Only propagate if status or refs actually changed — a no-op
-                    // update would still trigger reactive re-renders and could
-                    // tear down open modals/menus.
-                    let snapshot = tasks_signal.get_untracked();
-                    let needs_update = snapshot.iter().any(|t| {
-                        t.id == updated.id
-                            && (t.status != updated.status
-                                || t.external_refs != updated.external_refs)
-                    });
-                    if needs_update {
-                        set_tasks_signal.update(|tasks| {
-                            if let Some(t) = tasks.iter_mut().find(|t| t.id == updated.id) {
-                                t.status = updated.status.clone();
-                                t.external_refs = updated.external_refs.clone();
-                                t.updated_at = updated.updated_at;
-                            }
-                        });
-                    }
+        spawn_local(async move {
+            let cached = crate::services::list_pr_statuses(project_id).await.unwrap_or_default();
+            let now = chrono::Utc::now();
+            board.replace(cached.clone(), now);
+            let fresh: std::collections::HashSet<crate::models::PrKey> = cached
+                .iter()
+                .filter(|e| !crate::components::pr_status::is_stale(e, now))
+                .map(|e| e.key())
+                .collect();
+            let mut asked = false;
+            for (task_id, keys) in candidates {
+                if keys.iter().all(|k| fresh.contains(k)) {
+                    continue;
                 }
-            });
-        }
+                asked = true;
+                if let Ok(entries) = crate::services::refresh_pr_status(task_id).await {
+                    board.merge(entries, chrono::Utc::now());
+                }
+            }
+            // A check may have finished a task whose pull request merged.
+            if asked {
+                refresh_tasks.try_run(());
+            }
+        });
     }
 
     let on_analyze_pr_comments = Callback::new({
@@ -2724,6 +2728,7 @@ fn KanbanTaskCard(
                                 })}
                                 {has_pr.then(|| {
                                     let task_for_refresh = task_for_pr_review.clone();
+                                    let pr_board = crate::components::pr_status::PrStatusBoard::get();
                                     view! {
                                         <button
                                             class="px-2 py-0.5 text-[10px] rounded bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 transition-colors"
@@ -2731,7 +2736,11 @@ fn KanbanTaskCard(
                                                 e.stop_propagation();
                                                 let task_id = task_for_refresh.id.to_string();
                                                 spawn_local(async move {
-                                                    match refresh_task_pr_state(task_id).await {
+                                                    let result = refresh_task_pr_state(task_id).await;
+                                                    if let Some(board) = pr_board {
+                                                        board.reload();
+                                                    }
+                                                    match result {
                                                         Ok(Some(updated)) => {
                                                             let new_status = updated.status.clone();
                                                             on_pr_created.run(updated);
@@ -2746,6 +2755,7 @@ fn KanbanTaskCard(
                                                     }
                                                 });
                                             }
+                                            data-testid="task-card-pr-refresh"
                                             title="Refresh PR state from GitHub"
                                         >
                                             "Refresh"

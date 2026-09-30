@@ -65,6 +65,9 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
     // poll, a live event saying a task changed, and a Stop. They overlap, so
     // each read takes a ticket and a late answer never overwrites a newer one.
     let order = StoredValue::new(ResponseOrder::default());
+    // What GitHub last said about this project's pull requests, read from the
+    // backend's cache on the same refresh as the tasks.
+    let pr_board = crate::components::pr_status::PrStatusBoard::provide(project_id.clone());
     let project_id_for_refresh = project_id.clone();
     let refresh_tasks = Callback::new(move |()| {
         let pid = project_id_for_refresh.clone();
@@ -74,6 +77,7 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
         let Some(ticket) = order.try_update_value(|o| o.issue()) else {
             return;
         };
+        pr_board.reload();
         spawn_local(async move {
             if let Ok(t) = list_tasks(pid).await {
                 let current = order.try_update_value(|o| o.accept(ticket)).unwrap_or(false);

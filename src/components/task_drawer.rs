@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::components::diff_viewer::DiffViewer;
 use crate::components::new_work_pause::NewWorkPauseNotice;
+use crate::components::pr_status::PullRequestSection;
 use crate::components::task_activity::TaskActivity;
 use crate::components::task_live::{
     format_elapsed, output_provenance, DrawerActions, OutputProvenance, RefreshGate, StartRequest,
@@ -441,6 +442,9 @@ pub fn TaskDrawer(
                     }>
                         <HumanReviewPanel task_id=task_id task=task apply_task=apply_task />
                     </Show>
+
+                    // Its pull request, when it has one.
+                    <PullRequestSection task_id=task_id task=task now=now refresh_tasks=refresh_tasks />
 
                     // How the task got here.
                     <TaskActivity task=task />

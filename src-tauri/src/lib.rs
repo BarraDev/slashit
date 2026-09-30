@@ -11,6 +11,8 @@ mod queue;
 mod pty;
 mod worktree;
 mod storage_accounting;
+/// What GitHub last said about the pull requests linked to tasks.
+pub mod pr_status;
 /// Building `AppState` once, for whichever front end wants it.
 pub mod lifecycle;
 pub mod app_core;
@@ -80,6 +82,10 @@ pub struct AppState {
     /// the executor and the IPC handlers, so every way of starting a task
     /// asks the same question.
     pub start_guard: Arc<queue::start_guard::StartGuard>,
+    /// The one owner of pull request status: the executor's background poll
+    /// and the refresh commands all ask GitHub through it, and the board
+    /// reads its cache.
+    pub pr_statuses: Arc<pr_status::PrStatuses>,
 }
 
 impl AppState {
@@ -198,6 +204,7 @@ pub fn run() {
                     events: events.clone(),
                     lifecycle: state.task_lifecycle_locks.clone(),
                     start_guard: state.start_guard.clone(),
+                    pr_statuses: state.pr_statuses.clone(),
                 },
             ));
             let _ = state.executor.set(executor.clone());
@@ -378,7 +385,8 @@ pub fn run() {
             find_pr_candidates,
             get_pr_push_recovery,
             recover_private_email_and_create_pr,
-            get_pr_status,
+            list_pr_statuses,
+            refresh_pr_status,
             analyze_pr_comments,
             address_pr_review,
             sync_pr_review_replies,
