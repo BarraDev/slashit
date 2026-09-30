@@ -1,10 +1,17 @@
-//! The two journeys that prove the harness itself.
+//! The journeys that prove the harness itself.
 //!
 //! They are deliberately few. Their job is not product coverage — it is to
 //! establish that a Rust test can start the real SlashIt desktop application,
 //! reach its frontend and its backend, restart it, and clean up after itself.
 //! Product acceptance coverage belongs in later suites built on these
 //! primitives.
+//!
+//! One more group, below the two application journeys, proves a narrower
+//! thing: that [`Provider::spawn`] actually waits for the native WebDriver to
+//! be ready rather than racing it. Those use a stand-in native driver
+//! (`src/bin/fake-native-driver.rs`) instead of the real application, because
+//! the race under test is between `tauri-driver` and its native driver, one
+//! layer below anything the application can influence.
 //!
 //! Run with:
 //!
@@ -21,7 +28,10 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use slashit_acceptance::driver::Provider;
 use slashit_acceptance::{ui, TestContext};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use thirtyfour::prelude::*;
 
 /// The button that opens the project wizard, and the wizard it opens.
@@ -233,4 +243,164 @@ fn mentions_project(listed: &Value, id: &str) -> bool {
                 .iter()
                 .any(|project| project.get("id").and_then(Value::as_str) == Some(id))
         })
+}
+
+// Below here: the native-driver readiness regression.
+//
+// A hosted run of PR #93 hit this for real once: `tauri-driver`'s own port
+// was open, `New Session` was sent, and `WebKitWebDriver` had not started
+// listening yet, so `tauri-driver`'s forward was refused. These tests use
+// `fake-native-driver` (`src/bin/fake-native-driver.rs`) — a stand-in that
+// can be told to delay listening, or to answer `POST /session` with a real
+// error — through the same `--native-driver` override the harness already
+// gives `tauri-driver` (`Provider::spawn`). Nothing here touches the real
+// application.
+
+/// Where this test's provider log goes. A directory under the system temp
+/// root, named for the test and unique enough that two runs of the whole
+/// suite never collide, kept only on failure.
+fn scratch_log(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "slashit-acc-driver-startup-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&dir).expect("create a scratch directory for the provider log");
+    dir.join("provider.log")
+}
+
+/// Capabilities `fake-native-driver` accepts. It never launches anything —
+/// `application` only needs the shape `tauri-driver`'s capability rewrite
+/// expects, never a real, existing path.
+fn fake_capabilities() -> Capabilities {
+    let mut capabilities = Capabilities::new();
+    capabilities
+        .set(
+            "tauri:options",
+            json!({ "application": "/nonexistent/fake-app", "args": [] }),
+        )
+        .expect("set tauri:options");
+    capabilities
+}
+
+/// A native driver that starts late must still be waited for.
+///
+/// RED against the code before this test was added: `Provider::spawn` waited
+/// only for `tauri-driver`'s own client port, so it returned as soon as that
+/// was open — while `fake-native-driver` was still three seconds from
+/// listening — and the `New Session` call that followed hit exactly the
+/// connection-refused forward the hosted run did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_native_driver_that_starts_late_is_still_waited_for() {
+    let fake = PathBuf::from(env!("CARGO_BIN_EXE_fake-native-driver"));
+    let log_path = scratch_log("starts-late");
+    let deadline = Instant::now() + Duration::from_secs(20);
+
+    let mut provider = Provider::spawn(Some(&fake), &log_path, deadline, |command| {
+        command.env("FAKE_NATIVE_DRIVER_DELAY_MS", "3000");
+        Ok(())
+    })
+    .await
+    .expect("a native driver that starts 3s late must still be waited for, not raced");
+
+    let driver = provider
+        .create_session(
+            fake_capabilities(),
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .await
+        .expect("session creation must succeed once the native driver becomes ready");
+
+    let _ = driver.quit().await;
+    provider
+        .shutdown()
+        .expect("the provider tree must tear down cleanly");
+    let _ = std::fs::remove_dir_all(log_path.parent().expect("log has a parent directory"));
+}
+
+/// A native driver that never starts must still fail inside its own bound,
+/// not hang, and not be retried against SESSION_TIMEOUT's full length.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_native_driver_that_never_starts_fails_within_the_deadline() {
+    let fake = PathBuf::from(env!("CARGO_BIN_EXE_fake-native-driver"));
+    let log_path = scratch_log("never-starts");
+    let budget = Duration::from_secs(3);
+    let deadline = Instant::now() + budget;
+
+    let started = Instant::now();
+    let result = Provider::spawn(Some(&fake), &log_path, deadline, |command| {
+        // Comfortably longer than any deadline this test uses.
+        command.env("FAKE_NATIVE_DRIVER_DELAY_MS", "600000");
+        Ok(())
+    })
+    .await;
+    let elapsed = started.elapsed();
+
+    let error = result.expect_err("a native driver that never listens must not wait forever");
+    assert!(
+        elapsed < budget + Duration::from_secs(2),
+        "the deadline ({budget:?}) was not honoured: spawn took {elapsed:?}"
+    );
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("native"),
+        "the failure should name the native driver, not just time out silently: {message}"
+    );
+    let _ = std::fs::remove_dir_all(log_path.parent().expect("log has a parent directory"));
+}
+
+/// A real WebDriver protocol error from `POST /session` must fail promptly
+/// and must not be retried by anything this crate added: this is a readiness
+/// wait, not a session-creation retry, and the two must not be confused.
+///
+/// `fake-native-driver` answers with HTTP 400 rather than 500 so this stays
+/// true to that scope: `thirtyfour`'s own `start_session` retries a bare 500
+/// once, on the theory that some WebDriver servers report a real, momentary
+/// startup failure that way (`session/create.rs`). This test is not a claim
+/// about that; it is a claim that nothing *this crate* added retries a
+/// genuine 4xx protocol error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_session_creation_error_is_not_retried() {
+    let fake = PathBuf::from(env!("CARGO_BIN_EXE_fake-native-driver"));
+    let log_path = scratch_log("session-rejected");
+    // Generous: proves the failure is fast on its own merits, not merely
+    // faster than some arbitrary short budget.
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    let mut provider = Provider::spawn(Some(&fake), &log_path, deadline, |command| {
+        command.env("FAKE_NATIVE_DRIVER_REJECT_SESSION", "1");
+        Ok(())
+    })
+    .await
+    .expect("a native driver with no artificial delay must be ready almost immediately");
+
+    let started = Instant::now();
+    let result = provider
+        .create_session(
+            fake_capabilities(),
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    result.expect_err("fake-native-driver was told to reject every session");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a real protocol error must fail promptly, not after a retry/backoff loop: took {elapsed:?}"
+    );
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let session_attempts = log.matches("POST /session").count();
+    assert_eq!(
+        session_attempts, 1,
+        "session creation must be attempted exactly once, never retried: log was:\n{log}"
+    );
+
+    provider
+        .shutdown()
+        .expect("the provider tree must tear down cleanly even after a rejected session");
+    let _ = std::fs::remove_dir_all(log_path.parent().expect("log has a parent directory"));
 }

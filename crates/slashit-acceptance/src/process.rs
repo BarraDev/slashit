@@ -21,6 +21,7 @@ const KILL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A child process that leads its own process group, together with every
 /// descendant that group ever gains.
+#[derive(Debug)]
 pub struct OwnedProcess {
     label: String,
     child: Child,

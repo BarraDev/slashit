@@ -88,6 +88,75 @@ pub async fn wait_until_listening(port: u16, timeout: Duration, what: &str) -> R
     )
 }
 
+/// Block until an HTTP GET on `port`/`path` returns a successful status, or
+/// fail with a useful timeout.
+///
+/// This is not a generic HTTP client wait: it exists for exactly one
+/// contract, `WebKitWebDriver`'s `GET /status` (the W3C readiness endpoint,
+/// `{"value":{"ready":true,...}}` once the server can accept a session).
+/// `tauri-driver` spawns that process and starts forwarding requests to it
+/// immediately, without waiting for it to be listening
+/// (`crates/tauri-driver/src/main.rs` upstream), so a connection refused here
+/// is the expected, retryable shape of "not up yet" -- it is not evidence of
+/// a permanent problem until the deadline passes. Any other failure while
+/// reading the response (a reset mid-response, a malformed status line) is
+/// treated the same way: retried, because during startup those are at least
+/// as likely to be transient as a refused connection, and the deadline is
+/// what turns "not ready yet" into a real failure either way.
+pub async fn wait_until_http_ready(
+    port: u16,
+    path: &str,
+    timeout: Duration,
+    what: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error: Option<String> = None;
+    while Instant::now() < deadline {
+        match http_get_status(port, path).await {
+            Ok(status) if (200..300).contains(&status) => return Ok(()),
+            Ok(status) => last_error = Some(format!("HTTP {status}")),
+            Err(e) => last_error = Some(e.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!(
+        "{what} never answered {path} on 127.0.0.1:{port} with success within {}s{}",
+        timeout.as_secs(),
+        last_error
+            .map(|e| format!(" (last attempt: {e})"))
+            .unwrap_or_default()
+    )
+}
+
+/// One GET, no retry, no connection reuse: the status code if a complete
+/// HTTP response was read, or the error that stopped it (most commonly
+/// "connection refused" while the server is still starting).
+async fn http_get_status(port: u16, path: &str) -> Result<u16> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .context("connect")?;
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .context("write request")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .await
+        .context("read status line")?;
+
+    // "HTTP/1.1 200 OK" -- the code is the second whitespace-separated field.
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .with_context(|| format!("not an HTTP status line: {status_line:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +212,74 @@ mod tests {
             .expect("a genuine listener must be reported as listening");
     }
 
+    /// The success path for [`wait_until_http_ready`]: a real HTTP response
+    /// with a 2xx status is recognised as readiness.
+    #[tokio::test]
+    async fn an_http_endpoint_answering_200_is_recognised() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a listener");
+        let port = listener.local_addr().expect("local address").port();
+        tokio::spawn(respond_once(listener, "HTTP/1.1 200 OK\r\n\r\n"));
+
+        wait_until_http_ready(port, "/status", Duration::from_secs(5), "a native driver")
+            .await
+            .expect("a 200 response must be recognised as ready");
+    }
+
+    /// The one thing this wait exists for: a connection refused while the
+    /// server has not started listening yet must be retried, not treated as
+    /// the final answer, right up until it actually comes up.
+    #[tokio::test]
+    async fn a_late_http_endpoint_is_waited_for_rather_than_raced() {
+        let port = {
+            // Reserve a real port, then let it go: nothing listens on it
+            // until the delayed task below binds it, which is exactly the
+            // "spawned but not yet listening" gap this wait exists to cross.
+            let probe = TcpListener::bind("127.0.0.1:0").expect("bind a probe listener");
+            probe.local_addr().expect("local address").port()
+        };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let listener =
+                tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("bind late");
+            respond_once_tokio(listener, "HTTP/1.1 200 OK\r\n\r\n").await;
+        });
+
+        let started = Instant::now();
+        wait_until_http_ready(port, "/status", Duration::from_secs(5), "a native driver")
+            .await
+            .expect("a server that starts late must still be waited for");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "the wait returned before the server could plausibly have started: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Respond to exactly one connection with `response`, from a std
+    /// listener handed off to a blocking task (used where the listener must
+    /// be bound before the task starts, to close the reservation gap).
+    async fn respond_once(listener: TcpListener, response: &'static str) {
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().expect("accept a connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf); // drain the request; content unused
+            let _ = stream.write_all(response.as_bytes());
+        })
+        .await
+        .expect("responder task must not panic");
+    }
+
+    /// Same as [`respond_once`], for a listener that was bound with tokio.
+    async fn respond_once_tokio(listener: tokio::net::TcpListener, response: &'static str) {
+        use tokio::io::AsyncWriteExt;
+        let (mut stream, _) = listener.accept().await.expect("accept a connection");
+        let mut buf = [0u8; 1024];
+        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+
     /// When the wait runs out, its message is often the only evidence a CI log
     /// carries about what failed, so it has to name both the port and what was
     /// expected on it.
@@ -162,5 +299,19 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("65000"), "message: {message}");
         assert!(message.contains("a provider"), "message: {message}");
+    }
+
+    /// Same proof as its `wait_until_listening` sibling above, for the HTTP
+    /// variant: nothing ever answers, so the deadline is the only thing that
+    /// can end the wait, and its message has to say enough to act on.
+    #[tokio::test]
+    async fn an_http_wait_that_runs_out_of_time_names_the_port_and_the_path() {
+        let err = wait_until_http_ready(65000, "/status", Duration::ZERO, "a native driver")
+            .await
+            .expect_err("a deadline that has already passed must fail");
+        let message = err.to_string();
+        assert!(message.contains("65000"), "message: {message}");
+        assert!(message.contains("/status"), "message: {message}");
+        assert!(message.contains("a native driver"), "message: {message}");
     }
 }

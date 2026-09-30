@@ -20,7 +20,7 @@ sha2 = "0.10"
 # it makes every session creation hang until the timeout, and it does not even
 # drop the heavy TLS backend. Left at defaults deliberately.
 thirtyfour = "0.37"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 
 # The acceptance runtime -- process groups, POSIX signals, /proc, XDG roots --
 # is implemented for Linux only, and the modules that need this dependency are
@@ -48,6 +48,14 @@ run-acceptance = []
 [[test]]
 name = "acceptance"
 path = "tests/acceptance.rs"
+required-features = ["run-acceptance"]
+
+# A stand-in native driver, used only by the readiness regression in
+# `tests/acceptance.rs`. Gated the same way that test target is: it has no
+# reason to exist in a plain `cargo build`.
+[[bin]]
+name = "fake-native-driver"
+path = "src/bin/fake-native-driver.rs"
 required-features = ["run-acceptance"]
 
 # Kept as its own target rather than folded into the journeys above. The two
