@@ -880,6 +880,9 @@ mod tests {
             path
         }
 
+        /// Linux-only: the zombie check reads `/proc`, which other Unix
+        /// systems do not have.
+        #[cfg(target_os = "linux")]
         fn alive(pid: i32) -> bool {
             // Signal 0 checks existence. A zombie still exists, so also read
             // its state: an unreaped zombie of ours is not "left running".
@@ -979,14 +982,20 @@ esac"#,
             assert_eq!(entry.status, Some(good), "a timeout keeps the last good status");
             assert_eq!(entry.error.map(|e| e.kind), Some(PrFetchErrorKind::Timeout));
 
-            let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap().trim().parse::<i32>().unwrap();
-            let (leader, grandchild) = (read("leader"), read("grandchild"));
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while (alive(leader) || alive(grandchild)) && std::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            // Whether the group kill reached every process is checked only
+            // where `alive` can tell a zombie from a running process.
+            #[cfg(target_os = "linux")]
+            {
+                let read =
+                    |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap().trim().parse::<i32>().unwrap();
+                let (leader, grandchild) = (read("leader"), read("grandchild"));
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while (alive(leader) || alive(grandchild)) && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(!alive(leader), "the timed-out gh is still running");
+                assert!(!alive(grandchild), "a process the timed-out gh started is still running");
             }
-            assert!(!alive(leader), "the timed-out gh is still running");
-            assert!(!alive(grandchild), "a process the timed-out gh started is still running");
         }
     }
 }

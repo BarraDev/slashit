@@ -124,8 +124,10 @@ impl PrStatusBoard {
 }
 
 /// Ask GitHub about `task_id`'s open pull requests now and show the answer on
-/// `board`. Observation only: the backend acts on it exactly as its
-/// background poll would, and never moves the task or ends its work.
+/// `board`. The backend acts on it exactly as its background poll would: an
+/// open pull request never moves the task or ends its work, and only a task
+/// in a delivery column (Pull Request Created, Human Review, Done) is
+/// finished by a merge or given a closure as its error.
 ///
 /// Answers with the refreshed entries; a pull request GitHub could not be
 /// asked about has its reason in its entry's `error`.

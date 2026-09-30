@@ -2743,9 +2743,9 @@ fn KanbanTaskCard(
                                             on:click=move |e: web_sys::MouseEvent| {
                                                 e.stop_propagation();
                                                 let task_id = task_for_refresh.id.to_string();
-                                                // Observation only, like the drawer's Refresh: the
-                                                // backend acts on the answer as its poll would, and
-                                                // the task list is read again for anything that did.
+                                                // Like the drawer's Refresh: the backend acts on the
+                                                // answer as its poll would, and the task list is read
+                                                // again for anything that did.
                                                 spawn_local(async move {
                                                     let refreshed = crate::components::pr_status::refresh_task_prs(pr_board, task_id).await;
                                                     match refreshed.as_deref().map_err(String::clone).and_then(crate::components::pr_status::refresh_outcome) {
