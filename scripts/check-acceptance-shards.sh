@@ -17,6 +17,24 @@ fail() {
 
 [[ -f $manifest ]] || fail "$manifest is missing"
 
+# A row that isn't exactly "<shard><TAB><name>", with the shard one of the
+# three CI actually runs (.github/workflows/ci.yml's `shard: [1, 2, 3]`
+# matrix), would still contribute its name to $manifest_names below via
+# `cut -f2` -- so a typo'd shard number, a stray extra field, or an empty
+# name would pass the coverage comparison while never actually running in
+# any real CI shard job. Reject that shape before it can hide behind a
+# passing coverage check.
+bad_rows=$(awk -F'\t' '
+  /^[[:space:]]*#/ { next }
+  /^[[:space:]]*$/ { next }
+  NF != 2 || $1 !~ /^[123]$/ || $2 == "" { print NR": "$0 }
+' "$manifest")
+if [[ -n $bad_rows ]]; then
+  echo "check-acceptance-shards: malformed rows in $manifest (need exactly '<1|2|3><TAB><test name>'):" >&2
+  echo "$bad_rows" >&2
+  fail "fix the rows above"
+fi
+
 actual=$(cargo test -q -p slashit-acceptance --features run-acceptance --test product_acceptance -- --list |
   sed -n 's/: test$//p' | sort)
 [[ -n $actual ]] || fail "\`cargo test --list\` reported no product acceptance tests; something upstream is broken"
