@@ -27,6 +27,12 @@
 //!   ready from the first poll. Models the other half of the readiness
 //!   contract: a process that is listening and answering 2xx, but that has
 //!   not yet said it can accept a session.
+//! - `FAKE_NATIVE_DRIVER_STALL_STATUS_MS`: milliseconds to hold a `GET
+//!   /status` connection open, accepted but silent, before writing anything
+//!   back. Defaults to 0, i.e. answer immediately. Models a native driver
+//!   that is accepting connections but is wedged before it can answer --
+//!   the one shape a per-attempt timeout, not just the overall deadline,
+//!   has to cover.
 //!
 //! Protocol coverage is deliberately minimal: `GET /status` (the readiness
 //! endpoint this regression exists to wait for), `POST /session` (the one
@@ -71,6 +77,10 @@ fn main() -> ExitCode {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let stall_status_ms: u64 = env::var("FAKE_NATIVE_DRIVER_STALL_STATUS_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     // The exact condition under test: this process exists (it is past
     // argument parsing and could already have been waited on by a process
@@ -87,7 +97,7 @@ fn main() -> ExitCode {
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        serve_connection(stream, reject_session, not_ready_polls);
+        serve_connection(stream, reject_session, not_ready_polls, stall_status_ms);
     }
     ExitCode::SUCCESS
 }
@@ -98,7 +108,12 @@ fn main() -> ExitCode {
 /// for it instead of trusting an in-process count the harness never sees.
 /// Every `GET /status` poll's outcome is printed the same way, so a test can
 /// prove the order readiness was observed in relative to `POST /session`.
-fn serve_connection(mut stream: TcpStream, reject_session: bool, not_ready_polls: usize) {
+fn serve_connection(
+    mut stream: TcpStream,
+    reject_session: bool,
+    not_ready_polls: usize,
+    stall_status_ms: u64,
+) {
     let peer = stream.try_clone().expect("clone stream for reading");
     let mut reader = BufReader::new(peer);
 
@@ -143,6 +158,10 @@ fn serve_connection(mut stream: TcpStream, reject_session: bool, not_ready_polls
 
         let result = match (method.as_str(), path.as_str()) {
             ("GET", "/status") => {
+                if stall_status_ms > 0 {
+                    eprintln!("fake-native-driver: GET /status stalling {stall_status_ms}ms");
+                    std::thread::sleep(Duration::from_millis(stall_status_ms));
+                }
                 let poll = STATUS_POLLS.fetch_add(1, Ordering::SeqCst);
                 let ready = poll >= not_ready_polls;
                 eprintln!("fake-native-driver: GET /status ready={ready}");

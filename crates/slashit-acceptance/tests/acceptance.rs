@@ -417,6 +417,60 @@ async fn a_native_driver_that_never_starts_fails_within_the_deadline() {
     let _ = std::fs::remove_dir_all(log_path.parent().expect("log has a parent directory"));
 }
 
+/// A native driver that accepts the `GET /status` connection and then
+/// withholds the response must not be able to stall a single attempt past
+/// the provider's own deadline.
+///
+/// RED against the code before the per-attempt timeout was added:
+/// `http_get_webdriver_ready` had no I/O timeout of its own, so the read
+/// against a peer that accepted the connection and then wrote nothing back
+/// blocked forever, and the deadline check between attempts was never
+/// reached. The outer `tokio::time::timeout` below exists only to bound that
+/// regression itself -- it is not the mechanism under test.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_native_driver_that_stalls_its_status_response_fails_within_the_deadline() {
+    let fake = PathBuf::from(env!("CARGO_BIN_EXE_fake-native-driver"));
+    let log_path = scratch_log("stalls-status");
+    // Short and test-only: long enough for tauri-driver's own port to come
+    // up, short enough to keep the regression fast.
+    let budget = Duration::from_secs(2);
+    let deadline = Instant::now() + budget;
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(budget + Duration::from_secs(10), async {
+        Provider::spawn(Some(&fake), &log_path, deadline, |command| {
+            // Comfortably longer than `budget`, so a single stalled attempt
+            // that ignored the deadline would still be "in flight" long
+            // after the outer watchdog below gives up.
+            command.env("FAKE_NATIVE_DRIVER_STALL_STATUS_MS", "60000");
+            Ok(())
+        })
+        .await
+    })
+    .await
+    .expect("the provider must fail on its own deadline, not rely on an outer watchdog");
+    let elapsed = started.elapsed();
+
+    let error = result.expect_err("a native driver that never answers /status must not be ready");
+    assert!(
+        elapsed < budget + Duration::from_secs(2),
+        "a stalled status attempt must not outlive the provider's own deadline ({budget:?}): took {elapsed:?}"
+    );
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("native") && message.contains("status"),
+        "the failure should name the native driver's status readiness: {message}"
+    );
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !log.contains("POST /session"),
+        "no session must be attempted against a native driver that never reported ready: log was:\n{log}"
+    );
+
+    let _ = std::fs::remove_dir_all(log_path.parent().expect("log has a parent directory"));
+}
+
 /// A real WebDriver protocol error from `POST /session` must fail promptly
 /// and must not be retried by anything this crate added: this is a readiness
 /// wait, not a session-creation retry, and the two must not be confused.

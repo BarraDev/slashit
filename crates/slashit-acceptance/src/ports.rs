@@ -114,12 +114,25 @@ pub async fn wait_until_webdriver_ready(
     let deadline = Instant::now() + timeout;
     let mut last_error: Option<String> = None;
     while Instant::now() < deadline {
-        match http_get_webdriver_ready(port, path).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => last_error = Some("status reported ready:false".to_string()),
-            Err(e) => last_error = Some(e.to_string()),
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Every I/O step inside `http_get_webdriver_ready` -- connect, write,
+        // status-line read, header reads, body read -- has no timeout of its
+        // own. A native driver that accepts the TCP connection and then never
+        // finishes the response could otherwise stall a single attempt past
+        // this function's own deadline. Wrapping the whole attempt in the
+        // *remaining* budget, rather than a fresh per-attempt timeout, keeps
+        // one shared deadline in force instead of letting retries multiply it.
+        match tokio::time::timeout(remaining, http_get_webdriver_ready(port, path)).await {
+            Ok(Ok(true)) => return Ok(()),
+            Ok(Ok(false)) => last_error = Some("status reported ready:false".to_string()),
+            Ok(Err(e)) => last_error = Some(e.to_string()),
+            Err(_) => {
+                last_error =
+                    Some("status request did not complete before the startup deadline".to_string());
+            }
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
     }
     bail!(
         "{what} never answered {path} on 127.0.0.1:{port} with ready:true within {}s{}",
@@ -352,6 +365,64 @@ mod tests {
         wait_until_webdriver_ready(port, "/status", Duration::from_millis(300), "a native driver")
             .await
             .expect_err("an implausible Content-Length must fail gracefully, not abort the process");
+    }
+
+    /// The regression this fix exists for: a peer that accepts the TCP
+    /// connection and then never sends anything back must not be able to
+    /// stall a single attempt past the wait's own deadline. Before the fix,
+    /// `http_get_webdriver_ready`'s `read_line` had no timeout of its own, so
+    /// this attempt would hang forever and the deadline check between
+    /// attempts would never be reached.
+    ///
+    /// An outer watchdog bounds the regression itself well above the 1s
+    /// deadline under test, so a real failure (the fix regressing) reports as
+    /// a normal assertion failure instead of hanging the test suite.
+    #[tokio::test]
+    async fn a_peer_that_accepts_and_never_responds_does_not_outlive_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a listener");
+        let port = listener.local_addr().expect("local address").port();
+        tokio::spawn(accept_and_never_respond(listener));
+
+        let deadline_budget = Duration::from_secs(1);
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            deadline_budget + Duration::from_secs(5),
+            wait_until_webdriver_ready(port, "/status", deadline_budget, "a native driver"),
+        )
+        .await
+        .expect("the wait must respect its own deadline instead of relying on an outer watchdog");
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("a peer that never responds must never count as ready");
+        assert!(
+            elapsed < deadline_budget + Duration::from_secs(1),
+            "a stalled attempt must not outlive the shared deadline: {elapsed:?}"
+        );
+        assert!(
+            err.to_string().contains("did not complete before the startup deadline"),
+            "the failure should name the stalled attempt, not a generic timeout: {err}"
+        );
+    }
+
+    /// Accept every connection this listener ever receives, read nothing back
+    /// from it, and never write a response -- the shape of a native driver
+    /// that is accepting connections but is wedged before it can answer.
+    async fn accept_and_never_respond(listener: TcpListener) {
+        listener
+            .set_nonblocking(true)
+            .expect("mark the listener non-blocking before handing it to tokio");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("adopt std listener into tokio");
+        // Accepted connections are kept here, alive for as long as this task
+        // runs, rather than dropped -- dropping would close the socket and
+        // turn "accepted but silent" into "connection reset", a different
+        // failure shape than the one under test.
+        let mut held = Vec::new();
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            held.push(stream);
+        }
     }
 
     /// The one thing this wait exists for: a native driver that is not ready
