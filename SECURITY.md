@@ -14,7 +14,7 @@ SlashIt is pre-1.0 software. Security fixes are currently provided for the lates
 
 Please do not open a public GitHub issue for security vulnerabilities.
 
-Report vulnerabilities by emailing <admin@barradev.com> with:
+Report vulnerabilities privately, either through GitHub's private vulnerability reporting (the **Report a vulnerability** button on this repository's **Security** tab) or by emailing <admin@barradev.com>. Include:
 
 - A concise description of the issue
 - Steps to reproduce or a proof of concept, if available

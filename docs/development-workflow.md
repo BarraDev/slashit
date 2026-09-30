@@ -561,7 +561,42 @@ local checks too, and do not merge with a known blocker open.
 | Abandoning or deleting work or workspaces you do not own | Explicit authorization from the owner |
 | Merging, force-pushing or otherwise rewriting a published checkpoint, deleting remote branches or tags, and changing repository or GitHub settings | The repository owner's explicit approval, every time |
 
-## 14. Failure gates
+## 14. Merge gates and security checks
+
+`main` has no branch protection or required status checks. The gates below are
+owner policy, applied by whoever merges.
+
+**Wait for green before merging.** Every functional check in `ci.yml`:
+
+- Agent docs
+- Lint, test and build (ubuntu-22.04)
+- Compile check (windows-latest)
+- Compile check (macos-latest)
+- Desktop acceptance / harness
+- Desktop acceptance / product shard 1, 2 and 3
+
+**Advisory; may finish after the merge.**
+
+- CodeQL (GitHub default setup: Actions, JavaScript/TypeScript and Rust, on
+  pull requests, pushes to `main`, and weekly). A pending CodeQL run does not
+  block a merge once the functional checks are green. A CodeQL check that has
+  already finished red must be inspected before merging. A confirmed false
+  positive is dismissed in the code scanning alert with a factual reason;
+  do not rewrite otherwise-correct code, including test code, just to turn
+  the check green.
+- CodeRabbit.
+
+**Asynchronous and periodic.** Review the repository's Security tab weekly or
+once per development round:
+
+- Dependabot alerts: triage Critical and High within one working day; batch
+  Medium and Low into a periodic dependency update.
+- Secret scanning alerts. Push protection is enabled, so a push containing a
+  detected secret is rejected before it reaches GitHub.
+- New CodeQL alerts on `main`, from post-merge and weekly runs. They stay
+  actionable even though CodeQL does not gate the pull request.
+
+## 15. Failure gates
 
 Stop and report instead of guessing when:
 
