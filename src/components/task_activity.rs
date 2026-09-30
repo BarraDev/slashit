@@ -78,7 +78,7 @@ pub fn visible_rows(rows: &[ActivityRow], expanded: bool) -> (&[ActivityRow], us
 
 /// The user's local offset from UTC at `at`, as the webview's time zone has
 /// it then.
-fn local_offset_at(at: DateTime<Utc>) -> FixedOffset {
+pub fn local_offset_at(at: DateTime<Utc>) -> FixedOffset {
     let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(at.timestamp_millis() as f64));
     // `getTimezoneOffset` is UTC minus local, in minutes.
     let minutes = date.get_timezone_offset();

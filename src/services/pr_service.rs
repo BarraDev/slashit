@@ -198,3 +198,22 @@ pub async fn refresh_task_pr_state(task_id: String) -> Result<Option<crate::mode
     let response = invoke("refresh_task_pr_state", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
+
+/// What GitHub last said about the pull requests linked to `project_id`'s
+/// tasks. Answered from the backend's memory: it never reaches GitHub, so the
+/// board may ask on every refresh.
+pub async fn list_pr_statuses(project_id: String) -> Result<Vec<crate::models::PrStatusEntry>, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "projectId": project_id })).unwrap();
+    let response = invoke("list_pr_statuses", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+/// Ask GitHub about a task's open pull requests now. What follows is what
+/// the background poll would do: an open pull request never moves the task
+/// or ends its work, and a merge or closure acts only on a task in a delivery
+/// column. Answers with the refreshed entries, a failure inside each.
+pub async fn refresh_pr_status(task_id: String) -> Result<Vec<crate::models::PrStatusEntry>, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "taskId": task_id })).unwrap();
+    let response = invoke("refresh_pr_status", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}

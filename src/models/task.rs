@@ -544,15 +544,47 @@ impl Default for QueueConfig {
     }
 }
 
+/// A pull request, as GitHub identifies it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PrKey {
+    pub repo: String,
+    pub number: u32,
+}
+
+/// What GitHub last said about one pull request, as the backend's
+/// `pr_status::PrStatusEntry` holds it. Mirrored by hand: both sides test
+/// against the same JSON literal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrStatusEntry {
+    pub repo: String,
+    pub number: u32,
+    /// The last status read successfully. A later failure never clears it.
+    pub status: Option<PrStatus>,
+    /// When `status` was read.
+    pub fetched_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the latest attempt started.
+    pub attempted_at: chrono::DateTime<chrono::Utc>,
+    /// Why the latest attempt failed, if it did.
+    pub error: Option<PrFetchError>,
+}
+
+impl PrStatusEntry {
+    pub fn key(&self) -> PrKey {
+        PrKey { repo: self.repo.clone(), number: self.number }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrStatus {
     pub state: PrState,
-    pub checks_passing: Option<bool>,
+    pub checks: ChecksState,
+    pub failing_checks: Vec<String>,
+    pub failing_check_count: u32,
     pub review_decision: Option<ReviewDecision>,
     pub mergeable: Option<Mergeability>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrState {
     Open,
@@ -561,7 +593,18 @@ pub enum PrState {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What a pull request's checks add up to. Only `Passing` is good news.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChecksState {
+    Passing,
+    Failing,
+    Pending,
+    NoChecks,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewDecision {
     Approved,
@@ -569,17 +612,60 @@ pub enum ReviewDecision {
     ReviewRequired,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mergeability {
     Mergeable,
     Conflicting,
+    /// GitHub has not finished computing it.
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrFetchError {
+    pub kind: PrFetchErrorKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFetchErrorKind {
+    Timeout,
+    Auth,
+    NotInstalled,
+    Failed,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same literal the backend's `pr_status` tests serialize to.
+    #[test]
+    fn a_pull_request_status_entry_reads_the_backend_shape() {
+        let entry: PrStatusEntry = serde_json::from_value(serde_json::json!({
+            "repo": "o/r",
+            "number": 7,
+            "status": {
+                "state": "open",
+                "checks": "no_checks",
+                "failing_checks": [],
+                "failing_check_count": 0,
+                "review_decision": "review_required",
+                "mergeable": "mergeable"
+            },
+            "fetched_at": "2026-09-30T12:00:00Z",
+            "attempted_at": "2026-09-30T12:00:00Z",
+            "error": { "kind": "timeout", "message": "slow" }
+        }))
+        .expect("the backend's shape");
+        let status = entry.status.clone().unwrap();
+        assert_eq!(status.checks, ChecksState::NoChecks);
+        assert_eq!(status.review_decision, Some(ReviewDecision::ReviewRequired));
+        assert_eq!(status.mergeable, Some(Mergeability::Mergeable));
+        assert_eq!(entry.error.as_ref().map(|e| e.kind), Some(PrFetchErrorKind::Timeout));
+        assert_eq!(entry.key(), PrKey { repo: "o/r".to_string(), number: 7 });
+    }
 
     fn issues(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|l| l.to_string()).collect()

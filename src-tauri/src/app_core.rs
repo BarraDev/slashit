@@ -108,6 +108,9 @@ pub async fn build_state_with_paths(
     let start_guard = Arc::new(crate::queue::start_guard::StartGuard::for_data_dir(
         paths.data_dir().to_path_buf(),
     ));
+    // The `gh` on `PATH`, in tests too: command tests stand in their own
+    // there, as they do for every other `gh` call.
+    let pr_statuses = Arc::new(crate::pr_status::PrStatuses::github());
     let app_state = AppState {
         repository: repository_state,
         project: project_state,
@@ -142,6 +145,7 @@ pub async fn build_state_with_paths(
         task_lifecycle_locks: Arc::new(lifecycle::TaskLifecycleLocks::new()),
         storage_accounting,
         start_guard,
+        pr_statuses,
     };
 
     let mut report = StartupReport::default();

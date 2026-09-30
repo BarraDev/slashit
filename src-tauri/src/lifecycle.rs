@@ -373,6 +373,38 @@ pub async fn record(
     publish(&mut tasks_w, storage, project_id, staged)
 }
 
+/// Changes a caller may need made in [`record_if_changed`]'s write, answering
+/// whether it changed anything.
+pub type Revise<'a> = &'a (dyn Fn(&mut HashMap<Uuid, Task>) -> bool + Send + Sync);
+
+/// [`record`], for an observation that is often already on the record.
+///
+/// `revise` answers whether it changed anything. When it did not, nothing is
+/// written, `updated_at` is left alone, and this answers `Ok(false)`. A
+/// repeated reading -- a pull request still open, thirty seconds later -- is
+/// not a change to the task and must not rewrite its project's file.
+pub async fn record_if_changed(
+    tasks: &Tasks,
+    storage: &Storage,
+    task_id: Uuid,
+    revise: Revise<'_>,
+) -> Result<bool, String> {
+    let mut tasks_w = tasks.write().await;
+    let Some(project_id) = tasks_w.get(&task_id).map(|t| t.project_id) else {
+        return Err(format!("task {task_id} is no longer on the board"));
+    };
+
+    let mut staged = stage_project(&tasks_w, project_id);
+    if !revise(&mut staged) {
+        return Ok(false);
+    }
+    if let Some(task) = staged.get_mut(&task_id) {
+        task.updated_at = chrono::Utc::now();
+    }
+
+    publish(&mut tasks_w, storage, project_id, staged).map(|()| true)
+}
+
 /// Amend a task's own fields durably, or say there is no such task.
 ///
 /// [`record`] cannot make the distinction an ordinary command needs: every

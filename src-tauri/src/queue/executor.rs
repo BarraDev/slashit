@@ -150,6 +150,100 @@ struct Acquired {
     created_at: Option<String>,
 }
 
+/// Whether `task` sits where a delivered pull request lives, so that the
+/// poll may finish it when the pull request merges and record a failure when
+/// it closes.
+///
+/// A pull request can be linked to a task in any column: `link_pr` and
+/// external references attach one without moving the task, and a task whose
+/// pull request is open can be dragged back to In Progress, the Queue or the
+/// Backlog to be worked on again. The poll keeps asking about those too, so
+/// their cards stay current, but only these columns hand the answer to the
+/// task's lifecycle.
+fn in_pr_lifecycle(task: &Task) -> bool {
+    matches!(task.status, TaskStatus::PrCreated | TaskStatus::HumanReview | TaskStatus::Done)
+}
+
+/// The pull requests the background poll asks about, each with the tasks
+/// linked to it, in a stable order.
+///
+/// Every GitHub pull request linked to a task is asked about, in whatever
+/// column the task is, unless:
+///
+/// - the task's interrupted cleanup is being reported on the task itself
+///   (`cleanup_in_flight`): it cannot be finished automatically, so asking is
+///   a `gh` call that can only end in the same refusal;
+/// - the task records the pull request as merged or closed, which is final;
+/// - the task is outside [`in_pr_lifecycle`] and this process already heard
+///   GitHub say merged. Nothing durable follows from that there (see
+///   [`TaskExecutor::apply_polled_pr_state`]), and the card already shows
+///   it, so asking again changes nothing until the task moves or SlashIt
+///   restarts. A closure heard there is recorded, which the previous rule
+///   covers; one whose recording failed is asked about again, so the write
+///   is retried.
+fn polled_pull_requests(
+    tasks: &HashMap<Uuid, Task>,
+    statuses: &crate::pr_status::PrStatuses,
+) -> Vec<(crate::pr_status::PrKey, Vec<Uuid>)> {
+    let mut polled: std::collections::BTreeMap<(String, u32), Vec<Uuid>> = Default::default();
+    for task in tasks.values().filter(|t| !t.cleanup_in_flight) {
+        for r in &task.external_refs {
+            let ExternalRef::GithubPr { number, repo, state, .. } = r else {
+                continue;
+            };
+            if state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("MERGED") || s.eq_ignore_ascii_case("CLOSED")) {
+                continue;
+            }
+            let key = crate::pr_status::PrKey::new(repo.clone(), *number);
+            let heard_merged = || {
+                statuses
+                    .get(&key)
+                    .and_then(|e| e.status)
+                    .is_some_and(|s| s.state == crate::pr_status::PrState::Merged)
+            };
+            if !in_pr_lifecycle(task) && heard_merged() {
+                continue;
+            }
+            let ids = polled.entry((key.repo, key.number)).or_default();
+            if !ids.contains(&task.id) {
+                ids.push(task.id);
+            }
+        }
+    }
+    polled
+        .into_iter()
+        .map(|((repo, number), mut ids)| {
+            ids.sort();
+            (crate::pr_status::PrKey::new(repo, number), ids)
+        })
+        .collect()
+}
+
+/// Write `state` onto every reference `task` has to the pull request `key`,
+/// and note it in the task's activity when it is a milestone. Answers whether
+/// anything changed.
+fn record_observed_pr_state(task: &mut Task, key: &crate::pr_status::PrKey, state: &str) -> bool {
+    let mut changed = false;
+    for r in &mut task.external_refs {
+        if let ExternalRef::GithubPr { number, repo, state: recorded, .. } = r {
+            // Merged and closed are final once recorded. An answer that says
+            // otherwise is an older reading arriving late (a poll that
+            // started before a refresh recorded the merge), not news.
+            let final_recorded = recorded
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("MERGED") || s.eq_ignore_ascii_case("CLOSED"));
+            if *number == key.number && *repo == key.repo && !final_recorded && recorded.as_deref() != Some(state) {
+                *recorded = Some(state.to_string());
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        task.record_pr_state(key.number, state);
+    }
+    changed
+}
+
 /// What the pull requests recorded on a dependency say about its work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordedPr {
@@ -547,6 +641,9 @@ pub struct TaskExecutor {
     worktree_manager: Arc<WorktreeManager>,
     events: SharedEventSink,
     pr_check_counter: std::sync::atomic::AtomicU32,
+    /// Where the background poll asks about pull requests, and records what
+    /// it heard. Shared with the refresh commands and the board.
+    pr_statuses: Arc<crate::pr_status::PrStatuses>,
     /// When a start of each task last failed to record the worktree it was
     /// given. See [`TaskExecutor::refuse_while_unrecorded_backoff`].
     unrecorded_acquisitions: std::sync::Mutex<HashMap<Uuid, UnrecordedBackoff>>,
@@ -712,6 +809,7 @@ pub struct TaskExecutorConfig {
     pub events: SharedEventSink,
     pub lifecycle: Arc<crate::lifecycle::TaskLifecycleLocks>,
     pub start_guard: Arc<StartGuard>,
+    pub pr_statuses: Arc<crate::pr_status::PrStatuses>,
 }
 
 impl TaskExecutor {
@@ -748,6 +846,7 @@ impl TaskExecutor {
             pr_check_counter: std::sync::atomic::AtomicU32::new(0),
             unrecorded_acquisitions: std::sync::Mutex::new(HashMap::new()),
             start_guard: config.start_guard,
+            pr_statuses: config.pr_statuses,
             run_tools: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -1053,80 +1152,126 @@ impl TaskExecutor {
             let _started = self.spawn_task_execution(task_id, reserved).await;
         }
 
-        // Poll PR status every ~30s (10 cycles at 3s each)
+        // Poll pull request status every ~30s (10 cycles at 3s each)
         let counter = self.pr_check_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if counter.is_multiple_of(10) {
-            use crate::domain::task::ExternalRef;
+            self.poll_pull_requests().await;
+        }
+    }
 
-            // Find tasks with GithubPr refs that haven't been merged yet
-            let pr_tasks: Vec<(Uuid, u32, String)> = {
-                let tasks = self.tasks.read().await;
-                tasks.values()
-                    .filter(|t| matches!(t.status, TaskStatus::PrCreated | TaskStatus::HumanReview | TaskStatus::Done))
-                    // A quarantined task cannot be finished automatically, so
-                    // polling it is a `gh pr view` every thirty seconds that
-                    // can only ever end in the same refusal. Its interrupted
-                    // cleanup is already reported on the task itself.
-                    .filter(|t| !t.cleanup_in_flight)
-                    .flat_map(|t| {
-                        t.external_refs.iter().filter_map(move |r| {
-                            if let ExternalRef::GithubPr { number, repo, state, .. } = r {
-                                // Only poll if not already in a terminal state
-                                if state.as_deref() != Some("MERGED") && state.as_deref() != Some("CLOSED") {
-                                    return Some((t.id, *number, repo.clone()));
-                                }
-                            }
-                            None
-                        })
-                    })
-                    .collect()
-            };
+    /// Ask GitHub about every pull request [`polled_pull_requests`] selects,
+    /// keep each answer in the shared cache, and act on the durable part.
+    ///
+    /// A few are asked at a time ([`crate::pr_status::PrStatuses::refresh_each`]),
+    /// each bounded by [`crate::pr_status::FETCH_TIMEOUT`], so one hung `gh`
+    /// holds up this pass by at most that long and never stops the others
+    /// from being asked. A failed answer is already recorded in the cache
+    /// beside the last good one; nothing durable follows from it.
+    async fn poll_pull_requests(&self) {
+        let (keys, task_ids): (Vec<_>, Vec<_>) = {
+            let tasks = self.tasks.read().await;
+            polled_pull_requests(&tasks, &self.pr_statuses).into_iter().unzip()
+        };
+        let answers = self.pr_statuses.refresh_each(keys).await;
 
-            for (task_id, number, repo_slug) in pr_tasks {
-                if let Ok(output) = tokio::process::Command::new("gh")
-                    .args(["pr", "view", &number.to_string(), "--repo", &repo_slug, "--json", "state"])
-                    .output()
-                    .await
-                {
-                    if output.status.success() {
-                        let json_str = String::from_utf8_lossy(&output.stdout);
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                            let state = json.get("state").and_then(|s| s.as_str()).unwrap_or("");
-
-                            if state == "MERGED" {
-                                self.complete_merged_task(task_id, number, state).await;
-                            } else if !state.is_empty() {
-                                self.record_pr_poll_state(task_id, number, state).await;
-                            }
-                        }
-                    }
-                }
+        for ((key, answer), task_ids) in answers.into_iter().zip(task_ids) {
+            let Ok(status) = answer else { continue };
+            for task_id in task_ids {
+                self.apply_polled_pr_state(task_id, &key, status.state).await;
             }
+        }
+    }
+
+    /// Act on the state GitHub reported for `key`, linked to `task_id`.
+    ///
+    /// Merged and closed finish or fail a task only in the columns a
+    /// delivered pull request lives in (see [`in_pr_lifecycle`]); anywhere
+    /// else the user has put the task back to work, and a poll does not take
+    /// it away from them. The board still shows the state, from the cache.
+    ///
+    /// Outside those columns a closure is still recorded on the pull request
+    /// reference, and noted in the task's activity; nothing else changes: no
+    /// column, no error, no stop. SlashIt treats a recorded closure as final,
+    /// in every column, and leaving the reference `OPEN` would have every
+    /// later start of SlashIt ask about it again, and would tell what reads
+    /// the record that it is still open. The only such reader that decides
+    /// anything is a dependent task's start, which refuses a dependency
+    /// whose branch is gone unless its pull request is recorded merged:
+    /// recording the closure changes why it refuses, not whether.
+    ///
+    /// A merge heard there is not recorded. Recording it is the task's one
+    /// automatic completion: the poll never asks about a reference recorded
+    /// `MERGED` again, so a task moved back to a delivery column would never
+    /// be finished. It would also let a dependent task start from the
+    /// default base instead of refusing, on the word of a task whose work
+    /// the user has taken back.
+    ///
+    /// Also what an explicit "check now" does (`commands::pr::refresh_pr_status`),
+    /// so asking by hand has exactly the background poll's consequences.
+    pub(crate) async fn apply_polled_pr_state(&self, task_id: Uuid, key: &crate::pr_status::PrKey, state: crate::pr_status::PrState) {
+        use crate::pr_status::PrState;
+
+        let Some(recorded) = state.as_recorded() else {
+            return;
+        };
+        // Answers are applied once a whole batch has settled, so a newer
+        // reading may have landed in the meantime, say an open after a
+        // reopen. Only what the cache still says is acted on.
+        if self.pr_statuses.get(key).and_then(|e| e.status).is_some_and(|s| s.state != state) {
+            return;
+        }
+        let lifecycle = {
+            let tasks = self.tasks.read().await;
+            match tasks.get(&task_id) {
+                // Its interrupted cleanup is reported on the task and only an
+                // explicit lifecycle action finishes it; see
+                // `polled_pull_requests`.
+                Some(t) if t.cleanup_in_flight => return,
+                Some(t) => in_pr_lifecycle(t),
+                None => return,
+            }
+        };
+        match state {
+            PrState::Merged if lifecycle => self.complete_merged_task(task_id, key.number, recorded).await,
+            PrState::Merged => {}
+            _ => self.record_pr_poll_state(task_id, key, recorded).await,
         }
     }
 
     /// Record a non-`MERGED` pull request state observed by the poll above.
     ///
-    /// `CLOSED` is exactly what removes this ref from the poll's own filter
-    /// above (`state != Some("CLOSED")`), so it must never be visible in
-    /// memory before it is durable: a lost write here would otherwise be a
-    /// permanent, silent stop to polling a PR that is not actually recorded
-    /// as closed anywhere the next start can see -- see issue #8. Any other
-    /// state (`OPEN`, ...) is not selector-terminal and would self-heal on
-    /// the next poll regardless; it is persisted the same way here only
-    /// because it shares this call site, not because it shares the hazard.
-    async fn record_pr_poll_state(&self, task_id: Uuid, number: u32, state: &str) {
+    /// Written only when it changes what the task records: a pull request
+    /// still open thirty seconds later is not a change to the task, and
+    /// rewriting its project's file for it every poll is churn.
+    ///
+    /// A closure also records its explanation as the task's error, without
+    /// moving it, only where [`in_pr_lifecycle`] says the task is waiting on
+    /// that pull request, judged on the task as it is when the write is
+    /// staged.
+    ///
+    /// `CLOSED` is exactly what removes this ref from the poll's own
+    /// selection, so it must never be visible in memory before it is durable:
+    /// a lost write here would otherwise be a permanent, silent stop to
+    /// polling a PR that is not actually recorded as closed anywhere the next
+    /// start can see -- see issue #8. Any other state (`OPEN`, ...) is not
+    /// selector-terminal and would self-heal on the next poll regardless; it
+    /// is persisted the same way here only because it shares this call site,
+    /// not because it shares the hazard.
+    async fn record_pr_poll_state(&self, task_id: Uuid, key: &crate::pr_status::PrKey, state: &str) {
         let state_owned = state.to_string();
-        let amend = move |staged: &mut HashMap<Uuid, Task>| {
-            if let Some(t) = staged.get_mut(&task_id) {
-                Self::record_pr_state(t, number, &state_owned);
-                if state_owned == "CLOSED" {
-                    t.error_message = Some("PR was closed without merge".to_string());
-                }
+        let key_owned = key.clone();
+        let revise = move |staged: &mut HashMap<Uuid, Task>| {
+            let Some(t) = staged.get_mut(&task_id) else {
+                return false;
+            };
+            let changed = record_observed_pr_state(t, &key_owned, &state_owned);
+            if changed && state_owned == "CLOSED" && in_pr_lifecycle(t) {
+                t.error_message = Some("PR was closed without merge".to_string());
             }
+            changed
         };
         if let Err(e) =
-            crate::lifecycle::record(&self.tasks, &self.storage, task_id, &amend).await
+            crate::lifecycle::record_if_changed(&self.tasks, &self.storage, task_id, &revise).await
         {
             self.events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
@@ -1181,6 +1326,12 @@ impl TaskExecutor {
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
             return;
         };
+        // The poll chose to finish this task from its column before the lease
+        // was held; a move out of the delivery columns since then is the
+        // user taking it back, and wins. The next poll decides again.
+        if !self.tasks.read().await.get(&task_id).is_some_and(in_pr_lifecycle) {
+            return;
+        }
 
         let record_merge = move |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
@@ -1393,8 +1544,8 @@ impl TaskExecutor {
                     let why = if recorded == RecordedPr::ClosedUnmerged {
                         "was closed without being merged, so that work was never delivered"
                     } else {
-                        "is not recorded as merged; refresh its pull request state, or restore \
-                         the branch"
+                        "is not recorded as merged; move the dependency to PR Created so \
+                         SlashIt can record its merge, or restore the branch"
                     };
                     return (
                         existing_branch,
@@ -3804,6 +3955,7 @@ mod tests {
     use crate::domain::task::ActivityEntry;
     use crate::domain::{AgentConfig, AgentType, Project, ProjectScope, Workspace, WorkspaceRoot};
     use crate::test_helpers::create_test_task_full;
+    use std::time::Duration;
 
     fn test_project(id: Uuid, scope: ProjectScope) -> Project {
         Project {
@@ -4013,6 +4165,7 @@ mod tests {
             events: crate::events::null_sink(),
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
             start_guard: crate::test_helpers::plenty_of_disk(),
+            pr_statuses: crate::test_helpers::no_github(),
         });
 
         let guard = Unwritable::on(&storage_temp.path().join("config").join("tasks"));
@@ -4419,7 +4572,7 @@ mod tests {
         let (id, _project_id) = task_with_open_pr(&executor, None).await;
         block_persistence(&temps[0]);
 
-        executor.record_pr_poll_state(id, 7, "CLOSED").await;
+        executor.record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED").await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
         assert_eq!(
@@ -4447,7 +4600,7 @@ mod tests {
         let (executor, _temps) = test_executor();
         let (id, project_id) = task_with_open_pr(&executor, None).await;
 
-        executor.record_pr_poll_state(id, 7, "CLOSED").await;
+        executor.record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED").await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
         assert_eq!(recorded_pr_state(&after).as_deref(), Some("CLOSED"));
@@ -4466,6 +4619,361 @@ mod tests {
             on_disk.error_message.as_deref(),
             Some("PR was closed without merge")
         );
+    }
+
+    // --- the pull request poll: selection, no-op writes, timeouts ---
+
+    fn pr_ref(repo: &str, number: u32, state: Option<&str>) -> ExternalRef {
+        ExternalRef::GithubPr {
+            url: format!("https://github.com/{repo}/pull/{number}"),
+            number,
+            repo: repo.to_string(),
+            state: state.map(str::to_string),
+        }
+    }
+
+    fn polled_status(state: crate::pr_status::PrState) -> crate::pr_status::PrStatus {
+        crate::pr_status::PrStatus {
+            state,
+            checks: crate::pr_status::ChecksState::Passing,
+            failing_checks: vec![],
+            failing_check_count: 0,
+            review_decision: None,
+            mergeable: None,
+        }
+    }
+
+    /// A stand-in `gh` that answers from a shell `case` on the pull request
+    /// number, which is its third argument.
+    #[cfg(unix)]
+    fn fake_gh(dir: &std::path::Path, cases: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("gh");
+        std::fs::write(&path, format!("#!/bin/sh\ncase \"$3\" in\n{cases}\nesac\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    const OPEN_FAILING: &str = r#"printf '{"state":"OPEN","statusCheckRollup":[{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"FAILURE"}],"reviewDecision":"","mergeable":"MERGEABLE"}'"#;
+    #[cfg(unix)]
+    const MERGED: &str = r#"printf '{"state":"MERGED","statusCheckRollup":[],"reviewDecision":"APPROVED","mergeable":"UNKNOWN"}'"#;
+
+    #[test]
+    fn every_column_with_a_linked_open_pull_request_is_polled() {
+        use crate::pr_status::{PrKey, PrState, PrStatuses};
+        let statuses = PrStatuses::with_program("unused", Duration::from_secs(1));
+        let project = Uuid::new_v4();
+        let all = [
+            TaskStatus::Backlog,
+            TaskStatus::Queue,
+            TaskStatus::InProgress,
+            TaskStatus::AiReview,
+            TaskStatus::HumanReview,
+            TaskStatus::PrCreated,
+            TaskStatus::Done,
+            TaskStatus::Error,
+        ];
+        let mut tasks = HashMap::new();
+        let mut expected = Vec::new();
+        for (i, status) in all.iter().enumerate() {
+            let mut t = crate::test_helpers::create_test_task_full("t", project, status.clone(), i as i32);
+            t.external_refs.push(pr_ref("o/r", 100 + i as u32, Some("OPEN")));
+            expected.push((PrKey::new("o/r", 100 + i as u32), vec![t.id]));
+            tasks.insert(t.id, t);
+        }
+        // A state never recorded is polled too.
+        let mut unrecorded = crate::test_helpers::create_test_task_full("t", project, TaskStatus::PrCreated, 20);
+        unrecorded.external_refs.push(pr_ref("o/r", 200, None));
+        expected.push((PrKey::new("o/r", 200), vec![unrecorded.id]));
+        tasks.insert(unrecorded.id, unrecorded);
+
+        let mut polled = polled_pull_requests(&tasks, &statuses);
+        polled.sort_by_key(|(key, _)| key.number);
+        assert_eq!(polled, expected, "a pull request linked in any column keeps its card current");
+
+        // Final, as recorded or as heard, or quarantined: not asked again.
+        let mut excluded = HashMap::new();
+        for (n, state) in [(1, "MERGED"), (2, "CLOSED"), (3, "merged")] {
+            let mut t = crate::test_helpers::create_test_task_full("t", project, TaskStatus::PrCreated, n);
+            t.external_refs.push(pr_ref("o/x", n as u32, Some(state)));
+            excluded.insert(t.id, t);
+        }
+        let mut quarantined = crate::test_helpers::create_test_task_full("t", project, TaskStatus::PrCreated, 4);
+        quarantined.cleanup_in_flight = true;
+        quarantined.external_refs.push(pr_ref("o/x", 4, Some("OPEN")));
+        excluded.insert(quarantined.id, quarantined);
+        let mut heard_merged = crate::test_helpers::create_test_task_full("t", project, TaskStatus::InProgress, 5);
+        heard_merged.external_refs.push(pr_ref("o/x", 5, Some("OPEN")));
+        statuses.remember(&PrKey::new("o/x", 5), polled_status(PrState::Merged));
+        excluded.insert(heard_merged.id, heard_merged);
+        assert_eq!(polled_pull_requests(&excluded, &statuses), vec![]);
+
+        // Heard closed but not recorded, because recording it failed: asked
+        // again, so the write is retried.
+        let mut unrecorded_closure = crate::test_helpers::create_test_task_full("t", project, TaskStatus::InProgress, 7);
+        unrecorded_closure.external_refs.push(pr_ref("o/x", 7, Some("OPEN")));
+        statuses.remember(&PrKey::new("o/x", 7), polled_status(PrState::Closed));
+        let retried = vec![(PrKey::new("o/x", 7), vec![unrecorded_closure.id])];
+        let mut with_closure = excluded.clone();
+        with_closure.insert(unrecorded_closure.id, unrecorded_closure);
+        assert_eq!(polled_pull_requests(&with_closure, &statuses), retried);
+
+        // Heard merged, but in a column the merge finishes: still asked, so
+        // the lifecycle gets its answer.
+        let mut delivered = crate::test_helpers::create_test_task_full("t", project, TaskStatus::PrCreated, 6);
+        delivered.external_refs.push(pr_ref("o/x", 5, Some("OPEN")));
+        let delivered_id = delivered.id;
+        excluded.insert(delivered_id, delivered);
+        assert_eq!(polled_pull_requests(&excluded, &statuses), vec![(PrKey::new("o/x", 5), vec![delivered_id])]);
+    }
+
+    #[test]
+    fn one_pull_request_linked_to_two_tasks_is_asked_about_once() {
+        let statuses = crate::pr_status::PrStatuses::with_program("unused", Duration::from_secs(1));
+        let project = Uuid::new_v4();
+        let mut tasks = HashMap::new();
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let mut t = crate::test_helpers::create_test_task_full("t", project, TaskStatus::PrCreated, i);
+            t.external_refs.push(pr_ref("o/r", 9, Some("OPEN")));
+            ids.push(t.id);
+            tasks.insert(t.id, t);
+        }
+        ids.sort();
+        assert_eq!(
+            polled_pull_requests(&tasks, &statuses),
+            vec![(crate::pr_status::PrKey::new("o/r", 9), ids)]
+        );
+    }
+
+    async fn seed_with_pr(executor: &TaskExecutor, status: TaskStatus, pr: ExternalRef) -> (Uuid, Uuid) {
+        let (id, project_id) = seed_task(executor, status).await;
+        let task = {
+            let mut tasks = executor.tasks.write().await;
+            let t = tasks.get_mut(&id).unwrap();
+            t.external_refs.push(pr);
+            t.clone()
+        };
+        let siblings: Vec<Task> = executor.tasks.read().await.values().filter(|t| t.project_id == project_id).cloned().collect();
+        executor.storage.save_project_tasks(project_id, &siblings).expect("seed");
+        let _ = task;
+        (id, project_id)
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_open_pull_request_writes_nothing() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, temps) = test_executor_with_events(recording.clone());
+        let (id, _) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("owner/repo", 7, Some("OPEN"))).await;
+        let before = executor.tasks.read().await.get(&id).unwrap().updated_at;
+        // Any write would now fail and be reported.
+        block_persistence(&temps[0]);
+
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        for _ in 0..3 {
+            executor.record_pr_poll_state(id, &key, "OPEN").await;
+        }
+
+        let after = executor.tasks.read().await.get(&id).cloned().unwrap();
+        assert_eq!(after.updated_at, before, "an unchanged reading is not a change to the task");
+        assert!(
+            !warn_message_containing(&recording, "recording it failed"),
+            "no write was attempted: {:?}",
+            recording.recorded()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_open_answer_never_reopens_a_recorded_merge_or_closure() {
+        let (executor, _temps) = test_executor();
+        for final_state in ["MERGED", "CLOSED"] {
+            let (id, project_id) = seed_with_pr(&executor, TaskStatus::Done, pr_ref("owner/repo", 7, Some(final_state))).await;
+            let before = executor.tasks.read().await[&id].updated_at;
+
+            executor.record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "OPEN").await;
+
+            let after = executor.tasks.read().await[&id].clone();
+            assert_eq!(recorded_pr_state(&after).as_deref(), Some(final_state));
+            assert_eq!(after.updated_at, before, "nothing was written");
+            assert_eq!(recorded_pr_state(&on_disk_task(&executor, project_id, id)).as_deref(), Some(final_state));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_merge_is_not_acted_on_once_the_task_has_left_the_delivery_columns() {
+        let (executor, _temps) = test_executor();
+        let (id, _) = seed_with_pr(&executor, TaskStatus::InProgress, pr_ref("owner/repo", 7, Some("OPEN"))).await;
+
+        executor.complete_merged_task(id, 7, "MERGED").await;
+
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(after.status, TaskStatus::InProgress);
+        assert_eq!(recorded_pr_state(&after).as_deref(), Some("OPEN"));
+    }
+
+    #[tokio::test]
+    async fn a_changed_pull_request_state_is_still_persisted() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("owner/repo", 7, None)).await;
+        let before = executor.tasks.read().await.get(&id).unwrap().updated_at;
+
+        executor.record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "OPEN").await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().unwrap();
+        assert_eq!(recorded_pr_state(&after).as_deref(), Some("OPEN"));
+        assert!(after.updated_at > before);
+        assert_eq!(recorded_pr_state(&on_disk_task(&executor, project_id, id)).as_deref(), Some("OPEN"));
+        // Another repository's pull request with the same number is not this one.
+        executor.record_pr_poll_state(id, &crate::pr_status::PrKey::new("other/repo", 7), "CLOSED").await;
+        assert_eq!(recorded_pr_state(&executor.tasks.read().await[&id]).as_deref(), Some("OPEN"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hung_gh_times_out_without_holding_up_the_other_pull_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = fake_gh(dir.path(), &format!("1) sleep 30 ;;\n*) {OPEN_FAILING} ;;"));
+        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(gh, Duration::from_millis(800)));
+        let hung_key = crate::pr_status::PrKey::new("o/r", 1);
+        statuses.remember(&hung_key, polled_status(crate::pr_status::PrState::Open));
+        let (executor, _temps) = test_executor_with_prs(statuses.clone());
+        let (hung, _) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 1, Some("OPEN"))).await;
+        let (answered, _) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("o/r", 2, None)).await;
+
+        let began = std::time::Instant::now();
+        executor.poll_pull_requests().await;
+        assert!(began.elapsed() < Duration::from_secs(10), "the pass took {:?}", began.elapsed());
+
+        let hung_entry = statuses.get(&hung_key).unwrap();
+        assert_eq!(hung_entry.error.map(|e| e.kind), Some(crate::pr_status::PrFetchErrorKind::Timeout));
+        assert_eq!(
+            hung_entry.status.map(|s| s.checks),
+            Some(crate::pr_status::ChecksState::Passing),
+            "the timeout keeps the last good reading"
+        );
+        let answered_entry = statuses.get(&crate::pr_status::PrKey::new("o/r", 2)).unwrap();
+        assert_eq!(answered_entry.status.map(|s| s.checks), Some(crate::pr_status::ChecksState::Failing));
+
+        let tasks = executor.tasks.read().await;
+        assert_eq!(recorded_pr_state(&tasks[&answered]).as_deref(), Some("OPEN"));
+        assert_eq!(recorded_pr_state(&tasks[&hung]).as_deref(), Some("OPEN"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_merge_heard_outside_the_delivery_columns_is_shown_not_acted_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = fake_gh(dir.path(), &format!("*) {MERGED} ;;"));
+        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(gh, Duration::from_secs(10)));
+        let (executor, _temps) = test_executor_with_prs(statuses.clone());
+        let (id, project_id) = seed_with_pr(&executor, TaskStatus::InProgress, pr_ref("o/r", 3, Some("OPEN"))).await;
+
+        executor.poll_pull_requests().await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().unwrap();
+        assert_eq!(after.status, TaskStatus::InProgress, "a poll does not take a task back from work");
+        assert_eq!(recorded_pr_state(&after).as_deref(), Some("OPEN"));
+        assert_eq!(recorded_pr_state(&on_disk_task(&executor, project_id, id)).as_deref(), Some("OPEN"));
+        let key = crate::pr_status::PrKey::new("o/r", 3);
+        assert_eq!(statuses.get(&key).unwrap().status.map(|s| s.state), Some(crate::pr_status::PrState::Merged));
+        let tasks = executor.tasks.read().await;
+        assert!(polled_pull_requests(&tasks, &statuses).is_empty(), "heard final: not asked again");
+    }
+
+    #[cfg(unix)]
+    const CLOSED: &str = r#"printf '{"state":"CLOSED","statusCheckRollup":[],"reviewDecision":"","mergeable":"UNKNOWN"}'"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_closure_heard_outside_the_delivery_columns_is_recorded_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = fake_gh(dir.path(), &format!("*) {CLOSED} ;;"));
+        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program(gh, Duration::from_secs(10)));
+        let (executor, _temps) = test_executor_with_prs(statuses.clone());
+        let (id, project_id) = seed_with_pr(&executor, TaskStatus::InProgress, pr_ref("o/r", 3, Some("OPEN"))).await;
+        let cleaned_up = register_cancellable_execution(&executor, id).await;
+        let before = executor.tasks.read().await[&id].clone();
+
+        executor.poll_pull_requests().await;
+
+        for (seen, task) in [
+            ("in memory", executor.tasks.read().await[&id].clone()),
+            ("on disk", on_disk_task(&executor, project_id, id)),
+        ] {
+            assert_eq!(recorded_pr_state(&task).as_deref(), Some("CLOSED"), "{seen}");
+            assert_eq!(task.status, TaskStatus::InProgress, "{seen}: a poll does not take a task back from work");
+            assert_eq!(task.phase, before.phase, "{seen}");
+            assert_eq!(task.error_message, None, "{seen}: the task is not waiting on this pull request");
+        }
+        assert!(!cleaned_up.load(std::sync::atomic::Ordering::SeqCst), "the work on it is not ended");
+        assert!(executor.running_handles.read().await.contains_key(&id));
+
+        // What the next start of SlashIt reads: the task as saved, and a cache
+        // that has heard nothing.
+        let restarted: HashMap<Uuid, Task> = executor
+            .storage
+            .load_project_tasks(project_id)
+            .expect("readable")
+            .into_iter()
+            .map(|t| (t.id, t))
+            .collect();
+        let fresh = crate::pr_status::PrStatuses::with_program("unused", Duration::from_secs(1));
+        assert!(
+            polled_pull_requests(&restarted, &fresh).is_empty(),
+            "a closed pull request is not an open one to ask about again"
+        );
+        assert_eq!(RecordedPr::of(&restarted[&id]), RecordedPr::ClosedUnmerged);
+    }
+
+    #[tokio::test]
+    async fn a_closure_fails_only_a_task_waiting_on_its_pull_request() {
+        let (executor, _temps) = test_executor();
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        for (status, fails) in [
+            (TaskStatus::PrCreated, true),
+            (TaskStatus::HumanReview, true),
+            (TaskStatus::Done, true),
+            (TaskStatus::Backlog, false),
+            (TaskStatus::Queue, false),
+            (TaskStatus::InProgress, false),
+            (TaskStatus::AiReview, false),
+            (TaskStatus::Error, false),
+        ] {
+            let (id, _) = seed_with_pr(&executor, status.clone(), pr_ref("owner/repo", 7, Some("OPEN"))).await;
+
+            executor.apply_polled_pr_state(id, &key, crate::pr_status::PrState::Closed).await;
+
+            let after = executor.tasks.read().await[&id].clone();
+            assert_eq!(recorded_pr_state(&after).as_deref(), Some("CLOSED"), "{status:?}");
+            assert_eq!(after.status, status, "a closure never moves the task");
+            assert_eq!(after.error_message.is_some(), fails, "{status:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answer_a_newer_reading_replaced_is_not_acted_on() {
+        use crate::pr_status::PrState;
+        let statuses = Arc::new(crate::pr_status::PrStatuses::with_program("unused", Duration::from_secs(1)));
+        let (executor, _temps) = test_executor_with_prs(statuses.clone());
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        // The pull request was reopened, and a newer reading says so.
+        statuses.remember(&key, polled_status(PrState::Open));
+        for (status, stale) in [
+            (TaskStatus::PrCreated, PrState::Closed),
+            (TaskStatus::InProgress, PrState::Closed),
+            (TaskStatus::PrCreated, PrState::Merged),
+        ] {
+            let (id, _) = seed_with_pr(&executor, status.clone(), pr_ref("owner/repo", 7, Some("OPEN"))).await;
+
+            executor.apply_polled_pr_state(id, &key, stale).await;
+
+            let after = executor.tasks.read().await[&id].clone();
+            assert_eq!(recorded_pr_state(&after).as_deref(), Some("OPEN"), "{status:?} {stale:?}");
+            assert_eq!(after.status, status, "{stale:?}");
+            assert_eq!(after.error_message, None, "{stale:?}");
+        }
     }
 
     // --- transition_to_human_review ---
@@ -4753,11 +5261,27 @@ mod tests {
         test_executor_with(events, crate::test_helpers::plenty_of_disk())
     }
 
+    /// An executor whose pull request status comes from `pr_statuses`.
+    #[cfg(unix)]
+    fn test_executor_with_prs(
+        pr_statuses: Arc<crate::pr_status::PrStatuses>,
+    ) -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {
+        test_executor_full(crate::events::null_sink(), crate::test_helpers::plenty_of_disk(), pr_statuses)
+    }
+
     /// Same as [`test_executor_with_events`], with a caller-supplied start
     /// guard, for tests about disk pressure.
     fn test_executor_with(
         events: SharedEventSink,
         start_guard: Arc<StartGuard>,
+    ) -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {
+        test_executor_full(events, start_guard, crate::test_helpers::no_github())
+    }
+
+    fn test_executor_full(
+        events: SharedEventSink,
+        start_guard: Arc<StartGuard>,
+        pr_statuses: Arc<crate::pr_status::PrStatuses>,
     ) -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {
         let (storage, storage_temp) = test_storage();
         let (registry, reg_temp) = test_registry();
@@ -4787,6 +5311,7 @@ mod tests {
             events,
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
             start_guard,
+            pr_statuses,
         }));
         (executor, vec![storage_temp, reg_temp, paths_temp])
     }
@@ -4919,6 +5444,7 @@ mod tests {
             events: crate::events::null_sink(),
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
             start_guard: crate::test_helpers::plenty_of_disk(),
+            pr_statuses: crate::test_helpers::no_github(),
         }));
 
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -4984,6 +5510,7 @@ mod tests {
             events: crate::events::null_sink(),
             lifecycle: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
             start_guard: crate::test_helpers::plenty_of_disk(),
+            pr_statuses: crate::test_helpers::no_github(),
         });
 
         let task_id = Uuid::new_v4();

@@ -169,6 +169,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
             events: events.clone(),
             lifecycle: state.task_lifecycle_locks.clone(),
             start_guard: state.start_guard.clone(),
+            pr_statuses: state.pr_statuses.clone(),
         },
     ));
     let _ = state.executor.set(executor.clone());

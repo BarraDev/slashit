@@ -16,6 +16,7 @@ Backend source for Tauri v2. This folder contains all Rust backend code organize
 - **worktree/** - Git worktrees, the only Task Checkout backend, committing a Task Checkout's changes, task diffs, restacking a task branch onto a new base, the base a task branch starts from (origin's default branch, else the project's local base), and a project's repository readiness and explicit setup (version control initialization, detecting origin's default branch)
 - **queue/** - Task queue, admission, the disk-space start guard, the executor that launches agent runs, and the tool calls a run keeps for its task's activity timeline
 - **pty/** - Terminal (PTY) sessions
+- **pr_status.rs** - What GitHub last said about the pull requests linked to tasks: the one place `gh pr view` runs for a status (bounded by a timeout), and the in-memory cache the executor's poll, the refresh commands and the board share. Never persisted
 - **storage_accounting/** - Read-only measurement of the disk SlashIt uses: which of it SlashIt owns, which is rebuildable, and how full the disk is. Never deletes anything
 - **ipc/** - Control channel server for the `slashit` CLI (see below)
 - **bin/** - The `slashitd` daemon entry point

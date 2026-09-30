@@ -342,6 +342,15 @@ impl FakeDisk {
     }
 }
 
+/// Pull request status that can never reach GitHub: the program it would run
+/// does not exist, so every refresh fails at once as "not installed".
+pub fn no_github() -> std::sync::Arc<crate::pr_status::PrStatuses> {
+    std::sync::Arc::new(crate::pr_status::PrStatuses::with_program(
+        "/nonexistent/slashit-test-gh",
+        std::time::Duration::from_secs(1),
+    ))
+}
+
 /// A start guard that always finds plenty of free space.
 ///
 /// Tests build state on whatever disk the machine has, and a CI runner's is
@@ -387,6 +396,7 @@ pub fn attach_test_executor(state: &crate::AppState) -> std::sync::Arc<crate::qu
             events: state.events(),
             lifecycle: state.task_lifecycle_locks.clone(),
             start_guard: state.start_guard.clone(),
+            pr_statuses: state.pr_statuses.clone(),
         },
     ));
     let _ = state.executor.set(executor.clone());
@@ -421,6 +431,7 @@ pub async fn attach_test_executor_ipc(ctx: &IpcContext) -> std::sync::Arc<crate:
             events: ctx.events.clone(),
             lifecycle: ctx.task_lifecycle_locks.clone(),
             start_guard: ctx.start_guard.clone(),
+            pr_statuses: no_github(),
         },
     ));
     let _ = ctx.executor.set(executor.clone());

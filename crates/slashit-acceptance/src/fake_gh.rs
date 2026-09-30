@@ -8,7 +8,8 @@
 //!
 //! It answers the calls SlashIt's pull request flow makes (`pr list`,
 //! `pr create`, `pr view`, `repo view`), records every invocation, and keeps
-//! each pull request it opened as a file named after its branch.
+//! each pull request it opened as a file named after its branch. What
+//! `pr view` says can be scripted, for journeys about a pull request's status.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,12 @@ const FAIL_CREATE: &str = "fail-create";
 
 /// The file whose contents, a number of seconds, `pr create` sleeps first.
 const DELAY_CREATE: &str = "delay-create";
+
+/// The file whose contents `pr view` prints instead of its default answer.
+const PR_VIEW: &str = "pr-view.json";
+
+/// The file whose contents, a number of seconds, `pr view` sleeps first.
+const DELAY_VIEW: &str = "delay-view";
 
 /// What `pr create` prints on stderr when scripted to fail.
 pub const CREATE_FAILURE: &str = "creating the pull request was scripted to fail";
@@ -92,6 +99,40 @@ impl FakeGh {
                 Err(e) => Err(e).with_context(|| format!("could not remove {}", marker.display())),
             },
         }
+    }
+
+    /// Make every following `pr view` print `answer`, the way GitHub would
+    /// describe the pull request now. Replaced whole, so a `pr view` running
+    /// at the same moment reads either the old answer or the new one.
+    pub fn script_pr_view(&self, answer: &serde_json::Value) -> Result<()> {
+        let target = self.dir.join(PR_VIEW);
+        let staged = self.dir.join(format!("{PR_VIEW}.partial"));
+        std::fs::write(&staged, answer.to_string()).with_context(|| format!("could not write {}", staged.display()))?;
+        std::fs::rename(&staged, &target).with_context(|| format!("could not replace {}", target.display()))
+    }
+
+    /// Make every following `pr view` take `seconds` before answering, or
+    /// answer at once again with `None`.
+    pub fn delay_pr_view(&self, seconds: Option<u32>) -> Result<()> {
+        let marker = self.dir.join(DELAY_VIEW);
+        match seconds {
+            Some(seconds) => std::fs::write(&marker, seconds.to_string())
+                .with_context(|| format!("could not write {}", marker.display())),
+            None => match std::fs::remove_file(&marker) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e).with_context(|| format!("could not remove {}", marker.display())),
+            },
+        }
+    }
+
+    /// How many times `gh pr view` was run.
+    pub fn view_count(&self) -> Result<usize> {
+        Ok(self
+            .invocations()?
+            .iter()
+            .filter(|args| args.first().map(String::as_str) == Some("pr") && args.get(1).map(String::as_str) == Some("view"))
+            .count())
     }
 
     /// Every recorded invocation's arguments, in start order.

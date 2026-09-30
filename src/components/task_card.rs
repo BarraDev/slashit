@@ -279,26 +279,8 @@ fn ExternalRefBadge(ext_ref: ExternalRef) -> impl IntoView {
                 </a>
             }.into_any()
         }
-        ExternalRef::GithubPr { url, number, state, .. } => {
-            let (icon_color, status_char) = match state.as_deref() {
-                Some("MERGED") => ("text-purple-400", "M"),
-                Some("CLOSED") => ("text-red-400", "X"),
-                _ => ("text-green-400", "O"),
-            };
-            view! {
-                <a
-                    href=url
-                    target="_blank"
-                    class=format!("flex items-center gap-1 px-2 py-1 text-[10px] rounded-md bg-green-500/10 {} hover:bg-green-500/20 transition-colors", icon_color)
-                    on:click=move |e: web_sys::MouseEvent| e.stop_propagation()
-                >
-                    <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                    </svg>
-                    {format!("PR #{}", number)}
-                    <span class="ml-0.5 text-[9px]">{status_char}</span>
-                </a>
-            }.into_any()
+        ExternalRef::GithubPr { url, number, repo, state } => {
+            view! { <crate::components::pr_status::PrBadge url=url number=number repo=repo state=state /> }.into_any()
         }
         ExternalRef::JiraTicket { key, .. } => {
             view! {
