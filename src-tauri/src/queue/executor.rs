@@ -4626,6 +4626,7 @@ mod tests {
 
     /// A stand-in `gh` that answers from a shell `case` on the pull request
     /// number, which is its third argument.
+    #[cfg(unix)]
     fn fake_gh(dir: &std::path::Path, cases: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("gh");
@@ -4634,7 +4635,9 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     const OPEN_FAILING: &str = r#"printf '{"state":"OPEN","statusCheckRollup":[{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"FAILURE"}],"reviewDecision":"","mergeable":"MERGEABLE"}'"#;
+    #[cfg(unix)]
     const MERGED: &str = r#"printf '{"state":"MERGED","statusCheckRollup":[],"reviewDecision":"APPROVED","mergeable":"UNKNOWN"}'"#;
 
     #[test]
@@ -4667,7 +4670,7 @@ mod tests {
         tasks.insert(unrecorded.id, unrecorded);
 
         let mut polled = polled_pull_requests(&tasks, &statuses);
-        polled.sort_by(|a, b| a.0.number.cmp(&b.0.number));
+        polled.sort_by_key(|(key, _)| key.number);
         assert_eq!(polled, expected, "a pull request linked in any column keeps its card current");
 
         // Final, as recorded or as heard, or quarantined: not asked again.
@@ -4797,6 +4800,7 @@ mod tests {
         assert_eq!(recorded_pr_state(&executor.tasks.read().await[&id]).as_deref(), Some("OPEN"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_hung_gh_times_out_without_holding_up_the_other_pull_requests() {
         let dir = tempfile::tempdir().unwrap();
@@ -4827,6 +4831,7 @@ mod tests {
         assert_eq!(recorded_pr_state(&tasks[&hung]).as_deref(), Some("OPEN"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_merge_heard_outside_the_delivery_columns_is_shown_not_acted_on() {
         let dir = tempfile::tempdir().unwrap();
@@ -5133,6 +5138,7 @@ mod tests {
     }
 
     /// An executor whose pull request status comes from `pr_statuses`.
+    #[cfg(unix)]
     fn test_executor_with_prs(
         pr_statuses: Arc<crate::pr_status::PrStatuses>,
     ) -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {

@@ -342,6 +342,15 @@ impl FakeDisk {
     }
 }
 
+/// Pull request status that can never reach GitHub: the program it would run
+/// does not exist, so every refresh fails at once as "not installed".
+pub fn no_github() -> std::sync::Arc<crate::pr_status::PrStatuses> {
+    std::sync::Arc::new(crate::pr_status::PrStatuses::with_program(
+        "/nonexistent/slashit-test-gh",
+        std::time::Duration::from_secs(1),
+    ))
+}
+
 /// A start guard that always finds plenty of free space.
 ///
 /// Tests build state on whatever disk the machine has, and a CI runner's is
@@ -599,13 +608,4 @@ mod tests {
         let task = create_test_task_with_status("In Progress Task", TaskStatus::InProgress);
         assert!(matches!(task.status, TaskStatus::InProgress));
     }
-}
-
-/// Pull request status that can never reach GitHub: the program it would run
-/// does not exist, so every refresh fails at once as "not installed".
-pub fn no_github() -> std::sync::Arc<crate::pr_status::PrStatuses> {
-    std::sync::Arc::new(crate::pr_status::PrStatuses::with_program(
-        "/nonexistent/slashit-test-gh",
-        std::time::Duration::from_secs(1),
-    ))
 }
