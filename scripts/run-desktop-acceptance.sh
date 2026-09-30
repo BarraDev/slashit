@@ -80,6 +80,13 @@ if ((list)); then
   exec "${cargo_test[@]}"
 fi
 
+# libtest reports success when a filter matches nothing, so a mistyped or
+# renamed journey would pass without running. Refuse that up front.
+if [[ -n $filter ]]; then
+  listed=$(cargo test -q -p slashit-acceptance --features run-acceptance --test "$target" -- --list --exact "$filter")
+  [[ $listed == *": test"* ]] || fail "no test in $target is named exactly '$filter' (see --list)"
+fi
+
 # The application under test. scripts/build-acceptance-app.sh records the
 # binary it built; any ordinary cargo build of slashit-ui silently replaces
 # that file with one that embeds no frontend or an unstripped one.
