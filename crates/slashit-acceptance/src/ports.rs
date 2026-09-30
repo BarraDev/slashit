@@ -88,6 +88,137 @@ pub async fn wait_until_listening(port: u16, timeout: Duration, what: &str) -> R
     )
 }
 
+/// Block until `WebKitWebDriver`'s `GET /status` reports `value.ready ==
+/// true`, or fail with a useful timeout.
+///
+/// This is not a generic "HTTP 2xx means ready" wait: a 2xx here only proves
+/// the process answered, not that it can accept a session. The W3C readiness
+/// contract lives in the body, `{"value":{"ready":true,...}}`; `ready:false`
+/// is a normal, well-formed "not yet" that must be retried exactly like a
+/// connection refused. `tauri-driver` spawns the native driver and starts
+/// forwarding requests to it immediately, without waiting for it to be
+/// listening (`crates/tauri-driver/src/main.rs` upstream), so a connection
+/// refused here is the expected, retryable shape of "not up yet" -- it is not
+/// evidence of a permanent problem until the deadline passes. Any other
+/// failure while reading or parsing the response (a reset mid-response, a
+/// malformed status line, a body that is not the expected JSON shape) is
+/// treated the same way: retried, because during startup those are at least
+/// as likely to be transient as a refused connection, and the deadline is
+/// what turns "not ready yet" into a real failure either way.
+pub async fn wait_until_webdriver_ready(
+    port: u16,
+    path: &str,
+    timeout: Duration,
+    what: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error: Option<String> = None;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Every I/O step inside `http_get_webdriver_ready` -- connect, write,
+        // status-line read, header reads, body read -- has no timeout of its
+        // own. A native driver that accepts the TCP connection and then never
+        // finishes the response could otherwise stall a single attempt past
+        // this function's own deadline. Wrapping the whole attempt in the
+        // *remaining* budget, rather than a fresh per-attempt timeout, keeps
+        // one shared deadline in force instead of letting retries multiply it.
+        match tokio::time::timeout(remaining, http_get_webdriver_ready(port, path)).await {
+            Ok(Ok(true)) => return Ok(()),
+            Ok(Ok(false)) => last_error = Some("status reported ready:false".to_string()),
+            Ok(Err(e)) => last_error = Some(e.to_string()),
+            Err(_) => {
+                last_error =
+                    Some("status request did not complete before the startup deadline".to_string());
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
+    }
+    bail!(
+        "{what} never answered {path} on 127.0.0.1:{port} with ready:true within {}s{}",
+        timeout.as_secs(),
+        last_error
+            .map(|e| format!(" (last attempt: {e})"))
+            .unwrap_or_default()
+    )
+}
+
+/// One GET, no retry, no connection reuse: whether the response was a
+/// well-formed WebDriver status report with `value.ready == true`, or the
+/// error that stopped it (most commonly "connection refused" while the
+/// server is still starting, but also a non-2xx status, a missing
+/// `Content-Length`, or a body that is not the expected JSON shape).
+async fn http_get_webdriver_ready(port: u16, path: &str) -> Result<bool> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .context("connect")?;
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .context("write request")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .await
+        .context("read status line")?;
+
+    // "HTTP/1.1 200 OK" -- the code is the second whitespace-separated field.
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .with_context(|| format!("not an HTTP status line: {status_line:?}"))?;
+    if !(200..300).contains(&status) {
+        bail!("HTTP {status}");
+    }
+
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header).await.context("read header")?;
+        let header = header.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        if let Some(value) = header
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .map(|v| v.trim().to_string())
+        {
+            content_length = value.parse().ok();
+        }
+    }
+    let content_length = content_length
+        .context("response had no usable Content-Length; cannot read a status body")?;
+    // A genuine WebDriver status body is a few hundred bytes. This cap is
+    // generous slack above that, not a real limit -- its only job is to turn
+    // a corrupt or hostile `Content-Length` into the same retryable `Err`
+    // every other malformed-response path returns, instead of an allocation
+    // large enough to abort the process outright.
+    const MAX_STATUS_BODY: usize = 64 * 1024;
+    if content_length > MAX_STATUS_BODY {
+        bail!("Content-Length {content_length} exceeds the {MAX_STATUS_BODY}-byte cap for a status body");
+    }
+
+    let mut body = vec![0u8; content_length];
+    reader
+        .read_exact(&mut body)
+        .await
+        .context("read response body")?;
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).context("response body was not valid JSON")?;
+    value
+        .get("value")
+        .and_then(|v| v.get("ready"))
+        .and_then(|v| v.as_bool())
+        .context("response JSON had no boolean value.ready")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +274,237 @@ mod tests {
             .expect("a genuine listener must be reported as listening");
     }
 
+    /// A truthful WebDriver status response -- HTTP 200 with a body whose
+    /// `value.ready` is `ready` -- with a correct `Content-Length`, since the
+    /// reader now parses the body rather than stopping at the status line.
+    fn webdriver_status_response(ready: bool) -> String {
+        let body = format!(r#"{{"value":{{"ready":{ready}}}}}"#);
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// The success path for [`wait_until_webdriver_ready`]: a response whose
+    /// body actually says `value.ready: true` is recognised as readiness.
+    ///
+    /// This used to send a bare `200 OK` with an empty body and no
+    /// `Content-Length` -- true before the fix, because the old reader never
+    /// looked past the status line. That is exactly the gap the real bug
+    /// lived in: an HTTP 200 is not the same claim as `value.ready == true`,
+    /// and this test now proves the wait requires the latter.
+    #[tokio::test]
+    async fn a_webdriver_status_reporting_ready_true_is_recognised() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a listener");
+        let port = listener.local_addr().expect("local address").port();
+        tokio::spawn(respond_once(listener, webdriver_status_response(true)));
+
+        wait_until_webdriver_ready(port, "/status", Duration::from_secs(5), "a native driver")
+            .await
+            .expect("a ready:true status body must be recognised as ready");
+    }
+
+    /// `ready:false` is a well-formed, successful HTTP response -- and must
+    /// never be mistaken for readiness. Without the deadline being spent, a
+    /// bug that treats any 2xx as ready would return immediately here instead
+    /// of waiting out the deadline.
+    #[tokio::test]
+    async fn a_webdriver_status_reporting_ready_false_never_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a listener");
+        let port = listener.local_addr().expect("local address").port();
+        tokio::spawn(respond_forever(listener, webdriver_status_response(false)));
+
+        let started = Instant::now();
+        let err = wait_until_webdriver_ready(port, "/status", Duration::from_millis(300), "a native driver")
+            .await
+            .expect_err("ready:false must never be reported as ready");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "a permanent ready:false must be retried until the deadline, not accepted early: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.to_string().contains("ready:false"),
+            "the failure should say what the last attempt actually reported: {err}"
+        );
+    }
+
+    /// A response that returns 2xx but whose body is not the expected
+    /// WebDriver status shape (invalid JSON, or JSON missing `value.ready`)
+    /// must be treated as "not ready yet", exactly like a connection refused
+    /// -- never as readiness, and never as an immediate hard failure either.
+    #[tokio::test]
+    async fn a_malformed_status_body_never_counts_as_ready() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a listener");
+        let port = listener.local_addr().expect("local address").port();
+        let body = "not json";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        tokio::spawn(respond_forever(listener, response));
+
+        wait_until_webdriver_ready(port, "/status", Duration::from_millis(300), "a native driver")
+            .await
+            .expect_err("a malformed status body must never be treated as ready");
+    }
+
+    /// A corrupt or hostile `Content-Length` must not be trusted for the size
+    /// of an allocation: without a cap, a value like this aborts the whole
+    /// process with an allocation failure instead of returning the same
+    /// graceful, retryable `Err` every other malformed-response path returns.
+    #[tokio::test]
+    async fn an_implausible_content_length_is_rejected_without_aborting() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a listener");
+        let port = listener.local_addr().expect("local address").port();
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999\r\n\r\n".to_string();
+        tokio::spawn(respond_forever(listener, response));
+
+        wait_until_webdriver_ready(port, "/status", Duration::from_millis(300), "a native driver")
+            .await
+            .expect_err("an implausible Content-Length must fail gracefully, not abort the process");
+    }
+
+    /// The regression this fix exists for: a peer that accepts the TCP
+    /// connection and then never sends anything back must not be able to
+    /// stall a single attempt past the wait's own deadline. Before the fix,
+    /// `http_get_webdriver_ready`'s `read_line` had no timeout of its own, so
+    /// this attempt would hang forever and the deadline check between
+    /// attempts would never be reached.
+    ///
+    /// An outer watchdog bounds the regression itself well above the 1s
+    /// deadline under test, so a real failure (the fix regressing) reports as
+    /// a normal assertion failure instead of hanging the test suite.
+    #[tokio::test]
+    async fn a_peer_that_accepts_and_never_responds_does_not_outlive_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a listener");
+        let port = listener.local_addr().expect("local address").port();
+        tokio::spawn(accept_and_never_respond(listener));
+
+        let deadline_budget = Duration::from_secs(1);
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            deadline_budget + Duration::from_secs(5),
+            wait_until_webdriver_ready(port, "/status", deadline_budget, "a native driver"),
+        )
+        .await
+        .expect("the wait must respect its own deadline instead of relying on an outer watchdog");
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("a peer that never responds must never count as ready");
+        assert!(
+            elapsed < deadline_budget + Duration::from_secs(1),
+            "a stalled attempt must not outlive the shared deadline: {elapsed:?}"
+        );
+        assert!(
+            err.to_string().contains("did not complete before the startup deadline"),
+            "the failure should name the stalled attempt, not a generic timeout: {err}"
+        );
+    }
+
+    /// Accept every connection this listener ever receives, read nothing back
+    /// from it, and never write a response -- the shape of a native driver
+    /// that is accepting connections but is wedged before it can answer.
+    async fn accept_and_never_respond(listener: TcpListener) {
+        listener
+            .set_nonblocking(true)
+            .expect("mark the listener non-blocking before handing it to tokio");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("adopt std listener into tokio");
+        // Accepted connections are kept here, alive for as long as this task
+        // runs, rather than dropped -- dropping would close the socket and
+        // turn "accepted but silent" into "connection reset", a different
+        // failure shape than the one under test.
+        let mut held = Vec::new();
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            held.push(stream);
+        }
+    }
+
+    /// The one thing this wait exists for: a native driver that is not ready
+    /// yet -- whether because nothing is listening, or because it answers
+    /// `ready:false` -- must be retried, not treated as the final answer,
+    /// right up until it actually reports `ready:true`.
+    #[tokio::test]
+    async fn a_late_ready_true_response_is_waited_for_rather_than_raced() {
+        let port = {
+            // Reserve a real port, then let it go: nothing listens on it
+            // until the delayed task below binds it, which is exactly the
+            // "spawned but not yet listening" gap this wait exists to cross.
+            let probe = TcpListener::bind("127.0.0.1:0").expect("bind a probe listener");
+            probe.local_addr().expect("local address").port()
+        };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let listener =
+                tokio::net::TcpListener::bind(("127.0.0.1", port)).await.expect("bind late");
+            respond_once_tokio(listener, webdriver_status_response(true)).await;
+        });
+
+        let started = Instant::now();
+        wait_until_webdriver_ready(port, "/status", Duration::from_secs(5), "a native driver")
+            .await
+            .expect("a server that starts late must still be waited for");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "the wait returned before the server could plausibly have started: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Respond to exactly one connection with `response`, from a std
+    /// listener handed off to a blocking task (used where the listener must
+    /// be bound before the task starts, to close the reservation gap).
+    async fn respond_once(listener: TcpListener, response: impl Into<String>) {
+        let response = response.into();
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().expect("accept a connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf); // drain the request; content unused
+            let _ = stream.write_all(response.as_bytes());
+        })
+        .await
+        .expect("responder task must not panic");
+    }
+
+    /// Same as [`respond_once`], for a listener that was bound with tokio.
+    async fn respond_once_tokio(listener: tokio::net::TcpListener, response: impl Into<String>) {
+        use tokio::io::AsyncWriteExt;
+        let response = response.into();
+        let (mut stream, _) = listener.accept().await.expect("accept a connection");
+        let mut buf = [0u8; 1024];
+        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+
+    /// Answer every connection this listener ever accepts with the same
+    /// `response`, for as long as the test keeps polling. Used where the wait
+    /// under test must retry more than once before its deadline.
+    async fn respond_forever(listener: TcpListener, response: impl Into<String> + Clone + Send + 'static) {
+        listener
+            .set_nonblocking(true)
+            .expect("mark the listener non-blocking before handing it to tokio");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("adopt std listener into tokio");
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let response = response.clone().into();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+
     /// When the wait runs out, its message is often the only evidence a CI log
     /// carries about what failed, so it has to name both the port and what was
     /// expected on it.
@@ -162,5 +524,19 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("65000"), "message: {message}");
         assert!(message.contains("a provider"), "message: {message}");
+    }
+
+    /// Same proof as its `wait_until_listening` sibling above, for the HTTP
+    /// variant: nothing ever answers, so the deadline is the only thing that
+    /// can end the wait, and its message has to say enough to act on.
+    #[tokio::test]
+    async fn an_http_wait_that_runs_out_of_time_names_the_port_and_the_path() {
+        let err = wait_until_webdriver_ready(65000, "/status", Duration::ZERO, "a native driver")
+            .await
+            .expect_err("a deadline that has already passed must fail");
+        let message = err.to_string();
+        assert!(message.contains("65000"), "message: {message}");
+        assert!(message.contains("/status"), "message: {message}");
+        assert!(message.contains("a native driver"), "message: {message}");
     }
 }
