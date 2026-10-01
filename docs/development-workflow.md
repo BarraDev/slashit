@@ -420,6 +420,30 @@ Rules:
   exercised by CI.
 - No lockfile is required beyond the exact version pin.
 
+### Rust toolchain
+
+The Rust version is pinned in one place, `rust-toolchain.toml` at the
+repository root. rustup selects it for any `cargo` or `rustc` run inside a
+checkout, including CI and the release workflow, so there is no `stable`
+selector and no version literal in the workflows. Outside the repository
+nothing changes: your global default toolchain is untouched.
+
+- Install it with `rustup toolchain install` (no argument) from inside the
+  checkout. By default rustup also installs it on first use.
+- The file pins only the compiler (profile `minimal`). Components and targets
+  are added by the jobs that need them (`clippy`, `wasm32-unknown-unknown`,
+  the macOS release targets), so a checkout or job does not carry
+  capabilities it does not use. Developers add `clippy` and `rustfmt`
+  themselves (`rustup component add clippy rustfmt`); rustup applies them to
+  the pinned toolchain.
+- A `cargo` that bypasses the rustup proxies (a distribution-packaged Rust
+  on `PATH` ahead of `~/.cargo/bin`) also bypasses the file. Check with
+  `rustc --version` inside the checkout.
+- This is a toolchain pin, not an MSRV declaration; `Cargo.toml` carries no
+  `rust-version`.
+- Bump it deliberately in its own pull request: change the `channel`, run the
+  exact Clippy command from CI, and address any new lints or warnings.
+
 ## 9. Disposable JJ experiments
 
 Checking how `jj` behaves, for example before documenting a workflow, belongs
