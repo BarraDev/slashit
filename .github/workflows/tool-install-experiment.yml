@@ -1,0 +1,132 @@
+name: Tool install experiment
+
+# Measurement only; never merged. It times two ways of getting `cargo-tauri`
+# and `tauri-driver` onto an ubuntu-22.04 runner, with the versions the
+# production acceptance jobs resolve today. It writes no cache of any kind
+# and builds no application.
+#
+#   a-source    cargo install of both tools, as ci.yml does today (1 control)
+#   b-prebuilt  cargo-tauri from Tauri's release asset, checked against a
+#               pinned SHA-256; tauri-driver from source (3 jobs)
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [experiment/tool-install]
+  workflow_dispatch:
+
+env:
+  TAURI_CLI_VERSION: 2.12.1
+  TAURI_DRIVER_VERSION: 2.1.0
+  # Digest GitHub reports for cargo-tauri-x86_64-unknown-linux-gnu.tgz in the
+  # tauri-cli-v2.12.1 release; a local download hashed to the same value.
+  TAURI_CLI_SHA256: 04ef3a9a2ed7b7dc479bef08ab40deee80065c99fc778f79ebce775eb72bbeff
+
+jobs:
+  a-source:
+    name: a-source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Install tauri-cli from source
+        run: |
+          t0=$(date +%s.%N)
+          cargo install tauri-cli --version "=${TAURI_CLI_VERSION}" --locked
+          t1=$(date +%s.%N)
+          echo "cli_seconds=$(awk -v a="$t1" -v b="$t0" 'BEGIN{printf "%.1f", a - b}')" >> "$GITHUB_ENV"
+
+      - name: Install tauri-driver from source
+        run: |
+          t0=$(date +%s.%N)
+          cargo install tauri-driver --version "=${TAURI_DRIVER_VERSION}" --locked
+          t1=$(date +%s.%N)
+          echo "driver_seconds=$(awk -v a="$t1" -v b="$t0" 'BEGIN{printf "%.1f", a - b}')" >> "$GITHUB_ENV"
+
+      - name: Report
+        run: |
+          {
+            echo "### a-source"
+            echo "- tauri-cli install: ${cli_seconds} s"
+            echo "- tauri-driver install: ${driver_seconds} s"
+            echo "- version: $(cargo tauri --version)"
+            echo "- cargo-tauri sha256: $(sha256sum "$HOME/.cargo/bin/cargo-tauri" | cut -d' ' -f1)"
+            echo "- cargo-tauri bytes: $(stat -c %s "$HOME/.cargo/bin/cargo-tauri")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  b-prebuilt:
+    name: b-prebuilt rep ${{ matrix.rep }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Download the official cargo-tauri asset
+        run: |
+          t0=$(date +%s.%N)
+          curl --fail --silent --show-error --location --retry 3 \
+            --output cargo-tauri.tgz \
+            "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/cargo-tauri-x86_64-unknown-linux-gnu.tgz"
+          t1=$(date +%s.%N)
+          echo "download_seconds=$(awk -v a="$t1" -v b="$t0" 'BEGIN{printf "%.2f", a - b}')" >> "$GITHUB_ENV"
+          echo "asset_bytes=$(stat -c %s cargo-tauri.tgz)" >> "$GITHUB_ENV"
+
+      - name: Verify the pinned SHA-256
+        run: |
+          t0=$(date +%s.%N)
+          echo "${TAURI_CLI_SHA256}  cargo-tauri.tgz" | sha256sum --check --strict
+          t1=$(date +%s.%N)
+          echo "verify_seconds=$(awk -v a="$t1" -v b="$t0" 'BEGIN{printf "%.2f", a - b}')" >> "$GITHUB_ENV"
+
+      - name: Extract and install cargo-tauri
+        run: |
+          t0=$(date +%s.%N)
+          tar -xzf cargo-tauri.tgz -C "$HOME/.cargo/bin" cargo-tauri
+          t1=$(date +%s.%N)
+          echo "extract_seconds=$(awk -v a="$t1" -v b="$t0" 'BEGIN{printf "%.2f", a - b}')" >> "$GITHUB_ENV"
+          [ "$(cargo tauri --version)" = "tauri-cli ${TAURI_CLI_VERSION}" ]
+
+      - name: Install tauri-driver from source (no official asset)
+        run: |
+          t0=$(date +%s.%N)
+          cargo install tauri-driver --version "=${TAURI_DRIVER_VERSION}" --locked
+          t1=$(date +%s.%N)
+          echo "driver_seconds=$(awk -v a="$t1" -v b="$t0" 'BEGIN{printf "%.1f", a - b}')" >> "$GITHUB_ENV"
+
+      - name: Report
+        run: |
+          {
+            echo "### b-prebuilt rep ${{ matrix.rep }}"
+            echo "- download: ${download_seconds} s (${asset_bytes} bytes)"
+            echo "- sha256 verify: ${verify_seconds} s"
+            echo "- extract and install: ${extract_seconds} s"
+            echo "- tauri-driver install: ${driver_seconds} s"
+            echo "- version: $(cargo tauri --version)"
+            echo "- cargo-tauri sha256: $(sha256sum "$HOME/.cargo/bin/cargo-tauri" | cut -d' ' -f1)"
+            echo "- cargo-tauri bytes: $(stat -c %s "$HOME/.cargo/bin/cargo-tauri")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Focused proof that the installed CLI runs on the hosted runner; it
+      # runs after the timings above and builds nothing.
+      - name: Validate the installed CLI
+        run: |
+          ldd "$HOME/.cargo/bin/cargo-tauri"
+          cargo tauri build --help > /dev/null
+          cargo tauri info > info.txt 2>&1 || true
+          head -20 info.txt
