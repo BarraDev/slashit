@@ -68,10 +68,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          components: clippy
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Add Clippy
+        run: rustup component add clippy
 
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
@@ -185,8 +186,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
 
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
@@ -250,8 +251,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
 
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
@@ -326,8 +327,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
 
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2

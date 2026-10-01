@@ -97,14 +97,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust stable
-        # dtolnay/rust-toolchain has no version tags; `stable` tracks the
-        # stable release channel, not a specific toolchain version. Pinned
-        # to the commit `stable` resolved to as of 2026-09-05; re-pin
-        # periodically to pick up channel updates.
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (channel, not a version)
-        with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Add macOS targets
+        if: matrix.platform == 'macos-latest'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Install trunk
         uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
