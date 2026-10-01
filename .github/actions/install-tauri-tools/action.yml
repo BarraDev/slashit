@@ -1,0 +1,71 @@
+name: Install the Tauri tools
+description: >
+  The Tauri CLI (`cargo tauri`) and `tauri-driver` for the Linux desktop
+  acceptance jobs, both at exact versions. The CLI is Tauri's official
+  prebuilt x86_64 Linux release asset, checked against a pinned SHA-256;
+  `tauri-driver` publishes no binary and is built from source. Linux x86_64
+  only: the asset below is that build, and the action refuses to run anywhere
+  else rather than install something that cannot run.
+
+runs:
+  using: composite
+  steps:
+    - name: Install the Tauri CLI (official release asset, SHA-256 verified)
+      shell: bash
+      env:
+        # Bumping the version means replacing the digest in the same change:
+        # take it from the `digest` field of the matching asset in the
+        # `tauri-cli-v<version>` release on github.com/tauri-apps/tauri, and
+        # check that the asset's own hash agrees. It is deliberately not
+        # fetched at run time, or the check would only prove that the download
+        # matches whatever the download said.
+        TAURI_CLI_VERSION: 2.12.1
+        TAURI_CLI_SHA256: 04ef3a9a2ed7b7dc479bef08ab40deee80065c99fc778f79ebce775eb72bbeff
+      run: |
+        set -euo pipefail
+
+        if [ "${RUNNER_OS}" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
+          echo "install-tauri-tools: the pinned Tauri CLI asset is x86_64 Linux only; this runner is ${RUNNER_OS}/$(uname -m)" >&2
+          exit 1
+        fi
+
+        expected="tauri-cli ${TAURI_CLI_VERSION}"
+
+        # A restored cache may already hold exactly this version. Any other
+        # version, or none, is replaced below.
+        if [ "$(cargo tauri --version 2>/dev/null || true)" = "${expected}" ]; then
+          echo "${expected} is already installed; skipping the download"
+          exit 0
+        fi
+
+        asset="cargo-tauri-x86_64-unknown-linux-gnu.tgz"
+        url="https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/${asset}"
+
+        work=$(mktemp -d)
+        trap 'rm -rf "${work}"' EXIT
+
+        curl --fail --silent --show-error --location --retry 3 \
+          --proto '=https' --proto-redir '=https' --tlsv1.2 --output "${work}/${asset}" "${url}"
+
+        # Nothing is extracted or installed unless this succeeds.
+        (cd "${work}" && echo "${TAURI_CLI_SHA256}  ${asset}" | sha256sum --check --strict -)
+
+        mkdir "${work}/extracted"
+        tar -xzf "${work}/${asset}" -C "${work}/extracted" cargo-tauri
+        mkdir -p "${HOME}/.cargo/bin"
+        install -m 0755 "${work}/extracted/cargo-tauri" "${HOME}/.cargo/bin/cargo-tauri"
+
+        actual=$(cargo tauri --version)
+        if [ "${actual}" != "${expected}" ]; then
+          echo "install-tauri-tools: expected '${expected}', got '${actual}'" >&2
+          exit 1
+        fi
+        echo "installed ${actual}"
+
+    - name: Install tauri-driver (no official binary; built from source)
+      shell: bash
+      env:
+        TAURI_DRIVER_VERSION: 2.1.0
+      run: |
+        set -euo pipefail
+        cargo install tauri-driver --version "=${TAURI_DRIVER_VERSION}" --locked
