@@ -20,8 +20,11 @@ For **security vulnerabilities**, do not open a public issue. See [SECURITY.md](
 
 ### Prerequisites
 
-- Rust (stable toolchain) -- install via [rustup](https://rustup.rs/)
+- Rust, through [rustup](https://rustup.rs/) -- the version is pinned by
+  `rust-toolchain.toml`; run `rustup toolchain install` in the checkout to
+  install it
 - [Trunk](https://trunkrs.dev/) -- `cargo install trunk`
+- `clippy` and `rustfmt` components -- `rustup component add clippy rustfmt`
 - `wasm32-unknown-unknown` target -- `rustup target add wasm32-unknown-unknown`
 - Tauri CLI -- `cargo install tauri-cli --version "^2.0"`
 - Linux: `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`

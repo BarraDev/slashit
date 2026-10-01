@@ -108,8 +108,9 @@ Installers are not code-signed yet, so the first launch will show a SmartScreen 
 
 **Prerequisites:**
 
-- Rust (stable toolchain)
+- Rust through [rustup](https://rustup.rs/); `rust-toolchain.toml` pins the version
 - [Trunk](https://trunkrs.dev/) (`cargo install trunk`)
+- `clippy` and `rustfmt` components (`rustup component add clippy rustfmt`)
 - `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`)
 - System dependencies (Linux): `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`
 
