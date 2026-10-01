@@ -1,0 +1,330 @@
+name: Acceptance build fan-out benchmark
+
+# EXPERIMENT. Not part of the required checks and never meant for main.
+#
+# Same revision, same runner generation, two architectures:
+#
+#   A  the production design from ci.yml: four independent jobs, each building
+#      its own application and then running its own acceptance subset.
+#   B  build the application once, ship a small bundle, run the same four
+#      subsets from it.
+#
+# A runs first and B after it (`needs`), so the nine runners never compete for
+# the repository's concurrency budget. Compare each arm from its first job's
+# start to its last job's end.
+#
+# THIS WORKFLOW MUST NEVER CREATE A CACHE ENTRY. The repository cache is close
+# to its quota, and a new entry would evict production caches. Therefore:
+#   - CACHE_MODE=cold: no cache action runs at all.
+#   - CACHE_MODE=warm: Swatinem/rust-cache restores an existing production
+#     cache with `save-if: false`. At the pinned commit that input makes the
+#     post step return before any cleanup or save (src/save.ts).
+# No other action used here touches the cache service.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [experiment/acceptance-build-fanout]
+
+concurrency:
+  group: acceptance-fanout-benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CACHE_MODE: cold
+
+jobs:
+  # ---------------------------------------------------------------- arm A ---
+  # Copied from ci.yml's acceptance-harness job. The job id must stay
+  # `acceptance-harness`: rust-cache folds it into the key it restores. The
+  # only additions are the read-only cache switch, the separately timed
+  # harness compile and the tee that records the test counts.
+  acceptance-harness:
+    runs-on: ubuntu-22.04
+    name: A / harness
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install Linux dependencies
+        uses: ./.github/actions/linux-build-deps
+        with:
+          webdriver: 'true'
+
+      - name: Rust cache (restore only)
+        if: env.CACHE_MODE == 'warm'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: false
+
+      - name: Install trunk
+        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
+        with:
+          version: latest
+
+      - name: Install the Tauri CLI and tauri-driver
+        run: |
+          cargo install tauri-cli --version "^2.10" --locked
+          cargo install tauri-driver --version "^2" --locked
+
+      - name: Build the application under test
+        run: scripts/build-acceptance-app.sh
+
+      # Production folds this into the journeys step; separated here so both
+      # arms report it. The runner below finds everything built.
+      - name: Compile the acceptance harness
+        run: cargo test -p slashit-acceptance --features run-acceptance --no-run
+
+      - name: Harness acceptance tests
+        shell: bash
+        run: |
+          scripts/run-desktop-acceptance.sh --harness 2>&1 | tee acceptance.log
+          grep -E '^test result:' acceptance.log >>"$GITHUB_STEP_SUMMARY" || true
+
+      - name: Preserve failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-a-failure-harness
+          path: target/acceptance
+          if-no-files-found: ignore
+          retention-days: 3
+
+  # Copied from ci.yml's acceptance-product job, same shard keys.
+  acceptance-product:
+    runs-on: ubuntu-22.04
+    name: A / product shard ${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install Linux dependencies
+        uses: ./.github/actions/linux-build-deps
+        with:
+          webdriver: 'true'
+
+      - name: Rust cache (restore only)
+        if: env.CACHE_MODE == 'warm'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: acceptance-product-shard-${{ matrix.shard }}
+          save-if: false
+
+      - name: Install trunk
+        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
+        with:
+          version: latest
+
+      - name: Install the Tauri CLI and tauri-driver
+        run: |
+          cargo install tauri-cli --version "^2.10" --locked
+          cargo install tauri-driver --version "^2" --locked
+
+      - name: Build the application under test
+        run: scripts/build-acceptance-app.sh
+
+      - name: Compile the acceptance harness
+        run: cargo test -p slashit-acceptance --features run-acceptance --no-run
+
+      - name: Product acceptance journeys (shard ${{ matrix.shard }})
+        shell: bash
+        run: |
+          scripts/run-desktop-acceptance.sh --shard ${{ matrix.shard }} 2>&1 | tee acceptance.log
+          grep -E '^test result:' acceptance.log >>"$GITHUB_STEP_SUMMARY" || true
+
+      - name: Preserve failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-a-failure-shard-${{ matrix.shard }}
+          path: target/acceptance
+          if-no-files-found: ignore
+          retention-days: 3
+
+  # ---------------------------------------------------------------- arm B ---
+  # The only job that compiles the application in this arm.
+  build:
+    needs: [acceptance-harness, acceptance-product]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    name: B / build once
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install Linux dependencies
+        uses: ./.github/actions/linux-build-deps
+        with:
+          webdriver: 'true'
+
+      # Restores the cache production's product shard 1 uses.
+      - name: Rust cache (restore only)
+        if: env.CACHE_MODE == 'warm'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: acceptance-product-shard-1
+          save-if: false
+
+      - name: Install trunk
+        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
+        with:
+          version: latest
+
+      - name: Install the Tauri CLI and tauri-driver
+        run: |
+          cargo install tauri-cli --version "^2.10" --locked
+          cargo install tauri-driver --version "^2" --locked
+
+      - name: Build the application under test
+        run: scripts/build-acceptance-app.sh
+
+      # Exactly what the consumers need: the binary (dist/ is embedded in it),
+      # the stamp scripts/run-desktop-acceptance.sh verifies it against, and
+      # the provider the harness drives it through. tar keeps the executable
+      # bit, which upload-artifact's zip would drop.
+      - name: Package the acceptance bundle
+        shell: bash
+        run: |
+          stage=$(mktemp -d)
+          mkdir -p "$stage/target/debug" "$stage/bin"
+          cp -p target/debug/slashit-ui "$stage/target/debug/"
+          cp -p target/acceptance-app.stamp "$stage/target/"
+          cp -p "$(command -v tauri-driver)" "$stage/bin/"
+          ( cd "$stage" && find . -type f | sort | xargs sha256sum ) | tee bundle.manifest
+          tar -C "$stage" -cf - . | zstd -3 -T0 -o acceptance-bundle.tar.zst
+          ls -l target/debug/slashit-ui "$stage/bin/tauri-driver" acceptance-bundle.tar.zst
+          {
+            echo "### Acceptance bundle"
+            echo "- compressed: $(stat -c %s acceptance-bundle.tar.zst) bytes"
+            echo "- uncompressed binary: $(stat -c %s target/debug/slashit-ui) bytes"
+            echo "- contents:"
+            sed 's/^/    /' bundle.manifest
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the acceptance bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acceptance-bundle
+          path: acceptance-bundle.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  # Four consumers in parallel. None builds the application: no trunk, no
+  # Tauri CLI, no wasm target, no Rust cache. They still need a Rust
+  # toolchain, because the harness is itself a cargo test target.
+  acceptance:
+    needs: build
+    runs-on: ubuntu-22.04
+    name: B / ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: harness
+            args: --harness
+          - name: product shard 1
+            args: --shard 1
+          - name: product shard 2
+            args: --shard 2
+          - name: product shard 3
+            args: --shard 3
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Install Linux dependencies
+        uses: ./.github/actions/linux-build-deps
+        with:
+          webdriver: 'true'
+
+      - name: Download the acceptance bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: acceptance-bundle
+
+      # Lays the bundle out exactly where the build script would have: the
+      # runner then verifies the binary against the stamp unchanged.
+      - name: Unpack the acceptance bundle
+        shell: bash
+        run: |
+          ls -l acceptance-bundle.tar.zst
+          zstd -dc acceptance-bundle.tar.zst | tar -xf -
+          mkdir -p "$HOME/.local/bin"
+          mv bin/tauri-driver "$HOME/.local/bin/"
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+          ls -l target/debug/slashit-ui target/acceptance-app.stamp "$HOME/.local/bin/tauri-driver"
+          test -x target/debug/slashit-ui
+          test -x "$HOME/.local/bin/tauri-driver"
+          for bin in target/debug/slashit-ui "$HOME/.local/bin/tauri-driver"; do
+            ldd "$bin" | grep "not found" && exit 1 || true
+          done
+          sha256sum target/debug/slashit-ui
+          cat target/acceptance-app.stamp
+
+      # The harness is a cargo test target and compiles here. It does not
+      # depend on slashit-ui, which the next step proves.
+      - name: Compile the acceptance harness (not the application)
+        run: cargo test -p slashit-acceptance --features run-acceptance --no-run
+
+      - name: Prove the application was not compiled here
+        shell: bash
+        run: |
+          found=$(find target \( -path '*slashit-ui*' -o -path '*slashit_ui*' \) \
+            -not -path 'target/debug/slashit-ui' -not -path 'target/acceptance*' | head -n 5)
+          if [ -n "$found" ]; then
+            echo "slashit-ui build products exist in a consumer:" >&2
+            echo "$found" >&2
+            exit 1
+          fi
+          echo "no slashit-ui compilation products under target/"
+
+      - name: Acceptance (${{ matrix.name }})
+        shell: bash
+        run: |
+          scripts/run-desktop-acceptance.sh ${{ matrix.args }} 2>&1 | tee acceptance.log
+          grep -E '^test result:' acceptance.log >>"$GITHUB_STEP_SUMMARY" || true
+          # The runner verified the binary before starting; confirm nothing
+          # replaced it while the journeys ran.
+          expected=$(sed -n 's/^sha256=//p' target/acceptance-app.stamp)
+          actual=$(sha256sum target/debug/slashit-ui | cut -d' ' -f1)
+          test "$expected" = "$actual"
+
+      - name: Preserve failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-b-failure-${{ strategy.job-index }}
+          path: target/acceptance
+          if-no-files-found: ignore
+          retention-days: 3
