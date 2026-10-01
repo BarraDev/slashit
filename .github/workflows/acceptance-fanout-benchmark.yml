@@ -32,7 +32,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CACHE_MODE: cold
+  CACHE_MODE: warm
 
 jobs:
   # ---------------------------------------------------------------- arm A ---
@@ -268,6 +268,16 @@ jobs:
         with:
           webdriver: 'true'
 
+      # Warm mode only: read-only restore of production's harness cache, so
+      # the consumers do not recompile the harness dependency graph. It goes
+      # before the unpack so a restore cannot remove the bundle's files.
+      - name: Rust cache (restore only)
+        if: env.CACHE_MODE == 'warm'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: acceptance-harness
+          save-if: false
+
       - name: Download the acceptance bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -292,6 +302,16 @@ jobs:
           sha256sum target/debug/slashit-ui
           cat target/acceptance-app.stamp
 
+      # A restored cache may already hold slashit-ui entries; what matters is
+      # that nothing here adds one.
+      - name: Record slashit-ui products before compiling
+        shell: bash
+        run: |
+          find target \( -path '*slashit-ui*' -o -path '*slashit_ui*' \) \
+            -not -path 'target/debug/slashit-ui' -not -path 'target/acceptance*' \
+            | sort >"$RUNNER_TEMP/slashit-ui.before"
+          wc -l <"$RUNNER_TEMP/slashit-ui.before"
+
       # The harness is a cargo test target and compiles here. It does not
       # depend on slashit-ui, which the next step proves.
       - name: Compile the acceptance harness (not the application)
@@ -300,14 +320,14 @@ jobs:
       - name: Prove the application was not compiled here
         shell: bash
         run: |
-          found=$(find target \( -path '*slashit-ui*' -o -path '*slashit_ui*' \) \
-            -not -path 'target/debug/slashit-ui' -not -path 'target/acceptance*' | head -n 5)
-          if [ -n "$found" ]; then
-            echo "slashit-ui build products exist in a consumer:" >&2
-            echo "$found" >&2
+          find target \( -path '*slashit-ui*' -o -path '*slashit_ui*' \) \
+            -not -path 'target/debug/slashit-ui' -not -path 'target/acceptance*' \
+            | sort >"$RUNNER_TEMP/slashit-ui.after"
+          if ! diff "$RUNNER_TEMP/slashit-ui.before" "$RUNNER_TEMP/slashit-ui.after"; then
+            echo "slashit-ui build products appeared in a consumer" >&2
             exit 1
           fi
-          echo "no slashit-ui compilation products under target/"
+          echo "no slashit-ui compilation products were added under target/"
 
       - name: Acceptance (${{ matrix.name }})
         shell: bash
