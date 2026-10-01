@@ -205,9 +205,7 @@ jobs:
           version: latest
 
       - name: Install the Tauri CLI and tauri-driver
-        run: |
-          cargo install tauri-cli --version "^2.10" --locked
-          cargo install tauri-driver --version "^2" --locked
+        uses: ./.github/actions/install-tauri-tools
 
       # The same script developers run. It is `cargo tauri build --debug
       # --no-bundle` -- not `cargo build`, whose binary points at devUrl and
@@ -278,9 +276,7 @@ jobs:
           version: latest
 
       - name: Install the Tauri CLI and tauri-driver
-        run: |
-          cargo install tauri-cli --version "^2.10" --locked
-          cargo install tauri-driver --version "^2" --locked
+        uses: ./.github/actions/install-tauri-tools
 
       - name: Build the application under test
         run: scripts/build-acceptance-app.sh
