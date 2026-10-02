@@ -31,8 +31,8 @@ of one 11-12 minute job; a separate `Desktop acceptance / harness` job runs
 `tests/acceptance.rs` once and is not sharded. `--shard <N>` reads
 [`shard-manifest.txt`](shard-manifest.txt) and runs exactly the journeys CI's
 shard `N` runs, so a shard failure reproduces locally without retyping test
-names. `scripts/check-acceptance-shards.sh` (run in the "Lint, test and
-build" job) proves the manifest assigns every journey `cargo test --list`
+names. `scripts/check-acceptance-shards.sh` (run in the "Lint and
+structural checks" job) proves the manifest assigns every journey `cargo test --list`
 reports to exactly one shard; editing the manifest to rebalance shards or add
 a newly-written journey to one is normal, but leaving a journey unassigned or
 in two shards fails that check.
