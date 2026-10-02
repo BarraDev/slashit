@@ -102,6 +102,26 @@ pub fn offers_action(status: &RepublishStatus) -> bool {
     !matches!(status, RepublishStatus::Blocked { .. })
 }
 
+/// Orders the status requests of one notice by when they were sent, as
+/// `PrStatusBoard` orders its own: a ticket is taken before the request, and
+/// only the answer to the newest ticket may be shown.
+#[derive(Default)]
+struct StatusTickets {
+    latest: u64,
+}
+
+impl StatusTickets {
+    fn issue(&mut self) -> u64 {
+        self.latest += 1;
+        self.latest
+    }
+
+    /// Whether no newer request has been sent since `ticket`.
+    fn is_latest(&self, ticket: u64) -> bool {
+        ticket == self.latest
+    }
+}
+
 /// The notice for one task, with its action. Reads the backend's answer when it
 /// appears and whenever `reload` changes; asks GitHub only then, never on a
 /// timer.
@@ -119,9 +139,20 @@ pub fn RestackNotice(
     let busy = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
 
+    let tickets = StoredValue::new(StatusTickets::default());
+
     let load = move || {
+        let Some(ticket) = tickets.try_update_value(StatusTickets::issue) else {
+            return;
+        };
         spawn_local(async move {
-            match get_published_restack_status(task_id.to_string()).await {
+            let answer = get_published_restack_status(task_id.to_string()).await;
+            // An older request answering late must not overwrite a newer one,
+            // whether it succeeded or failed.
+            if !tickets.try_with_value(|t| t.is_latest(ticket)).unwrap_or(false) {
+                return;
+            }
+            match answer {
                 Ok(found) => status.try_set(found),
                 // Not knowing is not a claim either way: show nothing.
                 Err(e) => {
@@ -352,5 +383,18 @@ mod tests {
         assert!(notice(&needs(true)).0.contains("needs restacking"));
         assert!(notice(&needs(false)).0.contains("retarget"));
         assert!(notice(&needs(true)).1.contains("would not remove them"));
+    }
+
+    /// A reply to an older request is dropped, so a stale `Interrupted` cannot
+    /// bring the Resume action back after a newer request found the restack done.
+    #[test]
+    fn only_the_newest_status_request_may_answer() {
+        let mut tickets = StatusTickets::default();
+        let first = tickets.issue();
+        assert!(tickets.is_latest(first));
+        let second = tickets.issue();
+        assert!(!tickets.is_latest(first), "the older reply is stale");
+        assert!(tickets.is_latest(second));
+        assert!(second > first);
     }
 }

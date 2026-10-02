@@ -10291,6 +10291,51 @@ mod tests {
                     }
                 }
 
+                /// A restack that crashed before its backup existed, then found
+                /// the branch moved from outside, must not send the user to a
+                /// backup ref that was never created: Resume and Discard name the
+                /// approved commit itself, and change nothing.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_refusal_before_any_backup_does_not_name_a_backup() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Planned).await;
+                    assert_eq!(p.republish_backup(), None, "the crash came before the backup");
+                    commit_file(&p.landed.worktree, "drift.txt", "d\n", "outside commit");
+                    let drifted = local_tip(&p.landed);
+                    let record = p.task().await.pending_republish;
+
+                    let resume = p.restack().await.expect_err("drift");
+                    assert!(resume.contains("not the approved branch"), "{resume}");
+                    assert!(!resume.contains("republish-backup"), "{resume}");
+                    assert!(resume.contains(&p.landed.child_tip), "{resume}");
+                    let discard = republish::discard(&p.state, p.task_id).await.expect_err("drift");
+                    assert!(discard.contains("not the restack's result"), "{discard}");
+                    assert!(!discard.contains("republish-backup"), "{discard}");
+                    assert!(discard.contains(&p.landed.child_tip), "{discard}");
+
+                    assert_eq!(local_tip(&p.landed), drifted);
+                    assert_eq!(p.republish_backup(), None, "no backup was created by a refusal");
+                    assert_eq!(p.remote_child().as_deref(), Some(p.landed.child_tip.as_str()));
+                    assert_eq!(p.task().await.pending_republish, record);
+                    assert!(!p.retargeted());
+                }
+
+                /// When the backup does exist at the approved tip, the refusal may
+                /// say so.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_refusal_with_a_backup_at_the_approved_tip_names_it() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Replayed).await;
+                    commit_file(&p.landed.worktree, "drift.txt", "d\n", "outside commit");
+                    let drifted = local_tip(&p.landed);
+
+                    let resume = p.restack().await.expect_err("drift");
+                    assert!(resume.contains("kept in refs/slashit/republish-backup/"), "{resume}");
+                    let discard = republish::discard(&p.state, p.task_id).await.expect_err("drift");
+                    assert!(discard.contains("kept in refs/slashit/republish-backup/"), "{discard}");
+                    assert_recovery_intact(&p, &drifted, "backup present").await;
+                }
+
                 /// The replay SlashIt made, found after a crash between the replay
                 /// and its record, is adopted: a rebase changes the commit IDs and
                 /// the committer and nothing else, which is what is not compared.

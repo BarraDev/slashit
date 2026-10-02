@@ -544,6 +544,21 @@ impl Context {
     }
 }
 
+/// Where the approved tip can be found, from what the repository holds now:
+/// the backup ref is named only if it resolves to `previous_tip`. A restack
+/// that stopped before its backup was created has only the commit itself.
+async fn approved_tip_note(repo: &Path, backup: &str, previous_tip: &str) -> String {
+    match restack::exact_ref(repo, backup).await {
+        Ok(Some(saved)) if saved == previous_tip => {
+            format!("The approved tip {previous_tip} is kept in {backup}")
+        }
+        Ok(_) => format!("The approved tip is {previous_tip}; no backup ref holds it"),
+        Err(e) => {
+            format!("The approved tip is {previous_tip}; the backup ref {backup} could not be read ({e})")
+        }
+    }
+}
+
 /// Carry a pending restack as far as it can go from what is actually in the
 /// repository, and finish it.
 async fn advance(
@@ -629,16 +644,23 @@ async fn advance(
                      (`git rebase --abort`), then run the restack again or discard it."
                 ));
             }
-            restack::replay_matches_exactly(worktree, &pending.fork_point, &pending.previous_tip, &pending.onto, &tip)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "{context}, but {branch} is at {tip}, which is not the approved branch \
-                         ({}) replayed onto {} ({e}). Someone else changed it. {backup} still \
-                         holds the approved tip; discard this restack to go back to it.",
-                        pending.previous_tip, pending.onto
-                    )
-                })?;
+            if let Err(e) = restack::replay_matches_exactly(
+                worktree,
+                &pending.fork_point,
+                &pending.previous_tip,
+                &pending.onto,
+                &tip,
+            )
+            .await
+            {
+                let approved = approved_tip_note(repo, &backup, &pending.previous_tip).await;
+                return Err(format!(
+                    "{context}, but {branch} is at {tip}, which is not the approved branch \
+                     ({}) replayed onto {} ({e}). Someone else changed it. {approved}. Bring \
+                     {branch} back to it by hand, then discard this restack.",
+                    pending.previous_tip, pending.onto
+                ));
+            }
             check_worktree(worktree, branch, &tip, &context).await?;
             pending = record_rewrite(state, task_uuid, branch, &pending, &tip).await?;
         }
@@ -651,13 +673,13 @@ async fn advance(
     };
     let tip = restack::exact_ref(repo, &branch_ref).await?.unwrap_or_default();
     if tip != rewritten {
+        let approved = approved_tip_note(repo, &backup, &pending.previous_tip).await;
         return Err(format!(
             "{context}, but {branch} is at {tip} here, not at {rewritten}, which the restack \
              produced. Something outside SlashIt changed it, and SlashIt will not adopt, publish \
-             or discard commits it did not make. The approved tip {} is kept in {backup}, and the \
-             restack's record is kept: bring {branch} back to {rewritten} (or to {}, then discard \
-             the restack) by hand, and try again.",
-            pending.previous_tip,
+             or discard commits it did not make. {approved}, and the restack's record is kept: \
+             bring {branch} back to {rewritten} (or to {}, then discard the restack) by hand, and \
+             try again.",
             pending.previous_tip
         ));
     }
@@ -685,11 +707,12 @@ async fn advance(
             push_with_lease(&ctx.working_dir, branch, &pending.previous_tip).await?;
         }
         other => {
+            let approved = approved_tip_note(repo, &backup, &pending.previous_tip).await;
             return Err(format!(
                 "{context}, but origin's {branch} is at {} now, which is neither the tip that \
                  was approved ({}) nor the restacked one ({rewritten}). Someone else changed it, \
-                 so SlashIt did not overwrite it. Nothing was pushed. Your rewrite is kept here, \
-                 with the approved tip in {backup}; discard the restack to go back to it.",
+                 so SlashIt did not overwrite it. Nothing was pushed. Your rewrite is kept here. \
+                 {approved}; discard the restack to go back to it.",
                 other.unwrap_or("nothing (the branch is gone)"),
                 pending.previous_tip
             ))
@@ -925,10 +948,11 @@ pub(super) async fn discard(state: &crate::AppState, task_uuid: Uuid) -> Result<
     // exclusive state while the rebase is still live in the worktree.
     if let Some(worktree) = ctx.worktree.as_deref() {
         if let Some(operation) = restack::worktree_state(worktree).await?.in_progress {
+            let approved = approved_tip_note(repo, &backup, &pending.previous_tip).await;
             return Err(format!(
                 "The task's worktree is in the middle of a {operation}, probably the restack's own, \
                  interrupted. Finish it or abort it there (`git rebase --abort`) first. The restack's \
-                 record and its backup {backup} are kept."
+                 record is kept. {approved}."
             ));
         }
     }
@@ -947,12 +971,11 @@ pub(super) async fn discard(state: &crate::AppState, task_uuid: Uuid) -> Result<
             .is_ok(),
         };
         if !produced {
+            let approved = approved_tip_note(repo, &backup, &pending.previous_tip).await;
             return Err(format!(
                 "{branch} is at {tip}, which is not the restack's result, so SlashIt will not move \
-                 it or discard what it holds. The approved tip {} is kept in {backup}, and the \
-                 restack's record is kept. Bring {branch} back to the restack's result by hand, or \
-                 to {} and discard again.",
-                pending.previous_tip,
+                 it or discard what it holds. {approved}, and the restack's record is kept. \
+                 Bring {branch} back to the restack's result by hand, or to {} and discard again.",
                 pending.previous_tip
             ));
         }
