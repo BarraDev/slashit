@@ -70,6 +70,11 @@ impl QueueManager {
             // quarantined task is the one place the interrupted cleanup is
             // explained to the user.
             .filter(|t| !t.cleanup_in_flight)
+            // Likewise a task with an unfinished restack of its published
+            // branch (see `Task::republish_pending_refusal`): no agent may
+            // start for it, so promoting it would park it InProgress holding
+            // one of the parallel-limit slots while nothing runs.
+            .filter(|t| t.republish_pending_refusal().is_none())
             .collect();
 
         if self.config.fifo_ordering {
@@ -319,6 +324,34 @@ mod tests {
         let manager = make_manager(tasks.clone(), 3);
 
         assert_eq!(promote(&manager, &tasks).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_promote_next_task_excludes_a_task_with_an_unfinished_restack() {
+        // Promoting it would park it InProgress, holding a parallel-limit slot,
+        // while the executor declines to start it; the next queued task is
+        // promoted instead.
+        let mut pending = create_test_task_with_status("Pending restack", TaskStatus::Queue);
+        pending.pending_republish = Some(crate::domain::PendingRepublish {
+            parent_branch: "p".to_string(),
+            parent_pr: 1,
+            pr_number: 2,
+            default_branch: "main".to_string(),
+            fork_point: "a".repeat(40),
+            previous_tip: "b".repeat(40),
+            onto: "c".repeat(40),
+            rewritten_tip: None,
+        });
+        let pending_id = pending.id;
+        let tasks = make_tasks_map(vec![pending]);
+        let manager = make_manager(tasks.clone(), 3);
+        assert_eq!(promote(&manager, &tasks).await, None);
+
+        let other = create_test_task_with_status("Ordinary", TaskStatus::Queue);
+        let other_id = other.id;
+        tasks.write().await.insert(other_id, other);
+        assert_eq!(promote(&manager, &tasks).await, Some(other_id));
+        assert_eq!(tasks.read().await[&pending_id].status, TaskStatus::Queue);
     }
 
     // === get_queued_tasks ===

@@ -881,8 +881,9 @@ pub enum RepublishStatus {
     },
     /// The parent landed, but a restack is not possible as things are.
     Blocked { reason: String },
-    /// A restack was started and did not finish.
-    Interrupted { rewritten: bool, detail: String },
+    /// A restack was started and did not finish. `discard_blocked` says why
+    /// Discard would be refused, when it already is known to be.
+    Interrupted { rewritten: bool, detail: String, discard_blocked: Option<String> },
 }
 
 /// What a finished restack did, as `commands::pr::RepublishOutcome` serializes it.
@@ -892,5 +893,4 @@ pub struct RepublishOutcome {
     pub base: String,
     pub previous_tip: String,
     pub new_tip: String,
-    pub backup: Option<String>,
 }

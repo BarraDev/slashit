@@ -457,6 +457,9 @@ pub enum PrHelperRefusal {
     TaskAlreadyOwned,
     /// No free slot in the shared [`Admission`] gate right now.
     NoCapacity,
+    /// An unfinished restack of the task's published branch owns it; see
+    /// `Task::republish_pending_refusal`.
+    RepublishPending,
 }
 
 impl std::fmt::Display for PrHelperRefusal {
@@ -474,6 +477,11 @@ impl std::fmt::Display for PrHelperRefusal {
             Self::NoCapacity => write!(
                 f,
                 "no agent capacity is available right now; try again shortly"
+            ),
+            Self::RepublishPending => write!(
+                f,
+                "a restack of this task's published branch is unfinished; resume or discard it \
+                 in the task's pull request section first"
             ),
         }
     }
@@ -1832,6 +1840,15 @@ impl TaskExecutor {
         let promote = {
             let tasks = self.tasks.read().await;
             let task = tasks.get(&task_id);
+            // An unfinished restack of the task's published branch owns it
+            // (see `Task::republish_pending_refusal`): no agent may advance
+            // the branch under it.
+            if let Some(refusal) = task.and_then(Task::republish_pending_refusal) {
+                return match request {
+                    StartRequest::Pending => Ok(false),
+                    StartRequest::Direct => Err(refusal),
+                };
+            }
             match request {
                 StartRequest::Pending => match task {
                     Some(task) if Self::is_pending(task) => false,
@@ -2573,6 +2590,9 @@ impl TaskExecutor {
         if already_owned {
             return Err(PrHelperRefusal::TaskAlreadyOwned);
         }
+        if self.tasks.read().await.get(&task_id).is_some_and(|t| t.republish_pending_refusal().is_some()) {
+            return Err(PrHelperRefusal::RepublishPending);
+        }
 
         // A direct/manual admission draw, same as `execute_task`'s own: no
         // pre-existing reservation feeds this, so the current runtime
@@ -2606,6 +2626,19 @@ impl TaskExecutor {
     /// No admission permit: this runs no agent, so it draws on no agent
     /// capacity, and a busy queue never refuses a pull request.
     pub async fn begin_pr_side_effect_under_lease(
+        self: &Arc<Self>,
+        task_id: Uuid,
+    ) -> Result<PrHelperLease, String> {
+        if let Some(refusal) = self.tasks.read().await.get(&task_id).and_then(Task::republish_pending_refusal) {
+            return Err(refusal);
+        }
+        self.begin_republish_under_lease(task_id).await
+    }
+
+    /// [`Self::begin_pr_side_effect_under_lease`] without the refusal for an
+    /// unfinished restack: the restack's own Resume and Discard are the one
+    /// thing allowed to act on a task that is in that state.
+    pub async fn begin_republish_under_lease(
         self: &Arc<Self>,
         task_id: Uuid,
     ) -> Result<PrHelperLease, String> {
@@ -2920,6 +2953,11 @@ impl TaskExecutor {
         // slip in between the other's check and its registration. Declining
         // leaves the task in `AiReview`, and the next pass retries it.
         if self.pr_helper_handles.lock().unwrap().contains_key(&task_id) {
+            return;
+        }
+        // An unfinished restack of the task's published branch owns it, and
+        // the fix agent's commit would advance the branch under it.
+        if self.tasks.read().await.get(&task_id).is_some_and(|t| t.republish_pending_refusal().is_some()) {
             return;
         }
 
@@ -8270,6 +8308,101 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             assert!(pid_is_alive(pid), "the reviewer agent is running");
 
             executor.stop_task(task_id).await.expect("stop the review");
+            assert!(!pid_is_alive(pid));
+        }
+
+        /// An unfinished restack of a published branch owns the task: no
+        /// review, execution, PR helper or PR side-effect flow may start for
+        /// it, whatever asks, while a task without one is untouched and the
+        /// restack's own reservation is still granted.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn nothing_starts_for_a_task_with_an_unfinished_restack() {
+            let _path_guard = PATH_LOCK.lock().await;
+            let mock = MockClaude::install("review");
+
+            let (executor, _temps) = test_executor();
+            let (repo, base_commit) = git_repo_with_change();
+            let path = repo.path().to_str().unwrap();
+            let pending = |mut task: Task| {
+                task.pending_republish = Some(crate::domain::PendingRepublish {
+                    parent_branch: "task-parent".to_string(),
+                    parent_pr: 7,
+                    pr_number: 21,
+                    default_branch: "main".to_string(),
+                    fork_point: "a".repeat(40),
+                    previous_tip: "b".repeat(40),
+                    onto: "c".repeat(40),
+                    rewritten_tip: None,
+                });
+                task
+            };
+            let blocked = pending(reviewing_task(Uuid::new_v4(), path, &base_commit));
+            let blocked_id = blocked.id;
+            executor.tasks.write().await.insert(blocked_id, blocked);
+
+            // Review.
+            review_declines(&executor, &mock, blocked_id, "pending restack").await;
+
+            // PR helper (analyze, discuss, apply fixes).
+            assert_eq!(
+                executor.try_begin_pr_helper(blocked_id).await.err(),
+                Some(crate::queue::PrHelperRefusal::RepublishPending)
+            );
+
+            // Execution, started directly and through the queue.
+            let mut queued = pending(create_test_task_full("queued", Uuid::new_v4(), TaskStatus::Queue, 0));
+            queued.phase = TaskPhase::Idle;
+            let queued_id = queued.id;
+            executor.tasks.write().await.insert(queued_id, queued);
+            let direct = executor.execute_task(queued_id).await.expect_err("direct start");
+            assert!(direct.contains("unfinished"), "{direct}");
+            assert!(executor.running_handles.read().await.is_empty());
+
+            // What the poller starts is a task already InProgress and Idle. With
+            // an unfinished restack it is declined quietly; the same task
+            // without one is not declined: it goes on to fail later, for want
+            // of a project, which is how the guard is told apart from any other
+            // reason a start returns `Ok(false)`.
+            let mut ready = create_test_task_full("ready", Uuid::new_v4(), TaskStatus::InProgress, 1);
+            ready.phase = TaskPhase::Idle;
+            let ordinary_id = ready.id;
+            let mut held = pending(ready.clone());
+            held.id = Uuid::new_v4();
+            let held_id = held.id;
+            {
+                let mut tasks = executor.tasks.write().await;
+                tasks.insert(ordinary_id, ready);
+                tasks.insert(held_id, held);
+            }
+            assert!(
+                !executor.spawn_task_execution(held_id, None).await.expect("declined, not failed"),
+                "the poller's start is declined while a restack is pending"
+            );
+            assert!(
+                executor.spawn_task_execution(ordinary_id, None).await.is_err(),
+                "without the restack the same start goes ahead (and fails for want of a project)"
+            );
+            assert!(executor.running_handles.read().await.is_empty());
+
+            // PR creation reserves the task for a side effect; the restack's own
+            // Resume and Discard are the one thing that may.
+            let lease = executor.lifecycle.acquire(blocked_id).await.expect("lease");
+            let refused = executor.begin_pr_side_effect_under_lease(blocked_id).await.err().expect("refused");
+            assert!(refused.contains("unfinished"), "{refused}");
+            let own = executor.begin_republish_under_lease(blocked_id).await.expect("the restack's own");
+            drop(own);
+            drop(lease);
+
+            // An unrelated task is untouched: its review starts normally.
+            let other = reviewing_task(Uuid::new_v4(), path, &base_commit);
+            let other_id = other.id;
+            executor.tasks.write().await.insert(other_id, other);
+            executor.spawn_review(other_id).await;
+            assert!(executor.reviewing_handles.read().await.contains_key(&other_id));
+            assert!(!executor.reviewing_handles.read().await.contains_key(&blocked_id));
+            let pid = wait_for_pidfile(&mock).await;
+            assert!(pid_is_alive(pid), "the unrelated task's reviewer is running");
+            executor.stop_task(other_id).await.expect("stop the review");
             assert!(!pid_is_alive(pid));
         }
     }

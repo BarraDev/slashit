@@ -147,7 +147,7 @@ pub fn RestackNotice(
                 Ok(outcome) => {
                     confirming.try_set(false);
                     toast::success(if outcome.rewritten {
-                        format!("Restacked onto {}; the previous tip is kept in {}", outcome.base, outcome.backup.unwrap_or_default())
+                        format!("Restacked onto {} and its pull request retargeted", outcome.base)
                     } else {
                         format!("Pull request retargeted to {}", outcome.base)
                     });
@@ -185,6 +185,10 @@ pub fn RestackNotice(
             let (title, detail) = notice(&current);
             let offers = offers_action(&current);
             let interrupted = matches!(current, RepublishStatus::Interrupted { .. });
+            let discard_blocked = match &current {
+                RepublishStatus::Interrupted { discard_blocked, .. } => discard_blocked.clone(),
+                _ => None,
+            };
             let lines = consequences(&current, &branch.get().unwrap_or_default());
             let label = if interrupted { "Resume restack" } else { ACTION_LABEL };
             view! {
@@ -231,16 +235,26 @@ pub fn RestackNotice(
                                     {label}
                                 </button>
                             })}
-                            {interrupted.then(|| view! {
-                                <button
-                                    data-testid="task-drawer-restack-discard"
-                                    class="px-2 py-1 rounded-md text-xs bg-white/5 text-white/70 hover:bg-white/10 disabled:opacity-50"
-                                    disabled=move || busy.get()
-                                    title="Put the branch back at the tip the restack started from. Nothing on GitHub changes."
-                                    on:click=discard
-                                >
-                                    "Discard restack"
-                                </button>
+                            {interrupted.then(|| {
+                                let blocked = discard_blocked.clone();
+                                let title = blocked.clone().unwrap_or_else(|| {
+                                    "Put the branch back at the tip the restack started from. Nothing on GitHub changes."
+                                        .to_string()
+                                });
+                                view! {
+                                    <button
+                                        data-testid="task-drawer-restack-discard"
+                                        class="px-2 py-1 rounded-md text-xs bg-white/5 text-white/70 hover:bg-white/10 disabled:opacity-50"
+                                        disabled=move || busy.get() || blocked.is_some()
+                                        title=title
+                                        on:click=discard
+                                    >
+                                        "Discard restack"
+                                    </button>
+                                }
+                            })}
+                            {discard_blocked.clone().map(|reason| view! {
+                                <p data-testid="task-drawer-restack-discard-blocked" class="text-xs text-white/50 break-words">{reason}</p>
                             })}
                         </div>
                     </Show>
@@ -274,11 +288,20 @@ mod tests {
             serde_json::from_str::<RepublishStatus>(blocked).unwrap(),
             RepublishStatus::Blocked { reason: "dirty".to_string() }
         );
-        let interrupted = r#"{"kind":"interrupted","rewritten":true,"detail":"d"}"#;
+        let interrupted = r#"{"kind":"interrupted","rewritten":true,"detail":"d","discard_blocked":"why"}"#;
         assert_eq!(
             serde_json::from_str::<RepublishStatus>(interrupted).unwrap(),
-            RepublishStatus::Interrupted { rewritten: true, detail: "d".to_string() }
+            RepublishStatus::Interrupted {
+                rewritten: true,
+                detail: "d".to_string(),
+                discard_blocked: Some("why".to_string())
+            }
         );
+        let unblocked = r#"{"kind":"interrupted","rewritten":false,"detail":"d","discard_blocked":null}"#;
+        assert!(matches!(
+            serde_json::from_str::<RepublishStatus>(unblocked).unwrap(),
+            RepublishStatus::Interrupted { discard_blocked: None, .. }
+        ));
     }
 
     /// The confirmation says everything the product requires of it.
@@ -309,7 +332,7 @@ mod tests {
 
     #[test]
     fn a_resumed_restack_is_not_described_as_a_new_rewrite() {
-        let resumed = RepublishStatus::Interrupted { rewritten: true, detail: String::new() };
+        let resumed = RepublishStatus::Interrupted { rewritten: true, detail: String::new(), discard_blocked: None };
         let text = consequences(&resumed, "task-branch").join("\n");
         assert!(text.contains("already rewritten"), "{text}");
         assert!(text.contains("--force-with-lease"), "{text}");

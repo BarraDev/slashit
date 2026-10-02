@@ -262,6 +262,25 @@ fn with_home_as_tilde(text: &str, home: &str) -> String {
 }
 
 impl Task {
+    /// Why nothing but the restack's own recovery may change this task's
+    /// branch or checkout right now, or `None`.
+    ///
+    /// While [`Self::pending_republish`] exists the task is in an exclusive
+    /// recovery state: the record is a proof of one exact transaction (the
+    /// approved remote tip, the fork point, the target base and the verified
+    /// rewritten tip), and anything that advanced the branch would make
+    /// resuming or discarding it ambiguous. An agent run, an AI review or
+    /// fix, a pull request helper, and pull request creation all ask this
+    /// first. Reading the task, and Resume and Discard themselves, do not.
+    pub fn republish_pending_refusal(&self) -> Option<String> {
+        self.pending_republish.as_ref().map(|_| {
+            "A restack of this task's published branch is unfinished, so nothing else may change \
+             its branch or checkout until it is resumed or discarded. Resume or discard it in the \
+             task's pull request section."
+                .to_string()
+        })
+    }
+
     /// Return the task to a state work can start from again, keeping the work
     /// it has already produced.
     ///
@@ -324,6 +343,7 @@ impl Task {
         self.status == TaskStatus::InProgress
             && self.phase == TaskPhase::Idle
             && !self.cleanup_in_flight
+            && self.pending_republish.is_none()
     }
 
     /// Record a milestone on the task's timeline now, unless it is a
@@ -1057,6 +1077,26 @@ mod tests {
             !quarantined.is_ready_to_execute(),
             "a task with an unresolved cleanup must never be reported ready to execute"
         );
+    }
+
+    /// A task whose published branch has an unfinished restack is not started:
+    /// the restack owns it (see `Task::republish_pending_refusal`).
+    #[test]
+    fn is_ready_to_execute_is_false_while_a_restack_of_its_branch_is_pending() {
+        let mut pending = startable_task();
+        pending.pending_republish = Some(PendingRepublish {
+            parent_branch: "p".to_string(),
+            parent_pr: 1,
+            pr_number: 2,
+            default_branch: "main".to_string(),
+            fork_point: "a".repeat(40),
+            previous_tip: "b".repeat(40),
+            onto: "c".repeat(40),
+            rewritten_tip: None,
+        });
+        assert!(!pending.is_ready_to_execute());
+        assert!(pending.republish_pending_refusal().is_some());
+        assert!(startable_task().republish_pending_refusal().is_none());
     }
 
     #[test]

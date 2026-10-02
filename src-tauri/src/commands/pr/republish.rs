@@ -34,8 +34,9 @@
 //! 1. Plan: the record is written. Nothing else has changed. A crash here
 //!    leaves a record, the branch at `previous_tip` and no backup.
 //! 2. Backup: `refs/slashit/republish-backup/<task>` is created at
-//!    `previous_tip`, create-only. It is never deleted before the remote
-//!    holds the rewritten branch, and it is kept after.
+//!    `previous_tip`, create-only. It is deleted only at the very end, after
+//!    the remote holds the rewritten branch, the pull request is retargeted
+//!    and the pending record is cleared.
 //! 3. Replay: the branch moves to a new tip, verified by patch-id.
 //! 4. Record: one compare-and-set task write sets `rewritten_tip`, moves
 //!    `base_commit` to `onto` and the origin to the default branch. The
@@ -83,7 +84,10 @@ pub enum RepublishStatus {
     /// `reason` says what to change first.
     Blocked { reason: String },
     /// A restack was started and did not finish. Running it again resumes it.
-    Interrupted { rewritten: bool, detail: String },
+    /// While it is, nothing else may change the task's branch or checkout.
+    /// `discard_blocked` says why Discard would be refused, when origin
+    /// already has the rewritten branch.
+    Interrupted { rewritten: bool, detail: String, discard_blocked: Option<String> },
 }
 
 /// What a finished restack did.
@@ -97,8 +101,6 @@ pub struct RepublishOutcome {
     pub previous_tip: String,
     /// The branch's tip now, which the remote has.
     pub new_tip: String,
-    /// The ref that keeps the previous tip, when the branch was rewritten.
-    pub backup: Option<String>,
 }
 
 /// Where a test makes the process "die": the function returns early without
@@ -392,14 +394,35 @@ pub(super) async fn status(
     let pending = state.task.tasks.read().await.get(&task_uuid).and_then(|t| t.pending_republish.clone());
     if let Some(pending) = pending {
         let rewritten = pending.rewritten_tip.is_some();
+        let discard_blocked = match &pending.rewritten_tip {
+            Some(tip) => match Context::of(state, task_uuid).await {
+                Ok(ctx) => match remote_branch_commit(&ctx.working_dir, &ctx.branch).await {
+                    Ok(Some(remote)) if remote == *tip => Some(
+                        "Origin already has the restacked branch, so going back would leave this \
+                         branch behind it. Resume to finish."
+                            .to_string(),
+                    ),
+                    _ => None,
+                },
+                Err(_) => None,
+            },
+            None => None,
+        };
         let detail = if rewritten {
-            "The branch was rewritten here, and origin may not have it yet. Resuming updates origin \
-             only if it still has the tip you approved, then retargets the pull request."
+            "The branch was rewritten here, and origin may not have it yet. Until this is resumed \
+             or discarded, agent runs, reviews and pull request actions for this task are refused. \
+             Resuming updates origin only if it still has the tip you approved, then retargets the \
+             pull request."
         } else {
             "A restack was started and the branch has not been rewritten, or not recorded, yet. \
-             Resuming continues it from where it stopped."
+             Until this is resumed or discarded, agent runs, reviews and pull request actions for \
+             this task are refused. Resuming continues it from where it stopped."
         };
-        return Ok(Some(RepublishStatus::Interrupted { rewritten, detail: detail.to_string() }));
+        return Ok(Some(RepublishStatus::Interrupted {
+            rewritten,
+            detail: detail.to_string(),
+            discard_blocked,
+        }));
     }
     match observe(state, task_uuid).await {
         Ok(None) => Ok(None),
@@ -419,7 +442,7 @@ pub(super) async fn status(
 /// landed on and retarget its pull request, or finish doing so after an
 /// interruption. Only ever called for a user's explicit request.
 pub(super) async fn restack(state: &crate::AppState, task_uuid: Uuid) -> Result<RepublishOutcome, String> {
-    let reservation = reserve_task_for_pr_side_effect(state, task_uuid).await?;
+    let reservation = reserve_task_for_republish(state, task_uuid).await?;
     restack_reserved(state, task_uuid, &reservation).await
 }
 
@@ -446,7 +469,6 @@ async fn restack_reserved(
             base: plan.default_branch,
             previous_tip: plan.tip.clone(),
             new_tip: plan.tip,
-            backup: None,
         });
     }
 
@@ -618,8 +640,11 @@ async fn advance(
     if tip != rewritten {
         return Err(format!(
             "{context}, but {branch} is at {tip} here, not at {rewritten}, which the restack \
-             produced. Something else changed it, so SlashIt will not publish it. Discard this \
-             restack to go back to {}.",
+             produced. Something outside SlashIt changed it, and SlashIt will not adopt, publish \
+             or discard commits it did not make. The approved tip {} is kept in {backup}, and the \
+             restack's record is kept: bring {branch} back to {rewritten} (or to {}, then discard \
+             the restack) by hand, and try again.",
+            pending.previous_tip,
             pending.previous_tip
         ));
     }
@@ -628,6 +653,14 @@ async fn advance(
     match remote.as_deref() {
         Some(remote) if remote == rewritten => {}
         Some(remote) if remote == pending.previous_tip => {
+            let (state, _) = read_pr(&ctx.working_dir, pending.pr_number, branch).await?;
+            if !state.eq_ignore_ascii_case("OPEN") {
+                return Err(format!(
+                    "{context}, but pull request #{} is {state} now, not open, so there is nothing \
+                     left to republish it for. Nothing was pushed. Discard this restack.",
+                    pending.pr_number
+                ));
+            }
             refuse_if_pr_operation_cancelled(reservation, "updating the branch on origin")?;
             #[cfg(test)]
             {
@@ -655,12 +688,24 @@ async fn advance(
     refuse_if_pr_operation_cancelled(reservation, "retargeting the pull request")?;
     converge_pr_base(&ctx.working_dir, pending.pr_number, branch, &pending.default_branch).await?;
     clear_pending(state, task_uuid, &pending).await?;
+    // The backup has held the approved tip through every step that could still
+    // need it: the remote update, the retarget and the cleared record. Only now
+    // is it dropped. A crash or failure right here leaves a harmless stale ref
+    // that nothing reads again, because the record that named it is gone.
+    if let Err(e) = restack::retire_backup(repo, &backup, &pending.previous_tip).await {
+        eprintln!(
+            "[pr] {branch} was restacked and its pull request retargeted, but its backup {backup} \
+             (holding {}) could not be deleted: {e}. It is harmless; to delete it, run `git \
+             update-ref -d {backup}` in {}.",
+            pending.previous_tip,
+            repo.display()
+        );
+    }
     Ok(RepublishOutcome {
         rewritten: true,
         base: pending.default_branch.clone(),
         previous_tip: pending.previous_tip.clone(),
         new_tip: rewritten,
-        backup: Some(backup),
     })
 }
 
@@ -793,38 +838,18 @@ async fn push_with_lease(working_dir: &str, branch: &str, expected: &str) -> Res
 /// differs, read it again. A pull request GitHub already moved is as good as
 /// one SlashIt moved. A pull request that is no longer open is left alone.
 async fn converge_pr_base(working_dir: &str, number: u64, branch: &str, default: &str) -> Result<(), String> {
-    let number = number.to_string();
-    let view = || async {
-        let out = run_cmd(
-            "gh",
-            &["pr", "view", &number, "--json", "state,baseRefName,headRefName"],
-            working_dir,
-        )
-        .await
-        .map_err(|e| format!("Could not read pull request #{number}: {e}"))?;
-        let json: serde_json::Value =
-            serde_json::from_str(&out).map_err(|e| format!("Failed to parse gh pr view output: {e}"))?;
-        let text = |name: &str| json.get(name).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        if text("headRefName") != branch {
-            return Err(format!(
-                "Pull request #{number} is from {:?}, not from {branch}, so SlashIt will not \
-                 retarget it.",
-                text("headRefName")
-            ));
-        }
-        Ok::<_, String>((text("state"), text("baseRefName")))
-    };
-    let (state, base) = view().await?;
+    let (state, base) = read_pr(working_dir, number, branch).await?;
     if !state.eq_ignore_ascii_case("OPEN") || base == default {
         return Ok(());
     }
+    let number = number.to_string();
     run_cmd("gh", &["pr", "edit", &number, "--base", default], working_dir).await.map_err(|e| {
         format!(
             "The branch is updated on origin, but pull request #{number} could not be retargeted \
              to {default}: {e}. Run the restack again to retry that step."
         )
     })?;
-    let (_, base) = view().await?;
+    let (_, base) = read_pr(working_dir, number.parse().unwrap_or_default(), branch).await?;
     if base != default {
         return Err(format!(
             "The branch is updated on origin, but pull request #{number} still targets {base}, \
@@ -834,10 +859,28 @@ async fn converge_pr_base(working_dir: &str, number: u64, branch: &str, default:
     Ok(())
 }
 
+/// The pull request's state and base, after checking it is `branch`'s own.
+async fn read_pr(working_dir: &str, number: u64, branch: &str) -> Result<(String, String), String> {
+    let number = number.to_string();
+    let out = run_cmd("gh", &["pr", "view", &number, "--json", "state,baseRefName,headRefName"], working_dir)
+        .await
+        .map_err(|e| format!("Could not read pull request #{number}: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&out).map_err(|e| format!("Failed to parse gh pr view output: {e}"))?;
+    let text = |name: &str| json.get(name).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    if text("headRefName") != branch {
+        return Err(format!(
+            "Pull request #{number} is from {:?}, not from {branch}, so SlashIt will not touch it.",
+            text("headRefName")
+        ));
+    }
+    Ok((text("state"), text("baseRefName")))
+}
+
 /// Go back to the approved tip: undo a restack that was planned or done
 /// locally and not yet published, and drop its record. Never touches origin.
 pub(super) async fn discard(state: &crate::AppState, task_uuid: Uuid) -> Result<(), String> {
-    let reservation = reserve_task_for_pr_side_effect(state, task_uuid).await?;
+    let reservation = reserve_task_for_republish(state, task_uuid).await?;
     let pending = state
         .task
         .tasks
@@ -863,6 +906,18 @@ pub(super) async fn discard(state: &crate::AppState, task_uuid: Uuid) -> Result<
             ));
         }
     }
+    // A rebase left stopped by a crash keeps the branch ref where it was, so
+    // it is checked whatever the tip is: discarding over it would end the
+    // exclusive state while the rebase is still live in the worktree.
+    if let Some(worktree) = ctx.worktree.as_deref() {
+        if let Some(operation) = restack::worktree_state(worktree).await?.in_progress {
+            return Err(format!(
+                "The task's worktree is in the middle of a {operation}, probably the restack's own, \
+                 interrupted. Finish it or abort it there (`git rebase --abort`) first. The restack's \
+                 record and its backup {backup} are kept."
+            ));
+        }
+    }
     if tip != pending.previous_tip {
         let worktree = ctx.worktree.as_deref().ok_or("This task has no worktree to restore the branch in.")?;
         let produced = match &pending.rewritten_tip {
@@ -880,7 +935,10 @@ pub(super) async fn discard(state: &crate::AppState, task_uuid: Uuid) -> Result<
         if !produced {
             return Err(format!(
                 "{branch} is at {tip}, which is not the restack's result, so SlashIt will not move \
-                 it. {backup} holds the approved tip {}.",
+                 it or discard what it holds. The approved tip {} is kept in {backup}, and the \
+                 restack's record is kept. Bring {branch} back to the restack's result by hand, or \
+                 to {} and discard again.",
+                pending.previous_tip,
                 pending.previous_tip
             ));
         }
@@ -936,8 +994,13 @@ mod tests {
             r#"{"kind":"blocked","reason":"dirty"}"#
         );
         assert_eq!(
-            serde_json::to_string(&RepublishStatus::Interrupted { rewritten: true, detail: "d".to_string() }).unwrap(),
-            r#"{"kind":"interrupted","rewritten":true,"detail":"d"}"#
+            serde_json::to_string(&RepublishStatus::Interrupted {
+                rewritten: true,
+                detail: "d".to_string(),
+                discard_blocked: Some("why".to_string()),
+            })
+            .unwrap(),
+            r#"{"kind":"interrupted","rewritten":true,"detail":"d","discard_blocked":"why"}"#
         );
     }
 }
