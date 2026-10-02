@@ -9,8 +9,11 @@ paths and storage are in [state-locations.md](state-locations.md#worktrees).
 ## Decision
 
 Local Git is the source of truth for a Task's checkout and branch. SlashIt
-drives it directly with `git`. No other tool decides where a checkout lives,
-where a branch starts, or what a Task is stacked on.
+drives it directly with `git`. No other tool decides where a checkout lives or
+what a Task is stacked on, and Git creates every branch. Where a branch starts
+is SlashIt's choice from local refs; in a Jujutsu repository, when `jj` is
+installed, its `trunk()` is one input to that choice (see
+[`jj` is optional](#jj-is-optional)).
 
 | Core behavior depends on | Does not depend on |
 |---|---|
@@ -63,7 +66,8 @@ a Git worktree registration.
 ## Stacked Tasks
 
 A Task that depends on another Task is stacked on the dependency's branch. A
-stack is made of ordinary Git branches. Nothing else records it.
+stack is made of ordinary Git branches; no tool's state records it. The Task
+record stores its parent and fork point (below).
 
 - **Creation.** `WorktreeManager::create_stacked_branch` reads the
   dependency's local branch tip, creates the Task's branch at exactly that
