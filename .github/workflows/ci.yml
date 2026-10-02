@@ -113,12 +113,12 @@ jobs:
       - name: The embedded WebDriver plugin must be opt-in
         run: |
           set -euo pipefail
-          if cargo tree -p slashit-ui -e normal | grep -q tauri-plugin-wdio-webdriver; then
+          if cargo tree -p slashit-ui -e normal | grep -F tauri-plugin-wdio-webdriver >/dev/null; then
             echo "::error::tauri-plugin-wdio-webdriver is reachable from a default build"
             exit 1
           fi
           cargo tree -p slashit-ui -e normal --features acceptance-webdriver \
-            | grep -q tauri-plugin-wdio-webdriver
+            | grep -F tauri-plugin-wdio-webdriver >/dev/null
 
   # Backend and harness unit tests. The backend test build compiles the Tauri
   # crate, so it needs the WebKitGTK dependencies; it needs no wasm target or
