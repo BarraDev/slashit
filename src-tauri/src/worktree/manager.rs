@@ -1282,7 +1282,92 @@ impl WorktreeManager {
         repo_path: &str,
         branch: Option<&str>,
     ) -> Result<(), String> {
+        Self::refuse_to_drop_detached_commit(worktree_path, repo_path).await?;
         self.remove_with_git(worktree_path, repo_path, branch).await
+    }
+
+    /// Refuse a removal that would leave the commit a detached `HEAD` names
+    /// with nothing else naming it.
+    ///
+    /// A checkout whose `HEAD` is detached keeps that `HEAD`, and its reflog,
+    /// in git's registration of it, and `git worktree remove` takes both
+    /// down, whether the directory is there or gone. Commits only that
+    /// `HEAD` reaches are then named by nothing. Acquisition refuses the
+    /// same registration for the same reason (see [`Self::adoptable_worktree`]);
+    /// removal is the other way a person's work can reach that end, so it
+    /// decides on the same facts: where the registration is, which commit its
+    /// `HEAD` is at, and whether any ref reaches that commit.
+    ///
+    /// Only the commit `HEAD` is at is looked at. A detached checkout whose
+    /// commit a branch or tag already reaches loses nothing and is removed as
+    /// before, as is any checkout with a branch checked out. Nothing is
+    /// written, so a refusal leaves the checkout, the registration and the
+    /// commit exactly as they were. A checkout git cannot be asked about is
+    /// left to the removal and its own checks, as it always was; one whose
+    /// detached commit cannot be looked up is refused.
+    async fn refuse_to_drop_detached_commit(
+        worktree_path: &str,
+        repo_path: &str,
+    ) -> Result<(), String> {
+        let (path, head, gone) = match Presence::of(Path::new(worktree_path)) {
+            Presence::Present => match Self::checkout_head(worktree_path).await {
+                Ok((None, head)) => (worktree_path.to_string(), head, false),
+                _ => return Ok(()),
+            },
+            Presence::Absent => {
+                let Ok(listing) = Self::worktree_listing(repo_path).await else {
+                    return Ok(());
+                };
+                match CheckoutRegistration::of_path(Ok(&listing), worktree_path) {
+                    CheckoutRegistration::MissingPrunable { path, branch: None, head } => {
+                        (path, head.unwrap_or_default(), true)
+                    }
+                    _ => return Ok(()),
+                }
+            }
+            Presence::Unverified(_) => return Ok(()),
+        };
+        let reaching = Self::refs_reaching(repo_path, &head).await;
+        if matches!(&reaching, Ok(refs) if !refs.is_empty()) {
+            return Ok(());
+        }
+        let state = if gone {
+            format!("git still registers {path}, whose directory is gone, with a detached HEAD")
+        } else {
+            format!("the checkout at {path} has a detached HEAD")
+        };
+        if head.is_empty() || reaching.is_err() {
+            let why = reaching.err().unwrap_or_default();
+            return Err(format!(
+                "{path} was not removed, because {state} and git could not say whether any ref \
+                 names its commit ({why}): removing it might make work made there unreachable. \
+                 Nothing was changed."
+            ));
+        }
+        Err(format!(
+            "{path} was not removed, because {state} at {head}, and no ref names that commit: \
+             removing it would make work made there unreachable. To keep it, run \
+             `git branch <name> {head}` (or `git tag <name> {head}`) in {repo_path}, then \
+             remove the checkout again. Nothing was changed."
+        ))
+    }
+
+    /// The refs in `repo_path` that reach `commit`, or why that could not be
+    /// asked.
+    async fn refs_reaching(repo_path: &str, commit: &str) -> Result<Vec<String>, String> {
+        if commit.is_empty() {
+            return Err("git listed no commit for its HEAD".to_string());
+        }
+        let output = tokio::process::Command::new(git_program())
+            .args(["for-each-ref", "--contains", commit, "--format=%(refname)"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| format!("`git for-each-ref` could not be run in {repo_path}: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect())
     }
 
     /// Check if a worktree directory exists on disk.
@@ -2230,6 +2315,141 @@ mod tests {
             .expect("once pruned, the checkout is acquired");
         assert_eq!(again.path, info.path);
         assert!(Path::new(&again.path).is_dir());
+    }
+
+    /// A checkout of `branch` whose `HEAD` is detached at a commit no ref
+    /// names, and that commit.
+    async fn detached_with_unique_commit(
+        mgr: &WorktreeManager,
+        repo_path: &str,
+        branch: &str,
+    ) -> (WorktreeInfo, String) {
+        let info = mgr.create(repo_path, branch).await.expect("create failed");
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        let detached = commit_work(&info.path, "detached.txt");
+        assert!(refs_reaching(repo_path, &detached).is_empty());
+        (info, detached)
+    }
+
+    /// Everything a refused removal has to have left alone: the registration
+    /// with the `HEAD` it keeps, and a commit that stays reachable through it
+    /// and is not unreachable to `git fsck`.
+    fn assert_detached_commit_kept(repo_path: &str, path: &str, commit: &str) {
+        assert!(
+            registration_of(repo_path, path).is_some_and(|r| r.contains(&format!("HEAD {commit}"))),
+            "the registration, and the HEAD it keeps, are left alone"
+        );
+        run_git(repo_path, &["rev-parse", "--verify", "-q", &format!("{commit}^{{commit}}")]);
+        let unreachable = run_git(repo_path, &["fsck", "--unreachable", "--no-reflogs"]);
+        assert!(
+            !unreachable.contains(commit),
+            "git still reaches the commit through the registration: {unreachable}"
+        );
+    }
+
+    /// What counts as naming a commit is any ref that reaches it, and a
+    /// commit git cannot be asked about is an error, never "unnamed".
+    #[tokio::test]
+    async fn refs_reaching_counts_any_ref_and_refuses_an_unknown_commit() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap();
+        let head = run_git(repo_path, &["rev-parse", "HEAD"]).trim().to_string();
+        run_git(repo_path, &["tag", "-a", "-m", "note", "keep", &head]);
+        let refs = WorktreeManager::refs_reaching(repo_path, &head).await.unwrap();
+        assert!(refs.iter().any(|r| r == "refs/tags/keep"), "{refs:?}");
+        assert!(WorktreeManager::refs_reaching(repo_path, "").await.is_err());
+        assert!(WorktreeManager::refs_reaching(repo_path, &"0".repeat(40)).await.is_err());
+    }
+
+    /// Removing a checkout that is there, detached at a commit nothing else
+    /// names, is refused: `git worktree remove` would take the only `HEAD`
+    /// naming it. The error says so, names the commit and how to keep it,
+    /// and changes nothing. Once the user names the commit, the same removal
+    /// goes through.
+    #[tokio::test]
+    async fn removing_a_present_detached_checkout_holding_a_unique_commit_is_refused() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let branch = "task-abcd1234";
+        let (info, detached) = detached_with_unique_commit(&mgr, &repo_path, branch).await;
+
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect_err("the detached HEAD is the only thing naming the commit");
+        assert!(refused.contains(&detached), "the commit is named: {refused}");
+        assert!(refused.contains("unreachable"), "the consequence is named: {refused}");
+        assert!(refused.contains("git branch <name>"), "the way to keep it is named: {refused}");
+        assert!(Path::new(&info.path).is_dir(), "the checkout is untouched");
+        assert_detached_commit_kept(&repo_path, &info.path, &detached);
+
+        run_git(&repo_path, &["branch", "kept-work", &detached]);
+        mgr.remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect("once a branch names the commit, nothing is lost");
+        assert!(!Path::new(&info.path).exists());
+        assert!(refs_reaching(&repo_path, &detached).contains(&"refs/heads/kept-work".to_string()));
+    }
+
+    /// The same for a checkout whose directory is gone while git still holds
+    /// its unlocked, detached registration.
+    #[tokio::test]
+    async fn removing_a_missing_detached_checkout_holding_a_unique_commit_is_refused() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let branch = "task-abcd1234";
+        let (info, detached) = detached_with_unique_commit(&mgr, &repo_path, branch).await;
+        std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect_err("clearing the registration would drop the only HEAD naming the commit");
+        assert!(refused.contains(&detached), "the commit is named: {refused}");
+        assert!(refused.contains("unreachable"), "the consequence is named: {refused}");
+        assert!(refused.contains("git branch <name>"), "the way to keep it is named: {refused}");
+        assert_detached_commit_kept(&repo_path, &info.path, &detached);
+
+        // Refused again, not worn down by a second attempt.
+        mgr.remove(&info.path, &repo_path, Some(branch)).await.expect_err("still refused");
+        assert_detached_commit_kept(&repo_path, &info.path, &detached);
+
+        run_git(&repo_path, &["tag", "kept-work", &detached]);
+        mgr.remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect("once a tag names the commit, the registration is cleared");
+        assert!(registration_of(&repo_path, &info.path).is_none());
+        assert!(refs_reaching(&repo_path, &detached).contains(&"refs/tags/kept-work".to_string()));
+    }
+
+    /// A detached checkout whose commit a ref already reaches loses nothing,
+    /// present or gone, and is removed as before.
+    #[tokio::test]
+    async fn removing_a_detached_checkout_whose_commit_a_ref_reaches_is_allowed() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let branch = "task-abcd1234";
+        let info = mgr.create(&repo_path, branch).await.expect("create failed");
+        commit_work(&info.path, "work.txt");
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        mgr.remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect("the task branch names the detached commit");
+        assert!(!Path::new(&info.path).exists());
+        assert!(branch_exists(&repo_path, branch));
+
+        let other = "task-ffff0000";
+        let info = mgr.create(&repo_path, other).await.expect("create failed");
+        commit_work(&info.path, "more.txt");
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+        mgr.remove(&info.path, &repo_path, Some(other))
+            .await
+            .expect("the task branch names the commit of the missing registration");
+        assert!(registration_of(&repo_path, &info.path).is_none());
     }
 
     /// A task whose checkout directory vanished without being removed leaves
