@@ -119,6 +119,10 @@ targets). SlashIt places it under its data directory, and adopts a Git
 worktree of the Task's branch that already exists elsewhere (see
 [state-locations.md](state-locations.md#worktrees)).
 
+How a checkout is created, how a stack is built and restacked, and which tools
+core behavior does not depend on are in
+[task-checkouts-and-stacks.md](task-checkouts-and-stacks.md).
+
 ### Base of a Task's branch
 
 A Task needs a safe, explicit version-control base. A remote is optional:
