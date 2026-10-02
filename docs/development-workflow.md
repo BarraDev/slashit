@@ -593,7 +593,9 @@ owner policy, applied by whoever merges.
 **Wait for green before merging.** Every functional check in `ci.yml`:
 
 - Agent docs
-- Lint, test and build (ubuntu-22.04)
+- Lint and structural checks
+- Backend and harness tests
+- Frontend tests and build
 - Compile check (windows-latest)
 - Compile check (macos-latest)
 - Desktop acceptance / harness

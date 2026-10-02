@@ -3,7 +3,7 @@
 # Every test name printed by:
 #   cargo test -p slashit-acceptance --features run-acceptance --test product_acceptance -- --list
 # must appear here exactly once, in exactly one shard. scripts/check-acceptance-shards.sh
-# enforces that in CI (the "Lint, test and build" job): a new journey with no entry here, a
+# enforces that in CI (the "Lint and structural checks" job): a new journey with no entry here, a
 # stale entry for a renamed or removed journey, or a journey listed under more than one shard
 # all fail that check. scripts/run-desktop-acceptance.sh --shard <N> reads this file to pick
 # which journeys a shard runs, both in CI and locally.
