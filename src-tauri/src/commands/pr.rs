@@ -10258,7 +10258,7 @@ mod tests {
                     assert_recovery_intact(&p, &drifted, "discard").await;
                     assert!(subjects(&p.landed.repo.checkout, &format!("{}~1..{drifted}", drifted)).contains(&"outside commit".to_string()));
                     let task = p.task().await;
-                    assert_eq!(task.pending_republish.unwrap().rewritten_tip.is_some(), true);
+                    assert!(task.pending_republish.unwrap().rewritten_tip.is_some());
                 }
 
                 /// 9: a branch found after a crash between the replay and its
@@ -10528,6 +10528,46 @@ mod tests {
                             assert_eq!(task.error_message, expected, "resume={resume} own={own}");
                         }
                     }
+                }
+
+                /// A published branch in a jj-colocated repository: the rewrite is
+                /// still a Git ref update, the guarded push sends it, and jj's
+                /// bookmark follows it without a conflict. Skipped where no `jj`
+                /// is installed.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_published_restack_in_a_jj_colocated_repository_is_what_jj_sees_and_pushes() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let Some(jj_bin) = installed_jj() else {
+                        eprintln!("skipped: no jj is installed");
+                        return;
+                    };
+                    let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    let jj_at = |args: &[&str]| {
+                        let output = StdCommand::new(&jj_bin)
+                            .args(args)
+                            .current_dir(&p.landed.repo.checkout)
+                            .env("JJ_USER", "Test")
+                            .env("JJ_EMAIL", "test@example.com")
+                            .output()
+                            .expect("run jj");
+                        assert!(output.status.success(), "jj {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+                        String::from_utf8_lossy(&output.stdout).trim().to_string()
+                    };
+                    jj_at(&["git", "init", "--colocate"]);
+
+                    p.restack().await.expect("the published restack in a colocated repository");
+
+                    assert_restacked(&p, "colocated").await;
+                    let tip = local_tip(&p.landed);
+                    assert_ne!(tip, p.landed.child_tip);
+                    assert_eq!(p.remote_child().as_deref(), Some(tip.as_str()));
+                    assert_eq!(
+                        jj_at(&["log", "--no-graph", "-r", "task-branch", "-T", "commit_id"]),
+                        tip,
+                        "jj's bookmark follows the restacked branch"
+                    );
+                    assert_eq!(local_tip(&p.landed), tip, "a jj command afterwards leaves the branch where it is");
+                    assert!(!jj_at(&["bookmark", "list", "task-branch"]).contains("conflict"));
                 }
 
                 /// A restack that is only planned can be discarded too.

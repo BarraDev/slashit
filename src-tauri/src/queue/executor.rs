@@ -4362,7 +4362,7 @@ mod tests {
             let mut tasks = executor.tasks.write().await;
             let task = tasks.get_mut(&id).unwrap();
             task.pending_republish = Some(pending.clone());
-            executor.storage.save_project_tasks(project_id, &[task.clone()]).unwrap();
+            executor.storage.save_project_tasks(project_id, std::slice::from_ref(task)).unwrap();
         }
 
         executor.complete_merged_task(id, 7, "MERGED").await;
