@@ -162,6 +162,17 @@ pub struct Task {
     #[serde(default)]
     pub branch_origin: Option<BranchOrigin>,
 
+    /// A restack of this task's already published branch that has begun and
+    /// not finished (see `commands::pr::republish`). `None` when none is
+    /// under way, which is what every record written before this field
+    /// existed deserializes to.
+    ///
+    /// While it is set, the pull request on GitHub and the remote branch may
+    /// still be what they were before the restack: this record is the only
+    /// durable statement that the local branch is ahead of them on purpose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_republish: Option<PendingRepublish>,
+
     /// A destructive worktree cleanup was started for this task and this
     /// process has not yet durably recorded its outcome.
     ///
@@ -395,6 +406,40 @@ impl Task {
         }
         .needs_you()
     }
+}
+
+/// The durable record of one restack of a published stacked branch, from the
+/// moment it is planned until its pull request has been retargeted.
+///
+/// Everything a retry needs is here, so that no step has to be recovered from
+/// incidental observations: the tip the user approved and that the remote must
+/// still have for the update to go through (`previous_tip`), the commit the
+/// branch is replayed onto (`onto`), and, once the replay is verified and the
+/// task's base is recorded, the tip it produced (`rewritten_tip`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingRepublish {
+    /// The branch the task was stacked on, as `BranchOrigin::Stacked` names it.
+    pub parent_branch: String,
+    /// The parent's merged pull request.
+    pub parent_pr: u64,
+    /// The task's own pull request, which is retargeted last.
+    pub pr_number: u64,
+    /// The default branch the parent landed on, which the pull request is
+    /// retargeted to.
+    pub default_branch: String,
+    /// `Task::base_commit` before the restack: the parent's tip the branch
+    /// was created at.
+    pub fork_point: String,
+    /// The branch's tip, local and on the remote, when the restack was
+    /// approved. The guarded push expects the remote to be exactly here.
+    pub previous_tip: String,
+    /// The commit the branch is replayed onto.
+    pub onto: String,
+    /// The tip the replay produced, set in the same write that moves the
+    /// task's `base_commit` to `onto` and its origin to the default branch.
+    /// `None` until then.
+    #[serde(default)]
+    pub rewritten_tip: Option<String>,
 }
 
 /// What a task's branch currently starts from, as recorded on
