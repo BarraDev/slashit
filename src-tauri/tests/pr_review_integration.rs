@@ -1183,7 +1183,8 @@ fn backfill_lifecycle_keeps_fix_uncommitted_when_the_comment_was_edited() {
     assert!(!plan.items[0].fix_done && !plan.items[0].reply_posted);
 }
 
-#[tokio::test]
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
 async fn apply_reruns_the_fix_for_a_comment_edited_after_the_apply_that_fixed_it() {
     use slashit_ui_lib::domain::task::PrReviewApplyResult;
 
