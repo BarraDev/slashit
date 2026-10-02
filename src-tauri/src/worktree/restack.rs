@@ -613,6 +613,44 @@ pub async fn replay_matches(
     Ok(())
 }
 
+/// [`replay_matches`], and in addition every replayed commit carries the same
+/// full message and the same author name and email as its original.
+///
+/// For finding a replay after a crash, where the question is not only "does
+/// this make the same changes" but "is this the replay SlashIt was authorized
+/// to make": a rebase rewrites parents, commit IDs and committer, and nothing
+/// else, so a commit that differs in message or author was changed by someone
+/// else. The unpublished restack's own verification stays content-only.
+pub async fn replay_matches_exactly(
+    dir: &Path,
+    fork_point: &str,
+    old_tip: &str,
+    onto: &str,
+    new_tip: &str,
+) -> Result<(), String> {
+    replay_matches(dir, fork_point, old_tip, onto, new_tip).await?;
+    let before = commits_between(dir, fork_point, old_tip).await?;
+    let after = commits_between(dir, onto, new_tip).await?;
+    for (original, replayed) in before.iter().zip(&after) {
+        if authored_message(dir, original).await? != authored_message(dir, replayed).await? {
+            return Err(format!(
+                "{replayed} has a different message or author than {original}, which a replay does not change"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A commit's author name, author email and full raw message, untrimmed.
+async fn authored_message(dir: &Path, commit: &str) -> Result<(String, String, String), String> {
+    let mut parts = git_entries(dir, &["show", "-s", "-z", "--format=%an%x00%ae%x00%B", commit])
+        .await?
+        .into_iter();
+    let name = parts.next().ok_or_else(|| format!("could not read the author of {commit}"))?;
+    let email = parts.next().ok_or_else(|| format!("could not read the author of {commit}"))?;
+    Ok((name, email, parts.next().unwrap_or_default()))
+}
+
 /// The backup ref that holds a published task branch's tip from before it was
 /// restacked (see `commands::pr::republish`). Its own name, not
 /// [`backup_ref`]'s: an unpublished restack's recovery deletes or refuses the

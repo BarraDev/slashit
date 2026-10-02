@@ -10291,6 +10291,81 @@ mod tests {
                     }
                 }
 
+                /// The replay SlashIt made, found after a crash between the replay
+                /// and its record, is adopted: a rebase changes the commit IDs and
+                /// the committer and nothing else, which is what is not compared.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn an_exact_replay_found_after_a_crash_is_adopted() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Replayed).await;
+                    assert!(p.task().await.pending_republish.unwrap().rewritten_tip.is_none());
+                    let replayed = local_tip(&p.landed);
+                    assert_ne!(replayed, p.landed.child_tip);
+
+                    p.restack().await.expect("the exact replay is adopted and published");
+                    assert_restacked(&p, "adopted").await;
+                    assert_eq!(local_tip(&p.landed), replayed, "adopted, not replayed again");
+                }
+
+                /// The same patches are not enough: a commit someone reworded or
+                /// re-attributed after the replay is not the replay SlashIt was
+                /// authorized to make. Resume and Discard both refuse, and the
+                /// record, the backup, the branch and origin stay as they were.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_replay_with_changed_metadata_is_not_adopted() {
+                    let _guard = PATH_LOCK.lock().await;
+                    for case in ["reworded", "re-attributed"] {
+                        let p = crashed_at(Spec::new(Landing::Squash), Stage::Replayed).await;
+                        let wt = &p.landed.worktree;
+                        let before_patch = git(wt, &["show", "--format=", "HEAD"]);
+                        if case == "reworded" {
+                            git(wt, &["commit", "-q", "--amend", "-m", "a different message"]);
+                        } else {
+                            git(wt, &["commit", "-q", "--amend", "--no-edit", "--author", "Someone Else <else@example.com>"]);
+                        }
+                        assert_eq!(git(wt, &["show", "--format=", "HEAD"]), before_patch, "{case}: same patch");
+                        let drifted = local_tip(&p.landed);
+
+                        let resume = p.restack().await.expect_err(case);
+                        assert!(resume.contains("not the approved branch") && resume.contains("message or author"), "{case}: {resume}");
+                        assert_recovery_intact(&p, &drifted, case).await;
+                        let discard = republish::discard(&p.state, p.task_id).await.expect_err(case);
+                        assert!(discard.contains("not the restack's result"), "{case}: {discard}");
+                        assert_recovery_intact(&p, &drifted, case).await;
+                        assert_eq!(p.task().await.pending_republish.unwrap().rewritten_tip, None, "{case}");
+                    }
+                }
+
+                /// A pull request that merged while the restack is unfinished
+                /// cannot be turned into a cleanup of the checkout, however the
+                /// terminalization is reached: the record, the backup, the branch
+                /// and the checkout all survive.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_merged_pull_request_does_not_clean_up_an_unfinished_restack() {
+                    let _guard = PATH_LOCK.lock().await;
+                    for stage in [Stage::BackedUp, Stage::Recorded, Stage::Pushed] {
+                        let p = crashed_at(Spec::new(Landing::Squash), stage).await;
+                        let tip = local_tip(&p.landed);
+                        for origin in [crate::lifecycle::Origin::Automatic, crate::lifecycle::Origin::User] {
+                            let refusal = crate::lifecycle::terminalize(
+                                crate::commands::task::terminalize_ctx(&p.state),
+                                p.task_id,
+                                origin,
+                                crate::lifecycle::TerminalizeRequest::new(TaskStatus::Done),
+                            )
+                            .await
+                            .expect_err("the restack owns the checkout");
+                            assert!(matches!(refusal, crate::lifecycle::TerminalizeRefusal::RepublishPending));
+                        }
+                        assert!(p.landed.worktree.exists(), "{stage:?}: the checkout");
+                        assert_eq!(local_tip(&p.landed), tip, "{stage:?}: the branch");
+                        assert_eq!(p.republish_backup().as_deref(), Some(p.landed.child_tip.as_str()), "{stage:?}: backup");
+                        let task = p.task().await;
+                        assert!(task.pending_republish.is_some(), "{stage:?}: the record");
+                        assert_ne!(task.status, TaskStatus::Done);
+                    }
+                }
+
                 /// 10: without the task's worktree, Resume still finishes a
                 /// recorded restack (it only needs the repository), refuses one
                 /// that was not rewritten yet, and Discard works only where the
@@ -10407,6 +10482,24 @@ mod tests {
                         matches!(&status, Some(RepublishStatus::Interrupted { rewritten: true, discard_blocked: None, .. })),
                         "{status:?}"
                     );
+                }
+
+                /// A remote that cannot be asked is unknown, not "Discard allowed"
+                /// (and Discard itself refuses, so the offer would be a lie).
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_status_does_not_offer_discard_when_origin_cannot_be_asked() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Recorded).await;
+                    git(&p.landed.repo.checkout, &["remote", "set-url", "origin", "/nonexistent/remote"]);
+                    let status = p.status().await.unwrap();
+                    let Some(RepublishStatus::Interrupted { discard_blocked: Some(reason), .. }) = &status else {
+                        panic!("a failed remote query must block Discard: {status:?}");
+                    };
+                    assert!(reason.contains("could not be checked"), "{reason}");
+                    let tip = local_tip(&p.landed);
+                    republish::discard(&p.state, p.task_id).await.expect_err("fails closed");
+                    assert!(p.task().await.pending_republish.is_some());
+                    assert_eq!(local_tip(&p.landed), tip);
                 }
 
                 /// A restack that is only planned can be discarded too.

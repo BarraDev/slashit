@@ -51,10 +51,11 @@
 //!
 //! A crash after phase 3 and before phase 4 leaves a branch that is not at
 //! `previous_tip` and a record without `rewritten_tip`: the branch is adopted
-//! only when its commits are, by patch-id, the replay of the recorded range
-//! onto `onto`, and refused otherwise. A rebase left stopped by a crash is
-//! never touched here; the user finishes or aborts it, then retries or
-//! discards.
+//! only when its commits are the replay of the recorded range onto `onto`:
+//! the same changes by patch-id, and the same full message and author for each
+//! (a rebase changes neither), and refused otherwise. A rebase left stopped by
+//! a crash is never touched here; the user finishes or aborts it, then retries
+//! or discards.
 //!
 //! The local branch is never claimed to be published: while the record exists,
 //! the remote may be behind it.
@@ -385,6 +386,15 @@ async fn check_worktree(worktree: &Path, branch: &str, tip: &str, context: &str)
     Ok(())
 }
 
+/// Why Discard is not offered while origin cannot be asked whether it already
+/// has the restacked branch.
+fn remote_unavailable(error: &str) -> String {
+    format!(
+        "Origin could not be checked, so whether going back is safe is unknown: {error}. Resume \
+         or try again once origin is reachable."
+    )
+}
+
 /// What the pull request surface should offer for the task, by observation
 /// only: nothing is written, and the only network use is asking GitHub.
 pub(super) async fn status(
@@ -394,6 +404,8 @@ pub(super) async fn status(
     let pending = state.task.tasks.read().await.get(&task_uuid).and_then(|t| t.pending_republish.clone());
     if let Some(pending) = pending {
         let rewritten = pending.rewritten_tip.is_some();
+        // Discard itself fails closed when origin cannot be asked, so a failed
+        // query is reported as unavailable rather than as "allowed".
         let discard_blocked = match &pending.rewritten_tip {
             Some(tip) => match Context::of(state, task_uuid).await {
                 Ok(ctx) => match remote_branch_commit(&ctx.working_dir, &ctx.branch).await {
@@ -402,9 +414,10 @@ pub(super) async fn status(
                          branch behind it. Resume to finish."
                             .to_string(),
                     ),
-                    _ => None,
+                    Ok(_) => None,
+                    Err(e) => Some(remote_unavailable(&e)),
                 },
-                Err(_) => None,
+                Err(e) => Some(remote_unavailable(&e)),
             },
             None => None,
         };
@@ -616,7 +629,7 @@ async fn advance(
                      (`git rebase --abort`), then run the restack again or discard it."
                 ));
             }
-            restack::replay_matches(worktree, &pending.fork_point, &pending.previous_tip, &pending.onto, &tip)
+            restack::replay_matches_exactly(worktree, &pending.fork_point, &pending.previous_tip, &pending.onto, &tip)
                 .await
                 .map_err(|e| {
                     format!(
@@ -922,7 +935,7 @@ pub(super) async fn discard(state: &crate::AppState, task_uuid: Uuid) -> Result<
         let worktree = ctx.worktree.as_deref().ok_or("This task has no worktree to restore the branch in.")?;
         let produced = match &pending.rewritten_tip {
             Some(rewritten) => *rewritten == tip,
-            None => restack::replay_matches(
+            None => restack::replay_matches_exactly(
                 worktree,
                 &pending.fork_point,
                 &pending.previous_tip,

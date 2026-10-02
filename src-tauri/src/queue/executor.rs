@@ -1424,7 +1424,16 @@ impl TaskExecutor {
             // task out of the poll's selection, and the card says what the user
             // has to fix. The task stays non-terminal, its worktree and branch
             // are untouched, and no git command has run.
-            Err(refusal @ crate::lifecycle::TerminalizeRefusal::RepositoryUnresolved(_)) => {
+            //
+            // A pending restack of the task's published branch is the same
+            // kind of blocker: it answers before anything is written, only the
+            // user's resume or discard can end it, and the checkout it keeps is
+            // its recovery evidence. The merge is latched for the same reasons;
+            // the restack record, its backup and the checkout are not touched.
+            Err(
+                refusal @ (crate::lifecycle::TerminalizeRefusal::RepositoryUnresolved(_)
+                | crate::lifecycle::TerminalizeRefusal::RepublishPending),
+            ) => {
                 let reason = refusal.to_string();
                 let latch = move |staged: &mut HashMap<Uuid, Task>| {
                     if let Some(t) = staged.get_mut(&task_id) {
@@ -4323,6 +4332,58 @@ mod tests {
             Some("MERGED"),
             "the file is what the next start reads, so a latch only in memory is no latch"
         );
+    }
+
+    /// A pull request merged outside SlashIt while a restack of the task's
+    /// published branch is unfinished: the merge is recorded, once, so the poll
+    /// stops asking, but the restack's record and the checkout are untouched
+    /// and the task is not finished.
+    #[tokio::test]
+    async fn a_merge_found_during_an_unfinished_restack_keeps_its_recovery_state() {
+        let (executor, _temps) = test_executor();
+        let checkout = tempfile::tempdir().expect("a checkout directory");
+        let path = checkout.path().to_str().unwrap().to_string();
+        let (id, project_id) = task_with_open_pr(&executor, Some(&path)).await;
+        let pending = crate::domain::PendingRepublish {
+            parent_branch: "task-parent".to_string(),
+            parent_pr: 7,
+            pr_number: 7,
+            default_branch: "main".to_string(),
+            fork_point: "a".repeat(40),
+            previous_tip: "b".repeat(40),
+            onto: "c".repeat(40),
+            rewritten_tip: None,
+        };
+        {
+            let mut tasks = executor.tasks.write().await;
+            let task = tasks.get_mut(&id).unwrap();
+            task.pending_republish = Some(pending.clone());
+            executor.storage.save_project_tasks(project_id, &[task.clone()]).unwrap();
+        }
+
+        executor.complete_merged_task(id, 7, "MERGED").await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(after.pending_republish, Some(pending), "the record is preserved");
+        assert_eq!(after.status, TaskStatus::PrCreated, "the task is not finished");
+        assert_eq!(after.worktree_path.as_deref(), Some(path.as_str()));
+        assert_eq!(after.branch_name.as_deref(), Some("task-abcd1234"));
+        assert!(!after.cleanup_in_flight, "no cleanup was announced");
+        assert!(checkout.path().exists(), "the checkout is untouched");
+        assert_eq!(recorded_pr_state(&after).as_deref(), Some("MERGED"));
+        assert!(
+            after.error_message.as_deref().is_some_and(|m| m.contains("restack")),
+            "the card says why: {:?}",
+            after.error_message
+        );
+        let on_disk = executor
+            .storage
+            .load_project_tasks(project_id)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == id)
+            .unwrap();
+        assert!(on_disk.pending_republish.is_some(), "and so is the file");
     }
 
     #[tokio::test]
