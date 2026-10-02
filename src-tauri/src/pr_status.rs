@@ -873,10 +873,25 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         /// A stand-in `gh` written into `dir`.
+        ///
+        /// The executable is created by a child process, never by this one.
+        /// A file this process holds open for writing can be inherited by a
+        /// child that another test thread forks at that moment, and `execve`
+        /// of the file fails with `ETXTBSY` until that child execs. The
+        /// descriptor that writes the executable lives only in `cp`, which has
+        /// exited by the time this returns, so no sibling can hold it. The
+        /// script text itself goes through a file that is never executed, so
+        /// it can be written here safely.
         pub fn script(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+            let source = dir.join("gh.source");
+            std::fs::write(&source, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
             let path = dir.join("gh");
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // An absolute path: tests that shadow `PATH` must not decide
+            // which `cp` this is.
+            let copied = std::process::Command::new("/bin/cp").arg(&source).arg(&path).status().unwrap();
+            assert!(copied.success(), "could not create the fake gh: {copied}");
+            std::fs::remove_file(&source).unwrap();
             path
         }
 
@@ -886,11 +901,13 @@ mod tests {
         fn alive(pid: i32) -> bool {
             // Signal 0 checks existence. A zombie still exists, so also read
             // its state: an unreaped zombie of ours is not "left running".
+            // Nor is a process in the instant its parent reaps it ('X'): it
+            // is gone but not yet removed from `/proc`.
             if unsafe { libc::kill(pid, 0) } != 0 {
                 return false;
             }
             match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                Ok(stat) => !stat.rsplit(')').next().unwrap_or("").trim_start().starts_with('Z'),
+                Ok(stat) => !stat.rsplit(')').next().unwrap_or("").trim_start().starts_with(['Z', 'X', 'x']),
                 Err(_) => false,
             }
         }
@@ -947,7 +964,7 @@ esac"#,
             let statuses = PrStatuses::with_program(gh, Duration::from_secs(10));
             let key = PrKey::new("o/r", 1);
             let err = statuses.refresh(&key).await.unwrap_err();
-            assert_eq!(err.kind, PrFetchErrorKind::Auth);
+            assert_eq!(err.kind, PrFetchErrorKind::Auth, "{err:?}");
             assert_eq!(statuses.get(&key).unwrap().error, Some(err));
         }
 
@@ -955,7 +972,7 @@ esac"#,
         async fn a_missing_gh_is_reported_as_not_installed() {
             let statuses = PrStatuses::with_program("/nonexistent/slashit-no-gh", Duration::from_secs(1));
             let err = statuses.refresh(&PrKey::new("o/r", 1)).await.unwrap_err();
-            assert_eq!(err.kind, PrFetchErrorKind::NotInstalled);
+            assert_eq!(err.kind, PrFetchErrorKind::NotInstalled, "{err:?}");
         }
 
         #[tokio::test]
@@ -975,7 +992,7 @@ esac"#,
 
             let began = std::time::Instant::now();
             let err = statuses.refresh(&key).await.unwrap_err();
-            assert_eq!(err.kind, PrFetchErrorKind::Timeout);
+            assert_eq!(err.kind, PrFetchErrorKind::Timeout, "{err:?}");
             assert!(began.elapsed() < Duration::from_secs(5), "took {:?}", began.elapsed());
 
             let entry = statuses.get(&key).unwrap();
