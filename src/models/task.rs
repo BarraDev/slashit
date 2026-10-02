@@ -172,6 +172,7 @@ impl PrReviewPlan {
     /// frontend can backfill the cached plan on modal open without a round
     /// trip — old plans created before lifecycle tracking surface their
     /// badges immediately.
+    /// A comment edited since the apply regains neither flag.
     pub fn backfill_lifecycle_from_last_apply(&mut self) {
         let Some(last) = self.last_apply.clone() else { return; };
         if last.dry_run { return; }
@@ -184,7 +185,10 @@ impl PrReviewPlan {
             .collect();
         for item in self.items.iter_mut() {
             let Some(cid) = item.comment_id else { continue; };
-            if last.fixed_ids.contains(&cid) {
+            let edited = self.comments.iter()
+                .find(|c| c.id == Some(cid))
+                .is_some_and(|c| c.edited_since(last.applied_at));
+            if last.fixed_ids.contains(&cid) && !edited {
                 if !item.fix_done {
                     item.fix_done = true;
                 }
@@ -222,6 +226,15 @@ pub struct PrReviewComment {
 }
 
 impl PrReviewComment {
+    /// Mirrors the backend rule of the same name: whether the comment may
+    /// have been edited at or after `applied_at`, compared at whole-second
+    /// precision and non-strictly. No `updated_at` means unchanged.
+    pub fn edited_since(&self, applied_at: chrono::DateTime<chrono::Utc>) -> bool {
+        use chrono::SubsecRound;
+        self.updated_at
+            .is_some_and(|updated_at| updated_at.trunc_subsecs(0) >= applied_at.trunc_subsecs(0))
+    }
+
     /// Mirrors the backend rule of the same name: only an owner, member or
     /// collaborator's Fix items may start out approved.
     pub fn author_is_collaborator(&self) -> bool {
@@ -665,6 +678,76 @@ mod tests {
         assert_eq!(status.mergeable, Some(Mergeability::Mergeable));
         assert_eq!(entry.error.as_ref().map(|e| e.kind), Some(PrFetchErrorKind::Timeout));
         assert_eq!(entry.key(), PrKey { repo: "o/r".to_string(), number: 7 });
+    }
+
+    /// Two Fix items, comments 1 and 2, fixed and answered by an apply at
+    /// `applied_at` whose lifecycle flags are not set yet.
+    fn plan_applied_at(applied_at: &str, updated: [Option<&str>; 2]) -> PrReviewPlan {
+        let comment = |id: u64, updated_at: Option<&str>| {
+            serde_json::json!({
+                "id": id, "kind": "inline", "author": "r", "body": "b",
+                "updated_at": updated_at,
+            })
+        };
+        let item = |id: u64| {
+            serde_json::json!({
+                "comment_id": id, "summary": "s", "decision": "fix",
+                "reasoning": "r", "proposed_change": "c", "approved": true,
+            })
+        };
+        serde_json::from_value(serde_json::json!({
+            "generated_at": "2026-09-30T12:00:00Z",
+            "pr_url": "https://github.com/o/r/pull/1",
+            "review_decision": null,
+            "comments": [comment(1, updated[0]), comment(2, updated[1])],
+            "items": [item(1), item(2)],
+            "raw_plan": "",
+            "last_apply": {
+                "applied_at": applied_at,
+                "agent_summary": "",
+                "fixed_ids": [1, 2],
+                "skipped_ids": [],
+                "auto_reply": true,
+            },
+        }))
+        .expect("a plan in the backend's shape")
+    }
+
+    #[test]
+    fn backfill_skips_a_comment_edited_after_the_last_apply() {
+        let mut plan = plan_applied_at(
+            "2026-09-30T12:00:30.500Z",
+            [Some("2026-09-30T12:05:00Z"), Some("2026-09-30T11:00:00Z")],
+        );
+        plan.items[0].fix_uncommitted = true;
+
+        plan.backfill_lifecycle_from_last_apply();
+
+        assert!(!plan.items[0].fix_done && !plan.items[0].reply_posted);
+        assert!(plan.items[0].fix_uncommitted, "the checkout fact survives the edit");
+        assert!(plan.items[1].fix_done && plan.items[1].reply_posted, "unchanged comments keep the backfill");
+    }
+
+    #[test]
+    fn backfill_treats_a_same_second_update_as_a_possible_edit() {
+        let mut plan = plan_applied_at(
+            "2026-09-30T12:00:30.700Z",
+            [Some("2026-09-30T12:00:30Z"), Some("2026-09-30T12:00:29Z")],
+        );
+
+        plan.backfill_lifecycle_from_last_apply();
+
+        assert!(!plan.items[0].fix_done && !plan.items[0].reply_posted);
+        assert!(plan.items[1].fix_done && plan.items[1].reply_posted);
+    }
+
+    #[test]
+    fn backfill_keeps_a_comment_without_an_update_time_as_unchanged() {
+        let mut plan = plan_applied_at("2026-09-30T12:00:30Z", [None, None]);
+
+        plan.backfill_lifecycle_from_last_apply();
+
+        assert!(plan.items.iter().all(|i| i.fix_done && i.reply_posted));
     }
 
     fn issues(lines: &[&str]) -> Vec<String> {
