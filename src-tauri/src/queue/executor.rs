@@ -1435,12 +1435,16 @@ impl TaskExecutor {
                 | crate::lifecycle::TerminalizeRefusal::RepublishPending),
             ) => {
                 let reason = refusal.to_string();
+                let republish_pending =
+                    matches!(refusal, crate::lifecycle::TerminalizeRefusal::RepublishPending);
                 let latch = move |staged: &mut HashMap<Uuid, Task>| {
                     if let Some(t) = staged.get_mut(&task_id) {
                         Self::record_pr_state(t, number, state);
-                        t.error_message = Some(format!(
-                            "The pull request is merged, but the task was not finished: {reason}"
-                        ));
+                        t.error_message = Some(if republish_pending {
+                            crate::lifecycle::merged_while_republish_pending_message()
+                        } else {
+                            format!("The pull request is merged, but the task was not finished: {reason}")
+                        });
                     }
                 };
                 // A failure here writes nothing, which leaves the ref

@@ -10502,6 +10502,34 @@ mod tests {
                     assert_eq!(local_tip(&p.landed), tip);
                 }
 
+                /// The explanation the merged-PR poll leaves on a task whose
+                /// cleanup a pending restack refused goes with the restack, on
+                /// a successful Resume and on a successful Discard; any other
+                /// error on the task stays.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn resolving_the_restack_clears_only_its_own_merge_explanation() {
+                    let _guard = PATH_LOCK.lock().await;
+                    for resume in [true, false] {
+                        for (own, message) in [
+                            (true, crate::lifecycle::merged_while_republish_pending_message()),
+                            (false, "the agent crashed".to_string()),
+                        ] {
+                            let p = crashed_at(Spec::new(Landing::Squash), Stage::Recorded).await;
+                            p.state.task.tasks.write().await.get_mut(&p.task_id).unwrap().error_message =
+                                Some(message.clone());
+                            if resume {
+                                p.restack().await.expect("resume");
+                            } else {
+                                republish::discard(&p.state, p.task_id).await.expect("discard");
+                            }
+                            let task = p.task().await;
+                            assert!(task.pending_republish.is_none());
+                            let expected = if own { None } else { Some(message) };
+                            assert_eq!(task.error_message, expected, "resume={resume} own={own}");
+                        }
+                    }
+                }
+
                 /// A restack that is only planned can be discarded too.
                 #[tokio::test(flavor = "multi_thread")]
                 async fn a_planned_restack_can_be_discarded() {

@@ -771,6 +771,7 @@ async fn clear_pending(
         if let Some(task) = staged.get_mut(&task_uuid) {
             if task.pending_republish.as_ref() == Some(pending) {
                 task.pending_republish = None;
+                crate::lifecycle::clear_merged_while_republish_pending(task);
             }
         }
     };
@@ -965,6 +966,7 @@ pub(super) async fn discard(state: &crate::AppState, task_uuid: Uuid) -> Result<
         if let Some(task) = staged.get_mut(&task_uuid) {
             if task.pending_republish.as_ref() == Some(&pending) {
                 task.pending_republish = None;
+                crate::lifecycle::clear_merged_while_republish_pending(task);
                 if pending.rewritten_tip.is_some() {
                     task.base_commit = Some(pending.fork_point.clone());
                     task.branch_origin = Some(stacked.clone());

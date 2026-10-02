@@ -228,6 +228,23 @@ impl<'a> TerminalizeRequest<'a> {
     }
 }
 
+const REPUBLISH_PENDING_REASON: &str = "a restack of this task's published branch is unfinished, so its \
+     checkout and branch were kept; resume or discard the restack first";
+
+/// What the merged-pull-request poll puts on a task whose terminalization a
+/// pending restack refused.
+pub fn merged_while_republish_pending_message() -> String {
+    format!("The pull request is merged, but the task was not finished: {REPUBLISH_PENDING_REASON}")
+}
+
+/// Drop [`merged_while_republish_pending_message`] from `task`, once the
+/// restack it names is resolved. Any other error is left alone.
+pub fn clear_merged_while_republish_pending(task: &mut Task) {
+    if task.error_message.as_deref() == Some(merged_while_republish_pending_message().as_str()) {
+        task.error_message = None;
+    }
+}
+
 /// Why a terminalization did not happen.
 ///
 /// Every variant leaves the task exactly as it was found, including its
@@ -282,11 +299,7 @@ impl std::fmt::Display for TerminalizeRefusal {
                 "the worktree at {worktree_path} was kept: {reason}"
             ),
             Self::NotRecorded(m) => write!(f, "{m}"),
-            Self::RepublishPending => write!(
-                f,
-                "a restack of this task's published branch is unfinished, so its checkout and \
-                 branch were kept; resume or discard the restack first"
-            ),
+            Self::RepublishPending => f.write_str(REPUBLISH_PENDING_REASON),
         }
     }
 }
