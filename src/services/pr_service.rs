@@ -217,3 +217,29 @@ pub async fn refresh_pr_status(task_id: String) -> Result<Vec<crate::models::PrS
     let response = invoke("refresh_pr_status", args).await?;
     serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
 }
+
+/// What the pull request section offers for the task's published stacked
+/// branch. Reads only.
+pub async fn get_published_restack_status(
+    task_id: String,
+) -> Result<Option<crate::models::RepublishStatus>, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "taskId": task_id })).unwrap();
+    let response = invoke("get_published_restack_status", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+/// Restack the task's published branch onto the branch its parent landed on,
+/// update its remote branch with a guarded force push, and retarget its pull
+/// request; or finish that after an interruption. Only after confirmation.
+pub async fn restack_published_task(task_id: String) -> Result<crate::models::RepublishOutcome, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "taskId": task_id })).unwrap();
+    let response = invoke("restack_published_task", args).await?;
+    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+}
+
+/// Go back to the tip an unfinished restack started from. Never touches origin.
+pub async fn discard_published_restack(task_id: String) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({ "taskId": task_id })).unwrap();
+    invoke("discard_published_restack", args).await?;
+    Ok(())
+}

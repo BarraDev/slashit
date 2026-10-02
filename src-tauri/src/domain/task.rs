@@ -162,6 +162,17 @@ pub struct Task {
     #[serde(default)]
     pub branch_origin: Option<BranchOrigin>,
 
+    /// A restack of this task's already published branch that has begun and
+    /// not finished (see `commands::pr::republish`). `None` when none is
+    /// under way, which is what every record written before this field
+    /// existed deserializes to.
+    ///
+    /// While it is set, the pull request on GitHub and the remote branch may
+    /// still be what they were before the restack: this record is the only
+    /// durable statement that the local branch is ahead of them on purpose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_republish: Option<PendingRepublish>,
+
     /// A destructive worktree cleanup was started for this task and this
     /// process has not yet durably recorded its outcome.
     ///
@@ -251,6 +262,25 @@ fn with_home_as_tilde(text: &str, home: &str) -> String {
 }
 
 impl Task {
+    /// Why nothing but the restack's own recovery may change this task's
+    /// branch or checkout right now, or `None`.
+    ///
+    /// While [`Self::pending_republish`] exists the task is in an exclusive
+    /// recovery state: the record is a proof of one exact transaction (the
+    /// approved remote tip, the fork point, the target base and the verified
+    /// rewritten tip), and anything that advanced the branch would make
+    /// resuming or discarding it ambiguous. An agent run, an AI review or
+    /// fix, a pull request helper, and pull request creation all ask this
+    /// first. Reading the task, and Resume and Discard themselves, do not.
+    pub fn republish_pending_refusal(&self) -> Option<String> {
+        self.pending_republish.as_ref().map(|_| {
+            "A restack of this task's published branch is unfinished, so nothing else may change \
+             its branch or checkout until it is resumed or discarded. Resume or discard it in the \
+             task's pull request section."
+                .to_string()
+        })
+    }
+
     /// Return the task to a state work can start from again, keeping the work
     /// it has already produced.
     ///
@@ -313,6 +343,7 @@ impl Task {
         self.status == TaskStatus::InProgress
             && self.phase == TaskPhase::Idle
             && !self.cleanup_in_flight
+            && self.pending_republish.is_none()
     }
 
     /// Record a milestone on the task's timeline now, unless it is a
@@ -395,6 +426,40 @@ impl Task {
         }
         .needs_you()
     }
+}
+
+/// The durable record of one restack of a published stacked branch, from the
+/// moment it is planned until its pull request has been retargeted.
+///
+/// Everything a retry needs is here, so that no step has to be recovered from
+/// incidental observations: the tip the user approved and that the remote must
+/// still have for the update to go through (`previous_tip`), the commit the
+/// branch is replayed onto (`onto`), and, once the replay is verified and the
+/// task's base is recorded, the tip it produced (`rewritten_tip`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingRepublish {
+    /// The branch the task was stacked on, as `BranchOrigin::Stacked` names it.
+    pub parent_branch: String,
+    /// The parent's merged pull request.
+    pub parent_pr: u64,
+    /// The task's own pull request, which is retargeted last.
+    pub pr_number: u64,
+    /// The default branch the parent landed on, which the pull request is
+    /// retargeted to.
+    pub default_branch: String,
+    /// `Task::base_commit` before the restack: the parent's tip the branch
+    /// was created at.
+    pub fork_point: String,
+    /// The branch's tip, local and on the remote, when the restack was
+    /// approved. The guarded push expects the remote to be exactly here.
+    pub previous_tip: String,
+    /// The commit the branch is replayed onto.
+    pub onto: String,
+    /// The tip the replay produced, set in the same write that moves the
+    /// task's `base_commit` to `onto` and its origin to the default branch.
+    /// `None` until then.
+    #[serde(default)]
+    pub rewritten_tip: Option<String>,
 }
 
 /// What a task's branch currently starts from, as recorded on
@@ -1012,6 +1077,26 @@ mod tests {
             !quarantined.is_ready_to_execute(),
             "a task with an unresolved cleanup must never be reported ready to execute"
         );
+    }
+
+    /// A task whose published branch has an unfinished restack is not started:
+    /// the restack owns it (see `Task::republish_pending_refusal`).
+    #[test]
+    fn is_ready_to_execute_is_false_while_a_restack_of_its_branch_is_pending() {
+        let mut pending = startable_task();
+        pending.pending_republish = Some(PendingRepublish {
+            parent_branch: "p".to_string(),
+            parent_pr: 1,
+            pr_number: 2,
+            default_branch: "main".to_string(),
+            fork_point: "a".repeat(40),
+            previous_tip: "b".repeat(40),
+            onto: "c".repeat(40),
+            rewritten_tip: None,
+        });
+        assert!(!pending.is_ready_to_execute());
+        assert!(pending.republish_pending_refusal().is_some());
+        assert!(startable_task().republish_pending_refusal().is_none());
     }
 
     #[test]

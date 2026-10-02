@@ -10,6 +10,9 @@ use crate::agents::runner::truncate_one_line;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
+mod republish;
+pub use republish::{RepublishOutcome, RepublishStatus};
+
 /// Parse a GitHub PR URL into an ExternalRef::GithubPr
 fn parse_pr_url_to_ref(pr_url: &str) -> Option<ExternalRef> {
     let parts: Vec<&str> = pr_url.trim_end_matches('/').split('/').collect();
@@ -398,6 +401,40 @@ pub async fn create_pr(
     create_pr_inner(&state, &task_id).await
 }
 
+/// What the pull request surface should offer for a stacked task whose parent
+/// landed: see [`republish::status`]. Reads only.
+#[tauri::command]
+pub async fn get_published_restack_status(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<Option<RepublishStatus>, String> {
+    let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    republish::status(&state, task_uuid).await
+}
+
+/// Restack a published stacked task onto the default branch its parent landed
+/// on, update its remote branch with a guarded force push and retarget its
+/// pull request, or finish doing so after an interruption. The caller is the
+/// person's explicit confirmation; nothing calls this on its own.
+#[tauri::command]
+pub async fn restack_published_task(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<RepublishOutcome, String> {
+    let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    republish::restack(&state, task_uuid).await
+}
+
+/// Go back to the tip a restack started from, without touching the remote.
+#[tauri::command]
+pub async fn discard_published_restack(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<(), String> {
+    let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    republish::discard(&state, task_uuid).await
+}
+
 /// [`create_pr`] for a task whose changes a person approved at Human Review.
 ///
 /// The approval is checked under the same lease that reserves the task for
@@ -420,6 +457,7 @@ pub(crate) async fn create_pr_for_approved_task(
                     .to_string(),
             );
         }
+        refuse_while_republish_pending(state, task_id).await?;
         match state.executor.get() {
             Some(executor) => Some(executor.begin_pr_side_effect_under_lease(task_id).await?),
             None => None,
@@ -2799,6 +2837,7 @@ async fn begin_pr_helper(
     state: &crate::AppState,
     task_id: Uuid,
 ) -> Result<(Option<crate::queue::PrHelperLease>, tokio::sync::watch::Receiver<bool>), String> {
+    refuse_while_republish_pending(state, task_id).await?;
     match state.executor.get() {
         Some(executor) => {
             let lease = executor
@@ -2838,9 +2877,34 @@ async fn reserve_task_for_pr_side_effect(
     task_id: Uuid,
 ) -> Result<Option<crate::queue::PrHelperLease>, String> {
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    refuse_while_republish_pending(state, task_id).await?;
     match state.executor.get() {
         Some(executor) => executor.begin_pr_side_effect_under_lease(task_id).await.map(Some),
         None => Ok(None),
+    }
+}
+
+/// [`reserve_task_for_pr_side_effect`] for the restack's own Resume and
+/// Discard, which are the one thing allowed to act on a task whose restack is
+/// unfinished.
+async fn reserve_task_for_republish(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<Option<crate::queue::PrHelperLease>, String> {
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+    match state.executor.get() {
+        Some(executor) => executor.begin_republish_under_lease(task_id).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Refuse while the task's published branch has an unfinished restack (see
+/// [`Task::republish_pending_refusal`]). Enforced here as well as in the
+/// executor, so it holds where no executor is wired.
+async fn refuse_while_republish_pending(state: &crate::AppState, task_id: Uuid) -> Result<(), String> {
+    match state.task.tasks.read().await.get(&task_id).and_then(Task::republish_pending_refusal) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
     }
 }
 
@@ -3650,26 +3714,7 @@ async fn restack_onto_landed_parent(
              --head {branch} --base {default}`. {unchanged_note}"
         )
     };
-    let dependent = {
-        let tasks = state.task.tasks.read().await;
-        let projects = state.project.projects.read().await;
-        let repository_of = |project_id: &Uuid| projects.get(project_id).and_then(|p| p.repository_id);
-        let own_project = tasks.get(&task_uuid).map(|t| t.project_id);
-        let own_repository = own_project.as_ref().and_then(repository_of);
-        let same_repository = |t: &&Task| {
-            Some(t.project_id) == own_project
-                || (own_repository.is_some() && repository_of(&t.project_id) == own_repository)
-        };
-        tasks
-            .values()
-            .filter(|t| t.id != task_uuid && t.branch_name.is_some())
-            .filter(same_repository)
-            .find(|t| {
-                matches!(&t.branch_origin, Some(BranchOrigin::Stacked { parent_branch }) if parent_branch == branch)
-            })
-            .map(|t| (t.title.clone(), t.id, t.branch_name.clone().unwrap_or_default()))
-    };
-    if let Some((title, id, dependent_branch)) = dependent {
+    if let Some((title, id, dependent_branch)) = stacked_dependent(state, task_uuid, branch).await {
         return Err(strands(format!(
             "task \"{title}\" ({id}) is stacked on it, on branch {dependent_branch}"
         )));
@@ -3765,6 +3810,33 @@ async fn restack_onto_landed_parent(
         );
     }
     Ok(RestackOutcome::Restacked)
+}
+
+/// A task of the same repository, other than `task_uuid`, that is stacked on
+/// `branch`: its title, id and branch. Rewriting `branch` would strand it on
+/// the old commits.
+async fn stacked_dependent(
+    state: &crate::AppState,
+    task_uuid: Uuid,
+    branch: &str,
+) -> Option<(String, Uuid, String)> {
+    let tasks = state.task.tasks.read().await;
+    let projects = state.project.projects.read().await;
+    let repository_of = |project_id: &Uuid| projects.get(project_id).and_then(|p| p.repository_id);
+    let own_project = tasks.get(&task_uuid).map(|t| t.project_id);
+    let own_repository = own_project.as_ref().and_then(repository_of);
+    let same_repository = |t: &&Task| {
+        Some(t.project_id) == own_project
+            || (own_repository.is_some() && repository_of(&t.project_id) == own_repository)
+    };
+    tasks
+        .values()
+        .filter(|t| t.id != task_uuid && t.branch_name.is_some())
+        .filter(same_repository)
+        .find(|t| {
+            matches!(&t.branch_origin, Some(BranchOrigin::Stacked { parent_branch }) if parent_branch == branch)
+        })
+        .map(|t| (t.title.clone(), t.id, t.branch_name.clone().unwrap_or_default()))
 }
 
 /// The refusal for a restack that did not produce a recorded, verified
@@ -9710,6 +9782,873 @@ mod tests {
                 let bookmarks = jj_at(&["bookmark", "list", "task-branch"]);
                 assert!(!bookmarks.contains("conflict"), "{bookmarks}");
             }
+
+            /// A stacked task whose branch is published and whose pull
+            /// request is open, after its parent landed. Only `gh` is faked,
+            /// and statefully: the child's pull request base, state and the
+            /// remote branch's tip at the moment of a retarget live in files.
+            mod published {
+                use super::*;
+                use crate::commands::pr::republish::{self, RepublishStatus, Stage};
+
+                const CHILD_NUMBER: u64 = 21;
+
+                struct Pub {
+                    landed: Landed,
+                    state: crate::AppState,
+                    _tmp: tempfile::TempDir,
+                    task_id: Uuid,
+                    mock: MockGh,
+                    base_file: PathBuf,
+                    seen_file: PathBuf,
+                }
+
+                /// Clears the test hooks however the test ends.
+                struct Hooks;
+                impl Drop for Hooks {
+                    fn drop(&mut self) {
+                        *republish::CRASH_AFTER.lock().unwrap() = None;
+                        *republish::BEFORE_PUSH.lock().unwrap() = None;
+                    }
+                }
+
+                fn crash_after(stage: Stage) -> Hooks {
+                    *republish::CRASH_AFTER.lock().unwrap() = Some(stage);
+                    Hooks
+                }
+
+                /// The task's branch pushed, a pull request open for it whose
+                /// base is `pr_base`, the parent's pull request merged as
+                /// `spec` says.
+                async fn published(spec: Spec, pr_base: &str) -> Pub {
+                    let landed = land(spec);
+                    let co = landed.repo.checkout.clone();
+                    git(&co, &["push", "-q", "origin", "task-branch"]);
+                    let dir = landed.repo._tmp.path().to_path_buf();
+                    let base_file = dir.join("pr-base");
+                    let state_file = dir.join("pr-state");
+                    let seen_file = dir.join("seen-at-retarget");
+                    std::fs::write(&base_file, pr_base).unwrap();
+                    std::fs::write(&state_file, "OPEN").unwrap();
+                    let remote = landed.repo.remote.display();
+                    let mut answers = merged_parent_answers(&landed);
+                    answers.push((
+                        "pr list --head task-branch --state all '*'".to_string(),
+                        format!(
+                            r#"printf '[{{"number":{CHILD_NUMBER},"state":"%s","baseRefName":"%s","isCrossRepository":false}}]' "$(cat {state})" "$(cat {base})""#,
+                            state = state_file.display(),
+                            base = base_file.display()
+                        ),
+                    ));
+                    answers.push((
+                        format!("pr view {CHILD_NUMBER} --json state,baseRefName,headRefName"),
+                        format!(
+                            r#"printf '{{"state":"%s","baseRefName":"%s","headRefName":"task-branch"}}' "$(cat {state})" "$(cat {base})""#,
+                            state = state_file.display(),
+                            base = base_file.display()
+                        ),
+                    ));
+                    answers.push((
+                        format!("pr edit {CHILD_NUMBER} --base main"),
+                        format!(
+                            "printf main > {base}; git --git-dir {remote} rev-parse refs/heads/task-branch > {seen}",
+                            base = base_file.display(),
+                            seen = seen_file.display()
+                        ),
+                    ));
+                    let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &answers);
+                    let (state, tmp) = build_test_state().await;
+                    let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                    state.task.tasks.write().await.get_mut(&task_id).unwrap().pr_url =
+                        Some(CHILD_PR_URL.to_string());
+                    Pub { landed, state, _tmp: tmp, task_id, mock, base_file, seen_file }
+                }
+
+                impl Pub {
+                    fn republish_backup(&self) -> Option<String> {
+                        ref_at(&self.landed.repo.checkout, &crate::worktree::restack::republish_backup_ref(self.task_id))
+                    }
+                    fn remote_child(&self) -> Option<String> {
+                        self.landed.repo.remote_has_branch("task-branch")
+                    }
+                    fn pr_base(&self) -> String {
+                        std::fs::read_to_string(&self.base_file).unwrap()
+                    }
+                    fn retargeted(&self) -> bool {
+                        self.mock.read_log().contains("\npr\nedit\n")
+                    }
+                    async fn task(&self) -> Task {
+                        self.state.task.tasks.read().await[&self.task_id].clone()
+                    }
+                    async fn status(&self) -> Result<Option<RepublishStatus>, String> {
+                        republish::status(&self.state, self.task_id).await
+                    }
+                    async fn restack(&self) -> Result<republish::RepublishOutcome, String> {
+                        republish::restack(&self.state, self.task_id).await
+                    }
+                }
+
+                /// What a finished restack must leave: the remote branch is
+                /// the restacked local one, holding only the task's own
+                /// commits and files; the pull request targets `main`; the
+                /// task records the new base and no pending restack; and the
+                /// previous tip is still recoverable.
+                async fn assert_restacked(p: &Pub, name: &str) {
+                    let co = &p.landed.repo.checkout;
+                    let tip = local_tip(&p.landed);
+                    let onto = remote_main(&p.landed);
+                    assert_ne!(tip, p.landed.child_tip, "{name}: the branch must have been rewritten");
+                    assert_eq!(p.remote_child().as_deref(), Some(tip.as_str()), "{name}");
+                    git(co, &["fetch", "-q", "origin"]);
+                    assert_eq!(subjects(co, "origin/main..origin/task-branch"), ["B1", "B2"], "{name}");
+                    assert_eq!(git(co, &["diff", "--name-only", "origin/main...origin/task-branch"]), "b.txt", "{name}");
+                    assert_eq!(git(co, &["rev-parse", "task-branch^^"]), onto, "{name}");
+                    assert_eq!(p.pr_base(), "main", "{name}");
+                    assert_eq!(p.republish_backup(), None, "{name}: dropped only after everything is recorded");
+                    assert_eq!(git(&p.landed.worktree, &["status", "--porcelain"]), "", "{name}");
+                    assert_eq!(git(&p.landed.worktree, &["symbolic-ref", "HEAD"]), "refs/heads/task-branch", "{name}");
+                    assert!(!mid_operation(&p.landed.worktree), "{name}");
+                    let task = p.task().await;
+                    assert_eq!(task.pending_republish, None, "{name}");
+                    assert_eq!(task.base_commit.as_deref(), Some(onto.as_str()), "{name}");
+                    assert_eq!(
+                        task.branch_origin,
+                        Some(crate::domain::BranchOrigin::DefaultBase { branch: Some("main".to_string()) }),
+                        "{name}"
+                    );
+                }
+
+                /// Everything a refusal before any rewrite must leave alone.
+                async fn assert_unchanged(p: &Pub, name: &str) {
+                    assert_eq!(local_tip(&p.landed), p.landed.child_tip, "{name}: local branch");
+                    assert_eq!(p.remote_child().as_deref(), Some(p.landed.child_tip.as_str()), "{name}: remote branch");
+                    assert_eq!(p.republish_backup(), None, "{name}: no backup");
+                    assert!(!p.retargeted(), "{name}: {}", p.mock.read_log());
+                    assert!(!mid_operation(&p.landed.worktree), "{name}");
+                    let task = p.task().await;
+                    assert_eq!(task.pending_republish, None, "{name}");
+                    assert_eq!(task.base_commit.as_deref(), Some(p.landed.base_commit.as_str()), "{name}");
+                    assert_eq!(task.branch_origin, stacked_on_parent(), "{name}");
+                }
+
+                /// 1 and 3: a squash or a rebase landing leaves the parent's
+                /// commits on the published child; restacking replaces the
+                /// remote branch with the child's own commits, then
+                /// retargets, whether the pull request still targets the
+                /// parent or GitHub already moved it when the parent's branch
+                /// was deleted. 4: the previous tip is kept. 10: a pull
+                /// request already on `main` is not edited again.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_published_child_is_restacked_after_a_squash_or_rebase_merge() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let cases = [
+                        ("squash, parent kept", Spec::new(Landing::Squash), "task-parent"),
+                        ("squash, parent deleted, retargeted by GitHub", Spec { delete_parent: true, ..Spec::new(Landing::Squash) }, "main"),
+                        ("rebase, parent kept", Spec::new(Landing::Rebase), "task-parent"),
+                        ("rebase, parent deleted, retargeted by GitHub", Spec { delete_parent: true, ..Spec::new(Landing::Rebase) }, "main"),
+                    ];
+                    for (name, spec, pr_base) in cases {
+                        let p = published(spec, pr_base).await;
+                        let before = p.status().await.unwrap();
+                        assert!(
+                            matches!(before, Some(RepublishStatus::NeedsRestack { rewrites: true, .. })),
+                            "{name}: {before:?}"
+                        );
+
+                        let outcome = p.restack().await.unwrap_or_else(|e| panic!("{name}: {e}"));
+
+                        assert!(outcome.rewritten, "{name}");
+                        assert_eq!(outcome.previous_tip, p.landed.child_tip, "{name}");
+                        assert_eq!(outcome.new_tip, local_tip(&p.landed), "{name}");
+                        assert_restacked(&p, name).await;
+                        assert_eq!(p.retargeted(), pr_base != "main", "{name}: edit only when not already on main: {}", p.mock.read_log());
+                        assert_eq!(p.status().await.unwrap(), None, "{name}: nothing left to do");
+                        // And the whole sequence is not repeated.
+                        let again = p.restack().await;
+                        assert!(again.is_err(), "{name}: nothing to restack twice");
+                        assert_eq!(p.remote_child(), Some(local_tip(&p.landed)), "{name}");
+                    }
+                }
+
+                /// 2: with a merge commit the parent's commits are on `main`
+                /// as they are, so nothing is rewritten and nothing is
+                /// pushed; only the pull request is retargeted.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_published_child_after_a_merge_commit_is_only_retargeted() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = published(Spec::new(Landing::Merge), "task-parent").await;
+                    let before = p.status().await.unwrap();
+                    assert!(matches!(before, Some(RepublishStatus::NeedsRestack { rewrites: false, .. })), "{before:?}");
+
+                    let outcome = p.restack().await.unwrap();
+
+                    assert!(!outcome.rewritten);
+                    assert_eq!(local_tip(&p.landed), p.landed.child_tip);
+                    assert_eq!(p.remote_child().as_deref(), Some(p.landed.child_tip.as_str()));
+                    assert_eq!(p.republish_backup(), None);
+                    assert_eq!(p.pr_base(), "main");
+                    let co = &p.landed.repo.checkout;
+                    git(co, &["fetch", "-q", "origin"]);
+                    assert_eq!(subjects(co, "origin/main..origin/task-branch"), ["B1", "B2"]);
+                    assert_eq!(p.task().await.pending_republish, None);
+                    assert_eq!(p.status().await.unwrap(), None);
+                }
+
+                /// 9: the pull request is retargeted only after the rewritten
+                /// branch is on the remote.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_pull_request_is_retargeted_after_the_remote_has_the_new_tip() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    p.restack().await.unwrap();
+                    let seen = std::fs::read_to_string(&p.seen_file).unwrap();
+                    assert_eq!(seen.trim(), local_tip(&p.landed), "the remote already had the new tip at the retarget");
+                    assert_ne!(seen.trim(), p.landed.child_tip);
+                }
+
+                /// 5: a dirty checkout is refused before anything changes.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_dirty_checkout_is_refused_before_anything_changes() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    std::fs::write(p.landed.worktree.join("scratch.txt"), "wip\n").unwrap();
+
+                    let err = p.restack().await.expect_err("dirty checkout");
+                    assert!(err.contains("uncommitted"), "{err}");
+                    assert_unchanged(&p, "dirty").await;
+                    assert!(p.landed.worktree.join("scratch.txt").exists());
+                    let status = p.status().await.unwrap();
+                    assert!(matches!(status, Some(RepublishStatus::Blocked { .. })), "{status:?}");
+                }
+
+                /// 6: another task stacked on this branch would be stranded.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_child_with_a_dependent_task_is_refused() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    let project_id = p.task().await.project_id;
+                    let mut grandchild = create_test_task_full("grandchild work", project_id, TaskStatus::InProgress, 1);
+                    grandchild.branch_name = Some("task-grandchild".to_string());
+                    grandchild.branch_origin =
+                        Some(crate::domain::BranchOrigin::Stacked { parent_branch: "task-branch".to_string() });
+                    p.state.task.tasks.write().await.insert(grandchild.id, grandchild);
+
+                    let err = p.restack().await.expect_err("dependent");
+                    assert!(err.contains("task-grandchild") && err.contains("strand"), "{err}");
+                    assert_unchanged(&p, "dependent").await;
+                }
+
+                /// 7: a merge commit of the child's own would be flattened.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_child_with_its_own_merge_commit_is_refused() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let mut p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    let wt = p.landed.worktree.clone();
+                    git(&wt, &["checkout", "-q", "-b", "side", &p.landed.base_commit]);
+                    commit_file(&wt, "side.txt", "s\n", "S1");
+                    git(&wt, &["checkout", "-q", "task-branch"]);
+                    git(&wt, &["merge", "-q", "--no-ff", "side", "-m", "merge side"]);
+                    git(&wt, &["push", "-q", "origin", "task-branch"]);
+                    p.landed.child_tip = local_tip(&p.landed);
+
+                    let err = p.restack().await.expect_err("merge commit");
+                    assert!(err.contains("merge commit"), "{err}");
+                    assert_unchanged(&p, "own merge commit").await;
+                }
+
+                /// The local and remote tips must be the same, so the update
+                /// never publishes commits nobody pushed.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_child_whose_remote_differs_from_its_local_tip_is_refused() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let mut p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    commit_file(&p.landed.worktree, "later.txt", "l\n", "local only");
+                    let remote = p.remote_child();
+                    p.landed.child_tip = local_tip(&p.landed);
+
+                    let err = p.restack().await.expect_err("unpushed commit");
+                    assert!(err.contains("Push or fetch"), "{err}");
+                    assert_eq!(p.remote_child(), remote);
+                    assert_eq!(local_tip(&p.landed), p.landed.child_tip);
+                    assert_eq!(p.republish_backup(), None);
+                    assert_eq!(p.task().await.pending_republish, None);
+                }
+
+                /// A local branch that contains the child's tip would be
+                /// stranded too.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_child_another_local_branch_builds_on_is_refused() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    git(&p.landed.repo.checkout, &["branch", "experiment", "task-branch"]);
+
+                    let err = p.restack().await.expect_err("built on");
+                    assert!(err.contains("experiment") && err.contains("strand"), "{err}");
+                    assert_unchanged(&p, "built on").await;
+                }
+
+                /// 11: a replay that conflicts is rolled back before anything
+                /// reaches the remote.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_conflicting_replay_leaves_the_remote_and_the_branch_alone() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = published(Spec { main_edits_child_file: true, ..Spec::new(Landing::Squash) }, "task-parent").await;
+
+                    let err = p.restack().await.expect_err("conflict");
+                    assert!(err.contains("failed") || err.contains("conflict"), "{err}");
+                    assert_unchanged(&p, "conflict").await;
+                }
+
+                /// 11: a process that dies after the local rewrite, before
+                /// the push, leaves the remote exactly as it was.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_crash_before_the_push_leaves_the_remote_unchanged() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    let _hooks = crash_after(Stage::Recorded);
+
+                    let err = p.restack().await.expect_err("crash");
+                    assert!(err.contains("injected"), "{err}");
+
+                    assert_eq!(p.remote_child().as_deref(), Some(p.landed.child_tip.as_str()));
+                    assert!(!p.retargeted());
+                    assert_eq!(p.republish_backup().as_deref(), Some(p.landed.child_tip.as_str()));
+                    let task = p.task().await;
+                    let pending = task.pending_republish.expect("a pending restack is recorded");
+                    assert_eq!(pending.previous_tip, p.landed.child_tip);
+                    assert_eq!(pending.rewritten_tip.as_deref(), Some(local_tip(&p.landed).as_str()));
+                    let status = p.status().await.unwrap();
+                    assert!(matches!(status, Some(RepublishStatus::Interrupted { rewritten: true, .. })), "{status:?}");
+                }
+
+                /// 12: a crash at any boundary is finished by a retry that
+                /// replays the child's commits once, never forces over
+                /// anything, and ends in the same state as an uninterrupted
+                /// run.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_retry_after_a_crash_at_any_boundary_finishes_without_replaying_twice() {
+                    let _guard = PATH_LOCK.lock().await;
+                    for stage in [Stage::Planned, Stage::BackedUp, Stage::Replayed, Stage::Recorded, Stage::Pushed] {
+                        let name = format!("{stage:?}");
+                        let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                        {
+                            let _hooks = crash_after(stage);
+                            let err = p.restack().await.expect_err("crash");
+                            assert!(err.contains("injected"), "{name}: {err}");
+                        }
+                        let rewritten_before = local_tip(&p.landed);
+
+                        let outcome = p.restack().await.unwrap_or_else(|e| panic!("{name}: {e}"));
+
+                        assert!(outcome.rewritten, "{name}");
+                        if matches!(stage, Stage::Replayed | Stage::Recorded | Stage::Pushed) {
+                            assert_eq!(local_tip(&p.landed), rewritten_before, "{name}: the branch is not replayed a second time");
+                        }
+                        assert_restacked(&p, &name).await;
+                    }
+                }
+
+                /// 8: another actor updated the remote branch after the
+                /// restack was approved: the guarded push fails, nothing is
+                /// overwritten, a retry does not observe the new tip and
+                /// force it, and the user can discard the local rewrite.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_remote_that_moved_after_approval_is_never_overwritten() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    let hub = p.landed.repo._tmp.path().join("hub");
+                    let moved = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+                    {
+                        let moved = moved.clone();
+                        let hub = hub.clone();
+                        *republish::BEFORE_PUSH.lock().unwrap() = Some(Box::new(move || {
+                            git(&hub, &["checkout", "-q", "-b", "other", "origin/main"]);
+                            commit_file(&hub, "other.txt", "x\n", "someone else");
+                            git(&hub, &["push", "-q", "-f", "origin", "other:refs/heads/task-branch"]);
+                            *moved.lock().unwrap() = git(&hub, &["rev-parse", "HEAD"]);
+                        }));
+                    }
+                    let _hooks = Hooks;
+
+                    let err = p.restack().await.expect_err("lease");
+                    let other = moved.lock().unwrap().clone();
+                    assert!(!other.is_empty(), "the hook ran");
+                    assert!(err.contains("did not overwrite origin"), "{err}");
+                    assert_eq!(p.remote_child().as_deref(), Some(other.as_str()), "the other actor's work is intact");
+                    assert!(!p.retargeted());
+                    assert_eq!(p.republish_backup().as_deref(), Some(p.landed.child_tip.as_str()));
+                    let pending = p.task().await.pending_republish.expect("still pending");
+                    assert!(pending.rewritten_tip.is_some());
+
+                    // A retry does not look at the remote again and force it.
+                    let again = p.restack().await.expect_err("still refused");
+                    assert!(again.contains("origin"), "{again}");
+                    assert_eq!(p.remote_child().as_deref(), Some(other.as_str()));
+                    assert!(!p.retargeted());
+
+                    // Back to the previous tip, recorded as it was.
+                    republish::discard(&p.state, p.task_id).await.unwrap();
+                    assert_eq!(local_tip(&p.landed), p.landed.child_tip);
+                    assert_eq!(git(&p.landed.worktree, &["status", "--porcelain"]), "");
+                    assert_eq!(p.remote_child().as_deref(), Some(other.as_str()));
+                    assert_eq!(p.republish_backup(), None);
+                    let task = p.task().await;
+                    assert_eq!(task.pending_republish, None);
+                    assert_eq!(task.base_commit.as_deref(), Some(p.landed.base_commit.as_str()));
+                    assert_eq!(task.branch_origin, stacked_on_parent());
+                }
+
+                /// Once origin has the restacked branch, discarding would leave
+                /// the local branch behind it, so it is refused and nothing moves.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_restack_origin_already_has_cannot_be_discarded() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    {
+                        let _hooks = crash_after(Stage::Pushed);
+                        p.restack().await.expect_err("crash after the push");
+                    }
+                    let tip = local_tip(&p.landed);
+
+                    let err = republish::discard(&p.state, p.task_id).await.expect_err("already published");
+                    assert!(err.contains("Origin already has"), "{err}");
+                    assert_eq!(local_tip(&p.landed), tip);
+                    assert_eq!(p.remote_child().as_deref(), Some(tip.as_str()));
+                    assert!(p.task().await.pending_republish.is_some());
+                    // Finishing it instead works.
+                    p.restack().await.unwrap();
+                    assert_restacked(&p, "finished after discard was refused").await;
+                }
+
+                /// A restack at `stage`, crashed, so that the task is left with a
+                /// pending record and whatever that boundary leaves behind.
+                async fn crashed_at(spec: Spec, stage: Stage) -> Pub {
+                    let p = published(spec, "task-parent").await;
+                    let _hooks = crash_after(stage);
+                    p.restack().await.expect_err("crash");
+                    p
+                }
+
+                /// What a refusal of Resume and Discard must leave untouched.
+                async fn assert_recovery_intact(p: &Pub, tip: &str, name: &str) {
+                    assert_eq!(local_tip(&p.landed), tip, "{name}: the branch is where it was");
+                    assert_eq!(p.remote_child().as_deref(), Some(p.landed.child_tip.as_str()), "{name}: origin");
+                    assert_eq!(p.republish_backup().as_deref(), Some(p.landed.child_tip.as_str()), "{name}: backup");
+                    assert!(p.task().await.pending_republish.is_some(), "{name}: the record");
+                    assert!(!p.retargeted(), "{name}");
+                }
+
+                /// 6, 7, 8: a commit made outside SlashIt on top of the rewritten
+                /// tip is never adopted, published or discarded: Resume and
+                /// Discard both refuse, the commit, the backup and the record
+                /// stay, and a manual way back is named.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_commit_on_top_of_the_rewritten_tip_blocks_resume_and_discard() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Recorded).await;
+                    commit_file(&p.landed.worktree, "drift.txt", "d\n", "outside commit");
+                    let drifted = local_tip(&p.landed);
+
+                    let resume = p.restack().await.expect_err("drift");
+                    assert!(resume.contains("will not adopt") && resume.contains("refs/slashit/republish-backup/"), "{resume}");
+                    assert_recovery_intact(&p, &drifted, "resume").await;
+
+                    let discard = republish::discard(&p.state, p.task_id).await.expect_err("drift");
+                    assert!(discard.contains("will not move") && discard.contains("refs/slashit/republish-backup/"), "{discard}");
+                    assert_recovery_intact(&p, &drifted, "discard").await;
+                    assert!(subjects(&p.landed.repo.checkout, &format!("{}~1..{drifted}", drifted)).contains(&"outside commit".to_string()));
+                    let task = p.task().await;
+                    assert!(task.pending_republish.unwrap().rewritten_tip.is_some());
+                }
+
+                /// 9: a branch found after a crash between the replay and its
+                /// record is adopted only if it is the replay: a commit on top, or
+                /// a different change under the same count, is refused for both
+                /// Resume and Discard, with everything kept.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_branch_that_is_not_the_replay_is_not_adopted() {
+                    let _guard = PATH_LOCK.lock().await;
+                    for case in ["commit on top", "amended change"] {
+                        let p = crashed_at(Spec::new(Landing::Squash), Stage::Replayed).await;
+                        let wt = &p.landed.worktree;
+                        if case == "commit on top" {
+                            commit_file(wt, "drift.txt", "d\n", "outside commit");
+                        } else {
+                            std::fs::write(wt.join("b.txt"), "something else\n").unwrap();
+                            git(wt, &["commit", "-q", "-a", "--amend", "-m", "B2"]);
+                        }
+                        let drifted = local_tip(&p.landed);
+
+                        let resume = p.restack().await.expect_err(case);
+                        assert!(resume.contains("not the approved branch"), "{case}: {resume}");
+                        assert_recovery_intact(&p, &drifted, case).await;
+                        let discard = republish::discard(&p.state, p.task_id).await.expect_err(case);
+                        assert!(discard.contains("not the restack's result"), "{case}: {discard}");
+                        assert_recovery_intact(&p, &drifted, case).await;
+                        let task = p.task().await;
+                        assert_eq!(task.pending_republish.unwrap().rewritten_tip, None, "{case}: still unrecorded");
+                        assert_eq!(task.base_commit.as_deref(), Some(p.landed.base_commit.as_str()), "{case}");
+                    }
+                }
+
+                /// A restack that crashed before its backup existed, then found
+                /// the branch moved from outside, must not send the user to a
+                /// backup ref that was never created: Resume and Discard name the
+                /// approved commit itself, and change nothing.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_refusal_before_any_backup_does_not_name_a_backup() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Planned).await;
+                    assert_eq!(p.republish_backup(), None, "the crash came before the backup");
+                    commit_file(&p.landed.worktree, "drift.txt", "d\n", "outside commit");
+                    let drifted = local_tip(&p.landed);
+                    let record = p.task().await.pending_republish;
+
+                    let resume = p.restack().await.expect_err("drift");
+                    assert!(resume.contains("not the approved branch"), "{resume}");
+                    assert!(!resume.contains("republish-backup"), "{resume}");
+                    assert!(resume.contains(&p.landed.child_tip), "{resume}");
+                    let discard = republish::discard(&p.state, p.task_id).await.expect_err("drift");
+                    assert!(discard.contains("not the restack's result"), "{discard}");
+                    assert!(!discard.contains("republish-backup"), "{discard}");
+                    assert!(discard.contains(&p.landed.child_tip), "{discard}");
+
+                    assert_eq!(local_tip(&p.landed), drifted);
+                    assert_eq!(p.republish_backup(), None, "no backup was created by a refusal");
+                    assert_eq!(p.remote_child().as_deref(), Some(p.landed.child_tip.as_str()));
+                    assert_eq!(p.task().await.pending_republish, record);
+                    assert!(!p.retargeted());
+                }
+
+                /// When the backup does exist at the approved tip, the refusal may
+                /// say so.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_refusal_with_a_backup_at_the_approved_tip_names_it() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Replayed).await;
+                    commit_file(&p.landed.worktree, "drift.txt", "d\n", "outside commit");
+                    let drifted = local_tip(&p.landed);
+
+                    let resume = p.restack().await.expect_err("drift");
+                    assert!(resume.contains("kept in refs/slashit/republish-backup/"), "{resume}");
+                    let discard = republish::discard(&p.state, p.task_id).await.expect_err("drift");
+                    assert!(discard.contains("kept in refs/slashit/republish-backup/"), "{discard}");
+                    assert_recovery_intact(&p, &drifted, "backup present").await;
+                }
+
+                /// The replay SlashIt made, found after a crash between the replay
+                /// and its record, is adopted: a rebase changes the commit IDs and
+                /// the committer and nothing else, which is what is not compared.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn an_exact_replay_found_after_a_crash_is_adopted() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Replayed).await;
+                    assert!(p.task().await.pending_republish.unwrap().rewritten_tip.is_none());
+                    let replayed = local_tip(&p.landed);
+                    assert_ne!(replayed, p.landed.child_tip);
+
+                    p.restack().await.expect("the exact replay is adopted and published");
+                    assert_restacked(&p, "adopted").await;
+                    assert_eq!(local_tip(&p.landed), replayed, "adopted, not replayed again");
+                }
+
+                /// The same patches are not enough: a commit someone reworded or
+                /// re-attributed after the replay is not the replay SlashIt was
+                /// authorized to make. Resume and Discard both refuse, and the
+                /// record, the backup, the branch and origin stay as they were.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_replay_with_changed_metadata_is_not_adopted() {
+                    let _guard = PATH_LOCK.lock().await;
+                    for case in ["reworded", "re-attributed"] {
+                        let p = crashed_at(Spec::new(Landing::Squash), Stage::Replayed).await;
+                        let wt = &p.landed.worktree;
+                        let before_patch = git(wt, &["show", "--format=", "HEAD"]);
+                        if case == "reworded" {
+                            git(wt, &["commit", "-q", "--amend", "-m", "a different message"]);
+                        } else {
+                            git(wt, &["commit", "-q", "--amend", "--no-edit", "--author", "Someone Else <else@example.com>"]);
+                        }
+                        assert_eq!(git(wt, &["show", "--format=", "HEAD"]), before_patch, "{case}: same patch");
+                        let drifted = local_tip(&p.landed);
+
+                        let resume = p.restack().await.expect_err(case);
+                        assert!(resume.contains("not the approved branch") && resume.contains("message or author"), "{case}: {resume}");
+                        assert_recovery_intact(&p, &drifted, case).await;
+                        let discard = republish::discard(&p.state, p.task_id).await.expect_err(case);
+                        assert!(discard.contains("not the restack's result"), "{case}: {discard}");
+                        assert_recovery_intact(&p, &drifted, case).await;
+                        assert_eq!(p.task().await.pending_republish.unwrap().rewritten_tip, None, "{case}");
+                    }
+                }
+
+                /// A pull request that merged while the restack is unfinished
+                /// cannot be turned into a cleanup of the checkout, however the
+                /// terminalization is reached: the record, the backup, the branch
+                /// and the checkout all survive.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_merged_pull_request_does_not_clean_up_an_unfinished_restack() {
+                    let _guard = PATH_LOCK.lock().await;
+                    for stage in [Stage::BackedUp, Stage::Recorded, Stage::Pushed] {
+                        let p = crashed_at(Spec::new(Landing::Squash), stage).await;
+                        let tip = local_tip(&p.landed);
+                        for origin in [crate::lifecycle::Origin::Automatic, crate::lifecycle::Origin::User] {
+                            let refusal = crate::lifecycle::terminalize(
+                                crate::commands::task::terminalize_ctx(&p.state),
+                                p.task_id,
+                                origin,
+                                crate::lifecycle::TerminalizeRequest::new(TaskStatus::Done),
+                            )
+                            .await
+                            .expect_err("the restack owns the checkout");
+                            assert!(matches!(refusal, crate::lifecycle::TerminalizeRefusal::RepublishPending));
+                        }
+                        assert!(p.landed.worktree.exists(), "{stage:?}: the checkout");
+                        assert_eq!(local_tip(&p.landed), tip, "{stage:?}: the branch");
+                        assert_eq!(p.republish_backup().as_deref(), Some(p.landed.child_tip.as_str()), "{stage:?}: backup");
+                        let task = p.task().await;
+                        assert!(task.pending_republish.is_some(), "{stage:?}: the record");
+                        assert_ne!(task.status, TaskStatus::Done);
+                    }
+                }
+
+                /// 10: without the task's worktree, Resume still finishes a
+                /// recorded restack (it only needs the repository), refuses one
+                /// that was not rewritten yet, and Discard works only where the
+                /// branch needs no moving back.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_task_without_a_worktree_recovers_only_where_nothing_has_to_be_checked_out() {
+                    let _guard = PATH_LOCK.lock().await;
+                    // Recorded: Resume finishes it.
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Recorded).await;
+                    p.state.task.tasks.write().await.get_mut(&p.task_id).unwrap().worktree_path = None;
+                    p.restack().await.expect("a recorded restack needs no worktree to finish");
+                    assert_eq!(p.remote_child(), Some(local_tip(&p.landed)));
+                    assert_eq!(p.pr_base(), "main");
+
+                    // Recorded, before the push: Discard needs a worktree to move the branch back.
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Recorded).await;
+                    p.state.task.tasks.write().await.get_mut(&p.task_id).unwrap().worktree_path = None;
+                    let tip = local_tip(&p.landed);
+                    let err = republish::discard(&p.state, p.task_id).await.expect_err("no worktree");
+                    assert!(err.contains("no worktree"), "{err}");
+                    assert_recovery_intact(&p, &tip, "discard without a worktree").await;
+
+                    // Backed up, not rewritten: Resume cannot replay, Discard needs no checkout.
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::BackedUp).await;
+                    p.state.task.tasks.write().await.get_mut(&p.task_id).unwrap().worktree_path = None;
+                    let err = p.restack().await.expect_err("no worktree");
+                    assert!(err.contains("no worktree"), "{err}");
+                    assert_recovery_intact(&p, &p.landed.child_tip, "resume without a worktree").await;
+                    republish::discard(&p.state, p.task_id).await.unwrap();
+                    assert_unchanged(&p, "discarded without a worktree").await;
+                }
+
+                /// 1-3: while a restack is pending, the pull request flows that
+                /// could advance the branch are refused by the backend, and a task
+                /// without one is not touched. Resume and Discard still run.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_pull_request_flows_are_refused_while_a_restack_is_pending() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Recorded).await;
+                    let id = p.task_id.to_string();
+                    let tip = local_tip(&p.landed);
+
+                    let create = create_pr_inner(&p.state, &id).await.expect_err("create");
+                    assert!(create.contains("unfinished"), "{create}");
+                    let helper = begin_pr_helper(&p.state, p.task_id).await.err().expect("helper");
+                    assert!(helper.contains("unfinished"), "{helper}");
+                    let reserve = reserve_task_for_pr_side_effect(&p.state, p.task_id).await.err().expect("reserve");
+                    assert!(reserve.contains("unfinished"), "{reserve}");
+                    assert!(!p.mock.read_log().contains("\npr\ncreate\n"), "{}", p.mock.read_log());
+                    assert_eq!(local_tip(&p.landed), tip);
+                    assert_eq!(p.remote_child().as_deref(), Some(p.landed.child_tip.as_str()));
+
+                    // Another task is not affected.
+                    let other = seed_task(&p.state, p.landed.repo.checkout.to_str().unwrap(), Some("task-other"), TaskStatus::Done).await;
+                    assert!(begin_pr_helper(&p.state, other).await.is_ok());
+                    assert!(reserve_task_for_pr_side_effect(&p.state, other).await.is_ok());
+
+                    // Reading, Resume and Discard stay available.
+                    assert!(matches!(p.status().await.unwrap(), Some(RepublishStatus::Interrupted { .. })));
+                    p.restack().await.unwrap();
+                    assert_restacked(&p, "resumed after the guards refused").await;
+                    assert!(begin_pr_helper(&p.state, p.task_id).await.is_ok(), "no longer pending");
+                }
+
+                /// A rebase the crash left stopped keeps the branch ref where it
+                /// was, so Discard must look at the worktree and not only at the
+                /// tip: it refuses, and the record and backup stay.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_stopped_rebase_blocks_discard_and_resume() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec { main_edits_child_file: true, ..Spec::new(Landing::Squash) }, Stage::BackedUp).await;
+                    let wt = &p.landed.worktree;
+                    git(wt, &["fetch", "-q", "origin"]);
+                    let (ok, out) = git_status(wt, &["rebase", "--merge", "--onto", "origin/main", &p.landed.base_commit, "task-branch"]);
+                    assert!(!ok && mid_operation(wt), "setup: a rebase stopped on a conflict: {out}");
+
+                    let discard = republish::discard(&p.state, p.task_id).await.expect_err("mid rebase");
+                    assert!(discard.contains("middle of a rebase"), "{discard}");
+                    let resume = p.restack().await.expect_err("mid rebase");
+                    assert!(resume.contains("middle of a rebase"), "{resume}");
+                    assert!(mid_operation(wt), "SlashIt never touches a rebase it did not just start");
+                    assert_eq!(p.republish_backup().as_deref(), Some(p.landed.child_tip.as_str()));
+                    assert!(p.task().await.pending_republish.is_some());
+                    assert_eq!(p.remote_child().as_deref(), Some(p.landed.child_tip.as_str()));
+                }
+
+                /// If the pull request was merged or closed while the restack
+                /// was pending, nothing is pushed over its branch.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_pull_request_that_is_no_longer_open_is_not_republished() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Recorded).await;
+                    std::fs::write(p.landed.repo._tmp.path().join("pr-state"), "MERGED").unwrap();
+                    let tip = local_tip(&p.landed);
+
+                    let err = p.restack().await.expect_err("merged meanwhile");
+                    assert!(err.contains("not open") && err.contains("MERGED"), "{err}");
+                    assert_recovery_intact(&p, &tip, "merged meanwhile").await;
+                }
+
+                /// The status says Discard is blocked once origin has the branch.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_status_says_when_discard_is_blocked() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Pushed).await;
+                    let status = p.status().await.unwrap();
+                    assert!(
+                        matches!(&status, Some(RepublishStatus::Interrupted { rewritten: true, discard_blocked: Some(_), .. })),
+                        "{status:?}"
+                    );
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Recorded).await;
+                    let status = p.status().await.unwrap();
+                    assert!(
+                        matches!(&status, Some(RepublishStatus::Interrupted { rewritten: true, discard_blocked: None, .. })),
+                        "{status:?}"
+                    );
+                }
+
+                /// A remote that cannot be asked is unknown, not "Discard allowed"
+                /// (and Discard itself refuses, so the offer would be a lie).
+                #[tokio::test(flavor = "multi_thread")]
+                async fn the_status_does_not_offer_discard_when_origin_cannot_be_asked() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = crashed_at(Spec::new(Landing::Squash), Stage::Recorded).await;
+                    git(&p.landed.repo.checkout, &["remote", "set-url", "origin", "/nonexistent/remote"]);
+                    let status = p.status().await.unwrap();
+                    let Some(RepublishStatus::Interrupted { discard_blocked: Some(reason), .. }) = &status else {
+                        panic!("a failed remote query must block Discard: {status:?}");
+                    };
+                    assert!(reason.contains("could not be checked"), "{reason}");
+                    let tip = local_tip(&p.landed);
+                    republish::discard(&p.state, p.task_id).await.expect_err("fails closed");
+                    assert!(p.task().await.pending_republish.is_some());
+                    assert_eq!(local_tip(&p.landed), tip);
+                }
+
+                /// The explanation the merged-PR poll leaves on a task whose
+                /// cleanup a pending restack refused goes with the restack, on
+                /// a successful Resume and on a successful Discard; any other
+                /// error on the task stays.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn resolving_the_restack_clears_only_its_own_merge_explanation() {
+                    let _guard = PATH_LOCK.lock().await;
+                    for resume in [true, false] {
+                        for (own, message) in [
+                            (true, crate::lifecycle::merged_while_republish_pending_message()),
+                            (false, "the agent crashed".to_string()),
+                        ] {
+                            let p = crashed_at(Spec::new(Landing::Squash), Stage::Recorded).await;
+                            p.state.task.tasks.write().await.get_mut(&p.task_id).unwrap().error_message =
+                                Some(message.clone());
+                            if resume {
+                                p.restack().await.expect("resume");
+                            } else {
+                                republish::discard(&p.state, p.task_id).await.expect("discard");
+                            }
+                            let task = p.task().await;
+                            assert!(task.pending_republish.is_none());
+                            let expected = if own { None } else { Some(message) };
+                            assert_eq!(task.error_message, expected, "resume={resume} own={own}");
+                        }
+                    }
+                }
+
+                /// A published branch in a jj-colocated repository: the rewrite is
+                /// still a Git ref update, the guarded push sends it, and jj's
+                /// bookmark follows it without a conflict. Skipped where no `jj`
+                /// is installed.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_published_restack_in_a_jj_colocated_repository_is_what_jj_sees_and_pushes() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let Some(jj_bin) = installed_jj() else {
+                        eprintln!("skipped: no jj is installed");
+                        return;
+                    };
+                    let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    let jj_at = |args: &[&str]| {
+                        let output = StdCommand::new(&jj_bin)
+                            .args(args)
+                            .current_dir(&p.landed.repo.checkout)
+                            .env("JJ_USER", "Test")
+                            .env("JJ_EMAIL", "test@example.com")
+                            .output()
+                            .expect("run jj");
+                        assert!(output.status.success(), "jj {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+                        String::from_utf8_lossy(&output.stdout).trim().to_string()
+                    };
+                    jj_at(&["git", "init", "--colocate"]);
+
+                    p.restack().await.expect("the published restack in a colocated repository");
+
+                    assert_restacked(&p, "colocated").await;
+                    let tip = local_tip(&p.landed);
+                    assert_ne!(tip, p.landed.child_tip);
+                    assert_eq!(p.remote_child().as_deref(), Some(tip.as_str()));
+                    assert_eq!(
+                        jj_at(&["log", "--no-graph", "-r", "task-branch", "-T", "commit_id"]),
+                        tip,
+                        "jj's bookmark follows the restacked branch"
+                    );
+                    assert_eq!(local_tip(&p.landed), tip, "a jj command afterwards leaves the branch where it is");
+                    assert!(!jj_at(&["bookmark", "list", "task-branch"]).contains("conflict"));
+                }
+
+                /// A restack that is only planned can be discarded too.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_planned_restack_can_be_discarded() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = published(Spec::new(Landing::Squash), "task-parent").await;
+                    {
+                        let _hooks = crash_after(Stage::BackedUp);
+                        p.restack().await.expect_err("crash");
+                    }
+                    republish::discard(&p.state, p.task_id).await.unwrap();
+                    assert_unchanged(&p, "discarded").await;
+                }
+
+                /// Nothing is offered while the parent is still open.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn nothing_is_offered_while_the_parent_is_open() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let landed = land(Spec::new(Landing::Squash));
+                    git(&landed.repo.checkout, &["push", "-q", "origin", "task-branch"]);
+                    let _mock = MockGh::setup_answering(
+                        CHILD_PR_URL,
+                        r#"{"state":"OPEN"}"#,
+                        &[any_pr_list_of("task-parent", r#"[{"number":7,"state":"OPEN","baseRefName":"main","isCrossRepository":false}]"#)],
+                    );
+                    let (state, _tmp) = build_test_state().await;
+                    let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                    state.task.tasks.write().await.get_mut(&task_id).unwrap().pr_url = Some(CHILD_PR_URL.to_string());
+
+                    assert_eq!(republish::status(&state, task_id).await.unwrap(), None);
+                    assert!(republish::restack(&state, task_id).await.is_err());
+                    assert_eq!(local_tip(&landed), landed.child_tip);
+                }
+            }
+
         }
 
         // ──────────────────────────────────────────────

@@ -577,6 +577,108 @@ pub async fn undo_stopped_rebase(dir: &Path, branch: &str, old_tip: &str, messag
     verify_restored(dir, branch, old_tip).await
 }
 
+/// Whether `new_tip` is exactly `fork_point..old_tip` replayed onto `onto`:
+/// it contains `onto`, holds as many commits on top of it as the task had,
+/// and each makes the same change as its original, compared as `git patch-id
+/// --stable` over diffs with no context lines, so that a change `onto` made
+/// next to a task's line does not count as a difference while a dropped or
+/// altered change does.
+///
+/// A property of the commits alone, so it holds the same in the process that
+/// ran the rebase and in a later one that finds its result.
+pub async fn replay_matches(
+    dir: &Path,
+    fork_point: &str,
+    old_tip: &str,
+    onto: &str,
+    new_tip: &str,
+) -> Result<(), String> {
+    if !is_ancestor(dir, onto, new_tip).await? {
+        return Err(format!("{new_tip} does not contain {onto}"));
+    }
+    let before = commits_between(dir, fork_point, old_tip).await?;
+    let after = commits_between(dir, onto, new_tip).await?;
+    if before.len() != after.len() {
+        return Err(format!(
+            "it holds {} commits on top of {onto} where the task had {}",
+            after.len(),
+            before.len()
+        ));
+    }
+    for (original, replayed) in before.iter().zip(&after) {
+        if patch_id(dir, original).await? != patch_id(dir, replayed).await? {
+            return Err(format!("{replayed} does not make the same change as {original}"));
+        }
+    }
+    Ok(())
+}
+
+/// [`replay_matches`], and in addition every replayed commit carries the same
+/// full message and the same author name and email as its original.
+///
+/// For finding a replay after a crash, where the question is not only "does
+/// this make the same changes" but "is this the replay SlashIt was authorized
+/// to make": a rebase rewrites parents, commit IDs and committer, and nothing
+/// else, so a commit that differs in message or author was changed by someone
+/// else. The unpublished restack's own verification stays content-only.
+pub async fn replay_matches_exactly(
+    dir: &Path,
+    fork_point: &str,
+    old_tip: &str,
+    onto: &str,
+    new_tip: &str,
+) -> Result<(), String> {
+    replay_matches(dir, fork_point, old_tip, onto, new_tip).await?;
+    let before = commits_between(dir, fork_point, old_tip).await?;
+    let after = commits_between(dir, onto, new_tip).await?;
+    for (original, replayed) in before.iter().zip(&after) {
+        if authored_message(dir, original).await? != authored_message(dir, replayed).await? {
+            return Err(format!(
+                "{replayed} has a different message or author than {original}, which a replay does not change"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A commit's author name, author email and full raw message, untrimmed.
+async fn authored_message(dir: &Path, commit: &str) -> Result<(String, String, String), String> {
+    let mut parts = git_entries(dir, &["show", "-s", "-z", "--format=%an%x00%ae%x00%B", commit])
+        .await?
+        .into_iter();
+    let name = parts.next().ok_or_else(|| format!("could not read the author of {commit}"))?;
+    let email = parts.next().ok_or_else(|| format!("could not read the author of {commit}"))?;
+    Ok((name, email, parts.next().unwrap_or_default()))
+}
+
+/// The backup ref that holds a published task branch's tip from before it was
+/// restacked (see `commands::pr::republish`). Its own name, not
+/// [`backup_ref`]'s: an unpublished restack's recovery deletes or refuses the
+/// refs under that prefix, and must never take this one for its own.
+pub fn republish_backup_ref(task_id: Uuid) -> String {
+    format!("refs/slashit/republish-backup/{task_id}")
+}
+
+/// Move `refs/heads/<branch>` back from `from` to `to`, and the index and
+/// files of the worktree that has it checked out along with it, but only while
+/// the branch is still exactly at `from`.
+///
+/// The ref is moved with a compare-and-swap, and the files with `git read-tree
+/// -m -u`, which refuses rather than overwrite a local change. The caller has
+/// checked that the worktree is on the branch at `from`, clean and in the
+/// middle of nothing. Verified afterwards by [`verify_restored`].
+pub async fn move_branch_back(dir: &Path, branch: &str, from: &str, to: &str) -> Result<(), String> {
+    let branch_ref = format!("refs/heads/{branch}");
+    git(dir, &["update-ref", &branch_ref, to, from])
+        .await
+        .map_err(|e| format!("could not move {branch_ref} from {from} back to {to}: {e}"))?;
+    git(dir, &["update-index", "-q", "--refresh"]).await?;
+    git(dir, &["read-tree", "-m", "-u", "--no-recurse-submodules", from, to])
+        .await
+        .map_err(|e| format!("{branch_ref} is back at {to}, but the worktree could not follow: {e}"))?;
+    verify_restored(dir, branch, to).await
+}
+
 /// Create the backup ref at `tip`, failing if it already exists.
 pub async fn create_backup(dir: &Path, backup: &str, tip: &str) -> Result<(), String> {
     git(dir, &["update-ref", backup, tip, ""])
@@ -829,24 +931,7 @@ impl<'a> Restack<'a> {
         if let Some(operation) = state.in_progress {
             return Err(format!("the worktree is in the middle of a {operation}"));
         }
-        if !is_ancestor(self.worktree, self.onto, &new_tip).await? {
-            return Err(format!("{new_tip} does not contain {}", self.onto));
-        }
-        let before = commits_between(self.worktree, self.fork_point, self.old_tip).await?;
-        let after = commits_between(self.worktree, self.onto, &new_tip).await?;
-        if before.len() != after.len() {
-            return Err(format!(
-                "it holds {} commits on top of {} where the task had {}",
-                after.len(),
-                self.onto,
-                before.len()
-            ));
-        }
-        for (original, replayed) in before.iter().zip(&after) {
-            if patch_id(self.worktree, original).await? != patch_id(self.worktree, replayed).await? {
-                return Err(format!("{replayed} does not make the same change as {original}"));
-            }
-        }
+        replay_matches(self.worktree, self.fork_point, self.old_tip, self.onto, &new_tip).await?;
         Ok(new_tip)
     }
 

@@ -228,6 +228,23 @@ impl<'a> TerminalizeRequest<'a> {
     }
 }
 
+const REPUBLISH_PENDING_REASON: &str = "a restack of this task's published branch is unfinished, so its \
+     checkout and branch were kept; resume or discard the restack first";
+
+/// What the merged-pull-request poll puts on a task whose terminalization a
+/// pending restack refused.
+pub fn merged_while_republish_pending_message() -> String {
+    format!("The pull request is merged, but the task was not finished: {REPUBLISH_PENDING_REASON}")
+}
+
+/// Drop [`merged_while_republish_pending_message`] from `task`, once the
+/// restack it names is resolved. Any other error is left alone.
+pub fn clear_merged_while_republish_pending(task: &mut Task) {
+    if task.error_message.as_deref() == Some(merged_while_republish_pending_message().as_str()) {
+        task.error_message = None;
+    }
+}
+
 /// Why a terminalization did not happen.
 ///
 /// Every variant leaves the task exactly as it was found, including its
@@ -252,6 +269,11 @@ pub enum TerminalizeRefusal {
     CleanupRefused { worktree_path: String, reason: String },
     /// The removal happened but the board could not be written.
     NotRecorded(String),
+    /// An unfinished restack of the task's published branch owns its checkout
+    /// and branch. Finishing the task would delete the evidence that resuming
+    /// or discarding that restack depends on, and nothing here can tell
+    /// whether the restack succeeded.
+    RepublishPending,
 }
 
 impl std::fmt::Display for TerminalizeRefusal {
@@ -277,6 +299,7 @@ impl std::fmt::Display for TerminalizeRefusal {
                 "the worktree at {worktree_path} was kept: {reason}"
             ),
             Self::NotRecorded(m) => write!(f, "{m}"),
+            Self::RepublishPending => f.write_str(REPUBLISH_PENDING_REASON),
         }
     }
 }
@@ -673,6 +696,14 @@ pub async fn terminalize_leased(
     let (project_id, worktree_path, branch_name, quarantined) = {
         let tasks = ctx.tasks.read().await;
         let task = tasks.get(&task_id).ok_or(TerminalizeRefusal::TaskNotFound)?;
+        // Before anything else, whatever the origin: a merged pull request, a
+        // card dragged to Done, a delete and an explicit cleanup all end here,
+        // and every one of them would remove the checkout and branch that the
+        // pending restack's recovery needs. Nothing is written, so the record
+        // and its backup are exactly as found.
+        if task.republish_pending_refusal().is_some() {
+            return Err(TerminalizeRefusal::RepublishPending);
+        }
         (
             task.project_id,
             task.worktree_path.clone(),
@@ -1412,6 +1443,78 @@ mod tests {
         let after = world.task(id).await;
         assert_eq!(after.status, TaskStatus::InProgress);
         assert!(!after.cleanup_in_flight);
+    }
+
+    // -----------------------------------------------------------------------
+    // An unfinished restack of a published branch
+    // -----------------------------------------------------------------------
+
+    fn pending_restack() -> crate::domain::PendingRepublish {
+        crate::domain::PendingRepublish {
+            parent_branch: "task-parent".to_string(),
+            parent_pr: 7,
+            pr_number: 21,
+            default_branch: "main".to_string(),
+            fork_point: "a".repeat(40),
+            previous_tip: "b".repeat(40),
+            onto: "c".repeat(40),
+            rewritten_tip: Some("d".repeat(40)),
+        }
+    }
+
+    /// Every way into the destructive cleanup -- a merged pull request, a card
+    /// moved to Done, an explicit cleanup, a delete -- is refused for a task
+    /// whose restack is unfinished, and nothing is touched: the record, the
+    /// checkout, the branch and the board are exactly as found.
+    #[tokio::test]
+    async fn a_task_with_an_unfinished_restack_is_never_terminalized_or_cleaned_up() {
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        let (id, _) = seed(&world, TaskStatus::PrCreated, Some(&wt)).await;
+        let pending = pending_restack();
+        {
+            let mut tasks = world.tasks.write().await;
+            tasks.get_mut(&id).unwrap().pending_republish = Some(pending.clone());
+            let board: Vec<Task> = tasks.values().cloned().collect();
+            world.storage.save_project_tasks(world.project_id, &board).expect("persist the record");
+        }
+        let before = world.task(id).await;
+
+        for origin in [Origin::Automatic, Origin::User] {
+            let refusal = terminalize(world.ctx(), id, origin, TerminalizeRequest::new(TaskStatus::Done))
+                .await
+                .expect_err("the restack's recovery needs this checkout and branch");
+            assert!(matches!(refusal, TerminalizeRefusal::RepublishPending), "{origin:?}: {refusal}");
+        }
+        let refusal = delete(world.ctx(), id).await.expect_err("a delete removes the checkout too");
+        assert!(matches!(refusal, TerminalizeRefusal::RepublishPending));
+
+        assert!(std::path::Path::new(&wt).exists(), "the checkout survives");
+        let after = world.task(id).await;
+        assert_eq!(after.pending_republish, Some(pending));
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.worktree_path, before.worktree_path);
+        assert_eq!(after.branch_name, before.branch_name);
+        assert!(!after.cleanup_in_flight, "no cleanup was announced");
+        assert_eq!(world.persisted(id).pending_republish, after.pending_republish);
+    }
+
+    /// The guard is the task's own: a task with no restack pending, on the same
+    /// board, terminalizes and is cleaned up as before.
+    #[tokio::test]
+    async fn an_ordinary_task_is_still_terminalized_and_cleaned_up() {
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        let (id, _) = seed(&world, TaskStatus::PrCreated, Some(&wt)).await;
+
+        terminalize(world.ctx(), id, Origin::Automatic, TerminalizeRequest::new(TaskStatus::Done))
+            .await
+            .expect("nothing is pending");
+
+        assert!(!std::path::Path::new(&wt).exists());
+        let after = world.task(id).await;
+        assert_eq!(after.status, TaskStatus::Done);
+        assert_eq!(after.worktree_path, None);
     }
 
     // -----------------------------------------------------------------------

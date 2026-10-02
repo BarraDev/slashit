@@ -863,3 +863,34 @@ mod tests {
         assert_eq!(review, HumanReviewRecord::default());
     }
 }
+
+/// What the pull request section offers for a stacked task whose branch is
+/// published, as the backend's `commands::pr::RepublishStatus` serializes it.
+/// Mirrored by hand: both sides test against the same JSON literal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepublishStatus {
+    /// The parent landed and the task can be moved onto it. `rewrites` is
+    /// false when only the pull request's base has to change.
+    NeedsRestack {
+        parent_branch: String,
+        parent_pr: u64,
+        default_branch: String,
+        pr_number: u64,
+        rewrites: bool,
+    },
+    /// The parent landed, but a restack is not possible as things are.
+    Blocked { reason: String },
+    /// A restack was started and did not finish. `discard_blocked` says why
+    /// Discard would be refused, when it already is known to be.
+    Interrupted { rewritten: bool, detail: String, discard_blocked: Option<String> },
+}
+
+/// What a finished restack did, as `commands::pr::RepublishOutcome` serializes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepublishOutcome {
+    pub rewritten: bool,
+    pub base: String,
+    pub previous_tip: String,
+    pub new_tip: String,
+}

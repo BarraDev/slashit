@@ -475,6 +475,7 @@ pub fn create_test_task(title: &str) -> Task {
         branch_name: None,
         base_commit: None,
         branch_origin: None,
+        pending_republish: None,
         cleanup_in_flight: false,
         position: 0,
         pr_review_plan: None,

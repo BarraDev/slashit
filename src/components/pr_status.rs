@@ -570,6 +570,9 @@ pub fn PullRequestSection(
     let board = PrStatusBoard::get();
     let pr = Memo::new(move |_| task.with(|t| t.as_ref().and_then(linked_pr)));
     let refreshing = RwSignal::new(false);
+    // Bumped after a refresh, so the restack notice looks at the parent again.
+    let restack_reload = RwSignal::new(0u32);
+    let branch = Memo::new(move |_| task.with(|t| t.as_ref().and_then(|t| t.branch_name.clone())));
 
     let on_refresh = move |_| {
         if refreshing.get_untracked() {
@@ -581,6 +584,7 @@ pub fn PullRequestSection(
                 toast::error(format!("Could not refresh the pull request: {e}"));
             }
             refresh_tasks.try_run(());
+            restack_reload.try_update(|n| *n += 1);
             refreshing.try_set(false);
         });
     };
@@ -626,6 +630,15 @@ pub fn PullRequestSection(
                     </div>
 
                     <Show when=move || !terminal()>
+                        <crate::components::restack_published::RestackNotice
+                            task_id=task_id
+                            branch=branch
+                            reload=restack_reload
+                            refresh=Callback::new(move |_| {
+                                refresh_tasks.try_run(());
+                                restack_reload.try_update(|n| *n += 1);
+                            })
+                        />
                         {move || shown.get().map(|s| (s.entry, s.stale)).map(|(entry, stale)| match entry.status.clone() {
                             Some(status) => view! {
                                 <StatusRows status=status stale=stale />
