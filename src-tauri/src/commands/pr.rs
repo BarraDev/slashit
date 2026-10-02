@@ -896,21 +896,12 @@ fn carry_forward_reanalysis_lifecycle(
         // delivered (see #79).
         if prev_item.fix_uncommitted { item.fix_uncommitted = true; }
 
-        // GitHub's `updated_at` has whole-second precision; `applied_at`
-        // (from `chrono::Utc::now()`) almost never does. Comparing them
-        // as-is could read a same-second edit right after the apply as
-        // "not edited" purely from sub-second truncation. Both are rounded
-        // down to the second and compared non-strictly, so a same-second
-        // timestamp is treated as a possible edit rather than assumed safe —
-        // reprocessing an unchanged comment is cheap; silently skipping an
-        // edited one is the failure mode this check exists to prevent.
+        // The boundary rule lives in `PrReviewComment::edited_since`, shared
+        // with `backfill_lifecycle_from_last_apply`.
         let edited_since_last_apply = applied_at.is_some_and(|applied_at| {
-            use chrono::SubsecRound;
-            let applied_at = applied_at.trunc_subsecs(0);
             comments.iter()
                 .find(|c| c.id == Some(cid))
-                .and_then(|c| c.updated_at)
-                .is_some_and(|updated_at| updated_at.trunc_subsecs(0) >= applied_at)
+                .is_some_and(|c| c.edited_since(applied_at))
         });
         if edited_since_last_apply {
             continue;
@@ -6119,9 +6110,10 @@ mod tests {
     }
 
     /// A fix whose push failed stays undelivered when its comment is edited
-    /// before the next apply: the backfill from that apply restores
-    /// `fix_done` but claims no reply, so neither Apply nor Sync can post
-    /// "fixed" before the fix is pushed. See #79.
+    /// before the next apply: the checkout fact survives, and the backfill
+    /// restores neither `fix_done` nor a reply for the edited comment, so
+    /// neither Apply nor Sync can post "fixed" before the fix is pushed, and
+    /// the next Apply processes the comment afresh. See #79 and #97.
     #[test]
     fn an_edited_comment_keeps_its_undelivered_fix_undelivered() {
         let applied_at = "2024-06-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
@@ -6167,7 +6159,8 @@ mod tests {
             };
             plan.backfill_lifecycle_from_last_apply();
             let item = &plan.items[0];
-            assert!(item.fix_done && item.fix_uncommitted, "auto_reply={auto_reply}: {item:?}");
+            assert!(item.fix_uncommitted, "auto_reply={auto_reply}: {item:?}");
+            assert!(!item.fix_done, "auto_reply={auto_reply}: the edit invalidates the old fix: {item:?}");
             assert!(!item.reply_posted, "auto_reply={auto_reply}: no reply was ever posted");
         }
     }

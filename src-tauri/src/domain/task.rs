@@ -458,7 +458,11 @@ impl PrReviewPlan {
     /// in a prior run.
     ///
     /// Only flips flags from `false` to `true` — never undoes user-visible
-    /// state. Dry-run results are ignored on purpose.
+    /// state. Dry-run results are ignored on purpose. An item whose comment
+    /// was edited since the apply ([`PrReviewComment::edited_since`]) gets
+    /// neither flag back: the apply fixed and answered the old wording, so
+    /// the next Apply processes the comment afresh. `fix_uncommitted` is not
+    /// touched; it describes the checkout, not the comment.
     pub fn backfill_lifecycle_from_last_apply(&mut self) {
         let Some(last) = self.last_apply.clone() else { return; };
         if last.dry_run { return; }
@@ -473,7 +477,10 @@ impl PrReviewPlan {
             .collect();
         for item in self.items.iter_mut() {
             let Some(cid) = item.comment_id else { continue; };
-            if last.fixed_ids.contains(&cid) {
+            let edited = self.comments.iter()
+                .find(|c| c.id == Some(cid))
+                .is_some_and(|c| c.edited_since(last.applied_at));
+            if last.fixed_ids.contains(&cid) && !edited {
                 if !item.fix_done {
                     item.fix_done = true;
                 }
@@ -516,6 +523,20 @@ pub struct PrReviewComment {
 }
 
 impl PrReviewComment {
+    /// Whether the comment may have been edited at or after `applied_at`.
+    ///
+    /// GitHub's `updated_at` has whole-second precision, while `applied_at`
+    /// (from `chrono::Utc::now()`) almost never does. Both are rounded down
+    /// to the second and compared non-strictly, so a timestamp in the apply's
+    /// own second counts as a possible edit: reprocessing an unchanged
+    /// comment is cheap, silently skipping an edited one is the failure this
+    /// guards against. A comment with no `updated_at` is taken as unchanged.
+    pub fn edited_since(&self, applied_at: chrono::DateTime<chrono::Utc>) -> bool {
+        use chrono::SubsecRound;
+        self.updated_at
+            .is_some_and(|updated_at| updated_at.trunc_subsecs(0) >= applied_at.trunc_subsecs(0))
+    }
+
     /// Whether a Fix triaged from this comment may start out approved.
     ///
     /// Only the repository's owner, its organization's members and invited

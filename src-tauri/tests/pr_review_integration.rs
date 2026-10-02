@@ -1102,6 +1102,126 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
         "dry-run last_apply must not flip lifecycle flags");
 }
 
+/// A plan whose last apply fixed and replied to comments 301 and 302 at
+/// `applied_at`, with the lifecycle flags still unset (as after a re-analysis
+/// or on a plan that pre-dates them).
+fn two_fix_plan_applied_at(applied_at: chrono::DateTime<chrono::Utc>) -> PrReviewPlan {
+    use slashit_ui_lib::domain::task::PrReviewApplyResult;
+
+    let (_task, mut plan) = create_test_two_fix_setup();
+    plan.last_apply = Some(PrReviewApplyResult {
+        applied_at,
+        agent_summary: "prior round".to_string(),
+        fixed_ids: vec![301, 302],
+        skipped_ids: vec![],
+        pushed: true,
+        push_branch: Some("test-branch".to_string()),
+        replies_posted: 2,
+        reply_errors: vec![],
+        dry_run: false,
+        failed_ids: vec![],
+        fix_errors: vec![],
+        push_error: None,
+        auto_reply: Some(true),
+    });
+    plan
+}
+
+#[test]
+fn backfill_lifecycle_does_not_restore_a_comment_edited_after_the_last_apply() {
+    let applied_at = chrono::Utc::now();
+    let mut plan = two_fix_plan_applied_at(applied_at);
+    // 301 was edited a minute after the apply; 302 was last touched before it.
+    plan.comments[0].updated_at = Some(applied_at + chrono::Duration::seconds(60));
+    plan.comments[1].updated_at = Some(applied_at - chrono::Duration::seconds(60));
+
+    plan.backfill_lifecycle_from_last_apply();
+
+    assert!(!plan.items[0].fix_done, "an edited comment must not inherit fix_done");
+    assert!(!plan.items[0].reply_posted, "an edited comment must not inherit reply_posted");
+    assert!(plan.items[1].fix_done && plan.items[1].reply_posted, "an unchanged comment keeps the backfill");
+}
+
+#[test]
+fn backfill_lifecycle_keeps_a_comment_without_an_update_time_as_unchanged() {
+    let mut plan = two_fix_plan_applied_at(chrono::Utc::now());
+    assert!(plan.comments.iter().all(|c| c.updated_at.is_none()));
+
+    plan.backfill_lifecycle_from_last_apply();
+
+    assert!(plan.items.iter().all(|i| i.fix_done && i.reply_posted));
+}
+
+#[test]
+fn backfill_lifecycle_treats_a_same_second_update_as_a_possible_edit() {
+    use chrono::SubsecRound;
+
+    // Same boundary as `carry_forward_reanalysis_lifecycle`: GitHub's
+    // `updated_at` has whole-second precision, so a timestamp in the apply's
+    // own second is a possible edit; the second before it is not.
+    let applied_at = chrono::Utc::now().trunc_subsecs(0) + chrono::Duration::milliseconds(700);
+    let mut plan = two_fix_plan_applied_at(applied_at);
+    plan.comments[0].updated_at = Some(applied_at.trunc_subsecs(0));
+    plan.comments[1].updated_at = Some(applied_at.trunc_subsecs(0) - chrono::Duration::seconds(1));
+
+    plan.backfill_lifecycle_from_last_apply();
+
+    assert!(!plan.items[0].fix_done && !plan.items[0].reply_posted);
+    assert!(plan.items[1].fix_done && plan.items[1].reply_posted);
+}
+
+#[test]
+fn backfill_lifecycle_keeps_fix_uncommitted_when_the_comment_was_edited() {
+    let applied_at = chrono::Utc::now();
+    let mut plan = two_fix_plan_applied_at(applied_at);
+    plan.comments[0].updated_at = Some(applied_at + chrono::Duration::seconds(60));
+    plan.items[0].fix_uncommitted = true;
+
+    plan.backfill_lifecycle_from_last_apply();
+
+    assert!(plan.items[0].fix_uncommitted, "the checkout fact survives the edit");
+    assert!(!plan.items[0].fix_done && !plan.items[0].reply_posted);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_reruns_the_fix_for_a_comment_edited_after_the_apply_that_fixed_it() {
+    use slashit_ui_lib::domain::task::PrReviewApplyResult;
+
+    let _guard = PATH_LOCK.lock().await;
+    let env = MockEnv::setup("FIXED: item #0\nDONE");
+    let (task, mut plan) = create_test_pr_review_setup();
+    let applied_at = chrono::Utc::now();
+    plan.last_apply = Some(PrReviewApplyResult {
+        applied_at,
+        agent_summary: "prior round".to_string(),
+        fixed_ids: vec![101],
+        skipped_ids: vec![],
+        pushed: true,
+        push_branch: Some("test-branch".to_string()),
+        replies_posted: 1,
+        reply_errors: vec![],
+        dry_run: false,
+        failed_ids: vec![],
+        fix_errors: vec![],
+        push_error: None,
+        auto_reply: Some(true),
+    });
+    plan.comments[0].updated_at = Some(applied_at + chrono::Duration::seconds(60));
+    // What `address_pr_review` does before every apply.
+    plan.backfill_lifecycle_from_last_apply();
+    let opts = AddressPrReviewOptions { auto_push: false, auto_reply: false, dry_run: false };
+
+    let (result, _plan) =
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
+            .await
+            .expect("apply succeeds");
+
+    assert_eq!(env.claude_invocations(), 1, "the edited comment is fixed afresh");
+    assert_eq!(result.fixed_ids, vec![101], "{result:?}");
+    assert_eq!(env.gh_invocations(), 0, "no reply rests on the pre-edit fix:\n{}", env.read_gh_log());
+}
+
 #[test]
 fn backfill_lifecycle_from_last_apply_never_attempted_reply_leaves_reply_posted_false() {
     use slashit_ui_lib::domain::task::PrReviewApplyResult;
