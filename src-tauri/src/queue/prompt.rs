@@ -29,11 +29,18 @@ pub fn build_task_prompt(task: &Task, project_path: Option<&str>) -> String {
     }
     parts.push(format!("\n## Context\n{}", meta.join("\n")));
 
-    // Working directory
+    // Working directory. This is the Task Checkout. A member Project's agent
+    // may be launched from the Workspace root with the checkout as an added
+    // directory, but SlashIt reviews, commits and opens the pull request from
+    // the checkout only, so writes belong there. The wording is the same with
+    // or without a Workspace; reading elsewhere stays allowed.
     if let Some(path) = project_path {
         parts.push(format!(
-            "\n## Working Directory\nThis is the directory containing the code to edit for this task: {}",
-            path
+            "\n## Working Directory\nThis is the directory containing the code to edit for this task: {path}\n\
+             Make every file change for this task inside this directory. SlashIt reviews, commits and \
+             sends to a pull request only the changes made here; edits anywhere else, including in \
+             other directories you can reach, are not part of this task's delivery. You may read other \
+             directories you can reach for context."
         ));
     }
 
@@ -297,6 +304,27 @@ mod tests {
         let prompt = build_task_prompt(&task, None);
 
         assert!(!prompt.contains("## Working Directory"));
+    }
+
+    #[test]
+    fn working_directory_section_confines_writes_but_not_reading() {
+        let task = create_test_task("Boundary task");
+        let prompt = build_task_prompt(&task, Some("/data/checkouts/task-1"));
+        let section = prompt
+            .split("## Working Directory")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("working directory section");
+
+        // Writes are confined to the Task Checkout, and the delivery boundary
+        // is stated: nothing outside it is committed or sent to a PR.
+        assert!(section.contains("Make every file change for this task inside this directory"));
+        assert!(section.contains("only the changes made here"));
+        assert!(section.contains("are not part of this task's delivery"));
+        // Reading Workspace context is not restricted.
+        assert!(section.contains("You may read other directories you can reach for context"));
+        // The prompt never suggests anything outside the checkout is committed.
+        assert!(!section.to_lowercase().contains("workspace"));
     }
 
     #[test]

@@ -6,6 +6,13 @@ use leptos::callback::Callback;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+/// What a Workspace does and does not do for a member Project's Tasks, shown
+/// with its member list. The agent may read Workspace context, but only the
+/// Task Checkout is reviewed, committed and sent to a pull request.
+const TASK_BOUNDARY_NOTE: &str = "Tasks in these projects start from the workspace folder, when it exists, and read its \
+shared instructions, but each Task edits only its own checkout. Review, commit and pull request \
+cover that checkout only; changes made elsewhere in the workspace are not included.";
+
 /// Projects whose membership names a Workspace missing from `workspaces`,
 /// sorted by name.
 ///
@@ -292,6 +299,7 @@ fn WorkspaceItem(
 
                     <div class="space-y-2">
                         <h4 class="text-xs font-medium text-white/40 uppercase tracking-wide">"Projects in this workspace"</h4>
+                        <p class="text-xs text-white/40" data-testid="workspace-task-boundary">{TASK_BOUNDARY_NOTE}</p>
                         <div class="space-y-1" data-testid="workspace-members">
                             <For
                                 each=members
@@ -362,7 +370,7 @@ fn WorkspaceItem(
 
 #[cfg(test)]
 mod tests {
-    use super::unresolved_members;
+    use super::{unresolved_members, TASK_BOUNDARY_NOTE};
     use crate::models::{AgentType, Project, ProjectScope, Workspace};
     use uuid::Uuid;
 
@@ -390,6 +398,13 @@ mod tests {
 
     fn names(projects: &[Project]) -> Vec<&str> {
         projects.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    #[test]
+    fn the_boundary_note_limits_delivery_to_the_task_checkout() {
+        assert!(TASK_BOUNDARY_NOTE.contains("edits only its own checkout"));
+        assert!(TASK_BOUNDARY_NOTE.contains("cover that checkout only"));
+        assert!(TASK_BOUNDARY_NOTE.contains("are not included"));
     }
 
     #[test]
