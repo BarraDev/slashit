@@ -347,6 +347,152 @@ fn resolved_path(path: &Path) -> PathBuf {
     out
 }
 
+/// The path a pointer file records, resolved the way git reads it: a
+/// relative one (`worktree.useRelativePaths`) is relative to `base`, the
+/// directory the file is in, and every symlink on the way is resolved, so
+/// two spellings of one location compare equal. An absolute one is resolved
+/// as it is.
+fn worktree_relative(base: &Path, recorded: &str) -> PathBuf {
+    resolved_path(&base.join(recorded.trim()))
+}
+
+/// Where the `gitdir` file of the registration directory `admin` points: the
+/// `.git` file of the checkout it belongs to.
+fn registered_gitdir(admin: &Path, recorded: &str) -> PathBuf {
+    worktree_relative(admin, recorded)
+}
+
+/// One line of a reflog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReflogEntry {
+    old: String,
+    new: String,
+    message: String,
+}
+
+/// What a rebase wrote into the `HEAD` reflog, from its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebaseStep {
+    Start,
+    /// The rebase finished and returned to a branch.
+    Finish,
+    /// The rebase was abandoned; the work it left is not its result.
+    Abort,
+    /// A commit or move the rebase itself made (pick, fixup, squash, reword,
+    /// edit, continue, fast-forward ...).
+    Step,
+}
+
+impl ReflogEntry {
+    fn rebase_step(&self) -> Option<RebaseStep> {
+        let rest = self.message.strip_prefix("rebase")?;
+        // `rebase (start): ...`, `rebase -i (pick): ...`, `rebase: fast-forward`.
+        // Only the label right after the command names is an action; a
+        // parenthesis in the commit subject is not.
+        let rest = match rest.strip_prefix(" -") {
+            Some(option) => option.split_once(' ').map_or("", |(_, tail)| tail),
+            None if rest.starts_with(' ') || rest.starts_with(':') => rest.trim_start(),
+            None => return None,
+        };
+        let action = rest
+            .strip_prefix('(')
+            .and_then(|tail| tail.split_once(')'))
+            .map(|(action, _)| action);
+        Some(match action {
+            Some("start") => RebaseStep::Start,
+            Some("finish") if self.message.contains(": returning to refs/heads/") => RebaseStep::Finish,
+            Some("finish") => RebaseStep::Abort,
+            Some("abort") => RebaseStep::Abort,
+            _ => RebaseStep::Step,
+        })
+    }
+}
+
+/// The distinct non-null commit ids the entries name, as old or new value,
+/// oldest first.
+fn distinct_commits(entries: &[ReflogEntry]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut commits = Vec::new();
+    for id in entries.iter().flat_map(|e| [&e.old, &e.new]) {
+        if id.bytes().any(|b| b != b'0') && seen.insert(id.as_str()) {
+            commits.push(id.clone());
+        }
+    }
+    commits
+}
+
+/// The commits a `HEAD` reflog shows only as the intermediate steps of
+/// rebases that ran to completion, and that therefore are not work to keep.
+///
+/// A completed rebase is a `rebase (start)` entry, then entries the rebase
+/// wrote itself, each continuing from where the previous one left `HEAD`,
+/// then a `rebase (finish): returning to refs/heads/...` entry, with no other
+/// start, finish or abort between. Its result is the commit that finish
+/// entry names, and `result_is_named` says whether that commit is reachable
+/// from a ref or a branch reflog; if it is not, the sequence's steps may be
+/// the only copy of the work and stay counted.
+///
+/// Only a commit that the reflog mentions nowhere except as a step of such
+/// sequences is returned. The start's and the finish's commits, anything an
+/// ordinary entry (a commit, an amend, a reset, a checkout) names, and
+/// anything an unfinished, aborted or non-contiguous rebase names, stay
+/// counted whatever they are near.
+fn completed_rebase_transients(
+    entries: &[ReflogEntry],
+    result_is_named: impl Fn(&str) -> bool,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+
+    let mut protected: HashSet<&str> = HashSet::new();
+    let mut steps: HashSet<&str> = HashSet::new();
+    // The rebase being read, if one is open: the commit `HEAD` was left at
+    // by the last entry, and the commits its own entries produced.
+    let mut open: Option<(&str, Vec<&str>)> = None;
+
+    for entry in entries {
+        let (old, new) = (entry.old.as_str(), entry.new.as_str());
+        match (open.take(), entry.rebase_step()) {
+            (None, Some(RebaseStep::Start)) => {
+                protected.extend([old, new]);
+                open = Some((new, Vec::new()));
+            }
+            (Some((tip, mut produced)), Some(RebaseStep::Step)) if tip == old => {
+                produced.push(new);
+                open = Some((new, produced));
+            }
+            (Some((tip, produced)), Some(RebaseStep::Finish)) => {
+                protected.extend([old, new]);
+                if tip == old && old == new && result_is_named(new) {
+                    steps.extend(produced);
+                } else {
+                    protected.extend(produced);
+                }
+            }
+            (Some((tip, produced)), None) if tip == old => {
+                // An ordinary entry inside the rebase (an amend while it is
+                // stopped at `edit`) names its commits and does not end it.
+                protected.extend([old, new]);
+                open = Some((new, produced));
+            }
+            (Some((_, produced)), step) => {
+                // A rebase that was abandoned, restarted, or whose HEAD was
+                // moved by something else: what it produced is not trusted.
+                protected.extend(produced);
+                protected.extend([old, new]);
+                open = (step == Some(RebaseStep::Start)).then_some((new, Vec::new()));
+            }
+            (None, _) => {
+                protected.extend([old, new]);
+            }
+        }
+    }
+    // A rebase still open at the end of the log was interrupted.
+    if let Some((_, produced)) = open {
+        protected.extend(produced);
+    }
+    steps.into_iter().filter(|id| !protected.contains(id)).map(str::to_string).collect()
+}
+
 /// What to tell a user whose Task Checkout at `path` is gone while git
 /// still holds a locked registration of it, which keeps `branch` checked out
 /// there. The command it names is the only thing that changes that, and it
@@ -1306,7 +1452,11 @@ impl WorktreeManager {
     /// checkout with a branch checked out as well, since it may have made
     /// commits while detached and then switched back; commits that a
     /// branch's own reflog or any ref reaches are not counted, so amended or
-    /// rebased work on the task branch does not block removal. Nothing is
+    /// rebased work on the task branch does not block removal. Neither do
+    /// the intermediate commits of a rebase that ran to completion and
+    /// returned to a branch whose result a ref names (see
+    /// [`completed_rebase_transients`]); an interrupted or aborted rebase's
+    /// commits are not such, and are kept. Nothing is
     /// written, so a refusal leaves the checkout, the registration and the
     /// commits exactly as they were.
     ///
@@ -1424,7 +1574,8 @@ impl WorktreeManager {
         let Some(git_dir) = Self::registration_git_dir(&common, path, present).await? else {
             return Err(format!("git has no registration directory for {path}"));
         };
-        let own = Self::reflog_commits(&git_dir.join("logs").join("HEAD")).await?;
+        let entries = Self::reflog_entries(&git_dir.join("logs").join("HEAD")).await?;
+        let own = distinct_commits(&entries);
         if own.is_empty() {
             return Ok(Vec::new());
         }
@@ -1453,7 +1604,7 @@ impl WorktreeManager {
                 if is_dir {
                     dirs.push(entry.path());
                 } else {
-                    kept.extend(Self::reflog_commits(&entry.path()).await?);
+                    kept.extend(distinct_commits(&Self::reflog_entries(&entry.path()).await?));
                 }
             }
         }
@@ -1485,33 +1636,40 @@ impl WorktreeManager {
             });
         }
         written.map_err(|e| format!("`git rev-list` could not be given the reflog: {e}"))?;
-        Ok(String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect())
+        let unreachable: Vec<String> =
+            String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect();
+        // What a successfully completed rebase only passed through is not
+        // work the checkout holds: its result is named by a ref, and what is
+        // left in the `HEAD` reflog are the steps that built it.
+        let still_unreachable: std::collections::HashSet<&str> =
+            unreachable.iter().map(String::as_str).collect();
+        let transient = completed_rebase_transients(&entries, |result| !still_unreachable.contains(result));
+        Ok(unreachable.into_iter().filter(|c| !transient.contains(c)).collect())
     }
 
-    /// The distinct commit ids a reflog file names, as old or new value, or
-    /// none when git never kept it. A line git would not have written is an
-    /// error, never skipped.
-    async fn reflog_commits(file: &Path) -> Result<Vec<String>, String> {
+    /// The entries of a reflog file, oldest first, or none when git never
+    /// kept it. A line git would not have written is an error, never skipped.
+    async fn reflog_entries(file: &Path) -> Result<Vec<ReflogEntry>, String> {
         let reflog = match tokio::fs::read(file).await {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(format!("{} could not be read: {e}", file.display())),
         };
-        let mut seen = std::collections::HashSet::new();
-        let mut commits = Vec::new();
+        let mut entries = Vec::new();
         for line in reflog.lines().filter(|l| !l.trim().is_empty()) {
-            let ids: Vec<&str> = line.split('\t').next().unwrap_or("").split(' ').take(2).collect();
+            let (head, message) = line.split_once('\t').unwrap_or((line, ""));
+            let ids: Vec<&str> = head.split(' ').take(2).collect();
             let is_id = |id: &&str| matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit());
             if ids.len() < 2 || !ids.iter().all(is_id) {
                 return Err(format!("{} has a line git would not write: {line:?}", file.display()));
             }
-            for id in ids {
-                if id.bytes().any(|b| b != b'0') && seen.insert(id) {
-                    commits.push(id.to_string());
-                }
-            }
+            entries.push(ReflogEntry {
+                old: ids[0].to_string(),
+                new: ids[1].to_string(),
+                message: message.to_string(),
+            });
         }
-        Ok(commits)
+        Ok(entries)
     }
 
     /// The common git directory of `repo_path`.
@@ -1551,10 +1709,7 @@ impl WorktreeManager {
             return Ok(Some(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())));
         }
         let worktrees = common.join("worktrees");
-        let wanted = [
-            format!("{path}/.git"),
-            format!("{}/.git", resolved_path(Path::new(path)).display()),
-        ];
+        let wanted = resolved_path(Path::new(path)).join(".git");
         let mut entries = match tokio::fs::read_dir(&worktrees).await {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1566,7 +1721,7 @@ impl WorktreeManager {
             .map_err(|e| format!("{} could not be read: {e}", worktrees.display()))?
         {
             if let Ok(recorded) = tokio::fs::read_to_string(entry.path().join("gitdir")).await {
-                if wanted.iter().any(|w| w == recorded.trim()) {
+                if registered_gitdir(&entry.path(), &recorded) == wanted {
                     return Ok(Some(entry.path()));
                 }
             }
@@ -1930,9 +2085,10 @@ impl WorktreeRecord {
 
         let (admin, gitlink_contents) = match std::fs::read(&gitlink) {
             Ok(contents) => {
-                let admin = PathBuf::from(
-                    std::str::from_utf8(&contents).ok()?.strip_prefix("gitdir:")?.trim(),
-                );
+                // Under `worktree.useRelativePaths` the pointer is relative
+                // to the directory it is in.
+                let pointed = std::str::from_utf8(&contents).ok()?.strip_prefix("gitdir:")?.trim();
+                let admin = worktree_relative(Path::new(worktree_path), pointed);
                 (admin, contents)
             }
             Err(_) => {
@@ -1948,7 +2104,7 @@ impl WorktreeRecord {
         // Wherever the pointer came from, where it leads is checked against
         // what git says about this repository rather than taken on trust:
         // only this repository's own worktree records are ever copied.
-        if admin.parent() != Some(worktrees_dir.as_path()) {
+        if admin.parent().map(resolved_path) != Some(resolved_path(&worktrees_dir)) {
             return None;
         }
 
@@ -1996,7 +2152,7 @@ impl WorktreeRecord {
     /// claims the same path -- restoring the wrong one would be worse than
     /// restoring none.
     fn locate_admin(worktrees_dir: &Path, worktree_path: &str) -> Option<PathBuf> {
-        let wanted = Path::new(worktree_path).join(".git");
+        let wanted = resolved_path(Path::new(worktree_path)).join(".git");
         let mut found: Option<PathBuf> = None;
 
         for entry in std::fs::read_dir(worktrees_dir).ok()?.flatten() {
@@ -2007,7 +2163,7 @@ impl WorktreeRecord {
             let Ok(contents) = std::fs::read_to_string(admin.join("gitdir")) else {
                 continue;
             };
-            if Path::new(contents.trim()) != wanted {
+            if registered_gitdir(&admin, &contents) != wanted {
                 continue;
             }
             if found.is_some() {
@@ -2822,6 +2978,365 @@ mod tests {
             .await
             .expect("the old commit stays reachable through the branch's reflog");
         assert!(branch_exists(&repo_path, branch));
+    }
+
+    /// Run git with extra environment, for a rebase that must not open an
+    /// editor.
+    fn run_git_env(dir: &str, envs: &[(&str, &str)], args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .envs(envs.iter().copied())
+            .env("GIT_EDITOR", "true")
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"))
+    }
+
+    /// A commit of `contents` in `file`, with `extra` arguments to `commit`.
+    fn commit_file(dir: &str, file: &str, contents: &str, extra: &[&str]) -> String {
+        std::fs::write(Path::new(dir).join(file), contents).expect("write file");
+        run_git(dir, &["add", "-A"]);
+        let mut args = vec!["-c", "user.email=t@t.t", "-c", "user.name=T", "commit", "-q"];
+        args.extend_from_slice(extra);
+        run_git(dir, &args);
+        run_git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// The commits the checkout's `HEAD` reflog names that no ref and no
+    /// branch reflog does: what removal would leave unreachable.
+    fn head_reflog_only(repo_path: &str, wt: &str, branch: &str) -> Vec<String> {
+        let ids = |args: &[&str], dir: &str| -> Vec<String> {
+            run_git(dir, args).lines().map(str::to_string).collect()
+        };
+        let head = ids(&["log", "-g", "--format=%H", "HEAD"], wt);
+        let kept = ids(&["log", "-g", "--format=%H", &format!("refs/heads/{branch}")], repo_path);
+        let reachable = ids(&["rev-list", "--all"], repo_path);
+        let mut only: Vec<String> = Vec::new();
+        for id in head {
+            if !kept.contains(&id) && !reachable.contains(&id) && !only.contains(&id) {
+                only.push(id);
+            }
+        }
+        only
+    }
+
+    /// A branch checkout holding two commits and a fixup for each, so a rebase
+    /// with `--autosquash` has steps to take.
+    async fn branch_checkout_with_fixup(
+        mgr: &WorktreeManager,
+        repo_path: &str,
+        branch: &str,
+    ) -> WorktreeInfo {
+        let info = mgr.create(repo_path, branch).await.expect("create failed");
+        commit_file(&info.path, "a.txt", "a\n", &["-m", "add a"]);
+        commit_file(&info.path, "b.txt", "b\n", &["-m", "add b"]);
+        commit_file(&info.path, "a.txt", "a2\n", &["--fixup", "HEAD~1"]);
+        commit_file(&info.path, "b.txt", "b2\n", &["--fixup", "HEAD~1"]);
+        info
+    }
+
+    /// A rebase that is done leaves the steps it took only in the `HEAD`
+    /// reflog, and they are no work to keep: the branch it returned to
+    /// names the result. `rebase -i --autosquash` reproduces this.
+    #[tokio::test]
+    async fn a_checkout_whose_autosquash_rebase_completed_is_removable() {
+        let mgr = test_manager();
+        for gone in [false, true] {
+            let repo = create_temp_git_repo();
+            let repo_path = repo.path().to_str().unwrap().to_string();
+            let branch = "task-abcd1234";
+            let info = branch_checkout_with_fixup(&mgr, &repo_path, branch).await;
+            let done = run_git_env(
+                &info.path,
+                &[("GIT_SEQUENCE_EDITOR", "true")],
+                &["rebase", "-q", "-i", "--autosquash", "main"],
+            );
+            assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+            assert!(
+                !head_reflog_only(&repo_path, &info.path, branch).is_empty(),
+                "the rebase left steps that only the HEAD reflog reaches"
+            );
+            if gone {
+                std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+            }
+            mgr.remove(&info.path, &repo_path, Some(branch))
+                .await
+                .expect("only the steps of a completed rebase are unreferenced");
+            assert!(registration_of(&repo_path, &info.path).is_none());
+            assert!(branch_exists(&repo_path, branch), "the rebased branch is kept");
+        }
+    }
+
+    /// A plain interactive rebase that completed is removable too, whether or
+    /// not it left steps only the `HEAD` reflog reaches (squashing does).
+    #[tokio::test]
+    async fn a_checkout_whose_plain_interactive_rebase_completed_is_removable() {
+        let mgr = test_manager();
+        for (editor, leaves_steps) in [("true", false), ("sed -i -e 2s/^pick/squash/", true)] {
+            let repo = create_temp_git_repo();
+            let repo_path = repo.path().to_str().unwrap().to_string();
+            let branch = "task-abcd1234";
+            let info = mgr.create(&repo_path, branch).await.expect("create failed");
+            commit_file(&info.path, "a.txt", "a\n", &["-m", "add a"]);
+            commit_file(&info.path, "b.txt", "b\n", &["-m", "add b"]);
+            commit_file(&repo_path, "main.txt", "m\n", &["-m", "main moves"]);
+            let done = run_git_env(&info.path, &[("GIT_SEQUENCE_EDITOR", editor)], &["rebase", "-q", "-i", "main"]);
+            assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+            assert_eq!(!head_reflog_only(&repo_path, &info.path, branch).is_empty(), leaves_steps);
+            mgr.remove(&info.path, &repo_path, Some(branch))
+                .await
+                .expect("a completed rebase's steps are not unique work");
+            assert!(!Path::new(&info.path).exists());
+        }
+    }
+
+    /// A rebase stopped at `edit`, in which the user committed work of their
+    /// own: the rebase has not finished, so that commit is kept.
+    async fn checkout_stopped_in_a_rebase_with_work(
+        mgr: &WorktreeManager,
+        repo_path: &str,
+        branch: &str,
+    ) -> (WorktreeInfo, String) {
+        let info = branch_checkout_with_fixup(mgr, repo_path, branch).await;
+        let stopped = run_git_env(
+            &info.path,
+            &[("GIT_SEQUENCE_EDITOR", "sed -i -e 1s/^pick/edit/")],
+            &["rebase", "-q", "-i", "--autosquash", "main"],
+        );
+        assert!(!stopped.status.success() || Path::new(&info.path).join(".git").is_file());
+        let work = commit_file(&info.path, "mine.txt", "mine\n", &["-m", "my own work"]);
+        assert!(refs_reaching(repo_path, &work).is_empty());
+        (info, work)
+    }
+
+    #[tokio::test]
+    async fn a_checkout_interrupted_in_a_rebase_holding_work_is_refused() {
+        let mgr = test_manager();
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let branch = "task-abcd1234";
+        let (info, work) = checkout_stopped_in_a_rebase_with_work(&mgr, &repo_path, branch).await;
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect_err("the rebase has not finished; its commits are not a result");
+        assert!(refused.contains(&work) || refused.contains("no ref names"), "{refused}");
+        assert!(Path::new(&info.path).is_dir(), "the checkout is untouched");
+        assert_reflog_still_keeps(&repo_path, &info.path, &work);
+    }
+
+    /// An aborted rebase puts HEAD back, and the commit made while it was
+    /// stopped is then named by nothing but the `HEAD` reflog (proven with
+    /// `git fsck`), so removal refuses.
+    #[tokio::test]
+    async fn a_checkout_that_aborted_a_rebase_keeps_the_work_made_in_it() {
+        let mgr = test_manager();
+        for gone in [false, true] {
+            let repo = create_temp_git_repo();
+            let repo_path = repo.path().to_str().unwrap().to_string();
+            let branch = "task-abcd1234";
+            let (info, work) = checkout_stopped_in_a_rebase_with_work(&mgr, &repo_path, branch).await;
+            let aborted = run_git_env(&info.path, &[], &["rebase", "--abort"]);
+            assert!(aborted.status.success(), "{}", String::from_utf8_lossy(&aborted.stderr));
+            assert!(
+                run_git(&repo_path, &["fsck", "--unreachable", "--no-reflogs"]).contains(&work),
+                "only the HEAD reflog keeps the commit once the rebase is aborted"
+            );
+            if gone {
+                std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+            }
+            let refused = mgr
+                .remove(&info.path, &repo_path, Some(branch))
+                .await
+                .expect_err("the aborted rebase's commit would be lost");
+            assert!(refused.contains(&work), "{refused}");
+            assert_reflog_still_keeps(&repo_path, &info.path, &work);
+            run_git(&repo_path, &["branch", "kept-work", &work]);
+            mgr.remove(&info.path, &repo_path, Some(branch)).await.expect("named, so removable");
+        }
+    }
+
+    /// A commit made detached, unrelated to a rebase that completed in the
+    /// same checkout, is still unique work.
+    #[tokio::test]
+    async fn a_detached_commit_beside_a_completed_rebase_is_still_refused() {
+        let mgr = test_manager();
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let branch = "task-abcd1234";
+        let info = branch_checkout_with_fixup(&mgr, &repo_path, branch).await;
+        let done = run_git_env(
+            &info.path,
+            &[("GIT_SEQUENCE_EDITOR", "true")],
+            &["rebase", "-q", "-i", "--autosquash", "main"],
+        );
+        assert!(done.status.success());
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        let manual = commit_file(&info.path, "manual.txt", "manual\n", &["-m", "detached work"]);
+        run_git(&info.path, &["switch", "-q", branch]);
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect_err("a manual detached commit is unique work");
+        assert!(refused.contains(&manual), "{refused}");
+        assert!(refused.contains("1 commit(s)"), "only the manual commit is counted: {refused}");
+        assert_reflog_still_keeps(&repo_path, &info.path, &manual);
+    }
+
+    /// Reset and amend on the task branch, done after a completed rebase,
+    /// remain recoverable from the branch's reflog and do not block removal.
+    #[tokio::test]
+    async fn amend_and_reset_after_a_completed_rebase_do_not_block_removal() {
+        let mgr = test_manager();
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let branch = "task-abcd1234";
+        let info = branch_checkout_with_fixup(&mgr, &repo_path, branch).await;
+        run_git_env(&info.path, &[("GIT_SEQUENCE_EDITOR", "true")], &["rebase", "-q", "-i", "--autosquash", "main"]);
+        run_git(&info.path, &["commit", "-q", "--amend", "-m", "amended"]);
+        run_git(&info.path, &["reset", "-q", "--hard", "HEAD~1"]);
+        mgr.remove(&info.path, &repo_path, Some(branch)).await.expect("branch reflog keeps them");
+    }
+
+    fn entry(old: &str, new: &str, message: &str) -> ReflogEntry {
+        let id = |c: &str| c.repeat(40);
+        ReflogEntry { old: id(old), new: id(new), message: message.to_string() }
+    }
+
+    /// The rule on hand-written logs: what counts as a completed rebase and
+    /// what may never be dropped.
+    #[test]
+    fn completed_rebase_transients_follow_the_rule() {
+        let id = |c: &str| c.repeat(40);
+        let named = |_: &str| true;
+        let complete = vec![
+            entry("1", "2", "rebase (start): checkout main"),
+            entry("2", "3", "rebase (pick): x"),
+            entry("3", "4", "rebase (fixup): x"),
+            entry("4", "5", "rebase (pick): y"),
+            entry("5", "5", "rebase (finish): returning to refs/heads/t"),
+        ];
+        // The start's commit, and the result, are never steps; the middle ones are.
+        let got = completed_rebase_transients(&complete, named);
+        assert_eq!(got, [id("3"), id("4")].into_iter().collect());
+        // A result that nothing names keeps every step.
+        assert!(completed_rebase_transients(&complete, |_| false).is_empty());
+        // No finish: interrupted.
+        assert!(completed_rebase_transients(&complete[..4], named).is_empty());
+        // Abort instead of finish.
+        let mut aborted = complete[..4].to_vec();
+        aborted.push(entry("4", "1", "rebase (abort): returning to refs/heads/t"));
+        assert!(completed_rebase_transients(&aborted, named).is_empty());
+        // Finishing to something other than a branch is not a success.
+        let mut detached = complete[..4].to_vec();
+        detached.push(entry("4", "4", "rebase (finish): returning to HEAD"));
+        assert!(completed_rebase_transients(&detached, named).is_empty());
+        // Steps without a start are not a rebase.
+        assert!(completed_rebase_transients(&complete[1..], named).is_empty());
+        // A step that does not continue from the last HEAD breaks the sequence.
+        let mut broken = complete.clone();
+        broken[3] = entry("9", "4", "rebase (pick): y");
+        assert!(completed_rebase_transients(&broken, named).is_empty());
+        // An ordinary entry naming a step's commit keeps it, wherever it is.
+        let mut named_elsewhere = vec![entry("0", "3", "commit: user work")];
+        named_elsewhere.extend(complete.clone());
+        assert_eq!(completed_rebase_transients(&named_elsewhere, named), [id("4")].into_iter().collect());
+        // A later aborted rebase that reuses a step's commit keeps it too.
+        let mut reused = complete.clone();
+        reused.push(entry("5", "5", "rebase (start): checkout main"));
+        reused.push(entry("5", "4", "rebase (pick): z"));
+        assert_eq!(completed_rebase_transients(&reused, named), [id("3")].into_iter().collect());
+        // A message that only starts with the word is not a rebase.
+        let mut forged = complete.clone();
+        forged[1] = entry("2", "3", "rebased: x");
+        assert_eq!(completed_rebase_transients(&forged, named), [id("4")].into_iter().collect());
+        // A parenthesis in a subject is not an action.
+        let mut subject = complete.clone();
+        subject[1] = entry("2", "3", "rebase: fast-forward (finish) (abort)");
+        assert_eq!(completed_rebase_transients(&subject, named), [id("3"), id("4")].into_iter().collect());
+        // Older git spelled the interactive rebase's messages with the option.
+        let mut legacy = complete.clone();
+        legacy[0] = entry("1", "2", "rebase -i (start): checkout main");
+        legacy[4] = entry("5", "5", "rebase -i (finish): returning to refs/heads/t");
+        assert_eq!(completed_rebase_transients(&legacy, named), [id("3"), id("4")].into_iter().collect());
+        // An amend while stopped does not end the rebase, and is itself kept.
+        let edited = vec![
+            entry("1", "2", "rebase (start): checkout main"),
+            entry("2", "3", "rebase (edit): x"),
+            entry("3", "8", "commit (amend): x"),
+            entry("8", "4", "rebase (continue): x"),
+            entry("4", "6", "rebase (pick): y"),
+            entry("6", "6", "rebase (finish): returning to refs/heads/t"),
+        ];
+        assert_eq!(completed_rebase_transients(&edited, named), [id("4")].into_iter().collect());
+    }
+
+    /// A relative `gitdir` is resolved against the registration directory it
+    /// is in, so it identifies the same checkout as the absolute spelling,
+    /// including through a symlinked parent.
+    #[test]
+    fn a_relative_gitdir_identifies_the_same_checkout_as_an_absolute_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().unwrap();
+        let admin = root.join("repo/.git/worktrees/wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir_all(root.join("checkouts")).unwrap();
+        let wanted = root.join("checkouts/wt/.git");
+        assert_eq!(registered_gitdir(&admin, "../../../../checkouts/wt/.git\n"), wanted);
+        assert_eq!(registered_gitdir(&admin, &format!("{}\n", wanted.display())), wanted);
+        assert_ne!(registered_gitdir(&admin, "../../../../checkouts/other/.git"), wanted);
+
+        let worktrees = root.join("repo/.git/worktrees");
+        std::fs::write(admin.join("gitdir"), "../../../../checkouts/wt/.git\n").unwrap();
+        assert_eq!(
+            WorktreeRecord::locate_admin(&worktrees, root.join("checkouts/wt").to_str().unwrap()),
+            Some(admin.clone()),
+        );
+        assert_eq!(
+            WorktreeRecord::locate_admin(&worktrees, root.join("checkouts/other").to_str().unwrap()),
+            None,
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("checkouts"), root.join("link")).unwrap();
+            assert_eq!(
+                WorktreeRecord::locate_admin(&worktrees, root.join("link/wt").to_str().unwrap()),
+                Some(admin),
+                "the same location through a symlink"
+            );
+        }
+    }
+
+    /// With `worktree.useRelativePaths`, git records the checkout and its
+    /// registration relative to each other. A checkout that is gone must
+    /// still be found by its registration. Needs a git that has the setting.
+    #[tokio::test]
+    async fn a_checkout_with_a_relative_registration_is_removable_present_or_gone() {
+        let mgr = test_manager();
+        for gone in [false, true] {
+            let repo = create_temp_git_repo();
+            let repo_path = repo.path().to_str().unwrap().to_string();
+            run_git(&repo_path, &["config", "worktree.useRelativePaths", "true"]);
+            let branch = "task-abcd1234";
+            let info = mgr.create(&repo_path, branch).await.expect("create failed");
+            let common = run_git(&repo_path, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+            let admins: Vec<_> = std::fs::read_dir(Path::new(&common).join("worktrees"))
+                .unwrap()
+                .flatten()
+                .collect();
+            let recorded = std::fs::read_to_string(admins[0].path().join("gitdir")).unwrap();
+            if Path::new(recorded.trim()).is_absolute() {
+                eprintln!("skipped: this git records absolute worktree paths");
+                return;
+            }
+            if gone {
+                std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+            }
+            mgr.remove(&info.path, &repo_path, Some(branch))
+                .await
+                .expect("a relative registration names the same checkout");
+            assert!(registration_of(&repo_path, &info.path).is_none());
+        }
     }
 
     /// A reflog git would not have written is not read as an empty one.

@@ -2112,6 +2112,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_task_whose_autosquash_rebase_completed_is_finished_and_deleted_as_usual() {
+        for delete_it in [false, true] {
+            let world = world(true);
+            let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+            let dir = std::path::PathBuf::from(&wt);
+            for (file, fixup) in [("work.txt", "HEAD"), ("other.txt", "HEAD")] {
+                std::fs::write(dir.join(file), "changed\n").unwrap();
+                git(&dir, &["add", "."]);
+                git(&dir, &["commit", "-q", "--fixup", fixup]);
+            }
+            let rebased = std::process::Command::new("git")
+                .args(["rebase", "-q", "-i", "--autosquash", "main"])
+                .env("GIT_SEQUENCE_EDITOR", "true")
+                .env("GIT_EDITOR", "true")
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(rebased.status.success(), "{}", String::from_utf8_lossy(&rebased.stderr));
+            let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
+
+            if delete_it {
+                delete(world.ctx(), id).await.expect("only a finished rebase's steps are left");
+                assert!(!world.tasks.read().await.contains_key(&id));
+            } else {
+                let done = terminalize(
+                    world.ctx(),
+                    id,
+                    Origin::User,
+                    TerminalizeRequest::new(TaskStatus::Done),
+                )
+                .await
+                .expect("only a finished rebase's steps are left");
+                assert_eq!(done.status, TaskStatus::Done);
+            }
+            assert!(!std::path::Path::new(&wt).exists());
+        }
+    }
+
+    #[tokio::test]
     async fn a_delete_refuses_while_an_agent_owns_the_task_and_removes_nothing() {
         let world = world(true);
         let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
