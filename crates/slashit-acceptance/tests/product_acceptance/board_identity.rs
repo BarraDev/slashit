@@ -34,7 +34,7 @@ const cards = [...document.querySelectorAll('[data-testid="task-card"]')]
 if (cards.length !== 1) { return 'expected one card, found ' + cards.length; }
 const wrapper = cards[0].closest('[data-card-task-id]');
 const draggable = cards[0].closest('[draggable="true"]');
-window.__marked = { card: cards[0], wrapper, draggable };
+window.__marked = { card: cards[0], wrapper, draggable, taskId: wrapper.getAttribute('data-card-task-id') };
 return 'marked';
 "#;
 
@@ -49,6 +49,7 @@ return {
   cardConnected: m.card.isConnected,
   wrapperConnected: m.wrapper.isConnected,
   draggableConnected: m.draggable.isConnected,
+  taskIdStillMatches: m.wrapper.getAttribute('data-card-task-id') === m.taskId,
   title: (m.card.querySelector('[data-testid="task-title"]') || {}).textContent,
 };
 "#;
@@ -103,7 +104,7 @@ async fn wait_for_title(driver: &WebDriver, task_id: &str, title: &str) -> Resul
 
 async fn assert_same_nodes(driver: &WebDriver, after: &str) -> Result<()> {
     let state = page(driver, SAME_NODES, vec![]).await?;
-    for key in ["cardStillOnBoard", "cardConnected", "wrapperConnected", "draggableConnected"] {
+    for key in ["cardStillOnBoard", "cardConnected", "wrapperConnected", "draggableConnected", "taskIdStillMatches"] {
         if state[key] != json!(true) {
             bail!("after {after}, the marked card's node was replaced ({key} is not true): {state}");
         }
@@ -113,11 +114,14 @@ async fn assert_same_nodes(driver: &WebDriver, after: &str) -> Result<()> {
 
 async fn keep_the_node(driver: &WebDriver, repository: &GitFixture) -> Result<()> {
     ui::assert_frontend_is_real(driver).await?;
-    let Prerequisites { project_id, task_id, title } =
-        create_prerequisites(driver, repository, "Identity", "Held against updates.").await?;
-    let before = create_backlog_task(driver, &project_id, "Sibling before").await?;
-    // Created last, so a sibling leaving ahead of it shifts it up the column.
-    let after = create_backlog_task(driver, &project_id, "Sibling after").await?;
+    let Prerequisites { project_id, task_id: first, .. } =
+        create_prerequisites(driver, repository, "Identity first", "Ahead of the marked card.").await?;
+    let second = create_backlog_task(driver, &project_id, "Identity second").await?;
+    // Created last, so it is the last card in the column and both others are
+    // ahead of it: one leaving shifts it up, which re-binds its node if cards
+    // are reused by position.
+    let title = "Identity marked".to_string();
+    let task_id = create_backlog_task(driver, &project_id, &title).await?;
     open_board(driver, &project_id).await?;
     assert_card_in_column(driver, BACKLOG_COLUMN, &title).await?;
 
@@ -150,9 +154,9 @@ async fn keep_the_node(driver: &WebDriver, repository: &GitFixture) -> Result<()
         assert_same_nodes(driver, &format!("its own update {round}")).await?;
     }
 
-    // The column changing around it: a sibling ahead of it leaves and comes
-    // back, and one behind it does the same.
-    for (name, sibling) in [("the sibling ahead", &before), ("the sibling behind", &after)] {
+    // The column changing around it: each card ahead of it leaves and comes
+    // back.
+    for (name, sibling) in [("the first card", &first), ("the second card", &second)] {
         for status in ["human_review", "backlog"] {
             ui::invoke(
                 driver,
@@ -167,7 +171,10 @@ async fn keep_the_node(driver: &WebDriver, repository: &GitFixture) -> Result<()
         }
     }
 
-    // And the card still opens its own drawer.
+    // And the card still opens its own drawer. It is the last of three in a
+    // column that scrolls inside the window, below the fold, so bring it into
+    // view first; the click itself is still the driver's.
+    page(driver, "window.__marked.card.scrollIntoView({ block: 'center' }); return true;", vec![]).await?;
     let current = card_title(driver, &task_id).await?;
     open_drawer(driver, &task_id, &current).await?;
     Ok(())
@@ -186,6 +193,15 @@ node.dispatchEvent(event);
 if (type === 'dragstart') { window.__transfer = transfer.getData('text/plain'); }
 return true;
 "#;
+
+/// Whether the marked card still wears the style of a card being dragged.
+async fn assert_dragging_style(driver: &WebDriver, when: &str) -> Result<()> {
+    let class = page(driver, "return window.__marked.draggable.className;", vec![]).await?;
+    if !class.as_str().unwrap_or_default().contains("opacity-25") {
+        bail!("after {when}, the dragged card lost its dragging style: {class}");
+    }
+    Ok(())
+}
 
 /// The task's status as the product holds it.
 async fn status_in_store(driver: &WebDriver, project_id: &str, task_id: &str) -> Result<String> {
@@ -227,11 +243,13 @@ async fn drag_through_an_update(driver: &WebDriver, repository: &GitFixture) -> 
 
     // A drag that ends where it started: begin, update the task mid-drag, end.
     page(driver, DRAG_EVENT, vec![json!(BACKLOG_COLUMN), json!("dragstart")]).await?;
+    assert_dragging_style(driver, "the drag started").await?;
     let renamed = format!("{title} (mid-drag)");
     ui::invoke(driver, "update_task", json!({"params": {"taskId": task_id, "title": renamed}})).await?;
     page(driver, ANNOUNCE, vec![json!(task_id), json!(40)]).await?;
     wait_for_title(driver, &task_id, &renamed).await?;
     assert_same_nodes(driver, "an update during the drag").await?;
+    assert_dragging_style(driver, "an update during the drag").await?;
     page(driver, DRAG_EVENT, vec![json!(BACKLOG_COLUMN), json!("dragend")]).await?;
 
     // The drag is over, so a drop now carries nothing: nothing moves.

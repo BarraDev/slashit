@@ -2267,6 +2267,10 @@ fn KanbanColumn(
                                             let next_task_id = Signal::derive(move || {
                                                 column_tasks.with(|tasks| next_card_id(tasks, task_id))
                                             });
+                                            // Drag state belongs to the row, not to the card built
+                                            // from the current record.
+                                            let is_dragging = RwSignal::new(false);
+                                            let is_lower_half = RwSignal::new(false);
                                             move || {
                                                 let task = current.get();
                                                 let column_status = column_status.clone();
@@ -2275,6 +2279,8 @@ fn KanbanColumn(
                                                         task=task
                                                         column_status=column_status
                                                         next_task_id=next_task_id
+                                                        is_dragging=is_dragging
+                                                        is_lower_half=is_lower_half
                                                         dragged_task=set_drag
                                                         drag_over_position=drag_over_position
                                                         set_drag_over_position=set_drag_over_position
@@ -2342,6 +2348,11 @@ fn KanbanTaskCard(
     column_status: TaskStatus,
     /// The task shown after this one in its column, kept current as the column changes.
     next_task_id: Signal<Option<String>>,
+    /// Whether this card is being dragged. Owned by the card's keyed row, so an
+    /// update to the task, which rebuilds the card, does not reset it.
+    is_dragging: RwSignal<bool>,
+    /// Whether the pointer is over the lower half of this card while dragging.
+    is_lower_half: RwSignal<bool>,
     dragged_task: WriteSignal<Option<(String, TaskStatus)>>,
     drag_over_position: Signal<Option<(TaskStatus, Option<String>)>>,
     set_drag_over_position: WriteSignal<Option<(TaskStatus, Option<String>)>>,
@@ -2380,9 +2391,9 @@ fn KanbanTaskCard(
 
     let task_status = task.status.clone();
     let is_in_progress = task_status == TaskStatus::InProgress;
-    let (is_dragging, set_is_dragging) = signal(false);
+    let (is_dragging, set_is_dragging) = is_dragging.split();
     // Track if mouse is in lower half (for showing indicator below instead of above)
-    let (is_lower_half, set_is_lower_half) = signal(false);
+    let (is_lower_half, set_is_lower_half) = is_lower_half.split();
 
     // Right-click context menu handler
     let on_context_menu = {

@@ -1508,12 +1508,18 @@ async fn open_drawer(driver: &WebDriver, task_id: &str, title: &str) -> Result<(
             match card.click().await {
                 Ok(()) => {
                     let selector = format!("{TASK_DRAWER}[data-task-id=\"{task_id}\"]");
-                    if let Err(error) = ui::visible(driver, &selector).await {
-                        let evidence = if probed {
-                            click_evidence(driver).await
-                        } else {
-                            "the click probe could not be installed".to_string()
-                        };
+                    let shown = ui::visible(driver, &selector).await;
+                    // The probe watches one click; it must not outlive it.
+                    let evidence = match (&shown, probed) {
+                        (Err(_), true) => Some(click_evidence(driver).await),
+                        _ => None,
+                    };
+                    if probed {
+                        stop_click_probe(driver).await;
+                    }
+                    if let Err(error) = shown {
+                        let evidence = evidence
+                            .unwrap_or_else(|| "the click probe could not be installed".to_string());
                         return Err(error.context(format!(
                             "clicking the card for {title:?} did not open its drawer\n\
                              page record of the click: {evidence}"
@@ -1521,7 +1527,12 @@ async fn open_drawer(driver: &WebDriver, task_id: &str, title: &str) -> Result<(
                     }
                     return Ok(());
                 }
-                Err(error) => last_problem = error.to_string(),
+                Err(error) => {
+                    last_problem = error.to_string();
+                    if probed {
+                        stop_click_probe(driver).await;
+                    }
+                }
             }
         }
         if started.elapsed() > RENDER_DEADLINE {
@@ -1616,6 +1627,17 @@ probe.stop = () => {
 window.__clickProbe = probe;
 return true;
 "#;
+
+/// Remove the probe's listeners, observer and console wrapper. Best effort: a
+/// page that is gone has nothing left to stop.
+async fn stop_click_probe(driver: &WebDriver) {
+    let _ = page(
+        driver,
+        "if (window.__clickProbe) { window.__clickProbe.stop(); window.__clickProbe = null; } return true;",
+        vec![],
+    )
+    .await;
+}
 
 /// What the page recorded about a click that opened no drawer, as one line of
 /// JSON: the events it saw, whether the clicked card was removed or replaced,

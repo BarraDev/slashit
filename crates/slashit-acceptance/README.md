@@ -149,9 +149,11 @@ export SLASHIT_ACCEPTANCE_NATIVE_DRIVER=/tmp/WebKitWebDriver
   down on left the page, any drawer that appeared or went, the board's scroll
   position and the element at the card's centre. A click whose button comes
   up over a different element than it went down on is delivered to their
-  common ancestor, not to the card, so a card that moves between the two
-  events opens nothing; the record shows that, and tells it apart from a
-  handler that ran and did nothing.
+  common ancestor. When that ancestor is not the card, the card's handler
+  never sees the click, so a card that moves between the two events can open
+  nothing. The event targets can help tell that apart from other failures;
+  they do not identify the cause. The probe listens before the card's own
+  handler runs, so the record does not show whether that handler ran.
 
 ## Platforms
 
