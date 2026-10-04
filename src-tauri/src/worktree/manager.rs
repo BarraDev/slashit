@@ -347,6 +347,152 @@ fn resolved_path(path: &Path) -> PathBuf {
     out
 }
 
+/// The path a pointer file records, resolved the way git reads it: a
+/// relative one (`worktree.useRelativePaths`) is relative to `base`, the
+/// directory the file is in, and every symlink on the way is resolved, so
+/// two spellings of one location compare equal. An absolute one is resolved
+/// as it is.
+fn worktree_relative(base: &Path, recorded: &str) -> PathBuf {
+    resolved_path(&base.join(recorded.trim()))
+}
+
+/// Where the `gitdir` file of the registration directory `admin` points: the
+/// `.git` file of the checkout it belongs to.
+fn registered_gitdir(admin: &Path, recorded: &str) -> PathBuf {
+    worktree_relative(admin, recorded)
+}
+
+/// One line of a reflog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReflogEntry {
+    old: String,
+    new: String,
+    message: String,
+}
+
+/// What a rebase wrote into the `HEAD` reflog, from its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebaseStep {
+    Start,
+    /// The rebase finished and returned to a branch.
+    Finish,
+    /// The rebase was abandoned; the work it left is not its result.
+    Abort,
+    /// A commit or move the rebase itself made (pick, fixup, squash, reword,
+    /// edit, continue, fast-forward ...).
+    Step,
+}
+
+impl ReflogEntry {
+    fn rebase_step(&self) -> Option<RebaseStep> {
+        let rest = self.message.strip_prefix("rebase")?;
+        // `rebase (start): ...`, `rebase -i (pick): ...`, `rebase: fast-forward`.
+        // Only the label right after the command names is an action; a
+        // parenthesis in the commit subject is not.
+        let rest = match rest.strip_prefix(" -") {
+            Some(option) => option.split_once(' ').map_or("", |(_, tail)| tail),
+            None if rest.starts_with(' ') || rest.starts_with(':') => rest.trim_start(),
+            None => return None,
+        };
+        let action = rest
+            .strip_prefix('(')
+            .and_then(|tail| tail.split_once(')'))
+            .map(|(action, _)| action);
+        Some(match action {
+            Some("start") => RebaseStep::Start,
+            Some("finish") if self.message.contains(": returning to refs/heads/") => RebaseStep::Finish,
+            Some("finish") => RebaseStep::Abort,
+            Some("abort") => RebaseStep::Abort,
+            _ => RebaseStep::Step,
+        })
+    }
+}
+
+/// The distinct non-null commit ids the entries name, as old or new value,
+/// oldest first.
+fn distinct_commits(entries: &[ReflogEntry]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut commits = Vec::new();
+    for id in entries.iter().flat_map(|e| [&e.old, &e.new]) {
+        if id.bytes().any(|b| b != b'0') && seen.insert(id.as_str()) {
+            commits.push(id.clone());
+        }
+    }
+    commits
+}
+
+/// The commits a `HEAD` reflog shows only as the intermediate steps of
+/// rebases that ran to completion, and that therefore are not work to keep.
+///
+/// A completed rebase is a `rebase (start)` entry, then entries the rebase
+/// wrote itself, each continuing from where the previous one left `HEAD`,
+/// then a `rebase (finish): returning to refs/heads/...` entry, with no other
+/// start, finish or abort between. Its result is the commit that finish
+/// entry names, and `result_is_named` says whether that commit is reachable
+/// from a ref or a branch reflog; if it is not, the sequence's steps may be
+/// the only copy of the work and stay counted.
+///
+/// Only a commit that the reflog mentions nowhere except as a step of such
+/// sequences is returned. The start's and the finish's commits, anything an
+/// ordinary entry (a commit, an amend, a reset, a checkout) names, and
+/// anything an unfinished, aborted or non-contiguous rebase names, stay
+/// counted whatever they are near.
+fn completed_rebase_transients(
+    entries: &[ReflogEntry],
+    result_is_named: impl Fn(&str) -> bool,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+
+    let mut protected: HashSet<&str> = HashSet::new();
+    let mut steps: HashSet<&str> = HashSet::new();
+    // The rebase being read, if one is open: the commit `HEAD` was left at
+    // by the last entry, and the commits its own entries produced.
+    let mut open: Option<(&str, Vec<&str>)> = None;
+
+    for entry in entries {
+        let (old, new) = (entry.old.as_str(), entry.new.as_str());
+        match (open.take(), entry.rebase_step()) {
+            (None, Some(RebaseStep::Start)) => {
+                protected.extend([old, new]);
+                open = Some((new, Vec::new()));
+            }
+            (Some((tip, mut produced)), Some(RebaseStep::Step)) if tip == old => {
+                produced.push(new);
+                open = Some((new, produced));
+            }
+            (Some((tip, produced)), Some(RebaseStep::Finish)) => {
+                protected.extend([old, new]);
+                if tip == old && old == new && result_is_named(new) {
+                    steps.extend(produced);
+                } else {
+                    protected.extend(produced);
+                }
+            }
+            (Some((tip, produced)), None) if tip == old => {
+                // An ordinary entry inside the rebase (an amend while it is
+                // stopped at `edit`) names its commits and does not end it.
+                protected.extend([old, new]);
+                open = Some((new, produced));
+            }
+            (Some((_, produced)), step) => {
+                // A rebase that was abandoned, restarted, or whose HEAD was
+                // moved by something else: what it produced is not trusted.
+                protected.extend(produced);
+                protected.extend([old, new]);
+                open = (step == Some(RebaseStep::Start)).then_some((new, Vec::new()));
+            }
+            (None, _) => {
+                protected.extend([old, new]);
+            }
+        }
+    }
+    // A rebase still open at the end of the log was interrupted.
+    if let Some((_, produced)) = open {
+        protected.extend(produced);
+    }
+    steps.into_iter().filter(|id| !protected.contains(id)).map(str::to_string).collect()
+}
+
 /// What to tell a user whose Task Checkout at `path` is gone while git
 /// still holds a locked registration of it, which keeps `branch` checked out
 /// there. The command it names is the only thing that changes that, and it
@@ -1282,7 +1428,391 @@ impl WorktreeManager {
         repo_path: &str,
         branch: Option<&str>,
     ) -> Result<(), String> {
+        Self::refuse_to_drop_detached_commit(worktree_path, repo_path).await?;
         self.remove_with_git(worktree_path, repo_path, branch).await
+    }
+
+    /// Refuse a removal that would leave work a detached `HEAD` is the only
+    /// thing keeping reachable.
+    ///
+    /// A checkout whose `HEAD` is detached keeps that `HEAD`, and its reflog,
+    /// in git's registration of it, and `git worktree remove` takes both
+    /// down, whether the directory is there or gone. Two kinds of commit are
+    /// then named by nothing: the one `HEAD` is at, and any commit the `HEAD`
+    /// reflog alone still reaches (work the checkout moved away from, such as
+    /// a commit made before `git checkout --detach <branch>`). Acquisition
+    /// refuses the same registration for the same reason (see
+    /// [`Self::adoptable_worktree`]); removal is the other way a person's work
+    /// can reach that end, so it decides on the same facts: where the
+    /// registration is, which commit its `HEAD` is at, and whether any ref
+    /// reaches that commit.
+    ///
+    /// A detached checkout whose commits a branch or tag already reaches
+    /// loses nothing and is removed as before. The reflog check applies to a
+    /// checkout with a branch checked out as well, since it may have made
+    /// commits while detached and then switched back; commits that a
+    /// branch's own reflog or any ref reaches are not counted, so amended or
+    /// rebased work on the task branch does not block removal. Neither do
+    /// the intermediate commits of a rebase that ran to completion and
+    /// returned to a branch whose result a ref names (see
+    /// [`completed_rebase_transients`]); an interrupted or aborted rebase's
+    /// commits are not such, and are kept. Nothing is
+    /// written, so a refusal leaves the checkout, the registration and the
+    /// commits exactly as they were.
+    ///
+    /// Only the `files` ref storage keeps the `HEAD` reflog where this reads
+    /// it. A repository on `reftable` (or any other backend), or one whose
+    /// storage cannot be determined, is refused (see
+    /// [`Self::ensure_reflog_inspectable`]).
+    ///
+    /// Not inspected: other per-worktree state removal deletes (an
+    /// interrupted rebase, `ORIG_HEAD`, `refs/bisect`), and a commit made
+    /// between this check and the removal.
+    ///
+    /// The rule is: proven safe removes, proven unsafe refuses with the
+    /// commit and how to keep it, and anything git or the filesystem could
+    /// not answer refuses with what failed. A failed inspection is never read
+    /// as "nothing to lose".
+    async fn refuse_to_drop_detached_commit(
+        worktree_path: &str,
+        repo_path: &str,
+    ) -> Result<(), String> {
+        let indeterminate = |what: &str, why: &str| {
+            format!(
+                "{worktree_path} was not removed, because {what} ({why}), so it is not known \
+                 whether removing it would make work made there unreachable. Nothing was changed. \
+                 Repair the checkout, or inspect and remove it by hand."
+            )
+        };
+        let (path, head, gone, attached) = match Presence::of(Path::new(worktree_path)) {
+            Presence::Present => match Self::checkout_head(worktree_path).await {
+                Ok((branch, head)) => (worktree_path.to_string(), head, false, branch.is_some()),
+                Err(why) => {
+                    // A directory git does not register at all has no
+                    // registration for a removal to take down; the removal
+                    // itself restores or refuses it. Only a registration
+                    // that cannot be read is unproven.
+                    let listing = Self::worktree_listing(repo_path).await;
+                    let unregistered = listing.as_deref().is_ok_and(|listing| {
+                        CheckoutRegistration::of_path(Ok(listing), worktree_path)
+                            == CheckoutRegistration::NotRegistered
+                    });
+                    if unregistered {
+                        return Ok(());
+                    }
+                    return Err(indeterminate("its HEAD could not be read", &why));
+                }
+            },
+            Presence::Absent => {
+                let listing = Self::worktree_listing(repo_path)
+                    .await
+                    .map_err(|why| indeterminate("git's worktree listing could not be read", &why))?;
+                match CheckoutRegistration::of_path(Ok(&listing), worktree_path) {
+                    CheckoutRegistration::MissingPrunable { path, branch, head } => {
+                        (path, head.unwrap_or_default(), true, branch.is_some())
+                    }
+                    CheckoutRegistration::Unknown(why) => {
+                        return Err(indeterminate("git's registration of it could not be read", &why))
+                    }
+                    _ => return Ok(()),
+                }
+            }
+            Presence::Unverified(why) => {
+                return Err(indeterminate("whether the directory is there could not be told", &why.to_string()))
+            }
+        };
+        let state = match (gone, attached) {
+            (true, true) => format!("git still registers {path}, whose directory is gone"),
+            (true, false) => {
+                format!("git still registers {path}, whose directory is gone, with a detached HEAD")
+            }
+            (false, true) => format!("the checkout at {path} is registered"),
+            (false, false) => format!("the checkout at {path} has a detached HEAD"),
+        };
+        // Whether the checkout's reflog can be read at all depends on how the
+        // repository stores refs; where it cannot, nothing below can show
+        // that removal loses nothing.
+        Self::ensure_reflog_inspectable(repo_path)
+            .await
+            .map_err(|why| format!(
+                "{path} was not removed, because {state} and {why} Nothing was changed. To remove it, \
+                 first inspect `git reflog` in the checkout and keep what you need with \
+                 `git branch <name> <commit>`, then run `git worktree remove` in {repo_path} yourself."
+            ))?;
+        let cannot_say = |why: &str| {
+            format!(
+                "{path} was not removed, because {state} and git could not say whether any ref \
+                 names its commits ({why}): removing it might make work made there unreachable. \
+                 Nothing was changed."
+            )
+        };
+        // A checkout with a branch checked out keeps that branch, so the
+        // commit its `HEAD` is at is named; only a detached `HEAD` is the
+        // sole name for it.
+        let reaching = match attached {
+            true => Vec::new(),
+            false => Self::refs_reaching(repo_path, &head).await.map_err(|why| cannot_say(&why))?,
+        };
+        if !attached && reaching.is_empty() {
+            return Err(format!(
+                "{path} was not removed, because {state} at {head}, and no ref names that commit: \
+                 removing it would make work made there unreachable. To keep it, run \
+                 `git branch <name> {head}` (or `git tag <name> {head}`) in {repo_path}, then \
+                 remove the checkout again. Nothing was changed."
+            ));
+        }
+        let moved_away = Self::reflog_only_commits(repo_path, &path, !gone)
+            .await
+            .map_err(|why| cannot_say(&why))?;
+        if let Some(newest) = moved_away.first() {
+            return Err(format!(
+                "{path} was not removed, because {state}, and {} commit(s) it moved away from, \
+                 newest {newest}, are named by nothing but that checkout's HEAD history, which \
+                 removal deletes: removing it would make work made there unreachable. To keep it, \
+                 run `git branch <name> {newest}` (or `git tag <name> {newest}`) in {repo_path}, \
+                 then remove the checkout again. Nothing was changed.",
+                moved_away.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the repository stores refs the way this inspection can read.
+    ///
+    /// Only the `files` backend keeps a checkout's `HEAD` reflog as the file
+    /// `logs/HEAD` in its registration, which is what the inspection reads.
+    /// `reftable`, or any backend this does not know, keeps it elsewhere, and
+    /// a reflog file that is missing there would read as "nothing to keep".
+    /// So anything but `files` is refused, and so is a repository whose
+    /// storage cannot be determined. `git rev-parse --show-ref-format` names
+    /// the backend where git has it; a git without it prints the option back,
+    /// and then the repository is `files` unless `extensions.refStorage` says
+    /// otherwise (git before 2.45 has no other backend).
+    async fn ensure_reflog_inspectable(repo_path: &str) -> Result<(), String> {
+        let unsupported = |name: &str| {
+            format!(
+                "the repository stores refs with the `{name}` backend, whose checkout reflog \
+                 cannot be inspected here, so it is not known whether removing it would make \
+                 work made there unreachable."
+            )
+        };
+        let undetermined = |why: &str| {
+            format!(
+                "how the repository stores refs could not be determined ({why}), so it is not \
+                 known whether removing it would make work made there unreachable."
+            )
+        };
+        let git = |args: &[&str]| {
+            tokio::process::Command::new(git_program()).args(args).current_dir(repo_path).output()
+        };
+        let shown = git(&["rev-parse", "--show-ref-format"])
+            .await
+            .map_err(|e| undetermined(&format!("`git rev-parse` could not be run in {repo_path}: {e}")))?;
+        if !shown.status.success() {
+            return Err(undetermined(String::from_utf8_lossy(&shown.stderr).trim()));
+        }
+        let shown = String::from_utf8_lossy(&shown.stdout).trim().to_string();
+        match shown.as_str() {
+            "files" => return Ok(()),
+            "--show-ref-format" => {}
+            other => return Err(unsupported(other)),
+        }
+        let config = git(&["config", "--get", "extensions.refStorage"])
+            .await
+            .map_err(|e| undetermined(&format!("`git config` could not be run in {repo_path}: {e}")))?;
+        match config.status.code() {
+            Some(1) => Ok(()),
+            Some(0) => match String::from_utf8_lossy(&config.stdout).trim() {
+                "files" => Ok(()),
+                other => Err(unsupported(other)),
+            },
+            _ => Err(undetermined(String::from_utf8_lossy(&config.stderr).trim())),
+        }
+    }
+
+    /// The commits, newest first, that the `HEAD` reflog of the checkout
+    /// registered at `path` reaches and no ref in `repo_path` does, or why
+    /// that could not be asked.
+    ///
+    /// A reflog git never kept (`core.logAllRefUpdates` off) has no entries
+    /// and is not an error. An entry whose object is gone is skipped by git
+    /// itself, since it can no longer be lost.
+    async fn reflog_only_commits(repo_path: &str, path: &str, present: bool) -> Result<Vec<String>, String> {
+        let common = Self::common_git_dir(repo_path).await?;
+        let Some(git_dir) = Self::registration_git_dir(&common, path, present).await? else {
+            return Err(format!("git has no registration directory for {path}"));
+        };
+        let entries = Self::reflog_entries(&git_dir.join("logs").join("HEAD")).await?;
+        let own = distinct_commits(&entries);
+        if own.is_empty() {
+            return Ok(Vec::new());
+        }
+        // What the repository's own branch reflogs keep survives the removal,
+        // so work they reach (amended or rebased away on a branch) is
+        // recoverable and not counted. `rev-list --reflog` cannot say this:
+        // it also reads the reflog about to be deleted.
+        let mut kept = Vec::new();
+        let mut dirs = vec![common.join("logs").join("refs").join("heads")];
+        while let Some(dir) = dirs.pop() {
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("{} could not be read: {e}", dir.display())),
+            };
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|e| format!("{} could not be read: {e}", dir.display()))?
+            {
+                let is_dir = entry
+                    .file_type()
+                    .await
+                    .map_err(|e| format!("{} could not be read: {e}", entry.path().display()))?
+                    .is_dir();
+                if is_dir {
+                    dirs.push(entry.path());
+                } else {
+                    kept.extend(distinct_commits(&Self::reflog_entries(&entry.path()).await?));
+                }
+            }
+        }
+        let mut revs = own.join("\n");
+        revs.push_str("\n--not\n");
+        revs.push_str(&kept.join("\n"));
+        revs.push('\n');
+        let mut child = tokio::process::Command::new(git_program())
+            .args(["rev-list", "--ignore-missing", "--not", "--all", "--stdin"])
+            .current_dir(repo_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("`git rev-list` could not be run in {repo_path}: {e}"))?;
+        let mut stdin = child.stdin.take().ok_or("`git rev-list` has no stdin")?;
+        let writing = async move {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(revs.as_bytes()).await
+        };
+        let (written, output) = tokio::join!(writing, child.wait_with_output());
+        let output = output.map_err(|e| format!("`git rev-list` could not be run in {repo_path}: {e}"))?;
+        if !output.status.success() {
+            let said = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let said = if said.is_empty() { format!("`git rev-list` exited with {}", output.status) } else { said };
+            return Err(match written {
+                Err(e) => format!("{said}; writing the reflog to it failed: {e}"),
+                Ok(()) => said,
+            });
+        }
+        written.map_err(|e| format!("`git rev-list` could not be given the reflog: {e}"))?;
+        let unreachable: Vec<String> =
+            String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect();
+        // What a successfully completed rebase only passed through is not
+        // work the checkout holds: its result is named by a ref, and what is
+        // left in the `HEAD` reflog are the steps that built it.
+        let still_unreachable: std::collections::HashSet<&str> =
+            unreachable.iter().map(String::as_str).collect();
+        let transient = completed_rebase_transients(&entries, |result| !still_unreachable.contains(result));
+        Ok(unreachable.into_iter().filter(|c| !transient.contains(c)).collect())
+    }
+
+    /// The entries of a reflog file, oldest first, or none when git never
+    /// kept it. A line git would not have written is an error, never skipped.
+    async fn reflog_entries(file: &Path) -> Result<Vec<ReflogEntry>, String> {
+        let reflog = match tokio::fs::read(file).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("{} could not be read: {e}", file.display())),
+        };
+        let mut entries = Vec::new();
+        for line in reflog.lines().filter(|l| !l.trim().is_empty()) {
+            let (head, message) = line.split_once('\t').unwrap_or((line, ""));
+            let ids: Vec<&str> = head.split(' ').take(2).collect();
+            let is_id = |id: &&str| matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit());
+            if ids.len() < 2 || !ids.iter().all(is_id) {
+                return Err(format!("{} has a line git would not write: {line:?}", file.display()));
+            }
+            entries.push(ReflogEntry {
+                old: ids[0].to_string(),
+                new: ids[1].to_string(),
+                message: message.to_string(),
+            });
+        }
+        Ok(entries)
+    }
+
+    /// The common git directory of `repo_path`.
+    async fn common_git_dir(repo_path: &str) -> Result<PathBuf, String> {
+        let output = tokio::process::Command::new(git_program())
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| format!("`git rev-parse` could not be run in {repo_path}: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        Ok(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+    }
+
+    /// The directory under the common git dir that holds the registration of
+    /// the checkout at `path`, found by the `gitdir` file each registration
+    /// keeps, or `None` when no registration says it is `path`'s.
+    async fn registration_git_dir(
+        common: &Path,
+        path: &str,
+        present: bool,
+    ) -> Result<Option<PathBuf>, String> {
+        if present {
+            // Ask the checkout itself: it answers whatever way its path is
+            // spelled, where the `gitdir` files below match only git's own.
+            let output = tokio::process::Command::new(git_program())
+                .args(["rev-parse", "--absolute-git-dir"])
+                .current_dir(path)
+                .output()
+                .await
+                .map_err(|e| format!("`git rev-parse` could not be run in {path}: {e}"))?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            return Ok(Some(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())));
+        }
+        let worktrees = common.join("worktrees");
+        let wanted = resolved_path(Path::new(path)).join(".git");
+        let mut entries = match tokio::fs::read_dir(&worktrees).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{} could not be read: {e}", worktrees.display())),
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| format!("{} could not be read: {e}", worktrees.display()))?
+        {
+            if let Ok(recorded) = tokio::fs::read_to_string(entry.path().join("gitdir")).await {
+                if registered_gitdir(&entry.path(), &recorded) == wanted {
+                    return Ok(Some(entry.path()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The refs in `repo_path` that reach `commit`, or why that could not be
+    /// asked.
+    async fn refs_reaching(repo_path: &str, commit: &str) -> Result<Vec<String>, String> {
+        if commit.is_empty() {
+            return Err("git listed no commit for its HEAD".to_string());
+        }
+        let output = tokio::process::Command::new(git_program())
+            .args(["for-each-ref", "--contains", commit, "--format=%(refname)"])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| format!("`git for-each-ref` could not be run in {repo_path}: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect())
     }
 
     /// Check if a worktree directory exists on disk.
@@ -1623,9 +2153,10 @@ impl WorktreeRecord {
 
         let (admin, gitlink_contents) = match std::fs::read(&gitlink) {
             Ok(contents) => {
-                let admin = PathBuf::from(
-                    std::str::from_utf8(&contents).ok()?.strip_prefix("gitdir:")?.trim(),
-                );
+                // Under `worktree.useRelativePaths` the pointer is relative
+                // to the directory it is in.
+                let pointed = std::str::from_utf8(&contents).ok()?.strip_prefix("gitdir:")?.trim();
+                let admin = worktree_relative(Path::new(worktree_path), pointed);
                 (admin, contents)
             }
             Err(_) => {
@@ -1641,7 +2172,7 @@ impl WorktreeRecord {
         // Wherever the pointer came from, where it leads is checked against
         // what git says about this repository rather than taken on trust:
         // only this repository's own worktree records are ever copied.
-        if admin.parent() != Some(worktrees_dir.as_path()) {
+        if admin.parent().map(resolved_path) != Some(resolved_path(&worktrees_dir)) {
             return None;
         }
 
@@ -1689,7 +2220,7 @@ impl WorktreeRecord {
     /// claims the same path -- restoring the wrong one would be worse than
     /// restoring none.
     fn locate_admin(worktrees_dir: &Path, worktree_path: &str) -> Option<PathBuf> {
-        let wanted = Path::new(worktree_path).join(".git");
+        let wanted = resolved_path(Path::new(worktree_path)).join(".git");
         let mut found: Option<PathBuf> = None;
 
         for entry in std::fs::read_dir(worktrees_dir).ok()?.flatten() {
@@ -1700,7 +2231,7 @@ impl WorktreeRecord {
             let Ok(contents) = std::fs::read_to_string(admin.join("gitdir")) else {
                 continue;
             };
-            if Path::new(contents.trim()) != wanted {
+            if registered_gitdir(&admin, &contents) != wanted {
                 continue;
             }
             if found.is_some() {
@@ -2230,6 +2761,791 @@ mod tests {
             .expect("once pruned, the checkout is acquired");
         assert_eq!(again.path, info.path);
         assert!(Path::new(&again.path).is_dir());
+    }
+
+    /// A checkout of `branch` whose `HEAD` is detached at a commit no ref
+    /// names, and that commit.
+    async fn detached_with_unique_commit(
+        mgr: &WorktreeManager,
+        repo_path: &str,
+        branch: &str,
+    ) -> (WorktreeInfo, String) {
+        let info = mgr.create(repo_path, branch).await.expect("create failed");
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        let detached = commit_work(&info.path, "detached.txt");
+        assert!(refs_reaching(repo_path, &detached).is_empty());
+        (info, detached)
+    }
+
+    /// Everything a refused removal has to have left alone: the registration
+    /// with the `HEAD` it keeps, and a commit that stays reachable through it
+    /// and is not unreachable to `git fsck`.
+    fn assert_detached_commit_kept(repo_path: &str, path: &str, commit: &str) {
+        assert!(
+            registration_of(repo_path, path).is_some_and(|r| r.contains(&format!("HEAD {commit}"))),
+            "the registration, and the HEAD it keeps, are left alone"
+        );
+        run_git(repo_path, &["rev-parse", "--verify", "-q", &format!("{commit}^{{commit}}")]);
+        let unreachable = run_git(repo_path, &["fsck", "--unreachable", "--no-reflogs"]);
+        assert!(
+            !unreachable.contains(commit),
+            "git still reaches the commit through the registration: {unreachable}"
+        );
+    }
+
+    /// What counts as naming a commit is any ref that reaches it, and a
+    /// commit git cannot be asked about is an error, never "unnamed".
+    #[tokio::test]
+    async fn refs_reaching_counts_any_ref_and_refuses_an_unknown_commit() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap();
+        let head = run_git(repo_path, &["rev-parse", "HEAD"]).trim().to_string();
+        run_git(repo_path, &["tag", "-a", "-m", "note", "keep", &head]);
+        let refs = WorktreeManager::refs_reaching(repo_path, &head).await.unwrap();
+        assert!(refs.iter().any(|r| r == "refs/tags/keep"), "{refs:?}");
+        assert!(WorktreeManager::refs_reaching(repo_path, "").await.is_err());
+        assert!(WorktreeManager::refs_reaching(repo_path, &"0".repeat(40)).await.is_err());
+    }
+
+    /// Removing a checkout that is there, detached at a commit nothing else
+    /// names, is refused: `git worktree remove` would take the only `HEAD`
+    /// naming it. The error says so, names the commit and how to keep it,
+    /// and changes nothing. Once the user names the commit, the same removal
+    /// goes through.
+    #[tokio::test]
+    async fn removing_a_present_detached_checkout_holding_a_unique_commit_is_refused() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let branch = "task-abcd1234";
+        let (info, detached) = detached_with_unique_commit(&mgr, &repo_path, branch).await;
+
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect_err("the detached HEAD is the only thing naming the commit");
+        assert!(refused.contains(&detached), "the commit is named: {refused}");
+        assert!(refused.contains("unreachable"), "the consequence is named: {refused}");
+        assert!(refused.contains("git branch <name>"), "the way to keep it is named: {refused}");
+        assert!(Path::new(&info.path).is_dir(), "the checkout is untouched");
+        assert_detached_commit_kept(&repo_path, &info.path, &detached);
+
+        run_git(&repo_path, &["branch", "kept-work", &detached]);
+        mgr.remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect("once a branch names the commit, nothing is lost");
+        assert!(!Path::new(&info.path).exists());
+        assert!(refs_reaching(&repo_path, &detached).contains(&"refs/heads/kept-work".to_string()));
+    }
+
+    /// The same for a checkout whose directory is gone while git still holds
+    /// its unlocked, detached registration.
+    #[tokio::test]
+    async fn removing_a_missing_detached_checkout_holding_a_unique_commit_is_refused() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let branch = "task-abcd1234";
+        let (info, detached) = detached_with_unique_commit(&mgr, &repo_path, branch).await;
+        std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect_err("clearing the registration would drop the only HEAD naming the commit");
+        assert!(refused.contains(&detached), "the commit is named: {refused}");
+        assert!(refused.contains("unreachable"), "the consequence is named: {refused}");
+        assert!(refused.contains("git branch <name>"), "the way to keep it is named: {refused}");
+        assert_detached_commit_kept(&repo_path, &info.path, &detached);
+
+        // Refused again, not worn down by a second attempt.
+        mgr.remove(&info.path, &repo_path, Some(branch)).await.expect_err("still refused");
+        assert_detached_commit_kept(&repo_path, &info.path, &detached);
+
+        run_git(&repo_path, &["tag", "kept-work", &detached]);
+        mgr.remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect("once a tag names the commit, the registration is cleared");
+        assert!(registration_of(&repo_path, &info.path).is_none());
+        assert!(refs_reaching(&repo_path, &detached).contains(&"refs/tags/kept-work".to_string()));
+    }
+
+    /// A detached checkout whose commit a ref already reaches loses nothing,
+    /// present or gone, and is removed as before.
+    #[tokio::test]
+    async fn removing_a_detached_checkout_whose_commit_a_ref_reaches_is_allowed() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let branch = "task-abcd1234";
+        let info = mgr.create(&repo_path, branch).await.expect("create failed");
+        commit_work(&info.path, "work.txt");
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        mgr.remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect("the task branch names the detached commit");
+        assert!(!Path::new(&info.path).exists());
+        assert!(branch_exists(&repo_path, branch));
+
+        let other = "task-ffff0000";
+        let info = mgr.create(&repo_path, other).await.expect("create failed");
+        commit_work(&info.path, "more.txt");
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+        mgr.remove(&info.path, &repo_path, Some(other))
+            .await
+            .expect("the task branch names the commit of the missing registration");
+        assert!(registration_of(&repo_path, &info.path).is_none());
+    }
+
+    /// A checkout detached at a commit an ordinary branch names, after it
+    /// made a commit that branch does not reach: the checkout moved away
+    /// from that commit, so only its `HEAD` reflog still reaches it. Returns
+    /// the checkout and that commit.
+    async fn detached_after_moving_away_from_unique_commit(
+        mgr: &WorktreeManager,
+        repo_path: &str,
+        branch: &str,
+    ) -> (WorktreeInfo, String) {
+        let info = mgr.create(repo_path, branch).await.expect("create failed");
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        let first = commit_work(&info.path, "first.txt");
+        let tree = run_git(repo_path, &["rev-parse", "HEAD^{tree}"]);
+        let head = run_git(repo_path, &["rev-parse", "HEAD"]);
+        let other = run_git(repo_path, &["commit-tree", &tree, "-p", &head, "-m", "B"]);
+        run_git(repo_path, &["update-ref", "refs/heads/other", &other]);
+        run_git(&info.path, &["checkout", "-q", "--detach", "other"]);
+        assert!(refs_reaching(repo_path, &first).is_empty(), "no ref reaches the commit left behind");
+        assert!(!refs_reaching(repo_path, &other).is_empty(), "the commit it is at is named");
+        (info, first)
+    }
+
+    /// The commit is reachable, as far as git is concerned, only because the
+    /// registration's `HEAD` reflog still names it.
+    fn assert_reflog_still_keeps(repo_path: &str, path: &str, commit: &str) {
+        assert!(registration_of(repo_path, path).is_some(), "the registration is left alone");
+        run_git(repo_path, &["rev-parse", "--verify", "-q", &format!("{commit}^{{commit}}")]);
+        assert!(
+            !run_git(repo_path, &["fsck", "--unreachable"]).contains(commit),
+            "the reflog still protects the commit from being unreachable"
+        );
+    }
+
+    /// The case the commit `HEAD` is at being named does not cover: removal
+    /// takes the checkout's `HEAD` reflog down too, and with it the only
+    /// thing reaching an earlier commit. Proven with git before and after
+    /// `git worktree remove`, then refused instead, present or gone.
+    #[tokio::test]
+    async fn removing_a_detached_checkout_whose_reflog_alone_reaches_a_commit_is_refused() {
+        // What git does, without SlashIt's guard.
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let (info, first) = detached_after_moving_away_from_unique_commit(&mgr, &repo_path, "task-feed0001").await;
+        assert_reflog_still_keeps(&repo_path, &info.path, &first);
+        run_git(&repo_path, &["worktree", "remove", &info.path]);
+        assert!(refs_reaching(&repo_path, &first).is_empty());
+        assert!(
+            run_git(&repo_path, &["fsck", "--unreachable"]).contains(&first),
+            "plain `git worktree remove` leaves the commit unreachable"
+        );
+
+        // Present.
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let (info, first) = detached_after_moving_away_from_unique_commit(&mgr, &repo_path, "task-abcd1234").await;
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some("task-abcd1234"))
+            .await
+            .expect_err("the reflog is the only thing reaching the commit");
+        assert!(refused.contains(&first), "the commit is named: {refused}");
+        assert!(refused.contains("git branch <name>"), "the way to keep it is named: {refused}");
+        assert!(Path::new(&info.path).is_dir(), "the checkout is untouched");
+        assert_reflog_still_keeps(&repo_path, &info.path, &first);
+        run_git(&repo_path, &["branch", "kept-work", &first]);
+        mgr.remove(&info.path, &repo_path, Some("task-abcd1234"))
+            .await
+            .expect("once a branch names the commit, nothing is lost");
+        assert!(!Path::new(&info.path).exists());
+        assert!(!run_git(&repo_path, &["fsck", "--unreachable"]).contains(&first));
+
+        // Gone.
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let (info, first) = detached_after_moving_away_from_unique_commit(&mgr, &repo_path, "task-abcd1234").await;
+        std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some("task-abcd1234"))
+            .await
+            .expect_err("clearing the registration would delete the only reflog reaching the commit");
+        assert!(refused.contains(&first), "the commit is named: {refused}");
+        assert_reflog_still_keeps(&repo_path, &info.path, &first);
+        run_git(&repo_path, &["tag", "kept-work", &first]);
+        mgr.remove(&info.path, &repo_path, Some("task-abcd1234"))
+            .await
+            .expect("once a tag names the commit, the registration is cleared");
+        assert!(registration_of(&repo_path, &info.path).is_none());
+    }
+
+    /// A commit the detached `HEAD` was made on top of is reached through the
+    /// commit it is at, so a reflog entry for it is no reason to refuse.
+    #[tokio::test]
+    async fn a_detached_checkout_whose_earlier_commits_a_ref_reaches_is_removed() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let mgr = test_manager();
+        let info = mgr.create(&repo_path, "task-abcd1234").await.expect("create failed");
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        let first = commit_work(&info.path, "first.txt");
+        let second = commit_work(&info.path, "second.txt");
+        run_git(&repo_path, &["branch", "kept-work", &second]);
+        assert!(refs_reaching(&repo_path, &first).contains(&"refs/heads/kept-work".to_string()));
+        mgr.remove(&info.path, &repo_path, Some("task-abcd1234"))
+            .await
+            .expect("the branch reaches both commits through the second");
+        assert!(!Path::new(&info.path).exists());
+    }
+
+    /// The checkout is back on its branch, but it made a commit while
+    /// detached: only its `HEAD` reflog reaches that commit.
+    #[tokio::test]
+    async fn removing_a_branch_checkout_that_left_a_detached_commit_behind_is_refused() {
+        let mgr = test_manager();
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let branch = "task-abcd1234";
+        let info = mgr.create(&repo_path, branch).await.expect("create failed");
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        let left = commit_work(&info.path, "left.txt");
+        run_git(&info.path, &["switch", "-q", branch]);
+        assert!(refs_reaching(&repo_path, &left).is_empty());
+        // A trailing slash is the same checkout spelled another way.
+        let spelled = format!("{}/", info.path);
+        let refused = mgr
+            .remove(&spelled, &repo_path, Some(branch))
+            .await
+            .expect_err("the reflog is the only thing reaching the commit");
+        assert!(refused.contains(&left), "{refused}");
+        assert_reflog_still_keeps(&repo_path, &info.path, &left);
+        run_git(&repo_path, &["tag", "kept-work", &left]);
+        mgr.remove(&info.path, &repo_path, Some(branch)).await.expect("named, so removable");
+    }
+
+    /// Work amended or rebased away on the task branch is still in the
+    /// branch's own reflog, which removal keeps, so it is no reason to refuse.
+    #[tokio::test]
+    async fn amended_work_on_a_branch_checkout_does_not_block_removal() {
+        let mgr = test_manager();
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let branch = "task-abcd1234";
+        let info = mgr.create(&repo_path, branch).await.expect("create failed");
+        commit_work(&info.path, "work.txt");
+        run_git(&info.path, &["commit", "-q", "--amend", "-m", "amended"]);
+        mgr.remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect("the old commit stays reachable through the branch's reflog");
+        assert!(branch_exists(&repo_path, branch));
+    }
+
+    /// Run git with extra environment, for a rebase that must not open an
+    /// editor.
+    fn run_git_env(dir: &str, envs: &[(&str, &str)], args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .envs(envs.iter().copied())
+            .env("GIT_EDITOR", "true")
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"))
+    }
+
+    /// A commit of `contents` in `file`, with `extra` arguments to `commit`.
+    fn commit_file(dir: &str, file: &str, contents: &str, extra: &[&str]) -> String {
+        std::fs::write(Path::new(dir).join(file), contents).expect("write file");
+        run_git(dir, &["add", "-A"]);
+        let mut args = vec!["-c", "user.email=t@t.t", "-c", "user.name=T", "commit", "-q"];
+        args.extend_from_slice(extra);
+        run_git(dir, &args);
+        run_git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// The commits the checkout's `HEAD` reflog names that no ref and no
+    /// branch reflog does: what removal would leave unreachable.
+    fn head_reflog_only(repo_path: &str, wt: &str, branch: &str) -> Vec<String> {
+        let ids = |args: &[&str], dir: &str| -> Vec<String> {
+            run_git(dir, args).lines().map(str::to_string).collect()
+        };
+        let head = ids(&["log", "-g", "--format=%H", "HEAD"], wt);
+        let kept = ids(&["log", "-g", "--format=%H", &format!("refs/heads/{branch}")], repo_path);
+        let reachable = ids(&["rev-list", "--all"], repo_path);
+        let mut only: Vec<String> = Vec::new();
+        for id in head {
+            if !kept.contains(&id) && !reachable.contains(&id) && !only.contains(&id) {
+                only.push(id);
+            }
+        }
+        only
+    }
+
+    /// A branch checkout holding two commits and a fixup for each, so a rebase
+    /// with `--autosquash` has steps to take.
+    async fn branch_checkout_with_fixup(
+        mgr: &WorktreeManager,
+        repo_path: &str,
+        branch: &str,
+    ) -> WorktreeInfo {
+        let info = mgr.create(repo_path, branch).await.expect("create failed");
+        commit_file(&info.path, "a.txt", "a\n", &["-m", "add a"]);
+        commit_file(&info.path, "b.txt", "b\n", &["-m", "add b"]);
+        commit_file(&info.path, "a.txt", "a2\n", &["--fixup", "HEAD~1"]);
+        commit_file(&info.path, "b.txt", "b2\n", &["--fixup", "HEAD~1"]);
+        info
+    }
+
+    /// A rebase that is done leaves the steps it took only in the `HEAD`
+    /// reflog, and they are no work to keep: the branch it returned to
+    /// names the result. `rebase -i --autosquash` reproduces this.
+    #[tokio::test]
+    async fn a_checkout_whose_autosquash_rebase_completed_is_removable() {
+        let mgr = test_manager();
+        for gone in [false, true] {
+            let repo = create_temp_git_repo();
+            let repo_path = repo.path().to_str().unwrap().to_string();
+            let branch = "task-abcd1234";
+            let info = branch_checkout_with_fixup(&mgr, &repo_path, branch).await;
+            let done = run_git_env(
+                &info.path,
+                &[("GIT_SEQUENCE_EDITOR", "true")],
+                &["rebase", "-q", "-i", "--autosquash", "main"],
+            );
+            assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+            assert!(
+                !head_reflog_only(&repo_path, &info.path, branch).is_empty(),
+                "the rebase left steps that only the HEAD reflog reaches"
+            );
+            if gone {
+                std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+            }
+            mgr.remove(&info.path, &repo_path, Some(branch))
+                .await
+                .expect("only the steps of a completed rebase are unreferenced");
+            assert!(registration_of(&repo_path, &info.path).is_none());
+            assert!(branch_exists(&repo_path, branch), "the rebased branch is kept");
+        }
+    }
+
+    /// A plain interactive rebase that completed is removable too, whether or
+    /// not it left steps only the `HEAD` reflog reaches (squashing does).
+    #[tokio::test]
+    async fn a_checkout_whose_plain_interactive_rebase_completed_is_removable() {
+        let mgr = test_manager();
+        for (editor, leaves_steps) in [("true", false), ("sed -i -e 2s/^pick/squash/", true)] {
+            let repo = create_temp_git_repo();
+            let repo_path = repo.path().to_str().unwrap().to_string();
+            let branch = "task-abcd1234";
+            let info = mgr.create(&repo_path, branch).await.expect("create failed");
+            commit_file(&info.path, "a.txt", "a\n", &["-m", "add a"]);
+            commit_file(&info.path, "b.txt", "b\n", &["-m", "add b"]);
+            commit_file(&repo_path, "main.txt", "m\n", &["-m", "main moves"]);
+            let done = run_git_env(&info.path, &[("GIT_SEQUENCE_EDITOR", editor)], &["rebase", "-q", "-i", "main"]);
+            assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+            assert_eq!(!head_reflog_only(&repo_path, &info.path, branch).is_empty(), leaves_steps);
+            mgr.remove(&info.path, &repo_path, Some(branch))
+                .await
+                .expect("a completed rebase's steps are not unique work");
+            assert!(!Path::new(&info.path).exists());
+        }
+    }
+
+    /// A rebase stopped at `edit`, in which the user committed work of their
+    /// own: the rebase has not finished, so that commit is kept.
+    async fn checkout_stopped_in_a_rebase_with_work(
+        mgr: &WorktreeManager,
+        repo_path: &str,
+        branch: &str,
+    ) -> (WorktreeInfo, String) {
+        let info = branch_checkout_with_fixup(mgr, repo_path, branch).await;
+        let stopped = run_git_env(
+            &info.path,
+            &[("GIT_SEQUENCE_EDITOR", "sed -i -e 1s/^pick/edit/")],
+            &["rebase", "-q", "-i", "--autosquash", "main"],
+        );
+        assert!(!stopped.status.success() || Path::new(&info.path).join(".git").is_file());
+        let work = commit_file(&info.path, "mine.txt", "mine\n", &["-m", "my own work"]);
+        assert!(refs_reaching(repo_path, &work).is_empty());
+        (info, work)
+    }
+
+    #[tokio::test]
+    async fn a_checkout_interrupted_in_a_rebase_holding_work_is_refused() {
+        let mgr = test_manager();
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let branch = "task-abcd1234";
+        let (info, work) = checkout_stopped_in_a_rebase_with_work(&mgr, &repo_path, branch).await;
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect_err("the rebase has not finished; its commits are not a result");
+        assert!(refused.contains(&work) || refused.contains("no ref names"), "{refused}");
+        assert!(Path::new(&info.path).is_dir(), "the checkout is untouched");
+        assert_reflog_still_keeps(&repo_path, &info.path, &work);
+    }
+
+    /// An aborted rebase puts HEAD back, and the commit made while it was
+    /// stopped is then named by nothing but the `HEAD` reflog (proven with
+    /// `git fsck`), so removal refuses.
+    #[tokio::test]
+    async fn a_checkout_that_aborted_a_rebase_keeps_the_work_made_in_it() {
+        let mgr = test_manager();
+        for gone in [false, true] {
+            let repo = create_temp_git_repo();
+            let repo_path = repo.path().to_str().unwrap().to_string();
+            let branch = "task-abcd1234";
+            let (info, work) = checkout_stopped_in_a_rebase_with_work(&mgr, &repo_path, branch).await;
+            let aborted = run_git_env(&info.path, &[], &["rebase", "--abort"]);
+            assert!(aborted.status.success(), "{}", String::from_utf8_lossy(&aborted.stderr));
+            assert!(
+                run_git(&repo_path, &["fsck", "--unreachable", "--no-reflogs"]).contains(&work),
+                "only the HEAD reflog keeps the commit once the rebase is aborted"
+            );
+            if gone {
+                std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+            }
+            let refused = mgr
+                .remove(&info.path, &repo_path, Some(branch))
+                .await
+                .expect_err("the aborted rebase's commit would be lost");
+            assert!(refused.contains(&work), "{refused}");
+            assert_reflog_still_keeps(&repo_path, &info.path, &work);
+            run_git(&repo_path, &["branch", "kept-work", &work]);
+            mgr.remove(&info.path, &repo_path, Some(branch)).await.expect("named, so removable");
+        }
+    }
+
+    /// A commit made detached, unrelated to a rebase that completed in the
+    /// same checkout, is still unique work.
+    #[tokio::test]
+    async fn a_detached_commit_beside_a_completed_rebase_is_still_refused() {
+        let mgr = test_manager();
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let branch = "task-abcd1234";
+        let info = branch_checkout_with_fixup(&mgr, &repo_path, branch).await;
+        let done = run_git_env(
+            &info.path,
+            &[("GIT_SEQUENCE_EDITOR", "true")],
+            &["rebase", "-q", "-i", "--autosquash", "main"],
+        );
+        assert!(done.status.success());
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        let manual = commit_file(&info.path, "manual.txt", "manual\n", &["-m", "detached work"]);
+        run_git(&info.path, &["switch", "-q", branch]);
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect_err("a manual detached commit is unique work");
+        assert!(refused.contains(&manual), "{refused}");
+        assert!(refused.contains("1 commit(s)"), "only the manual commit is counted: {refused}");
+        assert_reflog_still_keeps(&repo_path, &info.path, &manual);
+    }
+
+    /// Reset and amend on the task branch, done after a completed rebase,
+    /// remain recoverable from the branch's reflog and do not block removal.
+    #[tokio::test]
+    async fn amend_and_reset_after_a_completed_rebase_do_not_block_removal() {
+        let mgr = test_manager();
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let branch = "task-abcd1234";
+        let info = branch_checkout_with_fixup(&mgr, &repo_path, branch).await;
+        run_git_env(&info.path, &[("GIT_SEQUENCE_EDITOR", "true")], &["rebase", "-q", "-i", "--autosquash", "main"]);
+        run_git(&info.path, &["commit", "-q", "--amend", "-m", "amended"]);
+        run_git(&info.path, &["reset", "-q", "--hard", "HEAD~1"]);
+        mgr.remove(&info.path, &repo_path, Some(branch)).await.expect("branch reflog keeps them");
+    }
+
+    fn entry(old: &str, new: &str, message: &str) -> ReflogEntry {
+        let id = |c: &str| c.repeat(40);
+        ReflogEntry { old: id(old), new: id(new), message: message.to_string() }
+    }
+
+    /// The rule on hand-written logs: what counts as a completed rebase and
+    /// what may never be dropped.
+    #[test]
+    fn completed_rebase_transients_follow_the_rule() {
+        let id = |c: &str| c.repeat(40);
+        let named = |_: &str| true;
+        let complete = vec![
+            entry("1", "2", "rebase (start): checkout main"),
+            entry("2", "3", "rebase (pick): x"),
+            entry("3", "4", "rebase (fixup): x"),
+            entry("4", "5", "rebase (pick): y"),
+            entry("5", "5", "rebase (finish): returning to refs/heads/t"),
+        ];
+        // The start's commit, and the result, are never steps; the middle ones are.
+        let got = completed_rebase_transients(&complete, named);
+        assert_eq!(got, [id("3"), id("4")].into_iter().collect());
+        // A result that nothing names keeps every step.
+        assert!(completed_rebase_transients(&complete, |_| false).is_empty());
+        // No finish: interrupted.
+        assert!(completed_rebase_transients(&complete[..4], named).is_empty());
+        // Abort instead of finish.
+        let mut aborted = complete[..4].to_vec();
+        aborted.push(entry("4", "1", "rebase (abort): returning to refs/heads/t"));
+        assert!(completed_rebase_transients(&aborted, named).is_empty());
+        // Finishing to something other than a branch is not a success.
+        let mut detached = complete[..4].to_vec();
+        detached.push(entry("4", "4", "rebase (finish): returning to HEAD"));
+        assert!(completed_rebase_transients(&detached, named).is_empty());
+        // Steps without a start are not a rebase.
+        assert!(completed_rebase_transients(&complete[1..], named).is_empty());
+        // A step that does not continue from the last HEAD breaks the sequence.
+        let mut broken = complete.clone();
+        broken[3] = entry("9", "4", "rebase (pick): y");
+        assert!(completed_rebase_transients(&broken, named).is_empty());
+        // An ordinary entry naming a step's commit keeps it, wherever it is.
+        let mut named_elsewhere = vec![entry("0", "3", "commit: user work")];
+        named_elsewhere.extend(complete.clone());
+        assert_eq!(completed_rebase_transients(&named_elsewhere, named), [id("4")].into_iter().collect());
+        // A later aborted rebase that reuses a step's commit keeps it too.
+        let mut reused = complete.clone();
+        reused.push(entry("5", "5", "rebase (start): checkout main"));
+        reused.push(entry("5", "4", "rebase (pick): z"));
+        assert_eq!(completed_rebase_transients(&reused, named), [id("3")].into_iter().collect());
+        // A message that only starts with the word is not a rebase.
+        let mut forged = complete.clone();
+        forged[1] = entry("2", "3", "rebased: x");
+        assert_eq!(completed_rebase_transients(&forged, named), [id("4")].into_iter().collect());
+        // A parenthesis in a subject is not an action.
+        let mut subject = complete.clone();
+        subject[1] = entry("2", "3", "rebase: fast-forward (finish) (abort)");
+        assert_eq!(completed_rebase_transients(&subject, named), [id("3"), id("4")].into_iter().collect());
+        // Older git spelled the interactive rebase's messages with the option.
+        let mut legacy = complete.clone();
+        legacy[0] = entry("1", "2", "rebase -i (start): checkout main");
+        legacy[4] = entry("5", "5", "rebase -i (finish): returning to refs/heads/t");
+        assert_eq!(completed_rebase_transients(&legacy, named), [id("3"), id("4")].into_iter().collect());
+        // An amend while stopped does not end the rebase, and is itself kept.
+        let edited = vec![
+            entry("1", "2", "rebase (start): checkout main"),
+            entry("2", "3", "rebase (edit): x"),
+            entry("3", "8", "commit (amend): x"),
+            entry("8", "4", "rebase (continue): x"),
+            entry("4", "6", "rebase (pick): y"),
+            entry("6", "6", "rebase (finish): returning to refs/heads/t"),
+        ];
+        assert_eq!(completed_rebase_transients(&edited, named), [id("4")].into_iter().collect());
+    }
+
+    /// A relative `gitdir` is resolved against the registration directory it
+    /// is in, so it identifies the same checkout as the absolute spelling,
+    /// including through a symlinked parent.
+    #[test]
+    fn a_relative_gitdir_identifies_the_same_checkout_as_an_absolute_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().unwrap();
+        let admin = root.join("repo/.git/worktrees/wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir_all(root.join("checkouts")).unwrap();
+        let wanted = root.join("checkouts/wt/.git");
+        assert_eq!(registered_gitdir(&admin, "../../../../checkouts/wt/.git\n"), wanted);
+        assert_eq!(registered_gitdir(&admin, &format!("{}\n", wanted.display())), wanted);
+        assert_ne!(registered_gitdir(&admin, "../../../../checkouts/other/.git"), wanted);
+
+        let worktrees = root.join("repo/.git/worktrees");
+        std::fs::write(admin.join("gitdir"), "../../../../checkouts/wt/.git\n").unwrap();
+        assert_eq!(
+            WorktreeRecord::locate_admin(&worktrees, root.join("checkouts/wt").to_str().unwrap()),
+            Some(admin.clone()),
+        );
+        assert_eq!(
+            WorktreeRecord::locate_admin(&worktrees, root.join("checkouts/other").to_str().unwrap()),
+            None,
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("checkouts"), root.join("link")).unwrap();
+            assert_eq!(
+                WorktreeRecord::locate_admin(&worktrees, root.join("link/wt").to_str().unwrap()),
+                Some(admin),
+                "the same location through a symlink"
+            );
+        }
+    }
+
+    /// With `worktree.useRelativePaths`, git records the checkout and its
+    /// registration relative to each other. A checkout that is gone must
+    /// still be found by its registration. Needs a git that has the setting.
+    #[tokio::test]
+    async fn a_checkout_with_a_relative_registration_is_removable_present_or_gone() {
+        let mgr = test_manager();
+        for gone in [false, true] {
+            let repo = create_temp_git_repo();
+            let repo_path = repo.path().to_str().unwrap().to_string();
+            run_git(&repo_path, &["config", "worktree.useRelativePaths", "true"]);
+            let branch = "task-abcd1234";
+            let info = mgr.create(&repo_path, branch).await.expect("create failed");
+            let common = run_git(&repo_path, &["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+            let admins: Vec<_> = std::fs::read_dir(Path::new(&common).join("worktrees"))
+                .unwrap()
+                .flatten()
+                .collect();
+            let recorded = std::fs::read_to_string(admins[0].path().join("gitdir")).unwrap();
+            if Path::new(recorded.trim()).is_absolute() {
+                eprintln!("skipped: this git records absolute worktree paths");
+                return;
+            }
+            if gone {
+                std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+            }
+            mgr.remove(&info.path, &repo_path, Some(branch))
+                .await
+                .expect("a relative registration names the same checkout");
+            assert!(registration_of(&repo_path, &info.path).is_none());
+        }
+    }
+
+    /// Move a freshly made repository to `reftable`, or say that this git
+    /// cannot.
+    fn migrate_to_reftable(repo_path: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["refs", "migrate", "--ref-format=reftable"])
+            .current_dir(repo_path)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Under `reftable` a checkout's `HEAD` reflog is not the file
+    /// `logs/HEAD`, so a missing file is no evidence of an empty reflog.
+    /// Removal is refused before anything is touched, present or gone,
+    /// including for a commit only that reflog reaches.
+    #[tokio::test]
+    async fn removing_a_checkout_in_a_reftable_repository_is_refused_before_anything_changes() {
+        let mgr = test_manager();
+        for gone in [false, true] {
+            let repo = create_temp_git_repo();
+            let repo_path = repo.path().to_str().unwrap().to_string();
+            if !migrate_to_reftable(&repo_path) {
+                eprintln!("skipped: this git cannot use the reftable backend");
+                return;
+            }
+            let branch = "task-abcd1234";
+            let info = mgr.create(&repo_path, branch).await.expect("create failed");
+            run_git(&info.path, &["checkout", "-q", "--detach"]);
+            let left = commit_file(&info.path, "left.txt", "left\n", &["-m", "left behind"]);
+            run_git(&info.path, &["switch", "-q", branch]);
+            if gone {
+                std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+            }
+            let refused = mgr
+                .remove(&info.path, &repo_path, Some(branch))
+                .await
+                .expect_err("the reflog cannot be inspected under reftable");
+            assert!(refused.contains("reftable"), "{refused}");
+            assert!(refused.contains("Nothing was changed"), "{refused}");
+            assert!(refused.contains("git worktree remove"), "the way forward is named: {refused}");
+            assert_eq!(Path::new(&info.path).exists(), !gone, "the checkout is untouched");
+            assert!(registration_of(&repo_path, &info.path).is_some(), "the registration is intact");
+            run_git(&repo_path, &["rev-parse", "--verify", "-q", &format!("{left}^{{commit}}")]);
+        }
+    }
+
+    /// What storage a repository has is asked of git, never inferred from a
+    /// file being there or not.
+    #[tokio::test]
+    async fn ref_storage_is_asked_of_git_and_anything_but_files_or_unknown_is_refused() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        WorktreeManager::ensure_reflog_inspectable(&repo_path).await.expect("files storage is read");
+
+        // Not a repository, or a directory that is not there: not determined.
+        let nowhere = repo.path().join("missing");
+        let why = WorktreeManager::ensure_reflog_inspectable(nowhere.to_str().unwrap())
+            .await
+            .expect_err("an undeterminable storage is refused");
+        assert!(why.contains("could not be determined"), "{why}");
+
+        // A backend this does not know, whatever git says about it.
+        run_git(&repo_path, &["config", "core.repositoryformatversion", "1"]);
+        run_git(&repo_path, &["config", "extensions.refStorage", "future"]);
+        let why = WorktreeManager::ensure_reflog_inspectable(&repo_path)
+            .await
+            .expect_err("an unknown backend is refused");
+        assert!(why.contains("could not be determined") || why.contains("`future`"), "{why}");
+
+        // `reftable` itself, where this git has it.
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        if migrate_to_reftable(&repo_path) {
+            let why = WorktreeManager::ensure_reflog_inspectable(&repo_path)
+                .await
+                .expect_err("reftable is refused");
+            assert!(why.contains("`reftable`"), "{why}");
+        }
+    }
+
+    /// A reflog git would not have written is not read as an empty one.
+    #[tokio::test]
+    async fn a_corrupt_head_reflog_is_refused_not_read_as_empty() {
+        let mgr = test_manager();
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let branch = "task-abcd1234";
+        let info = mgr.create(&repo_path, branch).await.expect("create failed");
+        let git_dir = run_git(&info.path, &["rev-parse", "--absolute-git-dir"]);
+        std::fs::write(Path::new(&git_dir).join("logs/HEAD"), "truncated\n").unwrap();
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some(branch))
+            .await
+            .expect_err("an unreadable reflog is not known to be safe");
+        assert!(refused.contains("was not removed"), "{refused}");
+        assert!(Path::new(&info.path).is_dir());
+    }
+
+    /// Safety that cannot be established is not safety. Whatever git or the
+    /// filesystem fails to answer, nothing is removed and the reason is
+    /// given.
+    #[tokio::test]
+    async fn removal_that_cannot_prove_safety_is_refused_and_changes_nothing() {
+        let mgr = test_manager();
+
+        // The checkout's own HEAD cannot be read.
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let info = mgr.create(&repo_path, "task-abcd1234").await.expect("create failed");
+        std::fs::write(Path::new(&info.path).join(".git"), "not a gitdir pointer\n").unwrap();
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some("task-abcd1234"))
+            .await
+            .expect_err("a checkout git cannot read is not known to be safe");
+        assert!(refused.contains("was not removed"), "{refused}");
+        assert!(refused.contains("HEAD could not be read"), "{refused}");
+        assert!(Path::new(&info.path).is_dir(), "the checkout is untouched");
+        assert!(registration_of(&repo_path, &info.path).is_some(), "so is its registration");
+
+        // The directory is gone and git cannot list worktrees.
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let info = mgr.create(&repo_path, "task-abcd1234").await.expect("create failed");
+        run_git(&info.path, &["checkout", "-q", "--detach"]);
+        let kept = commit_work(&info.path, "kept.txt");
+        std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+        let admin = Path::new(&repo_path).join(".git/worktrees");
+        let registration = std::fs::read_dir(&admin).unwrap().next().unwrap().unwrap().path();
+        let head_file = Path::new(&repo_path).join(".git/HEAD");
+        let head = std::fs::read(&head_file).unwrap();
+        std::fs::write(&head_file, "garbage\n").unwrap();
+        let refused = mgr
+            .remove(&info.path, &repo_path, Some("task-abcd1234"))
+            .await
+            .expect_err("a listing git cannot give is not an empty one");
+        assert!(refused.contains("was not removed"), "{refused}");
+        assert!(refused.contains("worktree listing could not be read"), "{refused}");
+        assert!(registration.is_dir(), "the registration is untouched");
+        std::fs::write(&head_file, head).unwrap();
+        assert_detached_commit_kept(&repo_path, &info.path, &kept);
     }
 
     /// A task whose checkout directory vanished without being removed leaves

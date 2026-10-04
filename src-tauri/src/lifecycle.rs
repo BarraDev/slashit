@@ -1914,6 +1914,283 @@ mod tests {
         assert_eq!(world.persisted(id).worktree_path, None);
     }
 
+    /// A checkout of `world`'s repository detached at a commit no ref names,
+    /// and that commit.
+    async fn detached_checkout_with_unique_commit(world: &World) -> (String, String) {
+        let wt = worktree_with_committed_work(world, "task-abcd1234").await;
+        let dir = std::path::PathBuf::from(&wt);
+        git(&dir, &["checkout", "-q", "--detach"]);
+        std::fs::write(dir.join("detached.txt"), "only the detached HEAD names this\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "detached work"]);
+        let commit = git_output(&dir, &["rev-parse", "HEAD"]);
+        let refs = git_output(
+            std::path::Path::new(&repo_path(world)),
+            &["for-each-ref", "--contains", &commit],
+        );
+        assert!(refs.is_empty(), "no ref names it yet: {refs}");
+        (wt, commit)
+    }
+
+    fn git_output(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git must be spawnable");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// What finishing or deleting a task whose checkout is detached at a
+    /// commit only that `HEAD` names must leave: the task, its status, its
+    /// checkout reference, on the board and on disk, an error naming the
+    /// commit, and the commit still reachable through the registration.
+    async fn assert_detached_work_kept(world: &World, id: Uuid, wt: &str, commit: &str) {
+        let after = world.task(id).await;
+        assert_eq!(after.status, TaskStatus::HumanReview, "the status must not move");
+        assert_eq!(after.worktree_path.as_deref(), Some(wt));
+        assert!(after.branch_name.is_some(), "the branch is still recorded");
+        assert!(!after.cleanup_in_flight, "the cleanup lease is released");
+        assert!(
+            after.error_message.as_deref().unwrap_or_default().contains(commit),
+            "the task says which commit: {:?}",
+            after.error_message
+        );
+        assert_eq!(world.persisted(id).worktree_path.as_deref(), Some(wt));
+        let repo = std::path::PathBuf::from(repo_path(world));
+        assert!(
+            git_output(&repo, &["worktree", "list", "--porcelain"]).contains(&format!("HEAD {commit}")),
+            "the registration, and the HEAD it keeps, are left alone"
+        );
+        git(&repo, &["rev-parse", "--verify", "-q", &format!("{commit}^{{commit}}")]);
+        assert!(!git_output(&repo, &["fsck", "--unreachable", "--no-reflogs"]).contains(commit));
+    }
+
+    #[tokio::test]
+    async fn finishing_and_deleting_a_task_with_a_present_detached_unique_commit_keep_it() {
+        let world = world(true);
+        let (wt, commit) = detached_checkout_with_unique_commit(&world).await;
+        let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
+
+        let refusal = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect_err("removing the checkout would make its only commit unreachable");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        assert!(std::path::Path::new(&wt).is_dir());
+        assert_detached_work_kept(&world, id, &wt, &commit).await;
+
+        let refusal = delete(world.ctx(), id).await.expect_err("nor is deleting the task");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        assert!(world.tasks.read().await.contains_key(&id), "the task is not deleted");
+        assert_eq!(world.persisted(id).id, id, "and neither is its record");
+        assert_detached_work_kept(&world, id, &wt, &commit).await;
+
+        git(std::path::Path::new(&repo_path(&world)), &["branch", "kept-work", &commit]);
+        let done = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect("once the commit is named, finishing goes through");
+        assert_eq!(done.status, TaskStatus::Done);
+        assert_eq!(world.persisted(id).worktree_path, None);
+    }
+
+    #[tokio::test]
+    async fn finishing_and_deleting_a_task_with_a_missing_detached_unique_commit_keep_it() {
+        let world = world(true);
+        let (wt, commit) = detached_checkout_with_unique_commit(&world).await;
+        std::fs::remove_dir_all(&wt).unwrap();
+        let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
+
+        let refusal = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect_err("clearing the registration would make its only commit unreachable");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        assert_detached_work_kept(&world, id, &wt, &commit).await;
+
+        let refusal = delete(world.ctx(), id).await.expect_err("nor is deleting the task");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        assert!(world.tasks.read().await.contains_key(&id), "the task is not deleted");
+        assert_detached_work_kept(&world, id, &wt, &commit).await;
+
+        git(std::path::Path::new(&repo_path(&world)), &["tag", "kept-work", &commit]);
+        assert!(delete(world.ctx(), id).await.expect("once named, the delete goes through"));
+        assert!(!world.tasks.read().await.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn finishing_and_deleting_a_task_whose_checkout_reflog_alone_reaches_a_commit_keep_it() {
+        let world = world(true);
+        let (wt, first) = detached_checkout_with_unique_commit(&world).await;
+        let repo = std::path::PathBuf::from(repo_path(&world));
+        // Move the checkout onto a commit a branch names: the commit it made
+        // is now reached only by the checkout's HEAD reflog.
+        git(&repo, &["branch", "elsewhere", "HEAD"]);
+        git(std::path::Path::new(&wt), &["checkout", "-q", "--detach", "elsewhere"]);
+        let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
+
+        let refusal = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect_err("removing the checkout would delete the reflog that reaches the commit");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        let refusal = delete(world.ctx(), id).await.expect_err("nor is deleting the task");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        assert!(world.tasks.read().await.contains_key(&id), "the task is not deleted");
+        assert!(std::path::Path::new(&wt).is_dir());
+        assert_eq!(world.persisted(id).worktree_path.as_deref(), Some(wt.as_str()));
+        assert!(!git_output(&repo, &["fsck", "--unreachable"]).contains(&first));
+    }
+
+    #[tokio::test]
+    async fn finishing_and_deleting_a_task_in_a_reftable_repository_keep_it() {
+        let world = world(true);
+        let repo = std::path::PathBuf::from(repo_path(&world));
+        let migrated = std::process::Command::new("git")
+            .args(["refs", "migrate", "--ref-format=reftable"])
+            .current_dir(&repo)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !migrated {
+            eprintln!("skipped: this git cannot use the reftable backend");
+            return;
+        }
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
+
+        let refusal = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect_err("the checkout's reflog cannot be inspected under reftable");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        let refusal = delete(world.ctx(), id).await.expect_err("nor is deleting the task");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        let after = world.task(id).await;
+        assert_eq!(after.status, TaskStatus::HumanReview);
+        assert!(world.tasks.read().await.contains_key(&id));
+        assert!(!after.cleanup_in_flight);
+        assert!(std::path::Path::new(&wt).is_dir());
+        assert_eq!(world.persisted(id).worktree_path.as_deref(), Some(wt.as_str()));
+        assert!(
+            after.error_message.as_deref().unwrap_or_default().contains("reftable"),
+            "{:?}",
+            after.error_message
+        );
+        assert!(git_output(&repo, &["worktree", "list", "--porcelain"]).contains(&wt));
+    }
+
+    #[tokio::test]
+    async fn finishing_and_deleting_a_task_whose_checkout_git_cannot_read_keep_it() {
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        git(std::path::Path::new(&wt), &["checkout", "-q", "--detach"]);
+        std::fs::write(std::path::Path::new(&wt).join(".git"), "not a gitdir pointer\n").unwrap();
+        let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
+
+        let refusal = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect_err("safety could not be established");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        let refusal = delete(world.ctx(), id).await.expect_err("nor is deleting the task");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        let after = world.task(id).await;
+        assert_eq!(after.status, TaskStatus::HumanReview);
+        assert!(world.tasks.read().await.contains_key(&id));
+        assert!(!after.cleanup_in_flight);
+        assert!(std::path::Path::new(&wt).is_dir());
+        assert_eq!(world.persisted(id).worktree_path.as_deref(), Some(wt.as_str()));
+        assert!(
+            after.error_message.as_deref().unwrap_or_default().contains("could not be read"),
+            "the underlying reason is given: {:?}",
+            after.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detached_checkout_whose_commit_a_branch_names_is_finished_as_usual() {
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        git(std::path::Path::new(&wt), &["checkout", "-q", "--detach"]);
+        let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
+
+        let done = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect("the task branch names the commit, so nothing is lost");
+        assert_eq!(done.status, TaskStatus::Done);
+        assert!(!std::path::Path::new(&wt).exists());
+    }
+
+    #[tokio::test]
+    async fn a_task_whose_autosquash_rebase_completed_is_finished_and_deleted_as_usual() {
+        for delete_it in [false, true] {
+            let world = world(true);
+            let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+            let dir = std::path::PathBuf::from(&wt);
+            for (file, fixup) in [("work.txt", "HEAD"), ("other.txt", "HEAD")] {
+                std::fs::write(dir.join(file), "changed\n").unwrap();
+                git(&dir, &["add", "."]);
+                git(&dir, &["commit", "-q", "--fixup", fixup]);
+            }
+            let rebased = std::process::Command::new("git")
+                .args(["rebase", "-q", "-i", "--autosquash", "main"])
+                .env("GIT_SEQUENCE_EDITOR", "true")
+                .env("GIT_EDITOR", "true")
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(rebased.status.success(), "{}", String::from_utf8_lossy(&rebased.stderr));
+            let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
+
+            if delete_it {
+                delete(world.ctx(), id).await.expect("only a finished rebase's steps are left");
+                assert!(!world.tasks.read().await.contains_key(&id));
+            } else {
+                let done = terminalize(
+                    world.ctx(),
+                    id,
+                    Origin::User,
+                    TerminalizeRequest::new(TaskStatus::Done),
+                )
+                .await
+                .expect("only a finished rebase's steps are left");
+                assert_eq!(done.status, TaskStatus::Done);
+            }
+            assert!(!std::path::Path::new(&wt).exists());
+        }
+    }
+
     #[tokio::test]
     async fn a_delete_refuses_while_an_agent_owns_the_task_and_removes_nothing() {
         let world = world(true);
