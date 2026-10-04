@@ -11,6 +11,13 @@
 //! nothing here runs on its own: [`status`] only observes, [`restack`] is one
 //! explicit action, and [`discard`] is the way back.
 //!
+//! A branch that is on origin with no pull request yet (an earlier push went
+//! through and the pull request was never created) is published in the same
+//! sense: the remote has its commits, so opening it as it is would list the
+//! parent's old ones. It takes the same approved, guarded rewrite, minus the
+//! retarget, and the pull request is created afterwards against the default
+//! branch.
+//!
 //! Where the parent landed with a merge commit, its commits are on the default
 //! branch as they are and the branch already differs from it by exactly the
 //! child's own commits. Nothing is rewritten then; the pull request is only
@@ -78,7 +85,10 @@ pub enum RepublishStatus {
         parent_branch: String,
         parent_pr: u64,
         default_branch: String,
-        pr_number: u64,
+        /// The task's open pull request, or `None` for a branch pushed
+        /// without one, which is restacked so that its pull request can be
+        /// created against the default branch.
+        pr_number: Option<u64>,
         rewrites: bool,
     },
     /// The parent landed, but a restack is not possible as things are, and
@@ -155,7 +165,7 @@ struct Plan {
     parent_branch: String,
     parent_pr: u64,
     default_branch: String,
-    pr_number: u64,
+    pr_number: Option<u64>,
     fork_point: String,
     /// The branch's tip, which is also the remote's.
     tip: String,
@@ -204,17 +214,25 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
     let Some(stacked) = stacked_task(state, task_uuid).await.map_err(Refusal::Unknown)? else {
         return Ok(None);
     };
-    if !stacked.linked {
-        return Ok(None);
-    }
     let working_dir = resolve_repository_dir(state, task_uuid).await.map_err(Refusal::Unknown)?;
     let branch = checked_task_branch(&stacked.branch).map_err(Refusal::Unknown)?.to_string();
 
     let child = branch_pr_state(&working_dir, &branch).await.map_err(Refusal::Unknown)?;
-    let (Some("OPEN"), Some(pr_number)) = (child.state.as_deref(), child.number) else {
-        return Ok(None);
+    let (pr_number, child_base) = match (child.state.as_deref(), child.number) {
+        (Some("OPEN"), Some(number)) => (Some(number), child.base.clone().unwrap_or_default()),
+        // A pull request that is merged or closed is not this restack's to
+        // retarget or to republish for.
+        (Some(_), _) => return Ok(None),
+        (None, _) if stacked.linked => return Ok(None),
+        // No pull request: the branch is published only if origin has it.
+        // One that is not on origin is the unpublished restack's, at pull
+        // request creation.
+        (None, _) => match remote_branch_commit(&working_dir, &branch).await {
+            Ok(Some(_)) => (None, String::new()),
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(Refusal::Unknown(e)),
+        },
     };
-    let child_base = child.base.clone().unwrap_or_default();
 
     let origin = BranchOrigin::Stacked { parent_branch: stacked.parent_branch.clone() };
     let base = pr_base_for(&working_dir, Some(&origin), stacked.fork_point.as_deref(), true)
@@ -283,7 +301,8 @@ async fn observe(state: &crate::AppState, task_uuid: Uuid) -> Result<Option<Plan
     if restack::is_ancestor(repo, &fork_point, &onto).await.map_err(git_err)? {
         // The parent's commits are on the default branch as they are, so the
         // branch already differs from it by exactly its own commits.
-        return Ok((child_base != default).then(|| plan(false, tip, None)));
+        // With no pull request there is nothing to retarget either.
+        return Ok((pr_number.is_some() && child_base != default).then(|| plan(false, tip, None)));
     }
 
     match remote_branch_commit(&working_dir, &branch).await {
@@ -475,8 +494,11 @@ async fn restack_reserved(
             .to_string());
     };
     if !plan.rewrites {
+        let Some(pr_number) = plan.pr_number else {
+            return Err("There is nothing to restack: this task has no pull request to retarget.".to_string());
+        };
         refuse_if_pr_operation_cancelled(reservation, "retargeting the pull request")?;
-        converge_pr_base(&plan.working_dir, plan.pr_number, &plan.branch, &plan.default_branch).await?;
+        converge_pr_base(&plan.working_dir, pr_number, &plan.branch, &plan.default_branch).await?;
         return Ok(RepublishOutcome {
             rewritten: false,
             base: plan.default_branch,
@@ -688,13 +710,30 @@ async fn advance(
     match remote.as_deref() {
         Some(remote) if remote == rewritten => {}
         Some(remote) if remote == pending.previous_tip => {
-            let (state, _) = read_pr(&ctx.working_dir, pending.pr_number, branch).await?;
-            if !state.eq_ignore_ascii_case("OPEN") {
-                return Err(format!(
-                    "{context}, but pull request #{} is {state} now, not open, so there is nothing \
-                     left to republish it for. Nothing was pushed. Discard this restack.",
-                    pending.pr_number
-                ));
+            match pending.pr_number {
+                Some(number) => {
+                    let (state, _) = read_pr(&ctx.working_dir, number, branch).await?;
+                    if !state.eq_ignore_ascii_case("OPEN") {
+                        return Err(format!(
+                            "{context}, but pull request #{number} is {state} now, not open, so \
+                             there is nothing left to republish it for. Nothing was pushed. \
+                             Discard this restack."
+                        ));
+                    }
+                }
+                None => {
+                    // The approval was for a branch with no pull request. One
+                    // opened since was never part of it, and would be left
+                    // listing the old commits.
+                    let found = branch_pr_state(&ctx.working_dir, branch).await?;
+                    if let Some(number) = found.number {
+                        return Err(format!(
+                            "{context}, but pull request #{number} was opened for it since the \
+                             restack was approved. Nothing was pushed. Discard this restack and \
+                             restack again."
+                        ));
+                    }
+                }
             }
             refuse_if_pr_operation_cancelled(reservation, "updating the branch on origin")?;
             #[cfg(test)]
@@ -722,7 +761,9 @@ async fn advance(
     crash_after(Stage::Pushed)?;
 
     refuse_if_pr_operation_cancelled(reservation, "retargeting the pull request")?;
-    converge_pr_base(&ctx.working_dir, pending.pr_number, branch, &pending.default_branch).await?;
+    if let Some(number) = pending.pr_number {
+        converge_pr_base(&ctx.working_dir, number, branch, &pending.default_branch).await?;
+    }
     clear_pending(state, task_uuid, &pending).await?;
     // The backup has held the approved tip through every step that could still
     // need it: the remote update, the retarget and the cleared record. Only now
@@ -1020,7 +1061,7 @@ mod tests {
             parent_branch: "task-parent".to_string(),
             parent_pr: 7,
             default_branch: "main".to_string(),
-            pr_number: 21,
+            pr_number: Some(21),
             rewrites: true,
         };
         assert_eq!(

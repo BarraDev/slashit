@@ -18,9 +18,23 @@ use crate::services::pr_service::{discard_published_restack, get_published_resta
 /// Short name of the action, as the button says it.
 pub const ACTION_LABEL: &str = "Restack onto merged parent";
 
+fn pull_request(number: Option<u64>) -> String {
+    number.map_or_else(|| "The pull request".to_string(), |n| format!("Pull request #{n}"))
+}
+
 /// The notice's heading and its explanation, from what the backend reported.
 pub fn notice(status: &RepublishStatus) -> (String, String) {
     match status {
+        RepublishStatus::NeedsRestack {
+            parent_branch, parent_pr, default_branch, pr_number: None, rewrites: true, ..
+        } => (
+            "Parent merged: this branch needs restacking before its pull request".to_string(),
+            format!(
+                "{parent_branch} (pull request #{parent_pr}) was merged into {default_branch} as new \
+                 commits. This branch is already on origin and still carries the old ones, so a pull \
+                 request opened from it would list them again. Restack it, then create the pull request."
+            ),
+        ),
         RepublishStatus::NeedsRestack { parent_branch, parent_pr, default_branch, rewrites: true, .. } => (
             "Parent merged: this branch needs restacking".to_string(),
             format!(
@@ -49,7 +63,7 @@ pub fn notice(status: &RepublishStatus) -> (String, String) {
 pub fn consequences(status: &RepublishStatus, branch: &str) -> Vec<String> {
     match status {
         RepublishStatus::NeedsRestack { default_branch, pr_number, rewrites: false, .. } => vec![
-            format!("Pull request #{pr_number} will be retargeted to {default_branch}."),
+            format!("{} will be retargeted to {default_branch}.", pull_request(*pr_number)),
             format!("{branch} is not rewritten and nothing is pushed."),
         ],
         RepublishStatus::NeedsRestack { parent_branch, default_branch, pr_number, rewrites: true, .. } => vec![
@@ -66,7 +80,10 @@ pub fn consequences(status: &RepublishStatus, branch: &str) -> Vec<String> {
                  (--force-with-lease): it is replaced only if it is still at the tip SlashIt checked. \
                  If anyone else pushed in the meantime, nothing is overwritten."
             ),
-            format!("Pull request #{pr_number} will then be retargeted to {default_branch}."),
+            match pr_number {
+                Some(number) => format!("Pull request #{number} will then be retargeted to {default_branch}."),
+                None => format!("Create the pull request afterwards: it will target {default_branch}."),
+            },
             "GitHub review comments on rewritten commits may become outdated, and CI will run again."
                 .to_string(),
         ],
@@ -178,7 +195,7 @@ pub fn RestackNotice(
                 Ok(outcome) => {
                     confirming.try_set(false);
                     toast::success(if outcome.rewritten {
-                        format!("Restacked onto {} and its pull request retargeted", outcome.base)
+                        format!("Restacked onto {}; its pull request, if any, is on the right base", outcome.base)
                     } else {
                         format!("Pull request retargeted to {}", outcome.base)
                     });
@@ -304,7 +321,7 @@ mod tests {
             parent_branch: "task-parent".to_string(),
             parent_pr: 7,
             default_branch: "main".to_string(),
-            pr_number: 21,
+            pr_number: Some(21),
             rewrites,
         }
     }

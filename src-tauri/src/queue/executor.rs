@@ -4351,7 +4351,7 @@ mod tests {
         let pending = crate::domain::PendingRepublish {
             parent_branch: "task-parent".to_string(),
             parent_pr: 7,
-            pr_number: 7,
+            pr_number: Some(7),
             default_branch: "main".to_string(),
             fork_point: "a".repeat(40),
             previous_tip: "b".repeat(40),
@@ -8392,7 +8392,7 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                 task.pending_republish = Some(crate::domain::PendingRepublish {
                     parent_branch: "task-parent".to_string(),
                     parent_pr: 7,
-                    pr_number: 21,
+                    pr_number: Some(21),
                     default_branch: "main".to_string(),
                     fork_point: "a".repeat(40),
                     previous_tip: "b".repeat(40),

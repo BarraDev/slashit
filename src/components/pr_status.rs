@@ -590,7 +590,22 @@ pub fn PullRequestSection(
     };
 
     move || {
-        pr.get().map(|(url, key, recorded)| {
+        let Some(linked) = pr.get() else {
+            // No pull request yet: a branch already on origin may still need
+            // restacking before one is created. The notice shows only then.
+            return branch.get().is_some().then(|| view! {
+                <crate::components::restack_published::RestackNotice
+                    task_id=task_id
+                    branch=branch
+                    reload=restack_reload
+                    refresh=Callback::new(move |_| {
+                        refresh_tasks.try_run(());
+                        restack_reload.try_update(|n| *n += 1);
+                    })
+                />
+            }.into_any());
+        };
+        Some(linked).map(|(url, key, recorded)| {
             let number = key.number;
             let shown = Memo::new(move |_| board.and_then(|b| b.shown(&key)));
             let recorded_terminal = recorded
@@ -682,7 +697,7 @@ pub fn PullRequestSection(
                         </div>
                     </Show>
                 </section>
-            }
+            }.into_any()
         })
     }
 }

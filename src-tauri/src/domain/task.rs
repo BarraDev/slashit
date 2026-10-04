@@ -442,8 +442,12 @@ pub struct PendingRepublish {
     pub parent_branch: String,
     /// The parent's merged pull request.
     pub parent_pr: u64,
-    /// The task's own pull request, which is retargeted last.
-    pub pr_number: u64,
+    /// The task's own pull request, which is retargeted last. `None` for a
+    /// branch that is on origin with no pull request yet: there is nothing to
+    /// retarget, and the pull request is created afterwards against the
+    /// default branch.
+    #[serde(default)]
+    pub pr_number: Option<u64>,
     /// The default branch the parent landed on, which the pull request is
     /// retargeted to.
     pub default_branch: String,
@@ -1087,7 +1091,7 @@ mod tests {
         pending.pending_republish = Some(PendingRepublish {
             parent_branch: "p".to_string(),
             parent_pr: 1,
-            pr_number: 2,
+            pr_number: Some(2),
             default_branch: "main".to_string(),
             fork_point: "a".repeat(40),
             previous_tip: "b".repeat(40),

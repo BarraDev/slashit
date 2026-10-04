@@ -335,7 +335,7 @@ mod tests {
         pending.pending_republish = Some(crate::domain::PendingRepublish {
             parent_branch: "p".to_string(),
             parent_pr: 1,
-            pr_number: 2,
+            pr_number: Some(2),
             default_branch: "main".to_string(),
             fork_point: "a".repeat(40),
             previous_tip: "b".repeat(40),
