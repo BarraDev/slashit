@@ -1460,6 +1460,11 @@ impl WorktreeManager {
     /// written, so a refusal leaves the checkout, the registration and the
     /// commits exactly as they were.
     ///
+    /// Only the `files` ref storage keeps the `HEAD` reflog where this reads
+    /// it. A repository on `reftable` (or any other backend), or one whose
+    /// storage cannot be determined, is refused (see
+    /// [`Self::ensure_reflog_inspectable`]).
+    ///
     /// Not inspected: other per-worktree state removal deletes (an
     /// interrupted rebase, `ORIG_HEAD`, `refs/bisect`), and a commit made
     /// between this check and the removal.
@@ -1524,6 +1529,16 @@ impl WorktreeManager {
             (false, true) => format!("the checkout at {path} is registered"),
             (false, false) => format!("the checkout at {path} has a detached HEAD"),
         };
+        // Whether the checkout's reflog can be read at all depends on how the
+        // repository stores refs; where it cannot, nothing below can show
+        // that removal loses nothing.
+        Self::ensure_reflog_inspectable(repo_path)
+            .await
+            .map_err(|why| format!(
+                "{path} was not removed, because {state} and {why} Nothing was changed. To remove it, \
+                 first inspect `git reflog` in the checkout and keep what you need with \
+                 `git branch <name> <commit>`, then run `git worktree remove` in {repo_path} yourself."
+            ))?;
         let cannot_say = |why: &str| {
             format!(
                 "{path} was not removed, because {state} and git could not say whether any ref \
@@ -1560,6 +1575,59 @@ impl WorktreeManager {
             ));
         }
         Ok(())
+    }
+
+    /// Whether the repository stores refs the way this inspection can read.
+    ///
+    /// Only the `files` backend keeps a checkout's `HEAD` reflog as the file
+    /// `logs/HEAD` in its registration, which is what the inspection reads.
+    /// `reftable`, or any backend this does not know, keeps it elsewhere, and
+    /// a reflog file that is missing there would read as "nothing to keep".
+    /// So anything but `files` is refused, and so is a repository whose
+    /// storage cannot be determined. `git rev-parse --show-ref-format` names
+    /// the backend where git has it; a git without it prints the option back,
+    /// and then the repository is `files` unless `extensions.refStorage` says
+    /// otherwise (git before 2.45 has no other backend).
+    async fn ensure_reflog_inspectable(repo_path: &str) -> Result<(), String> {
+        let unsupported = |name: &str| {
+            format!(
+                "the repository stores refs with the `{name}` backend, whose checkout reflog \
+                 cannot be inspected here, so it is not known whether removing it would make \
+                 work made there unreachable."
+            )
+        };
+        let undetermined = |why: &str| {
+            format!(
+                "how the repository stores refs could not be determined ({why}), so it is not \
+                 known whether removing it would make work made there unreachable."
+            )
+        };
+        let git = |args: &[&str]| {
+            tokio::process::Command::new(git_program()).args(args).current_dir(repo_path).output()
+        };
+        let shown = git(&["rev-parse", "--show-ref-format"])
+            .await
+            .map_err(|e| undetermined(&format!("`git rev-parse` could not be run in {repo_path}: {e}")))?;
+        if !shown.status.success() {
+            return Err(undetermined(String::from_utf8_lossy(&shown.stderr).trim()));
+        }
+        let shown = String::from_utf8_lossy(&shown.stdout).trim().to_string();
+        match shown.as_str() {
+            "files" => return Ok(()),
+            "--show-ref-format" => {}
+            other => return Err(unsupported(other)),
+        }
+        let config = git(&["config", "--get", "extensions.refStorage"])
+            .await
+            .map_err(|e| undetermined(&format!("`git config` could not be run in {repo_path}: {e}")))?;
+        match config.status.code() {
+            Some(1) => Ok(()),
+            Some(0) => match String::from_utf8_lossy(&config.stdout).trim() {
+                "files" => Ok(()),
+                other => Err(unsupported(other)),
+            },
+            _ => Err(undetermined(String::from_utf8_lossy(&config.stderr).trim())),
+        }
     }
 
     /// The commits, newest first, that the `HEAD` reflog of the checkout
@@ -3336,6 +3404,85 @@ mod tests {
                 .await
                 .expect("a relative registration names the same checkout");
             assert!(registration_of(&repo_path, &info.path).is_none());
+        }
+    }
+
+    /// Move a freshly made repository to `reftable`, or say that this git
+    /// cannot.
+    fn migrate_to_reftable(repo_path: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["refs", "migrate", "--ref-format=reftable"])
+            .current_dir(repo_path)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Under `reftable` a checkout's `HEAD` reflog is not the file
+    /// `logs/HEAD`, so a missing file is no evidence of an empty reflog.
+    /// Removal is refused before anything is touched, present or gone,
+    /// including for a commit only that reflog reaches.
+    #[tokio::test]
+    async fn removing_a_checkout_in_a_reftable_repository_is_refused_before_anything_changes() {
+        let mgr = test_manager();
+        for gone in [false, true] {
+            let repo = create_temp_git_repo();
+            let repo_path = repo.path().to_str().unwrap().to_string();
+            if !migrate_to_reftable(&repo_path) {
+                eprintln!("skipped: this git cannot use the reftable backend");
+                return;
+            }
+            let branch = "task-abcd1234";
+            let info = mgr.create(&repo_path, branch).await.expect("create failed");
+            run_git(&info.path, &["checkout", "-q", "--detach"]);
+            let left = commit_file(&info.path, "left.txt", "left\n", &["-m", "left behind"]);
+            run_git(&info.path, &["switch", "-q", branch]);
+            if gone {
+                std::fs::remove_dir_all(&info.path).expect("remove worktree dir");
+            }
+            let refused = mgr
+                .remove(&info.path, &repo_path, Some(branch))
+                .await
+                .expect_err("the reflog cannot be inspected under reftable");
+            assert!(refused.contains("reftable"), "{refused}");
+            assert!(refused.contains("Nothing was changed"), "{refused}");
+            assert!(refused.contains("git worktree remove"), "the way forward is named: {refused}");
+            assert_eq!(Path::new(&info.path).exists(), !gone, "the checkout is untouched");
+            assert!(registration_of(&repo_path, &info.path).is_some(), "the registration is intact");
+            run_git(&repo_path, &["rev-parse", "--verify", "-q", &format!("{left}^{{commit}}")]);
+        }
+    }
+
+    /// What storage a repository has is asked of git, never inferred from a
+    /// file being there or not.
+    #[tokio::test]
+    async fn ref_storage_is_asked_of_git_and_anything_but_files_or_unknown_is_refused() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        WorktreeManager::ensure_reflog_inspectable(&repo_path).await.expect("files storage is read");
+
+        // Not a repository, or a directory that is not there: not determined.
+        let nowhere = repo.path().join("missing");
+        let why = WorktreeManager::ensure_reflog_inspectable(nowhere.to_str().unwrap())
+            .await
+            .expect_err("an undeterminable storage is refused");
+        assert!(why.contains("could not be determined"), "{why}");
+
+        // A backend this does not know, whatever git says about it.
+        run_git(&repo_path, &["config", "core.repositoryformatversion", "1"]);
+        run_git(&repo_path, &["config", "extensions.refStorage", "future"]);
+        let why = WorktreeManager::ensure_reflog_inspectable(&repo_path)
+            .await
+            .expect_err("an unknown backend is refused");
+        assert!(why.contains("could not be determined") || why.contains("`future`"), "{why}");
+
+        // `reftable` itself, where this git has it.
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        if migrate_to_reftable(&repo_path) {
+            let why = WorktreeManager::ensure_reflog_inspectable(&repo_path)
+                .await
+                .expect_err("reftable is refused");
+            assert!(why.contains("`reftable`"), "{why}");
         }
     }
 

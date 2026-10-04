@@ -2061,6 +2061,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finishing_and_deleting_a_task_in_a_reftable_repository_keep_it() {
+        let world = world(true);
+        let repo = std::path::PathBuf::from(repo_path(&world));
+        let migrated = std::process::Command::new("git")
+            .args(["refs", "migrate", "--ref-format=reftable"])
+            .current_dir(&repo)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !migrated {
+            eprintln!("skipped: this git cannot use the reftable backend");
+            return;
+        }
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
+
+        let refusal = terminalize(
+            world.ctx(),
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect_err("the checkout's reflog cannot be inspected under reftable");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        let refusal = delete(world.ctx(), id).await.expect_err("nor is deleting the task");
+        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        let after = world.task(id).await;
+        assert_eq!(after.status, TaskStatus::HumanReview);
+        assert!(world.tasks.read().await.contains_key(&id));
+        assert!(!after.cleanup_in_flight);
+        assert!(std::path::Path::new(&wt).is_dir());
+        assert_eq!(world.persisted(id).worktree_path.as_deref(), Some(wt.as_str()));
+        assert!(
+            after.error_message.as_deref().unwrap_or_default().contains("reftable"),
+            "{:?}",
+            after.error_message
+        );
+        assert!(git_output(&repo, &["worktree", "list", "--porcelain"]).contains(&wt));
+    }
+
+    #[tokio::test]
     async fn finishing_and_deleting_a_task_whose_checkout_git_cannot_read_keep_it() {
         let world = world(true);
         let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
