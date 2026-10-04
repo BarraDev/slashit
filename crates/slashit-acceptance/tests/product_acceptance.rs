@@ -50,6 +50,8 @@ mod human_review;
 mod local_first;
 #[path = "product_acceptance/needs_you.rs"]
 mod needs_you;
+#[path = "product_acceptance/orphans.rs"]
+mod orphans;
 #[path = "product_acceptance/pr_status.rs"]
 mod pr_status;
 #[path = "product_acceptance/storage.rs"]

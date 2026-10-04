@@ -42,7 +42,7 @@ pub struct StackedWorktree {
 /// something destructive or something irreversible on the strength of a
 /// path's presence needs to tell them apart rather than treat both as
 /// `false`.
-enum Presence {
+pub(super) enum Presence {
     Present,
     Absent,
     Unverified(std::io::Error),
@@ -52,7 +52,7 @@ impl Presence {
     /// `metadata` follows symlinks, as [`Path::exists`] does: a link
     /// pointing at nothing is `Absent`, not `Present`, and a live link is
     /// `Present` regardless of what kind of file it names.
-    fn of(path: &Path) -> Self {
+    pub(super) fn of(path: &Path) -> Self {
         match std::fs::metadata(path) {
             Ok(_) => Presence::Present,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Presence::Absent,
@@ -123,20 +123,20 @@ pub enum CheckoutRegistration {
 }
 
 /// One record of `git worktree list --porcelain -z`.
-struct ListedWorktree<'a> {
-    path: &'a str,
+pub(super) struct ListedWorktree<'a> {
+    pub(super) path: &'a str,
     /// The commit its `HEAD` is at.
-    head: Option<&'a str>,
+    pub(super) head: Option<&'a str>,
     /// The `refs/heads/...` it has checked out, `None` when detached.
-    branch: Option<&'a str>,
+    pub(super) branch: Option<&'a str>,
     /// `Some` when locked, with the reason if one was given.
-    locked: Option<Option<&'a str>>,
+    pub(super) locked: Option<Option<&'a str>>,
 }
 
 impl<'a> ListedWorktree<'a> {
     /// Every record in `porcelain`, whose fields are NUL-terminated and whose
     /// records end with an empty field.
-    fn parse(porcelain: &'a str) -> Vec<Self> {
+    pub(super) fn parse(porcelain: &'a str) -> Vec<Self> {
         let mut records = Vec::new();
         let mut current: Option<Self> = None;
         for field in porcelain.split('\0') {
@@ -292,7 +292,7 @@ impl CheckoutState {
 /// recorded after resolving its symlinks compares equal to one spelled
 /// through them. A path with more than 40 symlink hops is returned as it
 /// is.
-fn resolved_path(path: &Path) -> PathBuf {
+pub(super) fn resolved_path(path: &Path) -> PathBuf {
     use std::collections::VecDeque;
     use std::path::Component;
 
@@ -536,6 +536,13 @@ impl WorktreeManager {
             paths.worktrees_dir().display()
         );
         Self { paths }
+    }
+
+    /// The directory every Task Checkout SlashIt places for the project whose
+    /// repository is at `repo_path` lives under.
+    pub(super) fn managed_root(&self, repo_path: &str) -> PathBuf {
+        let key = ProjectKey::for_path(Path::new(repo_path)).key;
+        self.paths.worktrees_root(&key)
     }
 
     /// Where SlashIt would place this branch's worktree.
@@ -1473,7 +1480,7 @@ impl WorktreeManager {
     /// commit and how to keep it, and anything git or the filesystem could
     /// not answer refuses with what failed. A failed inspection is never read
     /// as "nothing to lose".
-    async fn refuse_to_drop_detached_commit(
+    pub(super) async fn refuse_to_drop_detached_commit(
         worktree_path: &str,
         repo_path: &str,
     ) -> Result<(), String> {
@@ -1880,7 +1887,7 @@ impl WorktreeManager {
     /// `-z` needs git 2.36 or newer. An older git refuses the option, and
     /// that refusal is reported like any other failure to answer, never read
     /// as an empty listing.
-    async fn worktree_listing(repo_path: &str) -> Result<String, String> {
+    pub(super) async fn worktree_listing(repo_path: &str) -> Result<String, String> {
         let output = tokio::process::Command::new(git_program())
             .args(["worktree", "list", "--porcelain", "-z"])
             .current_dir(repo_path)
@@ -2344,7 +2351,7 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 /// `PATH`. A unit test can stand in its own `git` for the code it awaits
 /// through [`test_git::scope`], rather than by changing the process-wide
 /// `PATH` that every other test running the real git reads at the same time.
-fn git_program() -> std::ffi::OsString {
+pub(super) fn git_program() -> std::ffi::OsString {
     #[cfg(test)]
     if let Some(path) = test_git::lookup() {
         return path.into_os_string();

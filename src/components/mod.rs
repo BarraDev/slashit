@@ -57,6 +57,7 @@ pub use jj_status::*;
 pub mod storage_settings;
 pub mod disk_usage;
 pub mod repository_setup;
+pub mod orphan_reclaim;
 
 pub use badge::*;
 pub use progress_bar::*;
@@ -81,4 +82,5 @@ pub use diff_viewer::*;
 pub use storage_settings::*;
 pub use disk_usage::*;
 pub use repository_setup::*;
+pub use orphan_reclaim::*;
 pub use update_banner::*;
