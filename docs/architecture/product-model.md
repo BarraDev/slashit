@@ -94,6 +94,15 @@ Only part of that exists today.
   context for every member Project. If the root is missing, the run falls
   back to the Task Checkout alone. Other agent runs, such as AI review and
   PR review fixes, do not use the Workspace root.
+- **Execution and delivery boundary.** The agent may read anything it can
+  reach, including the Workspace's instruction files and other member
+  Projects. Its writes belong in the Task Checkout, and the coding prompt
+  says so. SlashIt's diff, AI review, Human Review, commit and pull request
+  cover only the Task Checkout. A file the agent edits elsewhere under the
+  Workspace root, such as a sibling Project's primary checkout, is outside the
+  Task's delivery: it is not in the Task's diff, not committed, and not sent to
+  a pull request. SlashIt does not scan for or report such edits, and a
+  Workspace does not make Task delivery span several repositories.
 
 **Planned, not yet modeled:**
 
@@ -218,7 +227,8 @@ Workspace and Task Checkout are distinct concepts at different levels:
 | Is a working copy | No | Yes |
 
 A Workspace root is a folder, but it is not meant to be a checkout of any
-Project, and agents edit Task files in the Task Checkout, not through it. Treating the two as one concept
+Project, and agents edit Task files in the Task Checkout, not through it. Only
+the Task Checkout is delivered (see Execution and delivery boundary above). Treating the two as one concept
 would suggest that grouping Projects shares their mutable state, which it
 does not.
 

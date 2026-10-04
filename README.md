@@ -37,7 +37,8 @@ It's built for people who've already outgrown a single terminal tab and a stack 
 - A Workspace is meant to bring several related projects under one context — useful when your work spans, say, a backend repo, a frontend repo, and a shared library. Each project belongs to at most one Workspace.
 - A Workspace has its own root folder. The engine is ready to start a member project's task agent from that folder, so instructions and agent memory kept there are defined once and shared by every project in the Workspace, instead of being scattered as `.claude/`, `.codex/`, etc. across every project repo.
 - Tasks still execute in their own Task Checkouts; the Workspace adds shared context, not shared mutable state.
-- Not yet available: projects cannot be attached to a Workspace yet, so none of the above is reachable in the app today. Also planned: Workspace-wide defaults, an overview across its projects, and coordinated multi-project changes. See [`docs/architecture/product-model.md`](docs/architecture/product-model.md).
+- Each Task's diff, review, commit and pull request cover only its own Task Checkout. Edits an agent makes elsewhere in the Workspace are not included in that Task's delivery.
+- You can attach a project to a Workspace, and detach it, from the Workspaces page. Not yet available, but planned: Workspace-wide defaults, an overview across its projects, and coordinated multi-project changes. See [`docs/architecture/product-model.md`](docs/architecture/product-model.md).
 
 **Close the loop on PRs**
 - Open pull requests directly from a finished task.
