@@ -761,7 +761,16 @@ async fn advance(
     crash_after(Stage::Pushed)?;
 
     refuse_if_pr_operation_cancelled(reservation, "retargeting the pull request")?;
-    if let Some(number) = pending.pr_number {
+    // A branch restacked with no pull request may have got one since: it is
+    // retargeted like any other, so it never stays on the old parent.
+    let number = match pending.pr_number {
+        Some(number) => Some(number),
+        None => {
+            let found = branch_pr_state(&ctx.working_dir, branch).await?;
+            found.number.filter(|_| found.state.as_deref() == Some("OPEN"))
+        }
+    };
+    if let Some(number) = number {
         converge_pr_base(&ctx.working_dir, number, branch, &pending.default_branch).await?;
     }
     clear_pending(state, task_uuid, &pending).await?;

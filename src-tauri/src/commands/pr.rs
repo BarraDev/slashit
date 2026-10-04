@@ -10021,6 +10021,17 @@ mod tests {
                         "pr list --head task-branch --state all '*'".to_string(),
                         format!("cat {}", listed.display()),
                     ));
+                    answers.push((
+                        format!("pr view {CHILD_NUMBER} --json state,baseRefName,headRefName"),
+                        format!(
+                            r#"printf '{{"state":"OPEN","baseRefName":"%s","headRefName":"task-branch"}}' "$(cat {})""#,
+                            base_file.display()
+                        ),
+                    ));
+                    answers.push((
+                        format!("pr edit {CHILD_NUMBER} --base main"),
+                        format!("printf main > {}", base_file.display()),
+                    ));
                     let mock = MockGh::setup_answering(CHILD_PR_URL, r#"{"state":"OPEN"}"#, &answers);
                     let (state, tmp) = build_test_state().await;
                     let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
@@ -10189,6 +10200,23 @@ mod tests {
                     assert_eq!(p.remote_child().as_deref(), Some(other.as_str()));
                     assert_eq!(p.republish_backup().as_deref(), Some(p.landed.child_tip.as_str()));
                     assert!(p.task().await.pending_republish.is_some());
+                }
+
+                /// A pull request that appears after the push, before a retry
+                /// finishes, is retargeted rather than left on the old parent.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_pull_request_opened_after_the_push_is_retargeted_on_retry() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let p = pushed_without_pr(Spec::new(Landing::Squash)).await;
+                    {
+                        let _hooks = crash_after(Stage::Pushed);
+                        p.restack().await.expect_err("crash");
+                    }
+                    p.open_a_pull_request();
+                    std::fs::write(&p.base_file, "task-parent").unwrap();
+                    p.restack().await.expect("finishes");
+                    assert!(p.retargeted(), "{}", p.mock.read_log());
+                    assert_eq!(p.task().await.pending_republish, None);
                 }
 
                 /// A pull request opened after the approval was never part of
@@ -10816,6 +10844,38 @@ mod tests {
                     );
                     assert_eq!(local_tip(&p.landed), tip, "a jj command afterwards leaves the branch where it is");
                     assert!(!jj_at(&["bookmark", "list", "task-branch"]).contains("conflict"));
+                }
+
+                /// The same for a pushed branch with no pull request.
+                #[tokio::test(flavor = "multi_thread")]
+                async fn a_no_pull_request_restack_in_a_jj_colocated_repository_is_what_jj_sees_and_pushes() {
+                    let _guard = PATH_LOCK.lock().await;
+                    let Some(jj_bin) = installed_jj() else {
+                        eprintln!("skipped: no jj is installed");
+                        return;
+                    };
+                    let p = pushed_without_pr(Spec::new(Landing::Squash)).await;
+                    let jj_at = |args: &[&str]| {
+                        let output = StdCommand::new(&jj_bin)
+                            .args(args)
+                            .current_dir(&p.landed.repo.checkout)
+                            .env("JJ_USER", "Test")
+                            .env("JJ_EMAIL", "test@example.com")
+                            .output()
+                            .expect("run jj");
+                        assert!(output.status.success(), "jj {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+                        String::from_utf8_lossy(&output.stdout).trim().to_string()
+                    };
+                    jj_at(&["git", "init", "--colocate"]);
+
+                    p.restack().await.expect("the restack in a colocated repository");
+
+                    let tip = local_tip(&p.landed);
+                    assert_ne!(tip, p.landed.child_tip);
+                    assert_eq!(p.remote_child().as_deref(), Some(tip.as_str()));
+                    assert_eq!(jj_at(&["log", "--no-graph", "-r", "task-branch", "-T", "commit_id"]), tip);
+                    assert!(!jj_at(&["bookmark", "list", "task-branch"]).contains("conflict"));
+                    assert!(!p.retargeted());
                 }
 
                 /// A restack that is only planned can be discarded too.
