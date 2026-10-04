@@ -2082,6 +2082,14 @@ fn KanbanColumn(
         }
     };
 
+    // The column's tasks in display order. The board renders from these, so a
+    // change elsewhere on the list does not touch this column's cards.
+    let column_tasks = Memo::new({
+        let get_column_tasks = get_column_tasks.clone();
+        move |_| get_column_tasks()
+    });
+    let column_is_empty = Memo::new(move |_| column_tasks.with(|tasks| tasks.is_empty()));
+
     // Select all handler for this column
     let status_for_select_all = status.clone();
     let get_column_tasks_for_select = get_column_tasks.clone();
@@ -2217,8 +2225,7 @@ fn KanbanColumn(
             <div class="p-2 flex-1 overflow-y-auto">
                 <div class="space-y-1">
                     {move || {
-                        let tasks = get_column_tasks();
-                        if tasks.is_empty() {
+                        if column_is_empty.get() {
                             view! {
                                 <div class="flex flex-col items-center justify-center h-32 rounded-xl border-2 border-dashed border-white/10 bg-white/[0.01]">
                                     <svg class="w-6 h-6 text-white/15 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -2232,46 +2239,77 @@ fn KanbanColumn(
                             let on_click = on_task_click;
                             let column_status = status.clone();
                             let column_status_end = status.clone();
-                            let task_ids: Vec<String> = tasks.iter().map(|t| t.id.to_string()).collect();
-                            let task_count = tasks.len();
                             view! {
                                 <>
-                                    {tasks.into_iter().enumerate().map(move |(idx, task)| {
-                                        let on_click = on_click;
-                                        let column_status = column_status.clone();
-                                        let next_task_id = task_ids.get(idx + 1).cloned();
-                                        view! {
-                                            <KanbanTaskCard 
-                                                task=task 
-                                                column_status=column_status
-                                                next_task_id=next_task_id
-                                                dragged_task=set_drag
-                                                drag_over_position=drag_over_position
-                                                set_drag_over_position=set_drag_over_position
-                                                on_click=on_click
-                                                set_show_context_menu=set_show_context_menu
-                                                set_context_menu_pos=set_context_menu_pos
-                                                set_context_menu_task=set_context_menu_task
-                                                selected_tasks=selected_tasks
-                                                set_selected_tasks=set_selected_tasks
-                                                show_diff_modal=show_diff_modal
-                                                diff_content=diff_content
-                                                diff_stat_content=diff_stat_content
-                                                diff_title=diff_title
-                                                on_pr_created=on_pr_created
-                                                on_analyze_pr_comments=on_analyze_pr_comments
-                                                show_pr_candidates_modal=show_pr_candidates_modal
-                                                pr_candidate_task=pr_candidate_task
-                                                pr_candidates=pr_candidates
-                                                refresh_tasks=refresh_tasks
-                                            />
+                                    // Keyed by task id, so a card's DOM node follows its task
+                                    // and lives as long as the task stays in this column.
+                                    // Unkeyed, nodes are reused by position: a task leaving
+                                    // the column re-binds every later node to the next task,
+                                    // and a click lands on whichever task the node holds when
+                                    // the button comes up.
+                                    //
+                                    // The key is the id alone. The task record reaches the card
+                                    // as a signal and the card is rebuilt in place from it, so
+                                    // an ordinary update (a title, a progress report) changes
+                                    // what the node shows and never replaces the node.
+                                    <For
+                                        each=move || column_tasks.get()
+                                        key=|task| task.id
+                                        children=move |task| {
+                                            let column_status = column_status.clone();
+                                            let task_id = task.id;
+                                            let current = Memo::new(move |previous: Option<&Task>| {
+                                                column_tasks
+                                                    .with(|tasks| tasks.iter().find(|t| t.id == task_id).cloned())
+                                                    .or_else(|| previous.cloned())
+                                                    .unwrap_or_else(|| task.clone())
+                                            });
+                                            let next_task_id = Signal::derive(move || {
+                                                column_tasks.with(|tasks| next_card_id(tasks, task_id))
+                                            });
+                                            // Drag state belongs to the row, not to the card built
+                                            // from the current record.
+                                            let is_dragging = RwSignal::new(false);
+                                            let is_lower_half = RwSignal::new(false);
+                                            move || {
+                                                let task = current.get();
+                                                let column_status = column_status.clone();
+                                                view! {
+                                                    <KanbanTaskCard
+                                                        task=task
+                                                        column_status=column_status
+                                                        next_task_id=next_task_id
+                                                        is_dragging=is_dragging
+                                                        is_lower_half=is_lower_half
+                                                        dragged_task=set_drag
+                                                        drag_over_position=drag_over_position
+                                                        set_drag_over_position=set_drag_over_position
+                                                        on_click=on_click
+                                                        set_show_context_menu=set_show_context_menu
+                                                        set_context_menu_pos=set_context_menu_pos
+                                                        set_context_menu_task=set_context_menu_task
+                                                        selected_tasks=selected_tasks
+                                                        set_selected_tasks=set_selected_tasks
+                                                        show_diff_modal=show_diff_modal
+                                                        diff_content=diff_content
+                                                        diff_stat_content=diff_stat_content
+                                                        diff_title=diff_title
+                                                        on_pr_created=on_pr_created
+                                                        on_analyze_pr_comments=on_analyze_pr_comments
+                                                        show_pr_candidates_modal=show_pr_candidates_modal
+                                                        pr_candidate_task=pr_candidate_task
+                                                        pr_candidates=pr_candidates
+                                                        refresh_tasks=refresh_tasks
+                                                    />
+                                                }
+                                            }
                                         }
-                                    }).collect::<Vec<_>>()}
+                                    />
                                     // End-of-column drop indicator
                                     <div
                                         class=move || {
                                             let show_end_indicator = if let Some((status, target)) = drag_over_position.get() {
-                                                status == column_status_end && target.is_none() && task_count > 0
+                                                status == column_status_end && target.is_none()
                                             } else {
                                                 false
                                             };
@@ -2297,12 +2335,24 @@ fn KanbanColumn(
     }
 }
 
+/// The task shown after `id` in a column, if there is one.
+fn next_card_id(column: &[Task], id: Uuid) -> Option<String> {
+    let at = column.iter().position(|task| task.id == id)?;
+    column.get(at + 1).map(|task| task.id.to_string())
+}
+
 #[component]
 fn KanbanTaskCard(
     task: Task,
     #[prop(default = 0)] _task_index: usize,
     column_status: TaskStatus,
-    next_task_id: Option<String>,
+    /// The task shown after this one in its column, kept current as the column changes.
+    next_task_id: Signal<Option<String>>,
+    /// Whether this card is being dragged. Owned by the card's keyed row, so an
+    /// update to the task, which rebuilds the card, does not reset it.
+    is_dragging: RwSignal<bool>,
+    /// Whether the pointer is over the lower half of this card while dragging.
+    is_lower_half: RwSignal<bool>,
     dragged_task: WriteSignal<Option<(String, TaskStatus)>>,
     drag_over_position: Signal<Option<(TaskStatus, Option<String>)>>,
     set_drag_over_position: WriteSignal<Option<(TaskStatus, Option<String>)>>,
@@ -2341,9 +2391,9 @@ fn KanbanTaskCard(
 
     let task_status = task.status.clone();
     let is_in_progress = task_status == TaskStatus::InProgress;
-    let (is_dragging, set_is_dragging) = signal(false);
+    let (is_dragging, set_is_dragging) = is_dragging.split();
     // Track if mouse is in lower half (for showing indicator below instead of above)
-    let (is_lower_half, set_is_lower_half) = signal(false);
+    let (is_lower_half, set_is_lower_half) = is_lower_half.split();
 
     // Right-click context menu handler
     let on_context_menu = {
@@ -2393,7 +2443,6 @@ fn KanbanTaskCard(
     // Handle drag over this task card to determine drop position using getBoundingClientRect
     let on_task_drag_over = {
         let task_id = task_id.clone();
-        let next_task_id = next_task_id.clone();
         let column_status = column_status.clone();
         move |e: web_sys::DragEvent| {
             e.prevent_default();
@@ -2432,7 +2481,7 @@ fn KanbanTaskCard(
                     
                     if in_lower_half {
                         // Drop after this task (before next task, or at end if no next task)
-                        set_drag_over_position.set(Some((column_status.clone(), next_task_id.clone())));
+                        set_drag_over_position.set(Some((column_status.clone(), next_task_id.get_untracked())));
                     } else {
                         // Drop before this task
                         set_drag_over_position.set(Some((column_status.clone(), Some(task_id.clone()))));
@@ -2469,9 +2518,6 @@ fn KanbanTaskCard(
     let column_status_below = column_status.clone();
     let column_status_below_2 = column_status.clone();
 
-    let next_task_id_below = next_task_id.clone();
-    let next_task_id_below_2 = next_task_id.clone();
-
     // Helper function to check if indicator should show above
     let check_show_above = move || {
         if let Some((status, Some(before_id))) = drag_over_position.get() {
@@ -2488,7 +2534,7 @@ fn KanbanTaskCard(
                 return false;
             }
             if is_lower_half.get() {
-                target_id == next_task_id_below
+                target_id == next_task_id.get()
             } else {
                 false
             }
@@ -2785,7 +2831,7 @@ fn KanbanTaskCard(
                         if status != column_status_below_2 {
                             false
                         } else if is_lower_half.get() {
-                            target_id == next_task_id_below_2
+                            target_id == next_task_id.get()
                         } else {
                             false
                         }
@@ -2809,6 +2855,34 @@ fn KanbanTaskCard(
 #[cfg(test)]
 mod tests {
     use super::approved_after_decision_change;
+    use super::next_card_id;
+    use crate::models::Task;
+    use uuid::Uuid;
+
+    fn column_task(id: u128, title: &str) -> Task {
+        serde_json::from_value(serde_json::json!({
+            "id": Uuid::from_u128(id), "project_id": Uuid::from_u128(99),
+            "title": title, "description": null, "status": "backlog", "model": "m",
+            "planning_mode": false, "dependencies": [], "workspace_id": null, "jj_change_id": null,
+            "category": "feature", "priority": "medium", "complexity": "moderate",
+            "impact": "medium", "security_severity": "none", "phase": "idle",
+            "phase_progress": 0, "overall_progress": 0, "subtasks": [], "sequence_number": 1,
+            "position": 0,
+            "github_issue_url": null, "gitlab_issue_url": null, "linear_ticket_id": null,
+            "pr_url": null, "qa_signoff": null, "human_review": { "arrivals": 1, "entries": [] },
+            "stuck_since": null,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_next_card_is_the_task_after_it_in_the_column() {
+        let column = [column_task(1, "a"), column_task(2, "b"), column_task(3, "c")];
+        assert_eq!(next_card_id(&column, Uuid::from_u128(1)), Some(Uuid::from_u128(2).to_string()));
+        assert_eq!(next_card_id(&column, Uuid::from_u128(3)), None);
+        assert_eq!(next_card_id(&column, Uuid::from_u128(9)), None);
+    }
 
     #[test]
     fn an_approval_ticked_before_an_item_became_a_fix_does_not_carry_over() {

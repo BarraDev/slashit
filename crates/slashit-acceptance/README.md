@@ -142,6 +142,18 @@ export SLASHIT_ACCEPTANCE_NATIVE_DRIVER=/tmp/WebKitWebDriver
   provider log are captured while the application is still alive, into
   `target/acceptance/`. Successful runs delete everything; failed runs are
   retained, oldest first, up to a bounded count.
+- **A click that opens nothing says why.** `open_drawer` clicks a card once.
+  If its drawer does not appear, the failure message carries what the page
+  saw: each pointer, mouse, drag and scroll event with where the card was,
+  which task the card showed, whether the card or the element the button went
+  down on left the page, any drawer that appeared or went, the board's scroll
+  position and the element at the card's centre. A click whose button comes
+  up over a different element than it went down on is delivered to their
+  common ancestor. When that ancestor is not the card, the card's handler
+  never sees the click, so a card that moves between the two events can open
+  nothing. The event targets can help tell that apart from other failures;
+  they do not identify the cause. The probe listens before the card's own
+  handler runs, so the record does not show whether that handler ran.
 
 ## Platforms
 

@@ -25,3 +25,10 @@ Frontend calls backend via `invoke()` from `window.__TAURI__.core` (global Tauri
 - Signals are `(value, setter)` tuples from `signal()` or `signal(initial_value)`
 - Use `view! { }` macro for JSX-like syntax
 - Components accept `#[prop]` attributes for props
+- Render a list of stateful or clickable elements with Leptos's keyed list component and a key that
+  names the item (the board keys cards by task). A list built with `.map(..)`
+  inside a reactive closure is rebuilt in place by position: when an item
+  leaves, every later DOM node is re-bound to the next item, and a click or
+  drag in progress lands on whichever item the node holds when it ends. Key
+  by id alone and hand the item's record to the row as a signal, so a changed
+  record updates the row in place instead of replacing its node.

@@ -36,6 +36,8 @@ use thirtyfour::prelude::*;
 /// ticks every three seconds and the fixture returns immediately, so this is
 /// mostly headroom for a loaded hosted runner.
 const EXECUTION_DEADLINE: Duration = Duration::from_secs(90);
+#[path = "product_acceptance/board_identity.rs"]
+mod board_identity;
 #[path = "product_acceptance/disk_pressure.rs"]
 mod disk_pressure;
 #[path = "product_acceptance/developer_tools.rs"]
@@ -1481,9 +1483,12 @@ async fn create_task_in(driver: &WebDriver, project_id: &str, title_prefix: &str
 
 /// Click the card with this title and wait for its drawer.
 ///
-/// Retried until the deadline because the board re-renders a card whenever the
-/// task list changes, which can leave a located element stale by the time it
-/// is clicked.
+/// Searching again until the deadline covers only finding a card to click: the
+/// board rebuilds its cards when the task list changes, so a located element can
+/// be gone by the time it is used, and `click()` then reports an error. A click
+/// that is reported as delivered is not repeated. If its drawer does not appear,
+/// the failure carries a record of what the page did with the click
+/// ([`CLICK_PROBE`], [`click_evidence`]), so the next occurrence names its cause.
 async fn open_drawer(driver: &WebDriver, task_id: &str, title: &str) -> Result<()> {
     let started = Instant::now();
     loop {
@@ -1495,21 +1500,185 @@ async fn open_drawer(driver: &WebDriver, task_id: &str, title: &str) -> Result<(
             if shown.prop("textContent").await.ok().flatten().as_deref() != Some(title) {
                 continue;
             }
+            // A probe that cannot be installed must not change the outcome.
+            let probed = match card.to_json() {
+                Ok(element) => page(driver, CLICK_PROBE, vec![element]).await.is_ok(),
+                Err(_) => false,
+            };
             match card.click().await {
                 Ok(()) => {
                     let selector = format!("{TASK_DRAWER}[data-task-id=\"{task_id}\"]");
-                    ui::visible(driver, &selector)
-                        .await
-                        .with_context(|| format!("clicking the card for {title:?} did not open its drawer"))?;
+                    let shown = ui::visible(driver, &selector).await;
+                    // The probe watches one click; it must not outlive it.
+                    let evidence = match (&shown, probed) {
+                        (Err(_), true) => Some(click_evidence(driver).await),
+                        _ => None,
+                    };
+                    if probed {
+                        stop_click_probe(driver).await;
+                    }
+                    if let Err(error) = shown {
+                        let evidence = evidence
+                            .unwrap_or_else(|| "the click probe could not be installed".to_string());
+                        return Err(error.context(format!(
+                            "clicking the card for {title:?} did not open its drawer\n\
+                             page record of the click: {evidence}"
+                        )));
+                    }
                     return Ok(());
                 }
-                Err(error) => last_problem = error.to_string(),
+                Err(error) => {
+                    last_problem = error.to_string();
+                    if probed {
+                        stop_click_probe(driver).await;
+                    }
+                }
             }
         }
         if started.elapsed() > RENDER_DEADLINE {
             bail!("could not open the drawer for {title:?}: no clickable card ({last_problem})");
         }
         tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Installed in the page just before a card is clicked. It records, in
+/// `window.__clickProbe`, every pointer, mouse and drag event that reaches the
+/// document (and every scroll), every removal of the card being clicked or of the element the
+/// button went down on, every insertion or removal of a drawer, and any page
+/// error. Capture phase and passive: it does not change how the page handles
+/// the events.
+const CLICK_PROBE: &str = r#"
+const card = arguments[0];
+if (window.__clickProbe) { window.__clickProbe.stop(); }
+const t0 = performance.now();
+// The board labels each card's wrapper with the task it shows (`data-card-task-id`).
+const taskOf = (node) => { const w = node.closest && node.closest('[data-card-task-id]'); return w ? w.getAttribute('data-card-task-id') : null; };
+const probe = { events: [], removed: [], drawer: [], errors: [], card, taskAtInstall: taskOf(card), stop: null };
+const stamp = () => Math.round(performance.now() - t0);
+const name = (node) => (node.getAttribute && node.getAttribute('data-testid')) || (node.tagName || String(node)).toLowerCase();
+const describe = (node) => {
+  const own = node.closest && node.closest('[data-testid="task-card"]');
+  return name(node) + (own ? (own === card ? ' (in the clicked card)' : ' (in another card)') : '');
+};
+const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'dragstart', 'dragend', 'pointercancel', 'contextmenu'];
+// WebKit sends no click when the element the button went down on has left the
+// page by the time it comes up, so the press target is tracked on its own.
+let pressed = null;
+const listener = (e) => {
+  if (e.type === 'mousedown' || e.type === 'pointerdown') { pressed = e.target; }
+  probe.events.push({
+    t: stamp(), type: e.type, target: describe(e.target),
+    pressTargetConnected: pressed ? pressed.isConnected : null, cardConnected: card.isConnected,
+    cardShowsTask: taskOf(card), targetShowsTask: taskOf(e.target),
+    cardTop: Math.round(card.getBoundingClientRect().top),
+    x: Math.round(e.clientX), y: Math.round(e.clientY),
+  });
+};
+for (const type of types) { window.addEventListener(type, listener, { capture: true, passive: true }); }
+// Scrolling moves the card under a pointer that has not moved, so it is recorded
+// with the card's position. Bounded: a long animation must not fill the record.
+const scrolled = (e) => {
+  if (probe.events.length >= 200) { return; }
+  const target = e.target;
+  probe.events.push({
+    t: stamp(), type: 'scroll', target: target === document ? 'document' : name(target),
+    scrollLeft: target.scrollLeft === undefined ? null : Math.round(target.scrollLeft),
+    cardTop: Math.round(card.getBoundingClientRect().top), cardLeft: Math.round(card.getBoundingClientRect().left),
+  });
+};
+window.addEventListener('scroll', scrolled, { capture: true, passive: true });
+const isDrawer = (node) => node.nodeType === 1
+  && (node.matches('[data-testid="task-drawer"]') || node.querySelector('[data-testid="task-drawer"]'));
+const observer = new MutationObserver((records) => {
+  for (const record of records) {
+    for (const node of record.addedNodes) {
+      if (isDrawer(node)) { probe.drawer.push({ t: stamp(), what: 'drawer added' }); }
+    }
+    for (const node of record.removedNodes) {
+      if (isDrawer(node)) { probe.drawer.push({ t: stamp(), what: 'drawer removed' }); }
+      if (node === card || (node.contains && node.contains(card))) {
+        probe.removed.push({ t: stamp(), what: name(node) });
+      }
+      if (pressed && (node === pressed || (node.contains && node.contains(pressed)))) {
+        probe.removed.push({ t: stamp(), what: 'press target ' + name(pressed) + ' removed with ' + name(node) });
+      }
+    }
+  }
+});
+observer.observe(document.body, { childList: true, subtree: true });
+// A panic or an uncaught error in the page: what the log would show if it were collected.
+const failed = (e) => probe.errors.push({ t: stamp(), what: String(e.message || e.reason || e.type).slice(0, 300) });
+window.addEventListener('error', failed);
+window.addEventListener('unhandledrejection', failed);
+const consoleError = console.error;
+console.error = (...args) => {
+  probe.errors.push({ t: stamp(), what: args.map(String).join(' ').slice(0, 300) });
+  return consoleError.apply(console, args);
+};
+probe.stop = () => {
+  window.removeEventListener('scroll', scrolled, { capture: true });
+  window.removeEventListener('error', failed);
+  window.removeEventListener('unhandledrejection', failed);
+  console.error = consoleError;
+  for (const type of types) { window.removeEventListener(type, listener, { capture: true }); }
+  observer.disconnect();
+};
+window.__clickProbe = probe;
+return true;
+"#;
+
+/// Remove the probe's listeners, observer and console wrapper. Best effort: a
+/// page that is gone has nothing left to stop.
+async fn stop_click_probe(driver: &WebDriver) {
+    let _ = page(
+        driver,
+        "if (window.__clickProbe) { window.__clickProbe.stop(); window.__clickProbe = null; } return true;",
+        vec![],
+    )
+    .await;
+}
+
+/// What the page recorded about a click that opened no drawer, as one line of
+/// JSON: the events it saw, whether the clicked card was removed or replaced,
+/// where the board's columns were scrolled, where the card sits, and which
+/// element is at the card's centre.
+async fn click_evidence(driver: &WebDriver) -> String {
+    let script = r#"
+      const probe = window.__clickProbe;
+      if (!probe) { return { probe: 'missing' }; }
+      const card = probe.card;
+      const columns = document.querySelector('.snap-x.snap-mandatory');
+      const rect = card.getBoundingClientRect();
+      const at = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      const taskOf = (node) => { const w = node.closest && node.closest('[data-card-task-id]'); return w ? w.getAttribute('data-card-task-id') : null; };
+      const titleOf = (c) => (c.querySelector('[data-testid="task-title"]') || {}).textContent;
+      const title = titleOf(card);
+      const sameTitle = [...document.querySelectorAll('[data-testid="task-card"]')]
+        .filter((c) => titleOf(c) === title);
+      return {
+        events: probe.events,
+        cardRemovedFromBoard: probe.removed,
+        drawerInsertedOrRemoved: probe.drawer,
+        pageErrors: probe.errors,
+        clickedCardStillConnected: card.isConnected,
+        cardsWithThatTitleNow: sameTitle.length,
+        clickedCardIsTheCurrentOne: sameTitle.includes(card),
+        columnsScrollLeft: columns ? Math.round(columns.scrollLeft) : null,
+        columnsScrollWidth: columns ? columns.scrollWidth : null,
+        columnsClientWidth: columns ? columns.clientWidth : null,
+        cardRect: [rect.left, rect.top, rect.width, rect.height].map(Math.round),
+        viewport: [window.innerWidth, window.innerHeight],
+        elementAtCardCentre: at ? (at.getAttribute('data-testid') || at.tagName.toLowerCase())
+          + (card.contains(at) ? ' (inside the clicked card)' : ' (outside the clicked card)') : null,
+        taskShownByTheCardWhenClicked: probe.taskAtInstall,
+        taskShownByTheCardNow: taskOf(card),
+        drawersNow: [...document.querySelectorAll('[data-testid="task-drawer"]')].map((d) => d.getAttribute('data-task-id')),
+      };
+    "#;
+    match page(driver, script, vec![]).await {
+        Ok(value) => value.to_string(),
+        Err(error) => format!("the record could not be read: {error:#}"),
     }
 }
 
