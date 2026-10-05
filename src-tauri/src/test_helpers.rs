@@ -684,6 +684,7 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
         items,
         raw_plan: String::new(),
         last_apply: None,
+        fixed_content: Vec::new(),
     };
 
     (task, plan)

@@ -13,6 +13,7 @@ repository = "https://github.com/BarraDev/slashit"
 leptos = { version = "0.8", features = ["csr"] }
 slashit-activity = { path = "crates/slashit-activity" }
 slashit-attention = { path = "crates/slashit-attention" }
+slashit-review-content = { path = "crates/slashit-review-content" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 gloo-timers = { version = "0.3", features = ["futures"] }
@@ -33,5 +34,5 @@ web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlE
 wasm-bindgen-test = "0.3"
 
 [workspace]
-members = ["src-tauri", "crates/slashit-activity", "crates/slashit-attention", "crates/slashit-ipc", "crates/slashit-cli", "crates/slashit-acceptance"]
+members = ["src-tauri", "crates/slashit-activity", "crates/slashit-attention", "crates/slashit-review-content", "crates/slashit-ipc", "crates/slashit-cli", "crates/slashit-acceptance"]
 resolver = "2"

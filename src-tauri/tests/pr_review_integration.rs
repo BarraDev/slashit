@@ -489,6 +489,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
         items,
         raw_plan: String::new(),
         last_apply: None,
+        fixed_content: Vec::new(),
     };
 
     (task, plan)
@@ -724,6 +725,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
         items,
         raw_plan: String::new(),
         last_apply: None,
+        fixed_content: Vec::new(),
     };
 
     (task, plan)
@@ -1091,6 +1093,7 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
             push_error: None,
             auto_reply: Some(true),
         }),
+        fixed_content: Vec::new(),
     };
     // Reset to prove backfill leaves dry-run alone.
     for it in dry_plan.items.iter_mut() {

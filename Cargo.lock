@@ -5177,6 +5177,7 @@ dependencies = [
  "serde_json",
  "slashit-activity",
  "slashit-attention",
+ "slashit-review-content",
  "thiserror 2.0.18",
  "uuid",
  "vte",
@@ -5205,6 +5206,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "slashit-review-content"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "sha2",
+]
+
+[[package]]
 name = "slashit-ui"
 version = "0.1.0"
 dependencies = [
@@ -5227,6 +5236,7 @@ dependencies = [
  "slashit-activity",
  "slashit-attention",
  "slashit-ipc",
+ "slashit-review-content",
  "sysinfo",
  "tauri",
  "tauri-build",

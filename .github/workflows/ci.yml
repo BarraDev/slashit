@@ -90,7 +90,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Clippy (backend + CLI)
-        run: cargo clippy -p slashit-ui -p slashit -p slashit-ipc -p slashit-attention -p slashit-activity -- -D warnings
+        run: cargo clippy -p slashit-ui -p slashit -p slashit-ipc -p slashit-attention -p slashit-activity -p slashit-review-content -- -D warnings
 
       # `--all-targets --features run-acceptance` so the acceptance journeys
       # themselves are linted, not just the harness library. They are behind a
@@ -148,7 +148,7 @@ jobs:
           install_args: jj
 
       - name: Tests (backend + harness units)
-        run: cargo test -p slashit-ui -p slashit-ipc -p slashit-attention -p slashit-activity -p slashit-acceptance
+        run: cargo test -p slashit-ui -p slashit-ipc -p slashit-attention -p slashit-activity -p slashit-review-content -p slashit-acceptance
 
   # `slashit-frontend` is the root package (Leptos/WASM), not `slashit-ui`
   # -- see that crate's own Cargo.toml comment. It does not depend on the
@@ -399,4 +399,4 @@ jobs:
       # only Linux tests use) is gated `#[cfg(target_os = "linux")]` instead,
       # so the macOS leg compiles it out rather than failing on it.
       - name: Check (backend + CLI + IPC + attention rule + acceptance harness, including test code)
-        run: cargo check --tests -p slashit-ui -p slashit -p slashit-ipc -p slashit-attention -p slashit-activity -p slashit-acceptance
+        run: cargo check --tests -p slashit-ui -p slashit -p slashit-ipc -p slashit-attention -p slashit-activity -p slashit-review-content -p slashit-acceptance

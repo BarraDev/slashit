@@ -66,7 +66,8 @@ slashit-app/
 │   ├── slashit-activity/    # What happened to a task: its timeline (shared by backend and frontend)
 │   ├── slashit-attention/   # Which tasks need the user (shared by backend and frontend)
 │   ├── slashit-cli/         # The `slashit` command-line client
-│   └── slashit-ipc/         # CLI control-channel protocol and transports
+│   ├── slashit-ipc/         # CLI control-channel protocol and transports
+│   └── slashit-review-content/ # Which version of a PR review comment a fix was made from (shared by backend and frontend)
 ├── docs/             # Architecture and process docs
 ├── scripts/          # Repository checks (agent docs)
 ├── src/              # Frontend (Leptos 0.8 CSR, compiled to WASM)
