@@ -15,7 +15,7 @@
 //! its bare `origin`), and the arguments `gh` was called with.
 
 use super::human_review::{await_task, click, install_fakes, open_reviewed_drawer, read_task, HR_APPROVE};
-use super::task_runs::{branch_name_of, create_task, git_out, git_succeeds, register_project, run_to_review};
+use super::task_runs::{branch_name_of, create_task, git_commit_exists, git_is_ancestor, git_out, register_project, run_to_review};
 use super::*;
 use slashit_acceptance::fake_gh::FakeGh;
 
@@ -152,6 +152,7 @@ async fn stack_land_and_restack(
     let (parent_id, parent_title) = create_task(driver, &project_id, "Stack parent", &[]).await?;
     let parent = run_to_review(driver, &project_id, &parent_id, &parent_title).await?;
     let parent_branch = branch_name_of(&read_task(driver, &parent).await?)?;
+    let parent_file = own_work_file_of(&parent)?;
     let parent_tip = repository.branch_tip(&parent_branch)?.context("the parent branch is missing")?;
     approve_and_open_the_pull_request(driver, &parent, gh).await?;
     let parent_pr = gh.pr_for(&parent_branch)?.context("gh opened no pull request for the parent")?;
@@ -186,14 +187,14 @@ async fn stack_land_and_restack(
     // And as git holds it: the child starts at the parent's tip and adds
     // exactly one commit of its own, in its own file.
     let repo = repository.path_buf();
-    if !git_succeeds(&repo, &["merge-base", "--is-ancestor", &parent_tip, &child_tip_before])? {
+    if !git_is_ancestor(&repo, &parent_tip, &child_tip_before)? {
         bail!("the child's branch does not contain the parent's tip {parent_tip}");
     }
     let own = git_out(&repo, &["rev-list", &format!("{parent_tip}..{child_tip_before}")])?;
     if own.lines().count() != 1 {
         bail!("the child holds {} commits beyond the parent's tip, expected its one: {own}", own.lines().count());
     }
-    let child_file = fake_agent::own_work_file(&child_branch);
+    let child_file = own_work_file_of(&child)?;
     if repository.file_at(&child_branch, &child_file)?.as_deref() != Some(fake_agent::WORK_CONTENT)
         || repository.file_at(&parent_branch, &child_file)?.is_some()
     {
@@ -269,17 +270,17 @@ async fn stack_land_and_restack(
     if child_tip == child_tip_before {
         bail!("the child's branch was not rewritten");
     }
-    if !git_succeeds(&repo, &["merge-base", "--is-ancestor", &landed, &child_tip])? {
+    if !git_is_ancestor(&repo, &landed, &child_tip)? {
         bail!("the child's branch does not sit on what landed ({landed})");
     }
-    if git_succeeds(&repo, &["merge-base", "--is-ancestor", &parent_tip, &child_tip])? {
+    if git_is_ancestor(&repo, &parent_tip, &child_tip)? {
         bail!("the child's branch still carries the parent's original commit {parent_tip}");
     }
     let own = git_out(&repo, &["rev-list", &format!("{landed}..{child_tip}")])?;
     if own.lines().count() != 1 || repository.file_at(&child_branch, &child_file)?.as_deref() != Some(fake_agent::WORK_CONTENT) {
         bail!("the restacked child does not hold exactly its own work: {own:?}");
     }
-    if repository.file_at(&child_branch, &fake_agent::own_work_file(&parent_branch))?.as_deref() != Some(fake_agent::WORK_CONTENT) {
+    if repository.file_at(&child_branch, &parent_file)?.as_deref() != Some(fake_agent::WORK_CONTENT) {
         bail!("the restacked child lost the parent's work, which landed on main");
     }
     if repository.remote_tip(&child_branch)?.as_deref() != Some(child_tip.as_str()) {
@@ -289,7 +290,7 @@ async fn stack_land_and_restack(
     if repository.branch_tip(&parent_branch)?.as_deref() != Some(parent_tip.as_str()) || repository.branch_tip("main")? != main_before {
         bail!("restacking the child moved the parent's branch or the local main");
     }
-    if !git_succeeds(&repo, &["cat-file", "-e", &format!("{child_tip_before}^{{commit}}")])? {
+    if !git_commit_exists(&repo, &child_tip_before)? {
         bail!("the child's previous tip {child_tip_before} no longer exists");
     }
     let backups = git_out(&repo, &["for-each-ref", "refs/slashit/restack-backup"])?;
@@ -307,6 +308,18 @@ async fn stack_land_and_restack(
     assert_card_in_column(driver, PR_CREATED_COLUMN, &child.title).await?;
     assert_card_in_column(driver, DONE_COLUMN_SELECTOR, &parent.title).await?;
     Ok(Restacked { project_id, child, landed })
+}
+
+/// The file the fake agent left in `task`'s checkout. It names the file after
+/// the checkout directory, so this reads the directory from the persisted
+/// worktree path rather than assuming it is called like the branch.
+fn own_work_file_of(task: &ExecutedTask) -> Result<String> {
+    let directory = task
+        .worktree_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .with_context(|| format!("the checkout {} has no name", task.worktree_path.display()))?;
+    Ok(fake_agent::own_work_file(directory))
 }
 
 /// Approve & Create PR from the drawer, and wait for PR Created.

@@ -629,6 +629,7 @@ mod tests {
             MARKER_DIR_VAR,
             FAILING_RUNS_VAR,
             WRITE_FILE_VAR,
+            WRITE_OWN_FILE_VAR,
             BLOCK_DIR_VAR,
             PROGRESS_VAR,
             PROGRESS_FIRST_TEXT,

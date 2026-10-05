@@ -123,10 +123,29 @@ pub(super) fn git_out(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Whether `git <args>` succeeds in `dir`; for questions such as
-/// `merge-base --is-ancestor`, whose answer is the exit status.
-pub(super) fn git_succeeds(dir: &Path, args: &[&str]) -> Result<bool> {
-    let status = std::process::Command::new("git")
+/// Whether `ancestor` is an ancestor of `descendant`.
+///
+/// `git merge-base --is-ancestor` exits 0 for yes and 1 for no; any other
+/// outcome (an unknown revision, a broken repository) is Git failing, not an
+/// answer.
+pub(super) fn git_is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    git_predicate(dir, &["merge-base", "--is-ancestor", ancestor, descendant], 1)
+}
+
+/// Whether the commit `revision` names exists in the repository.
+///
+/// `git rev-parse --verify --quiet` exits 0 when it resolves and 1 when it
+/// does not. `cat-file -e` would not do: it exits 128 for a missing
+/// `<sha>^{commit}`, the same status as a real failure.
+pub(super) fn git_commit_exists(dir: &Path, revision: &str) -> Result<bool> {
+    git_predicate(dir, &["rev-parse", "--verify", "--quiet", &format!("{revision}^{{commit}}")], 1)
+}
+
+/// Runs a Git command that answers a yes/no question by exit status: 0 is
+/// yes, `negative_status` is no, and every other outcome is an error carrying
+/// Git's stderr, so an assertion cannot pass because Git itself failed.
+fn git_predicate(dir: &Path, args: &[&str], negative_status: i32) -> Result<bool> {
+    let output = std::process::Command::new("git")
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -134,7 +153,15 @@ pub(super) fn git_succeeds(dir: &Path, args: &[&str]) -> Result<bool> {
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .with_context(|| format!("could not run git {args:?} in {}", dir.display()))?;
-    Ok(status.status.success())
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(code) if code == negative_status => Ok(false),
+        status => bail!(
+            "git {args:?} failed unexpectedly in {} (status {status:?}): {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
 }
 
 /// A task's branch, from the product.
