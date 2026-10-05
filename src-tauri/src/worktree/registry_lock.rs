@@ -2,28 +2,39 @@
 //!
 //! `git worktree add` registers a checkout by making
 //! `<common dir>/worktrees/<id>/` and then writing `gitdir`, `commondir` and
-//! `HEAD` into it, one file after another. For that moment the entry exists
-//! and is incomplete. Every `git` that walks the registrations (another
-//! `worktree add`, `worktree list`, ref walks such as `for-each-ref`, and
-//! `worktree remove` taking an entry apart) can read it, and dies with `fatal: failed to read
-//! .git/worktrees/<id>/commondir`, with either "No such file or directory"
-//! or, when it catches the file created but not yet written, "Success"
-//! (and `Invalid path .../worktrees/<id>` when it catches an entry being
-//! removed).
-//! Git takes no lock to prevent this, so two tasks of one project starting
-//! at the same time can fail on it without anything of SlashIt's being at
-//! fault.
+//! `HEAD` into it, one file after another, and `git worktree remove` takes
+//! the entry apart the same way. While that happens the entry is incomplete,
+//! and any `git` that walks the registrations can read it and die with
+//! `fatal: failed to read .git/worktrees/<id>/commondir` ("No such file or
+//! directory", or "Success" when it catches the file created but not yet
+//! written) or `Invalid path .../worktrees/<id>`. Git takes no lock against
+//! this, so two tasks of one project started together can fail on it
+//! without anything of SlashIt's being at fault.
 //!
-//! So SlashIt's own `git worktree add`, `list` and `remove` for one
-//! repository run one at a time, whichever [`super::WorktreeManager`] starts
-//! them: the lock is process-wide and keyed by the repository's git common
-//! directory, not by manager and not global. Runs on different repositories
-//! stay concurrent, and nothing but the one `git` process is held under the
-//! lock, so it is never held across other work and never nested.
+//! So SlashIt's own `git` runs that walk the registrations go through
+//! [`run_git`] and its variants, and run one at a time per repository,
+//! whichever [`super::WorktreeManager`] (or other caller) starts them. They
+//! are `worktree add`, `list` and `remove`; the ref walks `for-each-ref` and
+//! `rev-list --all` (`WorktreeManager`, the orphan scan, the version control
+//! probes in `vcs`, the default base); and every `git` the restack runs
+//! except `fetch` (a rebase checks where a branch is checked out; a fetch
+//! never does, and holding the lock across the network would stall creating
+//! worktrees). Runs that read one ref or one object (`rev-parse`,
+//! `update-ref`, `cat-file`, `symbolic-ref`, `show-ref`, `merge-base`,
+//! `rev-list <range>`), or only the files of one checkout (`add`, `commit`,
+//! `diff`, `status`, `ls-files`), do not walk the registrations and are not
+//! behind the lock.
+//!
+//! The lock is process-wide and keyed by the repository's git common
+//! directory, not by manager and not global: runs on different repositories
+//! stay concurrent. It is held for exactly one `git` process, taken and
+//! released inside one blocking call, so it is never held across an `await`
+//! or other work, and one run never starts another while holding it.
 //!
 //! What this cannot cover: a `git` started by another process (the `slashit`
-//! CLI, `slashitd` beside the app, a person's terminal) is not behind this
-//! lock.
+//! CLI, `slashitd` beside the app, a hook, a person's terminal) is not
+//! behind this lock, so the race with those is reduced to what Git itself
+//! allows, not removed.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -89,6 +100,16 @@ pub(super) fn run_git_blocking(
     args: &[&str],
     input: Input,
 ) -> std::io::Result<Ran> {
+    run_git_blocking_with(program, repo_path, args, &[], input)
+}
+
+fn run_git_blocking_with(
+    program: &OsString,
+    repo_path: &str,
+    args: &[&str],
+    envs: &[(String, String)],
+    input: Input,
+) -> std::io::Result<Ran> {
     use std::process::Stdio;
     let lock = {
         let mut held = locks().lock().unwrap_or_else(PoisonError::into_inner);
@@ -98,7 +119,8 @@ pub(super) fn run_git_blocking(
     // half-written behind it.
     let _one_at_a_time = lock.lock().unwrap_or_else(PoisonError::into_inner);
     let mut command = std::process::Command::new(program);
-    command.args(args).current_dir(repo_path);
+    command.args(args).envs(envs.iter().map(|(k, v)| (k, v))).current_dir(repo_path);
+    // Standard input is closed unless given: `output()` does that for us.
     match input {
         Input::None => Ok(Ran { output: command.output()?, input_written: Ok(()) }),
         Input::Bytes(bytes) => {
@@ -129,11 +151,23 @@ pub(super) async fn run_git(
     args: &[&str],
     input: Input,
 ) -> std::io::Result<Ran> {
+    run_git_with(program, repo_path, args, &[], input).await
+}
+
+/// [`run_git`] with environment variables set for the `git` run.
+pub(super) async fn run_git_with(
+    program: OsString,
+    repo_path: &str,
+    args: &[&str],
+    envs: &[(&str, String)],
+    input: Input,
+) -> std::io::Result<Ran> {
     let repo_path = repo_path.to_string();
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let envs: Vec<(String, String)> = envs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
     tokio::task::spawn_blocking(move || {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_git_blocking(&program, &repo_path, &args, input)
+        run_git_blocking_with(&program, &repo_path, &args, &envs, input)
     })
     .await
     .map_err(std::io::Error::other)?

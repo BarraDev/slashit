@@ -231,13 +231,13 @@ enum Listed {
 /// chain of symbolic refs ends, not the next ref along it. Its pattern also matches refs below `refname/`, so
 /// only the line for the exact name is taken.
 async fn listed(repo: &Path, refname: &str) -> Result<Listed, String> {
-    let output = tokio::process::Command::new("git")
-        .args(["for-each-ref", "--format=%(refname) %(symref)", refname])
-        .current_dir(repo)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run git for-each-ref: {e}"))?;
+    let output = super::registry_lock::output(
+        "git".into(),
+        &repo.to_string_lossy(),
+        &["for-each-ref", "--format=%(refname) %(symref)", refname],
+    )
+    .await
+    .map_err(|e| format!("Failed to run git for-each-ref: {e}"))?;
     if !output.status.success() {
         return Err(format!(
             "Could not read {refname} in {}: {}",

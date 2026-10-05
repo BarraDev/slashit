@@ -181,14 +181,16 @@ pub async fn jj_available() -> bool {
 
 /// `git <args>` in `dir`, its trimmed stdout on success, its stderr otherwise.
 pub(super) async fn git_stdout(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run git: {e}"))?;
+    let output = super::registry_lock::run_git_with(
+        "git".into(),
+        &dir.to_string_lossy(),
+        args,
+        &[("GIT_TERMINAL_PROMPT", "0".to_string())],
+        super::registry_lock::Input::None,
+    )
+    .await
+    .map_err(|e| format!("Failed to run git: {e}"))?
+    .output;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
