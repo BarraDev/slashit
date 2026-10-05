@@ -191,11 +191,7 @@ pub struct OrphanScan {
 }
 
 async fn git(repo: &str, args: &[&str]) -> Result<String, String> {
-    let output = tokio::process::Command::new(git_program())
-        .args(args)
-        .current_dir(repo)
-        .stdin(std::process::Stdio::null())
-        .output()
+    let output = super::registry_lock::output(git_program(), repo, args)
         .await
         .map_err(|e| format!("`git {}` could not be run in {repo}: {e}", args.join(" ")))?;
     if !output.status.success() {

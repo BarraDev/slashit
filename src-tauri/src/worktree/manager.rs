@@ -604,11 +604,14 @@ impl WorktreeManager {
     /// absence, and this function returning a bare empty string used to
     /// supply that proof out of a failed `git` invocation.
     pub fn worktree_list_porcelain(repo_path: &str) -> Option<String> {
-        let output = std::process::Command::new(git_program())
-            .args(["worktree", "list", "--porcelain", "-z"])
-            .current_dir(repo_path)
-            .output()
-            .ok()?;
+        let output = super::registry_lock::run_git_blocking(
+            &git_program(),
+            repo_path,
+            &["worktree", "list", "--porcelain", "-z"],
+            super::registry_lock::Input::None,
+        )
+        .ok()?
+        .output;
 
         if !output.status.success() {
             return None;
@@ -785,11 +788,8 @@ impl WorktreeManager {
     /// anyway. A listing git could not produce adopts nothing, and whatever
     /// is then tried instead fails on the same git.
     async fn adoptable_worktree(&self, repo_path: &str, branch: &str) -> Result<Option<String>, String> {
-        let Ok(output) = tokio::process::Command::new(git_program())
-            .args(["worktree", "list", "--porcelain", "-z"])
-            .current_dir(repo_path)
-            .output()
-            .await
+        let Ok(output) =
+            super::registry_lock::output(git_program(), repo_path, &["worktree", "list", "--porcelain", "-z"]).await
         else {
             return Ok(None);
         };
@@ -1049,12 +1049,13 @@ impl WorktreeManager {
             .to_str()
             .ok_or_else(|| "Worktree path is not valid UTF-8".to_string())?;
 
-        let output = tokio::process::Command::new(git_program())
-            .args(Self::git_worktree_add_args(dest, branch))
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| format!("Failed to create git worktree: {}", e))?;
+        let output = super::registry_lock::output(
+            git_program(),
+            repo_path,
+            &Self::git_worktree_add_args(dest, branch),
+        )
+        .await
+        .map_err(|e| format!("Failed to create git worktree: {}", e))?;
 
         if !output.status.success() {
             return Err(format!(
@@ -1113,10 +1114,7 @@ impl WorktreeManager {
     pub async fn local_branch_exists(repo_path: &str, branch: &str) -> Result<bool, String> {
         let branch = checked_task_branch(branch)?;
         let refname = format!("refs/heads/{branch}");
-        let output = tokio::process::Command::new(git_program())
-            .args(["for-each-ref", "--format=%(refname)", &refname])
-            .current_dir(repo_path)
-            .output()
+        let output = super::registry_lock::output(git_program(), repo_path, &["for-each-ref", "--format=%(refname)", &refname])
             .await
             .map_err(|e| format!("Failed to run git for-each-ref: {e}"))?;
         if !output.status.success() || !output.stderr.is_empty() {
@@ -1687,21 +1685,15 @@ impl WorktreeManager {
         revs.push_str("\n--not\n");
         revs.push_str(&kept.join("\n"));
         revs.push('\n');
-        let mut child = tokio::process::Command::new(git_program())
-            .args(["rev-list", "--ignore-missing", "--not", "--all", "--stdin"])
-            .current_dir(repo_path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("`git rev-list` could not be run in {repo_path}: {e}"))?;
-        let mut stdin = child.stdin.take().ok_or("`git rev-list` has no stdin")?;
-        let writing = async move {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(revs.as_bytes()).await
-        };
-        let (written, output) = tokio::join!(writing, child.wait_with_output());
-        let output = output.map_err(|e| format!("`git rev-list` could not be run in {repo_path}: {e}"))?;
+        let ran = super::registry_lock::run_git(
+            git_program(),
+            repo_path,
+            &["rev-list", "--ignore-missing", "--not", "--all", "--stdin"],
+            super::registry_lock::Input::Bytes(revs.into_bytes()),
+        )
+        .await
+        .map_err(|e| format!("`git rev-list` could not be run in {repo_path}: {e}"))?;
+        let (output, written) = (ran.output, ran.input_written);
         if !output.status.success() {
             let said = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let said = if said.is_empty() { format!("`git rev-list` exited with {}", output.status) } else { said };
@@ -1810,12 +1802,13 @@ impl WorktreeManager {
         if commit.is_empty() {
             return Err("git listed no commit for its HEAD".to_string());
         }
-        let output = tokio::process::Command::new(git_program())
-            .args(["for-each-ref", "--contains", commit, "--format=%(refname)"])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| format!("`git for-each-ref` could not be run in {repo_path}: {e}"))?;
+        let output = super::registry_lock::output(
+            git_program(),
+            repo_path,
+            &["for-each-ref", "--contains", commit, "--format=%(refname)"],
+        )
+        .await
+        .map_err(|e| format!("`git for-each-ref` could not be run in {repo_path}: {e}"))?;
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
@@ -1888,12 +1881,10 @@ impl WorktreeManager {
     /// that refusal is reported like any other failure to answer, never read
     /// as an empty listing.
     pub(super) async fn worktree_listing(repo_path: &str) -> Result<String, String> {
-        let output = tokio::process::Command::new(git_program())
-            .args(["worktree", "list", "--porcelain", "-z"])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| format!("`git worktree list` could not be run in {repo_path}: {e}"))?;
+        let output =
+            super::registry_lock::output(git_program(), repo_path, &["worktree", "list", "--porcelain", "-z"])
+                .await
+                .map_err(|e| format!("`git worktree list` could not be run in {repo_path}: {e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "`git worktree list` failed in {repo_path}: {}",
@@ -1979,12 +1970,10 @@ impl WorktreeManager {
         // second-guess it; ignored build output is not dirty to git and this
         // removal takes the checkout away build output and all.
         let was_present = matches!(Presence::of(Path::new(worktree_path)), Presence::Present);
-        let output = tokio::process::Command::new(git_program())
-            .args(["worktree", "remove", worktree_path])
-            .current_dir(repo_path)
-            .output()
-            .await
-            .map_err(|e| format!("Failed to remove worktree: {}", e))?;
+        let output =
+            super::registry_lock::output(git_program(), repo_path, &["worktree", "remove", worktree_path])
+                .await
+                .map_err(|e| format!("Failed to remove worktree: {}", e))?;
 
         // Kept for the failure message below. A refusal git explains in
         // stderr is the only thing that can tell the user *which* file is
@@ -2484,6 +2473,34 @@ mod tests {
         assert_eq!(distinct.len(), roots.len(), "every manager has a root of its own");
         let left: Vec<_> = roots.iter().filter(|root| root.exists()).collect();
         assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
+    /// Git registers a worktree in steps, and a `git` that reads the
+    /// registrations in between fails. Creating, listing and removing from
+    /// several managers on one repository must never meet one half made.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn managers_creating_listing_and_removing_in_one_repository_never_meet_a_half_made_registration() {
+        let repo = create_temp_git_repo();
+        let repo_path = repo.path().to_str().unwrap().to_string();
+        let runs: Vec<_> = (0..6)
+            .map(|i| {
+                let repo_path = repo_path.clone();
+                tokio::spawn(async move {
+                    let mgr = test_manager();
+                    for round in 0..4 {
+                        let branch = format!("task-{i:04}{round:04}");
+                        let info = mgr.create(&repo_path, &branch).await.expect("create");
+                        WorktreeManager::worktree_listing(&repo_path).await.expect("list");
+                        mgr.remove(&info.path, &repo_path, None).await.expect("remove");
+                    }
+                })
+            })
+            .collect();
+        for run in runs {
+            run.await.expect("the run completes");
+        }
+        let listing = WorktreeManager::worktree_listing(&repo_path).await.expect("list");
+        assert_eq!(listing.matches("worktree ").count(), 1, "only the primary checkout is left: {listing:?}");
     }
 
     /// A test that panics still removes the root: the owner is dropped

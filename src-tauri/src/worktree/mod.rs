@@ -8,6 +8,7 @@ mod ownership;
 pub mod project_base;
 pub mod readiness;
 pub mod remote_head;
+mod registry_lock;
 pub mod restack;
 pub mod vcs;
 pub mod vcs_init;
