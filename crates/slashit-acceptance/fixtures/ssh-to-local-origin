@@ -1,0 +1,19 @@
+#!/bin/sh
+# Stands in for `ssh` so a repository whose `origin` is an scp-style GitHub
+# address (`git@github.com:owner/repo.git`) can still be fetched from and
+# queried without a network: the first argument names the local bare
+# repository to serve, and git's own request (`git-upload-pack '<path>'`) is
+# answered from that repository instead of from a host. Nothing else is
+# accepted, and nothing here can reach a real host.
+set -e
+origin="$1"
+shift
+for requested in "$@"; do :; done
+case "$requested" in
+    "git-upload-pack "*|"git-receive-pack "*)
+        service=${requested%% *}
+        exec git "${service#git-}" "$origin"
+        ;;
+esac
+echo "ssh-to-local-origin: refusing to run: $requested" >&2
+exit 128

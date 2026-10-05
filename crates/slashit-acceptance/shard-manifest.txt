@@ -24,6 +24,7 @@
 1	deleting_a_task_removes_its_worktree_without_destroying_its_work
 1	git_fixture::a_fixture_created_in_a_later_second_still_pushes_its_own_main
 1	git_fixture::a_fixture_never_takes_over_an_origin_that_already_exists
+1	git_fixture::git_predicates_answer_yes_and_no_and_report_git_failing
 1	git_fixture::fixtures_created_together_in_one_state_root_each_get_their_own_origin
 1	human_review::a_failed_pull_request_keeps_the_approval_and_retrying_needs_no_second_approval
 1	human_review::closing_a_reviewed_task_without_merging_is_confirmed_first_and_keeps_its_work
@@ -59,3 +60,9 @@
 3	the_task_drawer_shows_a_failure_in_full_and_retries_it
 3	the_task_drawer_starts_a_backlog_task_through_the_queue
 1	orphans::leftover_checkouts_and_branches_are_listed_and_reclaimed_only_on_explicit_confirmation
+
+# Added after the timings above, measured locally (not on a hosted runner) at about 45s and
+# 35s: each went to a different shard, the checkout-recovery journey to shard 1 and the stacked
+# journey to shard 3, rather than rebalancing the existing assignment.
+1	checkout_recovery::restarting_keeps_an_intact_checkout_adopts_a_moved_one_and_clears_a_gone_one
+3	stacked_tasks::a_task_stacked_on_a_parent_is_restacked_onto_the_default_branch_once_the_parent_lands
