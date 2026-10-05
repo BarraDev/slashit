@@ -66,13 +66,37 @@ struct Ran {
     stderr: String,
 }
 
+/// One `git` run, under the repository's registration lock (see
+/// [`super::registry_lock`]) except a `fetch`, which never reads the
+/// registrations and may take long on the network. Each helper here runs one
+/// `git` and returns; none is called while another holds the lock.
+async fn run_unless_fetch(
+    dir: &Path,
+    args: &[&str],
+    envs: &[(&str, String)],
+) -> std::io::Result<std::process::Output> {
+    if args.first() == Some(&"fetch") {
+        return tokio::process::Command::new("git")
+            .args(args)
+            .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
+            .current_dir(dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await;
+    }
+    super::registry_lock::run_git_with(
+        "git".into(),
+        &dir.to_string_lossy(),
+        args,
+        envs,
+        super::registry_lock::Input::None,
+    )
+    .await
+    .map(|ran| ran.output)
+}
+
 async fn run(dir: &Path, args: &[&str], envs: &[(&str, String)]) -> Result<Ran, String> {
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
-        .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .output()
+    let output = run_unless_fetch(dir, args, envs)
         .await
         .map_err(|e| format!("Failed to run git: {e}"))?;
     Ok(Ran {
@@ -87,11 +111,7 @@ async fn run(dir: &Path, args: &[&str], envs: &[(&str, String)]) -> Result<Ran, 
 /// path may start or end with whitespace; only the empty entry after the
 /// final NUL is dropped.
 async fn git_entries(dir: &Path, args: &[&str]) -> Result<Vec<String>, String> {
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdin(std::process::Stdio::null())
-        .output()
+    let output = run_unless_fetch(dir, args, &[])
         .await
         .map_err(|e| format!("Failed to run git: {e}"))?;
     if !output.status.success() {
