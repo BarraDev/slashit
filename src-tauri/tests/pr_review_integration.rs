@@ -10,10 +10,11 @@
 //! The working directory is a real Git repository with one commit on the
 //! tasks' branch, `test-branch`, because a real apply commits the fixes
 //! there and reports a commit that fails. That commit is already on a bare
-//! `origin`, as a pull request's branch is. The mock `claude` edits nothing,
-//! so there is nothing to commit and nothing to push: the fixes count as
-//! delivered, and replies may be posted. Committing and pushing are covered
-//! in `worktree::commit` and the `commands::pr` unit tests.
+//! `origin`, as a pull request's branch is. The mock `claude` writes one new
+//! file per run, as a fix agent does: an apply commits it, pushes it to that
+//! `origin` and only then may reply that the item is fixed. Committing and
+//! pushing are covered in `worktree::commit` and the `commands::pr` unit
+//! tests.
 
 #[cfg(unix)]
 use std::fs;
@@ -109,7 +110,7 @@ impl MockEnv {
         // then emits one stream-json `result` event so
         // extract_text_from_stream_json picks it up.
         let claude_script = format!(
-            "#!/bin/sh\n{record}printf '%s\\n' '{{\"type\":\"result\",\"result\":{result:?}}}'\n",
+            "#!/bin/sh\n{record}mktemp ./review-fix.XXXXXX > /dev/null\nprintf '%s\\n' '{{\"type\":\"result\",\"result\":{result:?}}}'\n",
             record = record_claude_run(&claude_log, &claude_prompts),
             result = claude_result,
         );
@@ -146,6 +147,17 @@ impl MockEnv {
 
     fn working_dir_str(&self) -> String {
         self.working_dir.display().to_string()
+    }
+
+    /// `git <args>` in the working directory, its trimmed stdout.
+    fn git_out(&self, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&self.working_dir)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     fn read_claude_log(&self) -> String {
@@ -319,7 +331,7 @@ async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
     let (task, plan) = create_test_pr_review_setup();
 
     let opts = AddressPrReviewOptions {
-        auto_push: false,  // nothing to push: the branch is already on origin
+        auto_push: true,
         auto_reply: true,
         dry_run: false,
     };
@@ -335,8 +347,14 @@ async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
     assert!(!persisted.dry_run);
 
     assert_eq!(env.claude_invocations(), 1, "claude called exactly once");
-    assert!(!result.pushed, "auto_push=false → not pushed");
+    assert!(result.pushed, "the fix is pushed before its reply says it is fixed");
     assert!(!result.dry_run, "full apply must not set the dry_run flag");
+    assert_eq!(
+        updated_plan.items[0].fix_commit.as_deref(),
+        Some(env.git_out(&["rev-parse", "HEAD"]).as_str()),
+        "the commit carrying the fix is recorded on its item",
+    );
+    assert!(!updated_plan.items[0].fix_uncommitted);
     assert_eq!(result.fixed_ids, vec![101]);
     assert_eq!(result.skipped_ids, vec![102]);
 
@@ -446,6 +464,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             last_error: None,
             pr_reply_text: None,
             reply_comment_id: None,
+            fix_commit: None,
         },
         PrReviewItem {
             comment_id: Some(202),
@@ -462,6 +481,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             last_error: None,
             pr_reply_text: None,
             reply_comment_id: None,
+            fix_commit: None,
         },
         PrReviewItem {
             comment_id: Some(203),
@@ -478,6 +498,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             last_error: None,
             pr_reply_text: None,
             reply_comment_id: None,
+            fix_commit: None,
         },
     ];
 
@@ -594,7 +615,7 @@ async fn a_non_collaborator_fix_is_applied_only_after_the_user_approves_it() {
     // The user ticks the item: the explicit approval boundary.
     let mut approved = merged;
     approved.items[0].approved = true;
-    let opts = AddressPrReviewOptions { auto_push: false, ..opts };
+    let opts = AddressPrReviewOptions { auto_push: true, ..opts };
     let (result, _) = address_pr_review_inner(
         task, env.working_dir_str(), approved, opts, no_progress(), never_cancelled(),
     )
@@ -698,6 +719,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             last_error: None,
             pr_reply_text: None,
             reply_comment_id: None,
+            fix_commit: None,
         },
         PrReviewItem {
             comment_id: Some(302),
@@ -714,6 +736,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             last_error: None,
             pr_reply_text: None,
             reply_comment_id: None,
+            fix_commit: None,
         },
     ];
 
@@ -804,7 +827,7 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
     let (task, plan) = create_test_two_fix_setup();
 
     let opts = AddressPrReviewOptions {
-        auto_push: false,
+        auto_push: true,
         auto_reply: true,
         dry_run: false,
     };
@@ -860,7 +883,9 @@ async fn rerunning_apply_with_only_replies_pending_skips_claude() {
     let (task, mut plan) = create_test_two_fix_setup();
 
     // Both approved, but only item index 0 has its fix on disk and is missing a reply.
+    // Its fix is carried by a commit `origin` holds.
     plan.items[0].fix_done = true;
+    plan.items[0].fix_commit = Some(env.git_out(&["rev-parse", "HEAD"]));
     plan.items[0].last_agent_summary = Some("prior round did the edit".to_string());
     plan.items[0].reply_posted = false;
     // Drop item 2 from approval so we focus on the reply-only path for item 1.
@@ -899,8 +924,10 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
     let env = MockEnv::setup("not used");
     let (task, mut plan) = create_test_two_fix_setup();
 
-    // Item 0: fix done, reply missing — should be replied to.
+    // Item 0: fix done, carried by a commit `origin` holds, reply missing —
+    // should be replied to.
     plan.items[0].fix_done = true;
+    plan.items[0].fix_commit = Some(env.git_out(&["rev-parse", "HEAD"]));
     plan.items[0].reply_posted = false;
     plan.items[0].last_agent_summary = Some("edit already shipped".to_string());
     // Item 1: fix done, reply posted in the current format (pr_reply_text set)
@@ -912,7 +939,7 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
     let _ = env.working_dir_str(); // unused but keeps the mock PATH active
 
     let (result, updated_plan) =
-        sync_pr_review_replies_inner(task, plan).await
+        sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await
             .expect("sync succeeds");
 
     assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
@@ -956,7 +983,7 @@ async fn sync_pr_review_replies_discovers_and_rewrites_a_legacy_reply() {
     // Item 1: leave fix_pending so it doesn't add noise to the gh call count.
 
     let (result, updated_plan) =
-        sync_pr_review_replies_inner(task, plan).await
+        sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await
             .expect("sync succeeds");
 
     assert_eq!(env.claude_invocations(), 0, "sync must never invoke claude");
@@ -985,7 +1012,7 @@ async fn sync_pr_review_replies_reports_fix_pending_items_without_calling_gh() {
     // them as fix_pending without touching gh.
 
     let (result, _plan) =
-        sync_pr_review_replies_inner(task, plan).await
+        sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await
             .expect("sync succeeds");
     assert_eq!(env.gh_invocations(), 0, "no replies posted when nothing is fix_done");
     assert_eq!(result.replied, 0);
@@ -1024,7 +1051,7 @@ async fn an_unpushed_fix_gets_no_reply_from_apply_or_sync() {
 
     plan.backfill_lifecycle_from_last_apply();
     assert!(!plan.items[0].reply_posted, "the backfill does not invent the reply");
-    let (synced, _plan) = sync_pr_review_replies_inner(task, plan).await.expect("sync succeeds");
+    let (synced, _plan) = sync_pr_review_replies_inner(task, env.working_dir_str(), plan).await.expect("sync succeeds");
     assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
     assert_eq!(env.gh_invocations(), 0, "gh log:\n{}", env.read_gh_log());
 }
@@ -1507,4 +1534,49 @@ async fn a_non_granting_discuss_run_clears_approval_when_it_changes_the_item() {
     assert!(!item.approved, "the user approved a different change");
     assert!(!merged.items[0].approved, "the member item was not pending and is untouched");
     assert_eq!(merged.items[0].reasoning, "Unsure whether retry is desired.");
+}
+
+#[test]
+fn fix_commit_round_trips_and_a_plan_saved_before_it_reads_as_having_none() {
+    let (_task, mut plan) = create_test_two_fix_setup();
+    plan.items[0].fix_commit = Some("a".repeat(40));
+    let json = serde_json::to_value(&plan).unwrap();
+    let read: PrReviewPlan = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(read.items[0].fix_commit, plan.items[0].fix_commit);
+    assert!(json["items"][1].get("fix_commit").is_none(), "an item without one writes nothing");
+
+    let mut legacy = json;
+    legacy["items"][0].as_object_mut().unwrap().remove("fix_commit");
+    let read: PrReviewPlan = serde_json::from_value(legacy).unwrap();
+    assert_eq!(read.items[0].fix_commit, None);
+}
+
+/// A fix whose commit is recorded had its reply decided by delivery, so the
+/// backfill never reads a missing `reply_errors` entry as a posted reply for
+/// it, however its `fix_uncommitted` marker was last set.
+#[test]
+fn backfill_does_not_infer_a_posted_reply_for_a_fix_with_a_recorded_commit() {
+    use slashit_ui_lib::domain::task::PrReviewApplyResult;
+
+    let (_task, mut plan) = create_test_two_fix_setup();
+    plan.last_apply = Some(PrReviewApplyResult {
+        applied_at: chrono::Utc::now(),
+        agent_summary: String::new(),
+        fixed_ids: vec![301, 302],
+        skipped_ids: vec![],
+        pushed: false,
+        push_branch: None,
+        replies_posted: 0,
+        reply_errors: vec![],
+        dry_run: false,
+        failed_ids: vec![],
+        fix_errors: vec![],
+        push_error: None,
+        auto_reply: Some(true),
+    });
+    // Item 0 has a commit; item 1 is a fix saved by a build that recorded none.
+    plan.items[0].fix_commit = Some("b".repeat(40));
+    plan.backfill_lifecycle_from_last_apply();
+    assert!(plan.items[0].fix_done && !plan.items[0].reply_posted, "{:?}", plan.items[0]);
+    assert!(plan.items[1].fix_done && plan.items[1].reply_posted, "history is kept: {:?}", plan.items[1]);
 }

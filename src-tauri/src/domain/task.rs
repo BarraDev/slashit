@@ -621,9 +621,14 @@ impl PrReviewPlan {
                 // A fix not yet delivered (`fix_uncommitted`) had no reply
                 // attempted -- replies wait for delivery -- so its absence
                 // from `reply_errors` says nothing about a reply being posted.
+                // Neither does it for any fix with a recorded commit: whether
+                // its reply was posted is recorded on the item itself, and
+                // only a plan from before delivery was tracked needs this
+                // inference.
                 if last.auto_reply == Some(true)
                     && !item.reply_posted
                     && !item.fix_uncommitted
+                    && item.fix_commit.is_none()
                     && !failed_reply_ids.contains(&cid)
                 {
                     item.reply_posted = true;
@@ -709,19 +714,33 @@ pub struct PrReviewItem {
     /// across modal reopens. A re-run with `fix_done=true` skips the agent.
     #[serde(default)]
     pub fix_done: bool,
-    /// True while this item's fix is not yet delivered to the pull request:
-    /// set when the fix agent succeeds, cleared once an apply commits the
-    /// checkout (or finds nothing left to commit) and, when the branch is
-    /// ahead of its remote, pushes it. A commit or push that fails, is
-    /// cancelled, or is withheld because another fix agent failed in the
-    /// same apply leaves it set, as does a needed push skipped because
-    /// `auto_push=false`, so the next apply commits or pushes it without
-    /// running the agent again. It survives an edit to the item's comment.
-    /// No reply claiming the fix is posted while it is set. Only these
-    /// fixes are ever committed by an apply; a fix already delivered is
-    /// never committed again.
+    /// Bookkeeping for the UI and for what an apply still owes: true from the
+    /// moment this item's fix agent succeeds until an apply or a sync has
+    /// seen [`PrReviewItem::fix_commit`] contained in the pull request's
+    /// remote branch. It is never evidence that a fix was delivered, and
+    /// clearing it proves nothing: a plan persisted before commits were
+    /// recorded has it cleared without any proof (see #96). Whether a reply
+    /// may say the fix is done is decided only by the commit's presence on
+    /// the remote.
+    ///
+    /// While it is set and `fix_commit` is not, the fix's edits are owed a
+    /// commit; while both are set, the commit is owed a push. A commit or
+    /// push that fails, is cancelled, or is withheld because another fix
+    /// agent failed in the same apply leaves it set. It survives an edit to
+    /// the item's comment.
     #[serde(default)]
     pub fix_uncommitted: bool,
+    /// The commit that carries this item's fix: recorded when an apply's
+    /// commit succeeds after the item's fix agent changed the checkout. One
+    /// commit may carry several items' fixes. `None` for a fix not yet
+    /// committed and for every plan saved before this field existed, which
+    /// therefore proves nothing about delivery.
+    ///
+    /// This is a different question from the one `PrReviewPlan::fixed_content`
+    /// answers (#109): that records which version of the comment's text the
+    /// fix was made from; this records which commit holds the fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_commit: Option<String>,
     /// True once a reply (inline or fallback PR comment) was posted on GitHub
     /// for this item. Decoupled from `fix_done` so a successful fix with a
     /// failed reply leaves the item visibly pending in the "Sync replies" path.
@@ -744,6 +763,16 @@ pub struct PrReviewItem {
     /// can PATCH the existing comment instead of duplicating it.
     #[serde(default)]
     pub reply_comment_id: Option<u64>,
+}
+
+impl PrReviewItem {
+    /// A fix saved without any record of the commit that carries it, and
+    /// with `fix_uncommitted` already clear: the shape of every fix a build
+    /// from before #96 left delivered or not. Nothing in the plan can say
+    /// whether it reached the pull request, so it is unproven.
+    pub fn fix_has_no_provenance(&self) -> bool {
+        self.fix_done && !self.fix_uncommitted && self.fix_commit.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

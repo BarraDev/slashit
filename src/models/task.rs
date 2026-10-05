@@ -232,6 +232,7 @@ impl PrReviewPlan {
                 if last.auto_reply == Some(true)
                     && !item.reply_posted
                     && !item.fix_uncommitted
+                    && item.fix_commit.is_none()
                     && !failed_reply_ids.contains(&cid)
                 {
                     item.reply_posted = true;
@@ -297,6 +298,11 @@ pub struct PrReviewItem {
     /// Mirrors the backend field: a fix not yet committed and pushed.
     #[serde(default)]
     pub fix_uncommitted: bool,
+    /// Mirrors the backend field: the commit carrying this item's fix. It
+    /// must survive a round trip through the frontend, or every fix would
+    /// look like one saved before commits were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_commit: Option<String>,
     #[serde(default)]
     pub reply_posted: bool,
     #[serde(default)]
