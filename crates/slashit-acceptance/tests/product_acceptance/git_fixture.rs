@@ -184,6 +184,10 @@ fn git_predicates_answer_yes_and_no_and_report_git_failing() {
     assert!(unknown.contains("failed unexpectedly") && unknown.contains("Not a valid commit name"), "{unknown}");
     let not_a_repository = parent.join("not-a-repository");
     std::fs::create_dir_all(&not_a_repository).expect("create a plain directory");
+    // Git looks for a repository in every parent directory, and a scratch
+    // directory under a checkout would find that one. An invalid `.git` stops
+    // the search at this directory with an error.
+    std::fs::write(not_a_repository.join(".git"), "not a gitfile\n").expect("write the marker");
     assert!(git_is_ancestor(&not_a_repository, &base, &tip).is_err());
     assert!(git_commit_exists(&not_a_repository, &tip).is_err());
 
