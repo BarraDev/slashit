@@ -107,6 +107,15 @@ if [ -n "$SLASHIT_FAKE_AGENT_WRITE_FILE" ] && [ -n "$is_run" ]; then
 " > "$SLASHIT_FAKE_AGENT_WRITE_FILE"
 fi
 
+# The same, with a file of its own per worktree, for a journey whose tasks must
+# each leave commits the others do not hold (a stacked task whose own work has
+# to differ from its parent's). Named after the worktree's directory, which is
+# the task's branch name.
+if [ -n "$SLASHIT_FAKE_AGENT_WRITE_OWN_FILE" ] && [ -n "$is_run" ]; then
+    printf '%s' "work produced by the fake agent
+" > "agent-work-$(basename "$PWD").txt"
+fi
+
 # Blocking mode, when a journey asked for it. A run that blocks gets a release
 # pipe of its own: it creates the pipe and opens it before it announces itself,
 # and takes both away again once its release has arrived.

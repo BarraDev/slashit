@@ -111,6 +111,40 @@ impl FakeGh {
         std::fs::rename(&staged, &target).with_context(|| format!("could not replace {}", target.display()))
     }
 
+    /// Make `pr view <number>` print `answer`, whatever [`Self::script_pr_view`]
+    /// says for every other pull request.
+    pub fn script_pr_view_of(&self, number: u64, answer: &serde_json::Value) -> Result<()> {
+        self.replace(&format!("pr-view-{number}.json"), &answer.to_string())
+    }
+
+    /// Make `pr list --head <branch>` print `answer`, a JSON array the way
+    /// `gh pr list --json` prints one, instead of the pull request this fake
+    /// opened for the branch.
+    pub fn script_pr_list_of(&self, branch: &str, answer: &serde_json::Value) -> Result<()> {
+        let directory = self.dir.join("pr-list");
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("could not create {}", directory.display()))?;
+        self.replace(&format!("pr-list/{branch}.json"), &answer.to_string())
+    }
+
+    /// Make the REST listing of pull request `number`'s commits print
+    /// `commits`, one object id per line.
+    pub fn script_pr_commits(&self, number: u64, commits: &[String]) -> Result<()> {
+        let directory = self.dir.join("pr-commits");
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("could not create {}", directory.display()))?;
+        self.replace(&format!("pr-commits/{number}"), &format!("{}\n", commits.join("\n")))
+    }
+
+    /// Write `name` under the fixture's directory whole, so a `gh` running at
+    /// the same moment reads the old contents or the new, never half.
+    fn replace(&self, name: &str, contents: &str) -> Result<()> {
+        let target = self.dir.join(name);
+        let staged = self.dir.join(format!("{name}.partial"));
+        std::fs::write(&staged, contents).with_context(|| format!("could not write {}", staged.display()))?;
+        std::fs::rename(&staged, &target).with_context(|| format!("could not replace {}", target.display()))
+    }
+
     /// Make every following `pr view` take `seconds` before answering, or
     /// answer at once again with `None`.
     pub fn delay_pr_view(&self, seconds: Option<u32>) -> Result<()> {

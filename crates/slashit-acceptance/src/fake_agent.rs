@@ -96,6 +96,18 @@ pub fn recorded_failure() -> String {
 /// a real commit on the task's real branch.
 pub const WRITE_FILE_VAR: &str = "SLASHIT_FAKE_AGENT_WRITE_FILE";
 
+/// Like [`WRITE_FILE_VAR`], but each run writes `agent-work-<worktree
+/// directory>.txt`, so tasks in different worktrees leave different files and
+/// a task stacked on another has commits of its own. Any non-empty value
+/// turns it on; [`WORK_CONTENT`] is what is written.
+pub const WRITE_OWN_FILE_VAR: &str = "SLASHIT_FAKE_AGENT_WRITE_OWN_FILE";
+
+/// The file [`WRITE_OWN_FILE_VAR`] makes a run leave in a worktree named
+/// `directory`.
+pub fn own_work_file(directory: &str) -> String {
+    format!("agent-work-{directory}.txt")
+}
+
 /// What a run writes when [`WRITE_FILE_VAR`] asks it to.
 ///
 /// Fixed rather than generated: a journey that finds this text has found the

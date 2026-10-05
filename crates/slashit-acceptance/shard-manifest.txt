@@ -59,3 +59,9 @@
 3	the_task_drawer_shows_a_failure_in_full_and_retries_it
 3	the_task_drawer_starts_a_backlog_task_through_the_queue
 1	orphans::leftover_checkouts_and_branches_are_listed_and_reclaimed_only_on_explicit_confirmation
+
+# Added after the timings above, measured locally (not on a hosted runner) at about 45s and
+# 35s: each went to a different shard, the checkout-recovery journey to shard 1 and the stacked
+# journey to shard 3, rather than rebalancing the existing assignment.
+1	checkout_recovery::restarting_keeps_an_intact_checkout_adopts_a_moved_one_and_clears_a_gone_one
+3	stacked_tasks::a_task_stacked_on_a_parent_is_restacked_onto_the_default_branch_once_the_parent_lands

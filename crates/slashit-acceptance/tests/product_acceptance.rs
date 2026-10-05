@@ -40,6 +40,8 @@ const EXECUTION_DEADLINE: Duration = Duration::from_secs(90);
 mod board_identity;
 #[path = "product_acceptance/disk_pressure.rs"]
 mod disk_pressure;
+#[path = "product_acceptance/checkout_recovery.rs"]
+mod checkout_recovery;
 #[path = "product_acceptance/developer_tools.rs"]
 mod developer_tools;
 #[path = "product_acceptance/git_fixture.rs"]
@@ -54,8 +56,12 @@ mod needs_you;
 mod orphans;
 #[path = "product_acceptance/pr_status.rs"]
 mod pr_status;
+#[path = "product_acceptance/stacked_tasks.rs"]
+mod stacked_tasks;
 #[path = "product_acceptance/storage.rs"]
 mod storage;
+#[path = "product_acceptance/task_runs.rs"]
+mod task_runs;
 
 /// How long the board gets to render the finished task.
 const RENDER_DEADLINE: Duration = Duration::from_secs(30);

@@ -11,6 +11,12 @@
 # is what `pr view` prints instead of its default, so a journey can script
 # what GitHub says about a pull request's checks, review and mergeability, and
 # a file `delay-view` holding a number of seconds makes `pr view` that slow.
+# Per pull request, `pr-view-<number>.json` answers `pr view <number>` before
+# that default does; `pr-list/<branch>.json` is what `pr list --head <branch>`
+# prints instead of its default (the pull request's state and base, as GitHub
+# would list it); and `pr-commits/<number>` holds the commit ids `gh api
+# --paginate repos/{owner}/{repo}/pulls/<number>/commits --jq .[].sha` prints,
+# one per line.
 set -e
 
 dir="$SLASHIT_FAKE_GH_DIR"
@@ -52,7 +58,9 @@ repository="https://github.com/slashit-acceptance/fixture"
 
 case "$1 $2" in
     "pr list")
-        if [ -n "$head" ] && [ -f "$dir/prs/$head" ]; then
+        if [ -n "$head" ] && [ -f "$dir/pr-list/$head.json" ]; then
+            cat "$dir/pr-list/$head.json"
+        elif [ -n "$head" ] && [ -f "$dir/prs/$head" ]; then
             printf '[{"url":"%s","isCrossRepository":false}]' "$(cat "$dir/prs/$head")"
         else
             printf '[]'
@@ -79,11 +87,22 @@ case "$1 $2" in
         if [ -f "$dir/delay-view" ]; then
             sleep "$(cat "$dir/delay-view")"
         fi
-        if [ -f "$dir/pr-view.json" ]; then
+        number="${3##*/}"
+        if [ -f "$dir/pr-view-$number.json" ]; then
+            cat "$dir/pr-view-$number.json"
+        elif [ -f "$dir/pr-view.json" ]; then
             cat "$dir/pr-view.json"
         else
             printf '{"state":"OPEN","number":1,"mergeable":"MERGEABLE","reviewDecision":"","statusCheckRollup":[],"baseRefName":"main","isCrossRepository":false}'
         fi
+        ;;
+    "api --paginate")
+        number=$(printf '%s' "$3" | sed -n 's#.*/pulls/\([0-9][0-9]*\)/commits$#\1#p')
+        if [ -z "$number" ] || [ ! -f "$dir/pr-commits/$number" ]; then
+            echo "fake gh: no commits scripted for $3" >&2
+            exit 1
+        fi
+        cat "$dir/pr-commits/$number"
         ;;
     "repo view")
         printf '{"defaultBranchRef":{"name":"main"}}'
