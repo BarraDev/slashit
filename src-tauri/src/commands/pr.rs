@@ -925,9 +925,16 @@ pub async fn triage_pr_comments(
 /// updated at or after the apply either). That text is then recorded as the
 /// fixed content, so the backfill after this analysis, and every later one,
 /// compares fingerprints too instead of the timestamps that miss an edit made
-/// before the apply finished. A legacy fix with no usable prior copy is not
-/// carried and records nothing: reprocessing it costs one apply, and wrongly
-/// calling it fixed would repeat the bug.
+/// before the apply finished. The prior copy counts only when the prior plan
+/// was generated at or before the apply (`generated_at <= applied_at`):
+/// `last_apply` is carried through every re-analysis, so a plan re-analyzed
+/// after its apply by an older build holds the re-fetched text, not the
+/// applied text. A legacy fix with no usable prior copy, or with one that
+/// cannot be shown to be the apply's input, is not carried and is recorded as
+/// [`slashit_review_content::UNPROVEN`], which no fingerprint equals, so the
+/// backfill cannot restore it from a timestamp that happens to fit. It fails
+/// toward reprocessing: that costs one apply, whereas wrongly calling it fixed
+/// would repeat the bug and could never be noticed.
 fn carry_forward_reanalysis_lifecycle(
     items: &mut [PrReviewItem],
     prior: &PrReviewPlan,
@@ -954,9 +961,28 @@ fn carry_forward_reanalysis_lifecycle(
             fixed_content.push(FixedContent { comment_id: cid, fingerprint: recorded.to_string() });
             continue;
         }
-        let used = prior.comments.iter().find(|c| c.id == Some(cid));
-        if let Some(used) = used.filter(|c| applied_at.is_none_or(|at| !slashit_review_content::edited_since(c.updated_at, at))) {
-            fixed_content.push(FixedContent { comment_id: cid, fingerprint: used.fingerprint() });
+        // The prior copy is the text the apply used only if it came from the
+        // analysis the apply consumed: `last_apply` survives every
+        // re-analysis, so a plan analyzed again after its apply (by a build
+        // that did not record fixed content) holds the re-fetched text.
+        let copy_is_apply_input = applied_at.is_none_or(|at| prior.generated_at <= at);
+        let used = prior.comments.iter()
+            .find(|c| c.id == Some(cid))
+            .filter(|_| copy_is_apply_input);
+        match used {
+            Some(used) if applied_at.is_none_or(|at| !slashit_review_content::edited_since(used.updated_at, at)) => {
+                fixed_content.push(FixedContent { comment_id: cid, fingerprint: used.fingerprint() });
+            }
+            // Timestamp contradicts: the backfill's timestamp rule already
+            // refuses it, so nothing is recorded.
+            Some(_) => {}
+            // Unprovable: record a value no fingerprint equals, so the
+            // backfill (whose timestamp rule would fit) cannot restore it
+            // either. The next real apply replaces it.
+            None => fixed_content.push(FixedContent {
+                comment_id: cid,
+                fingerprint: slashit_review_content::UNPROVEN.to_string(),
+            }),
         }
     }
 
@@ -6279,6 +6305,14 @@ mod tests {
 
         let reverted = reanalyze(&edited, vec![comment_text(42, "original wording", Some("2024-06-03T00:00:00Z"))]);
         assert!(reverted.items[0].fix_done && reverted.items[0].reply_posted, "{:?}", reverted.items[0]);
+        // The edit's re-analysis dropped the reply text and id (they described
+        // the old wording and are not kept anywhere), so a revert restores the
+        // flags only. Sync then cannot PATCH the existing reply; it reports it
+        // as unmatched rather than posting a duplicate, because reply_posted is true.
+        assert_eq!(
+            (reverted.items[0].pr_reply_text.as_deref(), reverted.items[0].reply_comment_id),
+            (None, None),
+        );
 
         // The edited wording was applied: a later revert is a new change.
         let mut applied_edit = edited.clone();
@@ -6354,7 +6388,38 @@ mod tests {
         );
 
         assert!(!items[0].fix_done && !items[0].reply_posted);
-        assert!(recorded.is_empty());
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].fingerprint, slashit_review_content::UNPROVEN);
+    }
+
+    /// A legacy plan analyzed again after its apply holds the re-fetched
+    /// text, so its copy proves nothing about what the apply used.
+    #[test]
+    fn a_legacy_copy_generated_after_the_apply_is_not_trusted() {
+        let refetched = comment_text(1, "same", Some("2024-05-30T00:00:00Z"));
+        let mut prior = prior_plan(vec![fixed_and_replied(1)], vec![refetched.clone()], Some("2024-06-01T00:00:00Z"), Vec::new());
+        prior.generated_at = at("2024-06-02T00:00:00Z");
+
+        let next = reanalyze(&prior, vec![refetched]);
+
+        assert!(!next.items[0].fix_done && !next.items[0].reply_posted, "{:?}", next.items[0]);
+        assert_eq!(next.fixed_fingerprint(1), Some(slashit_review_content::UNPROVEN));
+    }
+
+    /// The exact sequence: apply fixes A; the reviewer edits to B with an
+    /// `updated_at` before `applied_at`; an older build re-analyzes and
+    /// carries the flags, storing B; after the upgrade B must not be taken
+    /// as fixed, in that analysis or any later one.
+    #[test]
+    fn a_legacy_plan_that_was_reanalyzed_on_b_never_records_b_as_fixed() {
+        let b = comment_text(1, "text B", Some("2024-05-31T00:00:00Z"));
+        let mut prior = prior_plan(vec![fixed_and_replied(1)], vec![b.clone()], Some("2024-06-01T00:00:00Z"), Vec::new());
+        prior.generated_at = at("2024-06-01T00:30:00Z"); // the old build's re-analysis
+
+        let first = reanalyze(&prior, vec![b.clone()]);
+        assert!(!first.items[0].fix_done && !first.items[0].reply_posted);
+        let second = reanalyze(&first, vec![b]);
+        assert!(!second.items[0].fix_done && !second.items[0].reply_posted, "{:?}", second.items[0]);
     }
 
     /// A fix whose push failed stays undelivered when its comment is edited

@@ -13,6 +13,10 @@
 use chrono::{DateTime, SubsecRound, Utc};
 use sha2::{Digest, Sha256};
 
+/// Recorded in place of a fingerprint when the text a fix was made from cannot
+/// be established. No fingerprint equals it, so the fix never counts as current.
+pub const UNPROVEN: &str = "unproven";
+
 /// Names the algorithm and the normalization, so either can change later
 /// without a stored fingerprint comparing equal to a different one.
 const PREFIX: &str = "sha256-v1:";
