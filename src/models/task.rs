@@ -876,7 +876,8 @@ pub enum RepublishStatus {
         parent_branch: String,
         parent_pr: u64,
         default_branch: String,
-        pr_number: u64,
+        /// `None` for a branch pushed without a pull request.
+        pr_number: Option<u64>,
         rewrites: bool,
     },
     /// The parent landed, but a restack is not possible as things are.
