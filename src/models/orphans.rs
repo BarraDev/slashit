@@ -57,12 +57,23 @@ pub struct OrphanBranch {
 }
 
 impl OrphanBranch {
+    /// Whether the commits survive elsewhere, which is what makes deletion
+    /// safe. It says nothing about whether this branch itself was pushed.
     pub fn work_label(&self) -> String {
         match (self.durable_refs.is_empty(), self.unique_commits) {
-            (false, _) if self.pushed == Some(true) => "Pushed; its commits exist elsewhere".to_string(),
             (false, _) => "Its commits are reachable from another ref".to_string(),
             (true, Some(n)) => format!("{n} commit(s) exist only on this branch"),
             (true, None) => "Could not establish whether its commits exist elsewhere".to_string(),
+        }
+    }
+
+    /// Whether this branch itself has the expected remote evidence,
+    /// independent of reachability.
+    pub fn push_label(&self) -> &'static str {
+        match self.pushed {
+            Some(true) => "Pushed to the remote",
+            Some(false) => "Not pushed to the remote",
+            None => "Could not tell whether it was pushed",
         }
     }
 }
@@ -112,5 +123,25 @@ mod tests {
             refusal: Some("x".into()),
         };
         assert!(b.work_label().starts_with("Could not establish"));
+    }
+
+    #[test]
+    fn push_state_is_separate_from_reachability() {
+        let b = OrphanBranch {
+            name: "task-1".into(),
+            tip: Some("abc".into()),
+            pushed: Some(false),
+            durable_refs: vec!["refs/heads/main".into()],
+            unique_commits: Some(0),
+            checked_out_at: None,
+            refusal: None,
+        };
+        assert_eq!(b.push_label(), "Not pushed to the remote");
+        assert_eq!(b.work_label(), "Its commits are reachable from another ref");
+        let pushed = OrphanBranch { pushed: Some(true), ..b.clone() };
+        assert_eq!(pushed.push_label(), "Pushed to the remote");
+        assert_eq!(pushed.work_label(), b.work_label());
+        let unknown = OrphanBranch { pushed: None, ..b };
+        assert!(unknown.push_label().starts_with("Could not tell"));
     }
 }

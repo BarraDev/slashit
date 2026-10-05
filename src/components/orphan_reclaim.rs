@@ -25,6 +25,7 @@ pub fn OrphanReclaim(project_id: String) -> impl IntoView {
     // an item was refused.
     let confirming = RwSignal::new(None::<String>);
     let refused = RwSignal::new(HashMap::<String, String>::new());
+    let has_project = !project_id.is_empty();
     let pid = StoredValue::new(project_id);
 
     let run_scan = move || {
@@ -129,7 +130,7 @@ pub fn OrphanReclaim(project_id: String) -> impl IntoView {
         row(c.path.clone(), "checkout", c.path, details, c.refusal, false)
     };
     let branch_view = move |b: OrphanBranch| {
-        let mut details = vec![b.work_label()];
+        let mut details = vec![b.push_label().to_string(), b.work_label()];
         if let Some(tip) = &b.tip {
             details.push(format!("At {}", tip.get(..12).unwrap_or(tip)));
         }
@@ -150,7 +151,10 @@ pub fn OrphanReclaim(project_id: String) -> impl IntoView {
                 </p>
             </div>
             <button class="px-3 py-1.5 text-sm rounded bg-white/10 text-white/80" data-testid="orphan-scan"
-                disabled=move || busy.get() on:click=move |_| run_scan()>"Scan for leftovers"</button>
+                disabled=move || busy.get() || !has_project on:click=move |_| run_scan()>"Scan for leftovers"</button>
+            {(!has_project).then(|| view! {
+                <p class="text-xs text-white/50" data-testid="orphan-select-project">"Select a project first; scanning looks at one project at a time."</p>
+            })}
             {move || error.get().map(|e| view! {
                 <div class="p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm" data-testid="orphan-scan-error">
                     {format!("The scan failed, so nothing is known to be safe: {e}")}
