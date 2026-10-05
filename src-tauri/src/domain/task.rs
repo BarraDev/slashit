@@ -562,7 +562,10 @@ impl PrReviewPlan {
     /// was edited. A comment edited and then put back to exactly the text
     /// that was fixed is current again: that fix and its reply already
     /// address it. Without one (a fix recorded before fingerprints existed):
-    /// the timestamp rule only. A comment the plan does not hold is current,
+    /// the timestamp rule, and only if the plan was generated at or before
+    /// the apply, so that its copy of the comment is what the agent was
+    /// given; a plan generated after its apply is unproven and restores
+    /// nothing. A comment the plan does not hold is current,
     /// as it always was: there is no text to have changed.
     pub fn fixed_content_is_current(
         &self,
@@ -577,6 +580,7 @@ impl PrReviewPlan {
             &comment.body,
             comment.updated_at,
             applied_at,
+            self.generated_at <= applied_at,
         )
     }
 

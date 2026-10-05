@@ -1112,6 +1112,9 @@ fn two_fix_plan_applied_at(applied_at: chrono::DateTime<chrono::Utc>) -> PrRevie
     use slashit_ui_lib::domain::task::PrReviewApplyResult;
 
     let (_task, mut plan) = create_test_two_fix_setup();
+    // The plan is the analysis the apply consumed: generated before it. A
+    // legacy plan generated after its apply proves nothing about its text.
+    plan.generated_at = applied_at - chrono::Duration::hours(1);
     plan.last_apply = Some(PrReviewApplyResult {
         applied_at,
         agent_summary: "prior round".to_string(),
@@ -1285,6 +1288,7 @@ fn backfill_lifecycle_from_last_apply_does_not_guess_for_a_legacy_result_missing
     let (_task, mut plan) = create_test_two_fix_setup();
     assert!(!plan.items[0].fix_done);
     assert!(!plan.items[1].fix_done);
+    plan.generated_at = legacy.applied_at - chrono::Duration::hours(1);
     plan.last_apply = Some(legacy);
 
     plan.backfill_lifecycle_from_last_apply();

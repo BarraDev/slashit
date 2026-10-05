@@ -198,6 +198,7 @@ impl PrReviewPlan {
             &comment.body,
             comment.updated_at,
             applied_at,
+            self.generated_at <= applied_at,
         )
     }
 
@@ -816,6 +817,36 @@ mod tests {
             assert_eq!(plan.items[0].fix_done, restored, "{case:?}");
             assert_eq!(plan.items[0].reply_posted, restored, "{case:?}");
         }
+    }
+
+    #[test]
+    fn backfill_does_not_restore_a_legacy_plan_generated_after_its_apply() {
+        let mut plan: PrReviewPlan = serde_json::from_value(serde_json::json!({
+            "generated_at": "2024-06-01T00:30:00Z",
+            "pr_url": "https://github.com/o/r/pull/1",
+            "review_decision": null,
+            "comments": [{
+                "id": 42, "kind": "inline", "author": "r",
+                "body": "B", "updated_at": "2024-06-01T00:05:00Z",
+            }],
+            "items": [{
+                "comment_id": 42, "summary": "s", "decision": "fix",
+                "reasoning": "r", "proposed_change": "c", "approved": true,
+            }],
+            "raw_plan": "",
+            "last_apply": {
+                "applied_at": "2024-06-01T00:10:00Z",
+                "agent_summary": "", "fixed_ids": [42], "skipped_ids": [],
+                "auto_reply": true,
+            },
+        }))
+        .expect("a plan in the backend's shape");
+        plan.items[0].fix_uncommitted = true;
+
+        plan.backfill_lifecycle_from_last_apply();
+
+        assert!(!plan.items[0].fix_done && !plan.items[0].reply_posted);
+        assert!(plan.items[0].fix_uncommitted);
     }
 
     #[test]

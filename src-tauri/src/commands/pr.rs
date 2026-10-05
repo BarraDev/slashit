@@ -6486,6 +6486,24 @@ mod tests {
         }
     }
 
+    /// A legacy plan analyzed after its apply holds re-fetched text, and the
+    /// timestamp fits: nothing proves the text was handled, so the backfill
+    /// restores nothing, with no new analysis involved.
+    #[test]
+    fn backfill_does_not_restore_a_legacy_plan_generated_after_its_apply() {
+        let b = comment_text(42, "B", Some("2024-06-01T00:05:00Z"));
+        let mut plan = prior_plan(vec![fresh_item(42)], vec![b], Some("2024-06-01T00:10:00Z"), Vec::new());
+        plan.generated_at = at("2024-06-01T00:30:00Z");
+        plan.last_apply.as_mut().unwrap().fixed_ids = vec![42];
+        plan.items[0].fix_uncommitted = true;
+
+        plan.backfill_lifecycle_from_last_apply();
+
+        let item = &plan.items[0];
+        assert!(!item.fix_done && !item.reply_posted, "{item:?}");
+        assert!(item.fix_uncommitted, "the checkout fact is untouched");
+    }
+
     #[test]
     fn fixed_content_round_trips_and_legacy_plans_read_as_empty() {
         let used = comment_text(1, "x", None);

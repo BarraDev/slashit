@@ -6,9 +6,10 @@
 //! comment text the apply used, and a later analysis or backfill compares it
 //! with the text now (see [`fixed_content_is_current`]).
 //!
-//! Timestamps never decide that for a comment with a recorded fingerprint. They
-//! are used only for a comment whose fix was recorded before fingerprints
-//! existed, where nothing better is known.
+//! Timestamps never decide that for a comment with a recorded fingerprint.
+//! For a fix recorded before fingerprints existed they count only when the
+//! plan's copy of the comment is known to be what the apply was given (the
+//! plan was generated at or before the apply); otherwise the fix is unproven.
 
 use chrono::{DateTime, SubsecRound, Utc};
 use sha2::{Digest, Sha256};
@@ -61,17 +62,24 @@ pub fn edited_since(updated_at: Option<DateTime<Utc>>, applied_at: DateTime<Utc>
 ///
 /// With a `recorded` fingerprint the answer is exactly whether the text is
 /// the same, whenever it was edited and whatever its `updated_at` says.
-/// Without one (a fix recorded before fingerprints existed) the answer falls
-/// back to the timestamp rule, [`edited_since`].
+///
+/// Without one (a fix recorded before fingerprints existed) a timestamp may
+/// stand in for proof only when `copy_is_apply_input` is true: the plan was
+/// generated at or before the apply, so the comment text it holds is what the
+/// agent was given, and the timestamp rule ([`edited_since`]) can then tell
+/// whether the comment moved since. A plan generated after its apply may hold
+/// text fetched later, and no timestamp ordering can show that text was
+/// handled, so the answer is `false`.
 pub fn fixed_content_is_current(
     recorded: Option<&str>,
     current_body: &str,
     updated_at: Option<DateTime<Utc>>,
     applied_at: DateTime<Utc>,
+    copy_is_apply_input: bool,
 ) -> bool {
     match recorded {
         Some(recorded) => recorded == fingerprint(current_body),
-        None => !edited_since(updated_at, applied_at),
+        None => copy_is_apply_input && !edited_since(updated_at, applied_at),
     }
 }
 
@@ -110,9 +118,9 @@ mod tests {
         let after = Some("2024-06-01T00:20:00Z".parse().unwrap());
         let recorded = fingerprint("old");
         // Edited long before the apply finished: the text is what decides.
-        assert!(!fixed_content_is_current(Some(&recorded), "new", before, applied));
+        assert!(!fixed_content_is_current(Some(&recorded), "new", before, applied, false));
         // Timestamp newer than the apply, text unchanged: still current.
-        assert!(fixed_content_is_current(Some(&recorded), "old", after, applied));
+        assert!(fixed_content_is_current(Some(&recorded), "old", after, applied, false));
     }
 
     #[test]
@@ -120,8 +128,16 @@ mod tests {
         let applied = "2024-06-01T00:10:00.500Z".parse().unwrap();
         let same_second = Some("2024-06-01T00:10:00Z".parse().unwrap());
         let earlier = Some("2024-06-01T00:09:59Z".parse().unwrap());
-        assert!(!fixed_content_is_current(None, "x", same_second, applied));
-        assert!(fixed_content_is_current(None, "x", earlier, applied));
-        assert!(fixed_content_is_current(None, "x", None, applied));
+        assert!(!fixed_content_is_current(None, "x", same_second, applied, true));
+        assert!(fixed_content_is_current(None, "x", earlier, applied, true));
+        assert!(fixed_content_is_current(None, "x", None, applied, true));
+    }
+
+    #[test]
+    fn without_a_fingerprint_a_copy_that_is_not_the_apply_input_is_never_current() {
+        let applied = "2024-06-01T00:10:00Z".parse().unwrap();
+        let earlier = Some("2024-06-01T00:05:00Z".parse().unwrap());
+        assert!(!fixed_content_is_current(None, "x", earlier, applied, false));
+        assert!(!fixed_content_is_current(None, "x", None, applied, false));
     }
 }
