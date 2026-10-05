@@ -197,6 +197,7 @@ pub fn Settings(
                                     <div class="space-y-10">
                                         <crate::components::DiskUsage />
                                         <crate::components::StorageSettings project_id=project_id.clone() />
+                                        <crate::components::OrphanReclaim project_id=project_id.clone() />
                                     </div>
                                 }.into_any(),
 

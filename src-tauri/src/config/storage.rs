@@ -574,6 +574,35 @@ impl Storage {
     /// tasks stay visible until the project that owns them is saved once.
     pub fn load_all_tasks(&self) -> Result<Vec<Task>> {
         let mut all_tasks = Vec::new();
+        for source in self.task_files()? {
+            if let Some(tasks) = Self::read_tasks_file(&source) {
+                all_tasks.extend(tasks);
+            }
+        }
+        Ok(all_tasks)
+    }
+
+    /// The board files [`Self::load_all_tasks`] reads that it cannot read or
+    /// parse. It skips those with a warning, so a task in one is absent from
+    /// every list built from it; whatever decides that no task owns
+    /// something must ask first.
+    pub fn unreadable_task_files(&self) -> Result<Vec<PathBuf>> {
+        let mut unreadable = Vec::new();
+        for source in self.task_files()? {
+            let readable = fs::read_to_string(&source)
+                .ok()
+                .is_some_and(|contents| toml::from_str::<ProjectTasksFile>(&contents).is_ok());
+            if !readable {
+                unreadable.push(source);
+            }
+        }
+        Ok(unreadable)
+    }
+
+    /// Every file a task can be loaded from, each project's own first and
+    /// the legacy ones no project has claimed after.
+    fn task_files(&self) -> Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
         let mut seen_files = std::collections::HashSet::new();
 
         let routes = {
@@ -598,20 +627,12 @@ impl Storage {
             seen_files.insert(path.clone());
             seen_files.insert(legacy.clone());
 
-            let source = if path.is_file() {
-                Some(path)
+            if path.is_file() {
+                files.push(path);
             } else if legacy.is_file() {
                 // Not migrated yet: read from where the tasks still are, so
                 // nothing disappears on upgrade.
-                Some(legacy)
-            } else {
-                None
-            };
-
-            if let Some(source) = source {
-                if let Some(tasks) = Self::read_tasks_file(&source) {
-                    all_tasks.extend(tasks);
-                }
+                files.push(legacy);
             }
         }
 
@@ -622,14 +643,12 @@ impl Storage {
                 if path.extension().is_some_and(|ext| ext == "toml")
                     && !seen_files.contains(&path)
                 {
-                    if let Some(tasks) = Self::read_tasks_file(&path) {
-                        all_tasks.extend(tasks);
-                    }
+                    files.push(path);
                 }
             }
         }
 
-        Ok(all_tasks)
+        Ok(files)
     }
 
     /// Load tasks for a specific project, falling back to the legacy location.
@@ -710,6 +729,18 @@ mod tests {
         ));
 
         (storage, temp_dir)
+    }
+
+    #[test]
+    fn a_board_that_cannot_be_parsed_is_reported_not_skipped_silently() {
+        let (storage, _dir) = create_test_storage();
+        assert!(storage.unreadable_task_files().unwrap().is_empty());
+        let legacy = storage.legacy_tasks_dir();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join(format!("{}.toml", Uuid::new_v4())), "tasks = [ not toml").unwrap();
+        fs::write(legacy.join(format!("{}.toml", Uuid::new_v4())), "version = 1\ntasks = []\n").unwrap();
+        assert_eq!(storage.unreadable_task_files().unwrap().len(), 1);
+        assert!(storage.load_all_tasks().unwrap().is_empty());
     }
 
     // ==================== AppConfig Serde Default Tests ====================

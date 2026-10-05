@@ -22,6 +22,7 @@ pub mod updater_service;
 pub mod task_run_service;
 pub mod human_review_service;
 pub mod repository_setup_service;
+pub mod orphans_service;
 
 pub use opener_service::open_url_external;
 pub use repository_service::{list_repositories, pick_folder, check_is_git_repo};

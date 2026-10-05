@@ -3,6 +3,7 @@ mod commit;
 mod default_base;
 mod diff;
 mod manager;
+mod orphans;
 mod ownership;
 pub mod project_base;
 pub mod readiness;
@@ -18,4 +19,5 @@ pub use manager::{
     carries_locked_registration_notice, locked_registration_notice, CheckoutRegistration,
     CheckoutState, WorktreeInfo, WorktreeManager, WorktreeRecovery,
 };
+pub use orphans::{owners_in_repository, OrphanScan, Owners};
 pub use ownership::{refuse_shared_task_branch, tasks_sharing_a_recorded_branch};

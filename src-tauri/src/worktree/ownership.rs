@@ -257,7 +257,7 @@ pub async fn tasks_sharing_a_recorded_branch(
 /// The repository `path` is a checkout of, as the directory git keeps its
 /// shared state in (`--git-common-dir`), canonicalized. `None` when git
 /// cannot say.
-async fn repository_identity(path: &str) -> Option<PathBuf> {
+pub(super) async fn repository_identity(path: &str) -> Option<PathBuf> {
     let output = tokio::process::Command::new("git")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(path)
