@@ -60,16 +60,112 @@ pub struct FakeProgram {
 }
 
 /// Where [`FakeProgram::without`] puts the directories standing in for
-/// `PATH` entries. They are never removed while the process runs: a program
-/// a test that does not take [`PATH_LOCK`] started while `PATH` named them
-/// (a `git` shell script looking up `sed`, say) may still be resolving
-/// programs there after the test that made them has finished. Deleting them
-/// then made such runs fail with "command not found" on machines where a
-/// hidden program shares a directory with everything else (`wt` in
-/// `/usr/bin`). The directory is left behind when the process exits.
+/// `PATH` entries. A shadow is never removed while this process runs: a
+/// program a test that does not take [`PATH_LOCK`] started while `PATH` named
+/// it (a `git` shell script looking up `sed`, say) may still be resolving
+/// programs there after the test that made it has finished. Deleting it then
+/// made such runs fail with "command not found" on machines where a hidden
+/// program shares a directory with everything else (`wt` in `/usr/bin`).
+///
+/// The root is reclaimed when the process is gone, not before: at normal exit
+/// by an `atexit` handler (a static is never dropped), and after a crash by
+/// the next process to claim a root. See [`ShadowRoot`].
 #[cfg(all(test, unix))]
-static SHADOW_ROOT: std::sync::LazyLock<tempfile::TempDir> =
-    std::sync::LazyLock::new(|| tempfile::tempdir().expect("shadow root"));
+static SHADOW_ROOT: std::sync::LazyLock<ShadowRoot> = std::sync::LazyLock::new(|| {
+    let root = ShadowRoot::claim(&shadow_parent(&std::env::temp_dir())).expect("claim the shadow root");
+    let _ = EXIT_ROOT.set(root.path().to_path_buf());
+    // Safety: `reclaim_at_exit` is a plain `extern "C"` function that
+    // touches no state but `EXIT_ROOT`, set above.
+    unsafe {
+        libc::atexit(reclaim_at_exit);
+    }
+    root
+});
+
+#[cfg(all(test, unix))]
+static EXIT_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(all(test, unix))]
+extern "C" fn reclaim_at_exit() {
+    if let Some(root) = EXIT_ROOT.get() {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+/// The directory under `base` holding every process's [`ShadowRoot`],
+/// private to the current user.
+#[cfg(all(test, unix))]
+fn shadow_parent(base: &std::path::Path) -> std::path::PathBuf {
+    // Safety: `geteuid` has no preconditions.
+    base.join(format!("slashit-test-shadows-{}", unsafe { libc::geteuid() }))
+}
+
+/// A directory of `PATH` shadows owned by one test process.
+///
+/// Liveness is an exclusive `flock` on `.alive` inside the root, held for as
+/// long as the process lives. The kernel drops it when the process ends, for
+/// any reason, so a lock that can be taken proves the owner is gone; unlike a
+/// recorded PID it cannot be confused by PID reuse. The descriptor is
+/// close-on-exec, so children never keep a dead owner's root looking alive.
+///
+/// [`ShadowRoot::claim`] first removes every root under `parent` whose owner
+/// is gone. Claiming and reaping run under one lock on `parent/.registry`,
+/// so a root that is still being created is never mistaken for a stale one.
+/// Only direct children named `root-*`, that are real directories owned by
+/// the current user, are removed, and `remove_dir_all` unlinks symlinks
+/// without following them, so nothing outside the root is touched.
+#[cfg(all(test, unix))]
+struct ShadowRoot {
+    path: std::path::PathBuf,
+    _alive: std::fs::File,
+}
+
+#[cfg(all(test, unix))]
+impl ShadowRoot {
+    fn claim(parent: &std::path::Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        // Safety: `geteuid` has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        let meta = std::fs::symlink_metadata(parent)?;
+        if !meta.is_dir() || meta.uid() != me {
+            return Err(std::io::Error::other(format!(
+                "{} is not a directory owned by the current user",
+                parent.display()
+            )));
+        }
+        let registry = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(parent.join(".registry"))?;
+        registry.lock()?;
+        for entry in std::fs::read_dir(parent)?.flatten() {
+            let owned = entry.file_name().to_string_lossy().starts_with("root-")
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+                && entry.metadata().is_ok_and(|m| m.uid() == me);
+            if !owned {
+                continue;
+            }
+            let owner_gone = match std::fs::File::open(entry.path().join(".alive")) {
+                Ok(alive) => alive.try_lock().is_ok(),
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            };
+            if owner_gone {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        let path = parent.join(format!("root-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path)?;
+        let alive = std::fs::OpenOptions::new().create_new(true).write(true).open(path.join(".alive"))?;
+        alive.lock()?;
+        Ok(ShadowRoot { path, _alive: alive })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
 
 #[cfg(all(test, unix))]
 impl FakeProgram {
@@ -608,5 +704,145 @@ mod tests {
     fn test_create_test_task_with_status() {
         let task = create_test_task_with_status("In Progress Task", TaskStatus::InProgress);
         assert!(matches!(task.status, TaskStatus::InProgress));
+    }
+}
+
+/// What keeps `FakeProgram::without`'s `PATH` shadows alive for exactly as
+/// long as a process that may still use them, and no longer.
+#[cfg(all(test, unix))]
+mod shadow_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    const PROBE: &str = "test_helpers::shadow_tests::process_probe";
+
+    /// A directory holding a program to hide and one to keep.
+    fn fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("fixture dir");
+        std::fs::write(dir.path().join("hide-me"), b"").expect("hidden program");
+        let real = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+            .map(|d| d.join("true"))
+            .find(|p| p.is_file())
+            .expect("a `true` on PATH");
+        std::os::unix::fs::symlink(real, dir.path().join("tool")).expect("link kept program");
+        dir
+    }
+
+    fn roots_in(tmp: &std::path::Path) -> Vec<String> {
+        let Ok(read) = std::fs::read_dir(shadow_parent(tmp)) else { return Vec::new() };
+        read.flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("root-"))
+            .collect()
+    }
+
+    /// Run [`process_probe`] in a fresh process of this same test binary,
+    /// with its temporary directory, and so its shadow root, under `tmp`.
+    fn run_probe(mode: &str, tmp: &std::path::Path, fixture: &std::path::Path) -> std::process::Output {
+        let mut path = vec![fixture.to_path_buf()];
+        path.extend(std::env::split_paths(&std::env::var_os("PATH").expect("PATH")));
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([PROBE, "--exact", "--test-threads=1"])
+            .env("TMPDIR", tmp)
+            .env("PATH", std::env::join_paths(path).expect("join PATH"))
+            .env("SLASHIT_SHADOW_PROBE", mode)
+            .output()
+            .expect("run the probe");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed")
+                || mode == "abort",
+            "the probe did not run: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        output
+    }
+
+    /// Only does anything when [`run_probe`] launched it: takes a shadow the
+    /// way a test does, then ends the process the requested way.
+    #[tokio::test]
+    async fn process_probe() {
+        let Some(mode) = std::env::var_os("SLASHIT_SHADOW_PROBE") else { return };
+        let fake = FakeProgram::without(&["hide-me"]).await;
+        assert!(!roots_in(&std::env::temp_dir()).is_empty());
+        drop(fake);
+        if mode == "abort" {
+            std::process::abort();
+        }
+    }
+
+    #[test]
+    fn a_shadow_outlives_the_fake_program_for_a_child_that_inherited_it() {
+        let fixture = fixture();
+        let shadows = SHADOW_ROOT.path().join(uuid::Uuid::new_v4().to_string());
+        let entries = path_entries_without(fixture.path().as_os_str(), &["hide-me"], &shadows);
+        let path = std::env::join_paths(&entries).expect("join PATH");
+        let shadow = shadows.join("0");
+        assert_eq!(entries, vec![shadow.clone()]);
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read _; tool && ! command -v hide-me"])
+            .env("PATH", &path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn child");
+
+        // A `FakeProgram` coming and going while the child holds the shadow.
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        rt.block_on(async { drop(FakeProgram::install("unused", "").await) });
+        assert!(shadow.join("tool").exists(), "the shadow went with the fake program");
+
+        drop(child.stdin.take()); // lets `read` return
+        assert!(child.wait().expect("wait").success(), "the child lost its tools");
+    }
+
+    #[test]
+    fn a_claim_reaps_only_roots_whose_owner_is_gone() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("precious"), b"x").expect("outside file");
+        let parent = shadow_parent(tmp.path());
+
+        let live = ShadowRoot::claim(&parent).expect("live");
+        // A root whose owner died: an unlocked `.alive` and a symlink out.
+        let stale = parent.join("root-1-stale");
+        std::fs::create_dir_all(stale.join("0")).expect("stale tree");
+        std::fs::write(stale.join(".alive"), b"").expect("stale lock file");
+        std::os::unix::fs::symlink(outside.path(), stale.join("0/out")).expect("link out");
+        // One that never got as far as a lock file.
+        std::fs::create_dir(parent.join("root-2-unfinished")).expect("unfinished");
+        // Neither a root nor a directory: left alone.
+        std::fs::write(parent.join("keep-me"), b"").expect("bystander");
+
+        let second = ShadowRoot::claim(&parent).expect("second");
+        let mut names = roots_in(tmp.path());
+        names.sort();
+        let mut want = vec![
+            live.path().file_name().unwrap().to_string_lossy().into_owned(),
+            second.path().file_name().unwrap().to_string_lossy().into_owned(),
+        ];
+        want.sort();
+        assert_eq!(names, want, "only live roots remain");
+        assert!(parent.join("keep-me").exists());
+        assert!(outside.path().join("precious").exists(), "cleanup followed a symlink out");
+    }
+
+    #[test]
+    fn a_normal_exit_reclaims_the_root_and_processes_do_not_accumulate() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fixture = fixture();
+        for _ in 0..3 {
+            assert!(run_probe("exit", tmp.path(), fixture.path()).status.success());
+            assert_eq!(roots_in(tmp.path()), Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn a_crashed_process_leaves_a_root_that_the_next_process_reaps() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let fixture = fixture();
+        assert!(!run_probe("abort", tmp.path(), fixture.path()).status.success());
+        assert_eq!(roots_in(tmp.path()).len(), 1, "an abort cannot run exit handlers");
+        assert!(run_probe("exit", tmp.path(), fixture.path()).status.success());
+        assert_eq!(roots_in(tmp.path()), Vec::<String>::new());
     }
 }
