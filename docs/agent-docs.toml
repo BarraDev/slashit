@@ -33,6 +33,7 @@ test_only = ["RecordingEventSink"]
 "crates/slashit-attention" = "covered-by:AGENTS.md"
 "crates/slashit-cli" = "covered-by:AGENTS.md"
 "crates/slashit-ipc" = "covered-by:AGENTS.md"
+"crates/slashit-review-content" = "covered-by:AGENTS.md"
 
 "src/components" = "covered-by:src/AGENTS.md"
 "src/models" = "covered-by:src/AGENTS.md"

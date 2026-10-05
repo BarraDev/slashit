@@ -818,7 +818,8 @@ pub async fn analyze_pr_comments(
             comments,
             items: Vec::new(),
             raw_plan: String::new(),
-            last_apply: prior_plan.and_then(|p| p.last_apply),
+            last_apply: prior_plan.as_ref().and_then(|p| p.last_apply.clone()),
+            fixed_content: prior_plan.map(|p| p.fixed_content).unwrap_or_default(),
         });
     }
 
@@ -832,10 +833,10 @@ pub async fn analyze_pr_comments(
     // already on the PR, so the freshly-triaged item should reflect that.
     // Skipped for a comment GitHub reports as edited after that apply: the
     // carried state describes the *old* text, not the one just re-triaged.
-    if let Some(prev) = prior_plan.as_ref() {
-        let applied_at = prev.last_apply.as_ref().map(|a| a.applied_at);
-        carry_forward_reanalysis_lifecycle(&mut items, &prev.items, &comments, applied_at);
-    }
+    let fixed_content = match prior_plan.as_ref() {
+        Some(prev) => carry_forward_reanalysis_lifecycle(&mut items, prev, &comments),
+        None => Vec::new(),
+    };
 
     let plan = PrReviewPlan {
         generated_at: chrono::Utc::now(),
@@ -845,6 +846,7 @@ pub async fn analyze_pr_comments(
         items,
         raw_plan: raw_output,
         last_apply: prior_plan.and_then(|p| p.last_apply),
+        fixed_content,
     };
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, plan.clone()).await?;
     Ok(plan)
@@ -900,8 +902,9 @@ pub async fn triage_pr_comments(
     Ok((items, raw_plan))
 }
 
-/// Merge lifecycle state from a prior plan's items into freshly re-parsed
-/// items sharing the same `comment_id`, in place. Extracted from
+/// Merge lifecycle state from `prior`'s items into freshly re-parsed
+/// `items` sharing the same `comment_id`, in place, and return the
+/// fixed-content record the new plan carries. Extracted from
 /// `analyze_pr_comments` for unit testing: a fresh re-parse always starts
 /// `pr_reply_text`/`reply_comment_id`/etc. as `None`/`false`, so anything
 /// already recorded against a matching prior item must be carried forward or
@@ -909,23 +912,83 @@ pub async fn triage_pr_comments(
 ///
 /// GitHub keeps a review comment's id stable across an edit, so matching on
 /// `comment_id` alone cannot tell an unchanged comment apart from one the
-/// reviewer materially edited after `applied_at`. Carrying `fix_done`/
-/// `reply_posted` forward for the latter would make `address_pr_review_inner`
-/// skip a comment that now says something different, believing it already
-/// addressed. `comments` (the freshly-fetched set for this analysis) is
-/// checked for each matched id and the merge is skipped when its
-/// `updated_at` is newer than the apply the prior lifecycle came from --
-/// except `fix_uncommitted`, which describes the checkout rather than the
-/// comment and is always carried.
+/// reviewer edited. What a fix was made from is the fingerprint the apply
+/// recorded ([`PrReviewPlan::fixed_content`]): the state is carried only when
+/// the freshly fetched text has that fingerprint, however the edit's time
+/// compares with the apply's. `fix_uncommitted` describes the checkout, not
+/// the comment, and is always carried.
+///
+/// A fix recorded before fingerprints existed has none to compare. For it the
+/// prior plan's own copy of the comment is the best evidence of the text the
+/// apply used (the apply is given the plan's comments), so it is used, but only
+/// when the timestamp rule does not contradict it (the comment was not
+/// updated at or after the apply either). That text is then recorded as the
+/// fixed content, so the backfill after this analysis, and every later one,
+/// compares fingerprints too instead of the timestamps that miss an edit made
+/// before the apply finished. The prior copy counts only when the prior plan
+/// was generated at or before the apply (`generated_at <= applied_at`):
+/// `last_apply` is carried through every re-analysis, so a plan re-analyzed
+/// after its apply by an older build holds the re-fetched text, not the
+/// applied text. A legacy fix with no usable prior copy, or with one that
+/// cannot be shown to be the apply's input, is not carried and is recorded as
+/// [`slashit_review_content::UNPROVEN`], which no fingerprint equals, so the
+/// backfill cannot restore it from a timestamp that happens to fit. It fails
+/// toward reprocessing: that costs one apply, whereas wrongly calling it fixed
+/// would repeat the bug and could never be noticed.
 fn carry_forward_reanalysis_lifecycle(
     items: &mut [PrReviewItem],
-    prior_items: &[PrReviewItem],
+    prior: &PrReviewPlan,
     comments: &[PrReviewComment],
-    applied_at: Option<chrono::DateTime<chrono::Utc>>,
-) {
+) -> Vec<crate::domain::task::FixedContent> {
+    use crate::domain::task::FixedContent;
+    let applied_at = prior.last_apply.as_ref().map(|a| a.applied_at);
+
+    // Every comment a fix is known or believed to have been made for.
+    let mut ids: Vec<u64> = prior.fixed_content.iter().map(|f| f.comment_id).collect();
+    if let Some(last) = prior.last_apply.as_ref().filter(|a| !a.dry_run) {
+        ids.extend(last.fixed_ids.iter().copied());
+    }
+    ids.extend(prior.items.iter().filter(|i| i.fix_done).filter_map(|i| i.comment_id));
+    ids.sort_unstable();
+    ids.dedup();
+
+    let mut fixed_content = Vec::new();
+    for cid in ids {
+        if !comments.iter().any(|c| c.id == Some(cid)) {
+            continue;
+        }
+        if let Some(recorded) = prior.fixed_fingerprint(cid) {
+            fixed_content.push(FixedContent { comment_id: cid, fingerprint: recorded.to_string() });
+            continue;
+        }
+        // The prior copy is the text the apply used only if it came from the
+        // analysis the apply consumed: `last_apply` survives every
+        // re-analysis, so a plan analyzed again after its apply (by a build
+        // that did not record fixed content) holds the re-fetched text.
+        let copy_is_apply_input = applied_at.is_none_or(|at| prior.generated_at <= at);
+        let used = prior.comments.iter()
+            .find(|c| c.id == Some(cid))
+            .filter(|_| copy_is_apply_input);
+        match used {
+            Some(used) if applied_at.is_none_or(|at| !slashit_review_content::edited_since(used.updated_at, at)) => {
+                fixed_content.push(FixedContent { comment_id: cid, fingerprint: used.fingerprint() });
+            }
+            // Timestamp contradicts: the backfill's timestamp rule already
+            // refuses it, so nothing is recorded.
+            Some(_) => {}
+            // Unprovable: record a value no fingerprint equals, so the
+            // backfill (whose timestamp rule would fit) cannot restore it
+            // either. The next real apply replaces it.
+            None => fixed_content.push(FixedContent {
+                comment_id: cid,
+                fingerprint: slashit_review_content::UNPROVEN.to_string(),
+            }),
+        }
+    }
+
     for item in items.iter_mut() {
         let Some(cid) = item.comment_id else { continue; };
-        let Some(prev_item) = prior_items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
+        let Some(prev_item) = prior.items.iter().find(|i| i.comment_id == Some(cid)) else { continue; };
 
         // An undelivered fix is a fact about the checkout, not about the
         // comment's wording, so it survives an edit: dropping it would let
@@ -934,14 +997,11 @@ fn carry_forward_reanalysis_lifecycle(
         // delivered (see #79).
         if prev_item.fix_uncommitted { item.fix_uncommitted = true; }
 
-        // The boundary rule lives in `PrReviewComment::edited_since`, shared
-        // with `backfill_lifecycle_from_last_apply`.
-        let edited_since_last_apply = applied_at.is_some_and(|applied_at| {
-            comments.iter()
-                .find(|c| c.id == Some(cid))
-                .is_some_and(|c| c.edited_since(applied_at))
-        });
-        if edited_since_last_apply {
+        let Some(fresh) = comments.iter().find(|c| c.id == Some(cid)) else { continue; };
+        let fixed_text_unchanged = fixed_content.iter()
+            .find(|f| f.comment_id == cid)
+            .is_some_and(|f| f.fingerprint == fresh.fingerprint());
+        if !fixed_text_unchanged {
             continue;
         }
 
@@ -952,6 +1012,7 @@ fn carry_forward_reanalysis_lifecycle(
         if item.pr_reply_text.is_none() { item.pr_reply_text = prev_item.pr_reply_text.clone(); }
         if item.reply_comment_id.is_none() { item.reply_comment_id = prev_item.reply_comment_id; }
     }
+    fixed_content
 }
 
 /// Re-discuss any items currently flagged Question that have a non-empty
@@ -1301,6 +1362,11 @@ pub async fn address_pr_review_inner(
                             p.pr_reply_text = reply_text;
                         }
                         p.last_error = None;
+                    }
+                    // The text the agent was given is the plan's own copy of
+                    // the comment, not what GitHub holds by now.
+                    if let Some(id) = item.comment_id {
+                        updated_plan.record_fixed_content(id);
                     }
                     per_item_summaries.push(format!(
                         "## Item {}/{} — comment {}: {}\n\n{}",
@@ -5116,6 +5182,7 @@ mod tests {
             items: Vec::new(),
             raw_plan: marker.to_string(),
             last_apply: None,
+            fixed_content: Vec::new(),
         }
     }
 
@@ -6022,23 +6089,100 @@ mod tests {
         }
     }
 
+    // ----- #109: which text a fix was made from ---------------------------
+
+    use crate::domain::task::FixedContent;
+
+    fn at(rfc3339: &str) -> chrono::DateTime<chrono::Utc> {
+        rfc3339.parse().unwrap()
+    }
+
+    fn comment_text(id: u64, body: &str, updated_at: Option<&str>) -> PrReviewComment {
+        PrReviewComment { body: body.to_string(), updated_at: updated_at.map(at), ..comment(id) }
+    }
+
+    fn real_apply_at(applied_at: &str, fixed_ids: Vec<u64>, auto_reply: Option<bool>) -> PrReviewApplyResult {
+        PrReviewApplyResult {
+            applied_at: at(applied_at),
+            agent_summary: String::new(),
+            fixed_ids,
+            skipped_ids: Vec::new(),
+            pushed: true,
+            push_branch: None,
+            replies_posted: 0,
+            reply_errors: Vec::new(),
+            dry_run: false,
+            failed_ids: Vec::new(),
+            fix_errors: Vec::new(),
+            push_error: None,
+            auto_reply,
+        }
+    }
+
+    /// A plan as an apply left it: `comments` is the text the apply used.
+    fn prior_plan(
+        items: Vec<PrReviewItem>,
+        comments: Vec<PrReviewComment>,
+        applied_at: Option<&str>,
+        fixed: Vec<FixedContent>,
+    ) -> PrReviewPlan {
+        let fixed_ids = items.iter().filter(|i| i.fix_done).filter_map(|i| i.comment_id).collect();
+        PrReviewPlan {
+            generated_at: at("2024-05-31T00:00:00Z"),
+            pr_url: String::new(),
+            review_decision: None,
+            comments,
+            items,
+            raw_plan: String::new(),
+            last_apply: applied_at.map(|t| real_apply_at(t, fixed_ids, Some(true))),
+            fixed_content: fixed,
+        }
+    }
+
+    fn fixed_from(c: &PrReviewComment) -> FixedContent {
+        FixedContent { comment_id: c.id.unwrap(), fingerprint: c.fingerprint() }
+    }
+
+    fn fixed_and_replied(cid: u64) -> PrReviewItem {
+        PrReviewItem {
+            fix_done: true,
+            reply_posted: true,
+            pr_reply_text: Some("addressed the original wording".to_string()),
+            reply_comment_id: Some(555),
+            ..fresh_item(cid)
+        }
+    }
+
+    /// Re-analyze `prior` against `fetched`, then run the backfill the next
+    /// apply and the modal run: the plan the user is left with.
+    fn reanalyze(prior: &PrReviewPlan, fetched: Vec<PrReviewComment>) -> PrReviewPlan {
+        let mut items: Vec<PrReviewItem> =
+            prior.items.iter().map(|i| fresh_item(i.comment_id.unwrap())).collect();
+        let fixed_content = carry_forward_reanalysis_lifecycle(&mut items, prior, &fetched);
+        let mut next = PrReviewPlan {
+            generated_at: at("2024-06-03T00:00:00Z"),
+            comments: fetched,
+            items,
+            fixed_content,
+            ..prior.clone()
+        };
+        next.backfill_lifecycle_from_last_apply();
+        next
+    }
+
     #[test]
     fn carry_forward_reanalysis_lifecycle_preserves_reply_text_and_id() {
-        // Previous plan: item was fixed and replied to, with the reply text
-        // and GitHub comment id recorded.
+        let text = comment_text(42, "same", Some("2024-05-30T00:00:00Z"));
         let prev_item = PrReviewItem {
-            fix_done: true,
-            fix_uncommitted: false,
-            reply_posted: true,
             pr_reply_text: Some("Thanks, fixed in the latest commit.".to_string()),
             reply_comment_id: Some(9999),
             last_agent_summary: Some("agent report".to_string()),
-            last_error: None,
-            ..fresh_item(42)
+            ..fixed_and_replied(42)
         };
+        let prior = prior_plan(vec![prev_item], vec![text.clone()], Some("2024-06-01T00:00:00Z"), vec![fixed_from(&text)]);
         let mut items = vec![fresh_item(42)];
 
-        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[comment(42)], None);
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &[text]);
 
         assert!(items[0].fix_done, "fix_done should carry forward");
         assert!(items[0].reply_posted, "reply_posted should carry forward");
@@ -6059,24 +6203,21 @@ mod tests {
 
     #[test]
     fn carry_forward_reanalysis_lifecycle_does_not_overwrite_freshly_parsed_values() {
-        // If the fresh re-parse already carries its own reply text/id (should
-        // never happen in practice — the agent doesn't fill these — but the
-        // merge must still be non-destructive), the prior plan's values must
-        // not clobber them.
+        // The merge must stay non-destructive even if the fresh re-parse
+        // already carries its own reply text/id.
+        let text = comment(7);
         let prev_item = PrReviewItem {
             pr_reply_text: Some("stale text".to_string()),
             reply_comment_id: Some(1),
-            fix_done: true,
-            fix_uncommitted: false,
-            reply_posted: true,
-            ..fresh_item(7)
+            ..fixed_and_replied(7)
         };
+        let prior = prior_plan(vec![prev_item], vec![text.clone()], Some("2024-06-01T00:00:00Z"), vec![fixed_from(&text)]);
         let mut fresh = fresh_item(7);
         fresh.pr_reply_text = Some("fresh text".to_string());
         fresh.reply_comment_id = Some(2);
         let mut items = vec![fresh];
 
-        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[comment(7)], None);
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &[text]);
 
         assert_eq!(items[0].pr_reply_text.as_deref(), Some("fresh text"));
         assert_eq!(items[0].reply_comment_id, Some(2));
@@ -6085,100 +6226,200 @@ mod tests {
     #[test]
     fn carry_forward_reanalysis_lifecycle_ignores_unmatched_comment_ids() {
         let prev_item = PrReviewItem { pr_reply_text: Some("for a different comment".to_string()), ..fresh_item(1) };
+        let prior = prior_plan(vec![prev_item], vec![comment(1)], None, Vec::new());
         let mut items = vec![fresh_item(2)];
 
-        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[comment(1), comment(2)], None);
+        carry_forward_reanalysis_lifecycle(&mut items, &prior, &[comment(1), comment(2)]);
 
         assert_eq!(items[0].pr_reply_text, None, "unrelated comment_id must not merge");
     }
 
+    /// Edited before the analysis the apply used: that text is what the fix
+    /// recorded, so nothing is reprocessed.
     #[test]
-    fn carry_forward_reanalysis_lifecycle_resets_a_comment_edited_after_the_last_apply() {
-        let applied_at = "2024-06-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
-        let prev_item = PrReviewItem {
-            fix_done: true,
-            fix_uncommitted: false,
-            reply_posted: true,
-            pr_reply_text: Some("addressed the original wording".to_string()),
-            reply_comment_id: Some(555),
-            ..fresh_item(42)
-        };
-        let mut items = vec![fresh_item(42)];
+    fn a_comment_edited_before_the_analysis_is_not_reprocessed() {
+        let analyzed = comment_text(1, "edited once, before analysis", Some("2024-05-30T12:00:00Z"));
+        let prior = prior_plan(vec![fixed_and_replied(1)], vec![analyzed.clone()], Some("2024-06-01T00:00:00Z"), vec![fixed_from(&analyzed)]);
 
-        // The reviewer edited comment 42 after the apply that produced
-        // `prev_item`'s lifecycle — GitHub kept the same comment id.
-        let edited_comment = PrReviewComment {
-            updated_at: Some("2024-06-02T00:00:00Z".parse().unwrap()),
-            ..comment(42)
-        };
+        let next = reanalyze(&prior, vec![analyzed]);
 
-        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[edited_comment], Some(applied_at));
+        assert!(next.items[0].fix_done && next.items[0].reply_posted);
+        assert_eq!(next.items[0].reply_comment_id, Some(555));
+    }
 
-        assert!(!items[0].fix_done, "an edited comment must be treated as needing fresh processing");
-        assert!(!items[0].reply_posted, "stale reply state must not suppress handling of the edited comment");
-        assert_eq!(items[0].pr_reply_text, None, "stale reply text must not carry forward for an edited comment");
-        assert_eq!(items[0].reply_comment_id, None);
+    /// Only the text decides: a later `updated_at` with the same text (a
+    /// metadata change such as the comment becoming outdated, if GitHub
+    /// stamps that) does not cause duplicate work, and neither does a
+    /// whole-second tie with the apply.
+    #[test]
+    fn an_updated_at_change_without_a_text_change_is_not_reprocessed() {
+        let analyzed = comment_text(1, "same words", Some("2024-05-30T00:00:00Z"));
+        let prior = prior_plan(vec![fixed_and_replied(1)], vec![analyzed.clone()], Some("2024-06-01T00:00:00.500Z"), vec![fixed_from(&analyzed)]);
+
+        for stamp in ["2024-06-01T00:00:00Z", "2024-06-02T00:00:00Z"] {
+            let refetched = comment_text(1, "same words", Some(stamp));
+            let next = reanalyze(&prior, vec![refetched]);
+            assert!(next.items[0].fix_done && next.items[0].reply_posted, "updated_at {stamp}");
+            assert_eq!(next.items[0].reply_comment_id, Some(555), "updated_at {stamp}");
+        }
     }
 
     #[test]
-    fn carry_forward_reanalysis_lifecycle_keeps_state_for_a_comment_unchanged_since_the_last_apply() {
-        let applied_at = "2024-06-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
-        let prev_item = PrReviewItem {
-            fix_done: true,
-            fix_uncommitted: true,
-            reply_posted: true,
-            pr_reply_text: Some("addressed the original wording".to_string()),
-            reply_comment_id: Some(555),
-            ..fresh_item(42)
-        };
-        let mut items = vec![fresh_item(42)];
+    fn a_comment_edited_after_the_apply_is_reprocessed() {
+        let used = comment_text(42, "original wording", Some("2024-05-30T00:00:00Z"));
+        let mut prev = fixed_and_replied(42);
+        prev.fix_uncommitted = true;
+        let prior = prior_plan(vec![prev], vec![used.clone()], Some("2024-06-01T00:00:00Z"), vec![fixed_from(&used)]);
 
-        // Same comment id, updated_at clearly before the apply: not edited.
-        // A same-second `updated_at` is deliberately NOT used here — that
-        // case is ambiguous (GitHub's whole-second precision vs.
-        // `applied_at`'s sub-second precision) and is treated as a possible
-        // edit by the covering test below, not as proof of "unchanged".
-        let unchanged_comment = PrReviewComment {
-            updated_at: Some(applied_at - chrono::Duration::seconds(1)),
-            ..comment(42)
-        };
+        let next = reanalyze(&prior, vec![comment_text(42, "new wording", Some("2024-06-02T00:00:00Z"))]);
 
-        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[unchanged_comment], Some(applied_at));
+        let item = &next.items[0];
+        assert!(!item.fix_done && !item.reply_posted, "{item:?}");
+        assert_eq!((item.pr_reply_text.as_deref(), item.reply_comment_id), (None, None));
+        assert!(item.fix_uncommitted, "the checkout fact survives the edit");
+    }
 
-        assert!(items[0].fix_done, "an unchanged comment may retain its lifecycle");
-        assert!(items[0].fix_uncommitted, "a fix not yet committed stays due for a commit");
-        assert!(items[0].reply_posted);
-        assert_eq!(items[0].pr_reply_text.as_deref(), Some("addressed the original wording"));
-        assert_eq!(items[0].reply_comment_id, Some(555));
+    /// The edit's `updated_at` is long before `applied_at`: only the text
+    /// shows that it came after the one the apply used.
+    #[test]
+    fn a_comment_edited_during_the_apply_is_reprocessed() {
+        let used = comment_text(42, "original wording", Some("2024-05-30T00:00:00Z"));
+        let prior = prior_plan(vec![fixed_and_replied(42)], vec![used.clone()], Some("2024-06-01T00:00:00Z"), vec![fixed_from(&used)]);
+
+        let next = reanalyze(&prior, vec![comment_text(42, "new wording", Some("2024-05-31T00:00:00Z"))]);
+
+        assert!(!next.items[0].fix_done && !next.items[0].reply_posted, "{:?}", next.items[0]);
+    }
+
+    /// Edit, re-analysis (the edited wording is reprocessed), edit back to
+    /// exactly the fixed text: the fix and reply that exist already address
+    /// it, so it is current again. If the edited wording had been applied in
+    /// between, that apply replaces the record and the revert is reprocessed.
+    #[test]
+    fn a_comment_put_back_to_the_fixed_text_is_current_again_unless_the_edit_was_applied() {
+        let used = comment_text(42, "original wording", Some("2024-05-30T00:00:00Z"));
+        let prior = prior_plan(vec![fixed_and_replied(42)], vec![used.clone()], Some("2024-06-01T00:00:00Z"), vec![fixed_from(&used)]);
+
+        let edited = reanalyze(&prior, vec![comment_text(42, "new wording", Some("2024-06-02T00:00:00Z"))]);
+        assert!(!edited.items[0].fix_done);
+
+        let reverted = reanalyze(&edited, vec![comment_text(42, "original wording", Some("2024-06-03T00:00:00Z"))]);
+        assert!(reverted.items[0].fix_done && reverted.items[0].reply_posted, "{:?}", reverted.items[0]);
+        // The edit's re-analysis dropped the reply text and id (they described
+        // the old wording and are not kept anywhere), so a revert restores the
+        // flags only. Sync then cannot PATCH the existing reply; it reports it
+        // as unmatched rather than posting a duplicate, because reply_posted is true.
+        assert_eq!(
+            (reverted.items[0].pr_reply_text.as_deref(), reverted.items[0].reply_comment_id),
+            (None, None),
+        );
+
+        // The edited wording was applied: a later revert is a new change.
+        let mut applied_edit = edited.clone();
+        applied_edit.comments = vec![comment_text(42, "new wording", Some("2024-06-02T00:00:00Z"))];
+        applied_edit.items[0].fix_done = true;
+        applied_edit.items[0].reply_posted = true;
+        applied_edit.last_apply = Some(real_apply_at("2024-06-04T00:00:00Z", vec![42], Some(true)));
+        applied_edit.record_fixed_content(42);
+        let reverted_again = reanalyze(&applied_edit, vec![comment_text(42, "original wording", Some("2024-06-05T00:00:00Z"))]);
+        assert!(!reverted_again.items[0].fix_done && !reverted_again.items[0].reply_posted);
     }
 
     #[test]
-    fn carry_forward_reanalysis_lifecycle_treats_a_same_second_update_as_a_possible_edit() {
-        // `applied_at` almost never lands exactly on a whole second (it comes
-        // from `chrono::Utc::now()`), while GitHub's `updated_at` always does.
-        // A comment updated in the same second as the apply must not be
-        // waved through as "unchanged" just because naive truncation makes
-        // `updated_at < applied_at` look true.
-        let applied_at = "2024-06-01T00:00:00.900Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
-        let prev_item = PrReviewItem {
-            fix_done: true,
-            fix_uncommitted: false,
-            reply_posted: true,
-            pr_reply_text: Some("addressed the original wording".to_string()),
-            reply_comment_id: Some(555),
-            ..fresh_item(42)
-        };
-        let mut items = vec![fresh_item(42)];
+    fn whitespace_and_line_ending_differences_are_not_an_edit() {
+        let used = comment_text(1, "line one\nline two", Some("2024-05-30T00:00:00Z"));
+        let prior = prior_plan(vec![fixed_and_replied(1)], vec![used.clone()], Some("2024-06-01T00:00:00Z"), vec![fixed_from(&used)]);
 
-        let same_second_comment = PrReviewComment {
-            updated_at: Some("2024-06-01T00:00:00Z".parse().unwrap()),
-            ..comment(42)
-        };
+        let next = reanalyze(&prior, vec![comment_text(1, "line one\r\nline two\r\n", Some("2024-06-02T00:00:00Z"))]);
 
-        carry_forward_reanalysis_lifecycle(&mut items, &[prev_item], &[same_second_comment], Some(applied_at));
+        assert!(next.items[0].fix_done && next.items[0].reply_posted);
+    }
 
-        assert!(!items[0].fix_done, "a same-second update must be treated as a possible edit, not assumed safe");
-        assert!(!items[0].reply_posted);
+    // Legacy: a plan saved before fixed content was recorded.
+
+    #[test]
+    fn a_legacy_fix_is_kept_when_the_plans_own_text_is_unchanged_and_not_newer_than_the_apply() {
+        let used = comment_text(1, "same", Some("2024-05-30T00:00:00Z"));
+        let prior = prior_plan(vec![fixed_and_replied(1)], vec![used.clone()], Some("2024-06-01T00:00:00Z"), Vec::new());
+
+        let next = reanalyze(&prior, vec![comment_text(1, "same", Some("2024-05-30T00:00:00Z"))]);
+
+        assert!(next.items[0].fix_done && next.items[0].reply_posted, "no churn for an old successful plan");
+        assert_eq!(next.fixed_fingerprint(1), Some(used.fingerprint().as_str()), "recorded from now on");
+    }
+
+    /// The bug itself, for a plan that predates the record: the plan's own
+    /// copy of the comment is the text the apply used, and it differs.
+    #[test]
+    fn a_legacy_fix_is_not_kept_when_the_text_differs_even_if_the_timestamp_fits() {
+        let used = comment_text(1, "original", Some("2024-05-30T00:00:00Z"));
+        let prior = prior_plan(vec![fixed_and_replied(1)], vec![used.clone()], Some("2024-06-01T00:00:00Z"), Vec::new());
+
+        let next = reanalyze(&prior, vec![comment_text(1, "edited during apply", Some("2024-05-31T00:00:00Z"))]);
+
+        assert!(!next.items[0].fix_done && !next.items[0].reply_posted, "{:?}", next.items[0]);
+        assert_eq!(next.fixed_fingerprint(1), Some(used.fingerprint().as_str()), "backfill must not restore it");
+    }
+
+    #[test]
+    fn a_legacy_fix_with_a_newer_timestamp_is_not_kept_even_if_the_text_is_equal() {
+        let used = comment_text(1, "same", Some("2024-06-02T00:00:00Z"));
+        let prior = prior_plan(vec![fixed_and_replied(1)], vec![used], Some("2024-06-01T00:00:00Z"), Vec::new());
+
+        let next = reanalyze(&prior, vec![comment_text(1, "same", Some("2024-06-02T00:00:00Z"))]);
+
+        assert!(!next.items[0].fix_done && !next.items[0].reply_posted);
+        assert_eq!(next.fixed_fingerprint(1), None, "nothing is claimed about unprovable text");
+    }
+
+    /// Practically unreachable (an item's comment is in its own plan), but
+    /// the rule is explicit: no usable copy of the text, nothing is carried
+    /// and nothing is recorded. The backfill that follows then knows no more
+    /// than the timestamp rule, the same as for any plan not yet re-analyzed.
+    #[test]
+    fn a_legacy_fix_without_a_prior_copy_of_the_comment_is_not_carried() {
+        let prior = prior_plan(vec![fixed_and_replied(1)], Vec::new(), Some("2024-06-01T00:00:00Z"), Vec::new());
+        let mut items = vec![fresh_item(1)];
+
+        let recorded = carry_forward_reanalysis_lifecycle(
+            &mut items,
+            &prior,
+            &[comment_text(1, "anything", Some("2024-05-30T00:00:00Z"))],
+        );
+
+        assert!(!items[0].fix_done && !items[0].reply_posted);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].fingerprint, slashit_review_content::UNPROVEN);
+    }
+
+    /// A legacy plan analyzed again after its apply holds the re-fetched
+    /// text, so its copy proves nothing about what the apply used.
+    #[test]
+    fn a_legacy_copy_generated_after_the_apply_is_not_trusted() {
+        let refetched = comment_text(1, "same", Some("2024-05-30T00:00:00Z"));
+        let mut prior = prior_plan(vec![fixed_and_replied(1)], vec![refetched.clone()], Some("2024-06-01T00:00:00Z"), Vec::new());
+        prior.generated_at = at("2024-06-02T00:00:00Z");
+
+        let next = reanalyze(&prior, vec![refetched]);
+
+        assert!(!next.items[0].fix_done && !next.items[0].reply_posted, "{:?}", next.items[0]);
+        assert_eq!(next.fixed_fingerprint(1), Some(slashit_review_content::UNPROVEN));
+    }
+
+    /// The exact sequence: apply fixes A; the reviewer edits to B with an
+    /// `updated_at` before `applied_at`; an older build re-analyzes and
+    /// carries the flags, storing B; after the upgrade B must not be taken
+    /// as fixed, in that analysis or any later one.
+    #[test]
+    fn a_legacy_plan_that_was_reanalyzed_on_b_never_records_b_as_fixed() {
+        let b = comment_text(1, "text B", Some("2024-05-31T00:00:00Z"));
+        let mut prior = prior_plan(vec![fixed_and_replied(1)], vec![b.clone()], Some("2024-06-01T00:00:00Z"), Vec::new());
+        prior.generated_at = at("2024-06-01T00:30:00Z"); // the old build's re-analysis
+
+        let first = reanalyze(&prior, vec![b.clone()]);
+        assert!(!first.items[0].fix_done && !first.items[0].reply_posted);
+        let second = reanalyze(&first, vec![b]);
+        assert!(!second.items[0].fix_done && !second.items[0].reply_posted, "{:?}", second.items[0]);
     }
 
     /// A fix whose push failed stays undelivered when its comment is edited
@@ -6188,53 +6429,96 @@ mod tests {
     /// the next Apply processes the comment afresh. See #79 and #97.
     #[test]
     fn an_edited_comment_keeps_its_undelivered_fix_undelivered() {
-        let applied_at = "2024-06-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        let used = comment_text(42, "original", Some("2024-05-30T00:00:00Z"));
         let prev_item = PrReviewItem { fix_done: true, fix_uncommitted: true, ..fresh_item(42) };
-        let edited_comment = PrReviewComment {
-            updated_at: Some("2024-06-02T00:00:00Z".parse().unwrap()),
-            ..comment(42)
-        };
-
         for auto_reply in [true, false] {
-            let mut items = vec![fresh_item(42)];
-            carry_forward_reanalysis_lifecycle(
-                &mut items,
-                std::slice::from_ref(&prev_item),
-                std::slice::from_ref(&edited_comment),
-                Some(applied_at),
-            );
-            assert!(items[0].fix_uncommitted, "the fix is still not pushed");
-            assert!(!items[0].fix_done, "re-analysis itself does not carry the edited item's fix_done");
-
-            let mut plan = PrReviewPlan {
-                generated_at: applied_at,
-                pr_url: String::new(),
-                review_decision: None,
-                comments: vec![edited_comment.clone()],
-                items,
-                raw_plan: String::new(),
-                last_apply: Some(PrReviewApplyResult {
-                    applied_at,
-                    agent_summary: String::new(),
-                    fixed_ids: vec![42],
-                    skipped_ids: Vec::new(),
+            for edited_at in ["2024-06-02T00:00:00Z", "2024-05-31T00:00:00Z"] {
+                let mut prior = prior_plan(vec![prev_item.clone()], vec![used.clone()], Some("2024-06-01T00:00:00Z"), vec![fixed_from(&used)]);
+                prior.last_apply = Some(PrReviewApplyResult {
                     pushed: false,
-                    push_branch: None,
-                    replies_posted: 0,
-                    reply_errors: Vec::new(),
-                    dry_run: false,
-                    failed_ids: Vec::new(),
-                    fix_errors: Vec::new(),
                     push_error: Some("the push was rejected".to_string()),
-                    auto_reply: Some(auto_reply),
-                }),
-            };
-            plan.backfill_lifecycle_from_last_apply();
-            let item = &plan.items[0];
-            assert!(item.fix_uncommitted, "auto_reply={auto_reply}: {item:?}");
-            assert!(!item.fix_done, "auto_reply={auto_reply}: the edit invalidates the old fix: {item:?}");
-            assert!(!item.reply_posted, "auto_reply={auto_reply}: no reply was ever posted");
+                    ..real_apply_at("2024-06-01T00:00:00Z", vec![42], Some(auto_reply))
+                });
+
+                let next = reanalyze(&prior, vec![comment_text(42, "edited", Some(edited_at))]);
+
+                let item = &next.items[0];
+                assert!(item.fix_uncommitted, "auto_reply={auto_reply} {edited_at}: {item:?}");
+                assert!(!item.fix_done, "auto_reply={auto_reply} {edited_at}: the edit invalidates the old fix: {item:?}");
+                assert!(!item.reply_posted, "auto_reply={auto_reply} {edited_at}: no reply was ever posted");
+            }
         }
+    }
+
+    // The same table is asserted by the frontend's `models::task` tests.
+    // (recorded text, current text, updated_at, restored?) with the apply at
+    // 2024-06-01T00:00:30.500Z.
+    const BACKFILL_CASES: [(Option<&str>, &str, Option<&str>, bool); 7] = [
+        (Some("a"), "a", Some("2024-06-05T00:00:00Z"), true),
+        (Some("a"), "b", Some("2024-05-01T00:00:00Z"), false),
+        (Some("a"), "a\r\n", None, true),
+        (Some("a"), "b", None, false),
+        (None, "b", Some("2024-06-01T00:00:29Z"), true),
+        (None, "b", Some("2024-06-01T00:00:30Z"), false),
+        (None, "b", None, true),
+    ];
+
+    #[test]
+    fn backfill_follows_the_recorded_text_and_falls_back_to_timestamps_only_without_one() {
+        for (recorded, current, updated_at, restored) in BACKFILL_CASES {
+            let comment = PrReviewComment {
+                body: current.to_string(),
+                updated_at: updated_at.map(at),
+                ..comment(1)
+            };
+            let fixed = recorded
+                .map(|r| FixedContent { comment_id: 1, fingerprint: slashit_review_content::fingerprint(r) })
+                .into_iter()
+                .collect();
+            let mut plan = prior_plan(vec![fresh_item(1)], vec![comment], Some("2024-06-01T00:00:30.500Z"), fixed);
+            plan.last_apply.as_mut().unwrap().fixed_ids = vec![1];
+
+            plan.backfill_lifecycle_from_last_apply();
+
+            let case = (recorded, current, updated_at);
+            assert_eq!(plan.items[0].fix_done, restored, "{case:?}");
+            assert_eq!(plan.items[0].reply_posted, restored, "{case:?}");
+        }
+    }
+
+    /// A legacy plan analyzed after its apply holds re-fetched text, and the
+    /// timestamp fits: nothing proves the text was handled, so the backfill
+    /// restores nothing, with no new analysis involved.
+    #[test]
+    fn backfill_does_not_restore_a_legacy_plan_generated_after_its_apply() {
+        let b = comment_text(42, "B", Some("2024-06-01T00:05:00Z"));
+        let mut plan = prior_plan(vec![fresh_item(42)], vec![b], Some("2024-06-01T00:10:00Z"), Vec::new());
+        plan.generated_at = at("2024-06-01T00:30:00Z");
+        plan.last_apply.as_mut().unwrap().fixed_ids = vec![42];
+        plan.items[0].fix_uncommitted = true;
+
+        plan.backfill_lifecycle_from_last_apply();
+
+        let item = &plan.items[0];
+        assert!(!item.fix_done && !item.reply_posted, "{item:?}");
+        assert!(item.fix_uncommitted, "the checkout fact is untouched");
+    }
+
+    #[test]
+    fn fixed_content_round_trips_and_legacy_plans_read_as_empty() {
+        let used = comment_text(1, "x", None);
+        let plan = prior_plan(vec![fresh_item(1)], vec![used.clone()], None, vec![fixed_from(&used)]);
+        let json = serde_json::to_string(&plan).unwrap();
+        assert_eq!(serde_json::from_str::<PrReviewPlan>(&json).unwrap(), plan);
+
+        let mut legacy = serde_json::to_value(&plan).unwrap();
+        legacy.as_object_mut().unwrap().remove("fixed_content");
+        let read: PrReviewPlan = serde_json::from_value(legacy).unwrap();
+        assert!(read.fixed_content.is_empty());
+
+        // A plan with nothing recorded serializes exactly as before.
+        let none = prior_plan(Vec::new(), Vec::new(), None, Vec::new());
+        assert!(serde_json::to_value(&none).unwrap().get("fixed_content").is_none());
     }
 
     // ──────────────────────────────────────────────
@@ -11845,6 +12129,7 @@ mod tests {
                     }],
                     raw_plan: "durable-marker-before-apply".to_string(),
                     last_apply: None,
+                    fixed_content: Vec::new(),
                 };
                 let options =
                     AddressPrReviewOptions { auto_push: false, auto_reply: false, dry_run: false };
@@ -12308,6 +12593,7 @@ mod tests {
                     items: vec![fix_item(1), fix_item(2)],
                     raw_plan: String::new(),
                     last_apply: None,
+                    fixed_content: Vec::new(),
                 };
                 let options =
                     AddressPrReviewOptions { auto_push: true, auto_reply: false, dry_run: false };
@@ -12488,6 +12774,7 @@ mod tests {
                     items: vec![fix_item(1)],
                     raw_plan: String::new(),
                     last_apply: None,
+                    fixed_content: Vec::new(),
                 };
                 (task, plan)
             }
@@ -13055,6 +13342,59 @@ mod tests {
                     error.contains("could not be committed"),
                     "the result must say the fix was not committed: {error:?}"
                 );
+            }
+
+            /// #109, end to end through the real apply: the comment is edited
+            /// after the analysis the apply used but long before the apply
+            /// finishes, so its `updated_at` is well before `applied_at`. The
+            /// next analysis and the backfill must not treat the edited
+            /// wording as already fixed and answered.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_comment_edited_while_an_apply_ran_is_not_carried_as_fixed() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, mut plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                // (1) The analysis captured wording A, long before the apply.
+                let now = chrono::Utc::now();
+                let text_a = PrReviewComment {
+                    body: "use a slice here".to_string(),
+                    updated_at: Some(now - chrono::Duration::seconds(180)),
+                    ..comment(1)
+                };
+                plan.generated_at = now - chrono::Duration::seconds(120);
+                plan.comments = vec![text_a.clone()];
+                let text_a_fingerprint = text_a.fingerprint();
+
+                // (2) The apply fixes and answers from A.
+                let (result, applied) = apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+                assert_eq!((result.fixed_ids.clone(), result.replies_posted), (vec![1], 1), "{result:?}");
+                assert!(applied.items[0].fix_done && applied.items[0].reply_posted);
+
+                // (3) While it ran, the reviewer changed the comment to B. GitHub
+                // stamped that 100 seconds ago: after the analysis, before
+                // `applied_at`, a whole second clear of both.
+                let text_b = PrReviewComment {
+                    body: "use an iterator here, not a slice".to_string(),
+                    updated_at: Some(now - chrono::Duration::seconds(100)),
+                    ..text_a
+                };
+                assert!(text_b.updated_at.unwrap() < result.applied_at - chrono::Duration::seconds(50));
+
+                // (5) The next analysis sees B.
+                assert_eq!(
+                    applied.fixed_fingerprint(1),
+                    Some(text_a_fingerprint.as_str()),
+                    "the apply records the text it used, A"
+                );
+                let next = reanalyze(&applied, vec![text_b]);
+
+                // (6) B was never fixed or answered.
+                assert!(!next.items[0].fix_done, "B was carried or restored as fixed: {:?}", next.items[0]);
+                assert!(!next.items[0].reply_posted, "B was carried or restored as answered: {:?}", next.items[0]);
             }
 
             /// A push failure posts no reply claiming the fix is done

@@ -489,6 +489,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
         items,
         raw_plan: String::new(),
         last_apply: None,
+        fixed_content: Vec::new(),
     };
 
     (task, plan)
@@ -724,6 +725,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
         items,
         raw_plan: String::new(),
         last_apply: None,
+        fixed_content: Vec::new(),
     };
 
     (task, plan)
@@ -1091,6 +1093,7 @@ fn backfill_lifecycle_from_last_apply_marks_fixed_items_and_skips_failed_replies
             push_error: None,
             auto_reply: Some(true),
         }),
+        fixed_content: Vec::new(),
     };
     // Reset to prove backfill leaves dry-run alone.
     for it in dry_plan.items.iter_mut() {
@@ -1109,6 +1112,9 @@ fn two_fix_plan_applied_at(applied_at: chrono::DateTime<chrono::Utc>) -> PrRevie
     use slashit_ui_lib::domain::task::PrReviewApplyResult;
 
     let (_task, mut plan) = create_test_two_fix_setup();
+    // The plan is the analysis the apply consumed: generated before it. A
+    // legacy plan generated after its apply proves nothing about its text.
+    plan.generated_at = applied_at - chrono::Duration::hours(1);
     plan.last_apply = Some(PrReviewApplyResult {
         applied_at,
         agent_summary: "prior round".to_string(),
@@ -1282,6 +1288,7 @@ fn backfill_lifecycle_from_last_apply_does_not_guess_for_a_legacy_result_missing
     let (_task, mut plan) = create_test_two_fix_setup();
     assert!(!plan.items[0].fix_done);
     assert!(!plan.items[1].fix_done);
+    plan.generated_at = legacy.applied_at - chrono::Duration::hours(1);
     plan.last_apply = Some(legacy);
 
     plan.backfill_lifecycle_from_last_apply();

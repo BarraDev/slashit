@@ -164,15 +164,51 @@ pub struct PrReviewPlan {
     pub raw_plan: String,
     #[serde(default)]
     pub last_apply: Option<PrReviewApplyResult>,
+    /// Mirrors the backend field of the same name. It must survive a round
+    /// trip through the frontend: the plan is sent back to the backend on
+    /// apply, and dropping it would make every fix look recorded before
+    /// fingerprints existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixed_content: Vec<FixedContent>,
+}
+
+/// Mirrors the backend type of the same name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixedContent {
+    pub comment_id: u64,
+    pub fingerprint: String,
 }
 
 impl PrReviewPlan {
+    /// Mirrors the backend rule of the same name, through the same shared
+    /// `slashit_review_content` functions.
+    pub fn fixed_content_is_current(
+        &self,
+        comment_id: u64,
+        applied_at: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        let Some(comment) = self.comments.iter().find(|c| c.id == Some(comment_id)) else {
+            return true;
+        };
+        let recorded = self.fixed_content.iter()
+            .find(|f| f.comment_id == comment_id)
+            .map(|f| f.fingerprint.as_str());
+        slashit_review_content::fixed_content_is_current(
+            recorded,
+            &comment.body,
+            comment.updated_at,
+            applied_at,
+            self.generated_at <= applied_at,
+        )
+    }
+
     /// Derive per-item `fix_done` / `reply_posted` from a persisted
     /// `last_apply`. Mirrors the backend helper of the same name so the
     /// frontend can backfill the cached plan on modal open without a round
     /// trip — old plans created before lifecycle tracking surface their
     /// badges immediately.
-    /// A comment edited since the apply regains neither flag.
+    /// A comment whose text is no longer the text its fix was made from
+    /// regains neither flag.
     pub fn backfill_lifecycle_from_last_apply(&mut self) {
         let Some(last) = self.last_apply.clone() else { return; };
         if last.dry_run { return; }
@@ -183,12 +219,12 @@ impl PrReviewPlan {
                 id.trim().parse::<u64>().ok()
             })
             .collect();
-        for item in self.items.iter_mut() {
-            let Some(cid) = item.comment_id else { continue; };
-            let edited = self.comments.iter()
-                .find(|c| c.id == Some(cid))
-                .is_some_and(|c| c.edited_since(last.applied_at));
-            if last.fixed_ids.contains(&cid) && !edited {
+        for idx in 0..self.items.len() {
+            let Some(cid) = self.items[idx].comment_id else { continue; };
+            let current = last.fixed_ids.contains(&cid)
+                && self.fixed_content_is_current(cid, last.applied_at);
+            let item = &mut self.items[idx];
+            if current {
                 if !item.fix_done {
                     item.fix_done = true;
                 }
@@ -226,15 +262,6 @@ pub struct PrReviewComment {
 }
 
 impl PrReviewComment {
-    /// Mirrors the backend rule of the same name: whether the comment may
-    /// have been edited at or after `applied_at`, compared at whole-second
-    /// precision and non-strictly. No `updated_at` means unchanged.
-    pub fn edited_since(&self, applied_at: chrono::DateTime<chrono::Utc>) -> bool {
-        use chrono::SubsecRound;
-        self.updated_at
-            .is_some_and(|updated_at| updated_at.trunc_subsecs(0) >= applied_at.trunc_subsecs(0))
-    }
-
     /// Mirrors the backend rule of the same name: only an owner, member or
     /// collaborator's Fix items may start out approved.
     pub fn author_is_collaborator(&self) -> bool {
@@ -739,6 +766,100 @@ mod tests {
 
         assert!(!plan.items[0].fix_done && !plan.items[0].reply_posted);
         assert!(plan.items[1].fix_done && plan.items[1].reply_posted);
+    }
+
+    // The backend asserts the same table in `commands::pr` tests.
+    const BACKFILL_CASES: [(Option<&str>, &str, Option<&str>, bool); 7] = [
+        (Some("a"), "a", Some("2024-06-05T00:00:00Z"), true),
+        (Some("a"), "b", Some("2024-05-01T00:00:00Z"), false),
+        (Some("a"), "a\r\n", None, true),
+        (Some("a"), "b", None, false),
+        (None, "b", Some("2024-06-01T00:00:29Z"), true),
+        (None, "b", Some("2024-06-01T00:00:30Z"), false),
+        (None, "b", None, true),
+    ];
+
+    #[test]
+    fn backfill_follows_the_recorded_text_and_falls_back_to_timestamps_only_without_one() {
+        for (recorded, current, updated_at, restored) in BACKFILL_CASES {
+            let fixed: Vec<serde_json::Value> = recorded
+                .map(|r| serde_json::json!({
+                    "comment_id": 1,
+                    "fingerprint": slashit_review_content::fingerprint(r),
+                }))
+                .into_iter()
+                .collect();
+            let mut plan: PrReviewPlan = serde_json::from_value(serde_json::json!({
+                "generated_at": "2024-05-31T00:00:00Z",
+                "pr_url": "https://github.com/o/r/pull/1",
+                "review_decision": null,
+                "comments": [{
+                    "id": 1, "kind": "inline", "author": "r",
+                    "body": current, "updated_at": updated_at,
+                }],
+                "items": [{
+                    "comment_id": 1, "summary": "s", "decision": "fix",
+                    "reasoning": "r", "proposed_change": "c", "approved": true,
+                }],
+                "raw_plan": "",
+                "last_apply": {
+                    "applied_at": "2024-06-01T00:00:30.500Z",
+                    "agent_summary": "", "fixed_ids": [1], "skipped_ids": [],
+                    "auto_reply": true,
+                },
+                "fixed_content": fixed,
+            }))
+            .expect("a plan in the backend's shape");
+
+            plan.backfill_lifecycle_from_last_apply();
+
+            let case = (recorded, current, updated_at);
+            assert_eq!(plan.items[0].fix_done, restored, "{case:?}");
+            assert_eq!(plan.items[0].reply_posted, restored, "{case:?}");
+        }
+    }
+
+    #[test]
+    fn backfill_does_not_restore_a_legacy_plan_generated_after_its_apply() {
+        let mut plan: PrReviewPlan = serde_json::from_value(serde_json::json!({
+            "generated_at": "2024-06-01T00:30:00Z",
+            "pr_url": "https://github.com/o/r/pull/1",
+            "review_decision": null,
+            "comments": [{
+                "id": 42, "kind": "inline", "author": "r",
+                "body": "B", "updated_at": "2024-06-01T00:05:00Z",
+            }],
+            "items": [{
+                "comment_id": 42, "summary": "s", "decision": "fix",
+                "reasoning": "r", "proposed_change": "c", "approved": true,
+            }],
+            "raw_plan": "",
+            "last_apply": {
+                "applied_at": "2024-06-01T00:10:00Z",
+                "agent_summary": "", "fixed_ids": [42], "skipped_ids": [],
+                "auto_reply": true,
+            },
+        }))
+        .expect("a plan in the backend's shape");
+        plan.items[0].fix_uncommitted = true;
+
+        plan.backfill_lifecycle_from_last_apply();
+
+        assert!(!plan.items[0].fix_done && !plan.items[0].reply_posted);
+        assert!(plan.items[0].fix_uncommitted);
+    }
+
+    #[test]
+    fn the_recorded_text_survives_a_round_trip_through_the_frontend() {
+        let plan = plan_applied_at("2024-06-01T00:00:30Z", [None, None]);
+        assert!(plan.fixed_content.is_empty());
+        let mut recorded = plan;
+        recorded.fixed_content.push(FixedContent { comment_id: 1, fingerprint: "sha256-v1:x".to_string() });
+        let back: PrReviewPlan =
+            serde_json::from_str(&serde_json::to_string(&recorded).unwrap()).unwrap();
+        assert_eq!(back.fixed_content, recorded.fixed_content);
+        let none = plan_applied_at("2024-06-01T00:00:30Z", [None, None]);
+        assert!(serde_json::to_value(&none).unwrap().get("fixed_content").is_none());
     }
 
     #[test]

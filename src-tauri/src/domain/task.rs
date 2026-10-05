@@ -517,9 +517,73 @@ pub struct PrReviewPlan {
     /// Result of the last apply, if any.
     #[serde(default)]
     pub last_apply: Option<PrReviewApplyResult>,
+    /// The comment text each fix was made from, one entry per comment id.
+    /// Empty for every plan saved before it existed; see
+    /// [`PrReviewPlan::fixed_content_is_current`] for what that means.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixed_content: Vec<FixedContent>,
+}
+
+/// The fingerprint ([`slashit_review_content::fingerprint`]) of the text of
+/// comment `comment_id` that a fix agent was given, recorded when the fix
+/// succeeded. It is what a later analysis compares the comment's current text
+/// with, instead of guessing from timestamps whether it was edited.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixedContent {
+    pub comment_id: u64,
+    pub fingerprint: String,
 }
 
 impl PrReviewPlan {
+    /// Record that a fix for `comment_id` was just made from the text this
+    /// plan holds for it. A comment the plan does not hold is not recorded:
+    /// nothing is known about what the agent saw, and the entry stays absent
+    /// (legacy behavior) rather than guessed.
+    pub fn record_fixed_content(&mut self, comment_id: u64) {
+        let Some(fingerprint) = self.comments.iter()
+            .find(|c| c.id == Some(comment_id))
+            .map(PrReviewComment::fingerprint)
+        else { return; };
+        self.fixed_content.retain(|f| f.comment_id != comment_id);
+        self.fixed_content.push(FixedContent { comment_id, fingerprint });
+    }
+
+    /// The fingerprint recorded for the text fixed for `comment_id`, if any.
+    pub fn fixed_fingerprint(&self, comment_id: u64) -> Option<&str> {
+        self.fixed_content.iter()
+            .find(|f| f.comment_id == comment_id)
+            .map(|f| f.fingerprint.as_str())
+    }
+
+    /// Whether the fix recorded for `comment_id` still covers the comment as
+    /// this plan holds it, judged against an apply made at `applied_at`.
+    ///
+    /// With a recorded fingerprint: whether the text is the same, whenever it
+    /// was edited. A comment edited and then put back to exactly the text
+    /// that was fixed is current again: that fix and its reply already
+    /// address it. Without one (a fix recorded before fingerprints existed):
+    /// the timestamp rule, and only if the plan was generated at or before
+    /// the apply, so that its copy of the comment is what the agent was
+    /// given; a plan generated after its apply is unproven and restores
+    /// nothing. A comment the plan does not hold is current,
+    /// as it always was: there is no text to have changed.
+    pub fn fixed_content_is_current(
+        &self,
+        comment_id: u64,
+        applied_at: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        let Some(comment) = self.comments.iter().find(|c| c.id == Some(comment_id)) else {
+            return true;
+        };
+        slashit_review_content::fixed_content_is_current(
+            self.fixed_fingerprint(comment_id),
+            &comment.body,
+            comment.updated_at,
+            applied_at,
+            self.generated_at <= applied_at,
+        )
+    }
+
     /// Derive per-item `fix_done` and `reply_posted` from the persisted
     /// `last_apply`. Used to upgrade plans that pre-date the lifecycle fields
     /// so badges show immediately for items the user already addressed, and
@@ -528,10 +592,11 @@ impl PrReviewPlan {
     ///
     /// Only flips flags from `false` to `true` — never undoes user-visible
     /// state. Dry-run results are ignored on purpose. An item whose comment
-    /// was edited since the apply ([`PrReviewComment::edited_since`]) gets
-    /// neither flag back: the apply fixed and answered the old wording, so
-    /// the next Apply processes the comment afresh. `fix_uncommitted` is not
-    /// touched; it describes the checkout, not the comment.
+    /// no longer has the text its fix was made from
+    /// ([`PrReviewPlan::fixed_content_is_current`]) gets neither flag back:
+    /// the apply fixed and answered the old wording, so the next Apply
+    /// processes the comment afresh. `fix_uncommitted` is not touched; it
+    /// describes the checkout, not the comment.
     pub fn backfill_lifecycle_from_last_apply(&mut self) {
         let Some(last) = self.last_apply.clone() else { return; };
         if last.dry_run { return; }
@@ -544,12 +609,12 @@ impl PrReviewPlan {
                 id.trim().parse::<u64>().ok()
             })
             .collect();
-        for item in self.items.iter_mut() {
-            let Some(cid) = item.comment_id else { continue; };
-            let edited = self.comments.iter()
-                .find(|c| c.id == Some(cid))
-                .is_some_and(|c| c.edited_since(last.applied_at));
-            if last.fixed_ids.contains(&cid) && !edited {
+        for idx in 0..self.items.len() {
+            let Some(cid) = self.items[idx].comment_id else { continue; };
+            let current = last.fixed_ids.contains(&cid)
+                && self.fixed_content_is_current(cid, last.applied_at);
+            let item = &mut self.items[idx];
+            if current {
                 if !item.fix_done {
                     item.fix_done = true;
                 }
@@ -592,18 +657,10 @@ pub struct PrReviewComment {
 }
 
 impl PrReviewComment {
-    /// Whether the comment may have been edited at or after `applied_at`.
-    ///
-    /// GitHub's `updated_at` has whole-second precision, while `applied_at`
-    /// (from `chrono::Utc::now()`) almost never does. Both are rounded down
-    /// to the second and compared non-strictly, so a timestamp in the apply's
-    /// own second counts as a possible edit: reprocessing an unchanged
-    /// comment is cheap, silently skipping an edited one is the failure this
-    /// guards against. A comment with no `updated_at` is taken as unchanged.
-    pub fn edited_since(&self, applied_at: chrono::DateTime<chrono::Utc>) -> bool {
-        use chrono::SubsecRound;
-        self.updated_at
-            .is_some_and(|updated_at| updated_at.trunc_subsecs(0) >= applied_at.trunc_subsecs(0))
+    /// The fingerprint of the comment's text: which version of it a fix was
+    /// made from. See [`slashit_review_content::fingerprint`].
+    pub fn fingerprint(&self) -> String {
+        slashit_review_content::fingerprint(&self.body)
     }
 
     /// Whether a Fix triaged from this comment may start out approved.

@@ -1,0 +1,14 @@
+[package]
+name = "slashit-review-content"
+version = "0.1.0"
+edition = "2021"
+authors = ["Barradev Digital Services <admin@barradev.com>"]
+license = "Apache-2.0"
+description = "Which version of a PR review comment a fix was made from: the one rule the backend and the frontend share"
+repository = "https://github.com/BarraDev/slashit"
+
+# Compiled into both the native backend and the WASM frontend, so it depends
+# on nothing that cannot build for either.
+[dependencies]
+chrono = { version = "0.4", default-features = false }
+sha2 = "0.10"
