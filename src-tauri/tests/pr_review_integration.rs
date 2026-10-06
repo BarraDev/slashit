@@ -116,9 +116,10 @@ impl MockEnv {
         );
         write_executable(&bin_dir.join("claude"), &claude_script);
 
-        // Mock `gh` — records argv, returns a successful empty JSON.
+        // Mock `gh` — records argv, reports the fixture's own PR for the
+        // task branch, and returns successful empty JSON for reply calls.
         let gh_script = format!(
-            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\nprintf '%s\\n' '{{}}'\n",
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log:?}; done\nprintf '%s\\n' '---END-ARGS---' >> {log:?}\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"https://github.com/test-org/test-repo/pull/42\",\"isCrossRepository\":false}}]' ;;\n  *) printf '%s\\n' '{{}}' ;;\nesac\n",
             log = gh_log,
         );
         write_executable(&bin_dir.join("gh"), &gh_script);
@@ -199,7 +200,10 @@ impl MockEnv {
     }
 
     fn gh_invocations(&self) -> usize {
-        self.read_gh_log().matches("---END-ARGS---").count()
+        self.read_gh_log()
+            .split("---END-ARGS---")
+            .filter(|call| call.contains("/replies") || call.contains("\ncomment\n"))
+            .count()
     }
 }
 
