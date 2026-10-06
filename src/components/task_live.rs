@@ -1,7 +1,11 @@
 //! The decisions behind the task drawer and the card activity line, kept free
 //! of the DOM so they can be tested natively.
 
-use crate::models::{AgentEvent, TaskRunSnapshot, TaskStatus};
+use std::collections::{HashMap, HashSet};
+
+use uuid::Uuid;
+
+use crate::models::{AgentEvent, AgentStatus, AttentionReason, LiveRun, TaskRunSnapshot, TaskStatus};
 
 /// The most characters of the agent's latest words a one-line activity shows.
 const ACTIVITY_LIMIT: usize = 120;
@@ -26,6 +30,12 @@ pub fn activity_from_event(event: &AgentEvent) -> Option<ActivityUpdate> {
         AgentEvent::PhaseChange { .. } | AgentEvent::Completed { .. } | AgentEvent::Error { .. } => {
             Some(ActivityUpdate::Clear)
         }
+        // A run beginning or ending belongs to another moment than whatever
+        // was shown; one that is running or stopping adds nothing.
+        AgentEvent::RunState { status, .. } => match status {
+            AgentStatus::Starting | AgentStatus::Stopped | AgentStatus::Failed(_) => Some(ActivityUpdate::Clear),
+            AgentStatus::Running | AgentStatus::Stopping => None,
+        },
         AgentEvent::Log { .. } => None,
     }
 }
@@ -46,22 +56,125 @@ pub fn changes_task_record(event: &AgentEvent) -> bool {
     matches!(
         event,
         AgentEvent::PhaseChange { .. } | AgentEvent::Completed { .. } | AgentEvent::Error { .. }
+    ) || matches!(
+        event,
+        // A run ending is when a stop settles the task, which announces
+        // nothing else.
+        AgentEvent::RunState { status: AgentStatus::Stopped | AgentStatus::Failed(_), .. }
     )
 }
 
-/// Whether the board's "Running" count includes a task in `status`: coding,
-/// or under AI review.
-///
-/// Read from the status alone, like the rest of the board. An AI review that
-/// is waiting for a free slot is counted too; the record does not tell it
-/// apart from one that has started.
-pub fn counts_as_running(status: &TaskStatus) -> bool {
-    matches!(status, TaskStatus::InProgress | TaskStatus::AiReview)
+/// What a card or drawer says about a run SlashIt owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunBadge {
+    /// Owned, process not started yet.
+    Starting,
+    /// Owned and running. The only state shown as Working.
+    Working,
+    /// A stop was asked for and the agent is still shutting down.
+    Stopping,
 }
 
-/// Whether the card should show a live activity line for a task in `status`.
-pub fn shows_activity(status: &TaskStatus) -> bool {
-    matches!(status, TaskStatus::InProgress | TaskStatus::AiReview)
+impl RunBadge {
+    /// `None` for a run that is over: it is not shown.
+    pub fn from_status(status: &AgentStatus) -> Option<Self> {
+        match status {
+            AgentStatus::Starting => Some(Self::Starting),
+            AgentStatus::Running => Some(Self::Working),
+            AgentStatus::Stopping => Some(Self::Stopping),
+            AgentStatus::Stopped | AgentStatus::Failed(_) => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting",
+            Self::Working => "Working",
+            Self::Stopping => "Stopping",
+        }
+    }
+
+    /// The drawer's activity line when the agent has said nothing yet.
+    pub fn placeholder(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting\u{2026}",
+            Self::Working => "Working\u{2026}",
+            Self::Stopping => "Stopping\u{2026}",
+        }
+    }
+}
+
+/// What a card or drawer shows for a task whose run is `run`.
+///
+/// A task that needs the person (`attention`) shows that, never a run badge:
+/// the reason is the more useful thing to say.
+pub fn project_run(run: Option<&AgentStatus>, attention: Option<AttentionReason>) -> Option<RunBadge> {
+    if attention.is_some() {
+        return None;
+    }
+    run.and_then(RunBadge::from_status)
+}
+
+/// The board's one record of the runs SlashIt owns.
+///
+/// Filled from `get_live_runs` when the board opens and kept current by
+/// `run_state` events. The two overlap: the snapshot is requested after the
+/// listener is registered, so an event can land while the answer is on its
+/// way, and the answer may describe a moment before it. A task an event
+/// spoke for while the request was out keeps what the event said.
+///
+/// Nothing here comes from a task's persisted status, so a restart starts
+/// empty and a stale `InProgress` never shows as working.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct LiveRuns {
+    runs: HashMap<Uuid, AgentStatus>,
+    /// Tasks an event spoke for since the snapshot was requested; `None`
+    /// when no snapshot is in flight.
+    spoken_for: Option<HashSet<Uuid>>,
+}
+
+impl LiveRuns {
+    /// A snapshot is about to be requested.
+    pub fn begin_hydration(&mut self) {
+        self.spoken_for = Some(HashSet::new());
+    }
+
+    /// The snapshot answered. A failed read passes `None` and leaves what the
+    /// events have said so far.
+    pub fn finish_hydration(&mut self, snapshot: Option<Vec<LiveRun>>) {
+        let spoken_for = self.spoken_for.take().unwrap_or_default();
+        let Some(snapshot) = snapshot else { return };
+        self.runs.retain(|id, _| spoken_for.contains(id));
+        for run in snapshot {
+            if !spoken_for.contains(&run.task_id) {
+                self.runs.insert(run.task_id, run.status);
+            }
+        }
+    }
+
+    /// Follow a `run_state` event. Ending states remove the run.
+    pub fn apply_event(&mut self, task_id: Uuid, status: AgentStatus) {
+        if let Some(spoken_for) = &mut self.spoken_for {
+            spoken_for.insert(task_id);
+        }
+        if RunBadge::from_status(&status).is_some() {
+            self.runs.insert(task_id, status);
+        } else {
+            self.runs.remove(&task_id);
+        }
+    }
+
+    /// The state of the run SlashIt owns for `task_id`, if it owns one.
+    pub fn status(&self, task_id: &Uuid) -> Option<AgentStatus> {
+        self.runs.get(task_id).cloned()
+    }
+
+    /// Number of tasks with an owned run, regardless of whether the run is
+    /// starting, working, or stopping. This is the board header's Running
+    /// count; it deliberately does not inspect persisted task status.
+    pub fn len(&self) -> usize {
+        self.runs.len()
+    }
 }
 
 /// What a person can do from the drawer, given the task and its run.
@@ -279,19 +392,22 @@ mod tests {
     use crate::models::{ExecutionSnapshot, TaskPhase};
 
     #[test]
-    fn running_counts_coding_and_ai_review() {
-        assert!(counts_as_running(&TaskStatus::InProgress));
-        assert!(counts_as_running(&TaskStatus::AiReview));
-        for status in [
-            TaskStatus::Backlog,
-            TaskStatus::Queue,
-            TaskStatus::HumanReview,
-            TaskStatus::PrCreated,
-            TaskStatus::Done,
-            TaskStatus::Error,
-        ] {
-            assert!(!counts_as_running(&status), "{status:?}");
-        }
+    fn running_count_comes_only_from_owned_runs() {
+        let mut runs = LiveRuns::default();
+        let (coding, review, stale) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        assert_eq!(runs.len(), 0);
+
+        // Persisted InProgress/AiReview records are not inputs to this count.
+        runs.apply_event(coding, AgentStatus::Running);
+        runs.apply_event(review, AgentStatus::Starting);
+        assert_eq!(runs.len(), 2);
+
+        // A task whose persisted status is still InProgress but whose owned
+        // run ended is removed from the same truth used by the header.
+        runs.apply_event(stale, AgentStatus::Running);
+        assert_eq!(runs.len(), 3);
+        runs.apply_event(stale, AgentStatus::Stopped);
+        assert_eq!(runs.len(), 2);
     }
 
     fn tool(tool: &str) -> AgentEvent {
@@ -301,6 +417,7 @@ mod tests {
     fn run(live: bool, execution: Option<bool>) -> TaskRunSnapshot {
         TaskRunSnapshot {
             live,
+            status: live.then_some(AgentStatus::Running),
             last_execution: execution.map(|stopped| ExecutionSnapshot {
                 started_at: chrono::Utc::now(),
                 stopped_at: stopped.then(chrono::Utc::now),
@@ -495,4 +612,163 @@ mod tests {
         assert!(changes_task_record(&AgentEvent::Error { task_id: "t".into(), message: "m".into() }));
         assert!(!changes_task_record(&tool("Read")));
     }
+
+    fn run_state(task: Uuid, status: AgentStatus) -> AgentEvent {
+        AgentEvent::RunState { task_id: task.to_string(), status }
+    }
+
+    fn working(runs: &LiveRuns, task: &Uuid) -> Option<RunBadge> {
+        project_run(runs.status(task).as_ref(), None)
+    }
+
+    // matrix 1, 2, 9, 10: nothing is working until the backend says it owns a run
+    #[test]
+    fn a_task_with_no_owned_run_is_not_working_whatever_its_status_says() {
+        let runs = LiveRuns::default();
+        let task = Uuid::from_u128(1);
+        assert_eq!(working(&runs, &task), None);
+        // The status alone never contributes: there is no input for it.
+        assert_eq!(runs.status(&task), None);
+    }
+
+    // matrix 3, 4, 8, 6
+    #[test]
+    fn a_run_goes_from_starting_to_working_to_stopping_and_then_is_gone() {
+        let mut runs = LiveRuns::default();
+        let task = Uuid::from_u128(1);
+        runs.apply_event(task, AgentStatus::Starting);
+        assert_eq!(working(&runs, &task), Some(RunBadge::Starting));
+        runs.apply_event(task, AgentStatus::Running);
+        assert_eq!(working(&runs, &task), Some(RunBadge::Working));
+        runs.apply_event(task, AgentStatus::Stopping);
+        assert_eq!(working(&runs, &task), Some(RunBadge::Stopping));
+        runs.apply_event(task, AgentStatus::Stopped);
+        assert_eq!(working(&runs, &task), None, "no stale Working after the run ends");
+    }
+
+    // matrix 6, 7
+    #[test]
+    fn a_failed_run_is_not_shown_as_working() {
+        let mut runs = LiveRuns::default();
+        let task = Uuid::from_u128(1);
+        runs.apply_event(task, AgentStatus::Running);
+        runs.apply_event(task, AgentStatus::Failed("boom".into()));
+        assert_eq!(working(&runs, &task), None);
+        assert_eq!(RunBadge::from_status(&AgentStatus::Failed("x".into())), None);
+    }
+
+    // matrix 5: what the agent says moves the activity line, never the run
+    #[test]
+    fn activity_changes_do_not_change_whether_the_run_is_working() {
+        let mut runs = LiveRuns::default();
+        let task = Uuid::from_u128(1);
+        runs.apply_event(task, AgentStatus::Running);
+        let before = runs.clone();
+        for event in [
+            tool("Edit"),
+            AgentEvent::Output { task_id: task.to_string(), text: "next step".into() },
+            tool("Bash"),
+        ] {
+            // Only `run_state` events are fed to the registry.
+            assert!(!matches!(event, AgentEvent::RunState { .. }));
+            assert!(activity_from_event(&event).is_some());
+        }
+        assert_eq!(runs, before);
+        assert_eq!(working(&runs, &task), Some(RunBadge::Working));
+    }
+
+    // matrix 12
+    #[test]
+    fn there_is_no_waiting_for_input_state_to_show() {
+        // Exhaustive on purpose: a new status must be placed here, and
+        // waiting for input needs a provider signal that does not exist.
+        for status in [
+            AgentStatus::Starting,
+            AgentStatus::Running,
+            AgentStatus::Stopping,
+            AgentStatus::Stopped,
+            AgentStatus::Failed(String::new()),
+        ] {
+            match status {
+                AgentStatus::Starting | AgentStatus::Running | AgentStatus::Stopping => {
+                    assert!(RunBadge::from_status(&status).is_some())
+                }
+                AgentStatus::Stopped | AgentStatus::Failed(_) => assert!(RunBadge::from_status(&status).is_none()),
+            }
+        }
+    }
+
+    // matrix 11
+    #[test]
+    fn a_task_that_needs_the_person_shows_that_not_a_run_badge() {
+        let mut runs = LiveRuns::default();
+        let task = Uuid::from_u128(1);
+        runs.apply_event(task, AgentStatus::Running);
+        assert_eq!(project_run(runs.status(&task).as_ref(), Some(AttentionReason::Review)), None);
+        assert_eq!(project_run(runs.status(&task).as_ref(), Some(AttentionReason::Failed)), None);
+        assert_eq!(project_run(runs.status(&task).as_ref(), None), Some(RunBadge::Working));
+    }
+
+    // matrix 13
+    #[test]
+    fn parallel_runs_do_not_cross_associate() {
+        let mut runs = LiveRuns::default();
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        runs.apply_event(a, AgentStatus::Running);
+        runs.apply_event(b, AgentStatus::Starting);
+        runs.apply_event(a, AgentStatus::Stopped);
+        assert_eq!(working(&runs, &a), None);
+        assert_eq!(working(&runs, &b), Some(RunBadge::Starting));
+    }
+
+    // matrix 14
+    #[test]
+    fn a_board_that_opens_while_a_run_is_active_starts_from_the_backend_snapshot() {
+        let mut runs = LiveRuns::default();
+        let task = Uuid::from_u128(1);
+        runs.begin_hydration();
+        runs.finish_hydration(Some(vec![LiveRun { task_id: task, status: AgentStatus::Running }]));
+        assert_eq!(working(&runs, &task), Some(RunBadge::Working));
+    }
+
+    #[test]
+    fn an_event_during_hydration_beats_the_older_snapshot_for_its_own_task() {
+        let mut runs = LiveRuns::default();
+        let (ended, begun, quiet) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        runs.begin_hydration();
+        // The snapshot was read before these happened.
+        runs.apply_event(ended, AgentStatus::Stopped);
+        runs.apply_event(begun, AgentStatus::Starting);
+        runs.finish_hydration(Some(vec![
+            LiveRun { task_id: ended, status: AgentStatus::Running },
+            LiveRun { task_id: quiet, status: AgentStatus::Running },
+        ]));
+        assert_eq!(working(&runs, &ended), None, "the run ended after the snapshot; no phantom");
+        assert_eq!(working(&runs, &begun), Some(RunBadge::Starting));
+        assert_eq!(working(&runs, &quiet), Some(RunBadge::Working));
+    }
+
+    #[test]
+    fn a_failed_snapshot_read_leaves_only_what_events_said() {
+        let mut runs = LiveRuns::default();
+        let task = Uuid::from_u128(1);
+        runs.begin_hydration();
+        runs.apply_event(task, AgentStatus::Running);
+        runs.finish_hydration(None);
+        assert_eq!(working(&runs, &task), Some(RunBadge::Working));
+        // And an event after hydration is applied as ever.
+        runs.apply_event(task, AgentStatus::Stopped);
+        assert_eq!(working(&runs, &task), None);
+    }
+
+    #[test]
+    fn a_run_ending_announces_a_task_record_change_and_clears_activity() {
+        let task = Uuid::from_u128(1);
+        assert!(changes_task_record(&run_state(task, AgentStatus::Stopped)));
+        assert!(changes_task_record(&run_state(task, AgentStatus::Failed("x".into()))));
+        assert!(!changes_task_record(&run_state(task, AgentStatus::Running)));
+        assert_eq!(activity_from_event(&run_state(task, AgentStatus::Stopped)), Some(ActivityUpdate::Clear));
+        assert_eq!(activity_from_event(&run_state(task, AgentStatus::Running)), None);
+    }
+
 }

@@ -9,7 +9,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 
-use crate::models::{AgentEvent, TaskRunSnapshot};
+use crate::models::{AgentEvent, LiveRun, TaskRunSnapshot};
 
 #[wasm_bindgen]
 extern "C" {
@@ -64,6 +64,16 @@ pub struct AgentEventListener {
 /// Listen to every `agent-event`. The handler is called with each event that
 /// decodes; callers filter by [`AgentEvent::task_id`].
 pub fn listen_agent_events(handler: impl Fn(AgentEvent) + 'static) -> AgentEventListener {
+    listen_agent_events_with_ready(handler, || {})
+}
+
+/// [`listen_agent_events`], calling `ready` once Tauri has registered the
+/// handler (or has refused to), which is the earliest a caller can ask for a
+/// snapshot knowing no later event can be missed.
+pub fn listen_agent_events_with_ready(
+    handler: impl Fn(AgentEvent) + 'static,
+    ready: impl FnOnce() + 'static,
+) -> AgentEventListener {
     let state = Rc::new(RefCell::new(ListenerState {
         unlisten: None,
         dropped: false,
@@ -99,6 +109,7 @@ pub fn listen_agent_events(handler: impl Fn(AgentEvent) + 'static) -> AgentEvent
         };
         let Some(unlisten) = unlisten else {
             pending.borrow_mut().handler = None;
+            ready();
             return;
         };
         adjust_active_listeners(1);
@@ -107,6 +118,7 @@ pub fn listen_agent_events(handler: impl Fn(AgentEvent) + 'static) -> AgentEvent
             unregister(unlisten, pending);
         } else {
             pending.borrow_mut().unlisten = Some(unlisten);
+            ready();
         }
     });
 
@@ -156,6 +168,12 @@ async fn invoke(cmd: &str, args: serde_json::Value) -> Result<JsValue, String> {
 /// output in this session.
 pub async fn get_task_run(task_id: String) -> Result<TaskRunSnapshot, String> {
     let value = invoke("get_task_run", serde_json::json!({ "taskId": task_id })).await?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
+/// The runs SlashIt owns right now, for a board that has just opened.
+pub async fn get_live_runs() -> Result<Vec<LiveRun>, String> {
+    let value = invoke("get_live_runs", serde_json::json!({})).await?;
     serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }
 

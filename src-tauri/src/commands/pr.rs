@@ -3111,6 +3111,10 @@ async fn run_claude_pr_helper(
 
     let Some(wait_result) = wait_result else {
         let _ = runner.kill().await;
+        // `kill` signals the process group but does not reap the direct child.
+        // Wait before releasing the helper lease so lifecycle transitions and
+        // checkout cleanup cannot proceed while the provider still exists.
+        let _ = runner.wait().await;
         return Err(
             "PR helper cancelled: task ownership changed before the run finished".into(),
         );

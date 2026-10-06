@@ -68,6 +68,32 @@ and it does not pretend otherwise.
 - "Waiting for input" requires a trustworthy structured provider or protocol
   signal. Silence or an idle output stream never implies it.
 
+## Managed run supervision today
+
+The executor's handle maps (`running_handles` for task executions,
+`reviewing_handles` for AI review and fix flows, and the helper entries for
+task-associated PR-review/fix invocations) are the in-memory registry of Runs
+SlashIt started. `AgentStatus` is the run vocabulary: `Starting`
+(registered, process not yet started), `Running`, `Stopping` (a stop is being
+carried out), and the ended `Stopped` and `Failed`. `get_task_run` and
+`get_live_runs` read the registry, and `AgentEvent::RunState` announces each
+change, with the ended states sent last. PR side-effect reservations share an
+executor map for task-exclusivity but are not provider runs and are excluded
+from live-run and agent-count projections. Nothing about a run is persisted:
+after a restart there is no run until SlashIt starts one. `AgentSlotStatus`
+and the workflow `AgentSlot`s are static templates that no execution updates,
+and the Tauri commands in `commands/agent.rs` that drive `AcpClient` are an
+older, parallel path that the board does not use. `AgentPanel` has no rendered
+call site in the current product, so ACP executions are not task-card or board
+Working state; they remain a separate adapter debt rather than being merged
+into `TaskExecutor` here. The tray, quit guard and IPC status helper still
+include their active execution records in the union with executor ownership,
+so the safety surfaces do not assume the executor is the only provider owner.
+Neither is a second source of truth for a TaskExecutor run, and ACP startup
+failures are terminalized rather than left as active records. `WaitingForInput`
+stays out of `AgentStatus` until a provider or protocol signal exists that can
+set it.
+
 ## ACP
 
 ACP is a provider or protocol adapter boundary. It must not become SlashIt's

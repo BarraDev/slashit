@@ -15,11 +15,12 @@ use crate::components::new_work_pause::NewWorkPauseNotice;
 use crate::components::pr_status::PullRequestSection;
 use crate::components::task_activity::TaskActivity;
 use crate::components::task_live::{
-    format_elapsed, output_provenance, DrawerActions, OutputProvenance, RefreshGate, StartRequest,
+    format_elapsed, output_provenance, project_run, DrawerActions, OutputProvenance, RefreshGate, RunBadge,
+    StartRequest,
 };
 use crate::components::task_review::{AiReviewSection, HumanReviewPanel};
 use crate::components::toast;
-use crate::models::{LogLevel, Task, TaskPhase, TaskRunSnapshot, TaskStatus};
+use crate::models::{AgentStatus, LogLevel, Task, TaskPhase, TaskRunSnapshot, TaskStatus};
 use crate::services::task_run_service::{get_task_run, listen_agent_events, stop_task_execution};
 use crate::services::{enqueue_task, get_task_diff, get_task_diff_stat, EnqueueOutcome};
 
@@ -40,6 +41,10 @@ pub fn TaskDrawer(
     /// The agent's current one-line activity for this task, if any.
     #[prop(into)]
     activity: Signal<Option<String>>,
+    /// The run SlashIt owns for this task, from the board's one record of
+    /// runs, so the drawer and the card cannot disagree about it.
+    #[prop(into)]
+    run_status: Signal<Option<AgentStatus>>,
     on_close: Callback<()>,
     on_edit: Callback<Task>,
     /// Apply a task record a command returned, superseding older reads.
@@ -49,6 +54,15 @@ pub fn TaskDrawer(
 ) -> impl IntoView {
     let task = Memo::new(move |_| tasks.with(|all| all.iter().find(|t| t.id == task_id).cloned()));
     let status = Memo::new(move |_| task.with(|t| t.as_ref().map(|t| t.status.clone())));
+
+    // What the drawer calls working: the owned run, unless the task needs the
+    // person, in which case that is what it says.
+    let badge = Memo::new(move |_| {
+        let attention = task.with(|t| {
+            t.as_ref().and_then(|t| t.needs_you(crate::components::attention::delivery_in_flight(task_id)))
+        });
+        run_status.with(|run| project_run(run.as_ref(), attention))
+    });
 
     let run = RwSignal::new(TaskRunSnapshot::default());
     let run_loaded = RwSignal::new(false);
@@ -309,14 +323,13 @@ pub fn TaskDrawer(
                         <div class="p-6 text-sm text-white/50">"This task no longer exists."</div>
                     }.into_any(),
                     Some(t) => view! {
-                        <DrawerHeader task=t.clone() on_close=on_close />
+                        <DrawerHeader task=t.clone() badge=badge on_close=on_close />
                     }.into_any(),
                 }}
 
                 <div class="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-4">
                     // Where the task is and what it is doing.
                     {move || task.get().map(|t| {
-                        let live = run.with(|r| r.live);
                         let started = run.with(|r| {
                             r.last_execution.as_ref().filter(|_| output_provenance(r) == OutputProvenance::Live).map(|e| e.started_at)
                         });
@@ -334,9 +347,13 @@ pub fn TaskDrawer(
                                         </span>
                                     })}
                                 </div>
-                                {live.then(|| view! {
-                                    <div data-testid="task-drawer-activity" class="text-sm text-blue-200/90 truncate">
-                                        {move || activity.get().unwrap_or_else(|| "Working…".to_string())}
+                                {move || badge.get().map(|badge| view! {
+                                    <div data-testid="task-drawer-activity" data-run=badge.label().to_lowercase() class="text-sm text-blue-200/90 truncate">
+                                        {if badge == RunBadge::Working {
+                                            activity.get().unwrap_or_else(|| badge.placeholder().to_string())
+                                        } else {
+                                            badge.placeholder().to_string()
+                                        }}
                                     </div>
                                 })}
                             </section>
@@ -517,8 +534,15 @@ pub fn TaskDrawer(
 }
 
 #[component]
-fn DrawerHeader(task: Task, on_close: Callback<()>) -> impl IntoView {
-    let (label, class) = status_badge(&task.status);
+fn DrawerHeader(task: Task, badge: Memo<Option<RunBadge>>, on_close: Callback<()>) -> impl IntoView {
+    let (status_label, class) = status_badge(&task.status);
+    // A task in the In Progress column says what its run is only while
+    // SlashIt owns one; the column alone does not say anything is running.
+    let in_progress = task.status == TaskStatus::InProgress;
+    let label = move || match badge.get() {
+        Some(badge) if in_progress => badge.label(),
+        _ => status_label,
+    };
     let status_key = format!("{:?}", task.status).to_lowercase();
     view! {
         <header class="flex items-start gap-3 px-5 py-4 border-b border-white/10">
@@ -601,7 +625,7 @@ fn status_badge(status: &TaskStatus) -> (&'static str, &'static str) {
     match status {
         TaskStatus::Backlog => ("Backlog", "bg-white/10 text-white/60"),
         TaskStatus::Queue => ("Queued", "bg-slate-500/20 text-slate-300"),
-        TaskStatus::InProgress => ("Running", "bg-blue-500/20 text-blue-300"),
+        TaskStatus::InProgress => ("In Progress", "bg-blue-500/20 text-blue-300"),
         TaskStatus::AiReview => ("AI Review", "bg-purple-500/20 text-purple-300"),
         TaskStatus::HumanReview => ("Human Review", "bg-purple-500/20 text-purple-300"),
         TaskStatus::Done => ("Done", "bg-emerald-500/20 text-emerald-300"),
