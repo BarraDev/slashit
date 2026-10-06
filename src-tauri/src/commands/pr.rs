@@ -1988,7 +1988,7 @@ async fn settle_delivery(
         // not be asked) keeps everything: it says nothing.
         let hopeless = if on_remote {
             verdict == Survival::Absent
-        } else if remote.unavailable().is_none() {
+        } else if remote.is_absent() || remote.unavailable().is_none() {
             commit_is_unreachable_locally(working_dir, Some(branch), &commit).await
         } else {
             false
@@ -14370,6 +14370,33 @@ mod tests {
                 let (third, _plan) = apply(&task, plan, &worktree, no_jj, true).await;
                 assert_eq!(claude.runs(), runs + 1, "the fix is made again");
                 assert_eq!(third.replies_posted, 1, "{third:?}");
+            }
+
+            /// A remote branch that is definitely absent is different from a
+            /// remote that cannot be queried. If the local branch has since
+            /// amended away the recorded commit, the evidence is stale even
+            /// when this apply is not allowed to push.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_absent_remote_branch_clears_unreachable_fix_provenance_without_a_push() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_push(&repo);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert!(!first.pushed, "{first:?}");
+                let recorded = plan.items[0].fix_commit.clone().expect("committed");
+
+                git(&worktree, &["commit", "-q", "--amend", "-m", "amended"]);
+                assert_ne!(git(&worktree, &["rev-parse", "task-branch"]), recorded);
+                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj, true).await;
+
+                assert_eq!(second.replies_posted, 0, "{second:?}");
+                assert!(plan.items[0].fix_commit.is_none() && plan.items[0].fix_effect.is_none(), "{:?}", plan.items[0]);
+                std::fs::remove_file(hook).unwrap();
             }
 
             /// The commit is made and the push fails: the commit is recorded

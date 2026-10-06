@@ -220,6 +220,18 @@ pub async fn fetch_remote_branch(dir: &Path, branch: &str) -> Result<String, Str
         .ok_or_else(|| format!("{tracking} does not exist after fetching {branch} from origin"))
 }
 
+/// Whether `origin` currently has exactly this branch. An empty successful
+/// `ls-remote` result is a definite absence; a failed request remains an
+/// unavailable remote rather than being mistaken for an absent branch.
+pub async fn remote_branch_exists(dir: &Path, branch: &str) -> Result<bool, String> {
+    let refname = format!("refs/heads/{branch}");
+    let ran = run(dir, &["ls-remote", "--heads", "origin", &refname], &[]).await?;
+    if ran.code != Some(0) {
+        return Err(format!("git ls-remote failed: {}", ran.stderr));
+    }
+    Ok(ran.stdout.lines().any(|line| line.ends_with(&format!("\t{refname}"))))
+}
+
 /// What a task's worktree has in progress and uncommitted, as far as a
 /// restack is concerned.
 pub struct WorktreeState {

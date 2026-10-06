@@ -265,6 +265,7 @@ pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, co
 pub struct RemoteBranch {
     dir: std::path::PathBuf,
     tip: Result<String, String>,
+    absent: bool,
 }
 
 impl RemoteBranch {
@@ -276,14 +277,18 @@ impl RemoteBranch {
     /// force-push may have made stale.
     pub async fn refresh(working_dir: &str, branch: Option<&str>) -> Self {
         let dir = std::path::PathBuf::from(working_dir);
-        let tip = match branch {
-            None => Err("this task records no branch".to_string()),
+        let (tip, absent) = match branch {
+            None => (Err("this task records no branch".to_string()), false),
             Some(branch) => match super::checked_task_branch(branch) {
-                Ok(branch) => restack::fetch_remote_branch(&dir, branch).await,
-                Err(e) => Err(e.to_string()),
+                Ok(branch) => match restack::remote_branch_exists(&dir, branch).await {
+                    Ok(false) => (Err(format!("origin has no branch {branch}")), true),
+                    Ok(true) => (restack::fetch_remote_branch(&dir, branch).await, false),
+                    Err(e) => (Err(e), false),
+                },
+                Err(e) => (Err(e.to_string()), false),
             },
         };
-        Self { dir, tip }
+        Self { dir, tip, absent }
     }
 
     /// The commit the branch was at when refreshed, if it could be.
@@ -294,6 +299,12 @@ impl RemoteBranch {
     /// Why the branch could not be refreshed, if it could not.
     pub fn unavailable(&self) -> Option<&str> {
         self.tip.as_ref().err().map(String::as_str)
+    }
+
+    /// Whether the remote was successfully queried and definitely has no
+    /// branch of this name. A failed query is not absence.
+    pub fn is_absent(&self) -> bool {
+        self.absent
     }
 
     /// Whether `commit` is the remote branch's tip or one of its ancestors.
