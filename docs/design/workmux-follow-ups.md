@@ -1,7 +1,8 @@
-# Design notes: follow-ups from the Workmux review
+# Design notes: agent supervision, resume, dispatch and related ideas
 
 Status: proposed. Nothing here is built. Each note is one of the six ideas
-from issue 73; implementation issues are filed only after a note is accepted.
+collected in issue 73, from a review of a comparable tool used only as a
+reference; implementation issues are filed only after a note is accepted.
 The audit reflects `main` at the time of writing. Vocabulary follows
 [product-model.md](../architecture/product-model.md).
 
@@ -12,7 +13,7 @@ The audit reflects `main` at the time of writing. Vocabulary follows
 | Agent attention states | KEEP, folded into managed run supervision; no new Task status model |
 | Cross-Project dashboard | DROPPED as a page; possible read-only Workspace filter later |
 | Resume agent sessions | KEEP, best-effort, provider session identity owned by the Run |
-| Coordinator dispatch | KEEP, narrow; multi-agent orchestration DEFERRED, not rejected |
+| Coordinator dispatch | KEEP as a deferred note, narrow; multi-agent orchestration DEFERRED, not rejected |
 | Stale-agent reaper | KEEP managed execution supervision; DROP automatic reaping and scanning |
 | Per-Project setup hooks | KEEP as design, deferred |
 
@@ -32,16 +33,24 @@ Failed, Review, PrNotCreated), derived from persisted facts. Run state asks
 model. Needs review is already Attention. Working is not an Attention reason.
 
 Working is not derivable from `TaskStatus` or `TaskPhase`. A persisted
-status does not prove a live process (after a crash an InProgress record has
-no process until hydration requeues it), and a queued task may be waiting on
+status does not prove a live process (after a crash an InProgress or AiReview
+record has no process until hydration resets it to Queue), and a queued task may be waiting on
 capacity or admission. Working must project live supervision: SlashIt holds
 the child process or protocol handle it started, so it can say Starting,
 Working, Stopping, Finished or Failed from that handle.
 
 Run state is held in memory by the supervisor and projected to the UI. It is
-not a persisted Task field and creates no new Task status model. What is
-persisted is only what already is (timeline entries, outcome) plus the
-provider session id from note 3.
+not a persisted Task field and creates no new Task status model. Nothing new
+is persisted on the Task; what is persisted is only what already is (timeline
+entries, outcome). Provider session ids (note 3) have no persisted home yet
+and are not a Task field.
+
+Three status vocabularies already overlap: `domain::AgentStatus`
+(Starting, Running, Stopping, Stopped, Failed), `AgentSlotStatus` (Idle,
+Working, WaitingForInput, Completed, Failed), and the executor's
+`AgentEvent`, with frontend mirrors of the agent status and event types in
+`src/models/agent.rs`. The supervision work must reconcile these rather than
+add a fourth.
 
 WaitingForInput is a supported-future run state with no current producer; it
 may only come from a reliable structured provider or protocol signal and is
@@ -51,7 +60,11 @@ never inferred from silence or output pauses. Audit of main: the only
 (`claude -p`, prompt on stdin) and parses `system`, `assistant`, `tool_use`
 and `result` events, none of which means "waiting for the human". ACP
 (`src-tauri/src/acp`) has a free-form `status` string notification with no
-defined vocabulary and no permission or input request; the app only logs it.
+defined vocabulary and no permission or input request. Nothing consumes
+the notifications at all: `subscribe_notifications` has no caller outside
+`src-tauri/src/acp`, and only the child's stderr is logged. `session.rs` and
+`stream.rs` are not compiled (`acp/mod.rs` declares only `protocol` and
+`client`).
 So no provider currently produces a trustworthy signal. Out of scope: any Conversation model, external process scanning,
 repo or provider hooks, notifications.
 
@@ -82,7 +95,8 @@ a real multi-Project user asks.
 ## 3. Resume provider sessions after a crash
 
 Three things, kept apart. (a) Resuming a SlashIt task: startup hydration
-already requeues tasks left InProgress as fresh runs in their Task Checkout.
+already resets tasks left InProgress or AiReview to Queue (recording an
+Interrupted activity), so they restart as fresh runs in their Task Checkout.
 (b) Reconnecting a terminal process: out of scope; PTYs die with the app and
 agent runs are not PTY based. (c) Resuming a provider session: best-effort.
 
@@ -99,7 +113,9 @@ reported, not the one SlashIt asked for. No id is persisted today. The
 claude CLI help lists `--resume`, `--session-id`, `--continue`,
 `--fork-session` and `--no-session-persistence`.
 
-Behavior: persist the provider-reported id on the run record when available;
+Behavior: persist the provider-reported id when available. No Run or attempt entity
+exists today, so this id has no persisted home yet; the resume work must
+decide where it lives (a run or attempt record) and it is not a Task field;
 on interrupted-run recovery try `--resume` once; if it fails, run fresh;
 never loop; write what happened to the activity timeline.
 
@@ -122,11 +138,17 @@ TCP peer may not, and mutations are audit logged. So an orchestrating agent
 running as the same OS user can already dispatch. The idea is therefore not
 "build dispatch" but "decide what is safe to give an agent".
 
-Gaps. No caller identity beyond "the owner"; an agent can edit or delete any
-task in any Project, not only tasks it created; created task text is
+`spawns_agent()` (`crates/slashit-ipc/src/protocol.rs`) covers CreateTask,
+MoveTask, EnqueueTask and also EditTask (editing a queued or running task
+rewrites the prompt a later run uses); DeleteTask is not in that set.
+Stale doc to fix as a follow-up: `docs/architecture/ipc-security.md` lists
+only three verbs and omits EditTask.
+
+Gaps. No caller identity beyond "the owner"; any caller can edit or delete
+tasks in any Project, not only tasks it created; created task text is
 attacker-influenced input that becomes another agent's prompt.
 
-Decision. KEEP as a small authorization design for a local coordinator; orchestration itself is deferred, see below.
+Decision. KEEP as a deferred note: a small authorization design for a local coordinator; orchestration itself is deferred, see below.
 
 Behavior. Tasks created over the channel record `created_via: cli` (plus an
 optional caller label from `--source`, informational only). A restricted
@@ -148,7 +170,7 @@ label is provenance, and a future Participant model may replace it. Also out
 of scope: task dependencies, results API, remote dispatch, per-agent
 credentials.
 
-Smallest first version. Provenance field and a `--json` output audit so an
+Smallest first version (deferred; kept as a note, not scheduled). Provenance field and a `--json` output audit so an
 orchestrator can read task ids and status reliably.
 
 Acceptance. Tasks made by the CLI are visibly marked; protocol test still
@@ -163,7 +185,7 @@ not assume the provider process died or survived. It never scans for or
 kills processes by executable name. A future recovery step may persist
 process identity (pid and start time) to surface a possible leftover agent;
 any destructive action would need strong ownership proof. A future daemon
-that owns processes is not part of issue 73.
+that owns processes is outside the scope of these notes.
 
 ## 6. SlashIt-owned per-Project setup hooks
 
@@ -205,7 +227,7 @@ text does not appear in the command line.
    size, foundation for the rest.
 2. Best-effort provider session resume. High value, small to medium,
    provider-drift risk; may depend on 1 and needs the spike answers first.
-3. Dispatch provenance: small, no issue now.
+3. Dispatch provenance: a kept but deferred note; no issue now.
 4. Setup hooks: deferred, code-execution surface.
 
 Only items 1 and 2 are proposed as near-term implementation issues.
