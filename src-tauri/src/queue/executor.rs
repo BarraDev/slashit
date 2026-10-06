@@ -8,7 +8,7 @@ use crate::domain::task::ActivityKind;
 use crate::queue::prompt::{build_task_prompt, build_review_prompt, build_fix_prompt};
 use crate::queue::QueueManager;
 use crate::worktree::{CheckoutCommit, WorktreeInfo, WorktreeManager};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use crate::events::{EventSink, SharedEventSink};
 use tokio::sync::RwLock;
@@ -1001,6 +1001,47 @@ impl TaskExecutor {
         self.running_handles.read().await.len()
             + self.reviewing_handles.read().await.len()
             + self.pr_helper_handles.lock().unwrap().len()
+    }
+
+    /// Return the executor-owned provider flows in two forms for safety
+    /// surfaces that also see the legacy ACP execution records:
+    ///
+    /// * execution ids are the records this executor itself inserted for
+    ///   coding runs, so callers can avoid counting those records twice;
+    /// * task ids are unrecorded provider flows (AI review/fix, PR helpers,
+    ///   and a coding run before its execution record exists).
+    ///
+    /// PR side-effect reservations are deliberately absent: they still count
+    /// as owned work for lifecycle protection and daemon shutdown, but they do
+    /// not own a provider process and must not inflate an agent count.
+    pub async fn active_agent_owners(&self) -> (HashSet<Uuid>, HashSet<Uuid>) {
+        let mut execution_ids = HashSet::new();
+        let mut task_ids = HashSet::new();
+
+        for (task_id, run) in self.running_handles.read().await.iter() {
+            if !run.handle.is_finished() {
+                if let Some(execution_id) = run.execution_id {
+                    execution_ids.insert(execution_id);
+                } else {
+                    task_ids.insert(*task_id);
+                }
+            }
+        }
+        for (task_id, run) in self.reviewing_handles.read().await.iter() {
+            if !run.handle.is_finished() {
+                task_ids.insert(*task_id);
+            }
+        }
+        for task_id in self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            task_ids.insert(*task_id);
+        }
+        for (task_id, owner) in self.pr_helper_handles.lock().unwrap().iter() {
+            if owner.kind == PrOwnerKind::Helper {
+                task_ids.insert(*task_id);
+            }
+        }
+
+        (execution_ids, task_ids)
     }
 
     /// Bring [`Self::admission`]'s capacity in line with the current runtime
@@ -3685,6 +3726,13 @@ impl TaskExecutor {
     pub async fn live_runs(&self) -> Vec<LiveRun> {
         let mut ids: Vec<Uuid> = self.running_handles.read().await.keys().copied().collect();
         ids.extend(self.reviewing_handles.read().await.keys().copied());
+        ids.extend(
+            self.pr_helper_handles
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(task_id, owner)| (owner.kind == PrOwnerKind::Helper).then_some(*task_id)),
+        );
         ids.extend(self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).iter().copied());
         ids.sort();
         ids.dedup();
@@ -3738,7 +3786,27 @@ impl TaskExecutor {
             .await
             .get(&task_id)
             .is_some_and(|r| !r.handle.is_finished());
-        reviewing.then_some(AgentStatus::Running)
+        if reviewing {
+            return Some(AgentStatus::Running);
+        }
+
+        // A PR helper is a command-owned provider flow rather than an
+        // executor-spawned JoinHandle. Its lease is the executor's ownership
+        // fact for the whole subprocess lifetime; a cancelled lease remains
+        // live until the helper drops it, so the UI can show Stopping rather
+        // than disappearing early. Side-effect reservations share the map but
+        // are not provider runs and are intentionally excluded.
+        self.pr_helper_handles
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .and_then(|owner| (owner.kind == PrOwnerKind::Helper).then_some(
+                if *owner.cancel.borrow() {
+                    AgentStatus::Stopping
+                } else {
+                    AgentStatus::Running
+                },
+            ))
     }
 
     /// Mark `task_id`'s run as being ended; see [`StoppingMark`].
@@ -10334,6 +10402,29 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             let run = executor.task_run(task_id).await;
             assert!(run.live);
             assert_eq!(run.status, Some(AgentStatus::Running));
+        }
+
+        #[tokio::test]
+        async fn a_pr_helper_is_a_live_run_but_a_pr_side_effect_is_not() {
+            let (executor, _temps) = test_executor();
+            let helper_task = Uuid::new_v4();
+            let helper = executor.try_begin_pr_helper(helper_task).await.expect("helper admission");
+
+            assert_eq!(
+                executor.live_runs().await,
+                vec![LiveRun { task_id: helper_task, status: AgentStatus::Running }]
+            );
+            let (execution_ids, task_ids) = executor.active_agent_owners().await;
+            assert!(execution_ids.is_empty());
+            assert!(task_ids.contains(&helper_task));
+
+            drop(helper);
+            let side_effect_task = Uuid::new_v4();
+            let side_effect = executor.begin_republish_under_lease(side_effect_task).await.expect("side effect admission");
+            assert!(executor.live_runs().await.is_empty());
+            let (_execution_ids, task_ids) = executor.active_agent_owners().await;
+            assert!(!task_ids.contains(&side_effect_task));
+            drop(side_effect);
         }
 
         #[tokio::test]

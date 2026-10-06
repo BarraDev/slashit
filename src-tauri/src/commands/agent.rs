@@ -33,6 +33,36 @@ impl Default for AgentState {
     }
 }
 
+/// Count provider processes owned by the executor and by the legacy ACP
+/// command path without counting an executor coding record twice.
+///
+/// The executor returns execution ids for the records it inserted itself and
+/// separate task ids for provider flows that have no `AgentExecution` record
+/// (AI review/fix, PR helpers, and a pre-record coding start). Any remaining
+/// active records belong to the independent ACP path and are counted as-is.
+/// A shared helper keeps tray, quit, and IPC status on the same safety rule.
+pub(crate) async fn active_agent_count(
+    executions: &AgentExecutions,
+    executor: Option<&crate::queue::TaskExecutor>,
+) -> usize {
+    let (executor_execution_ids, executor_task_ids) = match executor {
+        Some(executor) => executor.active_agent_owners().await,
+        None => (std::collections::HashSet::new(), std::collections::HashSet::new()),
+    };
+    let legacy_count = executions
+        .read()
+        .await
+        .values()
+        .filter(|execution| {
+            matches!(
+                execution.status,
+                AgentStatus::Starting | AgentStatus::Running | AgentStatus::Stopping
+            ) && !executor_execution_ids.contains(&execution.id)
+        })
+        .count();
+    executor_task_ids.len() + legacy_count
+}
+
 #[tauri::command]
 pub async fn start_agent(
     state: tauri::State<'_, crate::AppState>,

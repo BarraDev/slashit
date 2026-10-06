@@ -11,7 +11,7 @@ use crate::components::{TaskCard, TaskDrawer, TaskEditModal, TaskEditMode, toast
 use crate::components::close_without_merge_dialog::{CloseWithoutMergeDialog, PendingClose};
 use crate::components::new_work_pause::{provide_new_work_pause, NewWorkPauseNotice};
 use crate::components::attention::{attention_order, next_after, reveal_card, BoardAttention, Deliveries};
-use crate::components::task_live::{activity_from_event, changes_task_record, counts_as_running, ActivityUpdate, LiveRuns};
+use crate::components::task_live::{activity_from_event, changes_task_record, ActivityUpdate, LiveRuns};
 use crate::models::AgentEvent;
 use crate::services::task_run_service::{get_live_runs, listen_agent_events_with_ready};
 use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
@@ -516,7 +516,10 @@ pub fn Kanban(
     let task_stats = move || {
         let tasks = tasks_signal.get();
         let total = tasks.len();
-        let running = tasks.iter().filter(|t| counts_as_running(&t.status)).count();
+        // A persisted status says where the task last was, not whether this
+        // process still owns a provider run. Keep the header on the same
+        // live-run registry as cards and drawers.
+        let running = live_runs.with(|runs| runs.len());
         let done = tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
         (total, running, done)
     };

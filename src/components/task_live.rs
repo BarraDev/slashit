@@ -168,16 +168,13 @@ impl LiveRuns {
     pub fn status(&self, task_id: &Uuid) -> Option<AgentStatus> {
         self.runs.get(task_id).cloned()
     }
-}
 
-/// Whether the board's "Running" count includes a task in `status`: coding,
-/// or under AI review.
-///
-/// Read from the status alone, like the rest of the board. An AI review that
-/// is waiting for a free slot is counted too; the record does not tell it
-/// apart from one that has started.
-pub fn counts_as_running(status: &TaskStatus) -> bool {
-    matches!(status, TaskStatus::InProgress | TaskStatus::AiReview)
+    /// Number of tasks with an owned run, regardless of whether the run is
+    /// starting, working, or stopping. This is the board header's Running
+    /// count; it deliberately does not inspect persisted task status.
+    pub fn len(&self) -> usize {
+        self.runs.len()
+    }
 }
 
 /// What a person can do from the drawer, given the task and its run.
@@ -395,19 +392,22 @@ mod tests {
     use crate::models::{ExecutionSnapshot, TaskPhase};
 
     #[test]
-    fn running_counts_coding_and_ai_review() {
-        assert!(counts_as_running(&TaskStatus::InProgress));
-        assert!(counts_as_running(&TaskStatus::AiReview));
-        for status in [
-            TaskStatus::Backlog,
-            TaskStatus::Queue,
-            TaskStatus::HumanReview,
-            TaskStatus::PrCreated,
-            TaskStatus::Done,
-            TaskStatus::Error,
-        ] {
-            assert!(!counts_as_running(&status), "{status:?}");
-        }
+    fn running_count_comes_only_from_owned_runs() {
+        let mut runs = LiveRuns::default();
+        let (coding, review, stale) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        assert_eq!(runs.len(), 0);
+
+        // Persisted InProgress/AiReview records are not inputs to this count.
+        runs.apply_event(coding, AgentStatus::Running);
+        runs.apply_event(review, AgentStatus::Starting);
+        assert_eq!(runs.len(), 2);
+
+        // A task whose persisted status is still InProgress but whose owned
+        // run ended is removed from the same truth used by the header.
+        runs.apply_event(stale, AgentStatus::Running);
+        assert_eq!(runs.len(), 3);
+        runs.apply_event(stale, AgentStatus::Stopped);
+        assert_eq!(runs.len(), 2);
     }
 
     fn tool(tool: &str) -> AgentEvent {

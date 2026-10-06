@@ -523,19 +523,9 @@ async fn request_quit_inner(app: &tauri::AppHandle) {
     let (pty_count, agent_count) = {
         let state = app.state::<AppState>();
         let pty_count = state.pty.sessions.lock().await.len();
-        let agent_count = state
-            .agent
-            .executions
-            .read()
-            .await
-            .values()
-            .filter(|e| {
-                matches!(
-                    e.status,
-                    crate::domain::AgentStatus::Running | crate::domain::AgentStatus::Starting
-                )
-            })
-            .count();
+        let executor = state.executor.get().map(|executor| executor.as_ref());
+        let agent_count =
+            commands::agent::active_agent_count(&state.agent.executions, executor).await;
         (pty_count, agent_count)
     };
 

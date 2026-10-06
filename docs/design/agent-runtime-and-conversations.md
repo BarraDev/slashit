@@ -71,12 +71,15 @@ and it does not pretend otherwise.
 ## Managed run supervision today
 
 The executor's handle maps (`running_handles` for task executions,
-`reviewing_handles` for AI review and fix flows) are the in-memory registry of
-Runs SlashIt started. `AgentStatus` is the run vocabulary: `Starting`
+`reviewing_handles` for AI review and fix flows, and the helper entries for
+task-associated PR-review/fix invocations) are the in-memory registry of Runs
+SlashIt started. `AgentStatus` is the run vocabulary: `Starting`
 (registered, process not yet started), `Running`, `Stopping` (a stop is being
 carried out), and the ended `Stopped` and `Failed`. `get_task_run` and
 `get_live_runs` read the registry, and `AgentEvent::RunState` announces each
-change, with the ended states sent last. Nothing about a run is persisted:
+change, with the ended states sent last. PR side-effect reservations share an
+executor map for task-exclusivity but are not provider runs and are excluded
+from live-run and agent-count projections. Nothing about a run is persisted:
 after a restart there is no run until SlashIt starts one. `AgentSlotStatus`
 and the workflow `AgentSlot`s are static templates that no execution updates,
 and the Tauri commands in `commands/agent.rs` that drive `AcpClient` are an

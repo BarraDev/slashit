@@ -13,7 +13,7 @@ use slashit_ipc::{
 };
 use uuid::Uuid;
 
-use crate::domain::{AgentStatus, TaskPriority, TaskStatus};
+use crate::domain::{TaskPriority, TaskStatus};
 
 use super::server::{IpcContext, PeerContext};
 
@@ -87,13 +87,9 @@ pub async fn dispatch(req: IpcRequest, ctx: &IpcContext, peer: &PeerContext) -> 
 async fn handle_status(ctx: &IpcContext) -> IpcResponse {
     let active_terminals = ctx.pty.sessions.lock().await.len();
 
-    let running_agents = {
-        let execs = ctx.executions.read().await;
-        execs
-            .values()
-            .filter(|e| matches!(e.status, AgentStatus::Running | AgentStatus::Starting))
-            .count()
-    };
+    let executor = ctx.executor.get().map(|executor| executor.as_ref());
+    let running_agents =
+        crate::commands::agent::active_agent_count(&ctx.executions, executor).await;
 
     let queue_mgr = ctx.queue_manager.read().await;
     let queued_tasks = queue_mgr.get_queued_tasks().await.len();
