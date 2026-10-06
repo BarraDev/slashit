@@ -50,10 +50,14 @@ pub fn AppLayout(
         <div class="flex h-screen bg-[#08080C] text-white">
             // Show ProjectRail when use_rail is true
             <Show when=move || use_rail.get()>
-                <ProjectRail
-                    selected_project=selected_project
-                    set_selected_project=set_selected_project
-                />
+                // The slot is the only flex item. The rail itself expands as
+                // an overlay, so its labels never move the rest of the app.
+                <div class="project-rail-slot">
+                    <ProjectRail
+                        selected_project=selected_project
+                        set_selected_project=set_selected_project
+                    />
+                </div>
             </Show>
             <Sidebar
                 current_page=current_page

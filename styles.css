@@ -150,9 +150,20 @@ button:focus:not(:focus-visible) {
 
 /* ── Project Rail ────────────────────────────────────────── */
 
+.project-rail-slot {
+  position: relative;
+  flex: 0 0 48px;
+  width: 48px;
+  min-width: 48px;
+  height: 100%;
+  z-index: 20;
+}
+
 .project-rail {
   display: flex;
   flex-direction: column;
+  position: absolute;
+  inset: 0 auto 0 0;
   width: 48px;
   min-width: 48px;
   height: 100%;
@@ -161,9 +172,11 @@ button:focus:not(:focus-visible) {
   transition: width 0.2s cubic-bezier(0.4, 0, 0.2, 1),
               min-width 0.2s cubic-bezier(0.4, 0, 0.2, 1);
   overflow: hidden;
-  z-index: 20;
+  z-index: 21;
 }
 
+/* The slot reserves the collapsed footprint. Expansion changes only the rail's
+   painted overlay, so the Sidebar and board keep their layout coordinates. */
 .project-rail.expanded {
   width: 180px;
   min-width: 180px;

@@ -166,8 +166,16 @@ do not compare them byte for byte.
   common ancestor. When that ancestor is not the card, the card's handler
   never sees the click, so a card that moves between the two events can open
   nothing. The event targets can help tell that apart from other failures;
-  they do not identify the cause. The probe listens before the card's own
-  handler runs, so the record does not show whether that handler ran.
+  they do not identify the cause. The product's project rail is expected to
+  expand over a fixed-width layout slot, so Sidebar and board geometry should
+  not move while its labels appear. Each event also carries the card's rect, the
+  element under the pointer, the board's scroll position and the widths of the
+  project rail and the sidebar at that moment, and a frame-by-frame record
+  lists every change of the card's place or of those widths, so a card that
+  slides under a stationary pointer is visible as a run of rects. A record of
+  the click reaching the card element itself separates a click the card never
+  received from one its handler ignored. The probe still listens before the
+  card's own handler runs, so the record does not show the handler's decision.
 
 ## Platforms
 
