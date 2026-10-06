@@ -18,9 +18,10 @@ The audit reflects `main` at the time of writing. Vocabulary follows
 | Stale-agent reaper | KEEP managed execution supervision; DROP automatic reaping and scanning |
 | Per-Project setup hooks | KEEP as design, deferred |
 
-Direction context: [agent-runtime-and-conversations.md](agent-runtime-and-conversations.md).
-Ownership principle: SlashIt owns conversation and execution metadata, not
-the user's repository or the provider's configuration.
+Direction context:
+[agent-runtime-and-conversations.md](agent-runtime-and-conversations.md).
+Ownership principle: SlashIt owns conversation and execution metadata, not the
+user's repository or the provider's configuration.
 
 ## 1. Agent attention states and managed run supervision
 
@@ -33,12 +34,12 @@ Failed, Review, PrNotCreated), derived from persisted facts. Run state asks
 "what is the execution SlashIt owns doing right now?" and is a different
 model. Needs review is already Attention. Working is not an Attention reason.
 
-Working is not derivable from `TaskStatus` or `TaskPhase`. A persisted
-status does not prove a live process (after a crash an InProgress or AiReview
-record has no process until hydration resets it to Queue), and a queued task may be waiting on
-capacity or admission. Working must project live supervision: SlashIt holds
-the child process or protocol handle it started, so it can say Starting,
-Working, Stopping, Finished or Failed from that handle.
+Working is not derivable from `TaskStatus` or `TaskPhase`. A persisted status
+does not prove a live process (after a crash an InProgress or AiReview record
+has no process until hydration resets it to Queue), and a queued task may be
+waiting on capacity or admission. Working must project live supervision:
+SlashIt holds the child process or protocol handle it started, so it can say
+Starting, Working, Stopping, Finished or Failed from that handle.
 
 Run state is held in memory by the supervisor and projected to the UI. It is
 not a persisted Task field and creates no new Task status model. Nothing new
@@ -61,13 +62,13 @@ never inferred from silence or output pauses. Audit of main: the only
 (`claude -p`, prompt on stdin) and parses `system`, `assistant`, `tool_use`
 and `result` events, none of which means "waiting for the human". ACP
 (`src-tauri/src/acp`) has a free-form `status` string notification with no
-defined vocabulary and no permission or input request. Nothing consumes
-the notifications at all: `subscribe_notifications` has no caller outside
+defined vocabulary and no permission or input request. Nothing consumes the
+notifications at all: `subscribe_notifications` has no caller outside
 `src-tauri/src/acp`, and only the child's stderr is logged. `session.rs` and
 `stream.rs` are not compiled (`acp/mod.rs` declares only `protocol` and
-`client`).
-So no provider currently produces a trustworthy signal. Out of scope: any Conversation model, external process scanning,
-repo or provider hooks, notifications.
+`client`). So no provider currently produces a trustworthy signal. Out of
+scope: any Conversation model, external process scanning, repo or provider
+hooks, notifications.
 
 Smallest first version: an in-memory registry of runs the executor starts,
 fed by the runner's existing structured events and live activity, with a
@@ -114,11 +115,11 @@ reported, not the one SlashIt asked for. No id is persisted today. The
 claude CLI help lists `--resume`, `--session-id`, `--continue`,
 `--fork-session` and `--no-session-persistence`.
 
-Behavior: persist the provider-reported id when available. No Run or attempt entity
-exists today, so this id has no persisted home yet; the resume work must
-decide where it lives (a run or attempt record) and it is not a Task field;
-on interrupted-run recovery try `--resume` once; if it fails, run fresh;
-never loop; write what happened to the activity timeline.
+Behavior: persist the provider-reported id when available. No Run or attempt
+entity exists today, so this id has no persisted home yet; the resume work
+must decide where it lives (a run or attempt record) and it is not a Task
+field; on interrupted-run recovery try `--resume` once; if it fails, run
+fresh; never loop; write what happened to the activity timeline.
 
 Spike questions to answer before any implementation issue (all unverified):
 does `claude -p` reliably report a resumable id; can a session killed
@@ -133,8 +134,9 @@ background sessions.
 
 Audit. The CLI and `IpcRequest` already expose CreateTask, MoveTask,
 EditTask, DeleteTask and EnqueueTask. `docs/architecture/ipc-security.md`
-already classifies the agent-spawning verbs (`spawns_agent()`): an OS-verified local peer may use them, a token-only
-TCP peer may not, and mutations are audit logged. So an orchestrating agent
+already classifies the agent-spawning verbs (`spawns_agent()`): an
+OS-verified local peer may use them, a token-only TCP peer may not, and
+mutations are audit logged. So an orchestrating agent
 running as the same OS user can already dispatch. The idea is therefore not
 "build dispatch" but "decide what is safe to give an agent".
 
@@ -147,13 +149,14 @@ Gaps. No caller identity beyond "the owner"; any caller can edit or delete
 tasks in any Project, not only tasks it created; created task text is
 attacker-influenced input that becomes another agent's prompt.
 
-Decision. KEEP as a deferred note: a small authorization design for a local coordinator; orchestration itself is deferred, see below.
+Decision. KEEP as a deferred note: a small authorization design for a local
+coordinator; orchestration itself is deferred, see below.
 
 Behavior. Tasks created over the channel record `created_via: cli` (plus an
-optional caller label from `--source`, informational only). A restricted
-mode, off by default, limits a caller to creating tasks and queueing tasks it
-created in one named Project. For this first step there are no dependency graphs, result
-collection or fan-out: the coordinator polls `slashit tasks`.
+optional caller label from `--source`, informational only). A restricted mode,
+off by default, limits a caller to creating tasks and queueing tasks it
+created in one named Project. For this first step there are no dependency
+graphs, result collection or fan-out: the coordinator polls `slashit tasks`.
 
 Ownership. The Project owns the tasks; the caller label is provenance, not a
 permission principal. Persistence: the provenance field on the task.
@@ -169,8 +172,9 @@ label is provenance, and a future Participant model may replace it. Also out
 of scope: task dependencies, results API, remote dispatch, per-agent
 credentials.
 
-Smallest first version (deferred; kept as a note, not scheduled). Provenance field and a `--json` output audit so an
-orchestrator can read task ids and status reliably.
+Smallest first version (deferred; kept as a note, not scheduled). Provenance
+field and a `--json` output audit so an orchestrator can read task ids and
+status reliably.
 
 Acceptance. Tasks made by the CLI are visibly marked; protocol test still
 forces every new verb to be classified; no new mutating verb is added.
@@ -188,8 +192,9 @@ that owns processes is outside the scope of these notes.
 
 ## 6. SlashIt-owned per-Project setup hooks
 
-Problem. A new Task Checkout often needs setup (dependency install, env
-files) before an agent is useful. (An external git-worktree tool had offered such hooks.)
+Problem. A new Task Checkout often needs setup (dependency install, env files)
+before an agent is useful. (An external git-worktree tool had offered such
+hooks.)
 
 Decision. KEEP as a deferred design; no code until a user shows a concrete
 need, because there is no setup mechanism today.

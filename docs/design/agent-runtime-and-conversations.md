@@ -2,11 +2,11 @@
 
 Status: architectural direction, not an implementation plan. No current
 feature commitment. Nothing here is built, and the follow-up-ideas issue
-[#73](https://github.com/BarraDev/slashit/issues/73) does not implement any of it.
-The historical record of the six decisions is
-[workmux-follow-ups.md](workmux-follow-ups.md). The direction document's
-purpose is to keep today's bounded decisions from closing doors. Vocabulary
-follows [product-model.md](../architecture/product-model.md).
+[#73](https://github.com/BarraDev/slashit/issues/73) does not implement
+any of it. The historical record of the six decisions is
+[workmux-follow-ups.md](workmux-follow-ups.md). The purpose of this document
+is to keep today's bounded decisions from closing doors. Vocabulary follows
+[product-model.md](../architecture/product-model.md).
 
 ## Ownership principle
 
@@ -52,7 +52,7 @@ and it does not pretend otherwise.
 - Conversation and orchestration are deferred future architecture. They are
   not rejected and not scheduled.
 
-## Supervision rules
+## Supervision boundaries
 
 - Managed supervision covers only executions SlashIt started or explicitly
   adopted. There is no scanning of arbitrary external processes.
@@ -69,11 +69,11 @@ ACP is a provider or protocol adapter boundary. It must not become SlashIt's
 domain model. Current support (`src-tauri/src/acp`) is rudimentary: four
 requests (initialize, create, send_prompt, stop), two notifications (log and
 a free-text status), no cancellation of a running prompt, no session
-loading, no recovery, and notifications that nothing consumes (`subscribe_notifications` has no
-caller outside the module; the app logs only the child's stderr). The
-`session.rs` and `stream.rs` files are not even compiled, because
-`acp/mod.rs` declares only `protocol` and `client`. Making it a
-dependable adapter needs lifecycle, notification, cancellation, session and
+loading, no recovery, and notifications that nothing consumes
+(`subscribe_notifications` has no caller outside the module; the app logs
+only the child's stderr). The `session.rs` and `stream.rs` files are not even
+compiled, because `acp/mod.rs` declares only `protocol` and `client`. Making
+it a dependable adapter needs lifecycle, notification, cancellation, session and
 recovery work. That is deliberately not tracked as one large issue now.
 
 ## What this means for the six follow-up ideas
