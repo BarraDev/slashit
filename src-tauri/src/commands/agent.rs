@@ -60,7 +60,11 @@ pub(crate) async fn active_agent_count(
             ) && !executor_execution_ids.contains(&execution.id)
         })
         .count();
-    executor_task_ids.len() + legacy_count
+    // Every executor-owned coding run has an execution id as soon as it is
+    // registered, even during the short window before its record exists.
+    // Those records are excluded above, so this counts each owned provider
+    // exactly once while still covering that pre-record window.
+    executor_execution_ids.len() + executor_task_ids.len() + legacy_count
 }
 
 #[tauri::command]

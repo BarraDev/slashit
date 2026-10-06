@@ -402,10 +402,12 @@ enum PrOwnerKind {
 /// effect until its durable link, and is retired on drop the same way.
 pub struct PrHelperLease {
     task_id: Uuid,
+    kind: PrOwnerKind,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     done_tx: Option<tokio::sync::watch::Sender<bool>>,
     _permit: Option<AdmissionPermit>,
     handles: Arc<std::sync::Mutex<HashMap<Uuid, PrHelperOwner>>>,
+    events: SharedEventSink,
 }
 
 impl PrHelperLease {
@@ -443,6 +445,12 @@ impl Drop for PrHelperLease {
         // `.await` inside it, so a blocking lock here never stalls the
         // runtime.
         self.handles.lock().unwrap().remove(&self.task_id);
+        if self.kind == PrOwnerKind::Helper {
+            self.events.agent_event(AgentEvent::RunState {
+                task_id: self.task_id.to_string(),
+                status: AgentStatus::Stopped,
+            });
+        }
         if let Some(done_tx) = self.done_tx.take() {
             let _ = done_tx.send(true);
         }
@@ -655,7 +663,7 @@ impl Drop for RunEndAnnouncer {
 /// (or put back). Without it the run would read as gone while its process is
 /// still shutting down.
 struct StoppingMark {
-    ending: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    ending: Arc<std::sync::Mutex<HashMap<Uuid, Option<Uuid>>>>,
     task_id: Uuid,
 }
 
@@ -680,7 +688,7 @@ pub struct TaskExecutor {
     running_handles: Arc<RwLock<HashMap<Uuid, RunningTask>>>,
     reviewing_handles: Arc<RwLock<HashMap<Uuid, ReviewOwner>>>,
     /// Tasks whose run is being ended right now; see [`StoppingMark`].
-    ending_runs: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    ending_runs: Arc<std::sync::Mutex<HashMap<Uuid, Option<Uuid>>>>,
     /// PR-helper Claude invocations (`commands::pr::run_claude_pr_helper`)
     /// currently claiming a task. See [`PrHelperOwner`]/[`PrHelperLease`] for
     /// why this is a blocking `std::sync::Mutex` rather than the `tokio::
@@ -910,7 +918,7 @@ impl TaskExecutor {
             executions: config.executions,
             running_handles: Arc::new(RwLock::new(HashMap::new())),
             reviewing_handles: Arc::new(RwLock::new(HashMap::new())),
-            ending_runs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            ending_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pr_helper_handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
             admission: Admission::new(initial_limit),
             reserved_permits: Arc::new(RwLock::new(HashMap::new())),
@@ -1032,8 +1040,12 @@ impl TaskExecutor {
                 task_ids.insert(*task_id);
             }
         }
-        for task_id in self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).iter() {
-            task_ids.insert(*task_id);
+        for (task_id, execution_id) in self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            if let Some(execution_id) = execution_id {
+                execution_ids.insert(*execution_id);
+            } else {
+                task_ids.insert(*task_id);
+            }
         }
         for (task_id, owner) in self.pr_helper_handles.lock().unwrap().iter() {
             if owner.kind == PrOwnerKind::Helper {
@@ -2642,7 +2654,7 @@ impl TaskExecutor {
             let mut handles = self.running_handles.write().await;
             let owner = handles.remove(&task_id);
             if owner.is_some() {
-                mark = Some(self.mark_ending(task_id));
+                mark = Some(self.mark_ending(task_id, owner.as_ref().and_then(|run| run.execution_id)));
             }
             owner
         };
@@ -2693,7 +2705,7 @@ impl TaskExecutor {
             let mut handles = self.reviewing_handles.write().await;
             let owner = handles.remove(&task_id);
             if owner.is_some() {
-                mark = Some(self.mark_ending(task_id));
+                mark = Some(self.mark_ending(task_id, None));
             }
             owner
         };
@@ -2841,13 +2853,21 @@ impl TaskExecutor {
                 kind,
             },
         );
+        if kind == PrOwnerKind::Helper {
+            self.events.agent_event(AgentEvent::RunState {
+                task_id: task_id.to_string(),
+                status: AgentStatus::Running,
+            });
+        }
 
         PrHelperLease {
             task_id,
+            kind,
             cancel_rx,
             done_tx: Some(done_tx),
             _permit: permit,
             handles: self.pr_helper_handles.clone(),
+            events: self.events.clone(),
         }
     }
 
@@ -2871,12 +2891,18 @@ impl TaskExecutor {
         let entry = {
             let map = self.pr_helper_handles.lock().unwrap();
             map.get(&task_id)
-                .map(|o| (o.cancel.clone(), o.done.clone()))
+                .map(|o| (o.cancel.clone(), o.done.clone(), o.kind))
         };
-        let Some((cancel, mut done)) = entry else {
+        let Some((cancel, mut done, kind)) = entry else {
             return Ok(false);
         };
         let _ = cancel.send(true);
+        if kind == PrOwnerKind::Helper {
+            self.events.agent_event(AgentEvent::RunState {
+                task_id: task_id.to_string(),
+                status: AgentStatus::Stopping,
+            });
+        }
         if *done.borrow() {
             return Ok(true);
         }
@@ -3733,7 +3759,7 @@ impl TaskExecutor {
                 .iter()
                 .filter_map(|(task_id, owner)| (owner.kind == PrOwnerKind::Helper).then_some(*task_id)),
         );
-        ids.extend(self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).iter().copied());
+        ids.extend(self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).keys().copied());
         ids.sort();
         ids.dedup();
 
@@ -3754,12 +3780,10 @@ impl TaskExecutor {
     /// review flow. A persisted task status never contributes, and neither
     /// does an execution record that is no longer backed by a handle.
     async fn owned_run_status(&self, task_id: Uuid) -> Option<AgentStatus> {
-        // Read in this order, and written in the opposite one by
-        // `end_task_owners_under_lease`, so a run being ended is never
-        // missed in the gap between leaving the map and being marked.
-        if self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).contains(&task_id) {
-            return Some(AgentStatus::Stopping);
-        }
+        // Read the owner maps before the stopping mark. The end path removes
+        // an owner and inserts that mark while holding the map's write lock;
+        // checking the map first means a reader that had to wait for that
+        // lock sees the mark after the removal, rather than missing both.
         let execution_id = self
             .running_handles
             .read()
@@ -3789,6 +3813,9 @@ impl TaskExecutor {
         if reviewing {
             return Some(AgentStatus::Running);
         }
+        if self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&task_id) {
+            return Some(AgentStatus::Stopping);
+        }
 
         // A PR helper is a command-owned provider flow rather than an
         // executor-spawned JoinHandle. Its lease is the executor's ownership
@@ -3810,8 +3837,11 @@ impl TaskExecutor {
     }
 
     /// Mark `task_id`'s run as being ended; see [`StoppingMark`].
-    fn mark_ending(&self, task_id: Uuid) -> StoppingMark {
-        self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).insert(task_id);
+    fn mark_ending(&self, task_id: Uuid, execution_id: Option<Uuid>) -> StoppingMark {
+        self.ending_runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(task_id, execution_id);
         StoppingMark { ending: self.ending_runs.clone(), task_id }
     }
 
@@ -10406,7 +10436,8 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
 
         #[tokio::test]
         async fn a_pr_helper_is_a_live_run_but_a_pr_side_effect_is_not() {
-            let (executor, _temps) = test_executor();
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let (executor, _temps) = test_executor_with_events(recording.clone());
             let helper_task = Uuid::new_v4();
             let helper = executor.try_begin_pr_helper(helper_task).await.expect("helper admission");
 
@@ -10418,13 +10449,64 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             assert!(execution_ids.is_empty());
             assert!(task_ids.contains(&helper_task));
 
+            assert_eq!(run_states(&recording, helper_task), vec![serde_json::json!("running")]);
+
+            let ending = {
+                let executor = executor.clone();
+                tokio::spawn(async move { executor.end_pr_helper_owner_under_lease(helper_task).await })
+            };
+            while !run_states(&recording, helper_task).contains(&serde_json::json!("stopping")) {
+                tokio::task::yield_now().await;
+            }
             drop(helper);
+            ending.await.unwrap().expect("helper stop succeeds");
+            assert_eq!(
+                run_states(&recording, helper_task),
+                vec![serde_json::json!("running"), serde_json::json!("stopping"), serde_json::json!("stopped")]
+            );
+
             let side_effect_task = Uuid::new_v4();
             let side_effect = executor.begin_republish_under_lease(side_effect_task).await.expect("side effect admission");
             assert!(executor.live_runs().await.is_empty());
             let (_execution_ids, task_ids) = executor.active_agent_owners().await;
             assert!(!task_ids.contains(&side_effect_task));
             drop(side_effect);
+        }
+
+        #[tokio::test]
+        async fn active_agent_count_covers_pre_record_and_stopping_execution_windows_once() {
+            let (executor, _temps) = test_executor();
+            let task_id = Uuid::new_v4();
+            let execution_id = Uuid::new_v4();
+            let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+            let handle = tokio::spawn(async move {
+                let _ = cancelled.changed().await;
+            });
+            executor.running_handles.write().await.insert(
+                task_id,
+                RunningTask { handle, cancel, execution_id: Some(execution_id) },
+            );
+
+            assert_eq!(
+                crate::commands::agent::active_agent_count(&executor.executions, Some(&executor)).await,
+                1,
+                "a registered coding owner counts before its execution record exists"
+            );
+
+            let owner = executor.running_handles.write().await.remove(&task_id).unwrap();
+            let mark = executor.mark_ending(task_id, owner.execution_id);
+            let mut execution = execution_for(task_id, chrono::Utc::now(), false);
+            execution.id = execution_id;
+            executor.executions.write().await.insert(execution_id, execution);
+            assert_eq!(
+                crate::commands::agent::active_agent_count(&executor.executions, Some(&executor)).await,
+                1,
+                "a stopping coding owner is not double-counted through its legacy record"
+            );
+
+            drop(mark);
+            owner.cancel.send(true).unwrap();
+            owner.handle.await.unwrap();
         }
 
         #[tokio::test]

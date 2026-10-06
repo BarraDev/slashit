@@ -50,7 +50,7 @@ pub fn TaskCard(
     };
 
     view! {
-        <div data-testid="task-card" class=card_class()>
+        <div data-testid="task-card" class=card_class>
             // Running indicator (subtle glow bar at top)
             {move || badge().map(|_| view! {
                 <div class="absolute top-0 left-2 right-2 h-0.5 bg-gradient-to-r from-blue-500 via-blue-400 to-blue-500 rounded-full animate-pulse"></div>
@@ -450,4 +450,3 @@ fn CompactPhaseIndicator(phase: TaskPhase) -> impl IntoView {
         </div>
     }
 }
-
