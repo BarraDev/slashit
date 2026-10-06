@@ -916,7 +916,8 @@ pub async fn triage_pr_comments(
 /// recorded ([`PrReviewPlan::fixed_content`]): the state is carried only when
 /// the freshly fetched text has that fingerprint, however the edit's time
 /// compares with the apply's. `fix_uncommitted` describes the checkout, not
-/// the comment, and is always carried.
+/// the comment, and is always carried; the commit carrying the fix
+/// (`fix_commit`) is carried with `fix_done`.
 ///
 /// A fix recorded before fingerprints existed has none to compare. For it the
 /// prior plan's own copy of the comment is the best evidence of the text the
@@ -1006,6 +1007,16 @@ fn carry_forward_reanalysis_lifecycle(
         }
 
         if prev_item.fix_done { item.fix_done = true; }
+        // The commit holds the fix made from that text, so it follows
+        // `fix_done` and stays behind with an edited comment: the new wording
+        // needs its own fix and its own commit (#96 is independent of #109,
+        // and neither answers the other's question).
+        if prev_item.fix_done && item.fix_commit.is_none() {
+            item.fix_commit = prev_item.fix_commit.clone();
+        }
+        if prev_item.fix_done && item.fix_effect.is_none() {
+            item.fix_effect = prev_item.fix_effect.clone();
+        }
         if prev_item.reply_posted { item.reply_posted = true; }
         if item.last_error.is_none() { item.last_error = prev_item.last_error.clone(); }
         if item.last_agent_summary.is_none() { item.last_agent_summary = prev_item.last_agent_summary.clone(); }
@@ -1251,6 +1262,24 @@ pub async fn address_pr_review_inner(
     // cloned so we don't hold a borrow across the async agent call.
     let mut updated_plan = plan;
 
+    // A fix with no commit recorded and no change left waiting for one
+    // (`PrReviewItem::fix_has_no_provenance`) cannot be tied to any commit,
+    // so nothing can prove it reached the pull request (#96). That is a fix
+    // saved by a build from before commits were recorded, one whose agent
+    // changed nothing, and one whose change was found missing from the commit
+    // that took the checkout. Its reply was never posted, so it is made again,
+    // once per Apply, never on load or backfill: the new fix is committed and
+    // recorded like any other, and a reply waits for that commit to be on the
+    // remote.
+    if !options.dry_run {
+        for &idx in &approved_indices {
+            let item = &mut updated_plan.items[idx];
+            if item.fix_has_no_provenance() && !item.reply_posted {
+                item.fix_done = false;
+            }
+        }
+    }
+
     let mut per_item_summaries: Vec<String> = Vec::with_capacity(total);
     let mut fixed_ids: Vec<u64> = Vec::new();
     let mut failed_ids: Vec<u64> = Vec::new();
@@ -1349,7 +1378,23 @@ pub async fn address_pr_review_inner(
         if !item.fix_done {
             let single = vec![&item];
             let prompt = build_review_fix_prompt(&task, &pr_url, &updated_plan.comments, &single, false);
-            match run_claude_pr_helper(prompt, working_dir.clone(), true, cancel_rx.clone()).await {
+            // What the checkout held before and after this agent ran: the
+            // item's own effect, which a later commit must be shown to hold
+            // before it counts as carrying the fix (#96). No change, or a
+            // checkout that cannot be inspected, leaves no effect to prove;
+            // the agent's own outcome is not second-guessed.
+            let before = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
+            let mut effect: Option<crate::domain::task::FixEffect> = None;
+            let outcome = run_claude_pr_helper(prompt, working_dir.clone(), true, cancel_rx.clone()).await;
+            if outcome.is_ok() {
+                let after = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
+                if let (Ok(before_tree), Ok(after_tree)) = (before, after) {
+                    if before_tree != after_tree {
+                        effect = Some(crate::domain::task::FixEffect { before_tree, after_tree });
+                    }
+                }
+            }
+            match outcome {
                 Ok(summary) => {
                     if let Some(id) = item.comment_id { fixed_ids.push(id); }
                     let reply_text = extract_pr_reply(&summary);
@@ -1357,6 +1402,8 @@ pub async fn address_pr_review_inner(
                         let p = &mut updated_plan.items[orig_idx];
                         p.fix_done = true;
                         p.fix_uncommitted = true;
+                        p.fix_commit = None;
+                        p.fix_effect = effect.take();
                         p.last_agent_summary = Some(summary.clone());
                         if reply_text.is_some() {
                             p.pr_reply_text = reply_text;
@@ -1429,7 +1476,7 @@ pub async fn address_pr_review_inner(
         }
     }
 
-    let agent_summary = per_item_summaries.join("\n\n---\n\n");
+    let mut agent_summary = per_item_summaries.join("\n\n---\n\n");
 
     let mut pushed = false;
     let mut push_branch_name: Option<String> = None;
@@ -1443,22 +1490,40 @@ pub async fn address_pr_review_inner(
     // has begun is waited on, bounded, like every other owner-ending path.
     let cancelled = *cancel_rx.borrow();
 
-    // The approved fixes not yet delivered (`fix_uncommitted`): the ones this
-    // apply made, and any an earlier apply made whose commit or push failed,
-    // was cancelled, or was withheld. Those an earlier apply already
-    // committed are recommitted as nothing new, and only pushed; fixes
-    // already delivered are not among them, and nothing is committed or
-    // pushed when this set is empty. The replies note counts only the posted
-    // replies of these.
-    let uncommitted: Vec<usize> = updated_plan.items.iter().enumerate()
-        .filter(|(_, i)| {
-            i.approved && matches!(i.decision, PrReviewDecision::Fix) && i.fix_done && i.fix_uncommitted
-        })
+    // The approved fixes still owing something. `owed_a_commit` are the ones
+    // whose edits no commit holds yet: the ones this apply made, and any an
+    // earlier apply made whose commit was withheld, failed or cancelled.
+    // `owed_a_push` are the ones a commit already holds (`fix_commit`) that
+    // were not seen on the remote: an earlier apply's commit whose push
+    // failed, was cancelled or was switched off. Both sets are replayed
+    // without running their fix agents again, and a fix whose commit the
+    // remote already holds is in neither. The replies note counts only the
+    // posted replies of these.
+    // What `origin` holds now decides what is still owed a push: a commit a
+    // force-push dropped is owed again, and one it already holds is not.
+    if !options.dry_run && !cancelled {
+        settle_delivery(&working_dir, &task, &mut updated_plan).await;
+    }
+    let approved_fix = |i: &PrReviewItem| {
+        i.approved && matches!(i.decision, PrReviewDecision::Fix) && i.fix_done && i.fix_uncommitted
+    };
+    let owed_a_commit: Vec<usize> = updated_plan.items.iter().enumerate()
+        .filter(|(_, i)| approved_fix(i) && i.fix_commit.is_none() && i.fix_effect.is_some())
         .map(|(idx, _)| idx)
         .collect();
+    let owed_a_push = |plan: &PrReviewPlan| -> Vec<usize> {
+        plan.items.iter().enumerate()
+            .filter(|(_, i)| approved_fix(i) && i.fix_commit.is_some())
+            .map(|(idx, _)| idx)
+            .collect()
+    };
     let unpushed_replies_note = unpushed_replies_note(
-        uncommitted.iter().filter(|&&idx| updated_plan.items[idx].reply_posted).count(),
+        owed_a_commit.iter().chain(owed_a_push(&updated_plan).iter())
+            .filter(|&&idx| updated_plan.items[idx].reply_posted)
+            .count(),
     );
+    let uncommitted = &owed_a_commit;
+    let anything_owed = !uncommitted.is_empty() || !owed_a_push(&updated_plan).is_empty();
 
     // Committing stages the whole checkout, and a fix agent that failed may
     // have left edits anywhere in it, so after a failure no fix is committed
@@ -1488,7 +1553,7 @@ pub async fn address_pr_review_inner(
             message: Some(error.clone()),
         });
         push_error = Some(error);
-    } else if cancelled && !options.dry_run && !uncommitted.is_empty() {
+    } else if cancelled && !options.dry_run && anything_owed {
         push_error = Some(format!(
             "the task was changed while these fixes were being applied, so they were not \
              committed or pushed; apply again to commit and push them.{unpushed_replies_note}"
@@ -1496,35 +1561,100 @@ pub async fn address_pr_review_inner(
     }
 
     // Also on an apply that made no new fix, when an earlier one left fixes
-    // uncommitted: applying again commits and pushes them without running
-    // their fix agents again.
-    if !options.dry_run && !uncommitted.is_empty() && !cancelled && !withheld {
-        // A real Git commit on the task branch, whether or not jj is
-        // installed: see `crate::worktree::commit_checkout`. A branch that
-        // does not hold the fixes is never pushed.
-        let message = format!(
-            "task: {} (PR review fixes: {} of {})",
-            task.title, uncommitted.len(), total,
-        );
-        let committed = match &task.branch_name {
-            Some(branch) => crate::worktree::commit_checkout(&working_dir, branch, &message).await,
-            None => Err("this task records no branch".to_string()),
-        };
-        let commit_failure = |e: String| {
-            format!(
-                "the review fixes could not be committed, so nothing was pushed: {e}. They remain \
-                 as uncommitted edits in the task checkout; once that is resolved, apply again to \
-                 commit and push them.{unpushed_replies_note}"
-            )
-        };
-        let committed_ok = committed.is_ok();
-        let needs_push = match committed {
-            Ok(crate::worktree::CheckoutCommit::Committed { .. }) => true,
-            Ok(crate::worktree::CheckoutCommit::NothingToCommit) => {
-                task_branch_is_ahead_of_origin(&working_dir, task.branch_name.as_deref()).await
-            }
-            Err(e) => {
-                let error = commit_failure(e);
+    // uncommitted or unpushed: applying again commits and pushes them without
+    // running their fix agents again.
+    if !options.dry_run && anything_owed && !cancelled && !withheld {
+        let mut committed_ok = true;
+        if !uncommitted.is_empty() {
+            // A real Git commit on the task branch, whether or not jj is
+            // installed: see `crate::worktree::commit_checkout`. A branch that
+            // does not hold the fixes is never pushed.
+            let message = format!(
+                "task: {} (PR review fixes: {} of {})",
+                task.title, uncommitted.len(), total,
+            );
+            let committed = match &task.branch_name {
+                Some(branch) => crate::worktree::commit_checkout(&working_dir, branch, &message).await,
+                None => Err("this task records no branch".to_string()),
+            };
+            let failure = match committed {
+                // Every fix owed a commit is in this one: the edits of each
+                // were made in this checkout since `fix_commit` was last
+                // empty, and this commit took the whole checkout.
+                Ok(crate::worktree::CheckoutCommit::Committed { commit }) => {
+                    // The commit took the whole checkout, so it carries an
+                    // item's fix only if that item's own effect (what its
+                    // agent changed) is still in it. Edits discarded or
+                    // overwritten since leave the item unproven, and a
+                    // fix that left no effect to check never is.
+                    for &idx in uncommitted {
+                        let item = &mut updated_plan.items[idx];
+                        use crate::worktree::delivery::{effect_survives_in, Survival};
+                        let verdict = match &item.fix_effect {
+                            Some(e) => {
+                                effect_survives_in(&working_dir, &e.before_tree, &e.after_tree, &commit).await
+                            }
+                            None => Survival::Absent,
+                        };
+                        match verdict {
+                            // Present, or Git could not be asked: the commit is
+                            // recorded with its effect, which is checked again
+                            // against the remote branch before any reply, so a
+                            // transient failure here loses nothing and claims
+                            // nothing.
+                            Survival::Present | Survival::Unknown => {
+                                item.fix_commit = Some(commit.clone());
+                            }
+                            // Weighed against the commit that took the
+                            // checkout and not there. An item left without a
+                            // commit has nothing more to wait for: it is
+                            // unproven, gets no reply, and a later Apply makes
+                            // the fix again.
+                            Survival::Absent => item.fix_effect = None,
+                        }
+                    }
+                    None
+                }
+                // Not proof of anything: the edits are gone from the
+                // checkout (discarded, or committed by hand under an ID this
+                // plan never saw), and a branch equal to its remote-tracking
+                // ref says nothing about them.
+                Ok(crate::worktree::CheckoutCommit::NothingToCommit) => {
+                    // The changes these fixes made are not in the checkout
+                    // any more (discarded, or committed outside this apply),
+                    // so no commit can carry them. That is not a failure of
+                    // anything else: commits already made are still pushed.
+                    for &idx in uncommitted {
+                        updated_plan.items[idx].fix_effect = None;
+                    }
+                    let note = format!(
+                        "the changes made by some review fixes are no longer in the task checkout, \
+                         so no commit carries them and they get no reply; a later apply makes \
+                         them again.{unpushed_replies_note}"
+                    );
+                    // Informational only: not a push error (nothing failed,
+                    // and a push error would hide the delivery status and
+                    // colour the summary as a failure). It travels with the
+                    // apply's summary and its progress.
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "nothing_to_commit".to_string(),
+                        current: None,
+                        total: None,
+                        comment_id: None,
+                        message: Some(note.clone()),
+                    });
+                    agent_summary.push_str(&format!("\n\n---\n\nNote: {note}\n"));
+                    None
+                }
+                Err(e) => Some(format!(
+                    "the review fixes could not be committed, so nothing was pushed: {e}. They \
+                     remain as uncommitted edits in the task checkout; once that is resolved, \
+                     apply again to commit and push them.{unpushed_replies_note}"
+                )),
+            };
+            if let Some(error) = failure {
+                committed_ok = false;
                 progress(PrReviewProgress {
                     task_id: task_id_str.clone(),
                     kind: "commit_failed".to_string(),
@@ -1534,11 +1664,13 @@ pub async fn address_pr_review_inner(
                     message: Some(error.clone()),
                 });
                 push_error = Some(error);
-                false
             }
-        };
+        }
 
-        if needs_push && options.auto_push {
+        // The fixes a commit now holds are owed a push, those of this apply
+        // and those of an earlier one alike.
+        let to_push = owed_a_push(&updated_plan);
+        if committed_ok && !to_push.is_empty() && options.auto_push {
             progress(PrReviewProgress {
                 task_id: task_id_str.clone(),
                 kind: "push_started".to_string(),
@@ -1576,81 +1708,82 @@ pub async fn address_pr_review_inner(
                 }
             }
         }
-
-        // A fix only counts as delivered -- safe to reply "fixed" about --
-        // once it is committed and, if this apply needed to push it, the
-        // push succeeded. `needs_push` is false when the commit found
-        // nothing new and the branch is where `origin` was last seen: the
-        // fixes are already on `origin`. See #79: a reply
-        // must never precede the content it describes reaching the remote
-        // the pull request reads.
-        if committed_ok && (!needs_push || pushed) {
-            for &idx in &uncommitted {
-                updated_plan.items[idx].fix_uncommitted = false;
-            }
-        }
     }
 
     // --- Reply delivery pass ----------------------------------------------
     //
-    // Runs once, after every commit and push this apply is going to attempt
-    // has already resolved, over every approved item -- not just the ones
-    // this apply fixed -- so it also posts the reply an earlier apply left
-    // owing once its fix is finally delivered. `reply_posted` makes it
-    // idempotent across applies; `fix_uncommitted` is what makes it
-    // truthful: an item stays excluded for as long as its fix sits only in
-    // this apply's failed or withheld commit, or an earlier apply's, and is
-    // picked up the first time a later apply actually delivers it. Disabled
-    // for a dry run (no real side effects) and when this flow was cancelled
-    // before its commit (the same `cancelled` the commit and push above
-    // follow). Because an item still owing delivery is not in
-    // `reply_errors`, `backfill_lifecycle_from_last_apply` must not read
-    // its absence there as a posted reply; it skips `fix_uncommitted` items.
-    if options.auto_reply && !options.dry_run && !cancelled {
-        for (loop_idx, &orig_idx) in approved_indices.iter().enumerate() {
-            let item = updated_plan.items[orig_idx].clone();
-            if item.reply_posted || !item.fix_done || item.fix_uncommitted {
-                continue;
+    // A fix is delivered, and its reply may say so, only when the commit that
+    // carries it is contained in the pull request's branch on `origin` as
+    // `origin` reports it now. That is decided once for the whole pass by
+    // [`settle_delivery`], the rule Sync replies uses too. Neither a push
+    // that succeeded, a clean checkout, nothing left to commit nor a branch
+    // that is not ahead of its tracking ref is evidence of it (#96). The pass
+    // runs once, after every commit and push this apply is going to attempt
+    // has resolved, over every approved item -- not just the ones this apply
+    // fixed -- so it also posts the reply an earlier apply left owing once its
+    // fix is finally on the remote. `reply_posted` makes it idempotent across
+    // applies. Disabled for a dry run (no real side effects) and when this
+    // flow was cancelled before its commit (the same `cancelled` the commit
+    // and push above follow). Because an item still owing delivery is not in
+    // `reply_errors`, `backfill_lifecycle_from_last_apply` must not read its
+    // absence there as a posted reply; it skips every item with a recorded
+    // commit or an undelivered fix.
+    if !options.dry_run && !cancelled {
+        let delivered = settle_delivery(&working_dir, &task, &mut updated_plan).await;
+        if let Some(why) = delivered.unavailable.as_ref() {
+            if push_error.is_none() && delivered.owed_delivery > 0 {
+                push_error = Some(format!(
+                    "whether the fixes reached the pull request's branch could not be confirmed, \
+                     so no reply says they are fixed: {why}"
+                ));
             }
-            let current = loop_idx + 1;
-            let label = item.comment_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "<none>".to_string());
-            let body = build_reply_body(&item);
-            progress(PrReviewProgress {
-                task_id: task_id_str.clone(),
-                kind: "reply_started".to_string(),
-                current: Some(current),
-                total: Some(total),
-                comment_id: item.comment_id,
-                message: None,
-            });
-            match post_pr_reply(&reply_repo, &reply_number, item.comment_id, &body).await {
-                Ok(reply_id) => {
-                    replies_posted += 1;
-                    updated_plan.items[orig_idx].reply_posted = true;
-                    if reply_id.is_some() {
-                        updated_plan.items[orig_idx].reply_comment_id = reply_id;
-                    }
-                    progress(PrReviewProgress {
-                        task_id: task_id_str.clone(),
-                        kind: "reply_done".to_string(),
-                        current: Some(current),
-                        total: Some(total),
-                        comment_id: item.comment_id,
-                        message: None,
-                    });
+        }
+        if options.auto_reply {
+            for (loop_idx, &orig_idx) in approved_indices.iter().enumerate() {
+                let item = updated_plan.items[orig_idx].clone();
+                if item.reply_posted || !delivered.indices.contains(&orig_idx) {
+                    continue;
                 }
-                Err(e) => {
-                    reply_errors.push(format!("comment {}: {}", label, e));
-                    progress(PrReviewProgress {
-                        task_id: task_id_str.clone(),
-                        kind: "reply_failed".to_string(),
-                        current: Some(current),
-                        total: Some(total),
-                        comment_id: item.comment_id,
-                        message: Some(e),
-                    });
+                let current = loop_idx + 1;
+                let label = item.comment_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "<none>".to_string());
+                let body = build_reply_body(&item);
+                progress(PrReviewProgress {
+                    task_id: task_id_str.clone(),
+                    kind: "reply_started".to_string(),
+                    current: Some(current),
+                    total: Some(total),
+                    comment_id: item.comment_id,
+                    message: None,
+                });
+                match post_pr_reply(&reply_repo, &reply_number, item.comment_id, &body).await {
+                    Ok(reply_id) => {
+                        replies_posted += 1;
+                        updated_plan.items[orig_idx].reply_posted = true;
+                        if reply_id.is_some() {
+                            updated_plan.items[orig_idx].reply_comment_id = reply_id;
+                        }
+                        progress(PrReviewProgress {
+                            task_id: task_id_str.clone(),
+                            kind: "reply_done".to_string(),
+                            current: Some(current),
+                            total: Some(total),
+                            comment_id: item.comment_id,
+                            message: None,
+                        });
+                    }
+                    Err(e) => {
+                        reply_errors.push(format!("comment {}: {}", label, e));
+                        progress(PrReviewProgress {
+                            task_id: task_id_str.clone(),
+                            kind: "reply_failed".to_string(),
+                            current: Some(current),
+                            total: Some(total),
+                            comment_id: item.comment_id,
+                            message: Some(e),
+                        });
+                    }
                 }
             }
         }
@@ -1715,18 +1848,158 @@ fn unpushed_replies_note(replies: usize) -> String {
     }
 }
 
-/// Whether the task branch in `working_dir` has commits `origin` has not
-/// been seen to have: its remote-tracking branch is missing or elsewhere.
-/// Unknown counts as ahead, which costs at most a push with nothing new.
-async fn task_branch_is_ahead_of_origin(working_dir: &str, branch: Option<&str>) -> bool {
+/// The approved fixes of a plan whose delivery has been settled against the
+/// pull request's remote branch.
+struct SettledDelivery {
+    /// The plan indices of the fixes whose commit `origin` holds now: the only
+    /// ones a reply may call fixed.
+    indices: std::collections::HashSet<usize>,
+    /// How many approved fixes were made and not proven delivered.
+    owed_delivery: u32,
+    /// Why the remote could not be asked, if it could not.
+    unavailable: Option<String>,
+}
+
+/// Whether the local task branch can no longer reach `commit`, so pushing the
+/// branch can never put it on the remote. Any doubt answers `false`.
+async fn commit_is_unreachable_locally(working_dir: &str, branch: Option<&str>, commit: &str) -> bool {
+    use crate::worktree::restack;
     let Some(branch) = branch else { return false };
     let dir = std::path::Path::new(working_dir);
-    let local = crate::worktree::restack::exact_ref(dir, &format!("refs/heads/{branch}")).await;
-    let tracking = crate::worktree::restack::exact_ref(dir, &format!("refs/remotes/origin/{branch}")).await;
-    match (local, tracking) {
-        (Ok(Some(local)), Ok(Some(tracking))) => local != tracking,
-        _ => true,
+    let Ok(Some(local_tip)) = restack::exact_ref(dir, &format!("refs/heads/{branch}")).await else {
+        return false;
+    };
+    match restack::has_commit(dir, commit).await {
+        Ok(false) => true,
+        Ok(true) => matches!(restack::is_ancestor(dir, commit, &local_tip).await, Ok(false)),
+        Err(_) => false,
     }
+}
+
+/// The one rule deciding whether a review item's fix reached the pull
+/// request, shared by Apply's reply pass and Sync replies so the two cannot
+/// disagree (#96).
+///
+/// A fix is delivered when it is done, a commit is recorded as carrying it
+/// (`fix_commit`), that exact commit is contained in `origin`'s branch for
+/// the pull request, and the item's recorded effect (`fix_effect`) is still
+/// provably in that branch's tip. The branch is refreshed here, once, by the
+/// user's own command. A commit with another ID but the same changes is not
+/// that commit, and a later commit that reverted or overwrote the change
+/// leaves the old commit an ancestor without leaving the fix there. Nothing
+/// else counts: not `fix_uncommitted` being clear, a clean checkout, nothing
+/// to commit, a branch that is not ahead of its tracking ref, or an earlier
+/// push succeeding. A plan saved before commits were recorded has none, so its
+/// fixes are never delivered by this rule.
+///
+/// The plan's `fix_uncommitted` is updated to match what was seen: cleared for
+/// a fix whose commit the remote holds, and set again for one it no longer
+/// holds (a force-push that dropped it). Neither change is read back as
+/// proof.
+async fn settle_delivery(
+    working_dir: &str,
+    task: &Task,
+    plan: &mut PrReviewPlan,
+) -> SettledDelivery {
+    let branch = task.branch_name.as_deref();
+    let candidates: Vec<usize> = plan.items.iter().enumerate()
+        .filter(|(_, i)| {
+            i.approved && matches!(i.decision, PrReviewDecision::Fix) && i.fix_done
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    let with_commit = candidates.iter()
+        .filter(|&&idx| plan.items[idx].fix_commit.is_some())
+        .count();
+    let owing = |plan: &PrReviewPlan, delivered: &std::collections::HashSet<usize>| {
+        candidates.iter()
+            .filter(|&&idx| !delivered.contains(&idx) && !plan.items[idx].reply_posted)
+            .count() as u32
+    };
+    let mut settled = SettledDelivery {
+        indices: Default::default(),
+        owed_delivery: owing(plan, &Default::default()),
+        unavailable: None,
+    };
+    if with_commit == 0 {
+        return settled;
+    }
+    // Containment in `origin/<branch>` speaks for the pull request only if
+    // the recorded pull request is still this repository's pull request whose
+    // head is that branch. Do not trust stale or imported task metadata: a
+    // different PR may name a different head while the task branch still
+    // contains the fix.
+    let (Some(branch), Some(pr_url)) = (branch, task.pr_url.as_deref()) else {
+        settled.unavailable = Some(
+            "the pull request is not recorded as this task branch's own, so what the branch \
+             holds says nothing about it"
+                .to_string(),
+        );
+        return settled;
+    };
+    match own_pr_url_for_branch(working_dir, branch).await {
+        Ok(Some(head_url)) if head_url == pr_url => {}
+        Ok(_) => {
+            settled.unavailable = Some(
+                "the recorded pull request is not this repository's pull request for the task \
+                 branch, so the branch's contents say nothing about it"
+                    .to_string(),
+            );
+            return settled;
+        }
+        Err(error) => {
+            settled.unavailable = Some(format!(
+                "could not verify the recorded pull request's head branch: {error}"
+            ));
+            return settled;
+        }
+    }
+    let remote = crate::worktree::delivery::RemoteBranch::refresh(working_dir, Some(branch)).await;
+    settled.unavailable = remote.unavailable().map(str::to_string);
+    for &idx in &candidates {
+        let Some(commit) = plan.items[idx].fix_commit.clone() else { continue };
+        let on_remote = remote.contains(&commit).await;
+        // Holding the commit is not enough: a later commit on the branch
+        // may have reverted or overwritten the change. The item's recorded
+        // effect must still be provably in the branch as it is now.
+        use crate::worktree::delivery::Survival;
+        let verdict = match (on_remote, remote.tip(), plan.items[idx].fix_effect.clone()) {
+            (true, Some(tip), Some(e)) => {
+                crate::worktree::delivery::effect_survives_in(working_dir, &e.before_tree, &e.after_tree, tip).await
+            }
+            // No effect on record: nothing could ever prove it.
+            (true, _, None) => Survival::Absent,
+            _ => Survival::Unknown,
+        };
+        if on_remote && verdict == Survival::Present {
+            plan.items[idx].fix_uncommitted = false;
+            settled.indices.insert(idx);
+            continue;
+        }
+        plan.items[idx].fix_uncommitted = true;
+        if plan.items[idx].reply_posted {
+            continue;
+        }
+        // An item is left with a way out when its evidence can never prove
+        // anything: the branch has the commit and the change is gone from it,
+        // or the commit can never reach the remote because this repository's
+        // branch no longer contains it (amended, rebased away). The next
+        // Apply then makes the fix again. A verdict of `Unknown` (Git could
+        // not be asked) keeps everything: it says nothing.
+        let hopeless = if on_remote {
+            verdict == Survival::Absent
+        } else if remote.is_absent() || remote.unavailable().is_none() {
+            commit_is_unreachable_locally(working_dir, Some(branch), &commit).await
+        } else {
+            false
+        };
+        if hopeless {
+            plan.items[idx].fix_commit = None;
+            plan.items[idx].fix_effect = None;
+        }
+    }
+    settled.owed_delivery = owing(plan, &settled.indices);
+    settled
 }
 
 /// Result of `sync_pr_review_replies` — counts the three operations Sync can
@@ -1772,6 +2045,13 @@ pub async fn sync_pr_review_replies(
     task_id: String,
 ) -> Result<SyncPrRepliesResult, String> {
     let task_uuid = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    // The checkout when the task still has one; the repository otherwise,
+    // which holds the same remote-tracking refs and is only asked where the
+    // pull request's branch is, never to run work.
+    let working_dir = match resolve_task_workspace(&state.task.tasks, task_uuid).await {
+        Ok(dir) => dir,
+        Err(_) => resolve_repository_dir(&state, task_uuid).await?,
+    };
     let task = {
         let tasks = state.task.tasks.read().await;
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
@@ -1780,7 +2060,7 @@ pub async fn sync_pr_review_replies(
         .ok_or_else(|| "Task has no PR review plan to sync".to_string())?;
     plan.backfill_lifecycle_from_last_apply();
 
-    let (result, updated_plan) = sync_pr_review_replies_inner(task, plan).await?;
+    let (result, updated_plan) = sync_pr_review_replies_inner(task, working_dir, plan).await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
     Ok(result)
 }
@@ -1793,6 +2073,7 @@ pub async fn sync_pr_review_replies(
 /// with `reply_posted` flipped on whatever succeeded.
 pub async fn sync_pr_review_replies_inner(
     task: Task,
+    working_dir: String,
     plan: PrReviewPlan,
 ) -> Result<(SyncPrRepliesResult, PrReviewPlan), String> {
     let pr_url = pr_url_for_task(&task)?;
@@ -1812,13 +2093,18 @@ pub async fn sync_pr_review_replies_inner(
     let mut rewritten = 0u32;
     let mut unmatched = 0u32;
 
+    // The same rule Apply's reply pass uses, asked once for the whole plan.
+    let delivered = settle_delivery(&working_dir, &task, &mut updated_plan).await;
+
     for orig_idx in approved_indices {
         let item = updated_plan.items[orig_idx].clone();
-        // A fix that is not on disk yet, or is on disk but not yet
-        // committed and pushed, is not delivered to the pull request: a
-        // reply claiming it was fixed would be false (see #79). Both wait
-        // for Apply, not Sync.
-        if !item.fix_done || item.fix_uncommitted {
+        // A fix that is not on disk yet, or whose commit the pull request's
+        // branch does not hold, is not delivered: a reply claiming it was
+        // fixed would be false (see #79, #96). Both wait for Apply, not
+        // Sync, and Sync never resurrects a reply Apply withheld for the
+        // same reason. A reply already posted is only maintained below: it
+        // makes no new claim.
+        if !item.fix_done || (!item.reply_posted && !delivered.indices.contains(&orig_idx)) {
             fix_pending += 1;
             continue;
         }
@@ -2437,6 +2723,8 @@ fn parse_review_items(output: &str, batch: &[PrReviewComment]) -> Vec<PrReviewIt
             last_error: None,
             pr_reply_text: None,
             reply_comment_id: None,
+            fix_commit: None,
+            fix_effect: None,
         })
     }).collect()
 }
@@ -4285,6 +4573,21 @@ async fn list_existing_prs(working_dir: &str, branch: &str) -> Result<std::proce
         .map_err(|e| format!("Failed to run gh: {}", e))
 }
 
+/// The URL of this repository's pull request whose head is `branch`, if one
+/// exists. A same-named fork branch is ignored by [`own_branch_pr`]. The
+/// caller uses the result to bind delivery proof to the pull request recorded
+/// on the task, rather than to an unrelated local branch.
+async fn own_pr_url_for_branch(working_dir: &str, branch: &str) -> Result<Option<String>, String> {
+    let output = list_existing_prs(working_dir, branch).await?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    own_existing_pr_url(&output.stdout, branch)
+}
+
 /// The URL of `branch`'s own newest pull request in the output of
 /// [`list_existing_prs`]. A pull request from a fork's same-named branch is
 /// never taken for it; see [`own_branch_pr`].
@@ -6086,6 +6389,8 @@ mod tests {
             last_error: None,
             pr_reply_text: None,
             reply_comment_id: None,
+            fix_commit: None,
+            fix_effect: None,
         }
     }
 
@@ -12126,6 +12431,8 @@ mod tests {
                         last_error: None,
                         pr_reply_text: None,
                         reply_comment_id: None,
+                        fix_commit: None,
+                        fix_effect: None,
                     }],
                     raw_plan: "durable-marker-before-apply".to_string(),
                     last_apply: None,
@@ -12489,6 +12796,7 @@ mod tests {
                          \x20 printf '%s\\n' \"$$\" > {blocked:?}\n\
                          \x20 exec sleep 300\n\
                          fi\n\
+                         printf 'fixed\\n' > \"review-fix-$n.txt\"\n\
                          printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s-fixture\",\"result\":\"fixed it\"}}\\n'\n\
                          exit 0\n",
                         counter = counter,
@@ -12554,6 +12862,8 @@ mod tests {
                     last_error: None,
                     pr_reply_text: None,
                     reply_comment_id: None,
+                    fix_commit: None,
+                    fix_effect: None,
                 }
             }
 
@@ -12656,11 +12966,22 @@ mod tests {
             struct EditingClaude {
                 _tmp: tempfile::TempDir,
                 runs: PathBuf,
+                gh: PathBuf,
                 saved_path: Option<String>,
             }
 
             impl EditingClaude {
                 fn install(before_fix: &str) -> Self {
+                    Self::install_editing(before_fix, true)
+                }
+
+                /// A fix agent that reports success without changing a file.
+                fn install_changing_nothing() -> Self {
+                    Self::install_editing("", false)
+                }
+
+                fn install_editing(before_fix: &str, edits: bool) -> Self {
+                    let edit = if edits { "printf 'fixed\\n' > \"review-fix-$n.txt\"" } else { ":" };
                     let tmp = tempfile::tempdir().expect("tempdir");
                     let bin_dir = tmp.path().join("bin");
                     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -12673,13 +12994,17 @@ mod tests {
                          n=$((n + 1))\n\
                          printf '%s\\n' \"$n\" > {runs:?}\n\
                          {before_fix}\n\
-                         printf 'fixed\\n' > \"review-fix-$n.txt\"\n\
+                         {edit}\n\
                          printf '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s-fixture\",\"result\":\"fixed it\"}}\\n'\n\
                          exit 0\n",
                         runs = runs,
                     );
                     write_executable(&bin_dir.join("claude"), &claude);
-                    write_executable(&bin_dir.join("gh"), "#!/bin/sh\necho 4242\n");
+                    let gh = bin_dir.join("gh");
+                    write_executable(
+                        &gh,
+                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}]' ;;\n  *) echo 4242 ;;\nesac\n",
+                    );
                     let saved_path = std::env::var("PATH").ok();
                     let new_path = match &saved_path {
                         Some(p) => format!("{}:{}", bin_dir.display(), p),
@@ -12689,7 +13014,7 @@ mod tests {
                     unsafe {
                         std::env::set_var("PATH", new_path);
                     }
-                    EditingClaude { _tmp: tmp, runs, saved_path }
+                    EditingClaude { _tmp: tmp, runs, gh, saved_path }
                 }
 
                 /// How many times `claude` has run.
@@ -12698,6 +13023,16 @@ mod tests {
                         .ok()
                         .and_then(|n| n.trim().parse().ok())
                         .unwrap_or(0)
+                }
+
+                /// Make the forge report a different own PR for the task
+                /// branch, as stale task metadata or an imported association
+                /// could do in production.
+                fn set_pr_list_url(&self, url: &str) {
+                    let script = format!(
+                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"{url}\",\"isCrossRepository\":false}}]' ;;\n  *) echo 4242 ;;\nesac\n"
+                    );
+                    write_executable(&self.gh, &script);
                 }
             }
 
@@ -13442,7 +13777,7 @@ mod tests {
                 // Sync runs the same backfill as the real command first.
                 let mut for_sync = plan;
                 for_sync.backfill_lifecycle_from_last_apply();
-                let (synced, plan) = sync_pr_review_replies_inner(task.clone(), for_sync).await.unwrap();
+                let (synced, plan) = sync_pr_review_replies_inner(task.clone(), worktree.to_str().unwrap().to_string(), for_sync).await.unwrap();
                 assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
                 assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
 
@@ -13464,8 +13799,839 @@ mod tests {
 
                 let mut for_sync = plan;
                 for_sync.backfill_lifecycle_from_last_apply();
-                let (synced, _plan) = sync_pr_review_replies_inner(task.clone(), for_sync).await.unwrap();
+                let (synced, _plan) = sync_pr_review_replies_inner(task.clone(), worktree.to_str().unwrap().to_string(), for_sync).await.unwrap();
                 assert_eq!((synced.replied, synced.fix_pending), (0, 0), "no duplicate reply: {synced:?}");
+            }
+
+            /// #96 case 1, a plan persisted by a build that cleared
+            /// `fix_uncommitted` as soon as the commit succeeded: the fix is
+            /// committed locally, the push failed, no reply was posted.
+            /// Neither Apply nor Sync may now post "fixed" for it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_legacy_plan_whose_fix_was_committed_but_never_pushed_gets_no_fixed_reply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                reject_push(&repo);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, mut plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(!first.pushed, "{first:?}");
+                assert_eq!(repo.remote_has_branch("task-branch"), None, "the fix never reached the remote");
+                // The old build's persisted state: committed, marker cleared,
+                // no provenance of any kind.
+                plan.items[0].fix_uncommitted = false;
+                plan.last_apply = None;
+
+                let mut for_sync = plan.clone();
+                for_sync.backfill_lifecycle_from_last_apply();
+                let (synced, synced_plan) = sync_pr_review_replies_inner(task.clone(), worktree.to_str().unwrap().to_string(), for_sync).await.unwrap();
+                assert_eq!(synced.replied, 0, "Sync posted a fixed reply for an unpushed fix: {synced:?}");
+                assert!(!synced_plan.items[0].reply_posted, "{:?}", synced_plan.items[0]);
+
+                let (second, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                assert_eq!(second.replies_posted, 0, "Apply posted a fixed reply for an unpushed fix: {second:?}");
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+            }
+
+            /// #96 case 2: a fix's edits were discarded before any commit
+            /// held them. The next apply finds nothing to commit and a branch
+            /// equal to its `origin` tracking ref, which proves nothing.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_whose_edits_were_discarded_before_a_commit_gets_no_fixed_reply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                git(&worktree, &["push", "-q", "-u", "origin", "task-branch"]);
+                let hook = reject_commits(&repo);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert!(!first.pushed && first.replies_posted == 0, "{first:?}");
+                assert!(plan.items[0].fix_done && plan.items[0].fix_uncommitted);
+                // The edits vanish: cleanup after a failure, a recreated checkout.
+                git(&worktree, &["reset", "-q", "--hard"]);
+                git(&worktree, &["clean", "-fdq"]);
+                assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+                std::fs::remove_file(&hook).unwrap();
+
+                let (second, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert_eq!(second.replies_posted, 0, "a fix that exists nowhere was reported fixed: {second:?}");
+                assert_eq!(second.push_error, None, "nothing failed, so no push error: {second:?}");
+                assert!(second.failed_ids.is_empty() && second.fix_errors.is_empty(), "{second:?}");
+                assert!(
+                    second.agent_summary.contains("no longer in the task checkout"),
+                    "the outcome is explained in the summary: {}", second.agent_summary
+                );
+                assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
+                assert!(!remote_branch_has_file(&repo, "review-fix-1.txt"));
+
+                let (synced, _plan) = sync_pr_review_replies_inner(task, worktree.to_str().unwrap().to_string(), plan).await.unwrap();
+                assert_eq!(synced.replied, 0, "{synced:?}");
+            }
+
+            /// Sync replies with the same plan and checkout an apply would use.
+            async fn sync(
+                task: &Task,
+                worktree: &Path,
+                plan: PrReviewPlan,
+            ) -> (SyncPrRepliesResult, PrReviewPlan) {
+                sync_pr_review_replies_inner(task.clone(), worktree.to_str().unwrap().to_string(), plan)
+                    .await
+                    .expect("sync reports per item, not as a command error")
+            }
+
+            /// [`apply`] with pushing switched off.
+            async fn apply_without_push(
+                task: &Task,
+                mut plan: PrReviewPlan,
+                worktree: &Path,
+                jj: PathBuf,
+                auto_reply: bool,
+            ) -> (PrReviewApplyResult, PrReviewPlan) {
+                plan.backfill_lifecycle_from_last_apply();
+                let options = AddressPrReviewOptions { auto_push: false, auto_reply, dry_run: false };
+                let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                test_programs::scope(
+                    [("jj", jj)],
+                    address_pr_review_inner(
+                        task.clone(),
+                        worktree.to_str().unwrap().to_string(),
+                        plan,
+                        options,
+                        no_progress(),
+                        cancel_rx,
+                    ),
+                )
+                .await
+                .expect("the apply flow reports per step, not as a command error")
+            }
+
+            /// The plan as the board file stores it and reads it back after a
+            /// restart.
+            fn restarted(plan: &PrReviewPlan) -> PrReviewPlan {
+                serde_json::from_str(&serde_json::to_string(plan).unwrap()).unwrap()
+            }
+
+            /// A commit on `origin`'s task branch that is not the fix and does
+            /// not contain it: the base the fix was built on, plus a change.
+            fn push_an_unrelated_commit(worktree: &Path) -> String {
+                let base = git(worktree, &["rev-parse", "task-branch~1"]);
+                let tree = git(worktree, &["rev-parse", &format!("{base}^{{tree}}")]);
+                let unrelated = git(worktree, &["commit-tree", &tree, "-p", &base, "-m", "unrelated"]);
+                git(worktree, &["push", "-q", "--force", "origin", &format!("{unrelated}:refs/heads/task-branch")]);
+                unrelated
+            }
+
+            /// Committed and pushed: the item records the commit that carries
+            /// its fix, `origin` holds that exact commit, and the reply is
+            /// posted.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_pushed_fix_records_its_commit_and_is_replied_to() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (result, plan) = apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                assert!(result.pushed && result.replies_posted == 1, "{result:?}");
+                assert_eq!(plan.items[0].fix_commit.as_deref(), Some(tip.as_str()));
+                assert_eq!(repo.remote_has_branch("task-branch"), Some(tip));
+                assert!(plan.items[0].reply_posted && !plan.items[0].fix_uncommitted);
+            }
+
+            /// One commit carries several fixes: every item records that same
+            /// commit, and each is proven by it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn one_commit_carrying_several_fixes_proves_each_of_them() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (result, plan) =
+                    apply(&task, with_item(plan, 2), &worktree, tmp.path().join("no-such-jj"), true).await;
+
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                assert_eq!(result.replies_posted, 2, "{result:?}");
+                assert_eq!(git(&worktree, &["rev-list", "--count", "task-branch~1..task-branch"]), "1");
+                for item in &plan.items {
+                    assert_eq!(item.fix_commit.as_deref(), Some(tip.as_str()), "{item:?}");
+                    assert!(item.reply_posted && !item.fix_uncommitted, "{item:?}");
+                }
+            }
+
+            /// A fix agent that reports success without changing a file is
+            /// still a success, but it has no effect for a commit to carry:
+            /// a commit made for another item is not credited to it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_fix_without_an_effect_is_not_credited_with_another_items_commit() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                // The second run succeeds without editing anything.
+                let _claude = EditingClaude::install(
+                    "if [ \"$n\" -eq 2 ]; then printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"nothing to do\"}'; exit 0; fi",
+                );
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (result, plan) =
+                    apply(&task, with_item(plan, 2), &worktree, tmp.path().join("no-such-jj"), true).await;
+
+                assert_eq!(result.fixed_ids, vec![1, 2], "the agent's own outcome stands: {result:?}");
+                assert!(result.failed_ids.is_empty(), "{result:?}");
+                assert_eq!(result.replies_posted, 1, "{result:?}");
+                assert!(plan.items[0].fix_commit.is_some() && plan.items[0].reply_posted);
+                assert!(plan.items[1].fix_done && plan.items[1].fix_commit.is_none(), "{:?}", plan.items[1]);
+                assert!(!plan.items[1].reply_posted && plan.items[1].fix_uncommitted);
+            }
+
+            /// Two fix agents each add a different line to the same file
+            /// `notes.txt`; `edit_b` is run after B's agent to simulate later
+            /// changes before the commit.
+            async fn two_fixes_then(
+                a_edit: &str,
+                b_edit: &str,
+                between: impl FnOnce(&Path),
+            ) -> (PrReviewApplyResult, PrReviewPlan, String) {
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                std::fs::write(worktree.join("notes.txt"), "one\nkeep\nthree\nfour\nfive\nsix\nseven\neight\n").unwrap();
+                git(&worktree, &["add", "-A"]);
+                git(&worktree, &["commit", "-q", "-m", "notes"]);
+                git(&worktree, &["push", "-q", "-u", "origin", "task-branch"]);
+                let hook = reject_commits(&repo);
+                let _claude = EditingClaude::install(&format!(
+                    "if [ \"$n\" -eq 1 ]; then {a_edit}; else {b_edit}; fi"
+                ));
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                // The first apply makes both fixes and cannot commit them.
+                let (first, plan) = apply(&task, with_item(plan, 2), &worktree, no_jj.clone(), true).await;
+                assert!(first.replies_posted == 0 && !first.pushed, "{first:?}");
+                between(&worktree);
+                std::fs::remove_file(&hook).unwrap();
+                let events: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+                let sink: ProgressSink = {
+                    let events = events.clone();
+                    Arc::new(move |e: PrReviewProgress| events.lock().unwrap().push(e.kind))
+                };
+                let mut plan = plan;
+                plan.backfill_lifecycle_from_last_apply();
+                let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                let options = AddressPrReviewOptions { auto_push: true, auto_reply: true, dry_run: false };
+                let (second, plan) = test_programs::scope(
+                    [("jj", no_jj)],
+                    address_pr_review_inner(
+                        task.clone(),
+                        worktree.to_str().unwrap().to_string(),
+                        plan,
+                        options,
+                        sink,
+                        cancel_rx,
+                    ),
+                )
+                .await
+                .expect("the apply flow reports per step, not as a command error");
+                // Whatever an item's change turned out to be, no failure is
+                // reported for it and nothing about the commit or push is
+                // withheld.
+                let kinds = events.lock().unwrap().clone();
+                assert_eq!(second.push_error, None, "{second:?}");
+                for bad in ["commit_failed", "commit_withheld", "nothing_to_commit", "push_failed"] {
+                    assert!(!kinds.iter().any(|k| k == bad), "{bad} in {kinds:?}");
+                }
+                assert!(second.failed_ids.is_empty() && second.fix_errors.is_empty(), "{second:?}");
+                (second, plan, git(&worktree, &["rev-parse", "task-branch"]))
+            }
+
+            /// A) both effects survive into one commit: both point to it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn two_items_whose_effects_both_survive_both_point_to_the_commit() {
+                let _guard = PATH_LOCK.lock().await;
+                let (result, plan, tip) = two_fixes_then(
+                    "printf 'a-line\\n' > a.txt",
+                    "printf 'b-line\\n' > b.txt",
+                    |_| {},
+                )
+                .await;
+                assert_eq!(result.replies_posted, 2, "{result:?}");
+                for item in &plan.items {
+                    assert_eq!(item.fix_commit.as_deref(), Some(tip.as_str()), "{item:?}");
+                }
+            }
+
+            /// B) A survives, B's edits are discarded before the commit: only
+            /// A gets the commit, and B gets no reply.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_item_whose_edits_were_discarded_is_not_credited_with_the_commit() {
+                let _guard = PATH_LOCK.lock().await;
+                let (result, plan, tip) = two_fixes_then(
+                    "printf 'a-line\\n' > a.txt",
+                    "printf 'b-line\\n' > b.txt",
+                    |w| std::fs::remove_file(w.join("b.txt")).unwrap(),
+                )
+                .await;
+                assert_eq!(result.replies_posted, 1, "{result:?}");
+                assert_eq!(plan.items[0].fix_commit.as_deref(), Some(tip.as_str()));
+                assert!(plan.items[0].reply_posted);
+                assert_eq!(plan.items[1].fix_commit, None, "{:?}", plan.items[1]);
+                assert!(!plan.items[1].reply_posted && plan.items[1].fix_uncommitted);
+            }
+
+            /// C) two items change different lines of the same file and both
+            /// changes survive: both are proven, though the path is shared.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn two_items_editing_one_file_in_different_places_are_both_proven() {
+                let _guard = PATH_LOCK.lock().await;
+                let (result, plan, tip) = two_fixes_then(
+                    "sed -i 's/^one$/ONE/' notes.txt",
+                    "sed -i 's/^eight$/EIGHT/' notes.txt",
+                    |_| {},
+                )
+                .await;
+                assert_eq!(result.replies_posted, 2, "{result:?}");
+                for item in &plan.items {
+                    assert_eq!(item.fix_commit.as_deref(), Some(tip.as_str()), "{item:?}");
+                }
+            }
+
+            /// C') the same file, one item's change discarded: the other is
+            /// proven, the discarded one is not.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discarding_one_of_two_edits_to_a_shared_file_leaves_only_it_unproven() {
+                let _guard = PATH_LOCK.lock().await;
+                let (result, plan, _tip) = two_fixes_then(
+                    "sed -i 's/^one$/ONE/' notes.txt",
+                    "sed -i 's/^eight$/EIGHT/' notes.txt",
+                    |w| {
+                        let t = std::fs::read_to_string(w.join("notes.txt")).unwrap();
+                        std::fs::write(w.join("notes.txt"), t.replace("EIGHT", "eight")).unwrap();
+                    },
+                )
+                .await;
+                assert_eq!(result.replies_posted, 1, "{result:?}");
+                assert!(plan.items[0].fix_commit.is_some() && plan.items[1].fix_commit.is_none());
+            }
+
+            /// D) a later edit overwrites the line an earlier item changed:
+            /// that item's effect is gone, so it stays unproven.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_effect_overwritten_by_an_overlapping_edit_stays_unproven() {
+                let _guard = PATH_LOCK.lock().await;
+                let (result, plan, tip) = two_fixes_then(
+                    "sed -i 's/^keep$/from-a/' notes.txt",
+                    "sed -i 's/^from-a$/from-b/' notes.txt",
+                    |_| {},
+                )
+                .await;
+                assert_eq!(result.replies_posted, 1, "{result:?}");
+                assert_eq!(plan.items[0].fix_commit, None, "A's line no longer exists: {:?}", plan.items[0]);
+                assert_eq!(plan.items[1].fix_commit.as_deref(), Some(tip.as_str()));
+            }
+
+            /// An item left unproven (its change gone, or never made) is not a
+            /// failure and is not stuck: the next apply makes it again, and
+            /// meanwhile it blocks neither another item's commit nor its push.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_unproven_item_blocks_no_other_push_and_is_made_again_by_the_next_apply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_push(&repo);
+                // Every second run changes nothing.
+                let claude = EditingClaude::install(
+                    "if [ \"$n\" -eq 2 ]; then printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"nothing to do\"}'; exit 0; fi",
+                );
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                // Item 1 is committed, its push fails.
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert!(!first.pushed, "{first:?}");
+                std::fs::remove_file(hook).unwrap();
+
+                // Item 2's agent changes nothing; item 1's commit is still pushed.
+                let (second, plan) = apply(&task, with_item(plan, 2), &worktree, no_jj.clone(), true).await;
+                assert!(second.pushed, "{:?}", second.push_error);
+                assert_eq!(second.push_error, None);
+                assert!(second.failed_ids.is_empty(), "{second:?}");
+                assert_eq!(second.replies_posted, 1, "only item 1's reply: {second:?}");
+                assert!(plan.items[1].fix_commit.is_none() && !plan.items[1].reply_posted);
+
+                // Not stuck: the next apply runs item 2's agent again.
+                let runs = claude.runs();
+                let (third, _plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                assert_eq!(claude.runs(), runs + 1, "the unproven fix is made again");
+                assert_eq!(third.replies_posted, 1, "and delivered this time: {third:?}");
+            }
+
+            /// Deliver one fix (an edit to `notes.txt` and a new file) as commit
+            /// C1 without replying, let `c2` put a later commit on the remote
+            /// branch, then ask both Sync and Apply to reply. Returns what each
+            /// did, and each one's plan.
+            async fn delivered_then_c2(
+                c2: impl FnOnce(&Path, &str),
+            ) -> (usize, PrReviewPlan, usize, PrReviewPlan) {
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                std::fs::write(worktree.join("notes.txt"), "one\nkeep\nthree\nfour\nfive\nsix\nseven\neight\n").unwrap();
+                git(&worktree, &["add", "-A"]);
+                git(&worktree, &["commit", "-q", "-m", "notes"]);
+                git(&worktree, &["push", "-q", "-u", "origin", "task-branch"]);
+                let _claude = EditingClaude::install("sed -i 's/^one$/ONE/' notes.txt");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(first.pushed, "{:?}", first.push_error);
+                let c1 = git(&worktree, &["rev-parse", "task-branch"]);
+                assert_eq!(plan.items[0].fix_commit.as_deref(), Some(c1.as_str()));
+                assert!(plan.items[0].fix_effect.is_some(), "the effect is kept as evidence once delivered");
+
+                c2(&worktree, &c1);
+                git(&worktree, &["add", "-A"]);
+                git(&worktree, &["commit", "-q", "--allow-empty", "-m", "c2"]);
+                git(&worktree, &["push", "-q", "origin", "task-branch"]);
+
+                // The plan comes back from the board file after a restart.
+                let plan = restarted(&plan);
+                assert!(plan.items[0].fix_effect.is_some(), "the retained effect is persisted");
+                let (synced, _) = sync(&task, &worktree, plan.clone()).await;
+                let (_, synced_plan) = sync(&task, &worktree, plan.clone()).await;
+                let (applied, applied_plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                (synced.replied as usize, synced_plan, applied.replies_posted as usize, applied_plan)
+            }
+
+            /// C2 leaves C1's change alone: the old commit is still an ancestor
+            /// and its change is still in the branch, so the reply is allowed,
+            /// from Apply and from Sync alike.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_later_commit_that_keeps_the_effect_keeps_the_proof() {
+                let _guard = PATH_LOCK.lock().await;
+                for (label, c2) in [
+                    ("empty", Box::new(|_: &Path, _: &str| {}) as Box<dyn FnOnce(&Path, &str)>),
+                    ("unrelated file", Box::new(|w: &Path, _: &str| std::fs::write(w.join("other.txt"), "x\n").unwrap())),
+                    ("same file, other line", Box::new(|w: &Path, _: &str| {
+                        let t = std::fs::read_to_string(w.join("notes.txt")).unwrap();
+                        std::fs::write(w.join("notes.txt"), t.replace("eight", "EIGHT")).unwrap();
+                    })),
+                ] {
+                    let (synced, _, applied, plan) = delivered_then_c2(c2).await;
+                    assert_eq!((synced, applied), (1, 1), "{label}");
+                    assert!(plan.items[0].reply_posted && !plan.items[0].fix_uncommitted, "{label}");
+                }
+            }
+
+            /// C2 reverts C1, or rewrites the very line C1 changed: C1 stays an
+            /// ancestor of the branch but the fix is not in it, so neither Apply
+            /// nor Sync says it is fixed, and a later Apply makes it again.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_later_commit_that_removes_the_effect_ends_the_proof() {
+                let _guard = PATH_LOCK.lock().await;
+                for (label, c2) in [
+                    ("revert", Box::new(|w: &Path, c1: &str| {
+                        git(w, &["revert", "--no-edit", c1]);
+                    }) as Box<dyn FnOnce(&Path, &str)>),
+                    ("overwrite", Box::new(|w: &Path, _: &str| {
+                        let t = std::fs::read_to_string(w.join("notes.txt")).unwrap();
+                        std::fs::write(w.join("notes.txt"), t.replace("ONE", "UNO")).unwrap();
+                        std::fs::remove_file(w.join("review-fix-1.txt")).unwrap();
+                    })),
+                    ("ambiguous: same line moved", Box::new(|w: &Path, _: &str| {
+                        let t = std::fs::read_to_string(w.join("notes.txt")).unwrap();
+                        std::fs::write(w.join("notes.txt"), format!("new first line\n{t}")).unwrap();
+                        std::fs::remove_file(w.join("review-fix-1.txt")).unwrap();
+                    })),
+                ] {
+                    let (synced, synced_plan, applied, applied_plan) = delivered_then_c2(c2).await;
+                    assert_eq!((synced, applied), (0, 0), "{label}");
+                    for plan in [&synced_plan, &applied_plan] {
+                        assert!(!plan.items[0].reply_posted && plan.items[0].fix_uncommitted, "{label}: {:?}", plan.items[0]);
+                    }
+                    assert_eq!(applied_plan.items[0].fix_commit, None, "{label}: nothing is left to push");
+                }
+            }
+
+            /// `fix_commit` itself, with pushing off: of two fixes taken by one
+            /// commit, the one whose edits were discarded is not credited with it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn fix_commit_is_recorded_only_for_the_item_whose_change_is_in_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_commits(&repo);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let (_first, plan) = apply_without_push(&task, with_item(plan, 2), &worktree, no_jj.clone(), false).await;
+                // Item 2's edits (review-fix-2.txt) are discarded.
+                std::fs::remove_file(worktree.join("review-fix-2.txt")).unwrap();
+                git(&worktree, &["reset", "-q"]);
+                std::fs::remove_file(hook).unwrap();
+
+                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj, false).await;
+
+                let tip = git(&worktree, &["rev-parse", "task-branch"]);
+                assert!(!second.pushed, "{second:?}");
+                assert_eq!(plan.items[0].fix_commit.as_deref(), Some(tip.as_str()));
+                assert_eq!(plan.items[1].fix_commit, None, "{:?}", plan.items[1]);
+                assert!(plan.items[1].fix_effect.is_none(), "weighed and gone");
+            }
+
+            /// A pull request that is only an external reference on the task
+            /// is not known to be this branch's own, so the branch's contents
+            /// prove nothing for it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_pull_request_not_recorded_as_the_branchs_own_gets_no_reply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(first.pushed, "{:?}", first.push_error);
+
+                let mut unlinked = task.clone();
+                unlinked.external_refs.push(parse_pr_url_to_ref(task.pr_url.as_deref().unwrap()).unwrap());
+                unlinked.pr_url = None;
+                let (second, plan) = apply(&unlinked, plan, &worktree, no_jj, true).await;
+                assert_eq!(second.replies_posted, 0, "{second:?}");
+                let (synced, _plan) = sync(&unlinked, &worktree, plan).await;
+                assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+            }
+
+            /// A stale task PR URL must not let the task branch prove a reply:
+            /// the current own PR for that branch is a different URL.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_recorded_pr_with_a_different_current_head_gets_no_reply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                claude.set_pr_list_url("https://github.com/testorg/testrepo/pull/406");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (result, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+
+                assert_eq!(result.replies_posted, 0, "a different PR head cannot prove delivery: {result:?}");
+                assert!(!plan.items[0].reply_posted, "{plan:?}");
+                assert!(plan.items[0].fix_uncommitted, "the item remains unproven: {plan:?}");
+            }
+
+            /// A commit amended away locally can never reach the remote. Its
+            /// evidence is dropped once the remote can be asked, and the next
+            /// Apply makes the fix again, so the item is not stuck.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_recorded_commit_the_branch_no_longer_has_is_made_again() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_push(&repo);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert!(!first.pushed, "{first:?}");
+                let recorded = plan.items[0].fix_commit.clone().expect("committed");
+                git(&worktree, &["commit", "-q", "--amend", "-m", "amended"]);
+                assert_ne!(git(&worktree, &["rev-parse", "task-branch"]), recorded);
+                std::fs::remove_file(hook).unwrap();
+
+                // The remote has no such branch yet, so it cannot be asked
+                // about the commit; the push of the amended branch cannot
+                // deliver the recorded one either.
+                let (second, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert_eq!(second.replies_posted, 0, "{second:?}");
+                assert!(plan.items[0].fix_commit.is_none() && plan.items[0].fix_effect.is_none(), "{:?}", plan.items[0]);
+
+                let runs = claude.runs();
+                let (third, _plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                assert_eq!(claude.runs(), runs + 1, "the fix is made again");
+                assert_eq!(third.replies_posted, 1, "{third:?}");
+            }
+
+            /// A remote branch that is definitely absent is different from a
+            /// remote that cannot be queried. If the local branch has since
+            /// amended away the recorded commit, the evidence is stale even
+            /// when this apply is not allowed to push.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_absent_remote_branch_clears_unreachable_fix_provenance_without_a_push() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_push(&repo);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert!(!first.pushed, "{first:?}");
+                let recorded = plan.items[0].fix_commit.clone().expect("committed");
+
+                git(&worktree, &["commit", "-q", "--amend", "-m", "amended"]);
+                assert_ne!(git(&worktree, &["rev-parse", "task-branch"]), recorded);
+                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj, true).await;
+
+                assert_eq!(second.replies_posted, 0, "{second:?}");
+                assert!(plan.items[0].fix_commit.is_none() && plan.items[0].fix_effect.is_none(), "{:?}", plan.items[0]);
+                std::fs::remove_file(hook).unwrap();
+            }
+
+            /// The commit is made and the push fails: the commit is recorded
+            /// but not on the remote, so no reply. A restart does not change
+            /// that, for Apply (pushing off) or Sync. Once a later apply
+            /// pushes the recorded commit, the reply is posted.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_commit_that_never_reached_the_remote_is_not_proof_across_a_restart() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_push(&repo);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                let commit = git(&worktree, &["rev-parse", "task-branch"]);
+                assert!(!first.pushed && first.replies_posted == 0, "{first:?}");
+                assert_eq!(plan.items[0].fix_commit.as_deref(), Some(commit.as_str()));
+
+                let plan = restarted(&plan);
+                assert_eq!(plan.items[0].fix_commit.as_deref(), Some(commit.as_str()), "provenance is persisted");
+                let (synced, plan) = sync(&task, &worktree, plan).await;
+                assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert_eq!(second.replies_posted, 0, "{second:?}");
+
+                std::fs::remove_file(hook).unwrap();
+                let (third, plan) = apply(&task, restarted(&plan), &worktree, no_jj, true).await;
+                assert!(third.pushed, "{:?}", third.push_error);
+                assert_eq!(third.replies_posted, 1, "{third:?}");
+                assert_eq!(claude.runs(), 1, "the recorded commit is pushed, the fix is not made again");
+                assert_eq!(git(&worktree, &["rev-parse", "task-branch"]), commit, "and not committed again");
+                assert!(plan.items[0].reply_posted && !plan.items[0].fix_uncommitted);
+            }
+
+            /// `origin`'s branch moved to a commit that is not the fix: not
+            /// proof, whatever else `origin` holds. Neither Apply nor Sync
+            /// replies, and Sync does not resurrect what Apply refused.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_unrelated_commit_on_the_remote_branch_is_not_the_fix() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply_without_push(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert!(!first.pushed && first.replies_posted == 0, "{first:?}");
+                let unrelated = push_an_unrelated_commit(&worktree);
+
+                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj, true).await;
+                assert_eq!(second.replies_posted, 0, "{second:?}");
+                let (synced, plan) = sync(&task, &worktree, plan).await;
+                assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+                assert!(!plan.items[0].reply_posted && plan.items[0].fix_uncommitted);
+                assert_eq!(repo.remote_has_branch("task-branch"), Some(unrelated));
+            }
+
+            /// The same change under another commit ID is not the fix: the
+            /// remote holds a patch-equivalent commit, and that is not proof.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_identical_change_under_another_commit_is_not_the_fix() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) =
+                    apply_without_push(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+                assert_eq!(first.replies_posted, 0);
+                let fix = git(&worktree, &["rev-parse", "task-branch"]);
+                // A different commit with the very same tree and parent.
+                let twin = git(&worktree, &[
+                    "commit-tree", &format!("{fix}^{{tree}}"), "-p", &format!("{fix}~1"), "-m", "twin",
+                ]);
+                assert_ne!(twin, fix);
+                git(&worktree, &["push", "-q", "origin", &format!("{twin}:refs/heads/task-branch")]);
+
+                let (synced, _plan) = sync(&task, &worktree, plan).await;
+                assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+            }
+
+            /// A force-push that drops the fix's commit from the remote
+            /// leaves it unproven again: no reply, and the fix is owed its
+            /// push again. The next apply pushes the same commit and replies.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_force_push_that_drops_the_fix_makes_it_unproven_again() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(first.pushed, "{:?}", first.push_error);
+                let commit = git(&worktree, &["rev-parse", "task-branch"]);
+                assert!(!plan.items[0].fix_uncommitted, "delivered while the remote holds it");
+
+                push_an_unrelated_commit(&worktree);
+                let (synced, plan) = sync(&task, &worktree, plan).await;
+                assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+                assert!(plan.items[0].fix_uncommitted, "no longer proven: {:?}", plan.items[0]);
+
+                // The branch diverged, so a plain push is refused and the
+                // refusal is reported rather than answered with a reply.
+                let (second, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert!(!second.pushed && second.push_error.is_some(), "{second:?}");
+                assert_eq!(second.replies_posted, 0, "{second:?}");
+
+                // Once the user has put the commit back, it is proven again.
+                git(&worktree, &["push", "-q", "--force", "origin", "task-branch"]);
+                let (third, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                assert_eq!(third.replies_posted, 1, "{third:?}");
+                assert_eq!(repo.remote_has_branch("task-branch"), Some(commit));
+                assert!(!plan.items[0].fix_uncommitted);
+            }
+
+            /// When the remote cannot be asked, nothing is proven and the
+            /// result says so; a cached tracking ref is not a fallback.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_unreachable_remote_proves_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(first.pushed, "{:?}", first.push_error);
+
+                git(&worktree, &["remote", "set-url", "origin", "/nonexistent/remote.git"]);
+                let (second, plan) = apply_without_push(&task, plan, &worktree, no_jj, true).await;
+
+                assert_eq!(second.replies_posted, 0, "{second:?}");
+                let error = second.push_error.as_deref().unwrap_or_default();
+                assert!(error.contains("could not be confirmed"), "{error:?}");
+                assert!(
+                    plan.items[0].fix_commit.is_some() && plan.items[0].fix_effect.is_some(),
+                    "a remote that cannot be asked loses no evidence: {:?}", plan.items[0]
+                );
+                let (synced, _plan) = sync(&task, &worktree, plan).await;
+                assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+            }
+
+            /// #109 and #96 answer different questions. With the comment's
+            /// text exactly as it was fixed (#109 says handled) but the fix's
+            /// commit not on the remote, no reply is posted.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn unchanged_comment_text_with_an_undelivered_fix_gets_no_reply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let _claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, mut plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let text = comment(1);
+                plan.comments = vec![text.clone()];
+
+                let (first, plan) = apply_without_push(&task, plan, &worktree, no_jj, true).await;
+                assert_eq!(first.fixed_ids, vec![1]);
+                let next = reanalyze(&plan, vec![text]);
+                assert!(next.items[0].fix_done, "#109: the same text is already handled");
+                assert_eq!(next.items[0].fix_commit, plan.items[0].fix_commit, "the commit follows the fix");
+
+                let (synced, next) = sync(&task, &worktree, next).await;
+                assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+                assert!(!next.items[0].reply_posted);
+            }
+
+            /// The other direction: the old fix was delivered and answered,
+            /// then the comment changed. #109 reprocesses it on its own, the
+            /// old commit proves nothing for the new text, and the new fix
+            /// gets its own commit and reply.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_changed_comment_needs_its_own_commit_even_when_the_old_one_was_delivered() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, mut plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                let text_a = PrReviewComment { body: "use a slice here".to_string(), ..comment(1) };
+                plan.comments = vec![text_a.clone()];
+
+                let (first, applied) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert_eq!(first.replies_posted, 1, "{first:?}");
+                let old_commit = applied.items[0].fix_commit.clone().expect("recorded");
+
+                let text_b = PrReviewComment { body: "use an iterator here instead".to_string(), ..text_a };
+                let next = reanalyze(&applied, vec![text_b]);
+                assert!(!next.items[0].fix_done && !next.items[0].reply_posted, "{:?}", next.items[0]);
+                assert_eq!(next.items[0].fix_commit, None, "the old commit does not carry the new text's fix");
+                let (synced, next) = sync(&task, &worktree, next).await;
+                assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+
+                let (second, next) = apply(&task, next, &worktree, no_jj, true).await;
+                assert_eq!(claude.runs(), 2, "the new wording is fixed afresh");
+                assert_eq!(second.replies_posted, 1, "{second:?}");
+                let new_commit = next.items[0].fix_commit.clone().expect("recorded");
+                assert_ne!(new_commit, old_commit);
+                assert_eq!(repo.remote_has_branch("task-branch"), Some(new_commit));
+            }
+
+            /// An agent that changes nothing on an item a legacy plan called
+            /// fixed leaves it unproven: no reply, and one rerun per apply,
+            /// not a loop inside one.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_legacy_fix_the_agent_cannot_reproduce_stays_unproven() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                git(&worktree, &["push", "-q", "-u", "origin", "task-branch"]);
+                let claude = EditingClaude::install_changing_nothing();
+                let (state, tmp) = build_test_state().await;
+                let (task, mut plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                plan.items[0].fix_done = true;
+
+                let (result, plan) = apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
+
+                assert_eq!(claude.runs(), 1);
+                assert_eq!(result.replies_posted, 0, "{result:?}");
+                assert!(plan.items[0].fix_commit.is_none() && !plan.items[0].reply_posted, "{:?}", plan.items[0]);
+                assert!(plan.items[0].fix_uncommitted, "unproven, still owed: {:?}", plan.items[0]);
             }
 
             /// A fake `gh` for the PR side-effect ownership tests. `pr list`

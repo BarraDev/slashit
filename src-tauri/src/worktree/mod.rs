@@ -1,6 +1,7 @@
 mod branch;
 mod commit;
 mod default_base;
+pub mod delivery;
 mod diff;
 mod manager;
 mod orphans;

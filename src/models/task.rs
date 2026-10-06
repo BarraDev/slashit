@@ -174,6 +174,13 @@ pub struct PrReviewPlan {
 
 /// Mirrors the backend type of the same name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixEffect {
+    pub before_tree: String,
+    pub after_tree: String,
+}
+
+/// Mirrors the backend type of the same name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FixedContent {
     pub comment_id: u64,
     pub fingerprint: String,
@@ -232,6 +239,7 @@ impl PrReviewPlan {
                 if last.auto_reply == Some(true)
                     && !item.reply_posted
                     && !item.fix_uncommitted
+                    && item.fix_commit.is_none()
                     && !failed_reply_ids.contains(&cid)
                 {
                     item.reply_posted = true;
@@ -297,6 +305,14 @@ pub struct PrReviewItem {
     /// Mirrors the backend field: a fix not yet committed and pushed.
     #[serde(default)]
     pub fix_uncommitted: bool,
+    /// Mirrors the backend field: the commit carrying this item's fix. It
+    /// must survive a round trip through the frontend, or every fix would
+    /// look like one saved before commits were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_commit: Option<String>,
+    /// Mirrors the backend field; it must round trip for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_effect: Option<FixEffect>,
     #[serde(default)]
     pub reply_posted: bool,
     #[serde(default)]

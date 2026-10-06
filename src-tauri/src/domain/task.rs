@@ -621,9 +621,14 @@ impl PrReviewPlan {
                 // A fix not yet delivered (`fix_uncommitted`) had no reply
                 // attempted -- replies wait for delivery -- so its absence
                 // from `reply_errors` says nothing about a reply being posted.
+                // Neither does it for any fix with a recorded commit: whether
+                // its reply was posted is recorded on the item itself, and
+                // only a plan from before delivery was tracked needs this
+                // inference.
                 if last.auto_reply == Some(true)
                     && !item.reply_posted
                     && !item.fix_uncommitted
+                    && item.fix_commit.is_none()
                     && !failed_reply_ids.contains(&cid)
                 {
                     item.reply_posted = true;
@@ -709,19 +714,65 @@ pub struct PrReviewItem {
     /// across modal reopens. A re-run with `fix_done=true` skips the agent.
     #[serde(default)]
     pub fix_done: bool,
-    /// True while this item's fix is not yet delivered to the pull request:
-    /// set when the fix agent succeeds, cleared once an apply commits the
-    /// checkout (or finds nothing left to commit) and, when the branch is
-    /// ahead of its remote, pushes it. A commit or push that fails, is
-    /// cancelled, or is withheld because another fix agent failed in the
-    /// same apply leaves it set, as does a needed push skipped because
-    /// `auto_push=false`, so the next apply commits or pushes it without
-    /// running the agent again. It survives an edit to the item's comment.
-    /// No reply claiming the fix is posted while it is set. Only these
-    /// fixes are ever committed by an apply; a fix already delivered is
-    /// never committed again.
+    /// Bookkeeping for the UI and for what an apply still owes, never
+    /// evidence: true from the moment this item's fix agent succeeds until an
+    /// apply or a sync has seen the fix delivered (see
+    /// [`PrReviewItem::fix_commit`] and [`PrReviewItem::fix_effect`]), and set
+    /// again if it is no longer. Clearing it proves nothing, and a plan
+    /// persisted before commits were recorded has it cleared without any proof
+    /// (#96). Whether a reply may say the fix is done is decided only by
+    /// delivery as the remote shows it at that moment.
+    ///
+    /// What is owed follows from the other two fields, not from this flag: a
+    /// commit is owed to a fix with a `fix_effect` and no `fix_commit`; a push
+    /// is owed to one with a `fix_commit` the remote does not hold; a fix with
+    /// neither is unproven and owes nothing (see
+    /// [`PrReviewItem::fix_has_no_provenance`]). A commit or push that fails,
+    /// is cancelled, or is withheld because another fix agent failed in the
+    /// same apply leaves the flag set. It survives an edit to the item's
+    /// comment.
     #[serde(default)]
     pub fix_uncommitted: bool,
+    /// The commit that carries this item's fix: recorded when an apply's
+    /// commit succeeds after the item's fix agent changed the checkout. One
+    /// commit may carry several items' fixes. `None` for a fix not yet
+    /// committed and for every plan saved before this field existed, which
+    /// therefore proves nothing about delivery.
+    ///
+    /// This is a different question from the one `PrReviewPlan::fixed_content`
+    /// answers (#109): that records which version of the comment's text the
+    /// fix was made from; this records which commit holds the fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_commit: Option<String>,
+    /// What this item's fix agent changed in the checkout: the trees before
+    /// and after its run. It is the evidence behind every claim that the fix
+    /// is delivered, so it is kept for as long as the item stands behind a
+    /// commit: a commit becomes `fix_commit` only if the change is still in
+    /// it, and a reply is allowed only if the change is also still in the
+    /// remote branch as refreshed at that moment (a later commit may have
+    /// overwritten or reverted it, whatever the ancestry says). The change is
+    /// found by its content, not its path, so later unrelated edits keep the
+    /// proof, including edits to other parts of the same file. An overlapping
+    /// edit removes it, and so does one that merely moves the hunk, such as a
+    /// line inserted above it: the change must still sit where it was made.
+    /// A false negative is acceptable and a false positive is not. The trees
+    /// are ordinary unreferenced Git objects, so once Git prunes them the
+    /// proof is unavailable and the fix is made again.
+    ///
+    /// It is dropped when no commit can carry it: a commit or a finding of
+    /// nothing to commit weighed it and it was not there, or the remote
+    /// branch no longer has it. `None` then, when the agent changed nothing,
+    /// and for every plan saved before this existed. Independent of #109's
+    /// `fixed_content`, which identifies the comment text, not the change.
+    ///
+    /// Scope boundary: the effect is everything that changed in the checkout
+    /// during the agent's run (a rewritten `Cargo.lock`, a manifest, a
+    /// workflow file, generated state), because a legitimate fix may be any
+    /// of those. It means "this concrete repository effect was attributed to
+    /// this fix agent's run". It does not mean SlashIt checked that the
+    /// change satisfies the review comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_effect: Option<FixEffect>,
     /// True once a reply (inline or fallback PR comment) was posted on GitHub
     /// for this item. Decoupled from `fix_done` so a successful fix with a
     /// failed reply leaves the item visibly pending in the "Sync replies" path.
@@ -744,6 +795,25 @@ pub struct PrReviewItem {
     /// can PATCH the existing comment instead of duplicating it.
     #[serde(default)]
     pub reply_comment_id: Option<u64>,
+}
+
+/// The checkout's tree before and after one fix agent ran.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixEffect {
+    pub before_tree: String,
+    pub after_tree: String,
+}
+
+impl PrReviewItem {
+    /// A fix recorded as done with no change on record to prove it by, with
+    /// or without a commit named: every fix a build from before #96 saved, an
+    /// agent that changed nothing, and a fix whose change was found missing
+    /// from the commit that took the checkout. Nothing can prove it reached
+    /// the pull request, so it never gets a reply; an Apply makes it again
+    /// once, rather than leaving it stuck.
+    pub fn fix_has_no_provenance(&self) -> bool {
+        self.fix_done && self.fix_effect.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

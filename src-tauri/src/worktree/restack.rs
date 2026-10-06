@@ -67,15 +67,16 @@ struct Ran {
 }
 
 /// One `git` run, under the repository's registration lock (see
-/// [`super::registry_lock`]) except a `fetch`, which never reads the
-/// registrations and may take long on the network. Each helper here runs one
-/// `git` and returns; none is called while another holds the lock.
+/// [`super::registry_lock`]) except network queries (`fetch` and
+/// `ls-remote`), which never read the registrations and may take long on the
+/// network. Each helper here runs one `git` and returns; none is called while
+/// another holds the lock.
 async fn run_unless_fetch(
     dir: &Path,
     args: &[&str],
     envs: &[(&str, String)],
 ) -> std::io::Result<std::process::Output> {
-    if args.first() == Some(&"fetch") {
+    if matches!(args.first(), Some(&"fetch") | Some(&"ls-remote")) {
         return tokio::process::Command::new("git")
             .args(args)
             .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
@@ -218,6 +219,18 @@ pub async fn fetch_remote_branch(dir: &Path, branch: &str) -> Result<String, Str
     exact_ref(dir, &tracking)
         .await?
         .ok_or_else(|| format!("{tracking} does not exist after fetching {branch} from origin"))
+}
+
+/// Whether `origin` currently has exactly this branch. An empty successful
+/// `ls-remote` result is a definite absence; a failed request remains an
+/// unavailable remote rather than being mistaken for an absent branch.
+pub async fn remote_branch_exists(dir: &Path, branch: &str) -> Result<bool, String> {
+    let refname = format!("refs/heads/{branch}");
+    let ran = run(dir, &["ls-remote", "--heads", "origin", &refname], &[]).await?;
+    if ran.code != Some(0) {
+        return Err(format!("git ls-remote failed: {}", ran.stderr));
+    }
+    Ok(ran.stdout.lines().any(|line| line.ends_with(&format!("\t{refname}"))))
 }
 
 /// What a task's worktree has in progress and uncommitted, as far as a
