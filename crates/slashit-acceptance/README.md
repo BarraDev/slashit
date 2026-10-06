@@ -104,6 +104,20 @@ chmod +x /tmp/WebKitWebDriver
 export SLASHIT_ACCEPTANCE_NATIVE_DRIVER=/tmp/WebKitWebDriver
 ```
 
+## Regenerating the README screenshots
+
+`scripts/capture-readme-screenshots.sh` rebuilds the README's PR Comment Review
+and Kanban images from a synthetic dataset (a fictional `harbor-api` project,
+reviewers such as `maya-ortiz-demo`, PR `slashit-demo/harbor-api#42`). It is
+documentation tooling, not a journey: it lives in its own test target,
+`tests/readme_screenshots.rs`, outside `product_acceptance` and the CI shard
+manifest, and CI never runs it. Run it locally after
+`scripts/build-acceptance-app.sh`; it reuses the harness's private state root
+and fake `claude` and `gh`, writes to `target/readme-screenshots/`, and copies
+into `docs/assets/screenshots/` only after a clean run (`--no-install` to
+skip the copy). Images may differ slightly between runs (card animation), so
+do not compare them byte for byte.
+
 ## What the harness guarantees
 
 - **Isolation.** Every run gets a fresh `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,

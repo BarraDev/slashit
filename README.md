@@ -24,7 +24,7 @@ It's built for people who've already outgrown a single terminal tab and a stack 
 ## What you can do with it
 
 **Plan and dispatch work**
-- Kanban board across Backlog, Queue, In Progress, Review, and Done — per project, fully local.
+- Kanban board across Backlog, Error, Queue, In Progress, AI Review, Human Review, PR Open, and Done — per project, fully local.
 - Pull issues in from GitHub or Jira instead of retyping them.
 - Drop a card into the queue and an agent picks it up; configurable concurrency keeps things sane.
 
@@ -65,7 +65,7 @@ Triage every reviewer comment on a pull request, decide Fix / Skip / Question pe
 The screens below preview the rest of the app, parts of which are still being polished.
 
 <p align="center">
-  <img src="docs/assets/screenshots/dashboard-kanban.jpg" alt="SlashIt dashboard with Kanban task queue, agent queue, worktrees, and JJ status" width="900">
+  <img src="docs/assets/screenshots/dashboard-kanban.png" alt="SlashIt Kanban board showing tasks moving from Queue through In Progress, AI Review, Human Review and PR Open to Done, with progress bars, priority labels and a linked pull request" width="900">
 </p>
 
 <p align="center">
