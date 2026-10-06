@@ -663,13 +663,41 @@ impl RunEndAnnouncer {
 impl Drop for RunEndAnnouncer {
     fn drop(&mut self) {
         if let Some((executions, execution_id)) = &self.execution {
-            if let Ok(mut executions) = executions.try_write() {
-                if let Some(execution) = executions.get_mut(execution_id) {
-                    if matches!(execution.status, AgentStatus::Starting | AgentStatus::Running | AgentStatus::Stopping) {
-                        execution.status = AgentStatus::Failed("execution owner panicked".to_string());
-                        execution.stopped_at = Some(chrono::Utc::now());
-                        self.end = execution.status.clone();
+            match executions.try_write() {
+                Ok(mut executions) => {
+                    if let Some(execution) = executions.get_mut(execution_id) {
+                        if matches!(execution.status, AgentStatus::Starting | AgentStatus::Running | AgentStatus::Stopping) {
+                            execution.status = AgentStatus::Failed("execution owner panicked".to_string());
+                            execution.stopped_at = Some(chrono::Utc::now());
+                            self.end = execution.status.clone();
+                        }
                     }
+                }
+                Err(_) if tokio::runtime::Handle::try_current().is_ok() => {
+                    let events = self.events.clone();
+                    let task_id = self.task_id;
+                    let end = self.end.clone();
+                    let executions = executions.clone();
+                    let execution_id = *execution_id;
+                    tokio::spawn(async move {
+                        let mut executions = executions.write().await;
+                        let mut end = end;
+                        if let Some(execution) = executions.get_mut(&execution_id) {
+                            if matches!(execution.status, AgentStatus::Starting | AgentStatus::Running | AgentStatus::Stopping) {
+                                execution.status = AgentStatus::Failed("execution owner panicked".to_string());
+                                execution.stopped_at = Some(chrono::Utc::now());
+                                end = execution.status.clone();
+                            }
+                        }
+                        events.agent_event(AgentEvent::RunState {
+                            task_id: task_id.to_string(),
+                            status: end,
+                        });
+                    });
+                    return;
+                }
+                Err(_) => {
+                    eprintln!("[executor] could not defer terminal cleanup for execution {execution_id}");
                 }
             }
         }
