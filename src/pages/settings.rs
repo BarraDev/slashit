@@ -149,7 +149,7 @@ pub fn Settings(
                     </div>
                 </div>
 
-                <div class="flex-1">
+                <div class="flex-1 min-w-0">
                     <div class="border border-white/10 rounded-xl bg-white/[0.02] p-6">
                         {move || {
                             match active_tab.get() {
