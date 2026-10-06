@@ -1954,7 +1954,7 @@ async fn settle_delivery(
             return settled;
         }
     }
-    let remote = crate::worktree::delivery::RemoteBranch::refresh(working_dir, branch).await;
+    let remote = crate::worktree::delivery::RemoteBranch::refresh(working_dir, Some(branch)).await;
     settled.unavailable = remote.unavailable().map(str::to_string);
     for &idx in &candidates {
         let Some(commit) = plan.items[idx].fix_commit.clone() else { continue };
@@ -1989,7 +1989,7 @@ async fn settle_delivery(
         let hopeless = if on_remote {
             verdict == Survival::Absent
         } else if remote.unavailable().is_none() {
-            commit_is_unreachable_locally(working_dir, branch, &commit).await
+            commit_is_unreachable_locally(working_dir, Some(branch), &commit).await
         } else {
             false
         };
