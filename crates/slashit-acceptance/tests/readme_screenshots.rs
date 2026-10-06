@@ -513,6 +513,9 @@ async fn capture(driver: &WebDriver, board_project: &str, out: &Path) -> Result<
 
     // Park the pointer, so no card shows a hover state.
     let inner = driver.execute("return window.innerWidth;", vec![]).await?.json().as_i64().context("no viewport width")?;
+    if inner != 1680 {
+        bail!("expected a 1680px capture viewport, got {inner}px");
+    }
     driver.action_chain().move_to(inner - 2, HEIGHT as i64 - 2).perform().await?;
     settle().await;
     write_png(out, "dashboard-kanban.png", &driver.screenshot_as_png().await?)?;
