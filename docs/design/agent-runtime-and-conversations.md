@@ -4,8 +4,9 @@ Status: architectural direction, not an implementation plan. No current
 feature commitment. Nothing here is built, and the follow-up-ideas issue
 [#73](https://github.com/BarraDev/slashit/issues/73) does not implement any of it.
 The historical record of the six decisions is
-[workmux-follow-ups.md](workmux-follow-ups.md). Its purpose is to keep today's bounded decisions from closing
-doors. Vocabulary follows [product-model.md](../architecture/product-model.md).
+[workmux-follow-ups.md](workmux-follow-ups.md). The direction document's
+purpose is to keep today's bounded decisions from closing doors. Vocabulary
+follows [product-model.md](../architecture/product-model.md).
 
 ## Ownership principle
 

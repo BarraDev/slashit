@@ -77,8 +77,9 @@ EditTask    { task_id, title, description, ... }
 Moving a task into `in_progress` reaches the queue executor, which creates a
 worktree and spawns the configured agent with the task's attacker-controlled
 description as its prompt. EditTask can rewrite that title and description on
-a task already queued or in progress, so it reaches the same primitive one
-step later. The agent is spawned using `--dangerously-skip-permissions` and the full
+a task already queued or in progress, so the changed text reaches the same
+primitive on a later run. The agent is spawned using
+`--dangerously-skip-permissions` and the full
 `Read,Edit,Write,Bash,Glob,Grep` tool set.
 
 There is no sandbox between "wrote a string into a task description" and

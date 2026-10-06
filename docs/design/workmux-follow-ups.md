@@ -1,8 +1,9 @@
 # Design notes: agent supervision, resume, dispatch and related ideas
 
 Status: proposed. Nothing here is built. Each note is one of the six ideas
-collected in issue [#73](https://github.com/BarraDev/slashit/issues/73), from a review of a comparable tool used only as a
-reference; implementation issues are filed only after a note is accepted.
+collected in issue [#73](https://github.com/BarraDev/slashit/issues/73), from a
+review of a comparable tool used only as a reference; implementation issues are
+filed only after a note is accepted.
 The audit reflects `main` at the time of writing. Vocabulary follows
 [product-model.md](../architecture/product-model.md).
 
