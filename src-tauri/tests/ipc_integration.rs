@@ -98,7 +98,9 @@ struct Harness {
 }
 
 impl Harness {
-    /// Bind a Unix socket and a loopback TCP listener, and start serving.
+    /// Bind the platform's local endpoint and a loopback TCP listener, and
+    /// start serving. On Unix the local endpoint is a unique Unix socket in a
+    /// temporary directory; on Windows it is a unique named pipe.
     async fn start() -> Self {
         let tmp = TempDir::new().expect("tempdir");
         let paths = Arc::new(AppPaths::with_roots(
