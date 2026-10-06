@@ -31,10 +31,10 @@ and it does not pretend otherwise.
   connection SlashIt started, with a start and an end.
 - **Provider adapter.** The boundary that starts and observes Runs for one
   provider (Claude Code today, an ACP-backed agent, others later).
-- **Provider session.** An opaque identity and lifecycle that belongs to a
-  Run or Participant at a provider. It is reported by the provider; SlashIt
-  records it and does not invent or interpret it. It is not a universal
-  singleton of a Task.
+- **Provider session.** Opaque provider-specific state associated with a
+  Participant and its execution lineage. A Run may create or resume it. The
+  provider reports its identity; SlashIt records that identity and does not
+  invent or interpret it. It is never a universal identity for a Task.
 - **Context projection.** The bounded subset of Conversation context SlashIt
   sends a Participant. Agents do not receive the full history by default.
 - **Task.** Work, delivery and Task Checkout ownership. Unchanged and kept
@@ -44,8 +44,13 @@ and it does not pretend otherwise.
 
 - One Task may eventually involve several Participants and Runs, each
   possibly with its own provider session.
-- Agent-to-agent communication is mediated and recorded by SlashIt; agents
-  do not talk to each other out of band.
+- Communication between Participants that SlashIt models is mediated and
+  recorded by SlashIt; their modeled exchanges are context-projected by
+  SlashIt, and they do not communicate out of band.
+- Provider-internal workers or subagents that SlashIt does not model as
+  Participants remain opaque provider behavior. If SlashIt later adopts one
+  as a Participant, the normal ownership, supervision and conversation rules
+  apply.
 - SlashIt projects context into each Participant rather than sharing history.
 - A human stays a first-class Participant: approvals, answers and review
   decisions belong in the model.

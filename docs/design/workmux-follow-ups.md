@@ -13,7 +13,7 @@ The audit reflects `main` at the time of writing. Vocabulary follows
 |---|---|
 | Agent attention states | KEEP, folded into managed run supervision; no new Task status model |
 | Cross-Project dashboard | DROPPED as a page; possible read-only Workspace filter later |
-| Resume agent sessions | KEEP, best-effort, provider session identity owned by the Run |
+| Resume agent sessions | KEEP, best-effort, provider session state follows Participant/execution lineage |
 | Coordinator dispatch | KEEP as a deferred note, narrow; multi-agent orchestration DEFERRED, not rejected |
 | Stale-agent reaper | KEEP managed execution supervision; DROP automatic reaping and scanning |
 | Per-Project setup hooks | KEEP as design, deferred |
@@ -102,9 +102,10 @@ Interrupted activity), so they restart as fresh runs in their Task Checkout.
 (b) Reconnecting a terminal process: out of scope; PTYs die with the app and
 agent runs are not PTY based. (c) Resuming a provider session: best-effort.
 
-Provider session identity belongs to the Run, Participant and provider
-adapter, not to the Task. SlashIt records the id the provider reports and
-never invents one that it treats as a provider session. Current code:
+Provider session state is opaque provider-specific state associated with the
+Participant and its execution lineage, not with the Task alone. A Run may
+create or resume that session. SlashIt records the id the provider reports
+and never invents or interprets it as a provider session. Current code:
 `ClaudeRunConfig` has `session_id` (`--session-id`) and `resume_session`
 (`--resume`); the runner captures the id from the `system` init event and the
 `result` event; the executor generates its own `Uuid::new_v4()` and passes it as
@@ -243,10 +244,10 @@ Only items 1 and 2 are proposed as near-term implementation issues.
   is part of run supervision, kept separate from `AttentionReason`.
 - Working is not derived from `TaskStatus` or `TaskPhase`; it projects live
   supervision, and nothing new is persisted on the Task.
-- Provider assumptions: session identity belongs to the Run and the provider
-  adapter, the id must be the provider-reported one, and resume is
-  best-effort with one fresh fallback. Resume behavior after a mid-turn kill
-  is unverified and is a spike question.
+- Provider assumptions: session state is associated with the Participant and
+  its execution lineage, the id must be the provider-reported one, and
+  resume is best-effort with one fresh fallback. Resume behavior after a
+  mid-turn kill is unverified and is a spike question.
 - Process management: supervision covers only runs SlashIt started. There is
   no scan, no kill path and no assumption about processes after a crash;
   any future leftover surfacing needs persisted identity and strong
