@@ -1,8 +1,10 @@
 # Agent runtime and conversations
 
 Status: architectural direction, not an implementation plan. No current
-feature commitment. Nothing here is built, and the follow-up-ideas issue (73)
-does not implement any of it. Its purpose is to keep today's bounded decisions from closing
+feature commitment. Nothing here is built, and the follow-up-ideas issue
+[#73](https://github.com/BarraDev/slashit/issues/73) does not implement any of it.
+The historical record of the six decisions is
+[workmux-follow-ups.md](workmux-follow-ups.md). Its purpose is to keep today's bounded decisions from closing
 doors. Vocabulary follows [product-model.md](../architecture/product-model.md).
 
 ## Ownership principle
@@ -48,6 +50,17 @@ and it does not pretend otherwise.
   decisions belong in the model.
 - Conversation and orchestration are deferred future architecture. They are
   not rejected and not scheduled.
+
+## Supervision rules
+
+- Managed supervision covers only executions SlashIt started or explicitly
+  adopted. There is no scanning of arbitrary external processes.
+- Monitoring uses no Git or project hooks and no repository or provider
+  configuration injection.
+- A persisted `TaskStatus` alone never proves a live run. "Working" must
+  project actual live-run supervision.
+- "Waiting for input" requires a trustworthy structured provider or protocol
+  signal. Silence or an idle output stream never implies it.
 
 ## ACP
 

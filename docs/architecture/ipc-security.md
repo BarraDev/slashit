@@ -63,18 +63,22 @@ for two instances to be started, so the check is load-bearing.
 
 ## What a client can do
 
-Most verbs are read-only. Three are not, and together they are a full
+Most verbs are read-only. Four are not (these are the verbs
+`IpcRequest::spawns_agent()` reports), and together they are a full
 code-execution primitive:
 
 ```text
 CreateTask  { project_id, title, description, ... }
 MoveTask    { task_id, status: "in_progress" }
 EnqueueTask { task_id }
+EditTask    { task_id, title, description, ... }
 ```
 
 Moving a task into `in_progress` reaches the queue executor, which creates a
 worktree and spawns the configured agent with the task's attacker-controlled
-description as its prompt, using `--dangerously-skip-permissions` and the full
+description as its prompt. EditTask can rewrite that title and description on
+a task already queued or in progress, so it reaches the same primitive one
+step later. The agent is spawned using `--dangerously-skip-permissions` and the full
 `Read,Edit,Write,Bash,Glob,Grep` tool set.
 
 There is no sandbox between "wrote a string into a task description" and

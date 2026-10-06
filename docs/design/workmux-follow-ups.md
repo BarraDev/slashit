@@ -1,7 +1,7 @@
 # Design notes: agent supervision, resume, dispatch and related ideas
 
 Status: proposed. Nothing here is built. Each note is one of the six ideas
-collected in issue 73, from a review of a comparable tool used only as a
+collected in issue [#73](https://github.com/BarraDev/slashit/issues/73), from a review of a comparable tool used only as a
 reference; implementation issues are filed only after a note is accepted.
 The audit reflects `main` at the time of writing. Vocabulary follows
 [product-model.md](../architecture/product-model.md).
@@ -132,8 +132,7 @@ background sessions.
 
 Audit. The CLI and `IpcRequest` already expose CreateTask, MoveTask,
 EditTask, DeleteTask and EnqueueTask. `docs/architecture/ipc-security.md`
-already classifies CreateTask, MoveTask(in_progress) and EnqueueTask as
-`spawns_agent()` verbs: an OS-verified local peer may use them, a token-only
+already classifies the agent-spawning verbs (`spawns_agent()`): an OS-verified local peer may use them, a token-only
 TCP peer may not, and mutations are audit logged. So an orchestrating agent
 running as the same OS user can already dispatch. The idea is therefore not
 "build dispatch" but "decide what is safe to give an agent".
@@ -141,8 +140,7 @@ running as the same OS user can already dispatch. The idea is therefore not
 `spawns_agent()` (`crates/slashit-ipc/src/protocol.rs`) covers CreateTask,
 MoveTask, EnqueueTask and also EditTask (editing a queued or running task
 rewrites the prompt a later run uses); DeleteTask is not in that set.
-Stale doc to fix as a follow-up: `docs/architecture/ipc-security.md` lists
-only three verbs and omits EditTask.
+`docs/architecture/ipc-security.md` lists the same four verbs.
 
 Gaps. No caller identity beyond "the owner"; any caller can edit or delete
 tasks in any Project, not only tasks it created; created task text is
