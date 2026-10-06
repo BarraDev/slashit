@@ -1554,8 +1554,10 @@ async fn open_drawer(driver: &WebDriver, task_id: &str, title: &str) -> Result<(
 /// `window.__clickProbe`, every pointer, mouse and drag event that reaches the
 /// document (and every scroll), every removal of the card being clicked or of the element the
 /// button went down on, every insertion or removal of a drawer, and any page
-/// error. Capture phase and passive: it does not change how the page handles
-/// the events.
+/// error. It also samples, once per animation frame, the card's rect and the
+/// widths of the project rail and the sidebar, keeping only the frames in which
+/// one of them changed. Capture phase and passive: it does not change how the
+/// page handles the events.
 const CLICK_PROBE: &str = r#"
 const card = arguments[0];
 if (window.__clickProbe) { window.__clickProbe.stop(); }
@@ -1569,6 +1571,15 @@ const describe = (node) => {
   const own = node.closest && node.closest('[data-testid="task-card"]');
   return name(node) + (own ? (own === card ? ' (in the clicked card)' : ' (in another card)') : '');
 };
+const rectOf = (node) => { const r = node.getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom].map(Math.round); };
+const columns = () => document.querySelector('.snap-x.snap-mandatory');
+const widthOf = (selector) => { const n = document.querySelector(selector); return n ? Math.round(n.getBoundingClientRect().width * 10) / 10 : null; };
+const railWidth = () => widthOf('[data-testid="project-rail"]');
+const sidebarWidth = () => widthOf('[data-testid="sidebar"]');
+const pointInfo = (x, y) => {
+  const at = document.elementFromPoint(x, y);
+  return at ? name(at) + ' / card ' + taskOf(at) : null;
+};
 const types = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click', 'dragstart', 'dragend', 'pointercancel', 'contextmenu'];
 // WebKit sends no click when the element the button went down on has left the
 // page by the time it comes up, so the press target is tracked on its own.
@@ -1579,8 +1590,12 @@ const listener = (e) => {
     t: stamp(), type: e.type, target: describe(e.target),
     pressTargetConnected: pressed ? pressed.isConnected : null, cardConnected: card.isConnected,
     cardShowsTask: taskOf(card), targetShowsTask: taskOf(e.target),
-    cardTop: Math.round(card.getBoundingClientRect().top),
+    cardRect: rectOf(card),
     x: Math.round(e.clientX), y: Math.round(e.clientY),
+    atPoint: pointInfo(e.clientX, e.clientY),
+    columnsScrollLeft: columns() ? Math.round(columns().scrollLeft) : null,
+    railWidth: railWidth(), sidebarWidth: sidebarWidth(),
+    pressTargetIsEventTarget: pressed ? pressed === e.target : null,
   });
 };
 for (const type of types) { window.addEventListener(type, listener, { capture: true, passive: true }); }
@@ -1592,10 +1607,41 @@ const scrolled = (e) => {
   probe.events.push({
     t: stamp(), type: 'scroll', target: target === document ? 'document' : name(target),
     scrollLeft: target.scrollLeft === undefined ? null : Math.round(target.scrollLeft),
-    cardTop: Math.round(card.getBoundingClientRect().top), cardLeft: Math.round(card.getBoundingClientRect().left),
+    cardRect: rectOf(card),
   });
 };
 window.addEventListener('scroll', scrolled, { capture: true, passive: true });
+// Layout samples. One frame at a time, recorded only when the card, the project
+// rail or the sidebar changed size or place since the last sample, so a layout
+// transition shows as a run of samples and a still page adds nothing. Bounded.
+probe.frames = [];
+probe.atInstall = { t: 0, cardRect: rectOf(card), railWidth: railWidth(), sidebarWidth: sidebarWidth(), columnsScrollLeft: columns() ? Math.round(columns().scrollLeft) : null };
+let last = JSON.stringify([probe.atInstall.cardRect, probe.atInstall.railWidth, probe.atInstall.sidebarWidth]);
+let frame = 0;
+let sampling = true;
+const sample = () => {
+  if (!sampling) { return; }
+  const now = [rectOf(card), railWidth(), sidebarWidth()];
+  const key = JSON.stringify(now);
+  if (key !== last && probe.frames.length < 120) {
+    last = key;
+    probe.frames.push({ t: stamp(), cardRect: now[0], railWidth: now[1], sidebarWidth: now[2] });
+  }
+  frame = requestAnimationFrame(sample);
+};
+frame = requestAnimationFrame(sample);
+// Whether the pointer is over the project rail (which widens on hover), and the
+// click reaching the card element itself.
+const crossing = (e) => {
+  const rail = e.target.closest && e.target.closest('[data-testid="project-rail"]');
+  if (rail && probe.events.length < 200) {
+    probe.events.push({ t: stamp(), type: 'rail-' + e.type, railWidth: railWidth(), x: Math.round(e.clientX), y: Math.round(e.clientY) });
+  }
+};
+window.addEventListener('mouseover', crossing, { capture: true, passive: true });
+window.addEventListener('mouseout', crossing, { capture: true, passive: true });
+const reachedCard = (e) => probe.events.push({ t: stamp(), type: 'click-reached-card-element', defaultPrevented: e.defaultPrevented, cardRect: rectOf(card) });
+card.addEventListener('click', reachedCard);
 const isDrawer = (node) => node.nodeType === 1
   && (node.matches('[data-testid="task-drawer"]') || node.querySelector('[data-testid="task-drawer"]'));
 const observer = new MutationObserver((records) => {
@@ -1625,6 +1671,11 @@ console.error = (...args) => {
   return consoleError.apply(console, args);
 };
 probe.stop = () => {
+  sampling = false;
+  cancelAnimationFrame(frame);
+  card.removeEventListener('click', reachedCard);
+  window.removeEventListener('mouseover', crossing, { capture: true });
+  window.removeEventListener('mouseout', crossing, { capture: true });
   window.removeEventListener('scroll', scrolled, { capture: true });
   window.removeEventListener('error', failed);
   window.removeEventListener('unhandledrejection', failed);
@@ -1656,7 +1707,8 @@ async fn click_evidence(driver: &WebDriver) -> String {
       const probe = window.__clickProbe;
       if (!probe) { return { probe: 'missing' }; }
       const card = probe.card;
-      const columns = document.querySelector('.snap-x.snap-mandatory');
+      const columns = () => document.querySelector('.snap-x.snap-mandatory');
+      const widthOf = (selector) => { const n = document.querySelector(selector); return n ? Math.round(n.getBoundingClientRect().width * 10) / 10 : null; };
       const rect = card.getBoundingClientRect();
       const at = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
       const taskOf = (node) => { const w = node.closest && node.closest('[data-card-task-id]'); return w ? w.getAttribute('data-card-task-id') : null; };
@@ -1665,6 +1717,8 @@ async fn click_evidence(driver: &WebDriver) -> String {
       const sameTitle = [...document.querySelectorAll('[data-testid="task-card"]')]
         .filter((c) => titleOf(c) === title);
       return {
+        atInstall: probe.atInstall,
+        layoutFrames: probe.frames,
         events: probe.events,
         cardRemovedFromBoard: probe.removed,
         drawerInsertedOrRemoved: probe.drawer,
@@ -1672,10 +1726,13 @@ async fn click_evidence(driver: &WebDriver) -> String {
         clickedCardStillConnected: card.isConnected,
         cardsWithThatTitleNow: sameTitle.length,
         clickedCardIsTheCurrentOne: sameTitle.includes(card),
-        columnsScrollLeft: columns ? Math.round(columns.scrollLeft) : null,
-        columnsScrollWidth: columns ? columns.scrollWidth : null,
-        columnsClientWidth: columns ? columns.clientWidth : null,
-        cardRect: [rect.left, rect.top, rect.width, rect.height].map(Math.round),
+        columnsScrollLeft: columns() ? Math.round(columns().scrollLeft) : null,
+        columnsScrollWidth: columns() ? columns().scrollWidth : null,
+        columnsClientWidth: columns() ? columns().clientWidth : null,
+        cardRect: [rect.left, rect.top, rect.right, rect.bottom].map(Math.round),
+        boardRect: columns() ? (() => { const b = columns().getBoundingClientRect(); return [b.left, b.top, b.right, b.bottom].map(Math.round); })() : null,
+        railWidthNow: widthOf('[data-testid="project-rail"]'),
+        sidebarWidthNow: widthOf('[data-testid="sidebar"]'),
         viewport: [window.innerWidth, window.innerHeight],
         elementAtCardCentre: at ? (at.getAttribute('data-testid') || at.tagName.toLowerCase())
           + (card.contains(at) ? ' (inside the clicked card)' : ' (outside the clicked card)') : null,
