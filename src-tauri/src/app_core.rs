@@ -546,7 +546,7 @@ async fn repository_paths_by_project(state: &AppState) -> HashMap<uuid::Uuid, St
 /// Bring one task up to date with the current model.
 ///
 /// Returns whether anything changed, so only affected projects are rewritten.
-fn migrate_task(task: &mut Task) -> bool {
+pub(crate) fn migrate_task(task: &mut Task) -> bool {
     let mut changed = false;
 
     // Model names used to be pinned to a specific Claude release. They are now
@@ -556,6 +556,13 @@ fn migrate_task(task: &mut Task) -> bool {
         task.model = "default".to_string();
         changed = true;
     }
+
+    // Whether a run was under way is read before the reset below erases it:
+    // an interrupted coding run is the only thing a recovery record may
+    // outlive a restart as.
+    let was_running =
+        task.status == domain::TaskStatus::InProgress && task.phase == domain::TaskPhase::Coding;
+    changed |= task.settle_run_recovery_at_startup(was_running);
 
     // A task left mid-flight by a crash has no agent behind it any more.
     // Returning it to the queue is what makes a restart resume work rather
@@ -809,6 +816,51 @@ mod tests {
         // A second pass finds nothing left to do and records nothing more.
         assert!(!migrate_task(&mut task));
         assert_eq!(task.activity.len(), 1);
+    }
+
+    fn recovery() -> domain::task::RunRecovery {
+        let mut recovery = domain::task::RunRecovery::started(
+            1,
+            domain::task::CheckoutIdentity { path: "/w".into(), branch: "b".into(), base_commit: None },
+        );
+        recovery.session_id = Some("s".into());
+        recovery
+    }
+
+    #[test]
+    fn a_coding_run_cut_off_by_a_restart_becomes_an_interrupted_recovery() {
+        let mut task = task_with(domain::TaskStatus::InProgress, domain::TaskPhase::Coding, "default");
+        task.run_recovery = Some(recovery());
+        assert!(migrate_task(&mut task));
+        let recovery = task.run_recovery.as_ref().expect("kept for the next start");
+        assert_eq!(recovery.state, domain::task::RunRecoveryState::Interrupted);
+        assert_eq!(recovery.session_id.as_deref(), Some("s"));
+        assert!(!recovery.resume_attempted);
+        assert!(!migrate_task(&mut task), "a second start-up changes nothing more");
+        assert_eq!(task.run_recovery.as_ref().unwrap().state, domain::task::RunRecoveryState::Interrupted);
+    }
+
+    #[test]
+    fn a_record_that_no_working_run_stands_behind_is_dropped_at_startup() {
+        for (status, phase) in [
+            (domain::TaskStatus::AiReview, domain::TaskPhase::QaReview),
+            (domain::TaskStatus::InProgress, domain::TaskPhase::Idle),
+            (domain::TaskStatus::Backlog, domain::TaskPhase::Idle),
+            (domain::TaskStatus::Done, domain::TaskPhase::Idle),
+        ] {
+            let mut task = task_with(status, phase, "default");
+            task.run_recovery = Some(recovery());
+            migrate_task(&mut task);
+            assert!(task.run_recovery.is_none(), "{:?}/{:?}", task.status, task.phase);
+        }
+    }
+
+    #[test]
+    fn a_task_with_no_recovery_metadata_starts_as_it_always_did() {
+        let mut task = task_with(domain::TaskStatus::InProgress, domain::TaskPhase::Coding, "default");
+        assert!(migrate_task(&mut task));
+        assert!(task.run_recovery.is_none());
+        assert_eq!(task.status, domain::TaskStatus::Queue);
     }
 
     #[test]

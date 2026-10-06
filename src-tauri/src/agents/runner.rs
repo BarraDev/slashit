@@ -113,6 +113,47 @@ pub fn result_failure_reason(event: &serde_json::Value) -> Option<String> {
     Some(reason)
 }
 
+/// Whether a `--resume` run's `stream-json` output says the provider has no
+/// such conversation, and nothing else went wrong.
+///
+/// A resume that cannot find its session ends before the conversation starts:
+/// no `system` init or `assistant` line, and one error `result` with no turns
+/// that names the missing session. That shape was observed on Claude Code
+/// 2.1.291 and 2.1.292 and is not a documented contract, so this recognizes
+/// only the whole of it. The structure -- an `error_during_execution`
+/// result that did no work before any session started -- keeps an API
+/// failure, a rejected option or a crash mid-conversation from reading as a
+/// missing session, and the message keeps any other early failure from
+/// doing so. A run that fits only part of it is an ordinary failure, which
+/// is the safe error: a miss starts a fresh run, a failure stops the task.
+pub fn is_resume_session_miss(raw_stdout: &str) -> bool {
+    let mut result_is_miss = false;
+    for line in raw_stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        match json.get("type").and_then(|t| t.as_str()) {
+            Some("result") => {
+                let session_missing = json
+                    .get("errors")
+                    .and_then(|e| e.as_array())
+                    .is_some_and(|errors| {
+                        errors.iter().filter_map(|e| e.as_str()).any(|e| e.contains("No conversation found"))
+                    });
+                result_is_miss = json.get("is_error").and_then(|e| e.as_bool()) == Some(true)
+                    && json.get("subtype").and_then(|s| s.as_str()) == Some("error_during_execution")
+                    && json.get("num_turns").and_then(|n| n.as_u64()) == Some(0)
+                    && session_missing;
+            }
+            // The conversation started. Other `system` lines, such as a hook
+            // reporting before it, say nothing either way.
+            Some("system") if json.get("subtype").and_then(|s| s.as_str()) != Some("init") => {}
+            _ => return false,
+        }
+    }
+    result_is_miss
+}
+
 /// `s` on one line: its non-blank lines, ended by `\n` or `\r`, joined with
 /// ` / `.
 fn one_line(s: &str) -> String {
@@ -1077,6 +1118,43 @@ async fn parse_claude_event(
         }
 
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod resume_miss_tests {
+    use super::is_resume_session_miss;
+
+    /// Claude Code 2.1.292, `--resume` with a session it does not have.
+    const MISS: &str = r#"{"type":"result","subtype":"error_during_execution","duration_ms":0,"is_error":true,"num_turns":0,"session_id":"asked-for","errors":["No conversation found with session ID: asked-for"]}"#;
+
+    #[test]
+    fn the_whole_observed_shape_is_a_miss() {
+        assert!(is_resume_session_miss(MISS));
+        assert!(is_resume_session_miss(&format!("{MISS}\n")));
+        // A hook reporting first says nothing either way.
+        let hook = r#"{"type":"system","subtype":"hook_started","session_id":"x"}"#;
+        assert!(is_resume_session_miss(&format!("{hook}\n{MISS}")));
+    }
+
+    #[test]
+    fn anything_less_than_the_whole_shape_is_an_ordinary_failure() {
+        let init = r#"{"type":"system","subtype":"init","session_id":"s"}"#;
+        let assistant = r#"{"type":"assistant","message":{"content":[]}}"#;
+        // The conversation started, then ended in the same error text.
+        assert!(!is_resume_session_miss(&format!("{init}\n{MISS}")));
+        assert!(!is_resume_session_miss(&format!("{assistant}\n{MISS}")));
+        // Same structure, a different reason.
+        let other = MISS.replace("No conversation found with session ID: asked-for", "Credit balance is too low");
+        assert!(!is_resume_session_miss(&other));
+        // Same message, but the run did work, was not an error, or ended some other way.
+        assert!(!is_resume_session_miss(&MISS.replace(r#""num_turns":0"#, r#""num_turns":2"#)));
+        assert!(!is_resume_session_miss(&MISS.replace(r#""is_error":true"#, r#""is_error":false"#)));
+        assert!(!is_resume_session_miss(&MISS.replace("error_during_execution", "error_max_turns")));
+        // No output, unparseable output, or no result at all.
+        assert!(!is_resume_session_miss(""));
+        assert!(!is_resume_session_miss("No conversation found with session ID: x"));
+        assert!(!is_resume_session_miss(&format!("not json\n{MISS}")));
     }
 }
 

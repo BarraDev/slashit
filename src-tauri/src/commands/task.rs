@@ -129,6 +129,7 @@ pub async fn create_task(
             branch_origin: None,
             pending_republish: None,
             cleanup_in_flight: false,
+            run_recovery: None,
             pr_review_plan: None,
             activity: Vec::new(),
             created_at: now,

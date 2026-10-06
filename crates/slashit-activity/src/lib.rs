@@ -126,6 +126,16 @@ pub enum Kind {
     /// running, or waiting to run or be reviewed -- and put it back in the
     /// queue. Says nothing about whether a run had begun.
     Interrupted { from: Column },
+    /// A coding run began by resuming the provider conversation of the run an
+    /// earlier session left unfinished, rather than starting a new one. A
+    /// best-effort attempt: see [`Kind::SessionUnavailable`] for when it
+    /// cannot be used.
+    SessionResumeAttempted { run: u32 },
+    /// The provider accepted the resume: the run continues that conversation.
+    SessionResumed { run: u32 },
+    /// The earlier provider conversation could not be used, so `run`
+    /// continues in a fresh one on the same checkout.
+    SessionUnavailable { run: u32, reason: String },
     AiReviewStarted { review: u32 },
     AiReviewApproved { review: u32 },
     /// The reviewer asked for changes; `issues` is how many it listed.
@@ -170,6 +180,10 @@ impl Kind {
             Self::RunCompleted { run } | Self::RunFailed { run: Some(run), .. } => {
                 Identity::RunEnded(*run)
             }
+            Self::SessionResumeAttempted { run } => Identity::ResumeAttempted(*run),
+            Self::SessionResumed { run } | Self::SessionUnavailable { run, .. } => {
+                Identity::ResumeOutcome(*run)
+            }
             Self::AiReviewStarted { review } => Identity::ReviewStarted(*review),
             Self::AiReviewApproved { review }
             | Self::AiReviewChangesRequested { review, .. }
@@ -202,6 +216,8 @@ impl Kind {
 enum Identity<'a> {
     RunStarted(u32),
     RunEnded(u32),
+    ResumeAttempted(u32),
+    ResumeOutcome(u32),
     ReviewStarted(u32),
     ReviewVerdict(u32),
     FixStarted(u32),
@@ -295,6 +311,7 @@ fn push(entries: &mut Vec<Entry>, at: DateTime<Utc>, kind: Kind) {
 fn sanitize_text(kind: &mut Kind) {
     match kind {
         Kind::RunFailed { reason, .. }
+        | Kind::SessionUnavailable { reason, .. }
         | Kind::AiReviewFailed { reason, .. }
         | Kind::AiReviewSkipped { reason, .. }
         | Kind::AiFixFailed { reason, .. }
@@ -477,6 +494,7 @@ impl Item<'_> {
                 | Kind::DeliveryFailed { .. }
                 | Kind::PrClosed { .. } => Tone::Bad,
                 Kind::RunCompleted { .. }
+                | Kind::SessionResumed { .. }
                 | Kind::AiReviewApproved { .. }
                 | Kind::AiFixApplied { .. }
                 | Kind::PrLinked { .. }
@@ -517,6 +535,9 @@ impl Item<'_> {
                 Kind::ToolsOmitted { .. } => "tools_omitted",
                 Kind::RunCompleted { .. } => "run_completed",
                 Kind::RunFailed { .. } => "run_failed",
+                Kind::SessionResumeAttempted { .. } => "session_resume_attempted",
+                Kind::SessionResumed { .. } => "session_resumed",
+                Kind::SessionUnavailable { .. } => "session_unavailable",
                 Kind::Stopped { .. } => "stopped",
                 Kind::Interrupted { .. } => "interrupted",
                 Kind::AiReviewStarted { .. } => "ai_review_started",
@@ -562,6 +583,9 @@ fn kind_title(kind: &Kind) -> String {
         Kind::RunCompleted { .. } => "Coding finished".to_string(),
         Kind::RunFailed { run: Some(_), .. } => "Coding failed".to_string(),
         Kind::RunFailed { run: None, .. } => "Could not start".to_string(),
+        Kind::SessionResumeAttempted { .. } => "Resuming the interrupted agent session".to_string(),
+        Kind::SessionResumed { .. } => "Agent session resumed".to_string(),
+        Kind::SessionUnavailable { .. } => "Agent session unavailable, continuing with fresh context".to_string(),
         Kind::Stopped { from } => format!("Stopped during {}", from.label()),
         Kind::Interrupted { from } => format!("Returned to the queue from {} when SlashIt restarted", from.label()),
         Kind::AiReviewStarted { review } => nth("AI review started", *review),
@@ -585,6 +609,7 @@ fn kind_detail(kind: &Kind) -> Option<String> {
     match kind {
         Kind::ToolUsed { detail, .. } => detail.clone(),
         Kind::RunFailed { reason, .. }
+        | Kind::SessionUnavailable { reason, .. }
         | Kind::AiReviewFailed { reason, .. }
         | Kind::AiReviewSkipped { reason, .. }
         | Kind::AiFixFailed { reason, .. }

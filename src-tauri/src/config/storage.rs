@@ -651,6 +651,13 @@ impl Storage {
         Ok(files)
     }
 
+    /// Where a project's tasks are kept, for tests that read the file from
+    /// outside the process.
+    #[cfg(test)]
+    pub(crate) fn tasks_file_for_tests(&self, project_id: Uuid) -> PathBuf {
+        self.tasks_path(project_id)
+    }
+
     /// Load tasks for a specific project, falling back to the legacy location.
     pub fn load_project_tasks(&self, project_id: Uuid) -> Result<Vec<Task>> {
         let path = self.tasks_path(project_id);

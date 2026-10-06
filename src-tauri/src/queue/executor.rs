@@ -1,11 +1,11 @@
 use crate::agents::runner::{ClaudeRunner, ClaudeRunConfig, ClaudeEvent, ToolAccess};
 use crate::domain::{Task, TaskStatus, TaskPhase, AgentExecution, AgentStatus, AgentLogEntry, LogLevel, QaSignoff, QaStatus, BranchOrigin};
-use crate::domain::task::ExternalRef;
+use crate::domain::task::{CheckoutIdentity, ExternalRef, RunRecovery, RunRecoveryState};
 use crate::queue::admission::{Admission, AdmissionPermit};
 use crate::queue::start_guard::StartGuard;
 use crate::queue::tool_activity::RunTools;
 use crate::domain::task::ActivityKind;
-use crate::queue::prompt::{build_task_prompt, build_review_prompt, build_fix_prompt};
+use crate::queue::prompt::{build_task_prompt, build_review_prompt, build_fix_prompt, with_recovery_instruction, Recovery};
 use crate::queue::QueueManager;
 use crate::worktree::{CheckoutCommit, WorktreeInfo, WorktreeManager};
 use std::collections::{HashMap, HashSet};
@@ -20,6 +20,45 @@ struct RunStart {
     working_dir: String,
     /// The run's number, as its recorded [`ActivityKind::RunStarted`] has it.
     run: u32,
+    /// How the run begins: normally, or as a recovery of an interrupted one.
+    launch: Launch,
+}
+
+/// How a coding run begins, as far as recovering an interrupted one decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Launch {
+    /// Not a recovery.
+    Normal,
+    /// Resume this provider conversation, once. Best effort: the provider may
+    /// not have it, and then the run starts a fresh one.
+    Resume { session_id: String },
+    /// An interrupted run left work in this checkout and its conversation
+    /// cannot be resumed, so the run starts a fresh one that has to
+    /// reconcile with that work first.
+    Reconcile { why: &'static str },
+}
+
+impl Launch {
+    /// How to begin a run in `checkout`, given what the task's last run left.
+    ///
+    /// A recovery needs an interrupted run, in this very checkout, and a
+    /// checkout this start did not just create: a branch made now holds no
+    /// earlier work. Anything short of that is an ordinary start, which
+    /// replaces the record. A conversation is resumed only when
+    /// [`RunRecovery::resumable_session`] allows it; otherwise the interrupted
+    /// work is reconciled by a fresh conversation. When in doubt, fresh.
+    fn decide(recovery: Option<&RunRecovery>, checkout: &CheckoutIdentity, created_now: bool) -> Self {
+        let Some(recovery) = recovery.filter(|r| !created_now && r.is_interrupted_in(checkout)) else {
+            return Self::Normal;
+        };
+        match recovery.resumable_session(checkout) {
+            Some(session_id) => Self::Resume { session_id: session_id.to_string() },
+            None if recovery.resume_attempted => Self::Reconcile {
+                why: "a resume of its conversation was already attempted",
+            },
+            None => Self::Reconcile { why: "no conversation was recorded for it" },
+        }
+    }
 }
 
 /// The phase progress a task shows from the moment its run starts.
@@ -808,6 +847,9 @@ struct RunEventForwarder {
     logs: ExecutionLogs,
     events: SharedEventSink,
     tasks: Tasks,
+    storage: crate::config::Storage,
+    /// Whether this launch resumes an interrupted run's conversation.
+    resumed: bool,
     run_tools: SharedRunTools,
     working_dir: String,
 }
@@ -907,12 +949,38 @@ impl RunEventForwarder {
                 record_output(&self.logs, self.execution_id, LogLevel::Info, format!("Using tool: {}", tool)).await;
                 self.events.agent_event(AgentEvent::ToolUse { task_id: task_id_str, tool: tool.clone() });
             }
-            ClaudeEvent::SystemInit { session_id, model, .. } => {
+            ClaudeEvent::SystemInit { session_id, model, message } => {
                 // Capture actual model on the task
                 if let Some(m) = model {
                     let mut tasks_w = self.tasks.write().await;
                     if let Some(t) = tasks_w.get_mut(&task_id) {
                         t.model = m.clone();
+                    }
+                }
+                // The conversation the provider says it started, from its own
+                // `init` and from nothing else: other `system` lines carry the
+                // same field, and a failed resume's `result` echoes the id
+                // that was asked for.
+                if message.as_deref() == Some("system:init") && !session_id.trim().is_empty() {
+                    if let Err(e) = TaskExecutor::record_session_reported(
+                        &self.tasks,
+                        &self.storage,
+                        task_id,
+                        self.run,
+                        session_id,
+                        self.resumed,
+                    )
+                    .await
+                    {
+                        // Recovery metadata, not the run's correctness: the
+                        // run goes on, with nothing to resume if it is cut off.
+                        record_output(
+                            &self.logs,
+                            self.execution_id,
+                            LogLevel::Warn,
+                            format!("The agent's session could not be recorded for recovery: {e}"),
+                        )
+                        .await;
                     }
                 }
                 record_output(
@@ -1914,6 +1982,7 @@ impl TaskExecutor {
         acquired: Acquired,
     ) -> Result<RunStart, String> {
         let run = std::sync::atomic::AtomicU32::new(0);
+        let launch = std::sync::Mutex::new(Launch::Normal);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
                 t.worktree_path = Some(acquired.info.path.clone());
@@ -1930,6 +1999,38 @@ impl TaskExecutor {
                 let addressing_feedback = !t.human_review.pending_feedback().is_empty();
                 t.record_activity(ActivityKind::RunStarted { run: next, addressing_feedback });
                 run.store(next, std::sync::atomic::Ordering::Relaxed);
+
+                // How this run relates to the one the last session left, and
+                // the record of this one, in the same write that starts it.
+                // A resume is marked attempted here, before any process for
+                // it exists, so a crash while it runs is not retried.
+                let previous = t.run_recovery.take();
+                let checkout = t.checkout_identity();
+                let decided = match &checkout {
+                    Some(checkout) => Launch::decide(previous.as_ref(), checkout, acquired.created_at.is_some()),
+                    None => Launch::Normal,
+                };
+                t.run_recovery = checkout.map(|checkout| {
+                    let mut recovery = RunRecovery::started(next, checkout);
+                    if let Launch::Resume { session_id } = &decided {
+                        recovery.session_id = Some(session_id.clone());
+                        recovery.resume_attempted = true;
+                    }
+                    recovery
+                });
+                match &decided {
+                    Launch::Normal => {}
+                    Launch::Resume { .. } => {
+                        t.record_activity(ActivityKind::SessionResumeAttempted { run: next });
+                    }
+                    Launch::Reconcile { why } => {
+                        t.record_activity(ActivityKind::SessionUnavailable {
+                            run: next,
+                            reason: format!("The interrupted run's session could not be resumed: {why}"),
+                        });
+                    }
+                }
+                *launch.lock().unwrap_or_else(|p| p.into_inner()) = decided;
             }
         };
         match crate::lifecycle::record(&self.tasks, &self.storage, task_id, &amend).await {
@@ -1938,6 +2039,7 @@ impl TaskExecutor {
             Ok(()) => Ok(RunStart {
                 working_dir: acquired.info.path,
                 run: run.load(std::sync::atomic::Ordering::Relaxed),
+                launch: launch.into_inner().unwrap_or_else(|p| p.into_inner()),
             }),
             Err(e) => {
                 let outcome = self
@@ -2168,7 +2270,7 @@ impl TaskExecutor {
                     .to_string(),
             });
         }
-        let RunStart { working_dir, run } = match self.record_run_start(task_id, &repo_path, acquired).await {
+        let RunStart { working_dir, run, launch } = match self.record_run_start(task_id, &repo_path, acquired).await {
             Ok(start) => {
                 self.unrecorded_backoff_lock().remove(&task_id);
                 start
@@ -2212,6 +2314,13 @@ impl TaskExecutor {
                 None => return Ok(false),
             }
         };
+
+        // What a run after an interruption is told besides the task: to look
+        // at the checkout before trusting the conversation. Built here for
+        // both ways it can begin, because a resume that misses becomes the
+        // second.
+        let resume_prompt = with_recovery_instruction(&prompt, Recovery::Resumed);
+        let reconcile_prompt = with_recovery_instruction(&prompt, Recovery::Fresh);
 
         self.run_tools
             .lock()
@@ -2290,204 +2399,253 @@ impl TaskExecutor {
                 message: format!("Starting Claude agent in {}", working_dir),
             });
 
-            // Start Claude runner
-            let runner = match ClaudeRunner::start(ClaudeRunConfig {
-                prompt,
-                working_dir: claude_cwd.clone(),
-                // `permission_mode: None` passes --dangerously-skip-permissions.
-                tools: ToolAccess::Full {
-                    auto_approve: vec![
-                        "Read".to_string(), "Edit".to_string(), "Write".to_string(),
-                        "Bash".to_string(), "Glob".to_string(), "Grep".to_string(),
-                    ],
-                    permission_mode: None,
-                },
-                max_turns: Some(50),
-                max_budget_usd: None,
-                session_id: Some(Uuid::new_v4().to_string()),
-                resume_session: None,
-                model: task_model,
-                system_prompt: None,
-                append_system_prompt: None,
-                disable_mcp: false,
-                additional_dirs: claude_add_dirs.clone(),
-            }).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = format!("Failed to start claude: {}", e);
-                    record_output(&logs, execution_id, LogLevel::Error, msg.clone()).await;
-                    let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id), timeline_reason: None };
-                    Self::set_task_error_static(&tasks, &storage, &events, task_id, &msg, Some(ended)).await;
-                    // This early return skips the removal after `runner.wait()`
-                    // below, so it must remove itself here or this slot never
-                    // frees up.
-                    running_handles.write().await.remove(&task_id);
+            // Start Claude runner. A resume that finds no conversation to
+            // resume goes round once more as a fresh start in the same run,
+            // on the same checkout, holding the same capacity and ownership;
+            // nothing else loops.
+            let mut mode = launch;
+            let mut first_launch = true;
+            let (runner, mut event_drain, ending, stopped) = loop {
+                let resuming = matches!(mode, Launch::Resume { .. });
+                let (launch_prompt, launch_session_id, launch_resume) = match &mode {
+                    Launch::Normal => (prompt.clone(), Some(Uuid::new_v4().to_string()), None),
+                    // The conversation carries its own id; asking for a new
+                    // one beside it is not what `--resume` means.
+                    Launch::Resume { session_id } => (resume_prompt.clone(), None, Some(session_id.clone())),
+                    Launch::Reconcile { .. } => (reconcile_prompt.clone(), Some(Uuid::new_v4().to_string()), None),
+                };
+                let runner = match ClaudeRunner::start(ClaudeRunConfig {
+                    prompt: launch_prompt,
+                    working_dir: claude_cwd.clone(),
+                    // `permission_mode: None` passes --dangerously-skip-permissions.
+                    tools: ToolAccess::Full {
+                        auto_approve: vec![
+                            "Read".to_string(), "Edit".to_string(), "Write".to_string(),
+                            "Bash".to_string(), "Glob".to_string(), "Grep".to_string(),
+                        ],
+                        permission_mode: None,
+                    },
+                    max_turns: Some(50),
+                    max_budget_usd: None,
+                    session_id: launch_session_id,
+                    resume_session: launch_resume,
+                    model: task_model.clone(),
+                    system_prompt: None,
+                    append_system_prompt: None,
+                    disable_mcp: false,
+                    additional_dirs: claude_add_dirs.clone(),
+                }).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let msg = format!("Failed to start claude: {}", e);
+                        record_output(&logs, execution_id, LogLevel::Error, msg.clone()).await;
+                        let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id), timeline_reason: None };
+                        Self::set_task_error_static(&tasks, &storage, &events, task_id, &msg, Some(ended)).await;
+                        // This early return skips the removal after `runner.wait()`
+                        // below, so it must remove itself here or this slot never
+                        // frees up.
+                        running_handles.write().await.remove(&task_id);
+                        if let Some(exec) = executions.write().await.get_mut(&execution_id) {
+                            exec.status = AgentStatus::Failed(msg.clone());
+                            exec.stopped_at = Some(chrono::Utc::now());
+                        }
+                        announcer.end = AgentStatus::Failed(msg.clone());
+                        // Announced last, as the end of every run is: see below.
+                        events.agent_event(AgentEvent::Error {
+                            task_id: task_id.to_string(),
+                            message: msg,
+                        });
+                        return;
+                    }
+                };
+
+                // Update status. Once per run: a fresh start after a resume that
+                // found nothing is the same run still going, not a new one.
+                if first_launch {
+                    first_launch = false;
                     if let Some(exec) = executions.write().await.get_mut(&execution_id) {
-                        exec.status = AgentStatus::Failed(msg.clone());
-                        exec.stopped_at = Some(chrono::Utc::now());
+                        exec.status = AgentStatus::Running;
                     }
-                    announcer.end = AgentStatus::Failed(msg.clone());
-                    // Announced last, as the end of every run is: see below.
-                    events.agent_event(AgentEvent::Error {
+                    events.agent_event(AgentEvent::RunState {
                         task_id: task_id.to_string(),
-                        message: msg,
+                        status: AgentStatus::Running,
                     });
-                    return;
+
+                    events.agent_event(AgentEvent::PhaseChange {
+                        task_id: task_id.to_string(),
+                        phase: TaskPhase::Coding,
+                        progress: 10,
+                    });
                 }
-            };
 
-            // Update status
-            if let Some(exec) = executions.write().await.get_mut(&execution_id) {
-                exec.status = AgentStatus::Running;
-            }
-            events.agent_event(AgentEvent::RunState {
-                task_id: task_id.to_string(),
-                status: AgentStatus::Running,
-            });
+                // Forward the run's events to the frontend, buffering its tool
+                // calls for the write that ends the run.
+                let mut event_drain = Some(RunEventForwarder {
+                    task_id,
+                    run,
+                    execution_id,
+                    logs: logs.clone(),
+                    events: events.clone(),
+                    tasks: tasks.clone(),
+                    storage: storage.clone(),
+                    resumed: resuming,
+                    run_tools: run_tools.clone(),
+                    working_dir: working_dir.clone(),
+                }
+                .spawn(runner.subscribe()));
 
-            events.agent_event(AgentEvent::PhaseChange {
-                task_id: task_id.to_string(),
-                phase: TaskPhase::Coding,
-                progress: 10,
-            });
+                // Wait for the run to finish, or for a stop to end it early.
+                //
+                // Biased so that a process which has already exited is reported as
+                // the completion it is: when both arms are ready the run finished
+                // before the stop reached it, and calling that a cancellation would
+                // throw away a result the agent had already produced.
+                // How the run ended, announced only once the run is fully over:
+                // the failure recorded, the handle gone and the execution marked
+                // stopped. A listener that reacts by reading the task back then
+                // sees where it settled, not a run that still looks live.
+                let mut ending: Option<AgentEvent> = None;
+                let mut resume_missed = false;
+                let stopped = tokio::select! {
+                    biased;
 
-            // Forward the run's events to the frontend, buffering its tool
-            // calls for the write that ends the run.
-            let mut event_drain = Some(RunEventForwarder {
-                task_id,
-                run,
-                execution_id,
-                logs: logs.clone(),
-                events: events.clone(),
-                tasks: tasks.clone(),
-                run_tools: run_tools.clone(),
-                working_dir: working_dir.clone(),
-            }
-            .spawn(runner.subscribe()));
+                    result = runner.wait() => {
+                        // `wait` has joined the run's stdout reader, so every
+                        // event of this run is already sent. Handling them all
+                        // before the run's end is recorded is what puts its last
+                        // tool calls on the timeline.
+                        if let Some(drain) = event_drain.take() {
+                            drain.drain().await;
+                        }
+                        // Only a resume can miss, and only a run that ended in
+                        // failure can have: asked once, here, because the
+                        // classification reads the run's whole output.
+                        let missed = resuming
+                            && result.is_err()
+                            && crate::agents::runner::is_resume_session_miss(&runner.raw_stdout().await);
+                        match result {
+                            // The provider has no such conversation. Not a
+                            // failure of the task: the run goes on in a fresh
+                            // one, below.
+                            Err(_) if missed => resume_missed = true,
+                            Ok(_) => 'finished: {
+                                // A run whose work could not be committed has
+                                // not finished its task: it fails the same way a
+                                // failed run does, and is not reviewed.
+                                if let Err(message) =
+                                    Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await
+                                {
+                                    record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
+                                    let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id), timeline_reason: None };
+                                    Self::set_task_error_static(&tasks, &storage, &events, task_id, &message, Some(ended)).await;
+                                    ending = Some(AgentEvent::Error {
+                                        task_id: task_id.to_string(),
+                                        message,
+                                    });
+                                    break 'finished;
+                                }
 
-            // Wait for the run to finish, or for a stop to end it early.
-            //
-            // Biased so that a process which has already exited is reported as
-            // the completion it is: when both arms are ready the run finished
-            // before the stop reached it, and calling that a cancellation would
-            // throw away a result the agent had already produced.
-            // How the run ended, announced only once the run is fully over:
-            // the failure recorded, the handle gone and the execution marked
-            // stopped. A listener that reacts by reading the task back then
-            // sees where it settled, not a run that still looks live.
-            let mut ending: Option<AgentEvent> = None;
-            let stopped = tokio::select! {
-                biased;
-
-                result = runner.wait() => {
-                    // `wait` has joined the run's stdout reader, so every
-                    // event of this run is already sent. Handling them all
-                    // before the run's end is recorded is what puts its last
-                    // tool calls on the timeline.
-                    if let Some(drain) = event_drain.take() {
-                        drain.drain().await;
-                    }
-                    match result {
-                        Ok(_) => 'finished: {
-                            // A run whose work could not be committed has
-                            // not finished its task: it fails the same way a
-                            // failed run does, and is not reviewed.
-                            if let Err(message) =
-                                Self::commit_changes(&tasks, task_id, &working_dir_for_commit, &events).await
-                            {
-                                record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
-                                let ended = RunEnd { run, tools: take_run_tools(&run_tools, task_id), timeline_reason: None };
-                                Self::set_task_error_static(&tasks, &storage, &events, task_id, &message, Some(ended)).await;
+                                // The move to AI review, the run's end and its
+                                // tool calls are one durable write, published
+                                // only once it is on disk.
+                                let tools = take_run_tools(&run_tools, task_id);
+                                ending = Some(
+                                    match Self::record_run_completed(&tasks, &storage, task_id, run, tools.as_ref()).await {
+                                        Ok(()) => {
+                                            let completed = "Agent completed — moving to AI review".to_string();
+                                            record_output(&logs, execution_id, LogLevel::Info, completed.clone()).await;
+                                            AgentEvent::Completed {
+                                                task_id: task_id.to_string(),
+                                                success: true,
+                                                message: Some(completed),
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Nothing was published: memory and
+                                            // disk both still have the run in
+                                            // progress. A finish that cannot be
+                                            // recorded ends the run as a failure,
+                                            // the durable transition every other
+                                            // unfinished run takes.
+                                            let message = format!(
+                                                "The agent finished and its work was committed, but moving the \
+                                                 task to AI review could not be saved, so it was not reviewed: {e}"
+                                            );
+                                            record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
+                                            let ended = RunEnd { run, tools, timeline_reason: None };
+                                            Self::set_task_error_static(&tasks, &storage, &events, task_id, &message, Some(ended)).await;
+                                            AgentEvent::Error { task_id: task_id.to_string(), message }
+                                        }
+                                    },
+                                );
+                            }
+                            Err(err_msg) => {
+                                // Nothing on stderr or in the result event said
+                                // why: quote the end of the output instead, cut to
+                                // one bounded line so a transcript never becomes
+                                // the error.
+                                let full_msg = if err_msg.contains("no details") {
+                                    let stdout_output = runner.get_output().await;
+                                    let last_lines: String = stdout_output.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
+                                    if last_lines.is_empty() {
+                                        err_msg.clone()
+                                    } else {
+                                        format!(
+                                            "{} — {}",
+                                            err_msg,
+                                            crate::agents::runner::truncate_one_line_tail(&last_lines, 400)
+                                        )
+                                    }
+                                } else {
+                                    err_msg.clone()
+                                };
+                                record_output(&logs, execution_id, LogLevel::Error, full_msg.clone()).await;
+                                // The quoted output stays on the task's error; the
+                                // timeline keeps only why the run ended.
+                                let ended = RunEnd {
+                                    run,
+                                    tools: take_run_tools(&run_tools, task_id),
+                                    timeline_reason: (full_msg != err_msg).then(|| err_msg.clone()),
+                                };
+                                Self::set_task_error_static(&tasks, &storage, &events, task_id, &full_msg, Some(ended)).await;
                                 ending = Some(AgentEvent::Error {
                                     task_id: task_id.to_string(),
-                                    message,
+                                    message: full_msg,
                                 });
-                                break 'finished;
                             }
-
-                            // The move to AI review, the run's end and its
-                            // tool calls are one durable write, published
-                            // only once it is on disk.
-                            let tools = take_run_tools(&run_tools, task_id);
-                            ending = Some(
-                                match Self::record_run_completed(&tasks, &storage, task_id, run, tools.as_ref()).await {
-                                    Ok(()) => {
-                                        let completed = "Agent completed — moving to AI review".to_string();
-                                        record_output(&logs, execution_id, LogLevel::Info, completed.clone()).await;
-                                        AgentEvent::Completed {
-                                            task_id: task_id.to_string(),
-                                            success: true,
-                                            message: Some(completed),
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // Nothing was published: memory and
-                                        // disk both still have the run in
-                                        // progress. A finish that cannot be
-                                        // recorded ends the run as a failure,
-                                        // the durable transition every other
-                                        // unfinished run takes.
-                                        let message = format!(
-                                            "The agent finished and its work was committed, but moving the \
-                                             task to AI review could not be saved, so it was not reviewed: {e}"
-                                        );
-                                        record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
-                                        let ended = RunEnd { run, tools, timeline_reason: None };
-                                        Self::set_task_error_static(&tasks, &storage, &events, task_id, &message, Some(ended)).await;
-                                        AgentEvent::Error { task_id: task_id.to_string(), message }
-                                    }
-                                },
-                            );
                         }
-                        Err(err_msg) => {
-                            // Nothing on stderr or in the result event said
-                            // why: quote the end of the output instead, cut to
-                            // one bounded line so a transcript never becomes
-                            // the error.
-                            let full_msg = if err_msg.contains("no details") {
-                                let stdout_output = runner.get_output().await;
-                                let last_lines: String = stdout_output.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
-                                if last_lines.is_empty() {
-                                    err_msg.clone()
-                                } else {
-                                    format!(
-                                        "{} — {}",
-                                        err_msg,
-                                        crate::agents::runner::truncate_one_line_tail(&last_lines, 400)
-                                    )
-                                }
-                            } else {
-                                err_msg.clone()
-                            };
-                            record_output(&logs, execution_id, LogLevel::Error, full_msg.clone()).await;
-                            // The quoted output stays on the task's error; the
-                            // timeline keeps only why the run ended.
-                            let ended = RunEnd {
-                                run,
-                                tools: take_run_tools(&run_tools, task_id),
-                                timeline_reason: (full_msg != err_msg).then(|| err_msg.clone()),
-                            };
-                            Self::set_task_error_static(&tasks, &storage, &events, task_id, &full_msg, Some(ended)).await;
-                            ending = Some(AgentEvent::Error {
-                                task_id: task_id.to_string(),
-                                message: full_msg,
-                            });
-                        }
+                        false
                     }
-                    false
-                }
 
-                // Dropping the `wait()` future above releases the child,
-                // which is what lets the `kill()` in the shared cleanup below
-                // reach the process at all. `wait()` must not be entered
-                // again after that — it takes the child's stderr on its way
-                // in, so a second call would report a run with no output.
-                //
-                // A closed channel is treated the same as a stop on purpose:
-                // it means the executor is no longer tracking this run, and a
-                // run nothing is tracking is exactly what must not be left
-                // with a process behind it.
-                _ = cancelled.changed() => true,
+                    // Dropping the `wait()` future above releases the child,
+                    // which is what lets the `kill()` in the shared cleanup below
+                    // reach the process at all. `wait()` must not be entered
+                    // again after that — it takes the child's stderr on its way
+                    // in, so a second call would report a run with no output.
+                    //
+                    // A closed channel is treated the same as a stop on purpose:
+                    // it means the executor is no longer tracking this run, and a
+                    // run nothing is tracking is exactly what must not be left
+                    // with a process behind it.
+                    _ = cancelled.changed() => true,
+                };
+
+                if resume_missed && *cancelled.borrow() {
+                    // Stopped meanwhile: no fresh process for a run nobody
+                    // wants any more.
+                    let _ = runner.kill().await;
+                    break (runner, event_drain, ending, true);
+                }
+                if resume_missed {
+                    let _ = runner.kill().await;
+                    let note = "The interrupted agent session could not be resumed; \
+                                continuing in a fresh one on the same checkout";
+                    record_output(&logs, execution_id, LogLevel::Warn, note.to_string()).await;
+                    Self::record_resume_miss(&tasks, &storage, &events, task_id, run).await;
+                    mode = Launch::Reconcile { why: "the provider had no such conversation" };
+                    continue;
+                }
+                break (runner, event_drain, ending, stopped);
             };
 
             if stopped {
@@ -4061,6 +4219,86 @@ impl TaskExecutor {
         }
     }
 
+    /// Attach the session the provider reported for `run` to its recovery
+    /// record, and note the resume as accepted when this launch resumed one.
+    /// Reporting a session clears `resume_attempted`: the provider accepted a
+    /// conversation of its own. Does nothing for a run that is no longer the
+    /// record's.
+    async fn record_session_reported(
+        tasks: &Tasks,
+        storage: &crate::config::Storage,
+        task_id: Uuid,
+        run: u32,
+        session_id: &str,
+        resumed: bool,
+    ) -> Result<(), String> {
+        let revise = |staged: &mut HashMap<Uuid, Task>| {
+            let Some(t) = staged.get_mut(&task_id) else { return false };
+            let Some(recovery) = t
+                .run_recovery
+                .as_mut()
+                .filter(|r| r.run == run && r.state == RunRecoveryState::Running)
+            else {
+                // Not this run's record any more: the run has ended, or a
+                // newer one replaced it.
+                return false;
+            };
+            let mut changed = false;
+            if recovery.session_id.as_deref() != Some(session_id) {
+                recovery.session_id = Some(session_id.to_string());
+                changed = true;
+            }
+            // A process reporting a conversation of its own is one the
+            // provider accepted: its own interruption gets its own resume.
+            if std::mem::take(&mut recovery.resume_attempted) {
+                changed = true;
+            }
+            if resumed {
+                changed |= t.record_activity(ActivityKind::SessionResumed { run });
+            }
+            changed
+        };
+        crate::lifecycle::record_if_changed(tasks, storage, task_id, &revise).await.map(|_| ())
+    }
+
+    /// Record that the resume of `run`'s predecessor found no conversation,
+    /// and the run is continuing in a fresh one.
+    ///
+    /// The session id stays out of the record: it names nothing the provider
+    /// has. The resume stays marked attempted until the fresh process
+    /// reports a session of its own, so a crash in between does not try the
+    /// same conversation again. A write that fails is only logged: the
+    /// record then still says what it said, which is just as conservative.
+    async fn record_resume_miss(
+        tasks: &Tasks,
+        storage: &crate::config::Storage,
+        events: &SharedEventSink,
+        task_id: Uuid,
+        run: u32,
+    ) {
+        let amend = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
+                // Only while the record is still this run's: a stop that
+                // landed first has cleared it and written its own end.
+                if let Some(recovery) = t.run_recovery.as_mut().filter(|r| r.run == run) {
+                    recovery.session_id = None;
+                    recovery.resume_attempted = true;
+                    t.record_activity(ActivityKind::SessionUnavailable {
+                        run,
+                        reason: "The provider no longer had the interrupted run's session".to_string(),
+                    });
+                }
+            }
+        };
+        if let Err(e) = crate::lifecycle::record(tasks, storage, task_id, &amend).await {
+            events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message: format!("Recording that the interrupted session was unavailable failed: {e}"),
+            });
+        }
+    }
+
     /// Move a task whose run finished and whose work is committed on to AI
     /// review, durably before the board can show it: the status, the review
     /// phase, the run's tool calls and its [`ActivityKind::RunCompleted`] are
@@ -4079,6 +4317,8 @@ impl TaskExecutor {
                 t.phase = TaskPhase::QaReview;
                 t.phase_progress = 80;
                 t.overall_progress = 80;
+                // Finished while SlashIt watched: nothing left to recover.
+                t.run_recovery = None;
                 if let Some(tools) = tools {
                     tools.apply_to(t);
                 }
@@ -4117,6 +4357,12 @@ impl TaskExecutor {
                 t.status = TaskStatus::Error;
                 t.phase = TaskPhase::Failed;
                 t.error_message = Some(msg_owned.clone());
+                // A run that ended in failure while SlashIt watched is not an
+                // interrupted one. A task that failed before any run began
+                // keeps what the earlier interruption left.
+                if run.is_some() {
+                    t.run_recovery = None;
+                }
                 if let Some(tools) = &tools {
                     tools.apply_to(t);
                 }
@@ -4883,6 +5129,8 @@ mod tests {
             logs: executor.logs.clone(),
             events: executor.events.clone(),
             tasks: executor.tasks.clone(),
+            storage: executor.storage.clone(),
+            resumed: false,
             run_tools: executor.run_tools.clone(),
             working_dir: "/nowhere".into(),
         }
@@ -10336,7 +10584,7 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
     mod run_supervision {
         use super::*;
 
-        fn run_states(recording: &crate::events::RecordingEventSink, task_id: Uuid) -> Vec<serde_json::Value> {
+        pub(super) fn run_states(recording: &crate::events::RecordingEventSink, task_id: Uuid) -> Vec<serde_json::Value> {
             recording
                 .recorded()
                 .into_iter()
@@ -10378,8 +10626,6 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             }
             panic!("the run never reported {wanted:?}: {:?}", executor.task_run(task_id).await);
         }
-
-        // matrix 1, 10
         #[tokio::test]
         async fn a_queued_task_is_not_live_even_while_it_waits_for_capacity() {
             let (executor, _temps) = test_executor();
@@ -10402,8 +10648,6 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             assert_eq!(live.len(), 3);
             assert!(live.iter().all(|r| r.task_id != queued_id && r.status == AgentStatus::Running));
         }
-
-        // matrix 2, 9
         #[tokio::test]
         async fn a_persisted_in_progress_task_with_no_owned_run_is_not_live() {
             let (executor, _temps) = test_executor();
@@ -10420,8 +10664,6 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             }
             assert!(executor.live_runs().await.is_empty(), "a restart owns nothing until a run starts");
         }
-
-        // matrix 3
         #[tokio::test]
         async fn a_registered_run_that_has_not_recorded_its_execution_is_starting() {
             let (executor, _temps) = test_executor();
@@ -10441,8 +10683,6 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             assert_eq!(run.status, Some(AgentStatus::Starting));
             assert_eq!(executor.live_runs().await, vec![LiveRun { task_id, status: AgentStatus::Starting }]);
         }
-
-        // matrix 4, 12
         #[tokio::test]
         async fn an_owned_run_reports_what_its_execution_recorded_and_never_waits_for_input() {
             let (executor, _temps) = test_executor();
@@ -10460,8 +10700,6 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             assert_eq!(wire["status"], "running");
             assert!(!wire.to_string().contains("waiting"), "{wire}");
         }
-
-        // matrix 13
         #[tokio::test]
         async fn parallel_runs_are_each_reported_for_their_own_task() {
             let (executor, _temps) = test_executor();
@@ -10645,8 +10883,6 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             assert!(!executor.task_run(task_id).await.live);
             assert!(executor.live_runs().await.is_empty());
         }
-
-        // matrix 8
         #[tokio::test]
         async fn a_stop_in_progress_is_stopping_until_the_run_is_gone() {
             let recording = Arc::new(crate::events::RecordingEventSink::new());
@@ -10728,15 +10964,15 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
         }
 
         #[cfg(unix)]
-        struct Real {
-            executor: Arc<TaskExecutor>,
-            recording: Arc<crate::events::RecordingEventSink>,
-            _temps: Vec<tempfile::TempDir>,
-            task_id: Uuid,
+        pub(super) struct Real {
+            pub(super) executor: Arc<TaskExecutor>,
+            pub(super) recording: Arc<crate::events::RecordingEventSink>,
+            pub(super) _temps: Vec<tempfile::TempDir>,
+            pub(super) task_id: Uuid,
         }
 
         #[cfg(unix)]
-        async fn real_world() -> Real {
+        pub(super) async fn real_world() -> Real {
             let recording = Arc::new(crate::events::RecordingEventSink::new());
             let (executor, temps) = test_executor_with_events(recording.clone());
             let (repo, task_id, _) =
@@ -10757,8 +10993,6 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             executor.storage.save_project_tasks(project_id, &board).expect("seed the board");
             Real { executor, recording, _temps: temps, task_id }
         }
-
-        // matrix 3, 4, 5-by-silence, 6, 12, 14
         #[cfg(unix)]
         #[tokio::test]
         async fn a_real_run_is_starting_then_working_then_gone_with_nothing_stale() {
@@ -10819,8 +11053,6 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                 "the end is announced last"
             );
         }
-
-        // matrix 7
         #[cfg(unix)]
         #[tokio::test]
         async fn a_failed_run_is_announced_as_failed_and_the_task_still_fails_as_before() {
@@ -10854,8 +11086,6 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                 "the last word is the failure: {states:?}"
             );
         }
-
-        // matrix 8 on a real process
         #[cfg(unix)]
         #[tokio::test]
         async fn stopping_a_real_run_announces_stopping_and_then_that_it_is_gone() {
@@ -10880,6 +11110,558 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
                 ],
                 "the run's own end, and the stop's repeat of it"
             );
+        }
+    }
+
+    // ---- Resuming an interrupted coding run's provider session ----
+    //
+    // A real executor and real checkouts, with a stand-in `claude` that
+    // behaves as the tests' files say: reports the session it is told to,
+    // holds until released, or answers a resume the way the CLI does when it
+    // has no such conversation.
+    #[cfg(unix)]
+    mod session_recovery {
+        use super::run_supervision::{real_world, run_states, Real};
+        use super::*;
+        use crate::domain::task::{CheckoutIdentity, RunRecovery, RunRecoveryState};
+        use slashit_activity::Kind;
+
+        /// What the CLI printed, in this shape, for a `--resume` with no such
+        /// conversation (Claude Code 2.1.292).
+        const MISS: &str = r#"{"type":"result","subtype":"error_during_execution","duration_ms":0,"is_error":true,"num_turns":0,"session_id":"asked-for","errors":["No conversation found with session ID: asked-for"]}"#;
+
+        struct Agent {
+            fake: crate::test_helpers::FakeProgram,
+            dir: tempfile::TempDir,
+        }
+
+        impl Agent {
+            async fn install() -> Self {
+                let dir = tempfile::tempdir().unwrap();
+                let d = dir.path().display();
+                let script = format!(
+                    r#"dir='{d}'
+n=$(ls "$dir" | grep -c '^stdin\.')
+cat > "$dir/stdin.$n"
+mode=normal
+case " $* " in *" --resume "*) mode=$(cat "$dir/resume_mode"); cp "$(cat "$dir/taskfile")" "$dir/seen_at_start";; esac
+if [ "$mode" = hookfail ]; then
+  printf '%s\n' '{{"type":"system","subtype":"hook_started","session_id":"hook-id"}}'
+  printf '%s\n' '{{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"errors":["Could not reach the API"]}}'
+  exit 1
+fi
+if [ "$mode" = miss ]; then
+  printf '%s\n' '{MISS}'
+  echo 'No conversation found with session ID: asked-for' >&2
+  exit 1
+fi
+if [ -e "$dir/prehold" ] && [ "$mode" = normal ]; then
+  : > "$dir/prehold_reached"
+  while [ ! -e "$dir/prego" ]; do sleep 0.05; done
+fi
+if [ "$mode" = block ]; then
+  : > "$dir/blocked"
+  while [ ! -e "$dir/go" ]; do sleep 0.05; done
+fi
+if [ "$mode" = ok ]; then id=s-resumed
+elif [ -e "$dir/report_id" ]; then id=$(cat "$dir/report_id")
+else id=reported-$n; fi
+printf '{{"type":"system","subtype":"hook_started","session_id":"hook-id-%s"}}\n' "$n"
+if [ ! -e "$dir/silent" ]; then
+  printf '{{"type":"system","subtype":"init","session_id":"%s","model":"m"}}\n' "$id"
+fi
+printf 'work\n' > "work_$n.txt"
+if [ -e "$dir/hold" ]; then
+  : > "$dir/blocked"
+  while [ ! -e "$dir/go" ]; do sleep 0.05; done
+fi
+if [ -e "$dir/fail" ]; then echo 'broke' >&2; exit 3; fi
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"done"}}'
+"#
+                );
+                let fake = crate::test_helpers::FakeProgram::install("claude", &script).await;
+                let agent = Self { fake, dir };
+                agent.set("resume_mode", "ok");
+                agent
+            }
+            fn set(&self, name: &str, contents: &str) {
+                std::fs::write(self.dir.path().join(name), contents).unwrap();
+            }
+            fn has(&self, name: &str) -> bool {
+                self.dir.path().join(name).exists()
+            }
+            fn stdin(&self, n: usize) -> String {
+                std::fs::read_to_string(self.dir.path().join(format!("stdin.{n}"))).unwrap_or_default()
+            }
+            /// Each time the CLI was started, its arguments.
+            fn calls(&self) -> Vec<String> {
+                self.fake.invocations().lines().map(|l| l.trim_start_matches("\"claude\" ").to_string()).collect()
+            }
+            async fn until(&self, name: &str) {
+                for _ in 0..400 {
+                    if self.has(name) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("the stand-in CLI never wrote {name}");
+            }
+        }
+
+        async fn task_of(w: &Real) -> Task {
+            w.executor.tasks.read().await[&w.task_id].clone()
+        }
+
+        async fn until_ended(w: &Real) {
+            for _ in 0..400 {
+                if !w.executor.task_run(w.task_id).await.live {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            panic!("the run never ended: {:?}", w.executor.task_run(w.task_id).await);
+        }
+
+        /// Run the task once, normally, to the end: it leaves its checkout.
+        async fn first_run(w: &Real, agent: &Agent) {
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            until_ended(w).await;
+            assert_eq!(task_of(w).await.status, TaskStatus::AiReview);
+            assert_eq!(agent.calls().len(), 1);
+            // Where a resume's process can read what is on disk when it starts.
+            let file = w.executor.storage.tasks_file_for_tests(task_of(w).await.project_id);
+            agent.set("taskfile", &file.display().to_string());
+        }
+
+        /// The task as a crash during run 1, then a start-up, leaves it.
+        async fn crash_during_run_one(w: &Real, session: Option<&str>, attempted: bool) {
+            let mut tasks = w.executor.tasks.write().await;
+            let t = tasks.get_mut(&w.task_id).unwrap();
+            let checkout = t.checkout_identity().expect("the first run recorded its checkout");
+            t.status = TaskStatus::InProgress;
+            t.phase = TaskPhase::Idle;
+            t.run_recovery = Some(RunRecovery {
+                run: 1,
+                checkout,
+                session_id: session.map(str::to_string),
+                state: RunRecoveryState::Interrupted,
+                resume_attempted: attempted,
+            });
+        }
+
+        fn kinds(task: &Task) -> Vec<Kind> {
+            task.activity.iter().map(|e| e.kind.clone()).collect()
+        }
+
+        async fn free_permits(executor: &TaskExecutor) -> usize {
+            let mut held = Vec::new();
+            while let Some(permit) = executor.admission.try_acquire() {
+                held.push(permit);
+            }
+            held.len()
+        }
+        #[tokio::test]
+        async fn a_run_records_the_session_the_provider_reports_and_not_the_one_asked_for() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            agent.set("hold", "");
+            agent.set("report_id", "chosen-by-the-provider");
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            agent.until("blocked").await;
+
+            let task = task_of(&w).await;
+            let recovery = task.run_recovery.clone().expect("a run in flight is recorded");
+            assert_eq!(recovery.run, 1);
+            assert_eq!(recovery.state, RunRecoveryState::Running);
+            assert!(!recovery.resume_attempted);
+            assert_eq!(recovery.session_id.as_deref(), Some("chosen-by-the-provider"));
+            assert_eq!(Some(recovery.checkout), task.checkout_identity());
+            let asked_for = agent.calls()[0].clone();
+            assert!(asked_for.contains("--session-id "), "{asked_for}");
+            assert!(!asked_for.contains("chosen-by-the-provider"), "{asked_for}");
+            // It is on disk, not only on the board.
+            let saved = w.executor.storage.load_project_tasks(task.project_id).unwrap();
+            let saved = saved.iter().find(|t| t.id == w.task_id).unwrap();
+            assert_eq!(saved.run_recovery.as_ref().and_then(|r| r.session_id.as_deref()), Some("chosen-by-the-provider"));
+
+            agent.set("go", "");
+            until_ended(&w).await;
+            let task = task_of(&w).await;
+            assert_eq!(task.status, TaskStatus::AiReview);
+            assert!(task.run_recovery.is_none(), "a run that finished is nothing to recover");
+            assert!(!kinds(&task).iter().any(|k| matches!(k, Kind::SessionResumeAttempted { .. } | Kind::SessionUnavailable { .. })));
+        }
+        #[tokio::test]
+        async fn a_provider_that_reports_no_session_does_not_fail_the_run() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            agent.set("silent", "");
+            agent.set("hold", "");
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            agent.until("blocked").await;
+            assert_eq!(task_of(&w).await.run_recovery.unwrap().session_id, None);
+            agent.set("go", "");
+            until_ended(&w).await;
+
+            let task = task_of(&w).await;
+            assert_eq!(task.status, TaskStatus::AiReview);
+            assert!(task.run_recovery.is_none());
+        }
+        #[tokio::test]
+        async fn a_run_that_failed_while_watched_is_not_left_looking_interrupted() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            agent.set("fail", "");
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            until_ended(&w).await;
+
+            let task = task_of(&w).await;
+            assert_eq!(task.status, TaskStatus::Error);
+            assert!(task.run_recovery.is_none());
+        }
+        #[tokio::test]
+        async fn an_interrupted_run_is_resumed_by_the_reported_id_with_the_reconcile_instruction() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            first_run(&w, &agent).await;
+            crash_during_run_one(&w, Some("s-old"), false).await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            until_ended(&w).await;
+
+            let calls = agent.calls();
+            assert_eq!(calls.len(), 2, "{calls:?}");
+            assert!(calls[1].contains("--resume s-old"), "{}", calls[1]);
+            assert!(!calls[1].contains("--session-id"), "a resume names its conversation once: {}", calls[1]);
+            let prompt = agent.stdin(1);
+            assert!(prompt.contains("Do not assume the last action completed"), "{prompt}");
+            assert!(prompt.contains("# Task:"), "the recovery complements the task prompt: {prompt}");
+            assert!(!prompt.contains("s-old"), "internal ids stay out of the prompt");
+
+            let task = task_of(&w).await;
+            assert_eq!(task.status, TaskStatus::AiReview);
+            assert!(task.run_recovery.is_none());
+            let k = kinds(&task);
+            assert!(k.contains(&Kind::SessionResumeAttempted { run: 2 }), "{k:?}");
+            assert!(k.contains(&Kind::SessionResumed { run: 2 }), "{k:?}");
+            assert!(!k.iter().any(|k| matches!(k, Kind::SessionUnavailable { .. })), "{k:?}");
+        }
+        #[tokio::test]
+        async fn the_resume_is_on_disk_as_attempted_before_its_process_exists() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            first_run(&w, &agent).await;
+            crash_during_run_one(&w, Some("s-old"), false).await;
+            agent.set("resume_mode", "block");
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            agent.until("blocked").await;
+
+            // What the process itself found on disk the moment it started.
+            let seen = std::fs::read_to_string(agent.dir.path().join("seen_at_start")).unwrap();
+            assert!(seen.contains("resume_attempted = true"), "{seen}");
+            assert!(seen.contains("session_resume_attempted"), "{seen}");
+
+            let project_id = task_of(&w).await.project_id;
+            let saved = w.executor.storage.load_project_tasks(project_id).unwrap();
+            let saved = saved.into_iter().find(|t| t.id == w.task_id).unwrap();
+            let marker = saved.run_recovery.clone().expect("recorded");
+            assert_eq!(marker.run, 2);
+            assert!(marker.resume_attempted, "{marker:?}");
+            assert!(kinds(&saved).contains(&Kind::SessionResumeAttempted { run: 2 }));
+
+            // A crash here, then a start-up: the same session is not tried again.
+            let mut restarted = saved.clone();
+            restarted.status = TaskStatus::InProgress;
+            restarted.phase = TaskPhase::Coding;
+            assert!(crate::app_core::migrate_task(&mut restarted));
+            let recovery = restarted.run_recovery.as_ref().unwrap();
+            let checkout = restarted.checkout_identity().unwrap();
+            assert_eq!(recovery.resumable_session(&checkout), None);
+            assert!(matches!(
+                Launch::decide(Some(recovery), &checkout, false),
+                Launch::Reconcile { .. }
+            ));
+
+            agent.set("go", "");
+            until_ended(&w).await;
+        }
+        #[tokio::test]
+        async fn a_resume_miss_continues_in_exactly_one_fresh_run_on_the_same_checkout() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            first_run(&w, &agent).await;
+            let before = task_of(&w).await;
+            let free_before = free_permits(&w.executor).await;
+            crash_during_run_one(&w, Some("s-gone"), false).await;
+            agent.set("resume_mode", "miss");
+            let states_before = run_states(&w.recording, w.task_id).len();
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            until_ended(&w).await;
+
+            let calls = agent.calls();
+            assert_eq!(calls.len(), 3, "first run, the resume, one fresh run: {calls:?}");
+            assert!(calls[1].contains("--resume s-gone"), "{}", calls[1]);
+            assert!(!calls[2].contains("--resume"), "{}", calls[2]);
+            assert!(calls[2].contains("--session-id"), "{}", calls[2]);
+            assert!(agent.stdin(1).contains("Do not assume the last action completed"));
+            let fresh = agent.stdin(2);
+            assert!(fresh.contains("could not be resumed"), "{fresh}");
+            assert!(fresh.contains("Keep the correct work that is already there"), "{fresh}");
+            assert!(!fresh.to_lowercase().contains("revert") && !fresh.to_lowercase().contains("reset"), "{fresh}");
+
+            let task = task_of(&w).await;
+            assert_eq!(task.status, TaskStatus::AiReview, "a miss does not fail the task: {:?}", task.error_message);
+            assert_eq!(task.worktree_path, before.worktree_path);
+            assert_eq!(task.branch_name, before.branch_name);
+            assert!(
+                std::path::Path::new(task.worktree_path.as_ref().unwrap()).join("work_0.txt").exists(),
+                "the earlier work was kept"
+            );
+            let k = kinds(&task);
+            assert_eq!(k.iter().filter(|k| matches!(k, Kind::SessionUnavailable { .. })).count(), 1, "{k:?}");
+            assert!(k.contains(&Kind::SessionResumeAttempted { run: 2 }));
+            assert!(!k.iter().any(|k| matches!(k, Kind::SessionResumed { .. })), "{k:?}");
+
+            // One run, one set of announcements: the fresh start is not a new run.
+            let states = run_states(&w.recording, w.task_id);
+            assert_eq!(
+                states[states_before..],
+                [serde_json::json!("starting"), serde_json::json!("running"), serde_json::json!("stopped")]
+            );
+            assert!(w.executor.live_runs().await.is_empty());
+            assert_eq!(free_permits(&w.executor).await, free_before, "capacity was drawn once and returned once");
+        }
+
+        // restart during recovery, matrix 17, 18, 19, and the whole journey
+        #[tokio::test]
+        async fn restart_resume_miss_fresh_fallback_never_loops() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            first_run(&w, &agent).await;
+
+            // Run 1 was cut off in flight: the record a crash leaves, and the
+            // task still `InProgress` and working, which a start-up reads.
+            crash_during_run_one(&w, Some("s-gone"), false).await;
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let t = tasks.get_mut(&w.task_id).unwrap();
+                t.phase = TaskPhase::Coding;
+                t.run_recovery.as_mut().unwrap().state = RunRecoveryState::Running;
+                assert!(crate::app_core::migrate_task(t));
+                assert_eq!(t.status, TaskStatus::Queue);
+                assert_eq!(t.run_recovery.as_ref().unwrap().state, RunRecoveryState::Interrupted);
+                // The queue promotes it again.
+                t.status = TaskStatus::InProgress;
+            }
+            agent.set("resume_mode", "miss");
+            // The fresh fallback stops before it reports a session, which is
+            // where a second crash would find it.
+            agent.set("prehold", "");
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            agent.until("prehold_reached").await;
+
+            let mut second_crash = task_of(&w).await;
+            second_crash.status = TaskStatus::InProgress;
+            second_crash.phase = TaskPhase::Coding;
+            assert!(crate::app_core::migrate_task(&mut second_crash));
+            let checkout = second_crash.checkout_identity().unwrap();
+            let recovery = second_crash.run_recovery.as_ref().unwrap();
+            assert_eq!(recovery.resumable_session(&checkout), None, "{recovery:?}");
+            assert!(matches!(Launch::decide(Some(recovery), &checkout, false), Launch::Reconcile { .. }));
+
+            agent.set("prego", "");
+            until_ended(&w).await;
+            assert_eq!(task_of(&w).await.status, TaskStatus::AiReview);
+            // The resume was tried once, in total.
+            assert_eq!(agent.calls().iter().filter(|c| c.contains("--resume")).count(), 1);
+
+            // A later, genuinely new run has its own record and its own session.
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let t = tasks.get_mut(&w.task_id).unwrap();
+                t.status = TaskStatus::InProgress;
+                t.phase = TaskPhase::Idle;
+            }
+            agent.set("hold", "");
+            agent.set("report_id", "second-attempt");
+            std::fs::remove_file(agent.dir.path().join("prehold")).unwrap();
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            agent.until("blocked").await;
+            let recovery = task_of(&w).await.run_recovery.unwrap();
+            assert_eq!(recovery.run, 3);
+            assert_eq!(recovery.session_id.as_deref(), Some("second-attempt"));
+            assert!(!agent.calls().last().unwrap().contains("--resume"));
+            agent.set("go", "");
+            until_ended(&w).await;
+        }
+        #[tokio::test]
+        async fn a_replaced_checkout_does_not_reuse_the_old_session() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            first_run(&w, &agent).await;
+            crash_during_run_one(&w, Some("s-old"), false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .run_recovery
+                .as_mut()
+                .unwrap()
+                .checkout
+                .base_commit = Some("0123456789abcdef".to_string());
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            until_ended(&w).await;
+
+            let calls = agent.calls();
+            assert!(!calls[1].contains("--resume"), "{}", calls[1]);
+            assert!(!agent.stdin(1).contains("## Recovery"));
+            assert!(!kinds(&task_of(&w).await).iter().any(|k| matches!(k, Kind::SessionResumeAttempted { .. })));
+        }
+        #[tokio::test]
+        async fn stopping_a_resumed_run_leaves_no_process_and_nothing_to_recover() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            first_run(&w, &agent).await;
+            crash_during_run_one(&w, Some("s-old"), false).await;
+            agent.set("resume_mode", "block");
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            agent.until("blocked").await;
+            w.executor.stop_task(w.task_id).await.expect("stop");
+
+            assert!(!w.executor.task_run(w.task_id).await.live);
+            let task = task_of(&w).await;
+            assert_eq!(task.status, TaskStatus::Backlog);
+            assert!(task.run_recovery.is_none(), "a person's stop is not a crash to recover");
+            assert_eq!(agent.calls().len(), 2, "no further process was started: {:?}", agent.calls());
+            assert!(!kinds(&task).iter().any(|k| matches!(k, Kind::SessionUnavailable { .. })));
+        }
+
+        #[tokio::test]
+        async fn the_session_a_run_reported_is_the_one_that_gets_resumed() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            agent.set("hold", "");
+            agent.set("report_id", "provider-chose-this");
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            agent.until("blocked").await;
+            // The record as the run itself wrote it, then the run is let go.
+            let captured = task_of(&w).await.run_recovery.unwrap();
+            agent.set("go", "");
+            until_ended(&w).await;
+            let file = w.executor.storage.tasks_file_for_tests(task_of(&w).await.project_id);
+            agent.set("taskfile", &file.display().to_string());
+            std::fs::remove_file(agent.dir.path().join("hold")).unwrap();
+            std::fs::remove_file(agent.dir.path().join("report_id")).unwrap();
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let t = tasks.get_mut(&w.task_id).unwrap();
+                t.status = TaskStatus::InProgress;
+                t.phase = TaskPhase::Idle;
+                let mut recovery = captured;
+                recovery.state = RunRecoveryState::Interrupted;
+                t.run_recovery = Some(recovery);
+            }
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            until_ended(&w).await;
+            let resumed = agent.calls()[1].clone();
+            assert!(resumed.contains("--resume provider-chose-this"), "{resumed}");
+            assert!(!resumed.contains("hook-id"), "{resumed}");
+        }
+
+        #[tokio::test]
+        async fn a_resumed_run_that_reports_its_session_has_its_own_record() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            first_run(&w, &agent).await;
+            crash_during_run_one(&w, Some("s-old"), false).await;
+            agent.set("hold", "");
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            agent.until("blocked").await;
+
+            let recovery = task_of(&w).await.run_recovery.unwrap();
+            assert_eq!(recovery.session_id.as_deref(), Some("s-resumed"));
+            assert!(!recovery.resume_attempted, "an accepted session has its own resume budget");
+            assert!(kinds(&task_of(&w).await).contains(&Kind::SessionResumed { run: 2 }));
+            agent.set("go", "");
+            until_ended(&w).await;
+        }
+
+        #[tokio::test]
+        async fn a_resume_that_fails_for_another_reason_fails_the_task_and_starts_nothing_fresh() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            first_run(&w, &agent).await;
+            crash_during_run_one(&w, Some("s-old"), false).await;
+            agent.set("resume_mode", "hookfail");
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            until_ended(&w).await;
+
+            assert_eq!(agent.calls().len(), 2, "no fresh fallback: {:?}", agent.calls());
+            let task = task_of(&w).await;
+            assert_eq!(task.status, TaskStatus::Error);
+            assert!(!kinds(&task).iter().any(|k| matches!(k, Kind::SessionUnavailable { .. })));
+        }
+
+        #[tokio::test]
+        async fn a_second_start_after_a_resume_is_an_ordinary_one() {
+            let w = real_world().await;
+            let agent = Agent::install().await;
+            first_run(&w, &agent).await;
+            crash_during_run_one(&w, Some("s-old"), false).await;
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            until_ended(&w).await;
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let t = tasks.get_mut(&w.task_id).unwrap();
+                t.status = TaskStatus::InProgress;
+                t.phase = TaskPhase::Idle;
+            }
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            until_ended(&w).await;
+            assert_eq!(agent.calls().iter().filter(|c| c.contains("--resume")).count(), 1);
+        }
+
+        // The decision, alone.
+        #[test]
+        fn recovery_is_decided_conservatively() {
+            let checkout = CheckoutIdentity { path: "/w".into(), branch: "b".into(), base_commit: Some("c".into()) };
+            let interrupted = |session: Option<&str>, attempted: bool| RunRecovery {
+                run: 1,
+                checkout: checkout.clone(),
+                session_id: session.map(str::to_string),
+                state: RunRecoveryState::Interrupted,
+                resume_attempted: attempted,
+            };
+            assert_eq!(Launch::decide(None, &checkout, false), Launch::Normal);
+            assert_eq!(
+                Launch::decide(Some(&interrupted(Some("s"), false)), &checkout, false),
+                Launch::Resume { session_id: "s".into() }
+            );
+            // This start made the branch: it holds no earlier work.
+            assert_eq!(Launch::decide(Some(&interrupted(Some("s"), false)), &checkout, true), Launch::Normal);
+            // A run still marked running is not evidence of a crash.
+            let mut running = interrupted(Some("s"), false);
+            running.state = RunRecoveryState::Running;
+            assert_eq!(Launch::decide(Some(&running), &checkout, false), Launch::Normal);
+            let elsewhere = CheckoutIdentity { path: "/other".into(), ..checkout.clone() };
+            assert_eq!(Launch::decide(Some(&interrupted(Some("s"), false)), &elsewhere, false), Launch::Normal);
+            // Interrupted work with nothing usable to resume is reconciled afresh.
+            assert!(matches!(Launch::decide(Some(&interrupted(None, false)), &checkout, false), Launch::Reconcile { .. }));
+            assert!(matches!(Launch::decide(Some(&interrupted(Some("s"), true)), &checkout, false), Launch::Reconcile { .. }));
+            assert!(matches!(Launch::decide(Some(&interrupted(Some("  "), false)), &checkout, false), Launch::Reconcile { .. }));
         }
     }
 

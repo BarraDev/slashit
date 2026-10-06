@@ -86,3 +86,21 @@ helper reads the stream the same way through `result_failure_reason`.
   reported a failure, in the runner and the PR helper alike.
 - Every quoted piece is cut to one bounded line. The `errors` list is
   preferred over the `result` text, which is model-written in general.
+
+## Resuming a session
+
+Only the executor's coding run resumes (`queue/executor.rs`; the contract is
+in `docs/design/agent-runtime-and-conversations.md`). The runner's part:
+
+- `resume_session` becomes `--resume <id>`. Do not pass `session_id` beside
+  it: a resume names its conversation once.
+- The session a run belongs to is the one in the CLI's own `system`/`init`
+  event (`ClaudeEvent::SystemInit` with `message == "system:init"`), never
+  `config.session_id`, which is only what SlashIt asked for. Other `system`
+  lines, such as hooks, carry a session id before `init`, and a failed
+  resume's `result` echoes the id it was asked for.
+- `is_resume_session_miss` recognizes a resume whose conversation does not
+  exist, from the raw stdout of a failed run: an `error_during_execution`
+  result with `num_turns` 0 that names the missing session, and no `init` or
+  assistant output before it. Anything less is an ordinary failure. Keep it
+  that strict: a miss starts a fresh run, a failure stops the task.

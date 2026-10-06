@@ -186,6 +186,7 @@ mod tests {
                 branch_origin: None,
                 pending_republish: None,
                 cleanup_in_flight: false,
+                run_recovery: None,
                 position: 0,
                 pr_review_plan: None,
                 activity: Vec::new(),

@@ -443,3 +443,34 @@ fn the_next_run_counts_past_a_start_dropped_from_a_full_timeline() {
     let entries = vec![Entry { seq: 1, at: t(1), kind: Kind::RunFailed { run: Some(7), reason: "x".into() } }];
     assert_eq!(next_run(&entries), 8);
 }
+
+#[test]
+fn a_resume_is_attempted_once_and_has_one_outcome_per_run() {
+    let mut entries = Vec::new();
+    assert!(record(&mut entries, t(1), Kind::SessionResumeAttempted { run: 2 }));
+    assert!(!record(&mut entries, t(2), Kind::SessionResumeAttempted { run: 2 }));
+    assert!(record(&mut entries, t(3), Kind::SessionUnavailable { run: 2, reason: "gone".into() }));
+    assert!(!record(&mut entries, t(4), Kind::SessionResumed { run: 2 }), "one outcome per run");
+    assert!(record(&mut entries, t(5), Kind::SessionResumed { run: 3 }));
+    assert_eq!(entries.len(), 3);
+}
+
+#[test]
+fn the_timeline_tells_a_resume_from_a_fresh_fallback() {
+    let rows = |kind: Kind| {
+        let mut entries = Vec::new();
+        record(&mut entries, t(1), kind);
+        let items = timeline(t(0), [], &entries);
+        let item = &items[1];
+        (item.title(), item.detail(), item.tone(), item.kind_name())
+    };
+    let (title, _, tone, name) = rows(Kind::SessionResumed { run: 2 });
+    assert_eq!(title, "Agent session resumed");
+    assert_eq!((tone, name), (Tone::Good, "session_resumed"));
+    let (title, detail, tone, name) = rows(Kind::SessionUnavailable { run: 2, reason: "token=abc\nno session".into() });
+    assert_eq!(title, "Agent session unavailable, continuing with fresh context");
+    assert_eq!(detail.as_deref(), Some("token=*** no session"));
+    assert_eq!((tone, name), (Tone::Neutral, "session_unavailable"));
+    let (title, _, _, name) = rows(Kind::SessionResumeAttempted { run: 2 });
+    assert_eq!((title.as_str(), name), ("Resuming the interrupted agent session", "session_resume_attempted"));
+}

@@ -204,6 +204,13 @@ pub struct Task {
     #[serde(default)]
     pub pr_review_plan: Option<PrReviewPlan>,
 
+    /// What a restart needs to recover the latest coding run's provider
+    /// conversation, best effort. See [`RunRecovery`]. `None` for a task
+    /// written before this existed and for every run that ended while
+    /// SlashIt was watching, which is what "nothing to recover" means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_recovery: Option<RunRecovery>,
+
     /// Milestones nothing else on the record keeps, oldest first: runs, AI
     /// reviews, delivery, moves. Each is appended in the durable write of the
     /// transition it describes. History only -- nothing decides what the
@@ -217,6 +224,108 @@ pub struct Task {
 
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The Task Checkout a coding run worked in, as far as SlashIt can tell it
+/// apart from another one the same task later owns.
+///
+/// The working directory alone is not an identity: a checkout can be removed
+/// and made again at the same path. The branch name is derived from the task,
+/// so it repeats too. `base_commit` is resolved once when the branch is
+/// created and kept, so a checkout made again starts from whatever the base
+/// was then. The three together are what a recovery compares; any difference
+/// is a different lineage and the old provider conversation is not evidence
+/// about it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutIdentity {
+    pub path: String,
+    pub branch: String,
+    /// `None` for a checkout SlashIt adopted rather than created, which has
+    /// no recorded starting commit.
+    #[serde(default)]
+    pub base_commit: Option<String>,
+}
+
+/// Whether the run a [`RunRecovery`] describes is still in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunRecoveryState {
+    /// The run's process is owned by this SlashIt process, or was when it
+    /// stopped without finishing it. Only a start-up can tell the two apart,
+    /// and it turns every `Running` record into [`Self::Interrupted`] or
+    /// drops it.
+    Running,
+    /// A start-up found the run unfinished and no process behind it. The
+    /// only state a recovery acts on.
+    Interrupted,
+}
+
+/// Provider-session recovery metadata for one coding run, the latest one.
+///
+/// Belongs to the run, not to the task: it names the run, the checkout the
+/// run worked in and the conversation the provider reported for it. It sits
+/// on the task only because SlashIt has no durable run record of its own yet;
+/// the next run replaces it, and a run that ends while SlashIt is watching
+/// removes it, so a finished run is never mistaken for an interrupted one.
+///
+/// Resuming is a best-effort attempt and never a guarantee, and a resumed
+/// conversation does not prove the tool call it was interrupted in
+/// completed. Whatever a recovery starts is told to reconcile with the
+/// checkout first. See `docs/design/agent-runtime-and-conversations.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecovery {
+    /// The run, as its [`ActivityKind::RunStarted`] numbers it. Lets the
+    /// session reported for a run be attached to that run and no other.
+    pub run: u32,
+    /// The checkout the run worked in. A recovery only continues work in the
+    /// same one.
+    pub checkout: CheckoutIdentity,
+    /// The conversation the provider itself reported for the run, opaque.
+    /// Never the id SlashIt asked for: a requested id is not evidence that
+    /// the provider kept anything. `None` until the provider reports one,
+    /// and for a run it never reported one for, which has nothing to resume.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub state: RunRecoveryState,
+    /// Whether a resume of `session_id` was already started for this
+    /// interruption. Written before the resume process exists, so a crash
+    /// while it runs cannot make the next start try the same session again.
+    /// Cleared once a process reports a session of its own for the run: that
+    /// is a live conversation the provider accepted, with its own budget.
+    #[serde(default)]
+    pub resume_attempted: bool,
+}
+
+impl RunRecovery {
+    /// A run that has just started and has no session yet.
+    pub fn started(run: u32, checkout: CheckoutIdentity) -> Self {
+        Self {
+            run,
+            checkout,
+            session_id: None,
+            state: RunRecoveryState::Running,
+            resume_attempted: false,
+        }
+    }
+
+    /// The conversation a recovery may resume in `checkout`, if any.
+    ///
+    /// Conservative on purpose: anything uncertain is `None`, which is a
+    /// fresh start. Only an interrupted run, in the same
+    /// checkout, with a reported session that no resume was started for.
+    pub fn resumable_session(&self, checkout: &CheckoutIdentity) -> Option<&str> {
+        if self.resume_attempted || !self.is_interrupted_in(checkout) {
+            return None;
+        }
+        self.session_id.as_deref().filter(|id| !id.trim().is_empty())
+    }
+
+    /// Whether this is an interrupted run's record for `checkout`: earlier
+    /// work in it that a new run should reconcile with, whether or not its
+    /// conversation can be resumed.
+    pub fn is_interrupted_in(&self, checkout: &CheckoutIdentity) -> bool {
+        self.state == RunRecoveryState::Interrupted && self.checkout == *checkout
+    }
 }
 
 /// `text` with the user's home directory written as `~`, for text the task
@@ -295,6 +404,10 @@ impl Task {
     /// task is going back to work, and whatever the next run commits is not
     /// what was approved. See [`HumanReviewRecord::withdraw_approval`].
     pub fn reset_execution_state(&mut self) {
+        // A person moving, stopping or retrying the task is a new decision
+        // about the work; a crash recovery of the run it replaces no longer
+        // applies.
+        self.run_recovery = None;
         self.phase = TaskPhase::Idle;
         self.phase_progress = 0;
         self.overall_progress = 0;
@@ -373,6 +486,9 @@ impl Task {
     /// that is a move at all.
     pub fn record_move(&mut self, from: &TaskStatus) {
         if *from != self.status {
+            // A person moving the task is a new decision about the work: a
+            // run's crash recovery no longer applies, wherever it goes next.
+            self.run_recovery = None;
             let kind = ActivityKind::Moved { from: from.column(), to: self.status.column() };
             self.record_activity(kind);
         }
@@ -386,6 +502,37 @@ impl Task {
         } else if state.eq_ignore_ascii_case("CLOSED") {
             self.record_activity(ActivityKind::PrClosed { number });
         }
+    }
+
+    /// What a start-up does with a recovery record the previous process left.
+    ///
+    /// `was_running` is whether the task was mid-run: in progress, working.
+    /// Only then is a `Running` record an interrupted run. Anything else
+    /// left one behind -- a run that ended some way no record was kept for --
+    /// and it is dropped, so it can never pass for crash evidence later.
+    /// Returns whether anything changed.
+    pub fn settle_run_recovery_at_startup(&mut self, was_running: bool) -> bool {
+        match &mut self.run_recovery {
+            Some(recovery) if recovery.state == RunRecoveryState::Running => {
+                if was_running {
+                    recovery.state = RunRecoveryState::Interrupted;
+                } else {
+                    self.run_recovery = None;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Where the task's checkout is, as a recovery compares it, or `None`
+    /// while the task has no checkout recorded.
+    pub fn checkout_identity(&self) -> Option<CheckoutIdentity> {
+        Some(CheckoutIdentity {
+            path: self.worktree_path.clone()?,
+            branch: self.branch_name.clone()?,
+            base_commit: self.base_commit.clone(),
+        })
     }
 
     /// The number the task's next coding run gets.
@@ -1520,6 +1667,87 @@ mod tests {
                 Some(AttentionReason::PrNotCreated)
             ]
         );
+    }
+
+    /// A board written before recovery metadata existed loads with none, which
+    /// is the ordinary fresh behavior, and is written back without the key
+    /// until a run records one.
+    #[test]
+    fn a_task_written_before_run_recovery_existed_loads_with_none() {
+        assert!(!LEGACY_TASK_TOML.contains("run_recovery"));
+        let task: Task = toml::from_str(LEGACY_TASK_TOML).expect("no recovery metadata");
+        assert!(task.run_recovery.is_none());
+        assert!(!toml::to_string(&task).unwrap().contains("run_recovery"));
+    }
+
+    fn checkout() -> CheckoutIdentity {
+        CheckoutIdentity { path: "/w/t".into(), branch: "task/1".into(), base_commit: None }
+    }
+
+    /// A record survives the task file, with an adopted checkout's missing
+    /// starting commit and a session nobody reported.
+    #[test]
+    fn run_recovery_round_trips_through_the_task_file() {
+        let mut task: Task = toml::from_str(LEGACY_TASK_TOML).unwrap();
+        let mut recovery = RunRecovery::started(3, checkout());
+        task.run_recovery = Some(recovery.clone());
+        let back: Task = toml::from_str(&toml::to_string(&task).unwrap()).unwrap();
+        assert_eq!(back.run_recovery, Some(recovery.clone()));
+
+        recovery.session_id = Some("opaque id".into());
+        recovery.checkout.base_commit = Some("abc".into());
+        recovery.state = RunRecoveryState::Interrupted;
+        recovery.resume_attempted = true;
+        task.run_recovery = Some(recovery.clone());
+        let back: Task = toml::from_str(&toml::to_string(&task).unwrap()).unwrap();
+        assert_eq!(back.run_recovery, Some(recovery));
+    }
+
+    #[test]
+    fn only_an_interrupted_run_in_the_same_checkout_with_an_unused_session_resumes() {
+        let mut recovery = RunRecovery::started(1, checkout());
+        recovery.session_id = Some("s".into());
+        assert_eq!(recovery.resumable_session(&checkout()), None, "still marked running");
+        recovery.state = RunRecoveryState::Interrupted;
+        assert_eq!(recovery.resumable_session(&checkout()), Some("s"));
+        let moved = CheckoutIdentity { branch: "task/2".into(), ..checkout() };
+        assert_eq!(recovery.resumable_session(&moved), None);
+        let rebased = CheckoutIdentity { base_commit: Some("x".into()), ..checkout() };
+        assert_eq!(recovery.resumable_session(&rebased), None);
+        recovery.resume_attempted = true;
+        assert_eq!(recovery.resumable_session(&checkout()), None);
+    }
+
+    #[test]
+    fn a_start_up_turns_a_running_record_into_an_interruption_only_for_a_run_that_was_working() {
+        let mut task: Task = toml::from_str(LEGACY_TASK_TOML).unwrap();
+        task.run_recovery = Some(RunRecovery::started(1, checkout()));
+        assert!(task.settle_run_recovery_at_startup(true));
+        assert_eq!(task.run_recovery.as_ref().unwrap().state, RunRecoveryState::Interrupted);
+        assert!(!task.settle_run_recovery_at_startup(true), "settling is idempotent");
+
+        task.run_recovery = Some(RunRecovery::started(1, checkout()));
+        assert!(task.settle_run_recovery_at_startup(false));
+        assert!(task.run_recovery.is_none(), "a record with no run behind it is not evidence");
+    }
+
+    #[test]
+    fn a_person_moving_the_task_ends_what_a_crash_recovery_could_resume() {
+        let mut task: Task = toml::from_str(LEGACY_TASK_TOML).unwrap();
+        task.status = TaskStatus::Queue;
+        task.run_recovery = Some(RunRecovery::started(1, checkout()));
+        let from = task.status.clone();
+        task.status = TaskStatus::HumanReview;
+        task.record_move(&from);
+        assert!(task.run_recovery.is_none());
+    }
+
+    #[test]
+    fn a_person_resetting_the_task_ends_what_a_crash_recovery_could_resume() {
+        let mut task: Task = toml::from_str(LEGACY_TASK_TOML).unwrap();
+        task.run_recovery = Some(RunRecovery::started(1, checkout()));
+        task.reset_execution_state();
+        assert!(task.run_recovery.is_none());
     }
 
     /// A board written before activity was recorded loads with none, and is

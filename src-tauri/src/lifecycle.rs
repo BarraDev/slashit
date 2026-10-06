@@ -887,6 +887,8 @@ async fn commit(
                 // checkout that is gone, and a cleared path on a non-terminal
                 // task loses the only handle back to one that is not.
                 task.worktree_path = None;
+                // A run's recovery names the checkout this just removed.
+                task.run_recovery = None;
                 task.error_message = None;
             }
             Some((worktree_path, reason)) => {

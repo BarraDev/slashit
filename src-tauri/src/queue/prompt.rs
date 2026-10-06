@@ -110,6 +110,44 @@ pub fn build_task_prompt(task: &Task, project_path: Option<&str>) -> String {
     parts.join("\n")
 }
 
+/// How a coding run that follows an interrupted one is told to begin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// The interrupted run's provider conversation is being resumed.
+    Resumed,
+    /// There is earlier work in the checkout, but no conversation to resume.
+    Fresh,
+}
+
+/// `prompt` followed by what a run after an interruption must do first.
+///
+/// The interrupted run may have been cut off in the middle of a tool call.
+/// The provider keeps what was said, not whether that call ran, and a resume
+/// does not replay it, so neither a resumed conversation nor a fresh one may
+/// take the previous run's last step as done. The checkout is the work as it
+/// is, and the instruction is the same in both cases about that; it never
+/// asks for work to be discarded.
+pub fn with_recovery_instruction(prompt: &str, recovery: Recovery) -> String {
+    let situation = match recovery {
+        Recovery::Resumed => {
+            "SlashIt was interrupted during the previous coding run on this task. Its \
+             conversation continues here, but it may end with a tool call that has no \
+             recorded result. Do not assume the last action completed."
+        }
+        Recovery::Fresh => {
+            "There was earlier work on this task's checkout, but the conversation that did \
+             it could not be resumed. You are starting without it."
+        }
+    };
+    format!(
+        "{prompt}\n\n## Recovery\n{situation}\n\
+         Before continuing, inspect the current state of the working directory: the \
+         version-control status and diff, and the files the task concerns. Work out what \
+         was already done and what was only partly applied, and reconcile any partial \
+         work. Keep the correct work that is already there. Then continue the task."
+    )
+}
+
 /// `feedback` with any line that would read as one of the fence lines
 /// quoted, so the text cannot close its own section early.
 fn unfenced(feedback: &str) -> String {
@@ -187,6 +225,26 @@ mod tests {
     use crate::domain::task::{ExternalRef, Subtask};
     use crate::test_helpers::create_test_task;
     use uuid::Uuid;
+
+    #[test]
+    fn a_recovery_follows_the_task_prompt_and_asks_for_reconciliation_not_a_reset() {
+        let base = build_task_prompt(&create_test_task("Fix it"), Some("/w"));
+        for recovery in [Recovery::Resumed, Recovery::Fresh] {
+            let prompt = with_recovery_instruction(&base, recovery);
+            assert!(prompt.starts_with(&base), "the task prompt stays whole and first");
+            assert!(prompt.contains("inspect the current state of the working directory"));
+            assert!(prompt.contains("reconcile any partial work"));
+            assert!(prompt.contains("Keep the correct work that is already there"));
+            let lower = prompt[base.len()..].to_lowercase();
+            assert!(!lower.contains("revert") && !lower.contains("discard") && !lower.contains("start over"));
+        }
+        let resumed = with_recovery_instruction(&base, Recovery::Resumed);
+        assert!(resumed.contains("Do not assume the last action completed"));
+        assert!(!resumed.contains("could not be resumed"));
+        let fresh = with_recovery_instruction(&base, Recovery::Fresh);
+        assert!(fresh.contains("could not be resumed"));
+        assert!(!fresh.contains("Do not assume the last action completed"));
+    }
 
     // ──────────────────────────────────────────────
     // build_task_prompt tests

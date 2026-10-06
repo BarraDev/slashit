@@ -94,6 +94,85 @@ failures are terminalized rather than left as active records. `WaitingForInput`
 stays out of `AgentStatus` until a provider or protocol signal exists that can
 set it.
 
+## Resuming an interrupted coding run
+
+Provider-session resume covers normal coding Runs of Claude Code only. AI review and fix runs, PR helpers, the legacy ACP path, other
+providers, terminal reattach and process discovery are not covered.
+
+**What is kept.** While a coding Run is in flight, the Task carries one
+`RunRecovery` for it: the run number, the Task Checkout the Run
+worked in (path, branch, starting commit), the session id the provider
+reported, and whether a resume was already attempted for this interruption.
+It lives on the Task only because SlashIt has no durable Run record yet; it
+belongs to the Run and its checkout, and the Task never uses it as an
+identity. The next Run replaces it, and a Run that ends while SlashIt is
+watching (completed, failed, stopped), and any move of the task by a person,
+removes it. The
+record is deliberately in the task file, so an old file loads with none and
+means a normal fresh start. The Run's live ownership stays in memory only
+(see [Managed run supervision today](#managed-run-supervision-today)); this
+record never says that a process is alive.
+
+**Provider identity is opaque and reported, not requested.** The id is taken
+from the provider's own `system`/`init` event and from nothing else. The id
+SlashIt asks for with `--session-id` is not evidence that the provider kept
+anything, and a failed resume's `result` echoes the id it was asked for. No
+code reads the id's format.
+
+**A reported id does not prove a resumable conversation.** On Claude Code
+2.1.291, killing the process right around `init` left a session the CLI could
+not resume ("No conversation found") in 2 of 2 attempts. Resume is therefore
+one best-effort attempt, never a guarantee.
+
+**State.** `Running` while a Run is in flight. A start-up finds a `Running`
+record on a task that was in progress and working and turns it into
+`Interrupted`; any other `Running` record is dropped. When the next Run
+starts in the same checkout, it decides, in the same durable write that
+records the Run's start:
+
+- interrupted, same checkout, a reported session, no resume attempted yet:
+  resume. The record is written with `resume_attempted` before any process
+  for it exists, so a crash during the resume is never retried against the
+  same session;
+- interrupted, same checkout, but no session or a resume already attempted:
+  start a fresh conversation that reconciles with the checkout;
+- anything else, including a different checkout or a branch this start just
+  created: an ordinary start, which replaces the record.
+
+`resume_attempted` is cleared once a process reports a session of its own for
+the Run: a conversation the provider accepted has its own interruption and
+its own single resume. A later, genuinely new Run starts with its own record.
+
+**A miss is not a failure.** If the resume ends with the provider having no
+such conversation, the Run continues once in a fresh conversation on the same
+checkout, holding the same capacity and ownership, and the miss is recorded
+on the timeline. The miss is recognized only by the whole observed shape (an
+`error_during_execution` result with no turns, no `init` first, naming the
+missing session), so any other early failure still fails the task. Ambiguity
+means a fresh start, never a retry.
+
+**The checkout is the work.** A resumed conversation keeps what was said, not
+whether the tool call it was interrupted in ran, and the CLI does not replay
+it (observed: the interrupted call had no result and was not rerun). The call
+may have changed the checkout partly, fully or not at all. Both a resumed and
+a fresh recovery Run are therefore told, after the normal task prompt, to
+inspect the working directory first, reconcile any partial work, keep the
+correct work already there, and then continue. Neither is told to discard
+anything.
+
+**Timeline.** An attempted resume gets one row, then one outcome: the
+session resumed, or the session unavailable and the Run continuing with fresh
+context. When nothing can be resumed (no session was recorded, or a resume
+was already attempted) only the unavailable row appears. No session ids appear in user-facing text.
+
+**What the evidence is.** Observed on Claude Code 2.1.291 and rechecked on
+2.1.292 with `-p --verbose --output-format stream-json` and
+`--resume <reported id>`; not a documented contract. Provider retention of
+sessions, behavior across CLI versions and whether the working directory
+matters for lookup (it did not in the tested runs) are provider-defined and
+unverified, so none of them is assumed and a version change alone does not
+block a resume.
+
 ## ACP
 
 ACP is a provider or protocol adapter boundary. It must not become SlashIt's
