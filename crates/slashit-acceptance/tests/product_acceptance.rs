@@ -62,6 +62,8 @@ mod stacked_tasks;
 mod storage;
 #[path = "product_acceptance/task_runs.rs"]
 mod task_runs;
+#[path = "product_acceptance/coordination.rs"]
+mod coordination;
 
 /// How long the board gets to render the finished task.
 const RENDER_DEADLINE: Duration = Duration::from_secs(30);

@@ -94,6 +94,25 @@ mv "$record" "$SLASHIT_FAKE_AGENT_MARKERS/invocation-$position"
 
 printf '{"type":"system","subtype":"init","session_id":"%s","model":"slashit-fake-agent"}\n' "$session"
 
+# Opt-in coordination protocol. Ordinary task journeys retain their answers.
+if [ -n "$SLASHIT_FAKE_COORDINATION" ] && [ -n "$is_run" ]; then
+    coordination_prompt="$SLASHIT_FAKE_AGENT_MARKERS/.prompts/$position"
+    if grep -Fq '"stage":"proposal"' "$coordination_prompt"; then
+        printf '%s\n' '{"type":"result","is_error":false,"result":"{\"request\":\"Create coordination-work.txt in the Task Checkout\",\"explanation\":\"PRIVATE_COORDINATOR_HISTORY: one bounded file change\"}"}'
+        exit 0
+    elif grep -Fq '"stage":"worker"' "$coordination_prompt"; then
+        if grep -Fq 'PRIVATE_COORDINATOR_HISTORY' "$coordination_prompt"; then exit 92; fi
+        printf '%s\n' 'approved delegated work' > coordination-work.txt
+        printf '%s\n' '{"type":"result","is_error":false,"result":"Worker created coordination-work.txt"}'
+        exit 0
+    elif grep -Fq '"stage":"summary"' "$coordination_prompt"; then
+        if grep -Fq 'PRIVATE_COORDINATOR_HISTORY' "$coordination_prompt"; then exit 93; fi
+        grep -Fq 'Worker created coordination-work.txt' "$coordination_prompt" || exit 94
+        printf '%s\n' '{"type":"result","is_error":false,"result":"Coordinator recommends approving the completed bounded change"}'
+        exit 0
+    fi
+fi
+
 if [ -n "$progress" ]; then
     say "fake agent step one: reading the task"
     use_tool "Read"

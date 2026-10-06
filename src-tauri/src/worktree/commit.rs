@@ -97,7 +97,7 @@ async fn commit(
 
 /// Refuse a checkout that is not exactly where the task's work belongs: see
 /// [`commit_checkout`]. Nothing has been staged when this refuses.
-async fn refuse_unless_on_task_branch(working_dir: &str, branch: &str) -> Result<(), String> {
+pub(crate) async fn refuse_unless_on_task_branch(working_dir: &str, branch: &str) -> Result<(), String> {
     let top_level = git(working_dir, &["rev-parse", "--show-toplevel"])
         .await
         .map_err(|e| format!("{working_dir} is not a Git checkout: {e}"))?;

@@ -292,6 +292,10 @@ impl AppPaths {
         &self.data_dir
     }
 
+    pub fn conversation(&self, task_id: uuid::Uuid) -> PathBuf {
+        self.data_dir.join("conversations").join(format!("{task_id}.json"))
+    }
+
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
     }

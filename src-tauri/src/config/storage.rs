@@ -488,7 +488,7 @@ pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
 /// the same temp path, and is opened already restricted to owner-only
 /// permissions so the secret it carries is never briefly world-readable, at
 /// the temporary path or the final one.
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

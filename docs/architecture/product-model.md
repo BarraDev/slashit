@@ -114,7 +114,19 @@ Only part of that exists today.
 Workspace defaults and configuration are planned as a capability of the
 Workspace itself, not as a separate entity.
 
-## Task Checkout
+## Task-linked coordination
+
+Coordination is opt-in from the Task Drawer for an idle, unapproved Task with
+an existing Task Checkout. A Conversation owns its ordered rounds, human
+goals and decisions, proposals and approved requests, bounded results and Run
+attempts. It is stored separately from Task. Human, Coordinator and Worker
+are logical Participants; a fresh provider Run can execute each agent step.
+The executor's actual owned handles remain the only live-run authority.
+
+See [task-coordination.md](task-coordination.md) for the human gate,
+projection contract, persistence and conservative recovery behavior.
+
+## Task Checkout ownership
 
 "Task Checkout" is the product term for a Task's isolated working copy.
 Product text, UI copy and user-facing docs use it. Backend docs and code name

@@ -1,4 +1,5 @@
 pub mod repository;
+pub mod coordination;
 pub mod repository_setup;
 pub mod project;
 pub mod workspace;

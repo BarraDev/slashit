@@ -5,6 +5,7 @@ Domain models shared across backend modules. These types define the core data st
 ## Models
 
 - **agent.rs** - Agent types and status
+- **conversation.rs** - Task-linked Conversation, logical Participants, delegation and Run attempts
 - **project.rs** - Project definition and metadata
 - **repository.rs** - Repository configuration
 - **session.rs** - Chat session with agents

@@ -1,4 +1,5 @@
 pub mod domain;
+pub mod coordination;
 pub mod commands;
 
 pub mod test_helpers;
@@ -35,6 +36,7 @@ use tauri::Manager;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub coordination_lock: Arc<tokio::sync::Mutex<()>>,
     pub repository: commands::repository::RepositoryState,
     pub project: commands::project::ProjectState,
     pub workspace: commands::workspace::WorkspaceState,
@@ -289,6 +291,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::coordination::get_coordination,
+            commands::coordination::act_on_coordination,
             greet,
             get_state_location,
             set_state_location,

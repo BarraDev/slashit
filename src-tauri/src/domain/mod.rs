@@ -1,4 +1,5 @@
 pub mod repository;
+pub mod conversation;
 pub mod project;
 pub mod workspace;
 pub mod task;

@@ -36,3 +36,4 @@ pub use worktree_service::*;
 pub use roadmap_service::*;
 pub use pr_service::*;
 pub use tray_service::*;
+pub mod coordination_service;

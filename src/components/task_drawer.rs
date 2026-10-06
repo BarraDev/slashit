@@ -465,6 +465,7 @@ pub fn TaskDrawer(
 
                     // How the task got here.
                     <TaskActivity task=task />
+                    <crate::components::task_coordination::TaskCoordination task_id=task_id />
 
                     // Output and, where there are any, changes.
                     <section class="space-y-2">

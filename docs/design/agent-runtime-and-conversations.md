@@ -1,7 +1,7 @@
 # Agent runtime and conversations
 
-Status: architectural direction, not an implementation plan. No current
-feature commitment. Nothing here is built, and the follow-up-ideas issue
+Status: architectural direction with a bounded Task-linked coordination slice
+implemented in [task-coordination.md](../architecture/task-coordination.md). The follow-up-ideas issue
 [#73](https://github.com/BarraDev/slashit/issues/73) does not implement
 any of it. The historical record of the six decisions is
 [workmux-follow-ups.md](workmux-follow-ups.md). The purpose of this document
@@ -31,10 +31,10 @@ and it does not pretend otherwise.
   connection SlashIt started, with a start and an end.
 - **Provider adapter.** The boundary that starts and observes Runs for one
   provider (Claude Code today, an ACP-backed agent, others later).
-- **Provider session.** Opaque provider-specific state associated with a
-  Participant and its execution lineage. A Run may create or resume it. The
-  provider reports its identity; SlashIt records that identity and does not
-  invent or interpret it. It is never a universal identity for a Task.
+- **Provider continuity.** A possible future adapter optimization, represented
+  conceptually by a `ProviderContinuityToken`. It is not Participant identity
+  or part of Conversation persistence. Fresh provider Runs must always work
+  from SlashIt's persisted state and deterministic context projections.
 - **Context projection.** The bounded subset of Conversation context SlashIt
   sends a Participant. Agents do not receive the full history by default.
 - **Task.** Work, delivery and Task Checkout ownership. Unchanged and kept
@@ -54,8 +54,8 @@ and it does not pretend otherwise.
 - SlashIt projects context into each Participant rather than sharing history.
 - A human stays a first-class Participant: approvals, answers and review
   decisions belong in the model.
-- Conversation and orchestration are deferred future architecture. They are
-  not rejected and not scheduled.
+- General orchestration remains future architecture. The implemented slice
+  has one Task, one Coordinator, one Worker and an explicit human delegation gate.
 
 ## Supervision boundaries
 

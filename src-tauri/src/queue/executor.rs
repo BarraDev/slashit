@@ -376,6 +376,8 @@ struct PrHelperOwner {
 /// Which PR flow a [`PrHelperOwner`] entry stands for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrOwnerKind {
+    /// A coordination Run leaves Task workflow status unchanged on stop.
+    Coordination,
     /// A PR-helper Claude invocation, holding an admission permit.
     Helper,
     /// A PR side-effect flow (branch rewrite, push, `gh pr create`, the
@@ -446,7 +448,7 @@ impl Drop for PrHelperLease {
         // `.await` inside it, so a blocking lock here never stalls the
         // runtime.
         self.handles.lock().unwrap().remove(&self.task_id);
-        if self.kind == PrOwnerKind::Helper {
+        if self.kind != PrOwnerKind::SideEffect {
             self.events.agent_event(AgentEvent::RunState {
                 task_id: self.task_id.to_string(),
                 status: AgentStatus::Stopped,
@@ -1098,7 +1100,7 @@ impl TaskExecutor {
             }
         }
         for (task_id, owner) in self.pr_helper_handles.lock().unwrap().iter() {
-            if owner.kind == PrOwnerKind::Helper {
+            if owner.kind != PrOwnerKind::SideEffect {
                 task_ids.insert(*task_id);
             }
         }
@@ -2658,8 +2660,12 @@ impl TaskExecutor {
         // [`AGENT_SHUTDOWN_TIMEOUT`].
         let _lease = self.lifecycle.acquire(task_id).await?;
 
+        let coordination = self.pr_helper_handles.lock().unwrap().get(&task_id)
+            .is_some_and(|owner| owner.kind == PrOwnerKind::Coordination);
+
         let ended = self.end_task_owners_under_lease(task_id).await?;
         let helper_ended = self.end_pr_helper_owner_under_lease(task_id).await?;
+        if coordination { return Ok(()); }
 
         // `ended` names which map actually held (and joined) a live owner,
         // which is the status the caller provably found the task in a moment
@@ -2815,6 +2821,14 @@ impl TaskExecutor {
         self: &Arc<Self>,
         task_id: Uuid,
     ) -> Result<PrHelperLease, PrHelperRefusal> {
+        self.try_begin_helper(task_id, PrOwnerKind::Helper).await
+    }
+
+    pub(crate) async fn try_begin_coordination(self: &Arc<Self>, task_id: Uuid) -> Result<PrHelperLease, PrHelperRefusal> {
+        self.try_begin_helper(task_id, PrOwnerKind::Coordination).await
+    }
+
+    async fn try_begin_helper(self: &Arc<Self>, task_id: Uuid, kind: PrOwnerKind) -> Result<PrHelperLease, PrHelperRefusal> {
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
             return Err(PrHelperRefusal::LifecycleContended);
         };
@@ -2839,7 +2853,7 @@ impl TaskExecutor {
             return Err(PrHelperRefusal::NoCapacity);
         };
 
-        Ok(self.register_pr_owner(task_id, PrOwnerKind::Helper, Some(permit)))
+        Ok(self.register_pr_owner(task_id, kind, Some(permit)))
     }
 
     /// Reserve `task_id` for a PR side-effect flow: a branch-tip rewrite, a
@@ -2916,7 +2930,7 @@ impl TaskExecutor {
                 kind,
             },
         );
-        if kind == PrOwnerKind::Helper {
+        if kind != PrOwnerKind::SideEffect {
             self.events.agent_event(AgentEvent::RunState {
                 task_id: task_id.to_string(),
                 status: AgentStatus::Running,
@@ -2960,7 +2974,7 @@ impl TaskExecutor {
             return Ok(false);
         };
         let _ = cancel.send(true);
-        if kind == PrOwnerKind::Helper {
+        if kind != PrOwnerKind::SideEffect {
             self.events.agent_event(AgentEvent::RunState {
                 task_id: task_id.to_string(),
                 status: AgentStatus::Stopping,
@@ -3104,6 +3118,14 @@ impl TaskExecutor {
         config: ClaudeRunConfig,
         cancelled: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<Option<AgentRun>, String> {
+        Self::run_cancellable_agent_output(config, cancelled, false).await
+    }
+
+    async fn run_cancellable_agent_output(
+        config: ClaudeRunConfig,
+        cancelled: &mut tokio::sync::watch::Receiver<bool>,
+        final_result_only: bool,
+    ) -> Result<Option<AgentRun>, String> {
         if *cancelled.borrow() {
             return Ok(None);
         }
@@ -3113,15 +3135,31 @@ impl TaskExecutor {
             result = runner.wait() => {
                 let success = matches!(result, Ok(true));
                 let failure = result.err();
-                let output = runner.get_output().await;
+                let output = if final_result_only && success {
+                    crate::coordination::final_result(&runner.raw_stdout().await)
+                } else { Ok(runner.get_output().await) };
                 let _ = runner.kill().await;
-                Ok(Some(AgentRun { success, failure, output }))
+                Ok(Some(AgentRun { success, failure, output: output? }))
             }
             _ = cancelled.changed() => {
                 let _ = runner.kill().await;
                 Ok(None)
             }
         }
+    }
+
+    /// A bounded coordination step uses the same admission, exclusive task
+    /// ownership and stop receiver as task-associated helper executions.
+    pub(crate) async fn run_coordination_agent(
+        config: ClaudeRunConfig,
+        lease: &PrHelperLease,
+    ) -> Result<String, String> {
+        let mut cancelled = lease.cancel_receiver();
+        let run = Self::run_cancellable_agent_output(config, &mut cancelled, true).await?
+            .ok_or("Coordination stopped; inspect checkout before retrying")?;
+        if lease.is_cancelled() { return Err("Coordination stopped".into()); }
+        if !run.success { return Err(run.failure.unwrap_or("Agent failed".into())); }
+        Ok(run.output)
     }
 
     /// Same contract as [`Self::run_cancellable_agent`], for the CodeRabbit
@@ -3820,7 +3858,7 @@ impl TaskExecutor {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter_map(|(task_id, owner)| (owner.kind == PrOwnerKind::Helper).then_some(*task_id)),
+                .filter_map(|(task_id, owner)| (owner.kind != PrOwnerKind::SideEffect).then_some(*task_id)),
         );
         ids.extend(self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).keys().copied());
         ids.sort();
@@ -3890,7 +3928,7 @@ impl TaskExecutor {
             .lock()
             .unwrap()
             .get(&task_id)
-            .and_then(|owner| (owner.kind == PrOwnerKind::Helper).then_some(
+            .and_then(|owner| (owner.kind != PrOwnerKind::SideEffect).then_some(
                 if *owner.cancel.borrow() {
                     AgentStatus::Stopping
                 } else {

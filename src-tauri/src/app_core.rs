@@ -112,6 +112,7 @@ pub async fn build_state_with_paths(
     // there, as they do for every other `gh` call.
     let pr_statuses = Arc::new(crate::pr_status::PrStatuses::github());
     let app_state = AppState {
+        coordination_lock: Arc::new(tokio::sync::Mutex::new(())),
         repository: repository_state,
         project: project_state,
         workspace: commands::workspace::WorkspaceState::load(&paths)?,
