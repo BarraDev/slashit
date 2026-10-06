@@ -59,6 +59,56 @@ async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, 
     run(&["write-tree"]).await
 }
 
+/// Whether the change between the trees `before` and `after` (what one fix
+/// agent did) is still in `commit`: the change, applied backwards to the
+/// commit's tree, must fit. Fixes sharing a file are told apart by their
+/// hunks, not their paths. A change an overlapping edit overwrote, or that
+/// was discarded, no longer fits; an empty change, an object this repository
+/// lost, or any Git failure answers `false`, because a missing proof is never
+/// read as a present one.
+pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, commit: &str) -> bool {
+    let run = |args: Vec<String>, index: Option<std::path::PathBuf>| async move {
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args(&args).current_dir(working_dir);
+        if let Some(index) = index {
+            cmd.env("GIT_INDEX_FILE", index);
+        }
+        cmd.output().await.ok().filter(|o| o.status.success())
+    };
+    let Some(diff) = run(
+        ["diff", "--binary", "--full-index", before, after].map(String::from).to_vec(),
+        None,
+    )
+    .await
+    else {
+        return false;
+    };
+    if diff.stdout.is_empty() {
+        return false;
+    }
+    let id = uuid::Uuid::new_v4();
+    let index = std::env::temp_dir().join(format!("slashit-effect-{id}.index"));
+    let patch = std::env::temp_dir().join(format!("slashit-effect-{id}.patch"));
+    let survives = async {
+        tokio::fs::write(&patch, &diff.stdout).await.ok()?;
+        run(["read-tree", commit].map(String::from).to_vec(), Some(index.clone())).await?;
+        run(
+            vec![
+                "apply".into(), "--cached".into(), "--reverse".into(), "--check".into(),
+                patch.display().to_string(),
+            ],
+            Some(index.clone()),
+        )
+        .await
+        .map(|_| ())
+    }
+    .await
+    .is_some();
+    let _ = tokio::fs::remove_file(&index).await;
+    let _ = tokio::fs::remove_file(&patch).await;
+    survives
+}
+
 /// Where `origin` held a pull request's branch when it was last refreshed.
 pub struct RemoteBranch {
     dir: std::path::PathBuf,

@@ -1014,6 +1014,9 @@ fn carry_forward_reanalysis_lifecycle(
         if prev_item.fix_done && item.fix_commit.is_none() {
             item.fix_commit = prev_item.fix_commit.clone();
         }
+        if prev_item.fix_done && item.fix_effect.is_none() {
+            item.fix_effect = prev_item.fix_effect.clone();
+        }
         if prev_item.reply_posted { item.reply_posted = true; }
         if item.last_error.is_none() { item.last_error = prev_item.last_error.clone(); }
         if item.last_agent_summary.is_none() { item.last_agent_summary = prev_item.last_agent_summary.clone(); }
@@ -1373,33 +1376,22 @@ pub async fn address_pr_review_inner(
         if !item.fix_done {
             let single = vec![&item];
             let prompt = build_review_fix_prompt(&task, &pr_url, &updated_plan.comments, &single, false);
-            // What the checkout held before the agent ran, so that a fix
-            // which changed nothing is not mistaken for one a later commit
-            // carries: a commit made for other items would otherwise be
-            // credited to it.
+            // What the checkout held before and after this agent ran: the
+            // item's own effect, which a later commit must be shown to hold
+            // before it counts as carrying the fix (#96). No change, or a
+            // checkout that cannot be inspected, leaves no effect to prove;
+            // the agent's own outcome is not second-guessed.
             let before = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
-            let mut changed_nothing = false;
-            let outcome = match run_claude_pr_helper(prompt, working_dir.clone(), true, cancel_rx.clone()).await {
-                Ok(summary) => {
-                    let after = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
-                    match (before, after) {
-                        (Ok(before), Ok(after)) if before != after => Ok(summary),
-                        (Ok(_), Ok(_)) => {
-                            changed_nothing = true;
-                            Err("the fix agent finished without changing any file, so there is no fix to \
-                                 commit and deliver for this item. Apply again to retry it, or skip it".to_string())
-                        }
-                        (Err(e), _) | (_, Err(e)) => {
-                            changed_nothing = true;
-                            Err(format!(
-                                "the checkout could not be inspected, so a fix for this item cannot be \
-                                 tied to a commit: {e}"
-                            ))
-                        }
+            let mut effect: Option<crate::domain::task::FixEffect> = None;
+            let outcome = run_claude_pr_helper(prompt, working_dir.clone(), true, cancel_rx.clone()).await;
+            if outcome.is_ok() {
+                let after = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
+                if let (Ok(before_tree), Ok(after_tree)) = (before, after) {
+                    if before_tree != after_tree {
+                        effect = Some(crate::domain::task::FixEffect { before_tree, after_tree });
                     }
                 }
-                Err(e) => Err(e),
-            };
+            }
             match outcome {
                 Ok(summary) => {
                     if let Some(id) = item.comment_id { fixed_ids.push(id); }
@@ -1409,6 +1401,7 @@ pub async fn address_pr_review_inner(
                         p.fix_done = true;
                         p.fix_uncommitted = true;
                         p.fix_commit = None;
+                        p.fix_effect = effect.take();
                         p.last_agent_summary = Some(summary.clone());
                         if reply_text.is_some() {
                             p.pr_reply_text = reply_text;
@@ -1434,9 +1427,7 @@ pub async fn address_pr_review_inner(
                     });
                 }
                 Err(e) => {
-                    // An agent that changed nothing left no partial edit
-                    // behind, so it does not withhold the other fixes' commit.
-                    a_fix_failed = a_fix_failed || !changed_nothing;
+                    a_fix_failed = true;
                     if let Some(id) = item.comment_id { failed_ids.push(id); }
                     fix_errors.push(format!("comment {}: {}", label, e));
                     updated_plan.items[orig_idx].last_error = Some(e.clone());
@@ -1589,8 +1580,23 @@ pub async fn address_pr_review_inner(
                 // were made in this checkout since `fix_commit` was last
                 // empty, and this commit took the whole checkout.
                 Ok(crate::worktree::CheckoutCommit::Committed { commit }) => {
+                    // The commit took the whole checkout, so it carries an
+                    // item's fix only if that item's own effect (what its
+                    // agent changed) is still in it. Edits discarded or
+                    // overwritten since leave the item unproven, and a
+                    // fix that left no effect to check never is.
                     for &idx in uncommitted {
-                        updated_plan.items[idx].fix_commit = Some(commit.clone());
+                        let item = &mut updated_plan.items[idx];
+                        let proven = match &item.fix_effect {
+                            Some(e) => crate::worktree::delivery::effect_survives_in(
+                                &working_dir, &e.before_tree, &e.after_tree, &commit,
+                            ).await,
+                            None => false,
+                        };
+                        if proven {
+                            item.fix_commit = Some(commit.clone());
+                            item.fix_effect = None;
+                        }
                     }
                     None
                 }
@@ -2598,6 +2604,7 @@ fn parse_review_items(output: &str, batch: &[PrReviewComment]) -> Vec<PrReviewIt
             pr_reply_text: None,
             reply_comment_id: None,
             fix_commit: None,
+            fix_effect: None,
         })
     }).collect()
 }
@@ -6248,6 +6255,7 @@ mod tests {
             pr_reply_text: None,
             reply_comment_id: None,
             fix_commit: None,
+            fix_effect: None,
         }
     }
 
@@ -12289,6 +12297,7 @@ mod tests {
                         pr_reply_text: None,
                         reply_comment_id: None,
                         fix_commit: None,
+                        fix_effect: None,
                     }],
                     raw_plan: "durable-marker-before-apply".to_string(),
                     last_apply: None,
@@ -12719,6 +12728,7 @@ mod tests {
                     pr_reply_text: None,
                     reply_comment_id: None,
                     fix_commit: None,
+                    fix_effect: None,
                 }
             }
 
@@ -13807,15 +13817,15 @@ mod tests {
                 }
             }
 
-            /// A fix agent that reports success but changes no file has no fix
-            /// to commit, so a commit made for another item is not credited to
-            /// it: it is reported failed and gets no reply.
+            /// A fix agent that reports success without changing a file is
+            /// still a success, but it has no effect for a commit to carry:
+            /// a commit made for another item is not credited to it.
             #[tokio::test(flavor = "multi_thread")]
-            async fn a_fix_that_changed_nothing_is_not_credited_with_another_items_commit() {
+            async fn a_fix_without_an_effect_is_not_credited_with_another_items_commit() {
                 let _guard = PATH_LOCK.lock().await;
                 let repo = RepoFixture::new();
                 let worktree = task_checkout_for_review(&repo, false);
-                // The second run reports success without editing anything.
+                // The second run succeeds without editing anything.
                 let _claude = EditingClaude::install(
                     "if [ \"$n\" -eq 2 ]; then printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"nothing to do\"}'; exit 0; fi",
                 );
@@ -13825,14 +13835,135 @@ mod tests {
                 let (result, plan) =
                     apply(&task, with_item(plan, 2), &worktree, tmp.path().join("no-such-jj"), true).await;
 
-                assert_eq!(result.fixed_ids, vec![1], "{result:?}");
-                assert_eq!(result.failed_ids, vec![2], "{result:?}");
+                assert_eq!(result.fixed_ids, vec![1, 2], "the agent's own outcome stands: {result:?}");
+                assert!(result.failed_ids.is_empty(), "{result:?}");
                 assert_eq!(result.replies_posted, 1, "{result:?}");
                 assert!(plan.items[0].fix_commit.is_some() && plan.items[0].reply_posted);
-                assert!(plan.items[1].fix_commit.is_none() && !plan.items[1].fix_done, "{:?}", plan.items[1]);
-                assert!(!plan.items[1].reply_posted);
-                let error = plan.items[1].last_error.as_deref().unwrap_or_default();
-                assert!(error.contains("without changing any file"), "{error:?}");
+                assert!(plan.items[1].fix_done && plan.items[1].fix_commit.is_none(), "{:?}", plan.items[1]);
+                assert!(!plan.items[1].reply_posted && plan.items[1].fix_uncommitted);
+            }
+
+            /// Two fix agents each add a different line to the same file
+            /// `notes.txt`; `edit_b` is run after B's agent to simulate later
+            /// changes before the commit.
+            async fn two_fixes_then(
+                a_edit: &str,
+                b_edit: &str,
+                between: impl FnOnce(&Path),
+                reject_first: bool,
+            ) -> (PrReviewApplyResult, PrReviewPlan, String) {
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                std::fs::write(worktree.join("notes.txt"), "one\nkeep\nthree\nfour\nfive\nsix\nseven\neight\n").unwrap();
+                git(&worktree, &["add", "-A"]);
+                git(&worktree, &["commit", "-q", "-m", "notes"]);
+                git(&worktree, &["push", "-q", "-u", "origin", "task-branch"]);
+                let hook = reject_commits(&repo);
+                let _claude = EditingClaude::install(&format!(
+                    "if [ \"$n\" -eq 1 ]; then {a_edit}; else {b_edit}; fi"
+                ));
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                // The first apply makes both fixes and cannot commit them.
+                let (first, plan) = apply(&task, with_item(plan, 2), &worktree, no_jj.clone(), true).await;
+                assert!(first.replies_posted == 0 && !first.pushed, "{first:?}");
+                between(&worktree);
+                if !reject_first {
+                    std::fs::remove_file(&hook).unwrap();
+                }
+                let (second, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                (second, plan, git(&worktree, &["rev-parse", "task-branch"]))
+            }
+
+            /// A) both effects survive into one commit: both point to it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn two_items_whose_effects_both_survive_both_point_to_the_commit() {
+                let _guard = PATH_LOCK.lock().await;
+                let (result, plan, tip) = two_fixes_then(
+                    "printf 'a-line\\n' > a.txt",
+                    "printf 'b-line\\n' > b.txt",
+                    |_| {},
+                    false,
+                )
+                .await;
+                assert_eq!(result.replies_posted, 2, "{result:?}");
+                for item in &plan.items {
+                    assert_eq!(item.fix_commit.as_deref(), Some(tip.as_str()), "{item:?}");
+                }
+            }
+
+            /// B) A survives, B's edits are discarded before the commit: only
+            /// A gets the commit, and B gets no reply.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_item_whose_edits_were_discarded_is_not_credited_with_the_commit() {
+                let _guard = PATH_LOCK.lock().await;
+                let (result, plan, tip) = two_fixes_then(
+                    "printf 'a-line\\n' > a.txt",
+                    "printf 'b-line\\n' > b.txt",
+                    |w| std::fs::remove_file(w.join("b.txt")).unwrap(),
+                    false,
+                )
+                .await;
+                assert_eq!(result.replies_posted, 1, "{result:?}");
+                assert_eq!(plan.items[0].fix_commit.as_deref(), Some(tip.as_str()));
+                assert!(plan.items[0].reply_posted);
+                assert_eq!(plan.items[1].fix_commit, None, "{:?}", plan.items[1]);
+                assert!(!plan.items[1].reply_posted && plan.items[1].fix_uncommitted);
+            }
+
+            /// C) two items change different lines of the same file and both
+            /// changes survive: both are proven, though the path is shared.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn two_items_editing_one_file_in_different_places_are_both_proven() {
+                let _guard = PATH_LOCK.lock().await;
+                let (result, plan, tip) = two_fixes_then(
+                    "sed -i 's/^one$/ONE/' notes.txt",
+                    "sed -i 's/^eight$/EIGHT/' notes.txt",
+                    |_| {},
+                    false,
+                )
+                .await;
+                assert_eq!(result.replies_posted, 2, "{result:?}");
+                for item in &plan.items {
+                    assert_eq!(item.fix_commit.as_deref(), Some(tip.as_str()), "{item:?}");
+                }
+            }
+
+            /// C') the same file, one item's change discarded: the other is
+            /// proven, the discarded one is not.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn discarding_one_of_two_edits_to_a_shared_file_leaves_only_it_unproven() {
+                let _guard = PATH_LOCK.lock().await;
+                let (result, plan, _tip) = two_fixes_then(
+                    "sed -i 's/^one$/ONE/' notes.txt",
+                    "sed -i 's/^eight$/EIGHT/' notes.txt",
+                    |w| {
+                        let t = std::fs::read_to_string(w.join("notes.txt")).unwrap();
+                        std::fs::write(w.join("notes.txt"), t.replace("EIGHT", "eight")).unwrap();
+                    },
+                    false,
+                )
+                .await;
+                assert_eq!(result.replies_posted, 1, "{result:?}");
+                assert!(plan.items[0].fix_commit.is_some() && plan.items[1].fix_commit.is_none());
+            }
+
+            /// D) a later edit overwrites the line an earlier item changed:
+            /// that item's effect is gone, so it stays unproven.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_effect_overwritten_by_an_overlapping_edit_stays_unproven() {
+                let _guard = PATH_LOCK.lock().await;
+                let (result, plan, tip) = two_fixes_then(
+                    "sed -i 's/^keep$/from-a/' notes.txt",
+                    "sed -i 's/^from-a$/from-b/' notes.txt",
+                    |_| {},
+                    false,
+                )
+                .await;
+                assert_eq!(result.replies_posted, 1, "{result:?}");
+                assert_eq!(plan.items[0].fix_commit, None, "A's line no longer exists: {:?}", plan.items[0]);
+                assert_eq!(plan.items[1].fix_commit.as_deref(), Some(tip.as_str()));
             }
 
             /// The commit is made and the push fails: the commit is recorded
@@ -14061,8 +14192,9 @@ mod tests {
                 let (result, plan) = apply(&task, plan, &worktree, tmp.path().join("no-such-jj"), true).await;
 
                 assert_eq!(claude.runs(), 1);
-                assert_eq!((result.replies_posted, result.failed_ids.clone()), (0, vec![1]), "{result:?}");
-                assert!(!plan.items[0].fix_done && !plan.items[0].reply_posted, "{:?}", plan.items[0]);
+                assert_eq!(result.replies_posted, 0, "{result:?}");
+                assert!(plan.items[0].fix_commit.is_none() && !plan.items[0].reply_posted, "{:?}", plan.items[0]);
+                assert!(plan.items[0].fix_uncommitted, "unproven, still owed: {:?}", plan.items[0]);
             }
 
             /// A fake `gh` for the PR side-effect ownership tests. `pr list`

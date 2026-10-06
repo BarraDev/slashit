@@ -741,6 +741,15 @@ pub struct PrReviewItem {
     /// fix was made from; this records which commit holds the fix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_commit: Option<String>,
+    /// What this item's fix agent changed in the checkout, kept until a
+    /// commit is shown to hold it: the trees before and after the run. A
+    /// commit becomes `fix_commit` only if that change is still in it, so a
+    /// fix whose edits were discarded or overwritten is never credited with a
+    /// commit made for others. `None` when the agent changed nothing, and
+    /// for every plan saved before this existed. Independent of #109's
+    /// `fixed_content`, which identifies the comment text, not the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_effect: Option<FixEffect>,
     /// True once a reply (inline or fallback PR comment) was posted on GitHub
     /// for this item. Decoupled from `fix_done` so a successful fix with a
     /// failed reply leaves the item visibly pending in the "Sync replies" path.
@@ -763,6 +772,13 @@ pub struct PrReviewItem {
     /// can PATCH the existing comment instead of duplicating it.
     #[serde(default)]
     pub reply_comment_id: Option<u64>,
+}
+
+/// The checkout's tree before and after one fix agent ran.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixEffect {
+    pub before_tree: String,
+    pub after_tree: String,
 }
 
 impl PrReviewItem {

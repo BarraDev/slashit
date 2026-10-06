@@ -658,6 +658,7 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
         pr_reply_text: None,
         reply_comment_id: None,
         fix_commit: None,
+        fix_effect: None,
         },
         PrReviewItem {
             comment_id: Some(102),
@@ -675,6 +676,7 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
         pr_reply_text: None,
         reply_comment_id: None,
         fix_commit: None,
+        fix_effect: None,
         },
     ];
 

@@ -465,6 +465,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             pr_reply_text: None,
             reply_comment_id: None,
             fix_commit: None,
+            fix_effect: None,
         },
         PrReviewItem {
             comment_id: Some(202),
@@ -482,6 +483,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             pr_reply_text: None,
             reply_comment_id: None,
             fix_commit: None,
+            fix_effect: None,
         },
         PrReviewItem {
             comment_id: Some(203),
@@ -499,6 +501,7 @@ fn create_test_discuss_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             pr_reply_text: None,
             reply_comment_id: None,
             fix_commit: None,
+            fix_effect: None,
         },
     ];
 
@@ -720,6 +723,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             pr_reply_text: None,
             reply_comment_id: None,
             fix_commit: None,
+            fix_effect: None,
         },
         PrReviewItem {
             comment_id: Some(302),
@@ -737,6 +741,7 @@ fn create_test_two_fix_setup() -> (slashit_ui_lib::domain::Task, PrReviewPlan) {
             pr_reply_text: None,
             reply_comment_id: None,
             fix_commit: None,
+            fix_effect: None,
         },
     ];
 

@@ -1179,7 +1179,13 @@ fn PrReviewModal(
             .filter(|i| i.approved
                 && matches!(i.decision, PrReviewDecisionKind::Fix)
                 && i.fix_done
-                && (!i.reply_posted || i.pr_reply_text.is_none()))
+                // A reply is owed only for a fix whose commit was seen on the
+                // PR branch; an undelivered fix waits for Apply, not Sync.
+                && (if i.reply_posted {
+                    i.pr_reply_text.is_none()
+                } else {
+                    i.fix_commit.is_some() && !i.fix_uncommitted
+                }))
             .count())
         .unwrap_or(0);
 
@@ -1793,6 +1799,7 @@ fn render_review_item(
                             // outstanding without re-running.
                             let fix_done_init = item.fix_done;
                             let reply_posted_init = item.reply_posted;
+                            let fix_delivered_init = item.fix_commit.is_some() && !item.fix_uncommitted;
                             let last_error_init = item.last_error.clone();
                             move || {
                                 let live = comment_id.and_then(|id| item_status.get().get(&id).cloned());
@@ -1821,10 +1828,16 @@ fn render_review_item(
                                                     "✓ Fixed · ✓ Replied"
                                                 </span>
                                             }.into_any()
+                                        } else if fix_done_init && fix_delivered_init {
+                                            view! {
+                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 font-medium text-[10px]" title="Fix is on the PR branch but no reply was posted yet — use Sync replies">
+                                                    "✓ Fixed · ⚠ Reply pending"
+                                                </span>
+                                            }.into_any()
                                         } else if fix_done_init {
                                             view! {
-                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 font-medium text-[10px]" title="Fix is on disk but no reply was posted yet — use Sync replies">
-                                                    "✓ Fixed · ⚠ Reply pending"
+                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 font-medium text-[10px]" title="The fix is not yet proven to be on the PR branch, so no reply is posted. Apply again to commit and push it.">
+                                                    "⚠ Fix not delivered"
                                                 </span>
                                             }.into_any()
                                         } else if let Some(err) = last_error_init.clone() {
