@@ -60,20 +60,12 @@ Triage every reviewer comment on a pull request, decide Fix / Skip / Question pe
   <img src="docs/assets/screenshots/pr-comment-review.png" alt="SlashIt PR Comment Review modal: per-comment Fix/Skip/Question dropdown, editable reasoning and proposed change, footer toggles for auto-push, auto-reply, and only-new filter, plus Re-discuss / Re-analyze / Apply actions" width="900">
 </p>
 
-### App overview (in progress)
+### Task flow overview
 
-The screens below preview the rest of the app, parts of which are still being polished.
+The board below follows tasks from the queue through review to done. Parts of the app are still being polished.
 
 <p align="center">
   <img src="docs/assets/screenshots/dashboard-kanban.png" alt="SlashIt Kanban board showing tasks moving from Queue through In Progress, AI Review, Human Review and PR Open to Done, with progress bars, priority labels and a linked pull request" width="900">
-</p>
-
-<p align="center">
-  <img src="docs/assets/screenshots/agent-workspace.jpg" alt="SlashIt agent execution view with terminal logs, task phases, and session context" width="900">
-</p>
-
-<p align="center">
-  <img src="docs/assets/screenshots/worktrees-prs.jpg" alt="SlashIt worktrees page with JJ status, PR readiness, and diff preview" width="900">
 </p>
 
 ## Status and Roadmap
