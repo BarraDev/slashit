@@ -153,7 +153,7 @@ Decision. KEEP as a deferred note: a small authorization design for a local coor
 Behavior. Tasks created over the channel record `created_via: cli` (plus an
 optional caller label from `--source`, informational only). A restricted
 mode, off by default, limits a caller to creating tasks and queueing tasks it
-created in one named Project. For this near-term step there are no dependency graphs, result
+created in one named Project. For this first step there are no dependency graphs, result
 collection or fan-out: the coordinator polls `slashit tasks`.
 
 Ownership. The Project owns the tasks; the caller label is provenance, not a
@@ -190,7 +190,7 @@ that owns processes is outside the scope of these notes.
 ## 6. SlashIt-owned per-Project setup hooks
 
 Problem. A new Task Checkout often needs setup (dependency install, env
-files) before an agent is useful. Worktrunk hooks would have covered this.
+files) before an agent is useful. (An external git-worktree tool had offered such hooks.)
 
 Decision. KEEP as a deferred design; no code until a user shows a concrete
 need, because there is no setup mechanism today.
