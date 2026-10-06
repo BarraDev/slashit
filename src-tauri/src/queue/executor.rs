@@ -310,6 +310,7 @@ pub enum AgentEvent {
 }
 
 type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
+type ExecutionRecords = Arc<RwLock<HashMap<Uuid, AgentExecution>>>;
 
 /// A task execution the executor can still reach.
 ///
@@ -641,16 +642,37 @@ struct RunEndAnnouncer {
     events: SharedEventSink,
     task_id: Uuid,
     end: AgentStatus,
+    execution: Option<(ExecutionRecords, Uuid)>,
 }
 
 impl RunEndAnnouncer {
     fn new(events: SharedEventSink, task_id: Uuid) -> Self {
-        Self { events, task_id, end: AgentStatus::Stopped }
+        Self { events, task_id, end: AgentStatus::Stopped, execution: None }
+    }
+
+    fn for_execution(
+        events: SharedEventSink,
+        task_id: Uuid,
+        executions: ExecutionRecords,
+        execution_id: Uuid,
+    ) -> Self {
+        Self { events, task_id, end: AgentStatus::Stopped, execution: Some((executions, execution_id)) }
     }
 }
 
 impl Drop for RunEndAnnouncer {
     fn drop(&mut self) {
+        if let Some((executions, execution_id)) = &self.execution {
+            if let Ok(mut executions) = executions.try_write() {
+                if let Some(execution) = executions.get_mut(execution_id) {
+                    if matches!(execution.status, AgentStatus::Starting | AgentStatus::Running | AgentStatus::Stopping) {
+                        execution.status = AgentStatus::Failed("execution owner panicked".to_string());
+                        execution.stopped_at = Some(chrono::Utc::now());
+                        self.end = execution.status.clone();
+                    }
+                }
+            }
+        }
         self.events.agent_event(AgentEvent::RunState {
             task_id: self.task_id.to_string(),
             status: self.end.clone(),
@@ -2207,7 +2229,12 @@ impl TaskExecutor {
             // including the early-return failure arms below. Removing this
             // task's `running_handles` entry does not by itself free
             // anything; see `crate::queue::admission`.
-            let mut announcer = RunEndAnnouncer::new(events.clone(), task_id);
+            let mut announcer = RunEndAnnouncer::for_execution(
+                events.clone(),
+                task_id,
+                executions.clone(),
+                execution_id,
+            );
             let _permit = permit;
 
             let now = chrono::Utc::now();
@@ -2580,14 +2607,16 @@ impl TaskExecutor {
     /// the run had already made all survive, and a later explicit move back
     /// into a working column reattaches to them.
     ///
-    /// Reaches whichever of an execution or an AI review/fix currently owns
-    /// the task -- the task-exclusivity contract (see
+    /// Reaches whichever of an execution, AI review/fix, or PR-helper flow
+    /// currently owns the task -- the task-exclusivity contract (see
     /// [`crate::queue::admission`]) means at most one of `running_handles`
     /// and `reviewing_handles` can have a live entry for it at once, so this
     /// tries the execution map first and only falls through to the review
     /// map if that found nothing. A review's reviewer-then-fix sequence is
     /// one future behind one [`ReviewOwner`]; cancelling it ends whichever
-    /// `ClaudeRunner` it currently owns, the same as [`RunningTask`].
+    /// `ClaudeRunner` it currently owns, the same as [`RunningTask`]. PR
+    /// helpers are ended after those maps through their lease, and are not
+    /// settled until that lease has observed the provider process finish.
     pub async fn stop_task(&self, task_id: Uuid) -> Result<(), String> {
         // Stopping is an ownership change, so it takes the task's lifecycle
         // lease like every other one. It cannot deadlock against the run it is
@@ -2602,6 +2631,7 @@ impl TaskExecutor {
         let _lease = self.lifecycle.acquire(task_id).await?;
 
         let ended = self.end_task_owners_under_lease(task_id).await?;
+        let helper_ended = self.end_pr_helper_owner_under_lease(task_id).await?;
 
         // `ended` names which map actually held (and joined) a live owner,
         // which is the status the caller provably found the task in a moment
@@ -2615,7 +2645,12 @@ impl TaskExecutor {
         // used for "neither map owned it" -- a crash or an unrecorded
         // outcome may have left the task stranded `InProgress` with no live
         // owner, and that is the one case this settles to `Backlog`.
-        let from_status = ended.unwrap_or(TaskStatus::InProgress);
+        let helper_status = if helper_ended {
+            self.tasks.read().await.get(&task_id).map(|task| task.status.clone())
+        } else {
+            None
+        };
+        let from_status = ended.or(helper_status).unwrap_or(TaskStatus::InProgress);
         let tools = take_run_tools(&self.run_tools, task_id);
         Self::settle_stopped_static(&self.tasks, &self.storage, task_id, from_status, tools).await
     }
@@ -10474,6 +10509,34 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
         }
 
         #[tokio::test]
+        async fn stop_task_ends_a_pr_helper_before_settling_the_task() {
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let (executor, _temps) = test_executor_with_events(recording.clone());
+            let task_id = Uuid::new_v4();
+            let mut task = create_test_task_full("helper", task_id, TaskStatus::AiReview, 1);
+            task.phase = TaskPhase::QaReview;
+            executor.tasks.write().await.insert(task_id, task);
+            let helper = executor.try_begin_pr_helper(task_id).await.expect("helper admission");
+
+            let stopper = {
+                let executor = executor.clone();
+                tokio::spawn(async move { executor.stop_task(task_id).await })
+            };
+            while !run_states(&recording, task_id).contains(&serde_json::json!("stopping")) {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(executor.tasks.read().await.get(&task_id).unwrap().status, TaskStatus::AiReview);
+            drop(helper);
+            stopper.await.unwrap().expect("stop settles after helper exits");
+            assert_eq!(executor.tasks.read().await.get(&task_id).unwrap().status, TaskStatus::Backlog);
+            assert_eq!(run_states(&recording, task_id), vec![
+                serde_json::json!("running"),
+                serde_json::json!("stopping"),
+                serde_json::json!("stopped"),
+            ]);
+        }
+
+        #[tokio::test]
         async fn active_agent_count_covers_pre_record_and_stopping_execution_windows_once() {
             let (executor, _temps) = test_executor();
             let task_id = Uuid::new_v4();
@@ -10507,6 +10570,33 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             drop(mark);
             owner.cancel.send(true).unwrap();
             owner.handle.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_panicking_execution_is_terminalized_before_its_record_can_count_as_live() {
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let (executor, _temps) = test_executor_with_events(recording.clone());
+            let task_id = Uuid::new_v4();
+            let execution_id = Uuid::new_v4();
+            let mut execution = execution_for(task_id, chrono::Utc::now(), false);
+            execution.id = execution_id;
+            executor.executions.write().await.insert(execution_id, execution);
+
+            drop(RunEndAnnouncer::for_execution(
+                executor.events.clone(),
+                task_id,
+                executor.executions.clone(),
+                execution_id,
+            ));
+
+            let execution = executor.executions.read().await.get(&execution_id).cloned().unwrap();
+            assert!(matches!(execution.status, AgentStatus::Failed(ref message) if message == "execution owner panicked"));
+            assert!(execution.stopped_at.is_some());
+            assert_eq!(
+                run_states(&recording, task_id),
+                vec![serde_json::json!({"failed": "execution owner panicked"})]
+            );
+            assert_eq!(crate::commands::agent::active_agent_count(&executor.executions, Some(&executor)).await, 0);
         }
 
         #[tokio::test]

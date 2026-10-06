@@ -78,22 +78,6 @@ pub async fn start_agent(
     // A new agent run, like a queued one, waits while new work is paused for
     // disk space. Checked before anything is recorded.
     state.start_guard.check().await.map_err(|block| block.to_string())?;
-    let id = Uuid::new_v4();
-    let now = chrono::Utc::now();
-
-    let execution = AgentExecution {
-        id,
-        worktree_id: Some(worktree_id),
-        task_id,
-        agent_type: "claude-code".to_string(),
-        status: AgentStatus::Starting,
-        started_at: now,
-        stopped_at: None,
-    };
-
-    state.agent.executions.write().await.insert(id, execution.clone());
-    state.agent.logs.write().await.insert(id, Vec::new());
-
     // The agent runs in the task's own checkout or it does not run. Passing no
     // directory at all -- which is what this did -- left it in whatever
     // directory SlashIt was launched from, so the agent read and wrote
@@ -112,19 +96,49 @@ pub async fn start_agent(
         )?
     };
 
+    let id = Uuid::new_v4();
+    let execution = AgentExecution {
+        id,
+        worktree_id: Some(worktree_id),
+        task_id,
+        agent_type: "claude-code".to_string(),
+        status: AgentStatus::Starting,
+        started_at: chrono::Utc::now(),
+        stopped_at: None,
+    };
+    state.agent.executions.write().await.insert(id, execution.clone());
+    state.agent.logs.write().await.insert(id, Vec::new());
+
     let client = AcpClient::start(
         "claude",
         &["--stdio"],
         &[],
         std::path::Path::new(&working_dir),
     )
-    .map_err(|e| format!("Failed to start agent: {}", e))?;
+    .map_err(|e| format!("Failed to start agent: {}", e));
 
-    let client = Arc::new(client);
+    let client = match client {
+        Ok(client) => Arc::new(client),
+        Err(error) => {
+            let mut executions = state.agent.executions.write().await;
+            if let Some(execution) = executions.get_mut(&id) {
+                execution.status = AgentStatus::Failed(error.clone());
+                execution.stopped_at = Some(chrono::Utc::now());
+            }
+            return Err(error);
+        }
+    };
 
-    client.initialize("SlashIt".to_string(), "0.1.0".to_string())
-        .await
-        .map_err(|e| format!("Failed to initialize agent: {}", e))?;
+    if let Err(error) = client.initialize("SlashIt".to_string(), "0.1.0".to_string()).await {
+        let error = format!("Failed to initialize agent: {}", error);
+        let _ = client.kill().await;
+        let mut executions = state.agent.executions.write().await;
+        if let Some(execution) = executions.get_mut(&id) {
+            execution.status = AgentStatus::Failed(error.clone());
+            execution.stopped_at = Some(chrono::Utc::now());
+        }
+        return Err(error);
+    }
 
     start_log_collection(client.clone(), id, state.agent.logs.clone());
 
@@ -134,7 +148,7 @@ pub async fn start_agent(
         ..execution.clone()
     });
 
-    Ok(execution)
+    Ok(AgentExecution { status: AgentStatus::Running, ..execution })
 }
 
 fn start_log_collection(client: Arc<AcpClient>, execution_id: Uuid, logs: AgentLogs) {
