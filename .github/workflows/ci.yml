@@ -400,3 +400,34 @@ jobs:
       # so the macOS leg compiles it out rather than failing on it.
       - name: Check (backend + CLI + IPC + attention rule + acceptance harness, including test code)
         run: cargo check --tests -p slashit-ui -p slashit -p slashit-ipc -p slashit-attention -p slashit-activity -p slashit-review-content -p slashit-acceptance
+
+  # The compile check above cannot say whether the named-pipe transport works,
+  # only that it builds. This job runs it: the IPC crate's own tests (the
+  # named-pipe unit tests and the owner-only security descriptor) and the same
+  # control-channel integration suite Linux runs, with the local endpoint being
+  # a uniquely named pipe served by the fully assembled server. That suite
+  # includes the authorization rule that lets an OS-verified peer reach the
+  # agent-spawning verbs while a token-holding TCP peer is refused.
+  #
+  # Deliberately not a general Windows `cargo test`: only these two targets are
+  # known to be meaningful on Windows, and the rest of the backend's tests
+  # assume a Unix toolchain. Widening this is a separate decision.
+  windows-ipc:
+    name: IPC tests (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: IPC crate tests (named-pipe transport)
+        run: cargo test -p slashit-ipc
+
+      - name: IPC integration suite (assembled server over a named pipe)
+        run: cargo test -p slashit-ui --test ipc_integration

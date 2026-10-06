@@ -11,16 +11,14 @@
 //! the important one: `CreateTask` plus `MoveTask(in_progress)` reaches the
 //! queue executor, which runs an agent with full tool access.
 //!
-//! Unix-only for now: the harness hardcodes `Endpoint::Unix`, which
-//! `transport::connect`/`bind_endpoints` reject outright on Windows. Gating
-//! the whole file keeps that a compile-time fact instead of 16 tests panicking
-//! the first time anyone runs `cargo test` on Windows. CI already only runs
-//! `cargo check`, not `cargo test`, on non-Linux platforms, so this changes
-//! nothing observable today — it only stops a latent trap. Real Windows
-//! named-pipe integration coverage remains a tracked gap, not something this
-//! gate closes.
-#![cfg(unix)]
-
+//! One suite, two local transports. The local endpoint is a Unix socket in a
+//! tempdir on Unix and a uniquely named pipe on Windows (see
+//! [`local_endpoint`]); everything else — the assembled server, the framing,
+//! the authorization rule — is the same code on both. Only the test that
+//! depends on a Unix filesystem artifact (a stale socket file left by a crash)
+//! is gated `#[cfg(unix)]`. The pipe names are never the production default
+//! (`slashit_ipc::endpoint::pipe_name`), so running the suite cannot collide
+//! with a real SlashIt instance on the same machine.
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,11 +38,58 @@ use slashit_ui_lib::config::paths::AppPaths;
 use slashit_ui_lib::ipc::IpcServer;
 use slashit_ui_lib::test_helpers::ipc_test_context;
 
+/// The local, OS-authenticated endpoint for one test.
+///
+/// Unix: a socket inside the test's tempdir. Windows: a named pipe, whose
+/// namespace is machine-global and therefore cannot live in the tempdir, so the
+/// name is made unique instead: process id (parallel test binaries), a
+/// process-wide counter (parallel tests, repeated harnesses inside one test)
+/// and the running test's name (so a leaked pipe is attributable). The name is
+/// released when the listeners are dropped, which closes every pipe instance;
+/// nothing is left on disk.
+///
+/// `unix_socket` is where the Unix socket goes relative to the tempdir; it is
+/// ignored on Windows.
+fn local_endpoint(tmp: &TempDir, unix_socket: &str) -> Endpoint {
+    #[cfg(unix)]
+    {
+        Endpoint::Unix {
+            path: tmp.path().join(unix_socket),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let _ = (tmp, unix_socket);
+        // Tokio test threads are named after the test. Keep the tail, which is
+        // the distinctive part, and stay far below the 256-character limit.
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_owned();
+        let sanitized: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let label = &sanitized[sanitized.len().saturating_sub(48)..];
+        Endpoint::NamedPipe {
+            name: format!(
+                r"\\.\pipe\slashit-test-{}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                label
+            ),
+        }
+    }
+}
+
 /// A running server plus everything a test needs to reach it.
 ///
-/// The tempdir is held for the lifetime of the harness because it contains both
-/// the socket and the credentials file; dropping it early would pull the
-/// listener's directory out from under it.
+/// The tempdir is held for the lifetime of the harness because it contains the
+/// credentials file (and, on Unix, the socket); dropping it early would pull
+/// the listener's directory out from under it.
 struct Harness {
     _tmp: TempDir,
     local: Endpoint,
@@ -53,7 +98,9 @@ struct Harness {
 }
 
 impl Harness {
-    /// Bind a Unix socket and a loopback TCP listener, and start serving.
+    /// Bind the platform's local endpoint and a loopback TCP listener, and
+    /// start serving. On Unix the local endpoint is a unique Unix socket in a
+    /// temporary directory; on Windows it is a unique named pipe.
     async fn start() -> Self {
         let tmp = TempDir::new().expect("tempdir");
         let paths = Arc::new(AppPaths::with_roots(
@@ -66,9 +113,7 @@ impl Harness {
         let ctx = Arc::new(ipc_test_context(paths.clone()));
 
         let requested = vec![
-            Endpoint::Unix {
-                path: tmp.path().join("slashit.sock"),
-            },
+            local_endpoint(&tmp, "slashit.sock"),
             // Port 0: the OS picks, and `endpoints()` reports what it picked.
             Endpoint::Tcp {
                 addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -82,7 +127,7 @@ impl Harness {
         let bound = server.endpoints();
         let local = bound
             .iter()
-            .find(|e| matches!(e, Endpoint::Unix { .. }))
+            .find(|e| e.is_os_authenticated())
             .expect("the local endpoint must be bound")
             .clone();
         let tcp = bound
@@ -160,10 +205,36 @@ fn error_of(response: &IpcResponse) -> String {
         .expect("a refusal must carry a message")
 }
 
+// --- Harness isolation -------------------------------------------------------
+
+#[tokio::test]
+async fn the_harness_never_binds_the_production_endpoint() {
+    let a = Harness::start().await;
+    let b = Harness::start().await;
+
+    assert_ne!(a.local, Endpoint::local_default());
+    assert_ne!(
+        a.local, b.local,
+        "two harnesses in one process must not share an endpoint"
+    );
+
+    #[cfg(windows)]
+    {
+        let Endpoint::NamedPipe { name } = &a.local else {
+            panic!(
+                "the local endpoint on Windows must be a named pipe: {:?}",
+                a.local
+            );
+        };
+        assert!(name.starts_with(r"\\.\pipe\slashit-test-"), "{name}");
+        assert!(name.len() < 256, "pipe names are limited to 256 characters");
+    }
+}
+
 // --- Round trip -------------------------------------------------------------
 
 #[tokio::test]
-async fn a_status_request_round_trips_over_a_unix_socket() {
+async fn a_status_request_round_trips_over_the_local_endpoint() {
     let h = Harness::start().await;
 
     let response = send(&IpcRequest::Status, &h.options(&h.local, None))
@@ -496,12 +567,6 @@ fn instance_paths(tmp: &TempDir) -> AppPaths {
     )
 }
 
-fn local_endpoint(tmp: &TempDir) -> Endpoint {
-    Endpoint::Unix {
-        path: tmp.path().join("runtime").join("slashit.sock"),
-    }
-}
-
 fn bind_opts() -> BindOptions {
     BindOptions {
         allow_remote: false,
@@ -515,7 +580,7 @@ async fn exactly_one_of_two_concurrent_starts_owns_the_instance() {
     let tmp = TempDir::new().expect("tempdir");
     std::fs::create_dir_all(tmp.path().join("runtime")).unwrap();
     let paths = Arc::new(instance_paths(&tmp));
-    let endpoint = local_endpoint(&tmp);
+    let endpoint = local_endpoint(&tmp, "runtime/slashit.sock");
 
     // Both candidates are released from the same barrier, so neither can win
     // merely by having started earlier.
@@ -578,7 +643,7 @@ async fn the_loser_of_the_race_never_touches_shared_state() {
     let tmp = TempDir::new().expect("tempdir");
     std::fs::create_dir_all(tmp.path().join("runtime")).unwrap();
     let paths = Arc::new(instance_paths(&tmp));
-    let endpoint = local_endpoint(&tmp);
+    let endpoint = local_endpoint(&tmp, "runtime/slashit.sock");
 
     let _winner = BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&endpoint), &bind_opts())
         .await
@@ -607,7 +672,8 @@ async fn the_loser_of_the_race_never_touches_shared_state() {
     let before_config = snapshot(&tmp.path().join("config"));
     let before_data = snapshot(&tmp.path().join("data"));
 
-    let refused = BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&endpoint), &bind_opts()).await;
+    let refused =
+        BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&endpoint), &bind_opts()).await;
     assert!(refused.is_err(), "the second instance must be refused");
 
     assert_eq!(
@@ -630,7 +696,7 @@ async fn ownership_is_released_on_shutdown_and_can_be_reacquired() {
     let tmp = TempDir::new().expect("tempdir");
     std::fs::create_dir_all(tmp.path().join("runtime")).unwrap();
     let paths = Arc::new(instance_paths(&tmp));
-    let endpoint = local_endpoint(&tmp);
+    let endpoint = local_endpoint(&tmp, "runtime/slashit.sock");
 
     let first = BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&endpoint), &bind_opts())
         .await
@@ -652,6 +718,7 @@ async fn ownership_is_released_on_shutdown_and_can_be_reacquired() {
         .expect("a later instance must be able to acquire ownership once released");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_stale_socket_left_by_a_crash_does_not_lock_the_app_out() {
     use slashit_ui_lib::ipc::BoundIpc;
@@ -671,7 +738,7 @@ async fn a_stale_socket_left_by_a_crash_does_not_lock_the_app_out() {
     let tmp = TempDir::new().expect("tempdir");
     std::fs::create_dir_all(tmp.path().join("runtime")).unwrap();
     let paths = Arc::new(instance_paths(&tmp));
-    let endpoint = local_endpoint(&tmp);
+    let endpoint = local_endpoint(&tmp, "runtime/slashit.sock");
     let socket_path = tmp.path().join("runtime").join("slashit.sock");
     let lock_path = tmp.path().join("runtime").join("slashit.lock");
 
