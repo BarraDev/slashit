@@ -519,7 +519,7 @@ pub fn Kanban(
         // A persisted status says where the task last was, not whether this
         // process still owns a provider run. Keep the header on the same
         // live-run registry as cards and drawers.
-        let running = tasks.iter().filter(|task| live_runs.status(&task.id).is_some()).count();
+        let running = live_runs.with(|runs| tasks.iter().filter(|task| runs.status(&task.id).is_some()).count());
         let done = tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
         (total, running, done)
     };
