@@ -20,6 +20,8 @@ usage: scripts/run-desktop-acceptance.sh [options] [-- <libtest args>]
   --exact <name>    only the journey with this exact test name
   --shard <N>       only the journeys $manifest assigns to shard N
   --harness         the harness suite (tests/acceptance.rs) instead
+  --readme-screenshots  regenerate the README screenshots (see
+                    scripts/capture-readme-screenshots.sh, which calls this)
   --visible         use your real display instead of a private one
   --list            list the selected tests without running them
 
@@ -52,6 +54,7 @@ while (($#)); do
   case $1 in
     --visible) visible=1 ;;
     --harness) target=acceptance ;;
+    --readme-screenshots) target=readme_screenshots ;;
     --list) list=1 ;;
     --exact)
       (($# >= 2)) || fail "--exact needs a test name"

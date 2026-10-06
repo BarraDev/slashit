@@ -35,6 +35,9 @@ libc = "0.2"
 # already writes with, so the harness reads what the product wrote.
 [dev-dependencies]
 toml = "0.8"
+# Only to crop an element screenshot: WebKitWebDriver pads one by the
+# element's offset (see tests/readme_screenshots.rs).
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
 # The acceptance journeys drive the REAL desktop application: they need the
@@ -66,4 +69,13 @@ required-features = ["run-acceptance"]
 [[test]]
 name = "product_acceptance"
 path = "tests/product_acceptance.rs"
+required-features = ["run-acceptance"]
+
+# Documentation tooling, not a journey: regenerates the README's screenshots
+# from synthetic data. Its own target so it stays out of `product_acceptance`
+# and the CI shard manifest, and runs only when named (`--test
+# readme_screenshots`, which scripts/capture-readme-screenshots.sh does).
+[[test]]
+name = "readme_screenshots"
+path = "tests/readme_screenshots.rs"
 required-features = ["run-acceptance"]
