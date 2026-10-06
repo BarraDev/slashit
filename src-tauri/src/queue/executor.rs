@@ -299,6 +299,14 @@ pub enum AgentEvent {
     Completed { task_id: String, success: bool, message: Option<String> },
     #[serde(rename = "error")]
     Error { task_id: String, message: String },
+    /// A run SlashIt owns changed state. Non-terminal states (starting,
+    /// running, stopping) mean SlashIt holds the run now; `stopped` and
+    /// `failed` are sent last, once the run no longer exists, and are what a
+    /// listener removes it on. Sent for every change, so a listener that
+    /// reads [`LiveRun`]s once on mount and then follows these never needs
+    /// to poll.
+    #[serde(rename = "run_state")]
+    RunState { task_id: String, status: AgentStatus },
 }
 
 type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
@@ -318,6 +326,11 @@ type Tasks = Arc<RwLock<HashMap<Uuid, Task>>>;
 struct RunningTask {
     handle: JoinHandle<()>,
     cancel: tokio::sync::watch::Sender<bool>,
+    /// The execution record this run keeps in `executions`, which is where
+    /// its [`AgentStatus`] lives. Known before the future first runs, so the
+    /// run's status is readable from the moment it is registered, not only
+    /// once the future has inserted its record.
+    execution_id: Option<Uuid>,
 }
 
 /// A review/fix flow the executor can still reach, on exactly the same
@@ -593,8 +606,63 @@ pub struct TaskRunSnapshot {
     /// live for the task, which is exactly when
     /// [`TaskExecutor::stop_task`] has something to end.
     pub live: bool,
+    /// What SlashIt knows of the run: `starting`, `running` or `stopping`
+    /// exactly while [`Self::live`], otherwise how the task's latest
+    /// execution this session ended (`stopped` or `failed`). `None` when
+    /// nothing has run for the task since the app started.
+    pub status: Option<AgentStatus>,
     /// The task's most recent execution, if one ran in this session.
     pub last_execution: Option<ExecutionSnapshot>,
+}
+
+/// A run SlashIt owns right now: the task it works on and its non-terminal
+/// state. The board reads these once when it opens and follows
+/// [`AgentEvent::RunState`] after.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct LiveRun {
+    pub task_id: Uuid,
+    pub status: AgentStatus,
+}
+
+/// Announces the end of a run on every way out of the future that owns it,
+/// the unwinding one included, so a run never stays live in a listener
+/// because one of many exits forgot to say so. Declared before the run's
+/// capacity permit, so the permit is released first and an announcement never
+/// precedes the capacity it frees.
+struct RunEndAnnouncer {
+    events: SharedEventSink,
+    task_id: Uuid,
+    end: AgentStatus,
+}
+
+impl RunEndAnnouncer {
+    fn new(events: SharedEventSink, task_id: Uuid) -> Self {
+        Self { events, task_id, end: AgentStatus::Stopped }
+    }
+}
+
+impl Drop for RunEndAnnouncer {
+    fn drop(&mut self) {
+        self.events.agent_event(AgentEvent::RunState {
+            task_id: self.task_id.to_string(),
+            status: self.end.clone(),
+        });
+    }
+}
+
+/// Marks a task whose run is being ended: from the moment its handle leaves
+/// `running_handles`/`reviewing_handles` until its future has been joined
+/// (or put back). Without it the run would read as gone while its process is
+/// still shutting down.
+struct StoppingMark {
+    ending: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    task_id: Uuid,
+}
+
+impl Drop for StoppingMark {
+    fn drop(&mut self) {
+        self.ending.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.task_id);
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -611,6 +679,8 @@ pub struct TaskExecutor {
     executions: Arc<RwLock<HashMap<Uuid, AgentExecution>>>,
     running_handles: Arc<RwLock<HashMap<Uuid, RunningTask>>>,
     reviewing_handles: Arc<RwLock<HashMap<Uuid, ReviewOwner>>>,
+    /// Tasks whose run is being ended right now; see [`StoppingMark`].
+    ending_runs: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
     /// PR-helper Claude invocations (`commands::pr::run_claude_pr_helper`)
     /// currently claiming a task. See [`PrHelperOwner`]/[`PrHelperLease`] for
     /// why this is a blocking `std::sync::Mutex` rather than the `tokio::
@@ -840,6 +910,7 @@ impl TaskExecutor {
             executions: config.executions,
             running_handles: Arc::new(RwLock::new(HashMap::new())),
             reviewing_handles: Arc::new(RwLock::new(HashMap::new())),
+            ending_runs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pr_helper_handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
             admission: Admission::new(initial_limit),
             reserved_permits: Arc::new(RwLock::new(HashMap::new())),
@@ -2064,6 +2135,9 @@ impl TaskExecutor {
         let working_dir_for_commit = working_dir.clone();
         let run_tools = self.run_tools.clone();
         let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        // Named before the future exists so the registered run can already be
+        // asked its status; the future records the execution under this id.
+        let execution_id = Uuid::new_v4();
 
         // The lock is taken before the spawn and held across the insert so
         // there is no instant in which an execution is running and
@@ -2080,9 +2154,9 @@ impl TaskExecutor {
             // including the early-return failure arms below. Removing this
             // task's `running_handles` entry does not by itself free
             // anything; see `crate::queue::admission`.
+            let mut announcer = RunEndAnnouncer::new(events.clone(), task_id);
             let _permit = permit;
 
-            let execution_id = Uuid::new_v4();
             let now = chrono::Utc::now();
 
             // Create execution record
@@ -2097,6 +2171,10 @@ impl TaskExecutor {
             };
             executions.write().await.insert(execution_id, execution);
             logs.write().await.insert(execution_id, Vec::new());
+            events.agent_event(AgentEvent::RunState {
+                task_id: task_id.to_string(),
+                status: AgentStatus::Starting,
+            });
 
             events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
@@ -2140,6 +2218,7 @@ impl TaskExecutor {
                         exec.status = AgentStatus::Failed(msg.clone());
                         exec.stopped_at = Some(chrono::Utc::now());
                     }
+                    announcer.end = AgentStatus::Failed(msg.clone());
                     // Announced last, as the end of every run is: see below.
                     events.agent_event(AgentEvent::Error {
                         task_id: task_id.to_string(),
@@ -2153,6 +2232,10 @@ impl TaskExecutor {
             if let Some(exec) = executions.write().await.get_mut(&execution_id) {
                 exec.status = AgentStatus::Running;
             }
+            events.agent_event(AgentEvent::RunState {
+                task_id: task_id.to_string(),
+                status: AgentStatus::Running,
+            });
 
             events.agent_event(AgentEvent::PhaseChange {
                 task_id: task_id.to_string(),
@@ -2327,6 +2410,7 @@ impl TaskExecutor {
                     _ => AgentStatus::Stopped,
                 };
                 exec.stopped_at = Some(chrono::Utc::now());
+                announcer.end = exec.status.clone();
             }
 
             if let Some(ending) = ending {
@@ -2334,7 +2418,7 @@ impl TaskExecutor {
             }
         });
 
-        handles.insert(task_id, RunningTask { handle, cancel });
+        handles.insert(task_id, RunningTask { handle, cancel, execution_id: Some(execution_id) });
         Ok(true)
     }
 
@@ -2508,9 +2592,22 @@ impl TaskExecutor {
     async fn end_task_owners_under_lease(&self, task_id: Uuid) -> Result<Option<TaskStatus>, String> {
         // Taken out of the map before awaiting anything, so the guard is
         // released before the future below tries to remove itself.
-        let running = self.running_handles.write().await.remove(&task_id);
+        //
+        // The mark goes up while the map's write guard is still held, so a
+        // reader never sees the run absent from the map without also seeing
+        // that it is being ended.
+        let mut mark = None;
+        let running = {
+            let mut handles = self.running_handles.write().await;
+            let owner = handles.remove(&task_id);
+            if owner.is_some() {
+                mark = Some(self.mark_ending(task_id));
+            }
+            owner
+        };
 
         if let Some(mut owner) = running {
+            self.announce_stopping(task_id, owner.execution_id).await;
             let _ = owner.cancel.send(true);
             // A run that finished on its own between the removal and here has
             // already recorded its own outcome; joining it is still correct,
@@ -2524,7 +2621,7 @@ impl TaskExecutor {
             // `owner` intact so it can be put back exactly as if this call
             // had never reached in.
             match tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, &mut owner.handle).await {
-                Ok(_) => {}
+                Ok(_) => self.announce_stopped(task_id),
                 Err(_) => {
                     // Still live, so still owning the checkout: put it back
                     // exactly where it was found rather than leave the map
@@ -2551,12 +2648,20 @@ impl TaskExecutor {
         // races a review that is still mid-flight -- it either sees the
         // review's own completed result already durable (nothing left to
         // end) or ends it before it can publish anything further.
-        let reviewing = self.reviewing_handles.write().await.remove(&task_id);
+        let reviewing = {
+            let mut handles = self.reviewing_handles.write().await;
+            let owner = handles.remove(&task_id);
+            if owner.is_some() {
+                mark = Some(self.mark_ending(task_id));
+            }
+            owner
+        };
 
         if let Some(mut owner) = reviewing {
+            self.announce_stopping(task_id, None).await;
             let _ = owner.cancel.send(true);
             match tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, &mut owner.handle).await {
-                Ok(_) => {}
+                Ok(_) => self.announce_stopped(task_id),
                 Err(_) => {
                     self.reviewing_handles.write().await.insert(task_id, owner);
                     return Err(format!(
@@ -2567,6 +2672,7 @@ impl TaskExecutor {
             }
             return Ok(Some(TaskStatus::AiReview));
         }
+        drop(mark);
 
         // Neither map owned it: either nothing was ever running for this
         // task, or an execution already finished and moved status off
@@ -3059,7 +3165,14 @@ impl TaskExecutor {
             // ownership flow, and it does not release or reacquire this
             // permit when it moves from one `ClaudeRunner` to the next. See
             // `crate::queue::admission`.
+            let _announcer = RunEndAnnouncer::new(events.clone(), task_id);
             let _permit = permit;
+            // A review flow keeps no execution record; owning its handle is
+            // what makes it live, and it is working from the first moment.
+            events.agent_event(AgentEvent::RunState {
+                task_id: task_id.to_string(),
+                status: AgentStatus::Running,
+            });
 
             let task_id_str = task_id.to_string();
             let started = (chrono::Utc::now(), ActivityKind::AiReviewStarted { review });
@@ -3538,8 +3651,7 @@ impl TaskExecutor {
     /// "Most recent" is by start time: a retried task has one execution per
     /// attempt, and the one a person asking about the task means is the last.
     pub async fn task_run(&self, task_id: Uuid) -> TaskRunSnapshot {
-        let live = self.running_handles.read().await.contains_key(&task_id)
-            || self.reviewing_handles.read().await.contains_key(&task_id);
+        let owned = self.owned_run_status(task_id).await;
 
         let latest = self
             .executions
@@ -3548,18 +3660,119 @@ impl TaskExecutor {
             .values()
             .filter(|e| e.task_id == Some(task_id))
             .max_by_key(|e| e.started_at)
-            .map(|e| (e.id, e.started_at, e.stopped_at));
+            .map(|e| (e.id, e.started_at, e.stopped_at, e.status.clone()));
 
-        let last_execution = match latest {
-            Some((id, started_at, stopped_at)) => Some(ExecutionSnapshot {
-                started_at,
-                stopped_at,
-                output: self.logs.read().await.get(&id).cloned().unwrap_or_default(),
-            }),
-            None => None,
+        let (last_execution, ended) = match latest {
+            Some((id, started_at, stopped_at, status)) => (
+                Some(ExecutionSnapshot {
+                    started_at,
+                    stopped_at,
+                    output: self.logs.read().await.get(&id).cloned().unwrap_or_default(),
+                }),
+                // Only an ended execution says how a run ended; a record that
+                // is not terminal but is not owned either describes nothing.
+                matches!(status, AgentStatus::Stopped | AgentStatus::Failed(_)).then_some(status),
+            ),
+            None => (None, None),
         };
 
-        TaskRunSnapshot { live, last_execution }
+        TaskRunSnapshot { live: owned.is_some(), status: owned.or(ended), last_execution }
+    }
+
+    /// The runs SlashIt owns right now, one per task, for a board that has
+    /// just opened. The same fact [`Self::task_run`] reads per task, and
+    /// what [`AgentEvent::RunState`] then keeps current.
+    pub async fn live_runs(&self) -> Vec<LiveRun> {
+        let mut ids: Vec<Uuid> = self.running_handles.read().await.keys().copied().collect();
+        ids.extend(self.reviewing_handles.read().await.keys().copied());
+        ids.extend(self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).iter().copied());
+        ids.sort();
+        ids.dedup();
+
+        let mut runs = Vec::new();
+        for task_id in ids {
+            if let Some(status) = self.owned_run_status(task_id).await {
+                runs.push(LiveRun { task_id, status });
+            }
+        }
+        runs
+    }
+
+    /// The state of the run SlashIt owns for `task_id`, or `None` when it
+    /// owns none.
+    ///
+    /// Grounded only in what the executor itself holds: a run being ended, a
+    /// registered execution whose future is still alive, or a registered
+    /// review flow. A persisted task status never contributes, and neither
+    /// does an execution record that is no longer backed by a handle.
+    async fn owned_run_status(&self, task_id: Uuid) -> Option<AgentStatus> {
+        // Read in this order, and written in the opposite one by
+        // `end_task_owners_under_lease`, so a run being ended is never
+        // missed in the gap between leaving the map and being marked.
+        if self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).contains(&task_id) {
+            return Some(AgentStatus::Stopping);
+        }
+        let execution_id = self
+            .running_handles
+            .read()
+            .await
+            .get(&task_id)
+            .filter(|r| !r.handle.is_finished())
+            .map(|r| r.execution_id);
+        if let Some(execution_id) = execution_id {
+            let recorded = match execution_id {
+                Some(id) => self.executions.read().await.get(&id).map(|e| e.status.clone()),
+                None => None,
+            };
+            return Some(match recorded {
+                // The future has not recorded its execution yet.
+                None => AgentStatus::Starting,
+                Some(status @ (AgentStatus::Starting | AgentStatus::Running | AgentStatus::Stopping)) => status,
+                // Ended on its own an instant before its handle left the map.
+                Some(AgentStatus::Stopped | AgentStatus::Failed(_)) => AgentStatus::Stopping,
+            });
+        }
+        let reviewing = self
+            .reviewing_handles
+            .read()
+            .await
+            .get(&task_id)
+            .is_some_and(|r| !r.handle.is_finished());
+        reviewing.then_some(AgentStatus::Running)
+    }
+
+    /// Mark `task_id`'s run as being ended; see [`StoppingMark`].
+    fn mark_ending(&self, task_id: Uuid) -> StoppingMark {
+        self.ending_runs.lock().unwrap_or_else(|p| p.into_inner()).insert(task_id);
+        StoppingMark { ending: self.ending_runs.clone(), task_id }
+    }
+
+    /// Announce that the run for `task_id` is over, after a stop has joined
+    /// it. The run's own future announces its end too; this repeats it, so a
+    /// `stopping` announced just after that end can never be the last word.
+    fn announce_stopped(&self, task_id: Uuid) {
+        self.events.agent_event(AgentEvent::RunState {
+            task_id: task_id.to_string(),
+            status: AgentStatus::Stopped,
+        });
+    }
+
+    /// Record and announce that the run for `task_id` is being stopped.
+    ///
+    /// The execution's record moves only from a non-terminal state: a run
+    /// that already ended keeps the outcome it recorded.
+    async fn announce_stopping(&self, task_id: Uuid, execution_id: Option<Uuid>) {
+        if let Some(id) = execution_id {
+            if let Some(exec) = self.executions.write().await.get_mut(&id) {
+                if matches!(exec.status, AgentStatus::Starting | AgentStatus::Running) {
+                    exec.status = AgentStatus::Stopping;
+                }
+            }
+        }
+        self.events.agent_event(AgentEvent::RunState {
+            task_id: task_id.to_string(),
+            status: AgentStatus::Stopping,
+        });
     }
 
     // --- Helpers ---
@@ -3834,7 +4047,7 @@ impl TaskExecutor {
         self.running_handles
             .write()
             .await
-            .insert(task_id, RunningTask { handle, cancel });
+            .insert(task_id, RunningTask { handle, cancel, execution_id: None });
         cleaned_up
     }
 
@@ -3898,7 +4111,7 @@ impl TaskExecutor {
         self.running_handles
             .write()
             .await
-            .insert(task_id, RunningTask { handle, cancel });
+            .insert(task_id, RunningTask { handle, cancel, execution_id: None });
     }
 
     /// Register a running-execution owner whose future never finishes even
@@ -3942,7 +4155,7 @@ impl TaskExecutor {
         self.running_handles
             .write()
             .await
-            .insert(task_id, RunningTask { handle, cancel });
+            .insert(task_id, RunningTask { handle, cancel, execution_id: None });
         cleaned_up
     }
 
@@ -3982,7 +4195,7 @@ impl TaskExecutor {
         self.running_handles
             .write()
             .await
-            .insert(task_id, RunningTask { handle, cancel });
+            .insert(task_id, RunningTask { handle, cancel, execution_id: None });
         cleaned_up
     }
 
@@ -3995,7 +4208,7 @@ impl TaskExecutor {
         self.running_handles
             .write()
             .await
-            .insert(task_id, RunningTask { handle, cancel });
+            .insert(task_id, RunningTask { handle, cancel, execution_id: None });
     }
 }
 
@@ -5682,7 +5895,7 @@ mod tests {
             .running_handles
             .write()
             .await
-            .insert(task_id, RunningTask { handle, cancel });
+            .insert(task_id, RunningTask { handle, cancel, execution_id: None });
         cleaned_up
     }
 
@@ -6725,7 +6938,7 @@ mod tests {
             .running_handles
             .write()
             .await
-            .insert(task_id, RunningTask { handle, cancel });
+            .insert(task_id, RunningTask { handle, cancel, execution_id: None });
         observed
     }
 
@@ -6824,7 +7037,7 @@ mod tests {
             .running_handles
             .write()
             .await
-            .insert(task_id, RunningTask { handle, cancel });
+            .insert(task_id, RunningTask { handle, cancel, execution_id: None });
 
         let first = executor.stop_task(task_id).await;
         assert!(first.is_err(), "setup: must still be stuck here");
@@ -7016,7 +7229,7 @@ mod tests {
             .running_handles
             .write()
             .await
-            .insert(task_id, RunningTask { handle, cancel });
+            .insert(task_id, RunningTask { handle, cancel, execution_id: None });
 
         executor
             .stop_task(task_id)
@@ -9954,4 +10167,429 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
             assert_eq!(w.task().await.status, TaskStatus::HumanReview);
         }
     }
+
+    /// What SlashIt says about the run it owns, which is only ever what the
+    /// executor itself holds: a handle it registered, the execution record
+    /// that handle names, and a stop it is carrying out. Never a task's
+    /// persisted status.
+    mod run_supervision {
+        use super::*;
+
+        fn run_states(recording: &crate::events::RecordingEventSink, task_id: Uuid) -> Vec<serde_json::Value> {
+            recording
+                .recorded()
+                .into_iter()
+                .filter(|(name, _)| name == "agent-event")
+                .map(|(_, payload)| payload)
+                .filter(|p| {
+                    p.get("type").and_then(|t| t.as_str()) == Some("run_state")
+                        && p.get("task_id").and_then(|t| t.as_str()) == Some(task_id.to_string().as_str())
+                })
+                .map(|p| p.get("status").cloned().unwrap_or_default())
+                .collect()
+        }
+
+        /// A registered execution whose record says `status`.
+        async fn register_recorded_run(executor: &TaskExecutor, task_id: Uuid, status: AgentStatus) -> Uuid {
+            let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+            let handle = tokio::spawn(async move {
+                let _ = cancelled.changed().await;
+            });
+            let execution_id = Uuid::new_v4();
+            let mut execution = execution_for(task_id, chrono::Utc::now(), false);
+            execution.id = execution_id;
+            execution.status = status;
+            executor.executions.write().await.insert(execution_id, execution);
+            executor
+                .running_handles
+                .write()
+                .await
+                .insert(task_id, RunningTask { handle, cancel, execution_id: Some(execution_id) });
+            execution_id
+        }
+
+        async fn wait_for_status(executor: &TaskExecutor, task_id: Uuid, wanted: AgentStatus) {
+            for _ in 0..400 {
+                if executor.task_run(task_id).await.status.as_ref() == Some(&wanted) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            panic!("the run never reported {wanted:?}: {:?}", executor.task_run(task_id).await);
+        }
+
+        // matrix 1, 10
+        #[tokio::test]
+        async fn a_queued_task_is_not_live_even_while_it_waits_for_capacity() {
+            let (executor, _temps) = test_executor();
+            let project_id = Uuid::new_v4();
+            let queued = create_test_task_full("waiting", project_id, TaskStatus::Queue, 0);
+            let queued_id = queued.id;
+            executor.tasks.write().await.insert(queued_id, queued);
+            // Every slot is taken by other work.
+            let mut others = Vec::new();
+            for _ in 0..3 {
+                let other = Uuid::new_v4();
+                register_recorded_run(&executor, other, AgentStatus::Running).await;
+                others.push(other);
+            }
+
+            let run = executor.task_run(queued_id).await;
+            assert!(!run.live);
+            assert_eq!(run.status, None);
+            let live = executor.live_runs().await;
+            assert_eq!(live.len(), 3);
+            assert!(live.iter().all(|r| r.task_id != queued_id && r.status == AgentStatus::Running));
+        }
+
+        // matrix 2, 9
+        #[tokio::test]
+        async fn a_persisted_in_progress_task_with_no_owned_run_is_not_live() {
+            let (executor, _temps) = test_executor();
+            let project_id = Uuid::new_v4();
+            for status in [TaskStatus::InProgress, TaskStatus::AiReview] {
+                let mut task = create_test_task_full("left over", project_id, status, 0);
+                task.phase = TaskPhase::Coding;
+                let id = task.id;
+                executor.tasks.write().await.insert(id, task);
+
+                let run = executor.task_run(id).await;
+                assert!(!run.live, "{run:?}");
+                assert_eq!(run.status, None);
+            }
+            assert!(executor.live_runs().await.is_empty(), "a restart owns nothing until a run starts");
+        }
+
+        // matrix 3
+        #[tokio::test]
+        async fn a_registered_run_that_has_not_recorded_its_execution_is_starting() {
+            let (executor, _temps) = test_executor();
+            let task_id = Uuid::new_v4();
+            let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+            let handle = tokio::spawn(async move {
+                let _ = cancelled.changed().await;
+            });
+            executor
+                .running_handles
+                .write()
+                .await
+                .insert(task_id, RunningTask { handle, cancel, execution_id: Some(Uuid::new_v4()) });
+
+            let run = executor.task_run(task_id).await;
+            assert!(run.live);
+            assert_eq!(run.status, Some(AgentStatus::Starting));
+            assert_eq!(executor.live_runs().await, vec![LiveRun { task_id, status: AgentStatus::Starting }]);
+        }
+
+        // matrix 4, 12
+        #[tokio::test]
+        async fn an_owned_run_reports_what_its_execution_recorded_and_never_waits_for_input() {
+            let (executor, _temps) = test_executor();
+            let task_id = Uuid::new_v4();
+            register_recorded_run(&executor, task_id, AgentStatus::Running).await;
+
+            // Any number of reads of a run that says nothing changes nothing:
+            // silence is not a state.
+            for _ in 0..5 {
+                let run = executor.task_run(task_id).await;
+                assert!(run.live);
+                assert_eq!(run.status, Some(AgentStatus::Running));
+            }
+            let wire = serde_json::to_value(executor.task_run(task_id).await).unwrap();
+            assert_eq!(wire["status"], "running");
+            assert!(!wire.to_string().contains("waiting"), "{wire}");
+        }
+
+        // matrix 13
+        #[tokio::test]
+        async fn parallel_runs_are_each_reported_for_their_own_task() {
+            let (executor, _temps) = test_executor();
+            let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+            register_recorded_run(&executor, a, AgentStatus::Running).await;
+            register_recorded_run(&executor, b, AgentStatus::Starting).await;
+
+            assert_eq!(executor.task_run(a).await.status, Some(AgentStatus::Running));
+            assert_eq!(executor.task_run(b).await.status, Some(AgentStatus::Starting));
+            assert_eq!(executor.task_run(c).await.status, None);
+            let mut live = executor.live_runs().await;
+            live.sort_by_key(|r| r.task_id);
+            let mut expected = vec![
+                LiveRun { task_id: a, status: AgentStatus::Running },
+                LiveRun { task_id: b, status: AgentStatus::Starting },
+            ];
+            expected.sort_by_key(|r| r.task_id);
+            assert_eq!(live, expected);
+        }
+
+        #[tokio::test]
+        async fn a_review_flow_is_live_and_working_while_it_owns_its_handle() {
+            let (executor, _temps) = test_executor();
+            let task_id = Uuid::new_v4();
+            let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+            let handle = tokio::spawn(async move {
+                let _ = cancelled.changed().await;
+            });
+            executor.reviewing_handles.write().await.insert(task_id, ReviewOwner { handle, cancel });
+
+            let run = executor.task_run(task_id).await;
+            assert!(run.live);
+            assert_eq!(run.status, Some(AgentStatus::Running));
+        }
+
+        #[tokio::test]
+        async fn a_handle_whose_future_died_is_not_a_live_run() {
+            let (executor, _temps) = test_executor();
+            let task_id = Uuid::new_v4();
+            let (cancel, _cancelled) = tokio::sync::watch::channel(false);
+            let handle = tokio::spawn(async {});
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            executor
+                .running_handles
+                .write()
+                .await
+                .insert(task_id, RunningTask { handle, cancel, execution_id: None });
+
+            assert!(!executor.task_run(task_id).await.live);
+            assert!(executor.live_runs().await.is_empty());
+        }
+
+        // matrix 8
+        #[tokio::test]
+        async fn a_stop_in_progress_is_stopping_until_the_run_is_gone() {
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let (executor, _temps) = test_executor_with_events(recording.clone());
+            let task = running_task(Uuid::new_v4());
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+
+            // A run that, once asked to end, ends only when the test lets it.
+            let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+            let release = Arc::new(tokio::sync::Notify::new());
+            let released = release.clone();
+            let handle = tokio::spawn(async move {
+                let _ = cancelled.changed().await;
+                released.notified().await;
+            });
+            let execution_id = Uuid::new_v4();
+            let mut execution = execution_for(task_id, chrono::Utc::now(), false);
+            execution.id = execution_id;
+            executor.executions.write().await.insert(execution_id, execution);
+            executor
+                .running_handles
+                .write()
+                .await
+                .insert(task_id, RunningTask { handle, cancel, execution_id: Some(execution_id) });
+            assert_eq!(executor.task_run(task_id).await.status, Some(AgentStatus::Running));
+
+            let stopper = {
+                let executor = executor.clone();
+                tokio::spawn(async move { executor.stop_task(task_id).await })
+            };
+            wait_for_status(&executor, task_id, AgentStatus::Stopping).await;
+            let run = executor.task_run(task_id).await;
+            assert!(run.live, "the agent is still shutting down: {run:?}");
+            assert_eq!(
+                executor.live_runs().await,
+                vec![LiveRun { task_id, status: AgentStatus::Stopping }]
+            );
+            assert_eq!(run_states(&recording, task_id), vec![serde_json::json!("stopping")]);
+
+            release.notify_one();
+            stopper.await.unwrap().expect("the stop succeeds");
+
+            let run = executor.task_run(task_id).await;
+            assert!(!run.live);
+            assert_eq!(run.status, None, "the fake never recorded an end of its own");
+            assert!(executor.live_runs().await.is_empty());
+            assert_eq!(
+                run_states(&recording, task_id),
+                vec![serde_json::json!("stopping"), serde_json::json!("stopped")]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stop_that_cannot_finish_keeps_the_run_stopping_not_working() {
+            let (executor, _temps) = test_executor();
+            let task = running_task(Uuid::new_v4());
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+            let execution_id = Uuid::new_v4();
+            let mut execution = execution_for(task_id, chrono::Utc::now(), false);
+            execution.id = execution_id;
+            executor.executions.write().await.insert(execution_id, execution);
+            // A run that never ends, even once asked to.
+            executor.register_unkillable_running_execution_for_test(task_id).await;
+            executor.running_handles.write().await.get_mut(&task_id).unwrap().execution_id = Some(execution_id);
+
+            let refused = tokio::time::timeout(
+                AGENT_SHUTDOWN_TIMEOUT * 2,
+                executor.stop_task(task_id),
+            )
+            .await
+            .expect("the bounded stop answers");
+
+            assert!(refused.is_err(), "{refused:?}");
+            let run = executor.task_run(task_id).await;
+            assert!(run.live, "the run was put back, so it is still owned");
+            assert_eq!(run.status, Some(AgentStatus::Stopping), "{run:?}");
+        }
+
+        #[cfg(unix)]
+        struct Real {
+            executor: Arc<TaskExecutor>,
+            recording: Arc<crate::events::RecordingEventSink>,
+            _temps: Vec<tempfile::TempDir>,
+            task_id: Uuid,
+        }
+
+        #[cfg(unix)]
+        async fn real_world() -> Real {
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let (executor, temps) = test_executor_with_events(recording.clone());
+            let (repo, task_id, _) =
+                stacked_task_fixture(&executor, &temps, TaskStatus::InProgress, None, "dependency-branch").await;
+            publish_default_base(&repo);
+            git_in(&repo, &["config", "user.email", "t@example.com"]);
+            git_in(&repo, &["config", "user.name", "T"]);
+            executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+            let project_id = executor.tasks.read().await[&task_id].project_id;
+            let board: Vec<Task> = executor
+                .tasks
+                .read()
+                .await
+                .values()
+                .filter(|t| t.project_id == project_id)
+                .cloned()
+                .collect();
+            executor.storage.save_project_tasks(project_id, &board).expect("seed the board");
+            Real { executor, recording, _temps: temps, task_id }
+        }
+
+        // matrix 3, 4, 5-by-silence, 6, 12, 14
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_real_run_is_starting_then_working_then_gone_with_nothing_stale() {
+            let w = real_world().await;
+            let gate = tempfile::tempdir().unwrap();
+            let (started, go) = (gate.path().join("started"), gate.path().join("go"));
+            let _agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &format!(
+                    "cat >/dev/null; printf 'work\\n' > agent_work.txt; : > '{}'; \
+                     while [ ! -e '{}' ]; do sleep 0.05; done; \
+                     printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'",
+                    started.display(),
+                    go.display(),
+                ),
+            )
+            .await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            // Owned from the moment it is registered.
+            assert!(w.executor.task_run(w.task_id).await.live);
+
+            wait_for_status(&w.executor, w.task_id, AgentStatus::Running).await;
+            for _ in 0..400 {
+                if started.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            assert!(started.exists(), "the agent is running");
+            // A fresh reader (a board that just opened) sees the same run.
+            assert_eq!(
+                w.executor.live_runs().await,
+                vec![LiveRun { task_id: w.task_id, status: AgentStatus::Running }]
+            );
+            // Silent so far, still working, and nothing but starting and
+            // running was ever announced.
+            assert_eq!(
+                run_states(&w.recording, w.task_id),
+                vec![serde_json::json!("starting"), serde_json::json!("running")]
+            );
+
+            std::fs::write(&go, b"").unwrap();
+            for _ in 0..400 {
+                if !w.executor.task_run(w.task_id).await.live {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+
+            let run = w.executor.task_run(w.task_id).await;
+            assert!(!run.live, "{run:?}");
+            assert_eq!(run.status, Some(AgentStatus::Stopped), "an ended run says how it ended");
+            assert!(w.executor.live_runs().await.is_empty());
+            assert_eq!(
+                run_states(&w.recording, w.task_id).last(),
+                Some(&serde_json::json!("stopped")),
+                "the end is announced last"
+            );
+        }
+
+        // matrix 7
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_failed_run_is_announced_as_failed_and_the_task_still_fails_as_before() {
+            let w = real_world().await;
+            let _agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                "cat >/dev/null; echo 'the fixture agent broke' >&2; exit 3",
+            )
+            .await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            for _ in 0..400 {
+                if !w.executor.task_run(w.task_id).await.live
+                    && w.executor.tasks.read().await[&w.task_id].status == TaskStatus::Error
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+
+            let task = w.executor.tasks.read().await[&w.task_id].clone();
+            assert_eq!(task.status, TaskStatus::Error);
+            assert_eq!(task.phase, TaskPhase::Failed);
+            let run = w.executor.task_run(w.task_id).await;
+            assert!(!run.live);
+            assert!(matches!(run.status, Some(AgentStatus::Failed(_))), "{run:?}");
+            assert!(w.executor.live_runs().await.is_empty());
+            let states = run_states(&w.recording, w.task_id);
+            assert!(
+                states.last().is_some_and(|s| s.get("failed").is_some()),
+                "the last word is the failure: {states:?}"
+            );
+        }
+
+        // matrix 8 on a real process
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn stopping_a_real_run_announces_stopping_and_then_that_it_is_gone() {
+            let w = real_world().await;
+            let _agent = crate::test_helpers::FakeProgram::install("claude", "cat >/dev/null; sleep 30").await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            wait_for_status(&w.executor, w.task_id, AgentStatus::Running).await;
+
+            w.executor.stop_task(w.task_id).await.expect("stop");
+
+            assert!(!w.executor.task_run(w.task_id).await.live);
+            assert!(w.executor.live_runs().await.is_empty());
+            assert_eq!(
+                run_states(&w.recording, w.task_id),
+                vec![
+                    serde_json::json!("starting"),
+                    serde_json::json!("running"),
+                    serde_json::json!("stopping"),
+                    serde_json::json!("stopped"),
+                    serde_json::json!("stopped"),
+                ],
+                "the run's own end, and the stop's repeat of it"
+            );
+        }
+    }
+
 }

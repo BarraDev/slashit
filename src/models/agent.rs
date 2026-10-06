@@ -54,6 +54,9 @@ pub enum AgentEvent {
     ToolUse { task_id: String, tool: String },
     Completed { task_id: String, success: bool, message: Option<String> },
     Error { task_id: String, message: String },
+    /// A run SlashIt owns changed state. `starting`, `running` and `stopping`
+    /// mean it owns the run now; `stopped` and `failed` mean the run is gone.
+    RunState { task_id: String, status: AgentStatus },
 }
 
 impl AgentEvent {
@@ -64,7 +67,8 @@ impl AgentEvent {
             | Self::PhaseChange { task_id, .. }
             | Self::ToolUse { task_id, .. }
             | Self::Completed { task_id, .. }
-            | Self::Error { task_id, .. } => task_id,
+            | Self::Error { task_id, .. }
+            | Self::RunState { task_id, .. } => task_id,
         }
     }
 }
@@ -76,7 +80,18 @@ pub struct TaskRunSnapshot {
     /// Whether the backend holds a live agent for the task, which is exactly
     /// when stopping it has something to end.
     pub live: bool,
+    /// The run's state while it is live; how the latest execution ended
+    /// otherwise; `None` when nothing has run since the app started.
+    #[serde(default)]
+    pub status: Option<AgentStatus>,
     pub last_execution: Option<ExecutionSnapshot>,
+}
+
+/// One run the backend owns right now, as `get_live_runs` reports it.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct LiveRun {
+    pub task_id: Uuid,
+    pub status: AgentStatus,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -189,4 +204,33 @@ mod tests {
             serde_json::from_value(value).expect("should deserialize");
         assert_eq!(round_tripped.worktree_id, exec.worktree_id);
     }
+
+    #[test]
+    fn run_state_events_and_live_runs_decode_the_backend_wire_shape() {
+        let running: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "run_state", "task_id": "a", "status": "running"
+        }))
+        .expect("running");
+        assert_eq!(running, AgentEvent::RunState { task_id: "a".into(), status: AgentStatus::Running });
+        assert_eq!(running.task_id(), "a");
+
+        let failed: AgentEvent = serde_json::from_value(serde_json::json!({
+            "type": "run_state", "task_id": "a", "status": {"failed": "boom"}
+        }))
+        .expect("failed");
+        assert_eq!(failed, AgentEvent::RunState { task_id: "a".into(), status: AgentStatus::Failed("boom".into()) });
+
+        let runs: Vec<LiveRun> = serde_json::from_value(serde_json::json!([
+            {"task_id": "00000000-0000-0000-0000-000000000001", "status": "stopping"}
+        ]))
+        .expect("live runs");
+        assert_eq!(runs[0].status, AgentStatus::Stopping);
+
+        let snapshot: TaskRunSnapshot = serde_json::from_value(serde_json::json!({
+            "live": false, "status": {"failed": "x"}, "last_execution": null
+        }))
+        .expect("snapshot with a status");
+        assert_eq!(snapshot.status, Some(AgentStatus::Failed("x".into())));
+    }
+
 }

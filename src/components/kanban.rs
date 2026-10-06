@@ -11,8 +11,9 @@ use crate::components::{TaskCard, TaskDrawer, TaskEditModal, TaskEditMode, toast
 use crate::components::close_without_merge_dialog::{CloseWithoutMergeDialog, PendingClose};
 use crate::components::new_work_pause::{provide_new_work_pause, NewWorkPauseNotice};
 use crate::components::attention::{attention_order, next_after, reveal_card, BoardAttention, Deliveries};
-use crate::components::task_live::{activity_from_event, changes_task_record, counts_as_running, shows_activity, ActivityUpdate};
-use crate::services::task_run_service::listen_agent_events;
+use crate::components::task_live::{activity_from_event, changes_task_record, counts_as_running, ActivityUpdate, LiveRuns};
+use crate::models::AgentEvent;
+use crate::services::task_run_service::{get_live_runs, listen_agent_events_with_ready};
 use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
@@ -21,6 +22,11 @@ use std::collections::{HashMap, HashSet};
 /// `agent-event` listener and read by the cards.
 #[derive(Clone, Copy)]
 struct LiveActivity(RwSignal<HashMap<Uuid, String>>);
+
+/// The runs SlashIt owns, read by the cards. The one source of what the board
+/// calls working; see [`LiveRuns`].
+#[derive(Clone, Copy)]
+struct LiveRunsContext(RwSignal<LiveRuns>);
 
 /// The card the header's "Needs you" last pointed at, and a counter that
 /// makes each press a new cue. Read by the cards.
@@ -260,11 +266,32 @@ pub fn Kanban(
     // the task list again when an event says a task's state changed.
     let live_activity = RwSignal::new(HashMap::<Uuid, String>::new());
     provide_context(LiveActivity(live_activity));
+    let live_runs = RwSignal::new(LiveRuns::default());
+    provide_context(LiveRunsContext(live_runs));
     {
-        let listener = StoredValue::new_local(Some(listen_agent_events(move |event| {
+        // The snapshot is requested only once the listener is registered, so
+        // no transition falls between the two; events that land while it is
+        // on its way win over it for their own task.
+        let hydrate = move || {
+            live_runs.try_update(|runs| runs.begin_hydration());
+            spawn_local(async move {
+                let snapshot = match get_live_runs().await {
+                    Ok(runs) => Some(runs),
+                    Err(e) => {
+                        leptos::logging::warn!("[board] could not read the live runs: {e}");
+                        None
+                    }
+                };
+                live_runs.try_update(|runs| runs.finish_hydration(snapshot));
+            });
+        };
+        let listener = StoredValue::new_local(Some(listen_agent_events_with_ready(move |event| {
             let Ok(task_id) = Uuid::parse_str(event.task_id()) else {
                 return;
             };
+            if let AgentEvent::RunState { status, .. } = &event {
+                live_runs.update(|runs| runs.apply_event(task_id, status.clone()));
+            }
             match activity_from_event(&event) {
                 Some(ActivityUpdate::Set(text)) => live_activity.update(|m| {
                     m.insert(task_id, text);
@@ -281,7 +308,7 @@ pub fn Kanban(
             if changes_task_record(&event) {
                 refresh_tasks.try_run(());
             }
-        })));
+        }, hydrate)));
         on_cleanup(move || listener.dispose());
     }
 
@@ -648,6 +675,7 @@ pub fn Kanban(
                     task_id=id
                     tasks=tasks_signal
                     activity=Signal::derive(move || live_activity.with(|m| m.get(&id).cloned()))
+                    run_status=Signal::derive(move || live_runs.with(|r| r.status(&id)))
                     on_close=on_drawer_close
                     on_edit=on_drawer_edit
                     apply_task=apply_task
@@ -2394,10 +2422,11 @@ fn KanbanTaskCard(
     let task_id = task.id.to_string();
     let task_id_for_indicator = task.id.to_string();
     let task_uuid = task.id;
-    // Only a running card shows what its agent is doing.
+    // The card itself shows this only while the task's run is working.
     let live_activity = use_context::<LiveActivity>()
-        .filter(|_| shows_activity(&task.status))
         .map(|live| Signal::derive(move || live.0.with(|m| m.get(&task_uuid).cloned())));
+    let live_run = use_context::<LiveRunsContext>()
+        .map(|live| Signal::derive(move || live.0.with(|r| r.status(&task_uuid))));
 
     // Check if this task is selected
     let is_selected = move || selected_tasks.get().contains(&task_uuid);
@@ -2670,7 +2699,7 @@ fn KanbanTaskCard(
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
                     </svg>
                 </button>
-                <TaskCard task=task.clone() activity=live_activity />
+                <TaskCard task=task.clone() activity=live_activity run=live_run />
                 // "Diff" button for review/done statuses
                 {
                     let show_diff = matches!(

@@ -54,3 +54,14 @@ pub async fn get_task_output(
         .ok_or("Executor not initialized")?;
     Ok(executor.get_task_output(task_id).await)
 }
+
+/// The runs SlashIt owns right now. Read when the board opens; the
+/// `run_state` agent events keep it current after that.
+#[tauri::command]
+pub async fn get_live_runs(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Vec<crate::queue::executor::LiveRun>, String> {
+    let executor = state.executor.get()
+        .ok_or("Executor not initialized")?;
+    Ok(executor.live_runs().await)
+}

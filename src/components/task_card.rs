@@ -1,6 +1,7 @@
 use leptos::prelude::*;
 use crate::components::attention::{AttentionChip, DeliveringChip};
-use crate::models::{AttentionReason, Task, TaskStatus, TaskCategory, TaskPriority, TaskPhase, QaStatus, ExternalRef, HumanReviewDecision};
+use crate::components::task_live::{project_run, RunBadge};
+use crate::models::{AgentStatus, AttentionReason, Task, TaskStatus, TaskCategory, TaskPriority, TaskPhase, QaStatus, ExternalRef, HumanReviewDecision};
 
 /// Compact task card designed to fit well within Kanban columns
 /// Inspired by Auto Claude's clean, modern design
@@ -10,9 +11,12 @@ pub fn TaskCard(
     /// The agent's current one-line activity, for a task that is running.
     #[prop(default = None)]
     activity: Option<Signal<Option<String>>>,
+    /// The run SlashIt owns for this task, if any. The card says a task is
+    /// working only from this, never from the task's status.
+    #[prop(default = None)]
+    run: Option<Signal<Option<AgentStatus>>>,
 ) -> impl IntoView {
     let is_stuck = task.stuck_since.is_some();
-    let is_running = task.status == TaskStatus::InProgress;
     let show_review = matches!(task.status, TaskStatus::AiReview | TaskStatus::HumanReview);
 
     // The record is fixed for this card; whether its pull request is being
@@ -25,6 +29,10 @@ pub fn TaskCard(
     // success: the amber chip is the card's signal, not a green "Approved".
     let pr_not_created = attention_idle == Some(AttentionReason::PrNotCreated);
     let task_status_in_review = task.status == TaskStatus::HumanReview;
+    let badge = move || {
+        let attention = if delivering() { attention_delivering } else { attention_idle };
+        project_run(run.and_then(|run| run.get()).as_ref(), attention)
+    };
 
     let card_class = move || {
         let mut classes = vec![
@@ -32,7 +40,7 @@ pub fn TaskCard(
             "bg-[#12121a] border border-white/[0.06]".to_string(),
         ];
 
-        if is_running {
+        if badge().is_some() {
             classes.push("border-blue-500/30 shadow-[0_0_15px_rgba(59,130,246,0.1)]".to_string());
         } else if is_stuck {
             classes.push("border-amber-500/30 shadow-[0_0_15px_rgba(245,158,11,0.1)]".to_string());
@@ -44,7 +52,7 @@ pub fn TaskCard(
     view! {
         <div data-testid="task-card" class=card_class()>
             // Running indicator (subtle glow bar at top)
-            {is_running.then(|| view! {
+            {move || badge().map(|_| view! {
                 <div class="absolute top-0 left-2 right-2 h-0.5 bg-gradient-to-r from-blue-500 via-blue-400 to-blue-500 rounded-full animate-pulse"></div>
             })}
             
@@ -76,15 +84,19 @@ pub fn TaskCard(
             <div class="flex items-center gap-1.5 mb-2.5">
                 <CategoryBadge category=task.category.clone() />
                 <PriorityBadge priority=task.priority.clone() />
-                {is_running.then(|| view! {
-                    <span class="px-1.5 py-0.5 text-[10px] font-medium rounded-md bg-blue-500/20 text-blue-300 animate-pulse">
-                        "Running"
+                {move || badge().map(|badge| view! {
+                    <span
+                        data-testid="task-run-badge"
+                        data-run=badge.label().to_lowercase()
+                        class="px-1.5 py-0.5 text-[10px] font-medium rounded-md bg-blue-500/20 text-blue-300 animate-pulse"
+                    >
+                        {badge.label()}
                     </span>
                 })}
             </div>
 
             // What the agent is doing right now, in one line.
-            {activity.map(|activity| move || activity.get().map(|text| {
+            {activity.map(|activity| move || activity.get().filter(|_| badge() == Some(RunBadge::Working)).map(|text| {
                 let title = text.clone();
                 view! {
                     <p data-testid="task-activity" class="mb-2 text-[11px] text-blue-300/80 truncate" title=title>

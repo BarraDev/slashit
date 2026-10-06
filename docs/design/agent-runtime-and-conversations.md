@@ -68,6 +68,22 @@ and it does not pretend otherwise.
 - "Waiting for input" requires a trustworthy structured provider or protocol
   signal. Silence or an idle output stream never implies it.
 
+## Managed run supervision today
+
+The executor's handle maps (`running_handles` for task executions,
+`reviewing_handles` for AI review and fix flows) are the in-memory registry of
+Runs SlashIt started. `AgentStatus` is the run vocabulary: `Starting`
+(registered, process not yet started), `Running`, `Stopping` (a stop is being
+carried out), and the ended `Stopped` and `Failed`. `get_task_run` and
+`get_live_runs` read the registry, and `AgentEvent::RunState` announces each
+change, with the ended states sent last. Nothing about a run is persisted:
+after a restart there is no run until SlashIt starts one. `AgentSlotStatus`
+and the workflow `AgentSlot`s are static templates that no execution updates,
+and the Tauri commands in `commands/agent.rs` that drive `AcpClient` are an
+older, parallel path that the board does not use. Neither is a second source
+of truth for a run. `WaitingForInput` stays out of `AgentStatus` until a
+provider or protocol signal exists that can set it.
+
 ## ACP
 
 ACP is a provider or protocol adapter boundary. It must not become SlashIt's

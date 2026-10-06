@@ -449,6 +449,7 @@ pub fn run() {
             get_execution_status,
             get_task_output,
             get_task_run,
+            get_live_runs,
             commands::workflow::get_workflow_config,
             commands::workflow::update_workflow_config,
             commands::workflow::list_workflows,
