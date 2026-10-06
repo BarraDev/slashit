@@ -1596,14 +1596,17 @@ pub async fn address_pr_review_inner(
                             None => false,
                         };
                         if proven {
+                            // The effect stays: it is what later proves the
+                            // fix is still on the remote.
                             item.fix_commit = Some(commit.clone());
+                        } else {
+                            // Weighed against the commit that took the
+                            // checkout and not there. An item left without
+                            // a commit has nothing more to wait for: it is
+                            // unproven, gets no reply, and a later Apply
+                            // makes the fix again.
+                            item.fix_effect = None;
                         }
-                        // Proven or not, the effect has been weighed against
-                        // the commit that took the checkout. An item left
-                        // without a commit has nothing more to wait for:
-                        // it is unproven, gets no reply, and a later Apply
-                        // makes the fix again.
-                        item.fix_effect = None;
                     }
                     None
                 }
@@ -1857,9 +1860,12 @@ struct SettledDelivery {
 /// disagree (#96).
 ///
 /// A fix is delivered when it is done, a commit is recorded as carrying it
-/// (`fix_commit`) and that exact commit is contained in `origin`'s branch for
-/// the pull request, which is refreshed here, once, by the user's own command.
-/// A commit with another ID but the same changes is not that commit. Nothing
+/// (`fix_commit`), that exact commit is contained in `origin`'s branch for
+/// the pull request, and the item's recorded effect (`fix_effect`) is still
+/// provably in that branch's tip. The branch is refreshed here, once, by the
+/// user's own command. A commit with another ID but the same changes is not
+/// that commit, and a later commit that reverted or overwrote the change
+/// leaves the old commit an ancestor without leaving the fix there. Nothing
 /// else counts: not `fix_uncommitted` being clear, a clean checkout, nothing
 /// to commit, a branch that is not ahead of its tracking ref, or an earlier
 /// push succeeding. A plan saved before commits were recorded has none, so its
@@ -1900,11 +1906,28 @@ async fn settle_delivery(
     settled.unavailable = remote.unavailable().map(str::to_string);
     for &idx in &candidates {
         let Some(commit) = plan.items[idx].fix_commit.clone() else { continue };
-        if remote.contains(&commit).await {
+        let on_remote = remote.contains(&commit).await;
+        // Holding the commit is not enough: a later commit on the branch
+        // may have reverted or overwritten the change. The item's recorded
+        // effect must still be provably in the branch as it is now.
+        let still_there = match (on_remote, remote.tip(), plan.items[idx].fix_effect.clone()) {
+            (true, Some(tip), Some(e)) => {
+                crate::worktree::delivery::effect_survives_in(working_dir, &e.before_tree, &e.after_tree, tip).await
+            }
+            _ => false,
+        };
+        if on_remote && still_there {
             plan.items[idx].fix_uncommitted = false;
             settled.indices.insert(idx);
         } else {
             plan.items[idx].fix_uncommitted = true;
+            if on_remote && !plan.items[idx].reply_posted {
+                // The branch has the commit and the change is gone from it:
+                // there is nothing left to push. The fix is unproven, and a
+                // later Apply makes it again.
+                plan.items[idx].fix_commit = None;
+                plan.items[idx].fix_effect = None;
+            }
         }
     }
     settled.owed_delivery = owing(plan, &settled.indices);
@@ -14057,6 +14080,94 @@ mod tests {
                 let (third, _plan) = apply(&task, plan, &worktree, no_jj, true).await;
                 assert_eq!(claude.runs(), runs + 1, "the unproven fix is made again");
                 assert_eq!(third.replies_posted, 1, "and delivered this time: {third:?}");
+            }
+
+            /// Deliver one fix (an edit to `notes.txt` and a new file) as commit
+            /// C1 without replying, let `c2` put a later commit on the remote
+            /// branch, then ask both Sync and Apply to reply. Returns what each
+            /// did, and each one's plan.
+            async fn delivered_then_c2(
+                c2: impl FnOnce(&Path, &str),
+            ) -> (usize, PrReviewPlan, usize, PrReviewPlan) {
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                std::fs::write(worktree.join("notes.txt"), "one\nkeep\nthree\nfour\nfive\nsix\nseven\neight\n").unwrap();
+                git(&worktree, &["add", "-A"]);
+                git(&worktree, &["commit", "-q", "-m", "notes"]);
+                git(&worktree, &["push", "-q", "-u", "origin", "task-branch"]);
+                let _claude = EditingClaude::install("sed -i 's/^one$/ONE/' notes.txt");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), false).await;
+                assert!(first.pushed, "{:?}", first.push_error);
+                let c1 = git(&worktree, &["rev-parse", "task-branch"]);
+                assert_eq!(plan.items[0].fix_commit.as_deref(), Some(c1.as_str()));
+                assert!(plan.items[0].fix_effect.is_some(), "the effect is kept as evidence once delivered");
+
+                c2(&worktree, &c1);
+                git(&worktree, &["add", "-A"]);
+                git(&worktree, &["commit", "-q", "--allow-empty", "-m", "c2"]);
+                git(&worktree, &["push", "-q", "origin", "task-branch"]);
+
+                // The plan comes back from the board file after a restart.
+                let plan = restarted(&plan);
+                assert!(plan.items[0].fix_effect.is_some(), "the retained effect is persisted");
+                let (synced, _) = sync(&task, &worktree, plan.clone()).await;
+                let (_, synced_plan) = sync(&task, &worktree, plan.clone()).await;
+                let (applied, applied_plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                (synced.replied as usize, synced_plan, applied.replies_posted as usize, applied_plan)
+            }
+
+            /// C2 leaves C1's change alone: the old commit is still an ancestor
+            /// and its change is still in the branch, so the reply is allowed,
+            /// from Apply and from Sync alike.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_later_commit_that_keeps_the_effect_keeps_the_proof() {
+                let _guard = PATH_LOCK.lock().await;
+                for (label, c2) in [
+                    ("empty", Box::new(|_: &Path, _: &str| {}) as Box<dyn FnOnce(&Path, &str)>),
+                    ("unrelated file", Box::new(|w: &Path, _: &str| std::fs::write(w.join("other.txt"), "x\n").unwrap())),
+                    ("same file, other line", Box::new(|w: &Path, _: &str| {
+                        let t = std::fs::read_to_string(w.join("notes.txt")).unwrap();
+                        std::fs::write(w.join("notes.txt"), t.replace("eight", "EIGHT")).unwrap();
+                    })),
+                ] {
+                    let (synced, _, applied, plan) = delivered_then_c2(c2).await;
+                    assert_eq!((synced, applied), (1, 1), "{label}");
+                    assert!(plan.items[0].reply_posted && !plan.items[0].fix_uncommitted, "{label}");
+                }
+            }
+
+            /// C2 reverts C1, or rewrites the very line C1 changed: C1 stays an
+            /// ancestor of the branch but the fix is not in it, so neither Apply
+            /// nor Sync says it is fixed, and a later Apply makes it again.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_later_commit_that_removes_the_effect_ends_the_proof() {
+                let _guard = PATH_LOCK.lock().await;
+                for (label, c2) in [
+                    ("revert", Box::new(|w: &Path, c1: &str| {
+                        git(w, &["revert", "--no-edit", c1]);
+                    }) as Box<dyn FnOnce(&Path, &str)>),
+                    ("overwrite", Box::new(|w: &Path, _: &str| {
+                        let t = std::fs::read_to_string(w.join("notes.txt")).unwrap();
+                        std::fs::write(w.join("notes.txt"), t.replace("ONE", "UNO")).unwrap();
+                        std::fs::remove_file(w.join("review-fix-1.txt")).unwrap();
+                    })),
+                    ("ambiguous: same line moved", Box::new(|w: &Path, _: &str| {
+                        let t = std::fs::read_to_string(w.join("notes.txt")).unwrap();
+                        std::fs::write(w.join("notes.txt"), format!("new first line\n{t}")).unwrap();
+                        std::fs::remove_file(w.join("review-fix-1.txt")).unwrap();
+                    })),
+                ] {
+                    let (synced, synced_plan, applied, applied_plan) = delivered_then_c2(c2).await;
+                    assert_eq!((synced, applied), (0, 0), "{label}");
+                    for plan in [&synced_plan, &applied_plan] {
+                        assert!(!plan.items[0].reply_posted && plan.items[0].fix_uncommitted, "{label}: {:?}", plan.items[0]);
+                    }
+                    assert_eq!(applied_plan.items[0].fix_commit, None, "{label}: nothing is left to push");
+                }
             }
 
             /// The commit is made and the push fails: the commit is recorded

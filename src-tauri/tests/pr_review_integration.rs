@@ -149,6 +149,22 @@ impl MockEnv {
         self.working_dir.display().to_string()
     }
 
+    /// Make one fix as an agent would, commit it and push it to `origin`:
+    /// the commit and the recorded effect a delivered item carries.
+    fn deliver_fix(&self, file: &str) -> (String, slashit_ui_lib::domain::task::FixEffect) {
+        self.git_out(&["add", "-A"]);
+        let before_tree = self.git_out(&["write-tree"]);
+        fs::write(self.working_dir.join(file), "fixed\n").unwrap();
+        self.git_out(&["add", "-A"]);
+        let after_tree = self.git_out(&["write-tree"]);
+        self.git_out(&["commit", "-q", "-m", "the fix"]);
+        self.git_out(&["push", "-q", "origin", "test-branch"]);
+        (
+            self.git_out(&["rev-parse", "HEAD"]),
+            slashit_ui_lib::domain::task::FixEffect { before_tree, after_tree },
+        )
+    }
+
     /// `git <args>` in the working directory, its trimmed stdout.
     fn git_out(&self, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
@@ -890,7 +906,9 @@ async fn rerunning_apply_with_only_replies_pending_skips_claude() {
     // Both approved, but only item index 0 has its fix on disk and is missing a reply.
     // Its fix is carried by a commit `origin` holds.
     plan.items[0].fix_done = true;
-    plan.items[0].fix_commit = Some(env.git_out(&["rev-parse", "HEAD"]));
+    let (commit, effect) = env.deliver_fix("fix-a.txt");
+    plan.items[0].fix_commit = Some(commit);
+    plan.items[0].fix_effect = Some(effect);
     plan.items[0].last_agent_summary = Some("prior round did the edit".to_string());
     plan.items[0].reply_posted = false;
     // Drop item 2 from approval so we focus on the reply-only path for item 1.
@@ -932,7 +950,9 @@ async fn sync_pr_review_replies_posts_only_deferred_replies_without_claude() {
     // Item 0: fix done, carried by a commit `origin` holds, reply missing —
     // should be replied to.
     plan.items[0].fix_done = true;
-    plan.items[0].fix_commit = Some(env.git_out(&["rev-parse", "HEAD"]));
+    let (commit, effect) = env.deliver_fix("fix-a.txt");
+    plan.items[0].fix_commit = Some(commit);
+    plan.items[0].fix_effect = Some(effect);
     plan.items[0].reply_posted = false;
     plan.items[0].last_agent_summary = Some("edit already shipped".to_string());
     // Item 1: fix done, reply posted in the current format (pr_reply_text set)

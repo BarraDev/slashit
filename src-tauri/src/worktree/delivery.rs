@@ -211,6 +211,11 @@ impl RemoteBranch {
         Self { dir, tip }
     }
 
+    /// The commit the branch was at when refreshed, if it could be.
+    pub fn tip(&self) -> Option<&str> {
+        self.tip.as_deref().ok()
+    }
+
     /// Why the branch could not be refreshed, if it could not.
     pub fn unavailable(&self) -> Option<&str> {
         self.tip.as_ref().err().map(String::as_str)
