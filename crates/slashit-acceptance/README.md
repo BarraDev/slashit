@@ -166,7 +166,9 @@ do not compare them byte for byte.
   common ancestor. When that ancestor is not the card, the card's handler
   never sees the click, so a card that moves between the two events can open
   nothing. The event targets can help tell that apart from other failures;
-  they do not identify the cause. Each event also carries the card's rect, the
+  they do not identify the cause. The product's project rail is expected to
+  expand over a fixed-width layout slot, so Sidebar and board geometry should
+  not move while its labels appear. Each event also carries the card's rect, the
   element under the pointer, the board's scroll position and the widths of the
   project rail and the sidebar at that moment, and a frame-by-frame record
   lists every change of the card's place or of those widths, so a card that

@@ -79,8 +79,70 @@ const HUMAN_REVIEW_COLUMN: &str = "[data-testid=\"column-humanreview\"]";
 const BACKLOG_COLUMN: &str = "[data-testid=\"column-backlog\"]";
 const ERROR_COLUMN: &str = "[data-testid=\"column-error\"]";
 const KANBAN_BOARD: &str = "[data-testid=\"kanban-board\"]";
+const PROJECT_RAIL: &str = "[data-testid=\"project-rail\"]";
 /// The title of one card, within whichever column is being read.
 const TASK_TITLE: &str = "[data-testid=\"task-title\"]";
+
+/// The rail may paint over adjacent content, but its expansion must never
+/// move the flex layout underneath it. The old rail widened its flex item from
+/// 48px to 180px, moving every board card during a pointer transition.
+#[tokio::test(flavor = "multi_thread")]
+async fn expanding_the_project_rail_does_not_move_board_geometry() {
+    let context = TestContext::new("project_rail_geometry").expect("harness setup");
+    let outcome = async {
+        let repository = GitFixture::create(&context.state().path().join("fixture-repo"))?;
+        let session = context.start_session("rail-geometry").await?;
+        let outcome = rail_geometry_journey(session.driver(), &repository).await;
+        context
+            .close_session(session, "rail-geometry", &outcome)
+            .await?;
+        outcome
+    }
+    .await;
+    context.finish(outcome);
+}
+
+async fn rail_geometry_journey(driver: &WebDriver, repository: &GitFixture) -> Result<()> {
+    ui::assert_frontend_is_real(driver).await?;
+    let Prerequisites {
+        project_id,
+        task_id,
+        title,
+    } = create_prerequisites(
+        driver,
+        repository,
+        "Rail geometry task",
+        "This task exists so the regression measures a real board card.",
+    )
+    .await?;
+    show_on_board(driver, &project_id, BACKLOG_COLUMN, &title).await?;
+
+    let before = rail_geometry(driver, &title).await?;
+    let rail = ui::visible(driver, PROJECT_RAIL).await?;
+    driver
+        .action_chain()
+        .move_to_element_center(&rail)
+        .perform()
+        .await
+        .context("could not hover the project rail")?;
+    await_rail_state(driver, true).await?;
+    let expanded = rail_geometry(driver, &title).await?;
+    assert_geometry_x_stable(&before, &expanded, "expanding the project rail")?;
+
+    let card = driver
+        .find(By::Css(format!("[data-card-task-id=\"{task_id}\"]")))
+        .await
+        .context("the board card was not present for the rail regression")?;
+    driver
+        .action_chain()
+        .move_to_element_center(&card)
+        .perform()
+        .await
+        .context("could not move the pointer away from the expanded rail")?;
+    await_rail_state(driver, false).await?;
+    let collapsed = rail_geometry(driver, &title).await?;
+    assert_geometry_x_stable(&before, &collapsed, "collapsing the project rail")
+}
 
 /// Prove that moving a task into execution really runs an agent and really
 /// carries the task to its reviewable state.
@@ -1771,6 +1833,71 @@ async fn page(driver: &WebDriver, script: &str, args: Vec<Value>) -> Result<Valu
         .context("could not run a script in the window")?
         .json()
         .clone())
+}
+
+async fn rail_geometry(driver: &WebDriver, title: &str) -> Result<Value> {
+    page(
+        driver,
+        r#"
+          const rect = (node) => {
+            if (!node) return null;
+            const r = node.getBoundingClientRect();
+            return [r.left, r.top, r.right, r.bottom];
+          };
+          const card = [...document.querySelectorAll('[data-testid="task-card"]')]
+            .find((node) => (node.querySelector('[data-testid="task-title"]') || {}).textContent === arguments[0]);
+          return {
+            rail: rect(document.querySelector('[data-testid="project-rail"]')),
+            sidebar: rect(document.querySelector('[data-testid="sidebar"]')),
+            board: rect(document.querySelector('[data-testid="kanban-board"]')),
+            card: rect(card),
+          };
+        "#,
+        vec![Value::String(title.to_string())],
+    )
+    .await
+}
+
+async fn await_rail_state(driver: &WebDriver, expanded: bool) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let state = page(
+            driver,
+            "const rail = document.querySelector(arguments[0]); return !!rail && rail.classList.contains('expanded');",
+            vec![Value::String(PROJECT_RAIL.to_string())],
+        )
+        .await?;
+        if state.as_bool() == Some(expanded) {
+            return Ok(());
+        }
+        if started.elapsed() > RENDER_DEADLINE {
+            bail!("the project rail did not reach expanded={expanded}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+fn geometry_x(geometry: &Value, name: &str) -> Result<i64> {
+    geometry
+        .get(name)
+        .and_then(Value::as_array)
+        .and_then(|rect| rect.first())
+        .and_then(Value::as_f64)
+        .map(|x| x.round() as i64)
+        .with_context(|| format!("geometry did not contain a {name} rectangle"))
+}
+
+fn assert_geometry_x_stable(before: &Value, after: &Value, transition: &str) -> Result<()> {
+    for name in ["sidebar", "board", "card"] {
+        let old = geometry_x(before, name)?;
+        let new = geometry_x(after, name)?;
+        if old != new {
+            bail!(
+                "{transition} moved the {name} x-position from {old}px to {new}px; geometry before={before}, after={after}"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn count(driver: &WebDriver, selector: &str) -> Result<usize> {
