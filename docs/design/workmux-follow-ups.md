@@ -45,8 +45,14 @@ provider session id from note 3.
 
 WaitingForInput is a supported-future run state with no current producer; it
 may only come from a reliable structured provider or protocol signal and is
-never inferred from silence or output pauses. See the audit in the revised
-report. Out of scope: any Conversation model, external process scanning,
+never inferred from silence or output pauses. Audit of main: the only
+`AgentSlotStatus::WaitingForInput` is a declared variant that nothing sets
+(`queue/workflow.rs` sets only Idle). The Claude runner is non-interactive
+(`claude -p`, prompt on stdin) and parses `system`, `assistant`, `tool_use`
+and `result` events, none of which means "waiting for the human". ACP
+(`src-tauri/src/acp`) has a free-form `status` string notification with no
+defined vocabulary and no permission or input request; the app only logs it.
+So no provider currently produces a trustworthy signal. Out of scope: any Conversation model, external process scanning,
 repo or provider hooks, notifications.
 
 Smallest first version: an in-memory registry of runs the executor starts,
@@ -68,9 +74,10 @@ ordering, ownership) that the product model deliberately avoids: a Task
 belongs to exactly one Project. Membership lives on the Project, so a
 Workspace aggregate is only a filter.
 
-Disposition. A read-only Workspace projection or filter remains possible later; add a Workspace filter (Projects whose scope
-names that Workspace) to the existing attention summary and rail; read-only,
-no new page, no new store. File only when a real multi-Project user asks.
+Disposition. A read-only Workspace projection or filter remains possible
+later: a filter (Projects whose scope names that Workspace) over the existing
+attention summary and rail, with no new page and no new store. File only when
+a real multi-Project user asks.
 
 ## 3. Resume provider sessions after a crash
 
@@ -84,8 +91,11 @@ adapter, not to the Task. SlashIt records the id the provider reports and
 never invents one that it treats as a provider session. Current code:
 `ClaudeRunConfig` has `session_id` (`--session-id`) and `resume_session`
 (`--resume`); the runner captures the id from the `system` init event and the
-`result` event; the executor passes a self-generated UUID as `--session-id`
-and no production caller sets `resume_session`. The id is not persisted. The
+`result` event; the executor generates its own `Uuid::new_v4()` and passes it as
+`--session-id`, and no production caller sets `resume_session`. That
+generated value is only a request to the provider; it must not be treated
+as the provider-reported id, and a resume must use the id the provider
+reported, not the one SlashIt asked for. No id is persisted today. The
 claude CLI help lists `--resume`, `--session-id`, `--continue`,
 `--fork-session` and `--no-session-persistence`.
 
@@ -116,13 +126,13 @@ Gaps. No caller identity beyond "the owner"; an agent can edit or delete any
 task in any Project, not only tasks it created; created task text is
 attacker-influenced input that becomes another agent's prompt.
 
-Decision. KEEP as a small authorization design, not orchestration.
+Decision. KEEP as a small authorization design for a local coordinator; orchestration itself is deferred, see below.
 
 Behavior. Tasks created over the channel record `created_via: cli` (plus an
 optional caller label from `--source`, informational only). A restricted
 mode, off by default, limits a caller to creating tasks and queueing tasks it
-created in one named Project. No dependency graphs, no result collection, no
-fan-out: the orchestrator polls `slashit tasks`.
+created in one named Project. For this near-term step there are no dependency graphs, result
+collection or fan-out: the coordinator polls `slashit tasks`.
 
 Ownership. The Project owns the tasks; the caller label is provenance, not a
 permission principal. Persistence: the provenance field on the task.
@@ -199,3 +209,26 @@ text does not appear in the command line.
 4. Setup hooks: deferred, code-execution surface.
 
 Only items 1 and 2 are proposed as near-term implementation issues.
+
+## Self-review
+
+- Duplication: the dashboard page was dropped because the rail and CLI
+  already show the facts; the Working label no longer has its own item and
+  is part of run supervision, kept separate from `AttentionReason`.
+- Working is not derived from `TaskStatus` or `TaskPhase`; it projects live
+  supervision, and nothing new is persisted on the Task.
+- Provider assumptions: session identity belongs to the Run and the provider
+  adapter, the id must be the provider-reported one, and resume is
+  best-effort with one fresh fallback. Resume behavior after a mid-turn kill
+  is unverified and is a spike question.
+- Process management: supervision covers only runs SlashIt started. There is
+  no scan, no kill path and no assumption about processes after a crash;
+  any future leftover surfacing needs persisted identity and strong
+  ownership proof first.
+- Dispatch and hooks are code-execution surfaces. The notes keep the OS
+  peer boundary, deny repository-supplied hooks and never interpolate task
+  text. Orchestration is deferred, not rejected, and the provenance design
+  must not close that path.
+- Unverified: whether hydration requeue always reuses the same Task
+  Checkout; all spike questions in note 3; ACP notification semantics beyond
+  the free-form status string.
