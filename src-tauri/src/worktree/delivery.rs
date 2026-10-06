@@ -60,52 +60,127 @@ async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, 
 }
 
 /// Whether the change between the trees `before` and `after` (what one fix
-/// agent did) is still in `commit`: the change, applied backwards to the
-/// commit's tree, must fit. Fixes sharing a file are told apart by their
-/// hunks, not their paths. A change an overlapping edit overwrote, or that
-/// was discarded, no longer fits; an empty change, an object this repository
-/// lost, or any Git failure answers `false`, because a missing proof is never
-/// read as a present one.
+/// agent did) is still in `commit`, path by path.
+///
+/// Every path the change touched must be in the commit exactly as the agent
+/// left it: absent if it deleted it, otherwise with the same file mode, and
+/// either the very same content (blob) or, where another edit has since
+/// changed the same file, with the agent's hunks still in place. That last
+/// check reverse-applies the path's own patch to the commit's tree and
+/// accepts it only if every hunk fits at its recorded line, with no offset or
+/// fuzz (a line that merely exists elsewhere in the file is not the change),
+/// and only if the patch no longer applies forwards. Fixes that share a file
+/// but not its hunks are both proven; overlapping or discarded edits are not.
+///
+/// The check does not depend on the user's Git configuration (renames,
+/// external diff drivers, whitespace settings are all turned off), and any
+/// object this repository lost, empty change or Git failure answers `false`:
+/// a missing proof is never read as a present one.
 pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, commit: &str) -> bool {
-    let run = |args: Vec<String>, index: Option<std::path::PathBuf>| async move {
+    let git = |args: Vec<String>, index: Option<std::path::PathBuf>| async move {
         let mut cmd = tokio::process::Command::new("git");
-        cmd.args(&args).current_dir(working_dir);
+        cmd.args(["--literal-pathspecs", "-c", "apply.ignoreWhitespace=false", "-c", "apply.whitespace=nowarn"])
+            .args(&args)
+            .current_dir(working_dir);
         if let Some(index) = index {
             cmd.env("GIT_INDEX_FILE", index);
         }
-        cmd.output().await.ok().filter(|o| o.status.success())
+        cmd.output().await.ok()
     };
-    let Some(diff) = run(
-        ["diff", "--binary", "--full-index", before, after].map(String::from).to_vec(),
+    let ok = |o: &Option<std::process::Output>| o.as_ref().is_some_and(|o| o.status.success());
+    let strings = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+
+    let raw = git(
+        strings(&["diff-tree", "-r", "-z", "--raw", "--no-renames", "--no-ext-diff", "--no-color", "--full-index", before, after]),
         None,
     )
-    .await
-    else {
-        return false;
-    };
-    if diff.stdout.is_empty() {
+    .await;
+    let Some(raw) = raw.filter(|o| o.status.success()) else { return false };
+    // ":<old mode> <new mode> <old blob> <new blob> <status>\0<path>\0" ...
+    let text = String::from_utf8_lossy(&raw.stdout).into_owned();
+    let mut parts = text.split('\0').filter(|p| !p.is_empty());
+    let mut changes: Vec<(String, String, String, String)> = Vec::new(); // status, mode, blob, path
+    while let (Some(meta), Some(path)) = (parts.next(), parts.next()) {
+        let fields: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        if fields.len() != 5 {
+            return false;
+        }
+        changes.push((fields[4].to_string(), fields[1].to_string(), fields[3].to_string(), path.to_string()));
+    }
+    if changes.is_empty() {
         return false;
     }
+
+    let mut listing = strings(&["ls-tree", "-r", "-z", "--full-tree", commit, "--"]);
+    listing.extend(changes.iter().map(|c| c.3.clone()));
+    let listed = git(listing, None).await;
+    let Some(listed) = listed.filter(|o| o.status.success()) else { return false };
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let mut in_commit: std::collections::HashMap<&str, (&str, &str)> = Default::default();
+    for entry in listed.split('\0').filter(|e| !e.is_empty()) {
+        let Some((meta, path)) = entry.split_once('\t') else { return false };
+        let mut f = meta.split(' ');
+        let (Some(mode), Some(_kind), Some(blob)) = (f.next(), f.next(), f.next()) else { return false };
+        in_commit.insert(path, (mode, blob));
+    }
+
     let id = uuid::Uuid::new_v4();
     let index = std::env::temp_dir().join(format!("slashit-effect-{id}.index"));
-    let patch = std::env::temp_dir().join(format!("slashit-effect-{id}.patch"));
-    let survives = async {
-        tokio::fs::write(&patch, &diff.stdout).await.ok()?;
-        run(["read-tree", commit].map(String::from).to_vec(), Some(index.clone())).await?;
-        run(
-            vec![
-                "apply".into(), "--cached".into(), "--reverse".into(), "--check".into(),
-                patch.display().to_string(),
-            ],
-            Some(index.clone()),
-        )
-        .await
-        .map(|_| ())
+    let mut needs_patch: Vec<&str> = Vec::new();
+    for (status, mode, blob, path) in &changes {
+        match (status.as_str(), in_commit.get(path.as_str())) {
+            ("D", None) => {}
+            ("D", Some(_)) => return false,
+            (_, None) => return false,
+            (_, Some((commit_mode, commit_blob))) => {
+                if commit_mode != mode {
+                    return false;
+                }
+                if commit_blob != blob {
+                    needs_patch.push(path);
+                }
+            }
+        }
     }
-    .await
-    .is_some();
+
+    let mut survives = true;
+    if !needs_patch.is_empty() {
+        survives = git(strings(&["read-tree", commit]), Some(index.clone())).await.as_ref().is_some_and(|o| o.status.success());
+        for path in needs_patch {
+            if !survives {
+                break;
+            }
+            let diff = git(
+                strings(&["diff-tree", "-p", "--binary", "--full-index", "--no-renames", "--no-ext-diff", "--no-color", before, after, "--", path]),
+                None,
+            )
+            .await;
+            let Some(diff) = diff.filter(|o| o.status.success() && !o.stdout.is_empty()) else {
+                survives = false;
+                break;
+            };
+            let patch = std::env::temp_dir().join(format!("slashit-effect-{id}.patch"));
+            survives = tokio::fs::write(&patch, &diff.stdout).await.is_ok() && {
+                let p = patch.display().to_string();
+                let reverse = git(
+                    vec!["apply".into(), "--cached".into(), "--reverse".into(), "--check".into(), "--verbose".into(), p.clone()],
+                    Some(index.clone()),
+                )
+                .await;
+                let in_place = ok(&reverse) && {
+                    let said = String::from_utf8_lossy(&reverse.as_ref().unwrap().stderr).to_lowercase();
+                    !said.contains("offset") && !said.contains("fuzz")
+                };
+                in_place && !ok(&git(
+                    vec!["apply".into(), "--cached".into(), "--check".into(), p],
+                    Some(index.clone()),
+                )
+                .await)
+            };
+            let _ = tokio::fs::remove_file(&patch).await;
+        }
+    }
     let _ = tokio::fs::remove_file(&index).await;
-    let _ = tokio::fs::remove_file(&patch).await;
     survives
 }
 
@@ -268,5 +343,92 @@ mod tests {
         assert!(remote.unavailable().is_some());
         assert!(!remote.contains(&pushed).await);
         assert!(RemoteBranch::refresh(dir, None).await.unavailable().is_some(), "no branch, no proof");
+    }
+
+    /// Snapshot trees before and after `change` runs in `work`, then put the
+    /// checkout back as it was.
+    async fn effect_of(work: &Path, change: impl FnOnce(&Path)) -> (String, String) {
+        let dir = work.to_str().unwrap();
+        let before = checkout_snapshot(dir).await.unwrap();
+        change(work);
+        let after = checkout_snapshot(dir).await.unwrap();
+        git(work, &["reset", "-q", "--hard"]);
+        git(work, &["clean", "-fdq"]);
+        (before, after)
+    }
+
+    async fn survives(work: &Path, effect: &(String, String), commit: &str) -> bool {
+        effect_survives_in(work.to_str().unwrap(), &effect.0, &effect.1, commit).await
+    }
+
+    /// A reverted change whose lines also exist, with identical context,
+    /// elsewhere in the file is not "still there": the reverse patch fits only
+    /// at an offset.
+    #[tokio::test]
+    async fn a_match_found_only_at_an_offset_elsewhere_is_not_survival() {
+        let (_tmp, work) = checkout_with_origin();
+        let pad = "pad\npad\npad\n";
+        std::fs::write(work.join("f"), format!("{pad}q\nlog\nr\n{pad}mid\n{pad}q\nr\n{pad}")).unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "two blocks"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        let effect = effect_of(&work, |w| {
+            std::fs::write(w.join("f"), format!("{pad}q\nlog\nr\n{pad}mid\n{pad}q\nlog\nr\n{pad}")).unwrap();
+        })
+        .await;
+        assert!(!survives(&work, &effect, &head).await, "the change was reverted");
+    }
+
+    /// A change that only toggles a file's executable bit survives only if
+    /// the commit has the mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mode_only_change_survives_only_with_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, work) = checkout_with_origin();
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        let effect = effect_of(&work, |w| {
+            std::fs::set_permissions(w.join("a.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        })
+        .await;
+        assert!(!survives(&work, &effect, &head).await, "the mode was never committed");
+
+        std::fs::set_permissions(work.join("a.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "mode"]);
+        assert!(survives(&work, &effect, &git(&work, &["rev-parse", "HEAD"])).await);
+    }
+
+    /// A content change that also changes the mode is credited only if both
+    /// are in the commit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_content_change_carrying_a_mode_change_needs_both() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, work) = checkout_with_origin();
+        let effect = effect_of(&work, |w| {
+            std::fs::write(w.join("a.txt"), "a\nmore\n").unwrap();
+            std::fs::set_permissions(w.join("a.txt"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        })
+        .await;
+        std::fs::write(work.join("a.txt"), "a\nmore\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "content only"]);
+        assert!(!survives(&work, &effect, &git(&work, &["rev-parse", "HEAD"])).await);
+    }
+
+    /// The user's own Git configuration cannot loosen the check: a change that
+    /// only collapsed whitespace is not found by ignoring whitespace.
+    #[tokio::test]
+    async fn user_whitespace_settings_do_not_loosen_the_proof() {
+        let (_tmp, work) = checkout_with_origin();
+        std::fs::write(work.join("w.txt"), "a  b\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "spaced"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        let effect = effect_of(&work, |w| std::fs::write(w.join("w.txt"), "a b\n").unwrap()).await;
+        git(&work, &["config", "apply.ignoreWhitespace", "change"]);
+        git(&work, &["config", "apply.whitespace", "fix"]);
+        assert!(!survives(&work, &effect, &head).await, "the collapsed spacing was never committed");
     }
 }

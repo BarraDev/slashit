@@ -1836,7 +1836,7 @@ fn render_review_item(
                                             }.into_any()
                                         } else if fix_done_init {
                                             view! {
-                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 font-medium text-[10px]" title="The fix is not yet proven to be on the PR branch, so no reply is posted. Apply again to commit and push it.">
+                                                <span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 font-medium text-[10px]" title="The fix is not yet proven to be on the PR branch, so no reply is posted. Applying again pushes a commit that is waiting, or makes the fix again if its change is not in a commit.">
                                                     "⚠ Fix not delivered"
                                                 </span>
                                             }.into_any()

@@ -782,12 +782,14 @@ pub struct FixEffect {
 }
 
 impl PrReviewItem {
-    /// A fix saved without any record of the commit that carries it, and
-    /// with `fix_uncommitted` already clear: the shape of every fix a build
-    /// from before #96 left delivered or not. Nothing in the plan can say
-    /// whether it reached the pull request, so it is unproven.
+    /// A fix recorded as done that no commit carries and that has no change
+    /// left waiting for one: every fix a build from before #96 saved, an
+    /// agent that changed nothing, and a fix whose change was found missing
+    /// from the commit that took the checkout. Nothing can prove it reached
+    /// the pull request, so it never gets a reply; an Apply makes it again
+    /// once, rather than leaving it stuck.
     pub fn fix_has_no_provenance(&self) -> bool {
-        self.fix_done && !self.fix_uncommitted && self.fix_commit.is_none()
+        self.fix_done && self.fix_commit.is_none() && self.fix_effect.is_none()
     }
 }
 

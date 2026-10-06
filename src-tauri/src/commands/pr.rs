@@ -1506,7 +1506,7 @@ pub async fn address_pr_review_inner(
         i.approved && matches!(i.decision, PrReviewDecision::Fix) && i.fix_done && i.fix_uncommitted
     };
     let owed_a_commit: Vec<usize> = updated_plan.items.iter().enumerate()
-        .filter(|(_, i)| approved_fix(i) && i.fix_commit.is_none())
+        .filter(|(_, i)| approved_fix(i) && i.fix_commit.is_none() && i.fix_effect.is_some())
         .map(|(idx, _)| idx)
         .collect();
     let owed_a_push = |plan: &PrReviewPlan| -> Vec<usize> {
@@ -1595,8 +1595,13 @@ pub async fn address_pr_review_inner(
                         };
                         if proven {
                             item.fix_commit = Some(commit.clone());
-                            item.fix_effect = None;
                         }
+                        // Proven or not, the effect has been weighed against
+                        // the commit that took the checkout. An item left
+                        // without a commit has nothing more to wait for:
+                        // it is unproven, gets no reply, and a later Apply
+                        // makes the fix again.
+                        item.fix_effect = None;
                     }
                     None
                 }
@@ -1604,12 +1609,30 @@ pub async fn address_pr_review_inner(
                 // checkout (discarded, or committed by hand under an ID this
                 // plan never saw), and a branch equal to its remote-tracking
                 // ref says nothing about them.
-                Ok(crate::worktree::CheckoutCommit::NothingToCommit) => Some(format!(
-                    "the review fixes have no changes left to commit in the task checkout, so no \
-                     commit carries them and nothing was pushed for them. Their edits were \
-                     discarded or committed outside this apply; skip the items or have them fixed \
-                     again.{unpushed_replies_note}"
-                )),
+                Ok(crate::worktree::CheckoutCommit::NothingToCommit) => {
+                    // The changes these fixes made are not in the checkout
+                    // any more (discarded, or committed outside this apply),
+                    // so no commit can carry them. That is not a failure of
+                    // anything else: commits already made are still pushed.
+                    for &idx in uncommitted {
+                        updated_plan.items[idx].fix_effect = None;
+                    }
+                    let note = format!(
+                        "the changes made by some review fixes are no longer in the task checkout, \
+                         so no commit carries them and they get no reply; a later apply makes \
+                         them again.{unpushed_replies_note}"
+                    );
+                    progress(PrReviewProgress {
+                        task_id: task_id_str.clone(),
+                        kind: "nothing_to_commit".to_string(),
+                        current: None,
+                        total: None,
+                        comment_id: None,
+                        message: Some(note.clone()),
+                    });
+                    push_error = Some(note);
+                    None
+                }
                 Err(e) => Some(format!(
                     "the review fixes could not be committed, so nothing was pushed: {e}. They \
                      remain as uncommitted edits in the task checkout; once that is resolved, \
@@ -13850,7 +13873,6 @@ mod tests {
                 a_edit: &str,
                 b_edit: &str,
                 between: impl FnOnce(&Path),
-                reject_first: bool,
             ) -> (PrReviewApplyResult, PrReviewPlan, String) {
                 let repo = RepoFixture::new();
                 let worktree = task_checkout_for_review(&repo, false);
@@ -13869,10 +13891,38 @@ mod tests {
                 let (first, plan) = apply(&task, with_item(plan, 2), &worktree, no_jj.clone(), true).await;
                 assert!(first.replies_posted == 0 && !first.pushed, "{first:?}");
                 between(&worktree);
-                if !reject_first {
-                    std::fs::remove_file(&hook).unwrap();
+                std::fs::remove_file(&hook).unwrap();
+                let events: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+                let sink: ProgressSink = {
+                    let events = events.clone();
+                    Arc::new(move |e: PrReviewProgress| events.lock().unwrap().push(e.kind))
+                };
+                let mut plan = plan;
+                plan.backfill_lifecycle_from_last_apply();
+                let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                let options = AddressPrReviewOptions { auto_push: true, auto_reply: true, dry_run: false };
+                let (second, plan) = test_programs::scope(
+                    [("jj", no_jj)],
+                    address_pr_review_inner(
+                        task.clone(),
+                        worktree.to_str().unwrap().to_string(),
+                        plan,
+                        options,
+                        sink,
+                        cancel_rx,
+                    ),
+                )
+                .await
+                .expect("the apply flow reports per step, not as a command error");
+                // Whatever an item's change turned out to be, no failure is
+                // reported for it and nothing about the commit or push is
+                // withheld.
+                let kinds = events.lock().unwrap().clone();
+                assert_eq!(second.push_error, None, "{second:?}");
+                for bad in ["commit_failed", "commit_withheld", "nothing_to_commit", "push_failed"] {
+                    assert!(!kinds.iter().any(|k| k == bad), "{bad} in {kinds:?}");
                 }
-                let (second, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                assert!(second.failed_ids.is_empty() && second.fix_errors.is_empty(), "{second:?}");
                 (second, plan, git(&worktree, &["rev-parse", "task-branch"]))
             }
 
@@ -13884,7 +13934,6 @@ mod tests {
                     "printf 'a-line\\n' > a.txt",
                     "printf 'b-line\\n' > b.txt",
                     |_| {},
-                    false,
                 )
                 .await;
                 assert_eq!(result.replies_posted, 2, "{result:?}");
@@ -13902,7 +13951,6 @@ mod tests {
                     "printf 'a-line\\n' > a.txt",
                     "printf 'b-line\\n' > b.txt",
                     |w| std::fs::remove_file(w.join("b.txt")).unwrap(),
-                    false,
                 )
                 .await;
                 assert_eq!(result.replies_posted, 1, "{result:?}");
@@ -13921,7 +13969,6 @@ mod tests {
                     "sed -i 's/^one$/ONE/' notes.txt",
                     "sed -i 's/^eight$/EIGHT/' notes.txt",
                     |_| {},
-                    false,
                 )
                 .await;
                 assert_eq!(result.replies_posted, 2, "{result:?}");
@@ -13942,7 +13989,6 @@ mod tests {
                         let t = std::fs::read_to_string(w.join("notes.txt")).unwrap();
                         std::fs::write(w.join("notes.txt"), t.replace("EIGHT", "eight")).unwrap();
                     },
-                    false,
                 )
                 .await;
                 assert_eq!(result.replies_posted, 1, "{result:?}");
@@ -13958,12 +14004,47 @@ mod tests {
                     "sed -i 's/^keep$/from-a/' notes.txt",
                     "sed -i 's/^from-a$/from-b/' notes.txt",
                     |_| {},
-                    false,
                 )
                 .await;
                 assert_eq!(result.replies_posted, 1, "{result:?}");
                 assert_eq!(plan.items[0].fix_commit, None, "A's line no longer exists: {:?}", plan.items[0]);
                 assert_eq!(plan.items[1].fix_commit.as_deref(), Some(tip.as_str()));
+            }
+
+            /// An item left unproven (its change gone, or never made) is not a
+            /// failure and is not stuck: the next apply makes it again, and
+            /// meanwhile it blocks neither another item's commit nor its push.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_unproven_item_blocks_no_other_push_and_is_made_again_by_the_next_apply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let hook = reject_push(&repo);
+                // Every second run changes nothing.
+                let claude = EditingClaude::install(
+                    "if [ \"$n\" -eq 2 ]; then printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"nothing to do\"}'; exit 0; fi",
+                );
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+                // Item 1 is committed, its push fails.
+                let (first, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
+                assert!(!first.pushed, "{first:?}");
+                std::fs::remove_file(hook).unwrap();
+
+                // Item 2's agent changes nothing; item 1's commit is still pushed.
+                let (second, plan) = apply(&task, with_item(plan, 2), &worktree, no_jj.clone(), true).await;
+                assert!(second.pushed, "{:?}", second.push_error);
+                assert_eq!(second.push_error, None);
+                assert!(second.failed_ids.is_empty(), "{second:?}");
+                assert_eq!(second.replies_posted, 1, "only item 1's reply: {second:?}");
+                assert!(plan.items[1].fix_commit.is_none() && !plan.items[1].reply_posted);
+
+                // Not stuck: the next apply runs item 2's agent again.
+                let runs = claude.runs();
+                let (third, _plan) = apply(&task, plan, &worktree, no_jj, true).await;
+                assert_eq!(claude.runs(), runs + 1, "the unproven fix is made again");
+                assert_eq!(third.replies_posted, 1, "and delivered this time: {third:?}");
             }
 
             /// The commit is made and the push fails: the commit is recorded
