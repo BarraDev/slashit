@@ -38,6 +38,8 @@ async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, 
             let output = tokio::process::Command::new("git")
                 .args(args)
                 .env("GIT_INDEX_FILE", &index)
+                .env("LC_ALL", "C")
+                .env("LANGUAGE", "C")
                 .current_dir(working_dir)
                 .output()
                 .await
@@ -59,6 +61,20 @@ async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, 
     run(&["write-tree"]).await
 }
 
+/// What [`effect_survives_in`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Survival {
+    /// The change is in the commit, where it was made.
+    Present,
+    /// The change is not in the commit, or can never be shown to be: an edit
+    /// removed or moved it, a path cannot be named, or the trees that record
+    /// the change no longer exist. The evidence is of no further use.
+    Absent,
+    /// Git could not be asked (it would not start, or failed on objects that
+    /// exist). Nothing is known; the evidence must be kept.
+    Unknown,
+}
+
 /// Whether the change between the trees `before` and `after` (what one fix
 /// agent did) is still in `commit`, path by path.
 ///
@@ -66,77 +82,100 @@ async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, 
 /// left it: absent if it deleted it, otherwise with the same file mode, and
 /// either the very same content (blob) or, where another edit has since
 /// changed the same file, with the agent's hunks still in place. That last
-/// check reverse-applies the path's own patch to the commit's tree and
-/// accepts it only if every hunk fits at its recorded line, with no offset or
-/// fuzz (a line that merely exists elsewhere in the file is not the change),
-/// and only if the patch no longer applies forwards. Fixes that share a file
-/// but not its hunks are both proven; overlapping or discarded edits are not.
+/// check needs three things of the path's own patch: it no longer applies
+/// forwards to the commit; it reverse-applies to the commit; and the change
+/// that reverse-applying leaves to be redone, diffed against the commit, has
+/// the very hunk positions the agent's change had. A hunk that only fits
+/// somewhere else in the file (an offset) therefore does not count. The
+/// positions are compared from the diffs themselves, never from what Git
+/// prints in words, so the user's language cannot loosen the rule. Fixes that
+/// share a file but not its hunks are both present; overlapping, discarded or
+/// shifted edits are not, a false negative being acceptable and a false
+/// positive not.
 ///
-/// The check does not depend on the user's Git configuration (renames,
-/// external diff drivers, whitespace settings are all turned off), and any
-/// object this repository lost, empty change or Git failure answers `false`:
-/// a missing proof is never read as a present one.
-pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, commit: &str) -> bool {
+/// Git runs with the C locale, with the user's diff, rename and whitespace
+/// settings turned off. A path that is not valid UTF-8, or trees that are gone,
+/// are [`Survival::Absent`]; a Git that cannot be run is [`Survival::Unknown`].
+pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, commit: &str) -> Survival {
     let git = |args: Vec<String>, index: Option<std::path::PathBuf>| async move {
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(["--literal-pathspecs", "-c", "apply.ignoreWhitespace=false", "-c", "apply.whitespace=nowarn"])
             .args(&args)
+            .env("LC_ALL", "C")
+            .env("LANGUAGE", "C")
             .current_dir(working_dir);
         if let Some(index) = index {
             cmd.env("GIT_INDEX_FILE", index);
         }
         cmd.output().await.ok()
     };
-    let ok = |o: &Option<std::process::Output>| o.as_ref().is_some_and(|o| o.status.success());
     let strings = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    let succeeded = |o: &Option<std::process::Output>| o.as_ref().is_some_and(|o| o.status.success());
+    // Hunk positions of a patch: its `@@ -a,b +c,d @@` markers.
+    let hunk_markers = |patch: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(patch)
+            .lines()
+            .filter(|l| l.starts_with("@@ -"))
+            .map(|l| l.split(" @@").next().unwrap_or(l).to_string())
+            .collect()
+    };
+
+    // Objects that exist but could not be read are unknown; objects that are
+    // gone are not coming back.
+    for (object, kind) in [(before, "tree"), (after, "tree"), (commit, "commit")] {
+        let probe = git(strings(&["cat-file", "-e", &format!("{object}^{{{kind}}}")]), None).await;
+        match probe {
+            None => return Survival::Unknown,
+            Some(o) if !o.status.success() => return Survival::Absent,
+            Some(_) => {}
+        }
+    }
 
     let raw = git(
         strings(&["diff-tree", "-r", "-z", "--raw", "--no-renames", "--no-ext-diff", "--no-color", "--full-index", before, after]),
         None,
     )
     .await;
-    let Some(raw) = raw.filter(|o| o.status.success()) else { return false };
-    // ":<old mode> <new mode> <old blob> <new blob> <status>\0<path>\0" ...
+    let Some(raw) = raw.filter(|o| o.status.success()) else { return Survival::Unknown };
     // A path that is not valid UTF-8 cannot be handed back to Git by name, so
-    // nothing about it can be checked: unproven, never a lossy guess.
-    let Ok(text) = String::from_utf8(raw.stdout) else { return false };
+    // nothing about it can be checked: never proven, never a lossy guess.
+    let Ok(text) = String::from_utf8(raw.stdout) else { return Survival::Absent };
+    // ":<old mode> <new mode> <old blob> <new blob> <status>\0<path>\0" ...
     let mut parts = text.split('\0').filter(|p| !p.is_empty());
     let mut changes: Vec<(String, String, String, String)> = Vec::new(); // status, mode, blob, path
     while let (Some(meta), Some(path)) = (parts.next(), parts.next()) {
         let fields: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
         if fields.len() != 5 {
-            return false;
+            return Survival::Unknown;
         }
         changes.push((fields[4].to_string(), fields[1].to_string(), fields[3].to_string(), path.to_string()));
     }
     if changes.is_empty() {
-        return false;
+        return Survival::Absent;
     }
 
     let mut listing = strings(&["ls-tree", "-r", "-z", "--full-tree", commit, "--"]);
     listing.extend(changes.iter().map(|c| c.3.clone()));
     let listed = git(listing, None).await;
-    let Some(listed) = listed.filter(|o| o.status.success()) else { return false };
-    let Ok(listed) = String::from_utf8(listed.stdout) else { return false };
+    let Some(listed) = listed.filter(|o| o.status.success()) else { return Survival::Unknown };
+    let Ok(listed) = String::from_utf8(listed.stdout) else { return Survival::Absent };
     let mut in_commit: std::collections::HashMap<&str, (&str, &str)> = Default::default();
     for entry in listed.split('\0').filter(|e| !e.is_empty()) {
-        let Some((meta, path)) = entry.split_once('\t') else { return false };
+        let Some((meta, path)) = entry.split_once('\t') else { return Survival::Unknown };
         let mut f = meta.split(' ');
-        let (Some(mode), Some(_kind), Some(blob)) = (f.next(), f.next(), f.next()) else { return false };
+        let (Some(mode), Some(_kind), Some(blob)) = (f.next(), f.next(), f.next()) else { return Survival::Unknown };
         in_commit.insert(path, (mode, blob));
     }
 
-    let id = uuid::Uuid::new_v4();
-    let index = std::env::temp_dir().join(format!("slashit-effect-{id}.index"));
     let mut needs_patch: Vec<&str> = Vec::new();
     for (status, mode, blob, path) in &changes {
         match (status.as_str(), in_commit.get(path.as_str())) {
             ("D", None) => {}
-            ("D", Some(_)) => return false,
-            (_, None) => return false,
+            ("D", Some(_)) => return Survival::Absent,
+            (_, None) => return Survival::Absent,
             (_, Some((commit_mode, commit_blob))) => {
                 if commit_mode != mode {
-                    return false;
+                    return Survival::Absent;
                 }
                 if commit_blob != blob {
                     needs_patch.push(path);
@@ -144,46 +183,82 @@ pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, co
             }
         }
     }
+    if needs_patch.is_empty() {
+        return Survival::Present;
+    }
 
-    let mut survives = true;
-    if !needs_patch.is_empty() {
-        survives = git(strings(&["read-tree", commit]), Some(index.clone())).await.as_ref().is_some_and(|o| o.status.success());
+    let id = uuid::Uuid::new_v4();
+    let index = std::env::temp_dir().join(format!("slashit-effect-{id}.index"));
+    let patch_file = std::env::temp_dir().join(format!("slashit-effect-{id}.patch"));
+    let verdict = async {
+        if !succeeded(&git(strings(&["read-tree", commit]), Some(index.clone())).await) {
+            return Survival::Unknown;
+        }
         for path in needs_patch {
-            if !survives {
-                break;
-            }
             let diff = git(
                 strings(&["diff-tree", "-p", "--binary", "--full-index", "--no-renames", "--no-ext-diff", "--no-color", before, after, "--", path]),
                 None,
             )
             .await;
-            let Some(diff) = diff.filter(|o| o.status.success() && !o.stdout.is_empty()) else {
-                survives = false;
-                break;
+            let Some(diff) = diff.filter(|o| o.status.success()) else { return Survival::Unknown };
+            if diff.stdout.is_empty() || tokio::fs::write(&patch_file, &diff.stdout).await.is_err() {
+                return Survival::Unknown;
+            }
+            let p = patch_file.display().to_string();
+            let apply = |reverse: bool, check: bool| {
+                let mut a = vec!["apply".to_string(), "--cached".to_string()];
+                if reverse {
+                    a.push("--reverse".into());
+                }
+                if check {
+                    a.push("--check".into());
+                }
+                a.push(p.clone());
+                git(a, Some(index.clone()))
             };
-            let patch = std::env::temp_dir().join(format!("slashit-effect-{id}.patch"));
-            survives = tokio::fs::write(&patch, &diff.stdout).await.is_ok() && {
-                let p = patch.display().to_string();
-                let reverse = git(
-                    vec!["apply".into(), "--cached".into(), "--reverse".into(), "--check".into(), "--verbose".into(), p.clone()],
-                    Some(index.clone()),
-                )
-                .await;
-                let in_place = ok(&reverse) && {
-                    let said = String::from_utf8_lossy(&reverse.as_ref().unwrap().stderr).to_lowercase();
-                    !said.contains("offset") && !said.contains("fuzz")
-                };
-                in_place && !ok(&git(
-                    vec!["apply".into(), "--cached".into(), "--check".into(), p],
-                    Some(index.clone()),
-                )
-                .await)
+            // Still applicable forwards: the change is not there.
+            let forward = apply(false, true).await;
+            if forward.is_none() {
+                return Survival::Unknown;
+            }
+            if succeeded(&forward) {
+                return Survival::Absent;
+            }
+            // Take the change out of a scratch copy of the commit's tree.
+            // Git exits non-zero when it does not fit at all.
+            let reversed = apply(true, false).await;
+            if reversed.is_none() {
+                return Survival::Unknown;
+            }
+            if !succeeded(&reversed) {
+                return Survival::Absent;
+            }
+            let Some(tree) = git(strings(&["write-tree"]), Some(index.clone())).await.filter(|o| o.status.success()) else {
+                return Survival::Unknown;
             };
-            let _ = tokio::fs::remove_file(&patch).await;
+            let reverted = String::from_utf8_lossy(&tree.stdout).trim().to_string();
+            // Putting it back must be a change at the same places the agent
+            // made it: a hunk that only fit elsewhere moves them.
+            let redo = git(
+                strings(&["diff-tree", "-p", "--binary", "--full-index", "--no-renames", "--no-ext-diff", "--no-color", &reverted, commit, "--", path]),
+                None,
+            )
+            .await;
+            let Some(redo) = redo.filter(|o| o.status.success()) else { return Survival::Unknown };
+            if hunk_markers(&redo.stdout) != hunk_markers(&diff.stdout) {
+                return Survival::Absent;
+            }
+            // Next path starts from the commit again.
+            if !succeeded(&git(strings(&["read-tree", commit]), Some(index.clone())).await) {
+                return Survival::Unknown;
+            }
         }
+        Survival::Present
     }
+    .await;
     let _ = tokio::fs::remove_file(&index).await;
-    survives
+    let _ = tokio::fs::remove_file(&patch_file).await;
+    verdict
 }
 
 /// Where `origin` held a pull request's branch when it was last refreshed.
@@ -365,7 +440,7 @@ mod tests {
     }
 
     async fn survives(work: &Path, effect: &(String, String), commit: &str) -> bool {
-        effect_survives_in(work.to_str().unwrap(), &effect.0, &effect.1, commit).await
+        effect_survives_in(work.to_str().unwrap(), &effect.0, &effect.1, commit).await == Survival::Present
     }
 
     /// A reverted change whose lines also exist, with identical context,
@@ -456,5 +531,116 @@ mod tests {
         })
         .await;
         assert!(!survives(&work, &effect, &head).await, "the file is still in the commit");
+    }
+
+    /// Two identical blocks, the second already holding a `log` line. The agent
+    /// adds `log` to block 1, and a later commit rewrites block 1. The reverse
+    /// patch then fits only at block 2, at an offset, and the forward patch
+    /// does not apply either, so only the in-place rule rejects it. It must
+    /// do so whatever language the user's Git speaks: the environment here asks
+    /// for German, which changes the words Git prints (the proof must not
+    /// depend on them).
+    #[tokio::test]
+    async fn the_in_place_rule_holds_under_a_translated_git() {
+        let (_tmp, work) = checkout_with_origin();
+        let dir = work.to_str().unwrap();
+        let pad = "pad\npad\npad\n";
+        let file = |first: &str| format!("{pad}{first}{pad}mid\n{pad}q\nlog\nr\n{pad}");
+        std::fs::write(work.join("f"), file("q\nr\n")).unwrap();
+        let before = checkout_snapshot(dir).await.unwrap();
+        std::fs::write(work.join("f"), file("q\nlog\nr\n")).unwrap();
+        let after = checkout_snapshot(dir).await.unwrap();
+        // A later commit rewrites block 1.
+        std::fs::write(work.join("f"), file("q\nX\nr\n")).unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "block one rewritten"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+
+        let saved: Vec<_> = ["LC_ALL", "LANGUAGE"].iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        // Safety: only this test touches these two variables.
+        unsafe {
+            std::env::set_var("LC_ALL", "de_DE.UTF-8");
+            std::env::set_var("LANGUAGE", "de");
+        }
+        let verdict = effect_survives_in(dir, &before, &after, &head).await;
+        for (k, v) in saved {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        assert_eq!(verdict, Survival::Absent, "the change only fits at block 2, not where it was made");
+    }
+
+    /// Reverse and forward both fit at the recorded place only for a patch
+    /// that is ambiguous about where it applies: the forward check is what
+    /// refuses it. (Found by search: the effect appends `b` to `a b b b b b`;
+    /// the commit has a different `b b a b b b b`.)
+    #[tokio::test]
+    async fn a_change_the_commit_could_still_take_is_not_present() {
+        let (_tmp, work) = checkout_with_origin();
+        let dir = work.to_str().unwrap();
+        let lines = |l: &str| l.split(' ').map(|c| format!("{c}\n")).collect::<String>();
+        std::fs::write(work.join("f"), lines("a b b b b b")).unwrap();
+        let before = checkout_snapshot(dir).await.unwrap();
+        std::fs::write(work.join("f"), lines("a b b b b b b")).unwrap();
+        let after = checkout_snapshot(dir).await.unwrap();
+        std::fs::write(work.join("f"), lines("b b a b b b b")).unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "other"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        assert_ne!(effect_survives_in(dir, &before, &after, &head).await, Survival::Present);
+    }
+
+    /// A file the agent deleted that the commit still has is not a deletion
+    /// that survived.
+    #[tokio::test]
+    async fn a_deletion_the_commit_does_not_have_is_not_present() {
+        let (_tmp, work) = checkout_with_origin();
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        let effect = effect_of(&work, |w| std::fs::remove_file(w.join("a.txt")).unwrap()).await;
+        assert!(!survives(&work, &effect, &head).await, "a.txt is still in the commit");
+        git(&work, &["rm", "-q", "a.txt"]);
+        git(&work, &["commit", "-q", "-m", "deleted"]);
+        assert!(survives(&work, &effect, &git(&work, &["rev-parse", "HEAD"])).await);
+    }
+
+    /// Git that cannot be run says nothing: the verdict is Unknown, which
+    /// callers must treat as no proof and no loss of evidence. Trees that no
+    /// longer exist, by contrast, are Absent.
+    #[tokio::test]
+    async fn a_git_that_cannot_run_is_unknown_and_missing_trees_are_absent() {
+        let (_tmp, work) = checkout_with_origin();
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        let tree = git(&work, &["rev-parse", "HEAD^{tree}"]);
+        let nowhere = work.join("no-such-directory");
+        assert_eq!(
+            effect_survives_in(nowhere.to_str().unwrap(), &tree, &tree, &head).await,
+            Survival::Unknown
+        );
+        let gone = "1".repeat(40);
+        assert_eq!(
+            effect_survives_in(work.to_str().unwrap(), &gone, &tree, &head).await,
+            Survival::Absent
+        );
+    }
+
+    /// A binary file has no hunks to compare, so only the reverse patch can
+    /// tell that the commit's bytes are neither the agent's nor the original.
+    #[tokio::test]
+    async fn a_binary_file_changed_again_is_not_present() {
+        let (_tmp, work) = checkout_with_origin();
+        let dir = work.to_str().unwrap();
+        std::fs::write(work.join("b.bin"), b"A\0A\0A\0").unwrap();
+        let before = checkout_snapshot(dir).await.unwrap();
+        std::fs::write(work.join("b.bin"), b"B\0B\0B\0").unwrap();
+        let after = checkout_snapshot(dir).await.unwrap();
+        std::fs::write(work.join("b.bin"), b"C\0C\0C\0").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "binary, but another one"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        assert_ne!(effect_survives_in(dir, &before, &after, &head).await, Survival::Present);
     }
 }

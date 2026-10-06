@@ -751,9 +751,13 @@ pub struct PrReviewItem {
     /// it, and a reply is allowed only if the change is also still in the
     /// remote branch as refreshed at that moment (a later commit may have
     /// overwritten or reverted it, whatever the ancestry says). The change is
-    /// found by its content, not its path, so later unrelated edits, even to
-    /// the same file, keep the proof; an overlapping or ambiguous edit
-    /// removes it, a false negative being acceptable and a false positive not.
+    /// found by its content, not its path, so later unrelated edits keep the
+    /// proof, including edits to other parts of the same file. An overlapping
+    /// edit removes it, and so does one that merely moves the hunk, such as a
+    /// line inserted above it: the change must still sit where it was made.
+    /// A false negative is acceptable and a false positive is not. The trees
+    /// are ordinary unreferenced Git objects, so once Git prunes them the
+    /// proof is unavailable and the fix is made again.
     ///
     /// It is dropped when no commit can carry it: a commit or a finding of
     /// nothing to commit weighed it and it was not there, or the remote
