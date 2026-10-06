@@ -1925,18 +1925,34 @@ async fn settle_delivery(
         return settled;
     }
     // Containment in `origin/<branch>` speaks for the pull request only if
-    // the pull request's head is that branch. A task's `pr_url` is recorded
-    // by `link_pr_to_task`, from the pull request `gh pr list --head <branch>`
-    // names as the branch's own (never a fork's same-named branch), so it
-    // is. A pull request that is only an external reference on the task has no
-    // such guarantee, and nothing is proven for it.
-    if task.pr_url.is_none() {
+    // the recorded pull request is still this repository's pull request whose
+    // head is that branch. Do not trust stale or imported task metadata: a
+    // different PR may name a different head while the task branch still
+    // contains the fix.
+    let (Some(branch), Some(pr_url)) = (branch, task.pr_url.as_deref()) else {
         settled.unavailable = Some(
             "the pull request is not recorded as this task branch's own, so what the branch \
              holds says nothing about it"
                 .to_string(),
         );
         return settled;
+    };
+    match own_pr_url_for_branch(working_dir, branch).await {
+        Ok(Some(head_url)) if head_url == pr_url => {}
+        Ok(_) => {
+            settled.unavailable = Some(
+                "the recorded pull request is not this repository's pull request for the task \
+                 branch, so the branch's contents say nothing about it"
+                    .to_string(),
+            );
+            return settled;
+        }
+        Err(error) => {
+            settled.unavailable = Some(format!(
+                "could not verify the recorded pull request's head branch: {error}"
+            ));
+            return settled;
+        }
     }
     let remote = crate::worktree::delivery::RemoteBranch::refresh(working_dir, branch).await;
     settled.unavailable = remote.unavailable().map(str::to_string);
@@ -4555,6 +4571,21 @@ async fn list_existing_prs(working_dir: &str, branch: &str) -> Result<std::proce
         .output()
         .await
         .map_err(|e| format!("Failed to run gh: {}", e))
+}
+
+/// The URL of this repository's pull request whose head is `branch`, if one
+/// exists. A same-named fork branch is ignored by [`own_branch_pr`]. The
+/// caller uses the result to bind delivery proof to the pull request recorded
+/// on the task, rather than to an unrelated local branch.
+async fn own_pr_url_for_branch(working_dir: &str, branch: &str) -> Result<Option<String>, String> {
+    let output = list_existing_prs(working_dir, branch).await?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    own_existing_pr_url(&output.stdout, branch)
 }
 
 /// The URL of `branch`'s own newest pull request in the output of
@@ -12968,7 +12999,10 @@ mod tests {
                         runs = runs,
                     );
                     write_executable(&bin_dir.join("claude"), &claude);
-                    write_executable(&bin_dir.join("gh"), "#!/bin/sh\necho 4242\n");
+                    write_executable(
+                        &bin_dir.join("gh"),
+                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}]' ;;\n  *) echo 4242 ;;\nesac\n",
+                    );
                     let saved_path = std::env::var("PATH").ok();
                     let new_path = match &saved_path {
                         Some(p) => format!("{}:{}", bin_dir.display(), p),
