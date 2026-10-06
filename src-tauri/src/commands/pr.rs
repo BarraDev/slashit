@@ -12966,6 +12966,7 @@ mod tests {
             struct EditingClaude {
                 _tmp: tempfile::TempDir,
                 runs: PathBuf,
+                gh: PathBuf,
                 saved_path: Option<String>,
             }
 
@@ -12999,8 +13000,9 @@ mod tests {
                         runs = runs,
                     );
                     write_executable(&bin_dir.join("claude"), &claude);
+                    let gh = bin_dir.join("gh");
                     write_executable(
-                        &bin_dir.join("gh"),
+                        &gh,
                         "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{\"url\":\"https://github.com/testorg/testrepo/pull/405\",\"isCrossRepository\":false}]' ;;\n  *) echo 4242 ;;\nesac\n",
                     );
                     let saved_path = std::env::var("PATH").ok();
@@ -13012,7 +13014,7 @@ mod tests {
                     unsafe {
                         std::env::set_var("PATH", new_path);
                     }
-                    EditingClaude { _tmp: tmp, runs, saved_path }
+                    EditingClaude { _tmp: tmp, runs, gh, saved_path }
                 }
 
                 /// How many times `claude` has run.
@@ -13021,6 +13023,16 @@ mod tests {
                         .ok()
                         .and_then(|n| n.trim().parse().ok())
                         .unwrap_or(0)
+                }
+
+                /// Make the forge report a different own PR for the task
+                /// branch, as stale task metadata or an imported association
+                /// could do in production.
+                fn set_pr_list_url(&self, url: &str) {
+                    let script = format!(
+                        "#!/bin/sh\ncase \"$*\" in\n  *'pr list'*) printf '%s\\n' '[{{\"url\":\"{url}\",\"isCrossRepository\":false}}]' ;;\n  *) echo 4242 ;;\nesac\n"
+                    );
+                    write_executable(&self.gh, &script);
                 }
             }
 
@@ -14305,6 +14317,26 @@ mod tests {
                 assert_eq!(second.replies_posted, 0, "{second:?}");
                 let (synced, _plan) = sync(&unlinked, &worktree, plan).await;
                 assert_eq!((synced.replied, synced.fix_pending), (0, 1), "{synced:?}");
+            }
+
+            /// A stale task PR URL must not let the task branch prove a reply:
+            /// the current own PR for that branch is a different URL.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_recorded_pr_with_a_different_current_head_gets_no_reply() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                let worktree = task_checkout_for_review(&repo, false);
+                let claude = EditingClaude::install("");
+                claude.set_pr_list_url("https://github.com/testorg/testrepo/pull/406");
+                let (state, tmp) = build_test_state().await;
+                let no_jj = tmp.path().join("no-such-jj");
+                let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
+
+                let (result, plan) = apply(&task, plan, &worktree, no_jj, true).await;
+
+                assert_eq!(result.replies_posted, 0, "a different PR head cannot prove delivery: {result:?}");
+                assert!(!plan.items[0].reply_posted, "{plan:?}");
+                assert!(plan.items[0].fix_uncommitted, "the item remains unproven: {plan:?}");
             }
 
             /// A commit amended away locally can never reach the remote. Its
