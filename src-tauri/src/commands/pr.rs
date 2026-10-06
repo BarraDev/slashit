@@ -1262,13 +1262,15 @@ pub async fn address_pr_review_inner(
     // cloned so we don't hold a borrow across the async agent call.
     let mut updated_plan = plan;
 
-    // A fix saved by a build that recorded no commit (`fix_commit`) and had
-    // already cleared `fix_uncommitted` cannot be tied to any commit, so
-    // nothing can prove it reached the pull request: it was either pushed,
-    // committed and never pushed, or discarded, and the plan cannot say
-    // which (#96). Its reply was never posted, so it is made again, once: the
-    // new fix is committed and recorded like any other, and a reply waits for
-    // that commit to be on the remote.
+    // A fix with no commit recorded and no change left waiting for one
+    // (`PrReviewItem::fix_has_no_provenance`) cannot be tied to any commit,
+    // so nothing can prove it reached the pull request (#96). That is a fix
+    // saved by a build from before commits were recorded, one whose agent
+    // changed nothing, and one whose change was found missing from the commit
+    // that took the checkout. Its reply was never posted, so it is made again,
+    // once per Apply, never on load or backfill: the new fix is committed and
+    // recorded like any other, and a reply waits for that commit to be on the
+    // remote.
     if !options.dry_run {
         for &idx in &approved_indices {
             let item = &mut updated_plan.items[idx];
@@ -1474,7 +1476,7 @@ pub async fn address_pr_review_inner(
         }
     }
 
-    let agent_summary = per_item_summaries.join("\n\n---\n\n");
+    let mut agent_summary = per_item_summaries.join("\n\n---\n\n");
 
     let mut pushed = false;
     let mut push_branch_name: Option<String> = None;
@@ -1622,6 +1624,10 @@ pub async fn address_pr_review_inner(
                          so no commit carries them and they get no reply; a later apply makes \
                          them again.{unpushed_replies_note}"
                     );
+                    // Informational only: not a push error (nothing failed,
+                    // and a push error would hide the delivery status and
+                    // colour the summary as a failure). It travels with the
+                    // apply's summary and its progress.
                     progress(PrReviewProgress {
                         task_id: task_id_str.clone(),
                         kind: "nothing_to_commit".to_string(),
@@ -1630,7 +1636,7 @@ pub async fn address_pr_review_inner(
                         comment_id: None,
                         message: Some(note.clone()),
                     });
-                    push_error = Some(note);
+                    agent_summary.push_str(&format!("\n\n---\n\nNote: {note}\n"));
                     None
                 }
                 Err(e) => Some(format!(
@@ -13736,6 +13742,12 @@ mod tests {
 
                 let (second, plan) = apply(&task, plan, &worktree, no_jj.clone(), true).await;
                 assert_eq!(second.replies_posted, 0, "a fix that exists nowhere was reported fixed: {second:?}");
+                assert_eq!(second.push_error, None, "nothing failed, so no push error: {second:?}");
+                assert!(second.failed_ids.is_empty() && second.fix_errors.is_empty(), "{second:?}");
+                assert!(
+                    second.agent_summary.contains("no longer in the task checkout"),
+                    "the outcome is explained in the summary: {}", second.agent_summary
+                );
                 assert!(!plan.items[0].reply_posted, "{:?}", plan.items[0]);
                 assert!(!remote_branch_has_file(&repo, "review-fix-1.txt"));
 

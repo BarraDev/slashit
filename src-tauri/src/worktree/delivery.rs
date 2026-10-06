@@ -97,7 +97,9 @@ pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, co
     .await;
     let Some(raw) = raw.filter(|o| o.status.success()) else { return false };
     // ":<old mode> <new mode> <old blob> <new blob> <status>\0<path>\0" ...
-    let text = String::from_utf8_lossy(&raw.stdout).into_owned();
+    // A path that is not valid UTF-8 cannot be handed back to Git by name, so
+    // nothing about it can be checked: unproven, never a lossy guess.
+    let Ok(text) = String::from_utf8(raw.stdout) else { return false };
     let mut parts = text.split('\0').filter(|p| !p.is_empty());
     let mut changes: Vec<(String, String, String, String)> = Vec::new(); // status, mode, blob, path
     while let (Some(meta), Some(path)) = (parts.next(), parts.next()) {
@@ -115,7 +117,7 @@ pub async fn effect_survives_in(working_dir: &str, before: &str, after: &str, co
     listing.extend(changes.iter().map(|c| c.3.clone()));
     let listed = git(listing, None).await;
     let Some(listed) = listed.filter(|o| o.status.success()) else { return false };
-    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let Ok(listed) = String::from_utf8(listed.stdout) else { return false };
     let mut in_commit: std::collections::HashMap<&str, (&str, &str)> = Default::default();
     for entry in listed.split('\0').filter(|e| !e.is_empty()) {
         let Some((meta, path)) = entry.split_once('\t') else { return false };
@@ -430,5 +432,24 @@ mod tests {
         git(&work, &["config", "apply.ignoreWhitespace", "change"]);
         git(&work, &["config", "apply.whitespace", "fix"]);
         assert!(!survives(&work, &effect, &head).await, "the collapsed spacing was never committed");
+    }
+
+    /// A path that is not valid UTF-8 cannot be matched by name, so a change to
+    /// it is never proven: a reverted deletion of such a file is not survival.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_path_that_is_not_utf8_is_never_proven() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_tmp, work) = checkout_with_origin();
+        let odd = work.join(std::ffi::OsStr::from_bytes(b"bad\xffname"));
+        std::fs::write(&odd, "x\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-q", "-m", "odd name"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        let effect = effect_of(&work, |w| {
+            std::fs::remove_file(w.join(std::ffi::OsStr::from_bytes(b"bad\xffname"))).unwrap();
+        })
+        .await;
+        assert!(!survives(&work, &effect, &head).await, "the file is still in the commit");
     }
 }

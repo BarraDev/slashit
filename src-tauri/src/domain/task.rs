@@ -717,7 +717,10 @@ pub struct PrReviewItem {
     /// Bookkeeping for the UI and for what an apply still owes: true from the
     /// moment this item's fix agent succeeds until an apply or a sync has
     /// seen [`PrReviewItem::fix_commit`] contained in the pull request's
-    /// remote branch. It is never evidence that a fix was delivered, and
+    /// remote branch. A commit is owed only while a [`FixEffect`] waits for
+    /// one: with `fix_effect` empty and no `fix_commit` the flag stays set,
+    /// but nothing is owed and the item is unproven (see
+    /// [`PrReviewItem::fix_has_no_provenance`]). It is never evidence that a fix was delivered, and
     /// clearing it proves nothing: a plan persisted before commits were
     /// recorded has it cleared without any proof (see #96). Whether a reply
     /// may say the fix is done is decided only by the commit's presence on
@@ -742,12 +745,21 @@ pub struct PrReviewItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_commit: Option<String>,
     /// What this item's fix agent changed in the checkout, kept until a
-    /// commit is shown to hold it: the trees before and after the run. A
+    /// commit is shown to hold it: the trees before and after the run. It is
+    /// cleared the first time a commit, or a finding that there is nothing to
+    /// commit, weighs it, whatever the verdict. A
     /// commit becomes `fix_commit` only if that change is still in it, so a
     /// fix whose edits were discarded or overwritten is never credited with a
     /// commit made for others. `None` when the agent changed nothing, and
     /// for every plan saved before this existed. Independent of #109's
     /// `fixed_content`, which identifies the comment text, not the change.
+    ///
+    /// Known limits, both left to the owner: the effect is everything that
+    /// changed in the checkout during the run, so a side effect of the
+    /// agent's build (a rewritten `Cargo.lock`, say) counts as a change; and a
+    /// fix proven by its commit's presence on the remote stays proven even if
+    /// a later pushed commit overwrote its change, since only the ancestry of
+    /// that exact commit is checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_effect: Option<FixEffect>,
     /// True once a reply (inline or fallback PR comment) was posted on GitHub
