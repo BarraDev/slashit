@@ -9,54 +9,54 @@ The audit reflects `main` at the time of writing. Vocabulary follows
 
 | Idea | Verdict |
 |---|---|
-| Agent attention states | KEEP, narrowed to a derived "Working" chip; no new status model |
-| Cross-Project dashboard | DROPPED as a page; MERGE into the existing attention summary |
-| Resume agent sessions | KEEP, split in three; only task-level resume is in scope |
-| Coordinator dispatch | KEEP, narrowed to an authorization audit of existing verbs |
-| Stale-agent reaper | DROPPED as a reaper; detect-and-surface folded into task resume work |
+| Agent attention states | KEEP, folded into managed run supervision; no new Task status model |
+| Cross-Project dashboard | DROPPED as a page; possible read-only Workspace filter later |
+| Resume agent sessions | KEEP, best-effort, provider session identity owned by the Run |
+| Coordinator dispatch | KEEP, narrow; multi-agent orchestration DEFERRED, not rejected |
+| Stale-agent reaper | KEEP managed execution supervision; DROP automatic reaping and scanning |
 | Per-Project setup hooks | KEEP as design, deferred |
 
-## 1. Agent attention states
+Direction context: [agent-runtime-and-conversations.md](agent-runtime-and-conversations.md).
+Ownership principle: SlashIt owns conversation and execution metadata, not
+the user's repository or the provider's configuration.
 
-Problem. A card does not say whether an agent is working or the user is
-needed. Workmux distinguishes working, waiting and done.
+## 1. Agent attention states and managed run supervision
 
-What exists. `slashit-attention` derives `AttentionReason` (Failed, Review,
-PrNotCreated) from persisted status plus Human Review facts and is shared by
-backend and frontend; the card chip, the header walk and the rail summary
-already use it. `TaskPhase` (Idle, Planning, Coding, QaReview, QaFixing,
-Complete, Failed) and `TaskStatus` already say "an agent is running".
-"Waiting for input" has no source today: runs are non-interactive
-(`claude -p` through the runner, prompt on stdin), so an agent cannot ask a
-question and block. "Needs review" is exactly `AttentionReason::Review`.
+Problem. A card does not say whether an agent is actually running or the
+user is needed.
 
-Decision. Do not add a second status model. Two of the three requested
-states already exist (needs review, failed). The remaining useful one is
-"working", which is derivable from status InProgress/AiReview plus phase and
-needs no persistence.
+Two separate questions, never merged. Attention asks "does the person need
+to act?" and is already answered by `slashit-attention` (`AttentionReason`:
+Failed, Review, PrNotCreated), derived from persisted facts. Run state asks
+"what is the execution SlashIt owns doing right now?" and is a different
+model. Needs review is already Attention. Working is not an Attention reason.
 
-Behavior. A card in InProgress or AiReview shows a quiet "Working" label with
-the phase name. Needs-you chips are unchanged and take precedence.
+Working is not derivable from `TaskStatus` or `TaskPhase`. A persisted
+status does not prove a live process (after a crash an InProgress record has
+no process until hydration requeues it), and a queued task may be waiting on
+capacity or admission. Working must project live supervision: SlashIt holds
+the child process or protocol handle it started, so it can say Starting,
+Working, Stopping, Finished or Failed from that handle.
 
-Model boundary. Presentation only, computed in the frontend from fields the
-task record already carries. If a CLI or tray later needs it, it moves into
-`slashit-attention` as a separate function, not as a new `AttentionReason`
-(attention means "the user is needed"; working means the opposite).
+Run state is held in memory by the supervisor and projected to the UI. It is
+not a persisted Task field and creates no new Task status model. What is
+persisted is only what already is (timeline entries, outcome) plus the
+provider session id from note 3.
 
-Persistence. None. Failure and recovery: after a crash the status is what the
-record says; there is no stored "working" to go stale.
+WaitingForInput is a supported-future run state with no current producer; it
+may only come from a reliable structured provider or protocol signal and is
+never inferred from silence or output pauses. See the audit in the revised
+report. Out of scope: any Conversation model, external process scanning,
+repo or provider hooks, notifications.
 
-Surface. Card and drawer header text. Security: none.
+Smallest first version: an in-memory registry of runs the executor starts,
+fed by the runner's existing structured events and live activity, with a
+Working label on the card and drawer driven by it. The Working chip is part
+of this work, not a separate item.
 
-Out of scope. "Waiting for input" (requires interactive agent sessions and a
-provider-specific signal; revisit only if interactive runs ship), terminal
-output scraping, notifications.
-
-Smallest first version. Card label from status and phase.
-
-Acceptance. A running task shows Working with its phase; a failed or review
-task shows the existing chip and not Working; no new field is written to the
-task file; `slashit-attention` tests are unchanged.
+Acceptance: a task with a live managed run shows Working; a queued or
+crashed-and-not-yet-requeued task does not; after an app restart no run is
+shown until one is actually started; Attention chips are unchanged.
 
 ## 2. Cross-Project dashboard: DROPPED as a separate view
 
@@ -68,55 +68,39 @@ ordering, ownership) that the product model deliberately avoids: a Task
 belongs to exactly one Project. Membership lives on the Project, so a
 Workspace aggregate is only a filter.
 
-Disposition. If wanted later, add a Workspace filter (Projects whose scope
+Disposition. A read-only Workspace projection or filter remains possible later; add a Workspace filter (Projects whose scope
 names that Workspace) to the existing attention summary and rail; read-only,
 no new page, no new store. File only when a real multi-Project user asks.
 
-## 3. Resume agent sessions after a crash
+## 3. Resume provider sessions after a crash
 
-Three different things, kept apart.
+Three things, kept apart. (a) Resuming a SlashIt task: startup hydration
+already requeues tasks left InProgress as fresh runs in their Task Checkout.
+(b) Reconnecting a terminal process: out of scope; PTYs die with the app and
+agent runs are not PTY based. (c) Resuming a provider session: best-effort.
 
-(a) Resuming a SlashIt task. Today startup hydration requeues tasks left
-InProgress, so the task restarts from the queue with a fresh run in its
-existing Task Checkout. This already works as "resume the task" at the
-product level; it just discards the agent's conversation.
+Provider session identity belongs to the Run, Participant and provider
+adapter, not to the Task. SlashIt records the id the provider reports and
+never invents one that it treats as a provider session. Current code:
+`ClaudeRunConfig` has `session_id` (`--session-id`) and `resume_session`
+(`--resume`); the runner captures the id from the `system` init event and the
+`result` event; the executor passes a self-generated UUID as `--session-id`
+and no production caller sets `resume_session`. The id is not persisted. The
+claude CLI help lists `--resume`, `--session-id`, `--continue`,
+`--fork-session` and `--no-session-persistence`.
 
-(b) Reconnecting a terminal process. PTY sessions are children of the app
-process and die with it. Reattaching would need a surviving supervisor (the
-daemon could in principle own them). Out of scope: large, new architecture,
-and the agent runs are not PTY based.
+Behavior: persist the provider-reported id on the run record when available;
+on interrupted-run recovery try `--resume` once; if it fails, run fresh;
+never loop; write what happened to the activity timeline.
 
-(c) Resuming a provider session. Verified locally with `claude --help`: the
-CLI supports `--resume <session-id>`, `--session-id <uuid>`, `--continue`,
-`--fork-session`, and `--no-session-persistence`. The runner already builds
-`--session-id` and `--resume` from `ClaudeRunConfig`, but every production
-caller passes `resume_session: None`, and the session id is generated per run
-(a fresh UUID) and not stored on the task. What I did not verify: whether a
-session started with `-p` and killed mid-turn can be resumed cleanly, and how
-long Claude retains session files. SlashIt must not promise resume; it can
-only try it and fall back.
+Spike questions to answer before any implementation issue (all unverified):
+does `claude -p` reliably report a resumable id; can a session killed
+mid-turn be resumed; does resume require the same working directory; how do
+clean completion and interruption differ; how long does Claude retain
+sessions.
 
-Decision. Scope to (c) as best-effort inside (a): persist the provider
-session id on the run record, and on requeue-after-crash pass `--resume`
-when the id is known; if Claude rejects it, retry once as a fresh run and
-record in the activity timeline which happened. Provider specifics stay in
-`agents/`; the task record stores an opaque optional string plus provider
-name.
-
-Persistence. One optional field on the task's run record; absence means
-fresh run. Failure: resume failure is never fatal and never loops; one retry
-then fresh. Surface: a timeline entry "resumed session" or "started fresh
-(resume unavailable)". Security: the session id is not a secret but is not
-shown in public text; the checkout path is unchanged.
-
-Out of scope. Terminal reattach, cloud or `--bg` sessions, other providers,
-resuming human-driven conversations.
-
-Smallest first version. Persist id, resume once on crash requeue, fall back.
-
-Acceptance. A fake agent that records its argv sees `--resume <id>` after a
-simulated crash; a fake that rejects it is rerun fresh exactly once; the
-timeline shows which path ran; no id is stored for tasks that never ran.
+Out of scope: terminal reattach, other providers, Conversations, cloud or
+background sessions.
 
 ## 4. Coordinator dispatch through the slashit CLI
 
@@ -147,8 +131,12 @@ untrusted; the real boundary remains OS peer identity; never relax the TCP
 denial of `spawns_agent()` verbs; document that a dispatching agent can run
 code as the user.
 
-Out of scope. Multi-agent orchestration, task dependencies, results API,
-remote dispatch, per-agent credentials.
+Out of scope for now: multi-agent Conversation and orchestration, which is
+DEFERRED future architecture and not rejected (see the direction doc).
+Provenance fields and any restricted mode must not close that path: a caller
+label is provenance, and a future Participant model may replace it. Also out
+of scope: task dependencies, results API, remote dispatch, per-agent
+credentials.
 
 Smallest first version. Provenance field and a `--json` output audit so an
 orchestrator can read task ids and status reliably.
@@ -156,23 +144,16 @@ orchestrator can read task ids and status reliably.
 Acceptance. Tasks made by the CLI are visibly marked; protocol test still
 forces every new verb to be classified; no new mutating verb is added.
 
-## 5. Stale-agent reaper: DROPPED as a reaper
+## 5. Stale-agent reaper: KEEP supervision, DROP reaping
 
-Rationale. The three parts differ in risk. Detect and surface already exist
-for their real cases: orphaned Task Checkouts and branches have a read-only
-scan with per-item reclaim (`commands/orphans.rs`), and crash recovery
-requeues InProgress tasks. For agent processes: runs are children of the
-SlashIt process, so when the app dies the pipes close and `claude -p` exits;
-a surviving agent with no owner is unobserved in practice. Killing a process
-by pattern is destructive and needs ownership proof SlashIt does not
-currently record (no pid persisted per task).
-
-Disposition. Do not build a reaper. If an orphan agent is ever observed,
-first record pid and start time on the run record (this piggybacks on the
-session-resume field in note 3), then surface "possible leftover agent" in
-the existing orphan scan, with kill only on explicit per-item request after
-verifying pid, start time and checkout path all match. Revisit with
-evidence.
+Managed execution supervision stays (note 1). Automatic process reaping and
+scanning are dropped. While SlashIt is alive it observes a run through the
+real process or protocol handle it holds. After an abrupt crash SlashIt must
+not assume the provider process died or survived. It never scans for or
+kills processes by executable name. A future recovery step may persist
+process identity (pid and start time) to surface a possible leftover agent;
+any destructive action would need strong ownership proof. A future daemon
+that owns processes is not part of issue 73.
 
 ## 6. SlashIt-owned per-Project setup hooks
 
@@ -210,24 +191,11 @@ text does not appear in the command line.
 
 ## Prioritization
 
-| Idea | Value | Size | Risk | Overlap | Order |
-|---|---|---|---|---|---|
-| Resume (c within a) | high | small-medium | medium, provider drift | queue recovery | 1 |
-| Attention Working label | medium | small | low | attention crate | 2 |
-| Dispatch provenance | medium | small | low | ipc-security | 3 |
-| Setup hooks | medium | medium | high, code execution | none | deferred |
+1. Managed run supervision (includes the Working chip). High value, medium
+   size, foundation for the rest.
+2. Best-effort provider session resume. High value, small to medium,
+   provider-drift risk; may depend on 1 and needs the spike answers first.
+3. Dispatch provenance: small, no issue now.
+4. Setup hooks: deferred, code-execution surface.
 
-Recommended near term: resume (best-effort, one retry) and the Working label.
-
-## Self-review
-
-- Duplication: the dashboard and the attention expansion were the main
-  duplicates and were dropped or narrowed.
-- Provider assumptions: resume is isolated in `agents/`, optional and
-  falls back; `--resume` behavior after a mid-turn kill is unverified.
-- Destructive process management: no reaper is proposed.
-- Dispatch and hooks: both are code-execution surfaces; the notes keep the
-  OS boundary, deny repo-supplied hooks and never interpolate task text.
-- Unverified: whether hydration requeue reuses the same checkout in every
-  case, and whether any task field already stores a provider session id
-  (a search found none).
+Only items 1 and 2 are proposed as near-term implementation issues.
