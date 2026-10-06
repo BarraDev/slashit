@@ -228,8 +228,9 @@ async fn walk_to_what_needs_you(driver: &WebDriver, repository: &GitFixture) -> 
         create_prerequisites(driver, repository, "Needs you failed", "Never runs.").await?;
     let (review, _) = create_task_in(driver, &project_id, "Needs you review").await?;
     let (ordinary, _) = create_task_in(driver, &project_id, "Needs you ordinary").await?;
-    // AI Review counts as running and never as needing the user. Moved there
-    // by hand it has no review to run, so it stays put.
+    // A persisted AI Review status is not liveness. Moved there by hand it
+    // has no executor-owned review run, so it stays put and is not counted as
+    // Running.
     let (reviewing, _) = create_task_in(driver, &project_id, "Needs you ai review").await?;
     move_to(driver, &failed, "error").await?;
     move_to(driver, &review, "human_review").await?;
@@ -243,8 +244,8 @@ async fn walk_to_what_needs_you(driver: &WebDriver, repository: &GitFixture) -> 
     assert_chip(&review_card, "review", "Needs you \u{00B7} Review", "violet")?;
     await_reason(driver, &ordinary, None).await?;
     await_reason(driver, &reviewing, None).await?;
-    if attribute(driver, "[data-testid=\"header-running\"]", "data-count").await?.as_deref() != Some("1") {
-        bail!("Running does not count the task under AI review");
+    if attribute(driver, "[data-testid=\"header-running\"]", "data-count").await?.as_deref() != Some("0") {
+        bail!("Running counted a persisted AI Review without an owned run");
     }
 
     // Precondition: the Human Review card is not on screen yet. A window
