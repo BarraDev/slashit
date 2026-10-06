@@ -67,15 +67,16 @@ struct Ran {
 }
 
 /// One `git` run, under the repository's registration lock (see
-/// [`super::registry_lock`]) except a `fetch`, which never reads the
-/// registrations and may take long on the network. Each helper here runs one
-/// `git` and returns; none is called while another holds the lock.
+/// [`super::registry_lock`]) except network queries (`fetch` and
+/// `ls-remote`), which never read the registrations and may take long on the
+/// network. Each helper here runs one `git` and returns; none is called while
+/// another holds the lock.
 async fn run_unless_fetch(
     dir: &Path,
     args: &[&str],
     envs: &[(&str, String)],
 ) -> std::io::Result<std::process::Output> {
-    if args.first() == Some(&"fetch") {
+    if matches!(args.first(), Some(&"fetch") | Some(&"ls-remote")) {
         return tokio::process::Command::new("git")
             .args(args)
             .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))

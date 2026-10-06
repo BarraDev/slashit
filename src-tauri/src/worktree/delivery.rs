@@ -21,17 +21,36 @@ use super::restack;
 /// untracked files and deletions, without touching the checkout's index, its
 /// files or its branch.
 ///
-/// A scratch index is filled from `HEAD` and then from the working tree, and
-/// written out as a tree. Files Git ignores are not part of it, as they are
-/// not part of a commit.
+/// A scratch index is seeded from the checkout's index when possible, then
+/// updated from the working tree, and written out as a tree. Files Git ignores
+/// are not part of it, as they are not part of a commit.
 pub async fn checkout_snapshot(working_dir: &str) -> Result<String, String> {
     let scratch = std::env::temp_dir().join(format!("slashit-snapshot-{}.index", uuid::Uuid::new_v4()));
-    let result = snapshot_with_index(working_dir, &scratch).await;
+    let seeded = match tokio::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "index"])
+        .env("LC_ALL", "C")
+        .current_dir(working_dir)
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let source = Path::new(&raw);
+            let source = if source.is_absolute() {
+                source.to_path_buf()
+            } else {
+                Path::new(working_dir).join(source)
+            };
+            tokio::fs::copy(source, &scratch).await.is_ok()
+        }
+        _ => false,
+    };
+    let result = snapshot_with_index(working_dir, &scratch, seeded).await;
     let _ = tokio::fs::remove_file(&scratch).await;
     result
 }
 
-async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, String> {
+async fn snapshot_with_index(working_dir: &str, index: &Path, seeded: bool) -> Result<String, String> {
     let run = |args: &'static [&'static str]| {
         let index = index.to_path_buf();
         async move {
@@ -55,8 +74,10 @@ async fn snapshot_with_index(working_dir: &str, index: &Path) -> Result<String, 
             }
         }
     };
-    // A repository without a commit yet has no HEAD to read: start empty.
-    let _ = run(&["read-tree", "HEAD"]).await;
+    if !seeded {
+        // A repository without a commit yet has no HEAD to read: start empty.
+        let _ = run(&["read-tree", "HEAD"]).await;
+    }
     run(&["add", "-A"]).await?;
     run(&["write-tree"]).await
 }
