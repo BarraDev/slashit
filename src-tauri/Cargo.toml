@@ -102,3 +102,4 @@ mockall = "0.13"
 # a dev-dependency feature, it is not unified into `cargo build`/`cargo tauri
 # build`, so no shipped binary carries the mock runtime.
 tauri = { version = "2", features = ["test"] }
+
