@@ -191,7 +191,11 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         ui::visible(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?.click().await?;
         await_blocked_provider_run(&agent).await?;
         ui::visible(session.driver(), "[data-testid=\"conversation-stop\"]").await?.click().await?;
-        await_text(session.driver(), "[data-testid=\"conversation-continuation-error\"]", "stopped").await?;
+        let stopped = await_conversation_idle(session.driver(), &project_id, 1).await?;
+        if stopped["conversation"]["actions"].as_array().is_none_or(|actions| !actions.iter().any(|action| action["status"] == "returned" && action["coordinator_replied"] == false)) {
+            bail!("stopping Coordinator mediation did not preserve the returned Worker result: {stopped}");
+        }
+        ui::visible(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?;
         ui::visible(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?.click().await?;
         await_and_release_provider_run(&agent).await?;
         await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Coordinator reviewed the Worker result.").await?;
