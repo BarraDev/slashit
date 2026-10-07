@@ -195,8 +195,7 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         if stopped["conversation"]["actions"].as_array().is_none_or(|actions| !actions.iter().any(|action| action["status"] == "returned" && action["coordinator_replied"] == false)) {
             bail!("stopping Coordinator mediation did not preserve the returned Worker result: {stopped}");
         }
-        ui::visible(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?;
-        ui::visible(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?.click().await?;
+        await_enabled(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?.click().await?;
         await_and_release_provider_run(&agent).await?;
         await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Coordinator reviewed the Worker result.").await?;
         let worker_runs = agent.invocations()?.iter().filter(|run| run.prompt.as_deref().is_some_and(|prompt| prompt.contains("Execute only approved_request in this Task Checkout"))).count();
@@ -258,6 +257,20 @@ async fn await_blocked_provider_run(agent: &FakeAgent) -> Result<()> {
         }
         if started.elapsed() > EXECUTION_DEADLINE {
             bail!("fake provider did not reach its deterministic blocking gate");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn await_enabled(driver: &WebDriver, selector: &str) -> Result<WebElement> {
+    let started = Instant::now();
+    loop {
+        let element = ui::visible(driver, selector).await?;
+        if element.is_enabled().await? {
+            return Ok(element);
+        }
+        if started.elapsed() > EXECUTION_DEADLINE {
+            bail!("{selector} stayed disabled past the acceptance deadline");
         }
         tokio::time::sleep(POLL).await;
     }
