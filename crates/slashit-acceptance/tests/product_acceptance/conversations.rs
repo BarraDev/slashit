@@ -14,8 +14,14 @@ async fn zero_task_project_conversation_replies_and_survives_restart() {
     let root = context.state().path().to_path_buf();
     let agent = FakeAgent::install(&root).expect("install fake Claude");
     context.set_child_env("PATH", agent.path_value().to_os_string());
-    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir().as_os_str().to_os_string());
-    context.set_child_env(fake_agent::COORDINATOR_OUTPUT_VAR, r#"{"type":"reply","text":"Fake Coordinator reply."}"#);
+    context.set_child_env(
+        fake_agent::MARKER_DIR_VAR,
+        agent.marker_dir().as_os_str().to_os_string(),
+    );
+    context.set_child_env(
+        fake_agent::COORDINATOR_OUTPUT_VAR,
+        r#"{"type":"reply","text":"Fake Coordinator reply."}"#,
+    );
 
     let outcome = async {
         let session = context.start_session("zero-tasks").await?;
@@ -84,8 +90,15 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
     let root = context.state().path().to_path_buf();
     let agent = FakeAgent::install(&root).expect("install fake Claude");
     context.set_child_env("PATH", agent.path_value().to_os_string());
-    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir().as_os_str().to_os_string());
+    context.set_child_env(
+        fake_agent::MARKER_DIR_VAR,
+        agent.marker_dir().as_os_str().to_os_string(),
+    );
     context.set_child_env(fake_agent::COORDINATOR_OUTPUT_VAR, "delegate_to_task");
+    let blocked_runs = agent
+        .block_agent_runs()
+        .expect("create deterministic run gates");
+    context.set_child_env(fake_agent::BLOCK_DIR_VAR, blocked_runs.into_os_string());
     // Fail the first Coordinator run after the Worker result. The saved result
     // must remain visible and an explicit fresh retry must not rerun the Worker.
     context.set_child_env(fake_agent::COORDINATOR_FAIL_AFTER_WORKER_VAR, "1");
@@ -102,7 +115,7 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         std::fs::create_dir_all(&target_config)?;
         let stale_target = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Task to remove before rejection","description":"A stale proposal target","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
         let stale_target_id = created_id(stale_target, "create stale proposal target")?;
-        std::fs::write(target_config.join("id"), &stale_target_id)?;
+        std::fs::write(target_config.join("id"), &task_id)?;
         let unrelated = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Unrelated private Task sentinel","description":"Must not enter the Worker projection","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
         let unrelated_task_id = created_id(unrelated, "create_task")?;
         open_board(session.driver(), &project_id).await?;
@@ -110,7 +123,9 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
 
         // No proposal may start the Worker. The fixture's invocation count
         // stays at the Coordinator until the exact payload is approved.
-        send_message(session.driver(), "Please make a small change in Existing Task.", "Coordinator proposes Task work").await?;
+        submit_message(session.driver(), "Please make a small change in Existing Task.").await?;
+        await_and_release_provider_run(&agent).await?;
+        await_text(session.driver(), PANEL, "Coordinator proposes Task work").await?;
         let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
         let proposal_text = proposal.text().await?;
         if !proposal_text.contains("Existing Task") || !proposal_text.contains(&task_id) || !proposal_text.contains("right execution boundary") { bail!("the exact target and explanation are not visible: {proposal_text}"); }
@@ -118,27 +133,46 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         if field_value(session.driver(), "[data-testid=\"conversation-action-request\"]").await? != "Add the approved marker." { bail!("the exact proposed request is not visible in its editable field"); }
         if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 1 { bail!("Worker ran before approval"); }
 
-        // Rejection remains a Conversation decision even if its target was
-        // deleted after proposal. It must never start a Worker.
-        ui::invoke(session.driver(), "delete_task", json!({"taskId":stale_target_id})).await?;
+        // A normal rejection is durable and must never start a Worker.
         ui::visible(session.driver(), "[data-testid=\"conversation-action-reject\"]").await?.click().await?;
         let rejected = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
         if rejected["conversation"]["actions"].as_array().and_then(|actions| actions.first()).is_none_or(|action| action["status"] != "rejected") { bail!("rejection was not persisted"); }
         if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 1 { bail!("reject started a Worker"); }
 
-        std::fs::write(target_config.join("id"), &task_id)?;
-        send_message(session.driver(), "Please propose the Task work again.", "Coordinator proposes Task work").await?;
+        // A stale proposal remains rejectable after its target disappears.
+        std::fs::write(target_config.join("id"), &stale_target_id)?;
+        submit_message(session.driver(), "Please propose the Task work again.").await?;
+        await_and_release_provider_run(&agent).await?;
+        await_text(session.driver(), PANEL, "Coordinator proposes Task work").await?;
         let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
         let proposal_text = proposal.text().await?;
-        if !proposal_text.contains("Existing Task") || !proposal_text.contains(&task_id) { bail!("the second exact proposal target is not visible: {proposal_text}"); }
+        if !proposal_text.contains("Task to remove before rejection") || !proposal_text.contains(&stale_target_id) { bail!("the stale proposal target is not visible: {proposal_text}"); }
+        ui::invoke(session.driver(), "delete_task", json!({"taskId":stale_target_id})).await?;
+        ui::visible(session.driver(), "[data-testid=\"conversation-action-reject\"]").await?.click().await?;
+        let stale_rejected = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
+        if stale_rejected["conversation"]["actions"].as_array().is_none_or(|actions| !actions.iter().any(|action| action["target_task_id"] == stale_target_id && action["status"] == "rejected")) { bail!("deleted proposal target could not be rejected: {stale_rejected}"); }
+        if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 2 { bail!("stale-target rejection started a Worker"); }
+
+        std::fs::write(target_config.join("id"), &task_id)?;
+        submit_message(session.driver(), "Please propose the Task work a third time.").await?;
+        await_and_release_provider_run(&agent).await?;
+        await_text(session.driver(), PANEL, "Coordinator proposes Task work").await?;
+        let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
+        let proposal_text = proposal.text().await?;
+        if !proposal_text.contains("Existing Task") || !proposal_text.contains(&task_id) { bail!("the third exact proposal target is not visible: {proposal_text}"); }
         ui::visible(session.driver(), "[data-testid=\"conversation-action-request\"]").await?;
-        if field_value(session.driver(), "[data-testid=\"conversation-action-request\"]").await? != "Add the approved marker." { bail!("the second exact proposed request is not visible in its editable field"); }
-        if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 2 { bail!("second proposal started a Worker before approval"); }
+        if field_value(session.driver(), "[data-testid=\"conversation-action-request\"]").await? != "Add the approved marker." { bail!("the third exact proposed request is not visible in its editable field"); }
+        if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 3 { bail!("third proposal started a Worker before approval"); }
 
         let request = ui::visible(session.driver(), "[data-testid=\"conversation-action-request\"]").await?;
         request.clear().await?;
         request.send_keys("Edited authoritative request").await?;
         ui::visible(session.driver(), "[data-testid=\"conversation-action-edit-approve\"]").await?.click().await?;
+        await_and_release_provider_run(&agent).await?; // Worker run
+        await_blocked_provider_run(&agent).await?; // Coordinator after durable Worker result
+        let result_while_mediating = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
+        if result_while_mediating["conversation"]["actions"].as_array().is_none_or(|actions| !actions.iter().any(|action| action["status"] == "returned" && action["worker_result"].as_str().is_some())) { bail!("Worker result was not durably visible while Coordinator mediation was blocked: {result_while_mediating}"); }
+        agent.release_blocked_runs()?; // First follow-up fails by fixture instruction.
         await_text(session.driver(), "[data-testid=\"conversation-worker-result\"]", "fake Worker completed approved work").await?;
         ui::visible(session.driver(), "[data-testid=\"conversation-continuation-error\"]").await?;
         if ui::visible(session.driver(), SEND).await?.is_enabled().await? { bail!("Human send remained enabled while a saved Worker result awaited Coordinator mediation"); }
@@ -153,6 +187,11 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         let after_reads = agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count();
         if after_reads != before_explicit_retry { bail!("GET unexpectedly launched provider work ({before_explicit_retry} -> {after_reads})"); }
         ui::visible(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?.click().await?;
+        await_blocked_provider_run(&agent).await?;
+        ui::visible(session.driver(), "[data-testid=\"conversation-stop\"]").await?.click().await?;
+        await_text(session.driver(), "[data-testid=\"conversation-continuation-error\"]", "stopped").await?;
+        ui::visible(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?.click().await?;
+        await_and_release_provider_run(&agent).await?;
         await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Coordinator reviewed the Worker result.").await?;
         let worker_runs = agent.invocations()?.iter().filter(|run| run.prompt.as_deref().is_some_and(|prompt| prompt.contains("Execute only approved_request in this Task Checkout"))).count();
         if worker_runs != 1 { bail!("Coordinator retry started the Worker {worker_runs} times"); }
@@ -171,13 +210,13 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         if persisted_task["status"] != "backlog" { bail!("TaskStatus was changed to represent Worker liveness: {}", persisted_task["status"]); }
         let invocations = agent.invocations()?;
         let runs = invocations.iter().filter(|invocation| invocation.prompt.is_some()).collect::<Vec<_>>();
-        if runs.len() != 5 { bail!("expected two proposal Coordinators, Worker, failed Coordinator and fresh retry; observed {}", runs.len()); }
-        let worker = runs[2];
+        if runs.len() != 7 { bail!("expected three proposal Coordinators, Worker, failed Coordinator, stopped Coordinator and successful retry; observed {}", runs.len()); }
+        let worker = runs[3];
         if !worker.working_dir.ends_with(persisted_task["worktree_path"].as_str().unwrap_or_default()) && worker.working_dir != Path::new(persisted_task["worktree_path"].as_str().unwrap_or_default()) { bail!("Worker did not run in target Task Checkout: {}", worker.working_dir.display()); }
         let worker_prompt = worker.prompt.as_deref().unwrap_or_default();
         if !worker_prompt.contains("Edited authoritative request") || worker_prompt.contains("Please make a small change") || worker_prompt.contains("right execution boundary") || worker_prompt.contains("Unrelated private Task sentinel") || worker_prompt.contains("Must not enter the Worker projection") { bail!("Worker context contains the wrong payload, hidden Coordinator history, or unrelated Task data: {worker_prompt}"); }
         if runs.iter().any(|run| run.args.iter().any(|arg| arg == "--resume" || arg == "--session-id")) { bail!("a fresh Run depended on provider continuity"); }
-        if !runs[4].prompt.as_deref().unwrap_or_default().contains("fake Worker completed approved work") { bail!("fresh Coordinator retry did not receive the persisted Worker result"); }
+        if !runs[6].prompt.as_deref().unwrap_or_default().contains("fake Worker completed approved work") { bail!("fresh Coordinator retry did not receive the persisted Worker result"); }
 
         send_message(session.driver(), "What should we do next?", "Fake Coordinator reply.").await?;
         let continued = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
@@ -201,12 +240,52 @@ async fn submit_message(driver: &WebDriver, message: &str) -> Result<()> {
     Ok(())
 }
 
-async fn await_conversation_idle(driver: &WebDriver, project_id: &str, minimum_entries: usize) -> Result<Value> {
+async fn await_blocked_provider_run(agent: &FakeAgent) -> Result<()> {
     let started = Instant::now();
     loop {
-        let snapshot = ui::invoke(driver, "get_project_conversation", json!({"projectId":project_id})).await?;
-        let entries = snapshot["conversation"]["entries"].as_array().map_or(0, Vec::len);
-        if entries >= minimum_entries && snapshot["coordinator_live"] == false && snapshot["worker_live"] == false {
+        if agent
+            .blocked_pids()?
+            .into_iter()
+            .any(|pid| agent.is_running(pid))
+        {
+            return Ok(());
+        }
+        if started.elapsed() > EXECUTION_DEADLINE {
+            bail!("fake provider did not reach its deterministic blocking gate");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn await_and_release_provider_run(agent: &FakeAgent) -> Result<()> {
+    await_blocked_provider_run(agent).await?;
+    let released = agent.release_blocked_runs()?;
+    if released != 1 {
+        bail!("expected one serial provider run at its gate, released {released}");
+    }
+    Ok(())
+}
+
+async fn await_conversation_idle(
+    driver: &WebDriver,
+    project_id: &str,
+    minimum_entries: usize,
+) -> Result<Value> {
+    let started = Instant::now();
+    loop {
+        let snapshot = ui::invoke(
+            driver,
+            "get_project_conversation",
+            json!({"projectId":project_id}),
+        )
+        .await?;
+        let entries = snapshot["conversation"]["entries"]
+            .as_array()
+            .map_or(0, Vec::len);
+        if entries >= minimum_entries
+            && snapshot["coordinator_live"] == false
+            && snapshot["worker_live"] == false
+        {
             return Ok(snapshot);
         }
         if started.elapsed() > EXECUTION_DEADLINE {
@@ -217,10 +296,16 @@ async fn await_conversation_idle(driver: &WebDriver, project_id: &str, minimum_e
 }
 
 async fn field_value(driver: &WebDriver, selector: &str) -> Result<String> {
-    Ok(driver.execute(
-        "return document.querySelector(arguments[0]).value;",
-        vec![Value::String(selector.to_owned())],
-    ).await?.json().as_str().context("editable field value missing")?.to_owned())
+    Ok(driver
+        .execute(
+            "return document.querySelector(arguments[0]).value;",
+            vec![Value::String(selector.to_owned())],
+        )
+        .await?
+        .json()
+        .as_str()
+        .context("editable field value missing")?
+        .to_owned())
 }
 
 async fn await_text(driver: &WebDriver, selector: &str, text: &str) -> Result<()> {
@@ -232,10 +317,17 @@ async fn await_text(driver: &WebDriver, selector: &str, text: &str) -> Result<()
             vec![Value::String(selector.to_owned())],
         ).await?;
         let shown = matches.as_array().is_some_and(|elements| {
-            elements.iter().filter_map(Value::as_str).any(|element| element.contains(text))
+            elements
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|element| element.contains(text))
         });
-        if shown { return Ok(()); }
-        if started.elapsed() > EXECUTION_DEADLINE { bail!("{selector} never displayed {text:?}"); }
+        if shown {
+            return Ok(());
+        }
+        if started.elapsed() > EXECUTION_DEADLINE {
+            bail!("{selector} never displayed {text:?}");
+        }
         tokio::time::sleep(POLL).await;
     }
 }

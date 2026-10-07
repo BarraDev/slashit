@@ -180,9 +180,19 @@ pub async fn delete_project(
     // history is removed, otherwise its completion could recreate an orphan.
     let conversation_lock = state.conversation.project_lock(id);
     let _conversation_guard = conversation_lock.lock().await;
-    if let Some(conversation) = state.storage.load_primary_conversation(id).map_err(|e| e.to_string())? {
-        if state.executor.get().is_some_and(|executor| executor.project_run_is_live(conversation.id)) {
-            return Err("Stop the active Project Conversation Run before deleting this Project".into());
+    if let Some(conversation) = state
+        .storage
+        .load_primary_conversation(id)
+        .map_err(|e| e.to_string())?
+    {
+        if state
+            .executor
+            .get()
+            .is_some_and(|executor| executor.project_run_is_live(conversation.id))
+        {
+            return Err(
+                "Stop the active Project Conversation Run before deleting this Project".into(),
+            );
         }
     }
     delete_project_committed(&state.project.projects, &state.storage, id).await
@@ -708,7 +718,9 @@ mod tests {
         let pointer = storage.paths().primary_conversation_file(id);
         let projects = RwLock::new(HashMap::from([(id, project)]));
 
-        assert!(delete_project_committed(&projects, &storage, id).await.unwrap());
+        assert!(delete_project_committed(&projects, &storage, id)
+            .await
+            .unwrap());
 
         assert!(!projects.read().await.contains_key(&id));
         assert!(!pointer.exists());

@@ -559,20 +559,8 @@ pub async fn act_on_project_conversation(
                 if target.project_id != project_id {
                     return Err("Target Task belongs to another Project".into());
                 }
-                let already_approved = action_record.status == ActionStatus::Approved;
-                let request = if already_approved {
-                    let approved = action_record
-                        .approved_request
-                        .clone()
-                        .ok_or("Approved action has no authoritative request")?;
-                    if request.as_ref().is_some_and(|edited| edited != &approved) {
-                        return Err("An approved request cannot be edited during recovery".into());
-                    }
-                    approved
-                } else {
-                    request.unwrap_or_else(|| action_record.request.clone())
-                };
-                Conversation::validate_text(&request)?;
+                let (request, already_approved) =
+                    record_human_approval(&mut conversation, action_id, request)?;
                 if target
                     .worktree_path
                     .as_deref()
@@ -584,16 +572,6 @@ pub async fn act_on_project_conversation(
                     return Err("Task has no recorded checkout branch".into());
                 }
                 if !already_approved {
-                    action_record.approved_request = Some(request.clone());
-                    action_record.status = ActionStatus::Approved;
-                    conversation.push(
-                        Role::Human,
-                        EntryKind::ActionDecision {
-                            action_id,
-                            approved: true,
-                            request: Some(request.clone()),
-                        },
-                    );
                     state
                         .storage
                         .save_conversation(&conversation)
@@ -770,6 +748,51 @@ fn can_reject(status: ActionStatus) -> bool {
     status == ActionStatus::Proposed
 }
 
+/// Record the one Human approval decision. Retrying start for an already
+/// approved action reuses its authoritative request without adding another
+/// Human decision event.
+fn record_human_approval(
+    conversation: &mut Conversation,
+    action_id: Uuid,
+    requested: Option<String>,
+) -> Result<(String, bool), String> {
+    let action = conversation
+        .actions
+        .iter_mut()
+        .find(|action| action.id == action_id)
+        .ok_or("Action not found")?;
+    let already_approved = action.status == ActionStatus::Approved;
+    if !already_approved && action.status != ActionStatus::Proposed {
+        return Err("Action is no longer awaiting approval or safe to start".into());
+    }
+    let request = if already_approved {
+        let approved = action
+            .approved_request
+            .clone()
+            .ok_or("Approved action has no authoritative request")?;
+        if requested.as_ref().is_some_and(|edited| edited != &approved) {
+            return Err("An approved request cannot be edited during recovery".into());
+        }
+        approved
+    } else {
+        requested.unwrap_or_else(|| action.request.clone())
+    };
+    Conversation::validate_text(&request)?;
+    if !already_approved {
+        action.approved_request = Some(request.clone());
+        action.status = ActionStatus::Approved;
+        conversation.push(
+            Role::Human,
+            EntryKind::ActionDecision {
+                action_id,
+                approved: true,
+                request: Some(request.clone()),
+            },
+        );
+    }
+    Ok((request, already_approved))
+}
+
 /// Mediate a persisted Worker result to one fresh, read-only Coordinator Run.
 /// If this process stops after the result write, the Human can explicitly
 /// retry Coordinator mediation; the Worker is never replayed.
@@ -902,8 +925,10 @@ async fn continue_from_worker_result_locked(
 
 #[cfg(test)]
 mod tests {
-    use super::{can_reject, preserve_saved_conversation, ContinuationError};
-    use crate::domain::conversation::{ActionStatus, Conversation};
+    use super::{
+        can_reject, preserve_saved_conversation, record_human_approval, ContinuationError,
+    };
+    use crate::domain::conversation::{ActionStatus, Conversation, EntryKind, Role, TaskAction};
     use uuid::Uuid;
 
     #[test]
@@ -911,6 +936,44 @@ mod tests {
         assert!(can_reject(ActionStatus::Proposed));
         assert!(!can_reject(ActionStatus::Approved));
         assert!(!can_reject(ActionStatus::Running));
+    }
+
+    #[test]
+    fn retrying_an_approved_action_keeps_one_human_decision_and_the_same_payload() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        let action_id = Uuid::new_v4();
+        conversation.actions.push(TaskAction {
+            id: action_id,
+            target_task_id: Uuid::new_v4(),
+            target_task_title: "Task".into(),
+            request: "original".into(),
+            explanation: "why".into(),
+            approved_request: None,
+            status: ActionStatus::Proposed,
+            worker_result: None,
+            coordinator_replied: false,
+            created_at: chrono::Utc::now(),
+        });
+        let (first_request, first_retry) = record_human_approval(
+            &mut conversation,
+            action_id,
+            Some("edited authoritative request".into()),
+        )
+        .unwrap();
+        let (retry_request, was_already_approved) =
+            record_human_approval(&mut conversation, action_id, None).unwrap();
+        let decisions = conversation
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.kind, EntryKind::ActionDecision { approved: true, .. }))
+            .count();
+
+        assert_eq!(first_request, "edited authoritative request");
+        assert!(!first_retry);
+        assert_eq!(retry_request, first_request);
+        assert!(was_already_approved);
+        assert_eq!(decisions, 1);
+        assert!(matches!(conversation.entries[0].role, Role::Human));
     }
 
     #[test]
