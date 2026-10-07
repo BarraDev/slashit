@@ -340,9 +340,14 @@ struct RunningTask {
 /// synthetic Task id.
 pub struct ProjectRunLease {
     conversation_id: Uuid,
-    owners: Arc<std::sync::Mutex<HashMap<Uuid, tokio::sync::watch::Sender<bool>>>>,
+    owners: Arc<std::sync::Mutex<HashMap<Uuid, ProjectRunOwner>>>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     _permit: Option<AdmissionPermit>,
+}
+
+struct ProjectRunOwner {
+    cancel: tokio::sync::watch::Sender<bool>,
+    counts_as_agent: bool,
 }
 
 impl ProjectRunLease {
@@ -766,7 +771,7 @@ pub struct TaskExecutor {
     pr_helper_handles: Arc<std::sync::Mutex<HashMap<Uuid, PrHelperOwner>>>,
     /// Project Conversation Runs share this executor's admission gate and
     /// cancellation ownership. They are keyed by Conversation identity.
-    project_runs: Arc<std::sync::Mutex<HashMap<Uuid, tokio::sync::watch::Sender<bool>>>>,
+    project_runs: Arc<std::sync::Mutex<HashMap<Uuid, ProjectRunOwner>>>,
     /// The one admission gate ordinary execution and AI review/fix share.
     ///
     /// See [`crate::queue::admission`] for why this is a semaphore-backed
@@ -1083,7 +1088,7 @@ impl TaskExecutor {
         self.running_handles.read().await.len()
             + self.reviewing_handles.read().await.len()
             + self.pr_helper_handles.lock().unwrap().len()
-            + self.project_runs.lock().unwrap().len()
+            + self.counted_project_run_count()
     }
 
     /// Register one Project-scoped fresh Run with the same capacity gate used
@@ -1098,7 +1103,7 @@ impl TaskExecutor {
         let mut owners = self.project_runs.lock().unwrap();
         if owners.contains_key(&conversation_id) { return Err("A Run is already active for this Conversation".into()); }
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        owners.insert(conversation_id, cancel_tx.clone());
+        owners.insert(conversation_id, ProjectRunOwner { cancel: cancel_tx.clone(), counts_as_agent: reserve_capacity });
         Ok(ProjectRunLease { conversation_id, owners: self.project_runs.clone(), cancel_rx, _permit: permit })
     }
 
@@ -1108,8 +1113,13 @@ impl TaskExecutor {
 
     pub fn active_project_run_count(&self) -> usize { self.project_runs.lock().unwrap().len() }
 
+    pub(crate) fn counted_project_run_count(&self) -> usize {
+        self.project_runs.lock().unwrap().values().filter(|owner| owner.counts_as_agent).count()
+    }
+
     pub fn stop_project_run(&self, conversation_id: Uuid) -> Result<(), String> {
-        let sender = self.project_runs.lock().unwrap().get(&conversation_id).cloned().ok_or("No live Run for this Conversation")?;
+        let owners = self.project_runs.lock().unwrap();
+        let sender = owners.get(&conversation_id).map(|owner| owner.cancel.clone()).ok_or("No live Run for this Conversation")?;
         sender.send(true).map_err(|_| "Conversation Run already ended".to_string())
     }
 
@@ -5789,6 +5799,27 @@ mod tests {
 
         drop(lease);
         assert!(!executor.project_run_is_live(conversation_id));
+        assert_eq!(executor.running_task_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn delegated_worker_is_counted_once_across_task_and_conversation_ownership() {
+        let (executor, _temps) = test_executor();
+        let task_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let task_lease = executor.try_begin_pr_helper(task_id).await.expect("admit Task Worker");
+        let worker_run = executor.begin_project_run(conversation_id, false).await.expect("register Worker Conversation run");
+
+        assert_eq!(executor.active_project_run_count(), 1, "the run remains live for stop/recovery");
+        assert_eq!(executor.running_task_count().await, 1, "shutdown waits on the process once");
+        assert_eq!(
+            crate::commands::agent::active_agent_count(&executor.executions, Some(&executor)).await,
+            1,
+            "Task and Conversation ownership refer to one provider process"
+        );
+
+        drop(worker_run);
+        drop(task_lease);
         assert_eq!(executor.running_task_count().await, 0);
     }
 
