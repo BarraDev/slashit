@@ -61,6 +61,9 @@ pub const FAILING_RUNS_VAR: &str = "SLASHIT_FAKE_AGENT_FAILING_RUNS";
 /// Strict JSON output for a Project Coordinator acceptance run.
 pub const COORDINATOR_OUTPUT_VAR: &str = "SLASHIT_FAKE_COORDINATOR_OUTPUT";
 
+/// Make the fresh Coordinator after a saved Worker result fail once.
+pub const COORDINATOR_FAIL_AFTER_WORKER_VAR: &str = "SLASHIT_FAKE_COORDINATOR_FAIL_AFTER_WORKER";
+
 /// The text the fixture returns for a run scripted to fail.
 pub const REPORTED_FAILURE: &str = "fake agent was scripted to fail this run";
 

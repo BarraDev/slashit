@@ -46,6 +46,32 @@ pub struct Snapshot {
     pub coordinator_live: bool,
     pub worker_live: bool,
     pub run_status: Option<AgentStatus>,
+    pub continuation_error: Option<String>,
+}
+
+#[derive(Debug)]
+enum ContinuationError {
+    Retryable(String),
+    Persistence(String),
+}
+
+impl From<String> for ContinuationError {
+    fn from(error: String) -> Self { Self::Retryable(error) }
+}
+
+impl From<&str> for ContinuationError {
+    fn from(error: &str) -> Self { Self::Retryable(error.to_owned()) }
+}
+
+fn preserve_saved_conversation(
+    saved: Conversation,
+    continuation: Result<Conversation, ContinuationError>,
+) -> Result<(Conversation, Option<String>), String> {
+    match continuation {
+        Ok(conversation) => Ok((conversation, None)),
+        Err(ContinuationError::Retryable(error)) => Ok((saved, Some(error))),
+        Err(ContinuationError::Persistence(error)) => Err(error),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,11 +85,11 @@ fn parse_id(value: &str, what: &str) -> Result<Uuid, String> {
     Uuid::parse_str(value).map_err(|error| format!("Invalid {what}: {error}"))
 }
 
-async fn snapshot(state: &AppState, conversation: Conversation) -> Snapshot {
+async fn snapshot(state: &AppState, conversation: Conversation, continuation_error: Option<String>) -> Snapshot {
     let live = state.executor.get().is_some_and(|executor| executor.project_run_is_live(conversation.id));
     let worker_live = conversation.actions.iter().any(|action| action.status == ActionStatus::Running) && live;
     Snapshot { conversation, coordinator_live: live && !worker_live, worker_live,
-        run_status: live.then_some(AgentStatus::Running) }
+        run_status: live.then_some(AgentStatus::Running), continuation_error }
 }
 
 async fn load_or_create(state: &AppState, project_id: Uuid) -> Result<Conversation, String> {
@@ -124,10 +150,11 @@ pub async fn get_project_conversation(state: tauri::State<'_, AppState>, project
     };
     let has_live_run = state.executor.get().is_some_and(|executor| executor.project_run_is_live(conversation.id));
     let pending = (!has_live_run).then(|| conversation.actions.iter().find(|action| action.status == ActionStatus::Returned && !action.coordinator_replied).map(|action| action.id)).flatten();
-    let conversation = if let Some(action_id) = pending {
-        continue_from_worker_result(&state, project_id, action_id).await?
-    } else { conversation };
-    Ok(snapshot(&state, conversation).await)
+    let (conversation, continuation_error) = if let Some(action_id) = pending {
+        let saved = conversation.clone();
+        preserve_saved_conversation(saved, continue_from_worker_result(&state, project_id, action_id).await)?
+    } else { (conversation, None) };
+    Ok(snapshot(&state, conversation, continuation_error).await)
 }
 
 #[tauri::command]
@@ -179,7 +206,7 @@ pub async fn send_project_message(state: tauri::State<'_, AppState>, project_id:
     }
     state.storage.save_conversation(&updated).map_err(|error| error.to_string())?;
     drop(run_lease);
-    Ok(snapshot(&state, updated).await)
+    Ok(snapshot(&state, updated, None).await)
 }
 
 async fn run_with_cancellation(executor: &Arc<crate::queue::TaskExecutor>, conversation_id: Uuid, config: ClaudeRunConfig, reserve_capacity: bool, task_cancel: Option<watch::Receiver<bool>>) -> Result<(Result<String, String>, crate::queue::ProjectRunLease), String> {
@@ -241,7 +268,7 @@ pub async fn act_on_project_conversation(state: tauri::State<'_, AppState>, proj
                 action_record.status = ActionStatus::Rejected;
                 conversation.push(Role::Human, EntryKind::ActionDecision { action_id, approved: false, request: None });
                 state.storage.save_conversation(&conversation).map_err(|error| error.to_string())?;
-                return Ok(snapshot(&state, conversation).await);
+                return Ok(snapshot(&state, conversation, None).await);
             }
             HumanAction::Approve { request } => {
                 let already_approved = action_record.status == ActionStatus::Approved;
@@ -318,10 +345,11 @@ pub async fn act_on_project_conversation(state: tauri::State<'_, AppState>, proj
     drop(_guard);
     drop(run_lease);
     drop(lease);
-    if conversation.actions.iter().any(|action| action.id == action_id && action.status == ActionStatus::Returned && !action.coordinator_replied) {
-        conversation = continue_from_worker_result(&state, project_id, action_id).await?;
-    }
-    Ok(snapshot(&state, conversation).await)
+    let (conversation, continuation_error) = if conversation.actions.iter().any(|action| action.id == action_id && action.status == ActionStatus::Returned && !action.coordinator_replied) {
+        let saved = conversation.clone();
+        preserve_saved_conversation(saved, continue_from_worker_result(&state, project_id, action_id).await)?
+    } else { (conversation, None) };
+    Ok(snapshot(&state, conversation, continuation_error).await)
 }
 
 fn can_reject(status: ActionStatus) -> bool {
@@ -331,11 +359,12 @@ fn can_reject(status: ActionStatus) -> bool {
 /// Mediate a persisted Worker result to one fresh, read-only Coordinator Run.
 /// If this process stops after the result write, `get_project_conversation`
 /// calls this again; the Worker is never replayed.
-async fn continue_from_worker_result(state: &AppState, project_id: Uuid, action_id: Uuid) -> Result<Conversation, String> {
+async fn continue_from_worker_result(state: &AppState, project_id: Uuid, action_id: Uuid) -> Result<Conversation, ContinuationError> {
     let project = state.project.projects.read().await.get(&project_id).cloned().ok_or("Project not found")?;
     let lock = state.conversation.project_lock(project_id);
     let _guard = lock.lock().await;
-    let mut conversation = state.storage.load_primary_conversation(project_id).map_err(|error| error.to_string())?.ok_or("Conversation not found")?;
+    let mut conversation = state.storage.load_primary_conversation(project_id)
+        .map_err(|error| ContinuationError::Persistence(error.to_string()))?.ok_or("Conversation not found")?;
     if conversation.actions.iter().find(|action| action.id == action_id).is_none_or(|action| action.status != ActionStatus::Returned || action.coordinator_replied) {
         return Ok(conversation);
     }
@@ -375,20 +404,42 @@ async fn continue_from_worker_result(state: &AppState, project_id: Uuid, action_
         }
     }
     if let Some(action) = conversation.actions.iter_mut().find(|action| action.id == action_id) { action.coordinator_replied = true; }
-    state.storage.save_conversation(&conversation).map_err(|error| error.to_string())?;
+    state.storage.save_conversation(&conversation).map_err(|error| ContinuationError::Persistence(error.to_string()))?;
     drop(run_lease);
     Ok(conversation)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::can_reject;
-    use crate::domain::conversation::ActionStatus;
+    use super::{can_reject, preserve_saved_conversation, ContinuationError};
+    use crate::domain::conversation::{ActionStatus, Conversation};
+    use uuid::Uuid;
 
     #[test]
     fn only_a_proposed_action_can_be_rejected() {
         assert!(can_reject(ActionStatus::Proposed));
         assert!(!can_reject(ActionStatus::Approved));
         assert!(!can_reject(ActionStatus::Running));
+    }
+
+    #[test]
+    fn a_failed_followup_run_keeps_the_saved_worker_result_visible() {
+        let saved = Conversation::new(Uuid::new_v4());
+        let saved_id = saved.id;
+        let (visible, error) = preserve_saved_conversation(
+            saved,
+            Err(ContinuationError::Retryable("Coordinator unavailable".into())),
+        ).expect("provider failure should preserve the saved Conversation");
+        assert_eq!(visible.id, saved_id);
+        assert_eq!(error.as_deref(), Some("Coordinator unavailable"));
+    }
+
+    #[test]
+    fn a_followup_persistence_failure_is_not_reported_as_a_saved_snapshot() {
+        let saved = Conversation::new(Uuid::new_v4());
+        assert!(preserve_saved_conversation(
+            saved,
+            Err(ContinuationError::Persistence("disk write failed".into())),
+        ).is_err());
     }
 }

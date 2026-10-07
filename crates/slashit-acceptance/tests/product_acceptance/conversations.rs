@@ -78,6 +78,9 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
     context.set_child_env("PATH", agent.path_value().to_os_string());
     context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir().as_os_str().to_os_string());
     context.set_child_env(fake_agent::COORDINATOR_OUTPUT_VAR, "delegate_to_task");
+    // Fail the first Coordinator run after the Worker result. The saved result
+    // must remain visible and an explicit fresh retry must not rerun the Worker.
+    context.set_child_env(fake_agent::COORDINATOR_FAIL_AFTER_WORKER_VAR, "1");
 
     let outcome = async {
         let repository = GitFixture::create(&root.join("fixture-repo"))?;
@@ -124,38 +127,15 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         request.send_keys("Edited authoritative request").await?;
         ui::visible(session.driver(), "[data-testid=\"conversation-action-edit-approve\"]").await?.click().await?;
         await_text(session.driver(), "[data-testid=\"conversation-worker-result\"]", "fake Worker completed approved work").await?;
-        if let Err(error) = await_text(session.driver(), "[data-testid=\"conversation-message\"]", "Coordinator reviewed the Worker result.").await {
-            let latest = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
-            let entries = latest["conversation"]["entries"].as_array().map(|entries| entries.iter().rev().take(12).map(|entry| json!({
-                "role":entry["role"],
-                "kind":entry["kind"]["kind"],
-                "text_excerpt":entry["kind"]["text"].as_str().map(|text| text.chars().take(160).collect::<String>()),
-            })).collect::<Vec<_>>()).unwrap_or_default();
-            let actions = latest["conversation"]["actions"].as_array().map(|actions| actions.iter().take(8).map(|action| json!({
-                "id":action["id"],
-                "status":action["status"],
-                "coordinator_replied":action["coordinator_replied"],
-            })).collect::<Vec<_>>()).unwrap_or_default();
-            let state_summary = json!({
-                "conversation_id":latest["conversation"]["id"],
-                "revision":latest["conversation"]["revision"],
-                "coordinator_live":latest["coordinator_live"],
-                "worker_live":latest["worker_live"],
-                "recent_entries":entries,
-                "actions":actions,
-            });
-            let runs = agent.invocations()?.into_iter().filter_map(|run| run.prompt.map(|prompt| {
-                let excerpt = prompt.chars().take(1000).collect::<String>();
-                let truncated = prompt.chars().count() > 1000;
-                json!({
-                    "working_directory":run.working_dir.file_name().and_then(|name| name.to_str()).unwrap_or("<non-utf8>"),
-                    "has_returned_action":prompt.contains("\"returned_action\""),
-                    "has_worker_result":prompt.contains("fake Worker completed approved work"),
-                    "prompt_excerpt":if truncated { format!("{excerpt}… [truncated]") } else { excerpt },
-                })
-            })).take(8).collect::<Vec<_>>();
-            bail!("{error}; persisted state summary: {state_summary}; fake provider run diagnostics: {runs:#?}");
+        ui::visible(session.driver(), "[data-testid=\"conversation-continuation-error\"]").await?;
+        if !super::text_of(session.driver(), "[data-testid=\"conversation-history\"]").await?.unwrap_or_default().contains("fake Worker completed approved work") {
+            bail!("a failed Coordinator follow-up hid the durable Worker result");
         }
+        ui::visible(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?.click().await?;
+        await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Coordinator reviewed the Worker result.").await?;
+        let worker_runs = agent.invocations()?.iter().filter(|run| run.prompt.as_deref().is_some_and(|prompt| prompt.contains("Execute only approved_request in this Task Checkout"))).count();
+        if worker_runs != 1 { bail!("Coordinator retry started the Worker {worker_runs} times"); }
+
 
         let conversation = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
         let conversation_id = conversation["conversation"]["id"].as_str().context("Conversation id missing")?.to_string();
@@ -170,13 +150,13 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         if persisted_task["status"] != "backlog" { bail!("TaskStatus was changed to represent Worker liveness: {}", persisted_task["status"]); }
         let invocations = agent.invocations()?;
         let runs = invocations.iter().filter(|invocation| invocation.prompt.is_some()).collect::<Vec<_>>();
-        if runs.len() != 4 { bail!("expected Coordinator, rejected proposal Coordinator, Worker, fresh Coordinator; observed {}", runs.len()); }
+        if runs.len() != 5 { bail!("expected two proposal Coordinators, Worker, failed Coordinator and fresh retry; observed {}", runs.len()); }
         let worker = runs[2];
         if !worker.working_dir.ends_with(persisted_task["worktree_path"].as_str().unwrap_or_default()) && worker.working_dir != Path::new(persisted_task["worktree_path"].as_str().unwrap_or_default()) { bail!("Worker did not run in target Task Checkout: {}", worker.working_dir.display()); }
         let worker_prompt = worker.prompt.as_deref().unwrap_or_default();
         if !worker_prompt.contains("Edited authoritative request") || worker_prompt.contains("Please make a small change") || worker_prompt.contains("right execution boundary") || worker_prompt.contains("Unrelated private Task sentinel") || worker_prompt.contains("Must not enter the Worker projection") { bail!("Worker context contains the wrong payload, hidden Coordinator history, or unrelated Task data: {worker_prompt}"); }
         if runs.iter().any(|run| run.args.iter().any(|arg| arg == "--resume" || arg == "--session-id")) { bail!("a fresh Run depended on provider continuity"); }
-        if !runs[3].prompt.as_deref().unwrap_or_default().contains("fake Worker completed approved work") { bail!("fresh Coordinator did not receive the mediated Worker result"); }
+        if !runs[4].prompt.as_deref().unwrap_or_default().contains("fake Worker completed approved work") { bail!("fresh Coordinator retry did not receive the persisted Worker result"); }
 
         send_message(session.driver(), "What should we do next?", "Fake Coordinator reply.").await?;
         let continued = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;

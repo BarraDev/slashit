@@ -141,6 +141,24 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             set_busy.set(false);
         });
     });
+    let retry_project_id = project_id.clone();
+    let retry_begin_request = begin_snapshot_request.clone();
+    let retry_publish = publish_snapshot.clone();
+    let retry_coordinator = Callback::new(move |()| {
+        if busy.get_untracked() { return; }
+        set_busy.set(true);
+        set_error.set(None);
+        let id = retry_project_id.clone();
+        let request = retry_begin_request.run(());
+        let publish = retry_publish.clone();
+        spawn_local(async move {
+            match conversation_service::get_project_conversation(id).await {
+                Ok(value) => publish.run((request, value)),
+                Err(error) => set_error.set(Some(error)),
+            }
+            set_busy.set(false);
+        });
+    });
     view! {
             <section data-testid="project-conversation" class="mb-6 rounded-xl border border-white/10 bg-zinc-900/70 p-4">
                 <header class="mb-3 flex items-center justify-between">
@@ -198,6 +216,15 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                     let status = if value.worker_live { "Worker is running in the Task Checkout" } else if value.coordinator_live { "Coordinator is responding" } else { "Conversation is ready" };
                     view! { <div data-testid="conversation-run-state" class="mb-2 text-xs text-white/50">{status}</div> }
                 })}
+                {move || snapshot.get().and_then(|value| value.continuation_error.map(|message| {
+                    let retry = retry_coordinator.clone();
+                    view! {
+                        <div data-testid="conversation-continuation-error" class="mb-3 rounded border border-amber-300/30 bg-amber-400/5 p-3 text-sm text-amber-100">
+                            <p>{message}</p>
+                            <button data-testid="conversation-retry-coordinator" class="mt-2 rounded border border-amber-200/30 px-3 py-1" disabled=move || busy.get() on:click=move |_| retry.run(())>"Retry Coordinator response"</button>
+                        </div>
+                    }
+                }))}
                 <form class="flex items-end gap-2" on:submit=move |event: web_sys::SubmitEvent| { event.prevent_default(); on_send(); }>
                     <textarea data-testid="conversation-message-input" class="min-h-16 flex-1 rounded-lg border border-white/10 bg-black/30 p-3 text-sm text-white" placeholder="Ask about this Project…" prop:value=draft on:input=move |event| set_draft.set(event_target_value(&event))></textarea>
                     <button data-testid="conversation-send" type="submit" class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium" disabled=move || busy.get() || draft.get().trim().is_empty()>"Send"</button>

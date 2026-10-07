@@ -20,7 +20,35 @@ pub struct Conversation { pub id: Uuid, pub project_id: Uuid, pub revision: u64,
 #[serde(rename_all = "snake_case")]
 pub enum ConversationRunStatus { Running }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Snapshot { pub conversation: Conversation, pub coordinator_live: bool, pub worker_live: bool, pub run_status: Option<ConversationRunStatus> }
+pub struct Snapshot { pub conversation: Conversation, pub coordinator_live: bool, pub worker_live: bool, pub run_status: Option<ConversationRunStatus>, #[serde(default)] pub continuation_error: Option<String> }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum HumanAction { Approve { request: Option<String> }, Reject }
+
+#[cfg(test)]
+mod tests {
+    use super::Snapshot;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn snapshot_json() -> serde_json::Value {
+        json!({
+            "conversation": {
+                "id": Uuid::new_v4(), "project_id": Uuid::new_v4(), "revision": 0,
+                "created_at": "", "updated_at": "", "entries": [], "actions": []
+            },
+            "coordinator_live": false, "worker_live": false, "run_status": null
+        })
+    }
+
+    #[test]
+    fn continuation_error_is_typed_and_optional_for_existing_snapshots() {
+        let legacy: Snapshot = serde_json::from_value(snapshot_json()).expect("legacy snapshot should decode");
+        assert!(legacy.continuation_error.is_none());
+
+        let mut failed = snapshot_json();
+        failed["continuation_error"] = json!("Coordinator unavailable; retry from saved result");
+        let failed: Snapshot = serde_json::from_value(failed).expect("continuation failure should decode");
+        assert_eq!(failed.continuation_error.as_deref(), Some("Coordinator unavailable; retry from saved result"));
+    }
+}
