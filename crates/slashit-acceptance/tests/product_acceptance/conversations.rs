@@ -100,7 +100,7 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         send_message(session.driver(), "Please make a small change in Existing Task.", "Coordinator proposes Task work").await?;
         let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
         let proposal_text = proposal.text().await?;
-        if !proposal_text.contains("Existing Task") || !proposal_text.contains("right execution boundary") { bail!("the target and explanation are not visible: {proposal_text}"); }
+        if !proposal_text.contains("Existing Task") || !proposal_text.contains(&task_id) || !proposal_text.contains("right execution boundary") { bail!("the exact target and explanation are not visible: {proposal_text}"); }
         ui::visible(session.driver(), "[data-testid=\"conversation-action-request\"]").await?;
         if field_value(session.driver(), "[data-testid=\"conversation-action-request\"]").await? != "Add the approved marker." { bail!("the exact proposed request is not visible in its editable field"); }
         if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 1 { bail!("Worker ran before approval"); }
@@ -114,7 +114,7 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         send_message(session.driver(), "Please propose the Task work again.", "Coordinator proposes Task work").await?;
         let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
         let proposal_text = proposal.text().await?;
-        if !proposal_text.contains("Existing Task") { bail!("the second proposal target is not visible: {proposal_text}"); }
+        if !proposal_text.contains("Existing Task") || !proposal_text.contains(&task_id) { bail!("the second exact proposal target is not visible: {proposal_text}"); }
         ui::visible(session.driver(), "[data-testid=\"conversation-action-request\"]").await?;
         if field_value(session.driver(), "[data-testid=\"conversation-action-request\"]").await? != "Add the approved marker." { bail!("the second exact proposed request is not visible in its editable field"); }
         if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 2 { bail!("second proposal started a Worker before approval"); }

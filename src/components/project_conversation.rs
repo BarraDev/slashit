@@ -5,6 +5,10 @@ use leptos::task::spawn_local;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+fn should_poll_snapshot(busy: bool, coordinator_live: bool, worker_live: bool) -> bool {
+    busy || coordinator_live || worker_live
+}
+
 fn should_publish_snapshot(current: Option<(Uuid, u64)>, incoming: (Uuid, u64), request: u64, applied_request: u64) -> bool {
     match current {
         None => true,
@@ -69,7 +73,10 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let poll_begin_request = begin_snapshot_request.clone();
     let poll_publish = publish_snapshot.clone();
     let timer = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(800, move || {
-        if !busy.get_untracked() { return; }
+        let active = snapshot.get_untracked().is_some_and(|value| {
+            should_poll_snapshot(busy.get_untracked(), value.coordinator_live, value.worker_live)
+        });
+        if !active { return; }
         let id = poll_id.clone();
         let request = poll_begin_request.run(());
         let publish = poll_publish.clone();
@@ -148,7 +155,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         value.conversation.entries.into_iter().filter_map(|entry| {
                             let (testid, text) = match entry.kind {
                                 ConversationEntryKind::HumanMessage { text } | ConversationEntryKind::CoordinatorReply { text } => ("conversation-message", Some(text)),
-                                ConversationEntryKind::ActionProposed { action_id } => ("conversation-action-event", actions.iter().find(|action| action.id == action_id).map(|action| format!("Proposed work for {}: {}", action.target_task_title, action.request))),
+                                ConversationEntryKind::ActionProposed { action_id } => ("conversation-action-event", actions.iter().find(|action| action.id == action_id).map(|action| format!("Proposed work for {} (Task {}): {}", action.target_task_title, action.target_task_id, action.request))),
                                 ConversationEntryKind::ActionDecision { approved, request, .. } => ("conversation-action-event", Some(if approved { format!("You approved the Worker request: {}", request.unwrap_or_default()) } else { "You rejected the proposed Task work.".to_string() })),
                                 ConversationEntryKind::WorkerStarted { action_id } => ("conversation-action-event", actions.iter().find(|action| action.id == action_id).map(|action| format!("Worker started in Task Checkout: {}", action.target_task_title))),
                                 ConversationEntryKind::WorkerResult { result, .. } => ("conversation-worker-result", Some(result)),
@@ -174,6 +181,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                             <article data-testid="conversation-action-proposal" class="rounded-lg border border-amber-300/30 bg-amber-400/5 p-3">
                                 <div class="text-xs uppercase tracking-wide text-amber-200">"Coordinator proposes Task work"</div>
                                 <div class="mt-1 font-medium text-white">{action.target_task_title}</div>
+                                <div class="mt-1 break-all font-mono text-xs text-white/55">{format!("Task ID: {}", action.target_task_id)}</div>
                                 <p class="mt-2 whitespace-pre-wrap text-sm text-white/75">{action.explanation}</p>
                                 <label class="mt-2 block text-xs text-white/50">"Worker request"<textarea data-testid="conversation-action-request" class="mt-1 min-h-20 w-full rounded bg-black/30 p-2 text-sm text-white" prop:value=move || edits.with(|edits| edits.get(&value_id).cloned().unwrap_or_else(|| current_request.get())) on:input=move |event| set_edits.update(|edits| { edits.insert(input_id.clone(), event_target_value(&event)); })></textarea></label>
                                 <div class="mt-2 flex gap-2">
@@ -201,8 +209,16 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::should_publish_snapshot;
+    use super::{should_poll_snapshot, should_publish_snapshot};
     use uuid::Uuid;
+
+    #[test]
+    fn polling_continues_until_a_live_run_is_absent_from_the_snapshot() {
+        assert!(should_poll_snapshot(false, true, false));
+        assert!(should_poll_snapshot(false, false, true));
+        assert!(should_poll_snapshot(true, false, false));
+        assert!(!should_poll_snapshot(false, false, false));
+    }
 
     #[test]
     fn an_older_revision_never_replaces_a_newer_conversation_snapshot() {
