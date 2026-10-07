@@ -110,18 +110,22 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         each=move || snapshot.get().map(|value| value.conversation.actions.into_iter().filter(|action| matches!(action.status, ConversationActionStatus::Proposed | ConversationActionStatus::Approved)).collect::<Vec<_>>()).unwrap_or_default()
                         key=|action| action.id
                         children=move |action| {
-                        let id = action.id.to_string(); let input_id = id.clone(); let approve_id = id.clone(); let edit_approve_id = id.clone(); let reject_id = id.clone();
-                        let original = action.approved_request.clone().unwrap_or_else(|| action.request.clone()); let value_fallback = original.clone(); let value_id = id.clone(); let is_approved = action.status == ConversationActionStatus::Approved; let approve_action = approve_action.clone(); let edit_approve_action = approve_action.clone(); let reject_action = reject_action.clone();
+                        let action_uuid = action.id;
+                        let id = action_uuid.to_string(); let input_id = id.clone(); let approve_id = id.clone(); let edit_approve_id = id.clone(); let reject_id = id.clone();
+                        let original = action.approved_request.clone().unwrap_or_else(|| action.request.clone()); let value_fallback = original.clone(); let value_id = id.clone();
+                        let current_request = Signal::derive(move || snapshot.get().and_then(|value| value.conversation.actions.into_iter().find(|item| item.id == action_uuid)).map(|item| item.approved_request.unwrap_or(item.request)).unwrap_or_else(|| value_fallback.clone()));
+                        let is_approved = Signal::derive(move || snapshot.get().and_then(|value| value.conversation.actions.into_iter().find(|item| item.id == action_uuid)).is_some_and(|item| item.status == ConversationActionStatus::Approved));
+                        let approve_action = approve_action.clone(); let edit_approve_action = approve_action.clone(); let reject_action = reject_action.clone();
                         view! {
                             <article data-testid="conversation-action-proposal" class="rounded-lg border border-amber-300/30 bg-amber-400/5 p-3">
                                 <div class="text-xs uppercase tracking-wide text-amber-200">"Coordinator proposes Task work"</div>
                                 <div class="mt-1 font-medium text-white">{action.target_task_title}</div>
                                 <p class="mt-2 whitespace-pre-wrap text-sm text-white/75">{action.explanation}</p>
-                                <label class="mt-2 block text-xs text-white/50">"Worker request"<textarea data-testid="conversation-action-request" class="mt-1 min-h-20 w-full rounded bg-black/30 p-2 text-sm text-white" prop:value=move || edits.with(|edits| edits.get(&value_id).cloned().unwrap_or_else(|| value_fallback.clone())) on:input=move |event| set_edits.update(|edits| { edits.insert(input_id.clone(), event_target_value(&event)); })></textarea></label>
+                                <label class="mt-2 block text-xs text-white/50">"Worker request"<textarea data-testid="conversation-action-request" class="mt-1 min-h-20 w-full rounded bg-black/30 p-2 text-sm text-white" prop:value=move || edits.with(|edits| edits.get(&value_id).cloned().unwrap_or_else(|| current_request.get())) on:input=move |event| set_edits.update(|edits| { edits.insert(input_id.clone(), event_target_value(&event)); })></textarea></label>
                                 <div class="mt-2 flex gap-2">
-                                    <button data-testid="conversation-action-approve" class="rounded bg-emerald-700 px-3 py-1 text-sm" disabled=move || busy.get() on:click=move |_| approve_action.run((approve_id.clone(), None))>{if is_approved { "Start approved Worker" } else { "Approve exact request" }}</button>
-                                    <button data-testid="conversation-action-edit-approve" class="rounded bg-emerald-700/70 px-3 py-1 text-sm" disabled=move || busy.get() || is_approved on:click=move |_| { let edited = edits.get_untracked().get(&id).cloned().unwrap_or(original.clone()); edit_approve_action.run((edit_approve_id.clone(), Some(edited))); } >"Edit + approve"</button>
-                                    <button data-testid="conversation-action-reject" class="rounded border border-white/20 px-3 py-1 text-sm" disabled=move || busy.get() || is_approved on:click=move |_| reject_action.run(reject_id.clone())>"Reject"</button>
+                                    <button data-testid="conversation-action-approve" class="rounded bg-emerald-700 px-3 py-1 text-sm" disabled=move || busy.get() on:click=move |_| approve_action.run((approve_id.clone(), None))>{move || if is_approved.get() { "Start approved Worker" } else { "Approve exact request" }}</button>
+                                    <button data-testid="conversation-action-edit-approve" class="rounded bg-emerald-700/70 px-3 py-1 text-sm" disabled=move || busy.get() || is_approved.get() on:click=move |_| { let edited = edits.get_untracked().get(&id).cloned().unwrap_or(original.clone()); edit_approve_action.run((edit_approve_id.clone(), Some(edited))); } >"Edit + approve"</button>
+                                    <button data-testid="conversation-action-reject" class="rounded border border-white/20 px-3 py-1 text-sm" disabled=move || busy.get() || is_approved.get() on:click=move |_| reject_action.run(reject_id.clone())>"Reject"</button>
                                 </div>
                             </article>
                         }

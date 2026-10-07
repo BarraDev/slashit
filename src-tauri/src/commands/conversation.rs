@@ -233,6 +233,7 @@ pub async fn act_on_project_conversation(state: tauri::State<'_, AppState>, proj
         if conversation.revision != revision { return Err("Conversation changed; reload before acting".into()); }
         let action_record = conversation.actions.iter_mut().find(|item| item.id == action_id).ok_or("Action not found")?;
         if !matches!(action_record.status, ActionStatus::Proposed | ActionStatus::Approved) { return Err("Action is no longer awaiting approval or safe to start".into()); }
+        if matches!(&action, HumanAction::Reject) && !can_reject(action_record.status) { return Err("An approved delegation cannot be rejected".into()); }
         let target = state.task.tasks.read().await.get(&action_record.target_task_id).cloned().ok_or("Target Task not found")?;
         if target.project_id != project_id { return Err("Target Task belongs to another Project".into()); }
         match action {
@@ -323,6 +324,10 @@ pub async fn act_on_project_conversation(state: tauri::State<'_, AppState>, proj
     Ok(snapshot(&state, conversation).await)
 }
 
+fn can_reject(status: ActionStatus) -> bool {
+    status == ActionStatus::Proposed
+}
+
 /// Mediate a persisted Worker result to one fresh, read-only Coordinator Run.
 /// If this process stops after the result write, `get_project_conversation`
 /// calls this again; the Worker is never replayed.
@@ -373,4 +378,17 @@ async fn continue_from_worker_result(state: &AppState, project_id: Uuid, action_
     state.storage.save_conversation(&conversation).map_err(|error| error.to_string())?;
     drop(run_lease);
     Ok(conversation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::can_reject;
+    use crate::domain::conversation::ActionStatus;
+
+    #[test]
+    fn only_a_proposed_action_can_be_rejected() {
+        assert!(can_reject(ActionStatus::Proposed));
+        assert!(!can_reject(ActionStatus::Approved));
+        assert!(!can_reject(ActionStatus::Running));
+    }
 }
