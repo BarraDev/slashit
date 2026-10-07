@@ -95,6 +95,7 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         agent.marker_dir().as_os_str().to_os_string(),
     );
     context.set_child_env(fake_agent::COORDINATOR_OUTPUT_VAR, "delegate_to_task");
+    context.set_child_env(fake_agent::COORDINATOR_DELEGATE_POSITION_VAR, "3");
     let blocked_runs = agent
         .block_agent_runs()
         .expect("create deterministic run gates");

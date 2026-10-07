@@ -61,6 +61,11 @@ pub const FAILING_RUNS_VAR: &str = "SLASHIT_FAKE_AGENT_FAILING_RUNS";
 /// Strict JSON output for a Project Coordinator acceptance run.
 pub const COORDINATOR_OUTPUT_VAR: &str = "SLASHIT_FAKE_COORDINATOR_OUTPUT";
 
+/// Coordinator turn position at which the fixture should return the scripted
+/// delegation even after its first two conversational turns.
+pub const COORDINATOR_DELEGATE_POSITION_VAR: &str =
+    "SLASHIT_FAKE_COORDINATOR_DELEGATE_POSITION";
+
 /// Make the fresh Coordinator after a saved Worker result fail once.
 pub const COORDINATOR_FAIL_AFTER_WORKER_VAR: &str = "SLASHIT_FAKE_COORDINATOR_FAIL_AFTER_WORKER";
 
