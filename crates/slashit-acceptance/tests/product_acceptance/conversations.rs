@@ -225,6 +225,7 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
 
         submit_message(session.driver(), "What should we do next?").await?;
         await_provider_invocation_count(&agent, 8).await?;
+        let continued = await_conversation_idle(session.driver(), &project_id, 8).await?;
         let final_run_count = agent
             .invocations()?
             .iter()
@@ -233,7 +234,6 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         if final_run_count != 8 {
             bail!("the continued Human turn started an unexpected number of provider Runs: {final_run_count}");
         }
-        let continued = await_conversation_idle(session.driver(), &project_id, 8).await?;
         let entries = continued["conversation"]["entries"].as_array().context("continued Conversation entries missing")?;
         let mediator_replies = entries.iter().filter(|entry| entry["kind"]["text"] == "Coordinator reviewed the Worker result.").count();
         let ordinary_replies = entries.iter().filter(|entry| entry["kind"]["text"] == "Fake Coordinator reply.").count();
