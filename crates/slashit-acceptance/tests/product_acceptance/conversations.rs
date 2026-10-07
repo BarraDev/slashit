@@ -91,7 +91,9 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         send_message(session.driver(), "Please make a small change in Existing Task.", "Coordinator proposes Task work").await?;
         let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
         let proposal_text = proposal.text().await?;
-        if !proposal_text.contains("Existing Task") || !proposal_text.contains("right execution boundary") || !proposal_text.contains("Add the approved marker.") { bail!("the exact proposal is not visible: {proposal_text}"); }
+        if !proposal_text.contains("Existing Task") || !proposal_text.contains("right execution boundary") { bail!("the target and explanation are not visible: {proposal_text}"); }
+        ui::visible(session.driver(), "[data-testid=\"conversation-action-request\"]").await?;
+        if field_value(session.driver(), "[data-testid=\"conversation-action-request\"]").await? != "Add the approved marker." { bail!("the exact proposed request is not visible in its editable field"); }
         if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 1 { bail!("Worker ran before approval"); }
 
         // Rejection is durable and must never start a Worker.
@@ -103,7 +105,9 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         send_message(session.driver(), "Please propose the Task work again.", "Coordinator proposes Task work").await?;
         let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
         let proposal_text = proposal.text().await?;
-        if !proposal_text.contains("Existing Task") || !proposal_text.contains("Add the approved marker.") { bail!("the second proposal is not visible: {proposal_text}"); }
+        if !proposal_text.contains("Existing Task") { bail!("the second proposal target is not visible: {proposal_text}"); }
+        ui::visible(session.driver(), "[data-testid=\"conversation-action-request\"]").await?;
+        if field_value(session.driver(), "[data-testid=\"conversation-action-request\"]").await? != "Add the approved marker." { bail!("the second exact proposed request is not visible in its editable field"); }
         if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 2 { bail!("second proposal started a Worker before approval"); }
 
         let request = ui::visible(session.driver(), "[data-testid=\"conversation-action-request\"]").await?;
@@ -149,6 +153,13 @@ async fn send_message(driver: &WebDriver, message: &str, expected: &str) -> Resu
     input.send_keys(message).await?;
     ui::visible(driver, SEND).await?.click().await?;
     await_text(driver, "[data-testid=\"project-conversation\"]", expected).await
+}
+
+async fn field_value(driver: &WebDriver, selector: &str) -> Result<String> {
+    Ok(driver.execute(
+        "return document.querySelector(arguments[0]).value;",
+        vec![Value::String(selector.to_owned())],
+    ).await?.json().as_str().context("editable field value missing")?.to_owned())
 }
 
 async fn await_text(driver: &WebDriver, selector: &str, text: &str) -> Result<()> {
