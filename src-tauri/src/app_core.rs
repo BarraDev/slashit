@@ -61,6 +61,9 @@ pub struct StartupReport {
     /// registration of their branch. The reference is kept, and the task says
     /// what the user can do about it.
     pub locked_worktrees: usize,
+    /// Durable Project Conversation cleanup records that could not be
+    /// completed during startup. Each record remains on disk for a later retry.
+    pub project_conversation_cleanup_failures: Vec<String>,
 }
 
 /// Resolve the OS directories and build state from what is on disk.
@@ -204,17 +207,28 @@ pub async fn build_state_with_paths(
                             .clear_project_conversation_deletion_pending(project_id)
                         {
                             eprintln!("Warning: Failed to clear uncommitted Project deletion record for {project_id}: {error}");
+                            report.project_conversation_cleanup_failures.push(format!(
+                                "{project_id}: could not clear uncommitted deletion marker: {error}"
+                            ));
                         }
                     } else {
                         let result = app_state.storage.delete_project_conversation(project_id)
                             .and_then(|()| app_state.storage.clear_project_conversation_deletion_pending(project_id));
                         if let Err(error) = result {
                             eprintln!("Warning: Project Conversation cleanup remains pending for {project_id}: {error}");
+                            report.project_conversation_cleanup_failures.push(format!(
+                                "{project_id}: {error}"
+                            ));
                         }
                     }
                 }
             }
-            Err(error) => eprintln!("Warning: Failed to discover pending Project Conversation cleanup: {error}"),
+            Err(error) => {
+                eprintln!("Warning: Failed to discover pending Project Conversation cleanup: {error}");
+                report.project_conversation_cleanup_failures.push(format!(
+                    "could not discover pending cleanup records: {error}"
+                ));
+            }
         }
     }
 
@@ -687,6 +701,7 @@ mod tests {
         // survive this startup too.
         let (first_state, first_report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert_eq!(first_report.projects, 0);
+        assert_eq!(first_report.project_conversation_cleanup_failures.len(), 1);
         assert!(!first_state.project.projects.read().await.contains_key(&project_id));
         assert!(pointer.exists());
         assert!(document.exists());
@@ -698,6 +713,7 @@ mod tests {
         let (state, report) = build_state_with_paths(paths.clone()).await.unwrap();
 
         assert_eq!(report.projects, 0);
+        assert!(report.project_conversation_cleanup_failures.is_empty());
         assert!(!state.project.projects.read().await.contains_key(&project_id));
         assert!(!pointer.exists());
         assert!(!document.exists());

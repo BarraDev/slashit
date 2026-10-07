@@ -145,10 +145,23 @@ pub fn run() {
     let (app_state, report) = tauri::async_runtime::block_on(app_core::build_state())
         .expect("Failed to build application state");
 
-    println!(
-        "SlashIt: Loaded {} repositories, {} projects, {} tasks from disk",
-        report.repositories, report.projects, report.tasks
-    );
+    if report.project_conversation_cleanup_failures.is_empty() {
+        println!(
+            "SlashIt: Loaded {} repositories, {} projects, {} tasks from disk",
+            report.repositories, report.projects, report.tasks
+        );
+    } else {
+        eprintln!(
+            "SlashIt: Startup incomplete: loaded {} repositories, {} projects, {} tasks; {} Project Conversation cleanup recovery issue(s) need attention",
+            report.repositories,
+            report.projects,
+            report.tasks,
+            report.project_conversation_cleanup_failures.len()
+        );
+        for failure in &report.project_conversation_cleanup_failures {
+            eprintln!("SlashIt: Pending Project Conversation cleanup: {failure}");
+        }
+    }
     if report.migrated_projects > 0 {
         if report.unsaved_migrated_projects > 0 {
             println!(
