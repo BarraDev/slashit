@@ -28,7 +28,13 @@ async fn zero_task_project_conversation_replies_and_survives_restart() {
         if !tasks.is_empty() { bail!("the no-Task fixture unexpectedly has {} Tasks", tasks.len()); }
 
         send_message(session.driver(), "What is this Project?", "Fake Coordinator reply.").await?;
-        send_message(session.driver(), "Can we keep discussing?", "Fake Coordinator reply.").await?;
+        submit_message(session.driver(), "Can we keep discussing?").await?;
+        let second_turn = await_conversation_idle(session.driver(), &project_id, 4).await?;
+        let second_reply = second_turn["conversation"]["entries"].as_array().context("Conversation entries missing after second turn")?.iter()
+            .filter_map(|entry| entry["kind"]["text"].as_str())
+            .filter(|text| *text == "Fake Coordinator reply.")
+            .count();
+        if second_reply != 2 { bail!("second Coordinator turn did not persist its reply: {second_turn}"); }
         let first = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
         let conversation_id = first["conversation"]["id"].as_str().context("Conversation id missing")?.to_string();
         if conversation_id == project_id { bail!("Conversation identity was encoded as Project identity"); }
@@ -118,7 +124,15 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         request.send_keys("Edited authoritative request").await?;
         ui::visible(session.driver(), "[data-testid=\"conversation-action-edit-approve\"]").await?.click().await?;
         await_text(session.driver(), "[data-testid=\"conversation-worker-result\"]", "fake Worker completed approved work").await?;
-        await_text(session.driver(), "[data-testid=\"conversation-message\"]", "Coordinator reviewed the Worker result.").await?;
+        if let Err(error) = await_text(session.driver(), "[data-testid=\"conversation-message\"]", "Coordinator reviewed the Worker result.").await {
+            let latest = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
+            let prompts = agent.invocations()?.into_iter().filter_map(|run| run.prompt.map(|prompt| json!({
+                "working_dir":run.working_dir,
+                "args":run.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+                "prompt":prompt,
+            }))).collect::<Vec<_>>();
+            bail!("{error}; persisted snapshot after timeout: {latest}; fake provider runs: {prompts:#?}");
+        }
 
         let conversation = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
         let conversation_id = conversation["conversation"]["id"].as_str().context("Conversation id missing")?.to_string();
@@ -152,10 +166,30 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
 }
 
 async fn send_message(driver: &WebDriver, message: &str, expected: &str) -> Result<()> {
+    submit_message(driver, message).await?;
+    await_text(driver, "[data-testid=\"project-conversation\"]", expected).await
+}
+
+async fn submit_message(driver: &WebDriver, message: &str) -> Result<()> {
     let input = ui::visible(driver, INPUT).await?;
     input.send_keys(message).await?;
     ui::visible(driver, SEND).await?.click().await?;
-    await_text(driver, "[data-testid=\"project-conversation\"]", expected).await
+    Ok(())
+}
+
+async fn await_conversation_idle(driver: &WebDriver, project_id: &str, minimum_entries: usize) -> Result<Value> {
+    let started = Instant::now();
+    loop {
+        let snapshot = ui::invoke(driver, "get_project_conversation", json!({"projectId":project_id})).await?;
+        let entries = snapshot["conversation"]["entries"].as_array().map_or(0, Vec::len);
+        if entries >= minimum_entries && snapshot["coordinator_live"] == false && snapshot["worker_live"] == false {
+            return Ok(snapshot);
+        }
+        if started.elapsed() > EXECUTION_DEADLINE {
+            bail!("Conversation did not persist {minimum_entries} entries and become idle: {snapshot}");
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 async fn field_value(driver: &WebDriver, selector: &str) -> Result<String> {
