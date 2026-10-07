@@ -125,7 +125,7 @@ pub async fn get_project_conversation(state: tauri::State<'_, AppState>, project
     let has_live_run = state.executor.get().is_some_and(|executor| executor.project_run_is_live(conversation.id));
     let pending = (!has_live_run).then(|| conversation.actions.iter().find(|action| action.status == ActionStatus::Returned && !action.coordinator_replied).map(|action| action.id)).flatten();
     let conversation = if let Some(action_id) = pending {
-        continue_from_worker_result(&state, project_id, action_id).await.unwrap_or(conversation)
+        continue_from_worker_result(&state, project_id, action_id).await?
     } else { conversation };
     Ok(snapshot(&state, conversation).await)
 }
@@ -316,6 +316,7 @@ pub async fn act_on_project_conversation(state: tauri::State<'_, AppState>, proj
     state.storage.save_conversation(&conversation).map_err(|error| error.to_string())?;
     drop(_guard);
     drop(run_lease);
+    drop(lease);
     if conversation.actions.iter().any(|action| action.id == action_id && action.status == ActionStatus::Returned && !action.coordinator_replied) {
         conversation = continue_from_worker_result(&state, project_id, action_id).await?;
     }

@@ -81,6 +81,9 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         let task = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Existing Task","description":"A bounded implementation task","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
         let task_id = created_id(task.clone(), "create_task")?;
         ui::invoke(session.driver(), "create_worktree", json!({"taskId":task_id})).await?;
+        let target_config = agent.marker_dir().join(".coordinator-target");
+        std::fs::create_dir_all(&target_config)?;
+        std::fs::write(target_config.join("id"), &task_id)?;
         let unrelated = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Unrelated private Task sentinel","description":"Must not enter the Worker projection","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
         let unrelated_task_id = created_id(unrelated, "create_task")?;
         open_board(session.driver(), &project_id).await?;
