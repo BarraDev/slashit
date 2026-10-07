@@ -128,6 +128,7 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         ui::visible(session.driver(), "[data-testid=\"conversation-action-edit-approve\"]").await?.click().await?;
         await_text(session.driver(), "[data-testid=\"conversation-worker-result\"]", "fake Worker completed approved work").await?;
         ui::visible(session.driver(), "[data-testid=\"conversation-continuation-error\"]").await?;
+        if ui::visible(session.driver(), SEND).await?.is_enabled().await? { bail!("Human send remained enabled while a saved Worker result awaited Coordinator mediation"); }
         if !super::text_of(session.driver(), "[data-testid=\"conversation-history\"]").await?.unwrap_or_default().contains("fake Worker completed approved work") {
             bail!("a failed Coordinator follow-up hid the durable Worker result");
         }

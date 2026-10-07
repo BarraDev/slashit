@@ -103,6 +103,10 @@ impl Conversation {
         self.updated_at = now;
     }
 
+    pub fn has_unmediated_worker_result(&self) -> bool {
+        self.actions.iter().any(|action| action.status == ActionStatus::Returned && !action.coordinator_replied)
+    }
+
     pub fn validate_text(value: &str) -> Result<(), String> {
         if value.trim().is_empty() || value.len() > MESSAGE_LIMIT {
             return Err(format!("Text must contain 1–{MESSAGE_LIMIT} bytes"));
@@ -162,5 +166,19 @@ mod tests {
         let projection = conversation.coordinator_projection("three", "Project", None, &[]);
         assert_eq!(projection["recent_messages"].as_array().unwrap().len(), 2);
         assert!(!projection.to_string().contains("private"));
+    }
+
+    #[test]
+    fn returned_worker_result_blocks_new_turn_until_coordinator_mediates_it() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        let now = Utc::now();
+        conversation.actions.push(TaskAction {
+            id: Uuid::new_v4(), target_task_id: Uuid::new_v4(), target_task_title: "Task".into(),
+            request: "request".into(), explanation: "why".into(), approved_request: Some("request".into()),
+            status: ActionStatus::Returned, worker_result: Some("result".into()), coordinator_replied: false, created_at: now,
+        });
+        assert!(conversation.has_unmediated_worker_result());
+        conversation.actions[0].coordinator_replied = true;
+        assert!(!conversation.has_unmediated_worker_result());
     }
 }

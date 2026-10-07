@@ -9,6 +9,10 @@ fn should_poll_snapshot(busy: bool, coordinator_live: bool, worker_live: bool) -
     busy || coordinator_live || worker_live
 }
 
+fn has_unmediated_worker_result(snapshot: &ConversationSnapshot) -> bool {
+    snapshot.conversation.actions.iter().any(|action| action.status == ConversationActionStatus::Returned && !action.coordinator_replied)
+}
+
 fn should_publish_snapshot(current: Option<(Uuid, u64)>, incoming: (Uuid, u64), request: u64, applied_request: u64) -> bool {
     match current {
         None => true,
@@ -225,9 +229,12 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                         </div>
                     }
                 }))}
+                {move || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value)).then(|| view! {
+                    <p data-testid="conversation-awaiting-mediation" class="mb-2 text-xs text-amber-100/80">"A saved Worker result must be reviewed before you send another message."</p>
+                })}
                 <form class="flex items-end gap-2" on:submit=move |event: web_sys::SubmitEvent| { event.prevent_default(); on_send(); }>
-                    <textarea data-testid="conversation-message-input" class="min-h-16 flex-1 rounded-lg border border-white/10 bg-black/30 p-3 text-sm text-white" placeholder="Ask about this Project…" prop:value=draft on:input=move |event| set_draft.set(event_target_value(&event))></textarea>
-                    <button data-testid="conversation-send" type="submit" class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium" disabled=move || busy.get() || draft.get().trim().is_empty()>"Send"</button>
+                    <textarea data-testid="conversation-message-input" class="min-h-16 flex-1 rounded-lg border border-white/10 bg-black/30 p-3 text-sm text-white" placeholder="Ask about this Project…" prop:value=draft disabled=move || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value)) on:input=move |event| set_draft.set(event_target_value(&event))></textarea>
+                    <button data-testid="conversation-send" type="submit" class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium" disabled=move || busy.get() || draft.get().trim().is_empty() || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value))>"Send"</button>
                 </form>
                 {move || error.get().map(|message| view! { <p data-testid="conversation-error" class="mt-2 text-sm text-red-300">{message}</p> })}
             </section>

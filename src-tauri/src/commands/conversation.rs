@@ -168,6 +168,7 @@ pub async fn send_project_message(state: tauri::State<'_, AppState>, project_id:
     let _guard = lock.lock().await;
     let mut conversation = load_or_create(&state, project_id).await?;
     if state.executor.get().is_some_and(|executor| executor.project_run_is_live(conversation.id)) { return Err("A Conversation run is already active".into()); }
+    if conversation.has_unmediated_worker_result() { return Err("A saved Worker result must be reviewed by the Coordinator before sending another message".into()); }
     conversation.push(Role::Human, EntryKind::HumanMessage { text: message.clone() });
     state.storage.save_conversation(&conversation).map_err(|error| error.to_string())?;
 
