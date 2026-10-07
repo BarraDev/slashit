@@ -129,21 +129,23 @@ pub async fn decide(
         // A repeated approval of finished work is a no-op, never a second effect.
         (ProjectActionStatus::Applied, Decision::Approve) => return Ok(()),
         (ProjectActionStatus::Proposed, Decision::Reject) => {
-            set_status(conversation, action_id, ProjectActionStatus::Rejected, None);
-            conversation.push(
+            let mut candidate = conversation.clone();
+            set_status(&mut candidate, action_id, ProjectActionStatus::Rejected, None);
+            candidate.push(
                 Role::Human,
                 EntryKind::ProjectActionDecision { action_id, approved: false },
             );
-            return save(scope, conversation);
+            return persist_then_commit(scope, conversation, candidate);
         }
         (ProjectActionStatus::Proposed, Decision::Approve) => {
-            set_status(conversation, action_id, ProjectActionStatus::Approved, None);
-            conversation.push(
+            let mut candidate = conversation.clone();
+            set_status(&mut candidate, action_id, ProjectActionStatus::Approved, None);
+            candidate.push(
                 Role::Human,
                 EntryKind::ProjectActionDecision { action_id, approved: true },
             );
             // Step 1 of the protocol: the decision is durable before any effect.
-            save(scope, conversation)?;
+            persist_then_commit(scope, conversation, candidate)?;
         }
         (ProjectActionStatus::Approved, Decision::Approve) => {}
         (ProjectActionStatus::Approved, Decision::Reject) => {
@@ -157,28 +159,41 @@ pub async fn decide(
         .ok_or("Action not found")?
         .mutation
         .clone();
+    let mut candidate = conversation.clone();
     match execute(scope, &mutation).await? {
         Execution::Applied { task_id, title } => {
             set_status(
-                conversation,
+                &mut candidate,
                 action_id,
                 ProjectActionStatus::Applied,
                 Some(ProjectActionOutcome::Applied { task_id, title }),
             );
-            conversation.push(Role::Coordinator, EntryKind::ProjectActionApplied { action_id, task_id });
+            candidate.push(Role::Coordinator, EntryKind::ProjectActionApplied { action_id, task_id });
         }
         Execution::Refused(reason) => {
             set_status(
-                conversation,
+                &mut candidate,
                 action_id,
                 ProjectActionStatus::Refused,
                 Some(ProjectActionOutcome::Refused { reason: reason.clone() }),
             );
-            conversation.push(Role::Coordinator, EntryKind::ProjectActionRefused { action_id, reason });
+            candidate.push(Role::Coordinator, EntryKind::ProjectActionRefused { action_id, reason });
         }
     }
     // Step 3 of the protocol.
-    save(scope, conversation)
+    persist_then_commit(scope, conversation, candidate)
+}
+
+/// The caller's Conversation never advances beyond what was persisted: the
+/// candidate replaces it only after a successful save.
+fn persist_then_commit(
+    scope: &Scope<'_>,
+    conversation: &mut Conversation,
+    candidate: Conversation,
+) -> Result<(), String> {
+    save(scope, &candidate)?;
+    *conversation = candidate;
+    Ok(())
 }
 
 fn set_status(
@@ -529,6 +544,74 @@ mod tests {
         let decisions = restarted.entries.iter()
             .filter(|e| matches!(e.kind, EntryKind::ProjectActionDecision { .. })).count();
         assert_eq!(decisions, 1, "a retry must not record a second Human decision");
+    }
+
+    /// Make the next Conversation save fail by putting a directory where its file belongs.
+    /// Returns the durable bytes so they can be restored afterwards.
+    fn block_conversation_persistence(world: &World, conversation: &Conversation) -> Vec<u8> {
+        let path = world.paths.conversation_file(conversation.id);
+        let durable = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        durable
+    }
+
+    fn unblock_conversation_persistence(world: &World, conversation: &Conversation, durable: &[u8]) {
+        let path = world.paths.conversation_file(conversation.id);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, durable).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_outcome_save_keeps_the_caller_at_the_durable_approved_state_and_retries_cleanly() {
+        let world = World::new();
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, CREATE).await.unwrap();
+        // Steps 1 and 2 by hand: durable Approved, then the Task exists.
+        conversation.project_actions[0].status = ProjectActionStatus::Approved;
+        conversation.push(Role::Human, EntryKind::ProjectActionDecision { action_id: id, approved: true });
+        world.storage.save_conversation(&conversation).unwrap();
+        execute(&world.scope(), &conversation.project_actions[0].mutation.clone()).await.unwrap();
+        // Step 3 fails: only the final Conversation save is blocked.
+        let durable = block_conversation_persistence(&world, &conversation);
+
+        assert!(decide(&world.scope(), &mut conversation, id, Decision::Approve).await.is_err());
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Approved);
+        assert_eq!(world.tasks.read().await.len(), 1);
+
+        unblock_conversation_persistence(&world, &conversation, &durable);
+        let persisted = world.storage.load_primary_conversation(world.project_id).unwrap();
+        assert_eq!(
+            persisted.unwrap().project_action(id).unwrap().status,
+            ProjectActionStatus::Approved,
+            "disk must not claim more than was saved"
+        );
+
+        // Retry with the very same in-memory object.
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+        let persisted = world.storage.load_primary_conversation(world.project_id).unwrap().unwrap();
+        assert_eq!(persisted.project_action(id).unwrap().status, ProjectActionStatus::Applied);
+        assert_eq!(world.tasks.read().await.len(), 1);
+        let decisions = persisted.entries.iter()
+            .filter(|e| matches!(e.kind, EntryKind::ProjectActionDecision { .. })).count();
+        assert_eq!(decisions, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_approval_save_leaves_memory_and_disk_proposed_and_creates_no_task() {
+        let world = World::new();
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, CREATE).await.unwrap();
+        world.storage.save_conversation(&conversation).unwrap();
+        let _durable = block_conversation_persistence(&world, &conversation);
+
+        assert!(decide(&world.scope(), &mut conversation, id, Decision::Approve).await.is_err());
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Proposed);
+        assert!(conversation.entries.iter().all(|e| !matches!(e.kind, EntryKind::ProjectActionDecision { .. })));
+        assert!(world.tasks.read().await.is_empty());
+
+        assert!(decide(&world.scope(), &mut conversation, id, Decision::Reject).await.is_err());
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Proposed);
     }
 
     #[tokio::test]

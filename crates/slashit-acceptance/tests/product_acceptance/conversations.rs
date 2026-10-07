@@ -280,7 +280,8 @@ async fn coordinator_creates_and_edits_tasks_only_after_human_approval() {
         submit_message(session.driver(), "We should capture some ideas.").await?;
         await_text(session.driver(), proposal, "Rejected idea").await?;
         let shown = ui::visible(session.driver(), proposal).await?.text().await?;
-        if !shown.contains("Create Task") || !shown.contains("Backlog") || !shown.contains("Nobody asked for this.") { bail!("the exact creation is not visible: {shown}"); }
+        // The action label is upper-cased by CSS, and WebDriver returns rendered text.
+        if !shown.to_lowercase().contains("create task") || !shown.contains("Backlog") || !shown.contains("Nobody asked for this.") { bail!("the exact creation is not visible: {shown}"); }
         if !list_tasks().await?.is_empty() { bail!("a proposal created a Task before approval"); }
         ui::visible(session.driver(), "[data-testid=\"project-action-reject\"]").await?.click().await?;
         await_text(session.driver(), "[data-testid=\"conversation-history\"]", "You rejected the proposal.").await?;
