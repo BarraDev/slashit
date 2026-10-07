@@ -207,7 +207,9 @@ if [ -n "$is_run" ] && grep -q '"current_message"' "$prompt_file" 2>/dev/null; t
 fi
 
 fail_after_worker=${SLASHIT_FAKE_COORDINATOR_FAIL_AFTER_WORKER:-0}
-if [ "$fail_after_worker" -gt 0 ] && grep -q '"returned_action"' "$prompt_file" 2>/dev/null; then
+if [ "$fail_after_worker" -gt 0 ] &&
+    grep -q '"returned_action"' "$prompt_file" 2>/dev/null &&
+    mkdir "$SLASHIT_FAKE_AGENT_MARKERS/.returned-action-failed" 2>/dev/null; then
     printf '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"%s","result":"fake Coordinator was scripted to fail this run"}\n' "$session"
     exit 0
 fi
