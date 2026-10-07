@@ -3,6 +3,17 @@ use crate::services::conversation_service;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::collections::HashMap;
+use uuid::Uuid;
+
+fn should_publish_snapshot(current: Option<(Uuid, u64)>, incoming: (Uuid, u64), request: u64, applied_request: u64) -> bool {
+    match current {
+        None => true,
+        Some((current_id, _)) if current_id != incoming.0 => request > applied_request,
+        Some((_, revision)) if incoming.1 > revision => true,
+        Some((_, revision)) if incoming.1 == revision => request > applied_request,
+        Some(_) => false,
+    }
+}
 
 #[component]
 pub fn ProjectConversation(project_id: String) -> impl IntoView {
@@ -11,6 +22,25 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let (edits, set_edits) = signal(HashMap::<String, String>::new());
     let (busy, set_busy) = signal(false);
     let (error, set_error) = signal(None::<String>);
+    let (next_snapshot_request, set_next_snapshot_request) = signal(0u64);
+    let (applied_snapshot_request, set_applied_snapshot_request) = signal(0u64);
+    let begin_snapshot_request = Callback::new(move |()| {
+        let mut request = 0;
+        set_next_snapshot_request.update(|latest| {
+            *latest = latest.saturating_add(1);
+            request = *latest;
+        });
+        request
+    });
+    let publish_snapshot = Callback::new(move |(request, value): (u64, ConversationSnapshot)| {
+        let current = snapshot.get_untracked();
+        let current_version = current.as_ref().map(|current| (current.conversation.id, current.conversation.revision));
+        let incoming_version = (value.conversation.id, value.conversation.revision);
+        if should_publish_snapshot(current_version, incoming_version, request, applied_snapshot_request.get_untracked()) {
+            set_snapshot.set(Some(value));
+            set_applied_snapshot_request.set(request);
+        }
+    });
 
     let edits_snapshot = snapshot;
     Effect::new(move |_| {
@@ -21,33 +51,45 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     });
 
     let initial_id = project_id.clone();
+    let initial_begin_request = begin_snapshot_request.clone();
+    let initial_publish = publish_snapshot.clone();
     Effect::new(move |_| {
         if initial_id.is_empty() { return; }
         let id = initial_id.clone();
+        let request = initial_begin_request.run(());
+        let publish = initial_publish.clone();
         spawn_local(async move {
             match conversation_service::get_project_conversation(id).await {
-                Ok(value) => set_snapshot.set(Some(value)),
+                Ok(value) => publish.run((request, value)),
                 Err(error) => set_error.set(Some(error)),
             }
         });
     });
     let poll_id = project_id.clone();
+    let poll_begin_request = begin_snapshot_request.clone();
+    let poll_publish = publish_snapshot.clone();
     let timer = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(800, move || {
         if !busy.get_untracked() { return; }
         let id = poll_id.clone();
-        spawn_local(async move { if let Ok(value) = conversation_service::get_project_conversation(id).await { set_snapshot.set(Some(value)); } });
+        let request = poll_begin_request.run(());
+        let publish = poll_publish.clone();
+        spawn_local(async move { if let Ok(value) = conversation_service::get_project_conversation(id).await { publish.run((request, value)); } });
     })));
     on_cleanup(move || { timer.update_value(|value| { value.take(); }); });
 
     let send_id = project_id.clone();
+    let send_begin_request = begin_snapshot_request.clone();
+    let send_publish = publish_snapshot.clone();
     let on_send = move || {
         let message = draft.get_untracked().trim().to_string();
         if message.is_empty() || busy.get_untracked() { return; }
         set_draft.set(String::new()); set_busy.set(true); set_error.set(None);
         let id = send_id.clone();
+        let request = send_begin_request.run(());
+        let publish = send_publish.clone();
         spawn_local(async move {
             match conversation_service::send_project_message(id, message).await {
-                Ok(value) => set_snapshot.set(Some(value)),
+                Ok(value) => publish.run((request, value)),
                 Err(error) => set_error.set(Some(error)),
             }
             set_busy.set(false);
@@ -55,27 +97,39 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     };
     let stop_id = StoredValue::new_local(project_id.clone());
     let approve_project_id = project_id.clone();
+    let approve_begin_request = begin_snapshot_request.clone();
+    let approve_publish = publish_snapshot.clone();
     let approve_action = Callback::new(move |(action_id, request): (String, Option<String>)| {
         let Some(current) = snapshot.get_untracked() else { return; };
         set_busy.set(true);
         let id = approve_project_id.clone();
         let refresh_id = approve_project_id.clone();
+        let request_id = approve_begin_request.run(());
+        let publish = approve_publish.clone();
+        let refresh_begin_request = approve_begin_request.clone();
+        let refresh_publish = approve_publish.clone();
         spawn_local(async move {
             match conversation_service::act_on_project_conversation(id, current.conversation.id.to_string(), current.conversation.revision, action_id, ConversationHumanAction::Approve { request }).await {
-                Ok(value) => set_snapshot.set(Some(value)), Err(error) => { set_error.set(Some(error)); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { set_snapshot.set(Some(value)); } },
+                Ok(value) => publish.run((request_id, value)), Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
             }
             set_busy.set(false);
         });
     });
     let reject_project_id = project_id.clone();
+    let reject_begin_request = begin_snapshot_request.clone();
+    let reject_publish = publish_snapshot.clone();
     let reject_action = Callback::new(move |action_id: String| {
         let Some(current) = snapshot.get_untracked() else { return; };
         set_busy.set(true);
         let id = reject_project_id.clone();
         let refresh_id = reject_project_id.clone();
+        let request_id = reject_begin_request.run(());
+        let publish = reject_publish.clone();
+        let refresh_begin_request = reject_begin_request.clone();
+        let refresh_publish = reject_publish.clone();
         spawn_local(async move {
             match conversation_service::act_on_project_conversation(id, current.conversation.id.to_string(), current.conversation.revision, action_id, ConversationHumanAction::Reject).await {
-                Ok(value) => set_snapshot.set(Some(value)), Err(error) => { set_error.set(Some(error)); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { set_snapshot.set(Some(value)); } },
+                Ok(value) => publish.run((request_id, value)), Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
             }
             set_busy.set(false);
         });
@@ -142,5 +196,38 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                 </form>
                 {move || error.get().map(|message| view! { <p data-testid="conversation-error" class="mt-2 text-sm text-red-300">{message}</p> })}
             </section>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_publish_snapshot;
+    use uuid::Uuid;
+
+    #[test]
+    fn an_older_revision_never_replaces_a_newer_conversation_snapshot() {
+        let conversation = Uuid::new_v4();
+        assert!(!should_publish_snapshot(Some((conversation, 9)), (conversation, 8), 12, 11));
+    }
+
+    #[test]
+    fn a_newer_revision_can_arrive_from_an_earlier_request() {
+        let conversation = Uuid::new_v4();
+        assert!(should_publish_snapshot(Some((conversation, 8)), (conversation, 9), 4, 10));
+    }
+
+    #[test]
+    fn equal_revision_snapshots_follow_request_order() {
+        let conversation = Uuid::new_v4();
+        assert!(!should_publish_snapshot(Some((conversation, 9)), (conversation, 9), 4, 5));
+        assert!(should_publish_snapshot(Some((conversation, 9)), (conversation, 9), 6, 5));
+    }
+
+    #[test]
+    fn conversation_identity_changes_follow_request_order() {
+        let current = Uuid::new_v4();
+        let incoming = Uuid::new_v4();
+        assert!(!should_publish_snapshot(Some((current, 20)), (incoming, 0), 1, 10));
+        assert!(should_publish_snapshot(Some((current, 20)), (incoming, 0), 11, 10));
     }
 }
