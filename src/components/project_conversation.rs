@@ -13,6 +13,18 @@ fn has_unmediated_worker_result(snapshot: &ConversationSnapshot) -> bool {
     snapshot.conversation.actions.iter().any(|action| action.status == ConversationActionStatus::Returned && !action.coordinator_replied)
 }
 
+/// The request the Human sees: an approved action always shows the persisted
+/// `approved_request`, never a leftover local edit.
+fn shown_request(approved: bool, edit: Option<String>, current: String) -> String {
+    if approved { current } else { edit.unwrap_or(current) }
+}
+
+/// The request plain Approve must send so the approved text is the visible text.
+/// An already approved action carries its request, so nothing is resent.
+fn plain_approval_request(approved: bool, edit: Option<String>) -> Option<String> {
+    if approved { None } else { edit }
+}
+
 fn should_publish_snapshot(current: Option<(Uuid, u64)>, incoming: (Uuid, u64), request: u64, applied_request: u64) -> bool {
     match current {
         None => true,
@@ -211,9 +223,9 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                 <div class="mt-1 font-medium text-white">{action.target_task_title}</div>
                                 <div class="mt-1 break-all font-mono text-xs text-white/55">{format!("Task ID: {}", action.target_task_id)}</div>
                                 <p class="mt-2 whitespace-pre-wrap text-sm text-white/75">{action.explanation}</p>
-                                <label class="mt-2 block text-xs text-white/50">"Worker request"<textarea data-testid="conversation-action-request" class="mt-1 min-h-20 w-full rounded bg-black/30 p-2 text-sm text-white" prop:value=move || edits.with(|edits| edits.get(&value_id).cloned().unwrap_or_else(|| current_request.get())) on:input=move |event| set_edits.update(|edits| { edits.insert(input_id.clone(), event_target_value(&event)); })></textarea></label>
+                                <label class="mt-2 block text-xs text-white/50">"Worker request"<textarea data-testid="conversation-action-request" class="mt-1 min-h-20 w-full rounded bg-black/30 p-2 text-sm text-white" readonly=move || is_approved.get() prop:value=move || shown_request(is_approved.get(), edits.with(|edits| edits.get(&value_id).cloned()), current_request.get()) on:input=move |event| set_edits.update(|edits| { edits.insert(input_id.clone(), event_target_value(&event)); })></textarea></label>
                                 <div class="mt-2 flex gap-2">
-                                    <button data-testid="conversation-action-approve" class="rounded bg-emerald-700 px-3 py-1 text-sm" disabled=move || busy.get() on:click=move |_| approve_action.run((approve_id.clone(), None))>{move || if is_approved.get() { "Start approved Worker" } else { "Approve exact request" }}</button>
+                                    <button data-testid="conversation-action-approve" class="rounded bg-emerald-700 px-3 py-1 text-sm" disabled=move || busy.get() on:click=move |_| { let request = plain_approval_request(is_approved.get_untracked(), edits.get_untracked().get(&approve_id).cloned()); approve_action.run((approve_id.clone(), request)); }>{move || if is_approved.get() { "Start approved Worker" } else { "Approve exact request" }}</button>
                                     <button data-testid="conversation-action-edit-approve" class="rounded bg-emerald-700/70 px-3 py-1 text-sm" disabled=move || busy.get() || is_approved.get() on:click=move |_| { let edited = edits.get_untracked().get(&id).cloned().unwrap_or(original.clone()); edit_approve_action.run((edit_approve_id.clone(), Some(edited))); } >"Edit + approve"</button>
                                     <button data-testid="conversation-action-reject" class="rounded border border-white/20 px-3 py-1 text-sm" disabled=move || busy.get() || is_approved.get() on:click=move |_| reject_action.run(reject_id.clone())>"Reject"</button>
                                 </div>
@@ -255,7 +267,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_poll_snapshot, should_publish_snapshot};
+    use super::{plain_approval_request, should_poll_snapshot, should_publish_snapshot, shown_request};
     use uuid::Uuid;
 
     #[test]
@@ -291,5 +303,19 @@ mod tests {
         let incoming = Uuid::new_v4();
         assert!(!should_publish_snapshot(Some((current, 20)), (incoming, 0), 1, 10));
         assert!(should_publish_snapshot(Some((current, 20)), (incoming, 0), 11, 10));
+    }
+
+    #[test]
+    fn plain_approval_sends_the_edited_request_the_textarea_shows() {
+        let shown = shown_request(false, Some("B".into()), "A".into());
+        assert_eq!(shown, "B");
+        assert_eq!(plain_approval_request(false, Some("B".into())), Some(shown));
+        assert_eq!(plain_approval_request(false, None), None);
+    }
+
+    #[test]
+    fn an_approved_action_shows_its_persisted_request_not_a_stale_edit() {
+        assert_eq!(shown_request(true, Some("B".into()), "A".into()), "A");
+        assert_eq!(plain_approval_request(true, Some("B".into())), None);
     }
 }
