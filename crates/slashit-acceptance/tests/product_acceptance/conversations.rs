@@ -170,6 +170,7 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         request.send_keys("Edited authoritative request").await?;
         ui::visible(session.driver(), "[data-testid=\"conversation-action-edit-approve\"]").await?.click().await?;
         await_and_release_provider_run(&agent).await?; // Worker run
+        await_returned_worker_result(session.driver(), &project_id).await?;
         await_blocked_provider_run(&agent).await?; // Coordinator after durable Worker result
         let result_while_mediating = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
         if result_while_mediating["conversation"]["actions"].as_array().is_none_or(|actions| !actions.iter().any(|action| action["status"] == "returned" && action["worker_result"].as_str().is_some())) { bail!("Worker result was not durably visible while Coordinator mediation was blocked: {result_while_mediating}"); }
@@ -253,6 +254,33 @@ async fn await_blocked_provider_run(agent: &FakeAgent) -> Result<()> {
         }
         if started.elapsed() > EXECUTION_DEADLINE {
             bail!("fake provider did not reach its deterministic blocking gate");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn await_returned_worker_result(driver: &WebDriver, project_id: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let snapshot = ui::invoke(
+            driver,
+            "get_project_conversation",
+            json!({"projectId":project_id}),
+        )
+        .await?;
+        let returned = snapshot["conversation"]["actions"]
+            .as_array()
+            .is_some_and(|actions| {
+                actions.iter().any(|action| {
+                    action["status"] == "returned"
+                        && action["worker_result"].as_str().is_some()
+                })
+            });
+        if returned {
+            return Ok(());
+        }
+        if started.elapsed() > EXECUTION_DEADLINE {
+            bail!("Worker did not durably return a result before Coordinator mediation");
         }
         tokio::time::sleep(POLL).await;
     }
