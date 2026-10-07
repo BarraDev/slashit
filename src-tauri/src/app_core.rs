@@ -116,6 +116,7 @@ pub async fn build_state_with_paths(
         project: project_state,
         workspace: commands::workspace::WorkspaceState::load(&paths)?,
         task: task_state,
+        conversation: commands::conversation::ConversationState::new(),
         agent: commands::agent::AgentState::new(),
         session: commands::session::SessionState::new(),
         jj: commands::jj::JjState::new(),

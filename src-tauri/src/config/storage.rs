@@ -1,6 +1,6 @@
 use crate::config::paths::{AppPaths, ProjectKey};
 use crate::domain::task::ExternalRef;
-use crate::domain::{AgentConfig, Project, Repository, Task};
+use crate::domain::{AgentConfig, Conversation, Project, Repository, Task};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -180,6 +180,51 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Load a Project's primary Conversation, if one has been created.
+    pub fn load_primary_conversation(&self, project_id: Uuid) -> Result<Option<Conversation>> {
+        let pointer = self.paths.primary_conversation_file(project_id);
+        if !pointer.is_file() {
+            return Ok(None);
+        }
+        let id: Uuid = fs::read_to_string(&pointer)
+            .with_context(|| format!("Failed to read primary Conversation pointer {pointer:?}"))?
+            .trim().parse().context("Invalid primary Conversation identity")?;
+        let path = self.paths.conversation_file(id);
+        let bytes = fs::read(&path).with_context(|| format!("Failed to read Conversation {path:?}"))?;
+        let conversation: Conversation = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to parse Conversation {path:?}"))?;
+        if conversation.id != id || conversation.project_id != project_id {
+            anyhow::bail!("Primary Conversation identity does not match its Project pointer");
+        }
+        Ok(Some(conversation))
+    }
+
+    /// Create a Conversation with its own identity and atomically publish the
+    /// Project's primary pointer only after the Conversation is durable.
+    pub fn create_primary_conversation(&self, project_id: Uuid) -> Result<Conversation> {
+        if let Some(existing) = self.load_primary_conversation(project_id)? {
+            return Ok(existing);
+        }
+        let conversation = Conversation::new(project_id);
+        self.save_conversation(&conversation)?;
+        write_private_atomic(
+            &self.paths.primary_conversation_file(project_id),
+            conversation.id.to_string().as_bytes(),
+        ).context("Failed to persist primary Conversation pointer")?;
+        Ok(conversation)
+    }
+
+    /// Persist a Project Conversation with owner-only permissions and an
+    /// atomic replacement, rejecting any identity/owner mismatch.
+    pub fn save_conversation(&self, conversation: &Conversation) -> Result<()> {
+        if conversation.id.is_nil() || conversation.project_id.is_nil() {
+            anyhow::bail!("Conversation and Project identities must be valid");
+        }
+        let bytes = serde_json::to_vec_pretty(conversation).context("Failed to serialize Conversation")?;
+        write_private_atomic(&self.paths.conversation_file(conversation.id), &bytes)
+            .context("Failed to atomically persist Conversation")
+    }
+
     pub fn new() -> Result<Self> {
         let paths = AppPaths::new().context("Failed to resolve application directories")?;
         Ok(Self::with_paths(paths))
@@ -729,6 +774,26 @@ mod tests {
         ));
 
         (storage, temp_dir)
+    }
+
+    #[test]
+    fn primary_project_conversation_has_its_own_identity_and_survives_reload() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let conversation = storage.create_primary_conversation(project_id).unwrap();
+        assert_ne!(conversation.id, project_id);
+        let mut changed = conversation.clone();
+        changed.push(
+            crate::domain::conversation::Role::Human,
+            crate::domain::conversation::EntryKind::HumanMessage { text: "No tasks needed".into() },
+        );
+        storage.save_conversation(&changed).unwrap();
+        let restarted_storage = storage.clone();
+        let restored = restarted_storage.load_primary_conversation(project_id).unwrap().unwrap();
+        assert_eq!(restored.id, conversation.id);
+        assert_eq!(restored.project_id, project_id);
+        assert_eq!(restored.entries.len(), 1);
+        assert!(restarted_storage.load_primary_conversation(Uuid::new_v4()).unwrap().is_none());
     }
 
     #[test]

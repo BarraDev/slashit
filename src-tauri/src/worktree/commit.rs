@@ -97,6 +97,31 @@ async fn commit(
 
 /// Refuse a checkout that is not exactly where the task's work belongs: see
 /// [`commit_checkout`]. Nothing has been staged when this refuses.
+pub async fn validate_task_checkout(working_dir: &str, branch: &str) -> Result<(), String> {
+    refuse_unless_on_task_branch(working_dir, branch).await
+}
+
+/// Prove Git registers `working_dir` under the Project repository on the Task's branch.
+pub async fn validate_registered_task_checkout(repository: &str, working_dir: &str, branch: &str) -> Result<(), String> {
+    validate_task_checkout(working_dir, branch).await?;
+    let listing = git(repository, &["worktree", "list", "--porcelain"])
+        .await.map_err(|error| format!("could not verify Task Checkout ownership: {error}"))?;
+    let expected_branch = format!("refs/heads/{branch}");
+    for record in listing.split("\n\n") {
+        let mut path = None;
+        let mut registered_branch = None;
+        for line in record.lines() {
+            if let Some(value) = line.strip_prefix("worktree ") { path = Some(value); }
+            if let Some(value) = line.strip_prefix("branch ") { registered_branch = Some(value); }
+        }
+        if path.is_some_and(|path| same_directory(Path::new(path), Path::new(working_dir)))
+            && registered_branch == Some(expected_branch.as_str()) {
+            return Ok(());
+        }
+    }
+    Err(format!("{working_dir} is not registered by the Project repository on {branch}"))
+}
+
 async fn refuse_unless_on_task_branch(working_dir: &str, branch: &str) -> Result<(), String> {
     let top_level = git(working_dir, &["rev-parse", "--show-toplevel"])
         .await

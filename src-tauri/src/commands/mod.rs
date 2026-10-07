@@ -27,6 +27,7 @@ pub mod workflow;
 pub mod jira;
 pub mod features;
 pub mod state_location;
+pub mod conversation;
 pub mod updater;
 
 pub use repository::*;
@@ -56,6 +57,7 @@ pub use executor::*;
 pub use tray::*;
 pub use features::*;
 pub use state_location::*;
+pub use conversation::{act_on_project_conversation, get_project_conversation, send_project_message, stop_project_conversation};
 // Only the commands: the module's types are reached through
 // `commands::updater::` so that `UpdaterState` cannot be confused with the
 // plugin type of the same name.

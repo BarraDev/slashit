@@ -58,6 +58,9 @@ pub const REPORTED_RESULT: &str = "fake agent completed without changing the rep
 /// journey depend on whether the frontend happened to ask first.
 pub const FAILING_RUNS_VAR: &str = "SLASHIT_FAKE_AGENT_FAILING_RUNS";
 
+/// Strict JSON output for a Project Coordinator acceptance run.
+pub const COORDINATOR_OUTPUT_VAR: &str = "SLASHIT_FAKE_COORDINATOR_OUTPUT";
+
 /// The text the fixture returns for a run scripted to fail.
 pub const REPORTED_FAILURE: &str = "fake agent was scripted to fail this run";
 

@@ -12,6 +12,7 @@ pub mod state_location;
 pub mod storage_usage;
 pub mod repository_setup;
 pub mod orphans;
+pub mod conversation;
 
 pub use project::*;
 pub use repository::*;
@@ -22,3 +23,4 @@ pub use agent::*;
 pub use roadmap::*;
 pub use github::*;
 pub use state_location::*;
+pub use conversation::{ActionStatus as ConversationActionStatus, Conversation, Entry as ConversationEntry, EntryKind as ConversationEntryKind, HumanAction as ConversationHumanAction, Role as ConversationRole, Snapshot as ConversationSnapshot, TaskAction as ConversationTaskAction};
