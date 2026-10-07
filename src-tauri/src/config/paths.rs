@@ -372,6 +372,12 @@ impl AppPaths {
         self.conversations_dir().join(format!("{project_id}.primary"))
     }
 
+    /// Durable recovery records for Project deletions whose Conversation
+    /// cleanup may not have completed before process exit.
+    pub fn pending_project_conversation_deletion_file(&self, project_id: Uuid) -> PathBuf {
+        self.conversations_dir().join(format!("{project_id}.delete-pending"))
+    }
+
     pub fn conversation_file(&self, conversation_id: Uuid) -> PathBuf {
         self.conversations_dir().join(format!("{conversation_id}.json"))
     }

@@ -251,32 +251,134 @@ impl Storage {
             .context("Failed to atomically persist Conversation")
     }
 
-    /// Remove a Project's primary pointer and its document only when the
-    /// pointer parses and the document confirms both identities. A malformed
-    /// or mismatched pointer never authorizes deleting an arbitrary file.
+    /// Remove a Project's primary pointer and its document only after the
+    /// document confirms both identities. Validation and cleanup failures
+    /// preserve the pointer as the recovery reference. An already-absent
+    /// document is a safe partial-cleanup state.
     pub fn delete_project_conversation(&self, project_id: Uuid) -> Result<()> {
         let pointer = self.paths.primary_conversation_file(project_id);
-        if !pointer.exists() {
-            return Ok(());
+        match fs::symlink_metadata(&pointer) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => anyhow::bail!("Conversation pointer is not a regular file: {pointer:?}"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // The Conversation document is written before its pointer, so
+                // a crash during creation can leave a document-only orphan.
+                // A pending Project-deletion marker authorizes a strict scan
+                // for documents that prove their own id and Project owner.
+                if self.pending_project_conversation_deletions()?.contains(&project_id) {
+                    self.delete_unpointed_project_conversations(project_id)?;
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error).context("Failed to inspect Conversation pointer"),
         }
         let raw = fs::read_to_string(&pointer)
             .with_context(|| format!("Failed to read Conversation pointer {pointer:?}"))?;
-        let conversation_id = raw.trim().parse::<Uuid>().ok();
-        if let Some(conversation_id) = conversation_id {
-            let document = self.paths.conversation_file(conversation_id);
-            if let Ok(bytes) = fs::read(&document) {
-                if let Ok(conversation) = serde_json::from_slice::<Conversation>(&bytes) {
-                    if conversation.id == conversation_id && conversation.project_id == project_id {
-                        fs::remove_file(&document).with_context(|| {
-                            format!("Failed to remove Project Conversation {document:?}")
-                        })?;
-                    }
-                }
+        let conversation_id = raw.trim().parse::<Uuid>()
+            .with_context(|| format!("Invalid Conversation identity in pointer {pointer:?}"))?;
+        let document = self.paths.conversation_file(conversation_id);
+        match fs::symlink_metadata(&document) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => anyhow::bail!("Conversation document is not a regular file: {document:?}"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::remove_file(&pointer)
+                    .with_context(|| format!("Failed to remove stale Conversation pointer {pointer:?}"))?;
+                return Ok(());
             }
+            Err(error) => return Err(error).context("Failed to inspect Conversation document"),
         }
+        let bytes = fs::read(&document)
+            .with_context(|| format!("Failed to read Conversation {document:?}"))?;
+        let conversation: Conversation = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to parse Conversation {document:?}"))?;
+        if conversation.id != conversation_id || conversation.project_id != project_id {
+            anyhow::bail!("Conversation identity or Project owner does not match pointer {pointer:?}");
+        }
+        fs::remove_file(&document)
+            .with_context(|| format!("Failed to remove Project Conversation {document:?}"))?;
         fs::remove_file(&pointer)
             .with_context(|| format!("Failed to remove Conversation pointer {pointer:?}"))?;
         Ok(())
+    }
+
+    fn delete_unpointed_project_conversations(&self, project_id: Uuid) -> Result<()> {
+        let directory = self.paths.conversations_dir();
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("Failed to scan unpointed Conversations"),
+        };
+        for entry in entries {
+            let entry = entry.context("Failed to read Conversation directory entry")?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue; };
+            let Some(id) = name.strip_suffix(".json") else { continue; };
+            let conversation_id = id.parse::<Uuid>()
+                .with_context(|| format!("Invalid Conversation filename {:?}", entry.path()))?;
+            if name != format!("{conversation_id}.json") {
+                anyhow::bail!("Non-canonical Conversation filename {:?}", entry.path());
+            }
+            let path = self.paths.conversation_file(conversation_id);
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("Failed to inspect Conversation {path:?}"))?;
+            if !metadata.file_type().is_file() {
+                anyhow::bail!("Conversation document is not a regular file: {path:?}");
+            }
+            let bytes = fs::read(&path)
+                .with_context(|| format!("Failed to read Conversation {path:?}"))?;
+            let conversation: Conversation = serde_json::from_slice(&bytes)
+                .with_context(|| format!("Failed to parse Conversation {path:?}"))?;
+            if conversation.id != conversation_id {
+                anyhow::bail!("Conversation identity does not match filename {path:?}");
+            }
+            if conversation.project_id == project_id {
+                fs::remove_file(&path)
+                    .with_context(|| format!("Failed to remove unpointed Project Conversation {path:?}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist the retry reference before removing a Project from config.
+    pub fn mark_project_conversation_deletion_pending(&self, project_id: Uuid) -> Result<()> {
+        let path = self.paths.pending_project_conversation_deletion_file(project_id);
+        write_private_atomic(&path, project_id.to_string().as_bytes())
+            .context("Failed to persist pending Project Conversation cleanup")
+    }
+
+    pub fn clear_project_conversation_deletion_pending(&self, project_id: Uuid) -> Result<()> {
+        let path = self.paths.pending_project_conversation_deletion_file(project_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("Failed to clear cleanup record {path:?}")),
+        }
+    }
+
+    /// List valid durable cleanup records without discarding malformed ones.
+    pub fn pending_project_conversation_deletions(&self) -> Result<Vec<Uuid>> {
+        let directory = self.paths.conversations_dir();
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("Failed to list Conversation cleanup records"),
+        };
+        let mut pending = Vec::new();
+        for entry in entries {
+            let entry = entry.context("Failed to read Conversation cleanup directory entry")?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue; };
+            let Some(id) = name.strip_suffix(".delete-pending") else { continue; };
+            let project_id = id.parse::<Uuid>()
+                .with_context(|| format!("Invalid Project id in cleanup record {:?}", entry.path()))?;
+            let recorded_id: Uuid = fs::read_to_string(entry.path())
+                .with_context(|| format!("Failed to read cleanup record {:?}", entry.path()))?
+                .trim().parse()
+                .with_context(|| format!("Invalid Project id in cleanup record {:?}", entry.path()))?;
+            if recorded_id != project_id {
+                anyhow::bail!("Project id does not match cleanup record {:?}", entry.path());
+            }
+            pending.push(project_id);
+        }
+        Ok(pending)
     }
 
     pub fn new() -> Result<Self> {
@@ -303,6 +405,26 @@ impl Storage {
 
     pub fn load_config(&self) -> Result<AppConfig> {
         let config = self.read_config()?;
+        self.refresh_routes(&config);
+        Ok(config)
+    }
+
+    /// Load the complete persisted config without salvage, requiring an
+    /// explicit `projects` section. Serde defaults that section for older or
+    /// incomplete files, but that default cannot prove a Project was deleted.
+    pub fn load_config_strict(&self) -> Result<AppConfig> {
+        let contents = fs::read_to_string(&self.config_file)
+            .context("Failed to read config for Project cleanup recovery")?;
+        let value: toml::Value = toml::from_str(&contents)
+            .context("Config is not valid TOML for Project cleanup recovery")?;
+        if !value
+            .as_table()
+            .is_some_and(|table| table.contains_key("projects"))
+        {
+            anyhow::bail!("Config has no projects section; Project absence is not authoritative");
+        }
+        let config: AppConfig = toml::from_str(&contents)
+            .context("Config is incomplete for Project cleanup recovery")?;
         self.refresh_routes(&config);
         Ok(config)
     }
@@ -876,6 +998,70 @@ mod tests {
     }
 
     #[test]
+    fn malformed_conversation_pointer_is_preserved() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let pointer = storage.paths.primary_conversation_file(project_id);
+        fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        fs::write(&pointer, "not-a-uuid").unwrap();
+
+        assert!(storage.delete_project_conversation(project_id).is_err());
+        assert_eq!(fs::read_to_string(pointer).unwrap(), "not-a-uuid");
+    }
+
+    #[test]
+    fn malformed_conversation_document_preserves_pointer_and_document() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let pointer = storage.paths.primary_conversation_file(project_id);
+        let document = storage.paths.conversation_file(conversation_id);
+        fs::create_dir_all(document.parent().unwrap()).unwrap();
+        fs::write(&pointer, conversation_id.to_string()).unwrap();
+        fs::write(&document, "not-json").unwrap();
+
+        assert!(storage.delete_project_conversation(project_id).is_err());
+        assert!(pointer.exists());
+        assert_eq!(fs::read_to_string(document).unwrap(), "not-json");
+    }
+
+    #[test]
+    fn unreadable_conversation_document_preserves_pointer() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let pointer = storage.paths.primary_conversation_file(project_id);
+        let document = storage.paths.conversation_file(conversation_id);
+        fs::create_dir_all(&document).unwrap();
+        fs::write(&pointer, conversation_id.to_string()).unwrap();
+
+        assert!(storage.delete_project_conversation(project_id).is_err());
+        assert!(pointer.exists());
+        assert!(document.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_conversation_document_is_not_treated_as_deleted() {
+        use std::os::unix::fs::symlink;
+
+        let (storage, temp) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let conversation = storage.create_primary_conversation(project_id).unwrap();
+        let document = storage.paths.conversation_file(conversation.id);
+        fs::remove_file(&document).unwrap();
+        let target = temp.path().join("conversation-target.json");
+        fs::write(&target, serde_json::to_vec(&conversation).unwrap()).unwrap();
+        symlink(&target, &document).unwrap();
+        let pointer = storage.paths.primary_conversation_file(project_id);
+
+        assert!(storage.delete_project_conversation(project_id).is_err());
+        assert!(pointer.exists());
+        assert!(fs::symlink_metadata(document).unwrap().file_type().is_symlink());
+        assert!(target.exists());
+    }
+
+    #[test]
     fn mismatched_conversation_pointer_never_deletes_another_projects_document() {
         let (storage, _dir) = create_test_storage();
         let project_id = Uuid::new_v4();
@@ -886,9 +1072,72 @@ mod tests {
         let pointer = storage.paths.primary_conversation_file(project_id);
         write_private_atomic(&pointer, other.id.to_string().as_bytes()).unwrap();
         let document = storage.paths.conversation_file(other.id);
+        assert!(storage.delete_project_conversation(project_id).is_err());
+        assert!(pointer.exists());
+        assert!(document.exists());
+    }
+
+    #[test]
+    fn pointer_to_document_with_mismatched_identity_preserves_both_files() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let pointer_id = Uuid::new_v4();
+        let mut conversation = Conversation::new(project_id);
+        conversation.id = Uuid::new_v4();
+        let pointer = storage.paths.primary_conversation_file(project_id);
+        let document = storage.paths.conversation_file(pointer_id);
+        fs::create_dir_all(document.parent().unwrap()).unwrap();
+        fs::write(&pointer, pointer_id.to_string()).unwrap();
+        fs::write(&document, serde_json::to_vec(&conversation).unwrap()).unwrap();
+
+        assert!(storage.delete_project_conversation(project_id).is_err());
+        assert!(pointer.exists());
+        assert!(document.exists());
+    }
+
+    #[test]
+    fn stale_owned_pointer_after_document_removal_is_safe_to_retry() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let conversation = storage.create_primary_conversation(project_id).unwrap();
+        let document = storage.paths.conversation_file(conversation.id);
+        let pointer = storage.paths.primary_conversation_file(project_id);
+        fs::remove_file(document).unwrap();
+
+        storage.delete_project_conversation(project_id).unwrap();
         storage.delete_project_conversation(project_id).unwrap();
         assert!(!pointer.exists());
-        assert!(document.exists());
+    }
+
+    #[test]
+    fn pending_deletion_finds_document_orphaned_before_pointer_publication() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let conversation = storage.create_primary_conversation(project_id).unwrap();
+        let document = storage.paths.conversation_file(conversation.id);
+        let pointer = storage.paths.primary_conversation_file(project_id);
+        fs::remove_file(&pointer).unwrap();
+        let foreign = storage.create_primary_conversation(Uuid::new_v4()).unwrap();
+        let foreign_document = storage.paths.conversation_file(foreign.id);
+        fs::remove_file(storage.paths.primary_conversation_file(foreign.project_id)).unwrap();
+        storage.mark_project_conversation_deletion_pending(project_id).unwrap();
+
+        storage.delete_project_conversation(project_id).unwrap();
+        storage.delete_project_conversation(project_id).unwrap();
+
+        assert!(!document.exists());
+        assert!(!pointer.exists());
+        assert!(foreign_document.exists());
+        assert!(storage.paths.pending_project_conversation_deletion_file(project_id).exists());
+    }
+
+    #[test]
+    fn pending_project_conversation_cleanup_survives_storage_restart() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        storage.mark_project_conversation_deletion_pending(project_id).unwrap();
+        let restarted = Storage::with_paths(storage.paths().clone());
+        assert_eq!(restarted.pending_project_conversation_deletions().unwrap(), vec![project_id]);
     }
 
     #[test]

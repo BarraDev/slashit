@@ -178,30 +178,41 @@ pub async fn delete_project(
     // Serialize deletion against every Project Conversation mutation. An
     // active provider must finish or be stopped before its owned durable
     // history is removed, otherwise its completion could recreate an orphan.
-    let conversation_lock = state.conversation.project_lock(id);
-    let _conversation_guard = conversation_lock.lock().await;
-    if let Some(conversation) = state
-        .storage
-        .load_primary_conversation(id)
-        .map_err(|e| e.to_string())?
-    {
-        if state
-            .executor
-            .get()
-            .is_some_and(|executor| executor.project_run_is_live(conversation.id))
-        {
-            return Err(
-                "Stop the active Project Conversation Run before deleting this Project".into(),
-            );
-        }
-    }
+    let _conversation_guard = lock_project_conversation_for_deletion(
+        &state.conversation,
+        &state.storage,
+        id,
+        |conversation_id| {
+            state.executor.get().is_some_and(|executor| {
+                executor.project_run_is_live(conversation_id)
+            })
+        },
+    )
+    .await?;
     delete_project_committed(&state.project.projects, &state.storage, id).await
 }
 
-/// Core of [`delete_project`]; see [`create_project_committed`] for why the
-/// map is cloned first. The task files are only deleted once the persisted
-/// map no longer references the project — a failed persist must leave both
-/// memory and the on-disk task files untouched.
+async fn lock_project_conversation_for_deletion(
+    conversations: &crate::commands::conversation::ConversationState,
+    storage: &Storage,
+    project_id: Uuid,
+    project_run_is_live: impl Fn(Uuid) -> bool,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    let guard = conversations.project_lock(project_id).lock_owned().await;
+    if let Some(conversation) = storage
+        .load_primary_conversation(project_id)
+        .map_err(|error| error.to_string())?
+    {
+        if project_run_is_live(conversation.id) {
+            return Err("Stop the active Project Conversation Run before deleting this Project".into());
+        }
+    }
+    Ok(guard)
+}
+
+/// Core of [`delete_project`]. The durable Conversation cleanup record is
+/// written before config removal and cleared only after cleanup succeeds.
+/// Task-file cleanup keeps its existing best-effort behavior.
 async fn delete_project_committed(
     projects: &RwLock<HashMap<Uuid, Project>>,
     storage: &Storage,
@@ -212,8 +223,13 @@ async fn delete_project_committed(
     let removed = proposed.remove(&id).is_some();
 
     if removed {
-        try_persist_projects(storage, &proposed)
-            .map_err(|e| format!("Failed to persist project deletion: {e}"))?;
+        storage.mark_project_conversation_deletion_pending(id)
+            .map_err(|e| format!("Failed to record Project Conversation cleanup: {e}"))?;
+        if let Err(error) = try_persist_projects(storage, &proposed) {
+            storage.clear_project_conversation_deletion_pending(id)
+                .map_err(|clear_error| format!("Failed to persist project deletion: {error}; also failed to clear its pending cleanup record: {clear_error}"))?;
+            return Err(format!("Failed to persist project deletion: {error}"));
+        }
 
         *projects_w = proposed;
 
@@ -221,9 +237,10 @@ async fn delete_project_committed(
         if let Err(e) = storage.delete_project_tasks(id) {
             eprintln!("Warning: Failed to delete project tasks: {}", e);
         }
-        if let Err(e) = storage.delete_project_conversation(id) {
-            eprintln!("Warning: Failed to delete project Conversation: {}", e);
-        }
+        storage.delete_project_conversation(id)
+            .map_err(|e| format!("Project was deleted, but Conversation cleanup is pending: {e}"))?;
+        storage.clear_project_conversation_deletion_pending(id)
+            .map_err(|e| format!("Project was deleted and Conversation cleanup completed, but its pending cleanup record remains: {e}"))?;
     }
 
     Ok(removed)
@@ -693,6 +710,9 @@ mod tests {
         let (storage, _temp) = make_storage_with_unreadable_config();
         let existing = make_test_project(Uuid::new_v4());
         let id = existing.id;
+        let conversation = storage.create_primary_conversation(id).unwrap();
+        let pointer = storage.paths().primary_conversation_file(id);
+        let document = storage.paths().conversation_file(conversation.id);
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
 
         let result = delete_project_committed(&projects, &storage, id).await;
@@ -705,6 +725,8 @@ mod tests {
             projects.read().await.contains_key(&id),
             "memory must still contain the project a failed deletion could not persist"
         );
+        assert!(pointer.exists());
+        assert!(document.exists());
     }
 
     #[tokio::test]
@@ -725,6 +747,55 @@ mod tests {
         assert!(!projects.read().await.contains_key(&id));
         assert!(!pointer.exists());
         assert!(!document.exists());
+        assert!(!storage.paths().pending_project_conversation_deletion_file(id).exists());
+    }
+
+    #[tokio::test]
+    async fn committed_project_deletion_reports_cleanup_failure_and_keeps_restart_record() {
+        let (storage, _temp) = create_test_storage();
+        storage.save_config(&AppConfig::default()).unwrap();
+        let project = make_test_project(Uuid::new_v4());
+        let id = project.id;
+        let conversation = storage.create_primary_conversation(id).unwrap();
+        let pointer = storage.paths().primary_conversation_file(id);
+        let document = storage.paths().conversation_file(conversation.id);
+        std::fs::write(&document, "malformed Conversation").unwrap();
+        let projects = RwLock::new(HashMap::from([(id, project)]));
+
+        let result = delete_project_committed(&projects, &storage, id).await;
+
+        assert!(result.is_err(), "cleanup failure must not be reported as success");
+        assert!(!projects.read().await.contains_key(&id));
+        assert!(pointer.exists());
+        assert_eq!(std::fs::read_to_string(document).unwrap(), "malformed Conversation");
+        assert!(storage.paths().pending_project_conversation_deletion_file(id).exists());
+    }
+
+    #[tokio::test]
+    async fn live_project_conversation_refuses_deletion_before_persistence() {
+        let (storage, _temp) = create_test_storage();
+        let project = make_test_project(Uuid::new_v4());
+        let id = project.id;
+        storage.save_config(&AppConfig {
+            projects: HashMap::from([(id.to_string(), project)]),
+            ..AppConfig::default()
+        }).unwrap();
+        let conversation = storage.create_primary_conversation(id).unwrap();
+        let pointer = storage.paths().primary_conversation_file(id);
+        let document = storage.paths().conversation_file(conversation.id);
+
+        let result = lock_project_conversation_for_deletion(
+            &crate::commands::conversation::ConversationState::new(),
+            &storage,
+            id,
+            |_| true,
+        ).await;
+
+        assert!(result.is_err());
+        assert!(pointer.exists());
+        assert!(document.exists());
+        assert!(storage.load_config_strict().unwrap().projects.contains_key(&id.to_string()));
+        assert!(!storage.paths().pending_project_conversation_deletion_file(id).exists());
     }
 
     #[cfg(unix)]

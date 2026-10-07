@@ -144,24 +144,30 @@ async fn load_or_create(state: &AppState, project_id: Uuid) -> Result<Conversati
         })
 }
 
+/// Recheck Project existence while the caller holds its Conversation lock.
+/// A pre-lock lookup can become stale while waiting behind Project deletion.
+async fn project_after_lock(
+    projects: &tokio::sync::RwLock<HashMap<Uuid, crate::domain::Project>>,
+    project_id: Uuid,
+) -> Result<crate::domain::Project, String> {
+    projects
+        .read()
+        .await
+        .get(&project_id)
+        .cloned()
+        .ok_or_else(|| "Project not found".to_string())
+}
+
 #[tauri::command]
 pub async fn open_project_conversation(
     state: tauri::State<'_, AppState>,
     project_id: String,
 ) -> Result<Snapshot, String> {
     let project_id = parse_id(&project_id, "Project id")?;
-    if !state
-        .project
-        .projects
-        .read()
-        .await
-        .contains_key(&project_id)
-    {
-        return Err("Project not found".into());
-    }
     let lock = state.conversation.project_lock(project_id);
     {
         let _guard = lock.lock().await;
+        project_after_lock(&state.project.projects, project_id).await?;
         load_or_create(&state, project_id).await?;
     }
     get_project_conversation(state, project_id.to_string()).await
@@ -199,6 +205,7 @@ pub async fn get_project_conversation(
     } else {
         let lock = state.conversation.project_lock(project_id);
         let _guard = lock.lock().await;
+        project_after_lock(&state.project.projects, project_id).await?;
         let mut conversation = state
             .storage
             .load_primary_conversation(project_id)
@@ -267,6 +274,7 @@ pub async fn retry_project_conversation_continuation(
     let _guard = lock
         .try_lock()
         .map_err(|_| "A Conversation mutation or continuation is already active".to_string())?;
+    project_after_lock(&state.project.projects, project_id).await?;
     let conversation = state
         .storage
         .load_primary_conversation(project_id)
@@ -308,18 +316,11 @@ pub async fn send_project_message(
 ) -> Result<Snapshot, String> {
     let project_id = parse_id(&project_id, "Project id")?;
     Conversation::validate_text(&message)?;
-    let project = state
-        .project
-        .projects
-        .read()
-        .await
-        .get(&project_id)
-        .cloned()
-        .ok_or("Project not found")?;
     let lock = state.conversation.project_lock(project_id);
     // Keep same-Conversation mutations serialized through the fresh Run and
     // its durable result so concurrent sends cannot race the projection.
     let _guard = lock.lock().await;
+    let project = project_after_lock(&state.project.projects, project_id).await?;
     let mut conversation = load_or_create(&state, project_id).await?;
     if state
         .executor
@@ -504,6 +505,7 @@ pub async fn act_on_project_conversation(
     let lock = state.conversation.project_lock(project_id);
     let (target_task_id, approved_status, request) = {
         let _guard = lock.lock().await;
+        project_after_lock(&state.project.projects, project_id).await?;
         let mut conversation = state
             .storage
             .load_primary_conversation(project_id)
@@ -653,6 +655,7 @@ pub async fn act_on_project_conversation(
     let run_lease = executor.begin_project_run(conversation_id, false).await?;
     {
         let _guard = lock.lock().await;
+        project_after_lock(&state.project.projects, project_id).await?;
         let mut conversation = state
             .storage
             .load_primary_conversation(project_id)
@@ -926,10 +929,22 @@ async fn continue_from_worker_result_locked(
 #[cfg(test)]
 mod tests {
     use super::{
-        can_reject, preserve_saved_conversation, record_human_approval, ContinuationError,
+        can_reject, preserve_saved_conversation, project_after_lock, record_human_approval,
+        ContinuationError,
     };
     use crate::domain::conversation::{ActionStatus, Conversation, EntryKind, Role, TaskAction};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn queued_conversation_open_rechecks_project_after_deletion() {
+        let project_id = Uuid::new_v4();
+        let projects = tokio::sync::RwLock::new(std::collections::HashMap::new());
+
+        let result = project_after_lock(&projects, project_id).await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Project not found");
+    }
 
     #[test]
     fn only_a_proposed_action_can_be_rejected() {
