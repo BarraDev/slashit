@@ -219,8 +219,6 @@ result="fake agent completed without changing the repository"
 if [ -n "$is_run" ] && grep -q '"returned_action"' "$prompt_file" 2>/dev/null &&
     ! grep -q '"current_message"' "$prompt_file" 2>/dev/null; then
     result='{"type":"reply","text":"Coordinator reviewed the Worker result."}'
-elif [ -n "$is_run" ] && grep -q '"approved_request"' "$prompt_file" 2>/dev/null; then
-    result="fake Worker completed approved work"
 elif [ -n "$is_run" ] && grep -q '"current_message"' "$prompt_file" 2>/dev/null; then
     forced_delegate_position=${SLASHIT_FAKE_COORDINATOR_DELEGATE_POSITION:-0}
     if [ "$coordinator_position" -eq "$forced_delegate_position" ]; then
@@ -245,6 +243,8 @@ elif [ -n "$is_run" ] && grep -q '"current_message"' "$prompt_file" 2>/dev/null;
         fi
         result="{\"type\":\"delegate_to_task\",\"text\":\"The existing Task is the right execution boundary.\",\"target_task_id\":\"$target\",\"request\":\"Add the approved marker.\"}"
     fi
+elif [ -n "$is_run" ] && grep -q '"approved_request"' "$prompt_file" 2>/dev/null; then
+    result="fake Worker completed approved work"
 fi
 escaped_result=$(printf '%s' "$result" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
 printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","result":"%s"}\n' "$session" "$escaped_result"
