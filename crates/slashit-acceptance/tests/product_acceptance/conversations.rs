@@ -81,6 +81,8 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         let task = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Existing Task","description":"A bounded implementation task","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
         let task_id = created_id(task.clone(), "create_task")?;
         ui::invoke(session.driver(), "create_worktree", json!({"taskId":task_id})).await?;
+        let unrelated = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Unrelated private Task sentinel","description":"Must not enter the Worker projection","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
+        let unrelated_task_id = created_id(unrelated, "create_task")?;
         open_board(session.driver(), &project_id).await?;
         ui::visible(session.driver(), PANEL).await?;
 
@@ -92,6 +94,18 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         if !proposal_text.contains("Existing Task") || !proposal_text.contains("right execution boundary") || !proposal_text.contains("Add the approved marker.") { bail!("the exact proposal is not visible: {proposal_text}"); }
         if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 1 { bail!("Worker ran before approval"); }
 
+        // Rejection is durable and must never start a Worker.
+        ui::visible(session.driver(), "[data-testid=\"conversation-action-reject\"]").await?.click().await?;
+        let rejected = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
+        if rejected["conversation"]["actions"].as_array().and_then(|actions| actions.first()).is_none_or(|action| action["status"] != "rejected") { bail!("rejection was not persisted"); }
+        if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 1 { bail!("reject started a Worker"); }
+
+        send_message(session.driver(), "Please propose the Task work again.", "Coordinator proposes Task work").await?;
+        let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
+        let proposal_text = proposal.text().await?;
+        if !proposal_text.contains("Existing Task") || !proposal_text.contains("Add the approved marker.") { bail!("the second proposal is not visible: {proposal_text}"); }
+        if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 2 { bail!("second proposal started a Worker before approval"); }
+
         let request = ui::visible(session.driver(), "[data-testid=\"conversation-action-request\"]").await?;
         request.clear().await?;
         request.send_keys("Edited authoritative request").await?;
@@ -101,7 +115,9 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
 
         let conversation = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
         let conversation_id = conversation["conversation"]["id"].as_str().context("Conversation id missing")?.to_string();
-        let action = conversation["conversation"]["actions"].as_array().and_then(|actions| actions.first()).context("Delegation action missing")?;
+        let actions = conversation["conversation"]["actions"].as_array().context("Delegation actions missing")?;
+        if actions.iter().any(|action| action["target_task_id"] == unrelated_task_id) { bail!("the unrelated Task was targeted"); }
+        let action = actions.iter().find(|action| action["status"] == "returned").context("Returned delegation action missing")?;
         if action["approved_request"] != "Edited authoritative request" || action["status"] != "returned" || action["coordinator_replied"] != true { bail!("approved payload/result state was not durably mediated: {action}"); }
         if conversation["coordinator_live"] != false || conversation["worker_live"] != false { bail!("completed delegation is still live"); }
 
@@ -110,13 +126,13 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         if persisted_task["status"] != "backlog" { bail!("TaskStatus was changed to represent Worker liveness: {}", persisted_task["status"]); }
         let invocations = agent.invocations()?;
         let runs = invocations.iter().filter(|invocation| invocation.prompt.is_some()).collect::<Vec<_>>();
-        if runs.len() != 3 { bail!("expected Coordinator, Worker, fresh Coordinator; observed {}", runs.len()); }
-        let worker = runs[1];
+        if runs.len() != 4 { bail!("expected Coordinator, rejected proposal Coordinator, Worker, fresh Coordinator; observed {}", runs.len()); }
+        let worker = runs[2];
         if !worker.working_dir.ends_with(persisted_task["worktree_path"].as_str().unwrap_or_default()) && worker.working_dir != Path::new(persisted_task["worktree_path"].as_str().unwrap_or_default()) { bail!("Worker did not run in target Task Checkout: {}", worker.working_dir.display()); }
         let worker_prompt = worker.prompt.as_deref().unwrap_or_default();
-        if !worker_prompt.contains("Edited authoritative request") || worker_prompt.contains("Please make a small change") || worker_prompt.contains("right execution boundary") { bail!("Worker context contains the wrong payload or hidden Coordinator history: {worker_prompt}"); }
+        if !worker_prompt.contains("Edited authoritative request") || worker_prompt.contains("Please make a small change") || worker_prompt.contains("right execution boundary") || worker_prompt.contains("Unrelated private Task sentinel") || worker_prompt.contains("Must not enter the Worker projection") { bail!("Worker context contains the wrong payload, hidden Coordinator history, or unrelated Task data: {worker_prompt}"); }
         if runs.iter().any(|run| run.args.iter().any(|arg| arg == "--resume" || arg == "--session-id")) { bail!("a fresh Run depended on provider continuity"); }
-        if !runs[2].prompt.as_deref().unwrap_or_default().contains("fake Worker completed approved work") { bail!("fresh Coordinator did not receive the mediated Worker result"); }
+        if !runs[3].prompt.as_deref().unwrap_or_default().contains("fake Worker completed approved work") { bail!("fresh Coordinator did not receive the mediated Worker result"); }
 
         send_message(session.driver(), "What should we do next?", "Fake Coordinator reply.").await?;
         let continued = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
