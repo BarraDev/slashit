@@ -1,27 +1,27 @@
-pub mod commands;
 pub mod domain;
+pub mod commands;
 
+pub mod test_helpers;
 mod acp;
+mod jj;
 mod agents;
-pub mod app_core;
 pub mod config;
+mod session;
+mod queue;
+mod pty;
+mod worktree;
+mod storage_accounting;
+/// What GitHub last said about the pull requests linked to tasks.
+pub mod pr_status;
+/// Building `AppState` once, for whichever front end wants it.
+pub mod lifecycle;
+pub mod app_core;
 /// Headless execution, sharing the whole stack with the GUI.
 pub mod daemon;
 /// Transport-neutral event emission, so the backend does not need a webview.
 pub mod events;
 /// What kind of process this is, and the few operations that differ.
 pub mod instance;
-mod jj;
-/// Building `AppState` once, for whichever front end wants it.
-pub mod lifecycle;
-/// What GitHub last said about the pull requests linked to tasks.
-pub mod pr_status;
-mod pty;
-mod queue;
-mod session;
-mod storage_accounting;
-pub mod test_helpers;
-mod worktree;
 // The control channel. No longer Unix-gated: the transport layer now provides
 // a Windows named pipe alongside the Unix socket, so the module compiles and
 // works on every supported platform.
@@ -267,8 +267,7 @@ pub fn run() {
                 use tauri::menu::{MenuBuilder, MenuItem};
                 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-                let toggle_i =
-                    MenuItem::with_id(app, "toggle", "Show/Hide SlashIt", true, None::<&str>)?;
+                let toggle_i = MenuItem::with_id(app, "toggle", "Show/Hide SlashIt", true, None::<&str>)?;
                 let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
                 let menu = MenuBuilder::new(app).items(&[&toggle_i, &quit_i]).build()?;
                 let tray_icon = tauri::include_image!("icons/32x32.png");

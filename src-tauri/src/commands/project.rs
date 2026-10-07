@@ -1,9 +1,9 @@
+use crate::domain::{Project, ProjectScope, AgentType, AgentConfig};
 use crate::config::{Storage, WorkspaceRegistry};
-use crate::domain::{AgentConfig, AgentType, Project, ProjectScope};
+use uuid::Uuid;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 type Projects = Arc<RwLock<HashMap<Uuid, Project>>>;
 
@@ -91,7 +91,8 @@ pub async fn create_project(
     agent_type: AgentType,
 ) -> Result<Project, String> {
     let id = Uuid::new_v4();
-    let repository_id = repository_id.and_then(|r| Uuid::parse_str(&r).ok());
+    let repository_id = repository_id
+        .and_then(|r| Uuid::parse_str(&r).ok());
 
     let agent_config = get_default_agent_config(&agent_type);
     let now = chrono::Utc::now();
@@ -100,13 +101,7 @@ pub async fn create_project(
     // project its local base now, so that tasks keep starting there however
     // the primary checkout moves later. See `worktree::project_base`.
     let repository_path = match repository_id {
-        Some(id) => state
-            .repository
-            .repositories
-            .read()
-            .await
-            .get(&id)
-            .map(|r| r.local_path.clone()),
+        Some(id) => state.repository.repositories.read().await.get(&id).map(|r| r.local_path.clone()),
         None => None,
     };
     let base = crate::commands::repository_setup::captured_base(repository_path.as_deref()).await;
@@ -255,15 +250,7 @@ pub async fn update_project(
     agent_type: Option<AgentType>,
 ) -> Result<Option<Project>, String> {
     let id = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-    update_project_committed(
-        &state.project.projects,
-        &state.storage,
-        id,
-        name,
-        repository_id,
-        agent_type,
-    )
-    .await
+    update_project_committed(&state.project.projects, &state.storage, id, name, repository_id, agent_type).await
 }
 
 /// Core of [`update_project`]; see [`create_project_committed`] for why the
@@ -372,8 +359,7 @@ pub async fn detach_project_from_workspace(
     project_id: String,
 ) -> Result<Project, String> {
     let project_id = Uuid::parse_str(&project_id).map_err(|e| e.to_string())?;
-    detach_project_from_workspace_committed(&state.project.projects, &state.storage, project_id)
-        .await
+    detach_project_from_workspace_committed(&state.project.projects, &state.storage, project_id).await
 }
 
 /// Core of [`detach_project_from_workspace`]; see [`create_project_committed`]
@@ -481,10 +467,7 @@ mod tests {
         );
         let valid = toml::to_string_pretty(&seeded).expect("serialize fixture");
         let poisoned = valid.replace("placement = \"managed\"", "placement = \"shared_root\"");
-        assert_ne!(
-            poisoned, valid,
-            "fixture must invalidate the placement variant"
-        );
+        assert_ne!(poisoned, valid, "fixture must invalidate the placement variant");
         std::fs::write(storage.paths().config_file(), &poisoned).expect("write fixture");
 
         let mut projects = HashMap::new();
@@ -518,16 +501,11 @@ mod tests {
 
         try_persist_projects(&storage, &projects).expect("should succeed against a missing config");
 
-        let loaded = storage
-            .load_config()
-            .expect("should load the freshly written config");
+        let loaded = storage.load_config().expect("should load the freshly written config");
         assert_eq!(loaded.projects.len(), 1);
         assert!(loaded.projects.contains_key(&id.to_string()));
         // Everything else should still be plain defaults.
-        assert_eq!(
-            loaded.ui_preferences.theme,
-            AppConfig::default().ui_preferences.theme
-        );
+        assert_eq!(loaded.ui_preferences.theme, AppConfig::default().ui_preferences.theme);
     }
 
     #[cfg(unix)]
@@ -561,15 +539,9 @@ mod tests {
         // Restore permissions so the file can be inspected and cleaned up.
         std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        assert!(
-            result.is_err(),
-            "a read failure must not be treated as success"
-        );
+        assert!(result.is_err(), "a read failure must not be treated as success");
         let on_disk = std::fs::read(&config_path).unwrap();
-        assert_eq!(
-            on_disk, original_bytes,
-            "config on disk must be untouched by a failed persist"
-        );
+        assert_eq!(on_disk, original_bytes, "config on disk must be untouched by a failed persist");
     }
 
     #[test]
@@ -668,14 +640,8 @@ mod tests {
     fn make_storage_with_unreadable_config() -> (Storage, TempDir) {
         use std::os::unix::fs::PermissionsExt;
         let (storage, temp) = create_test_storage();
-        storage
-            .save_config(&AppConfig::default())
-            .expect("seed config");
-        std::fs::set_permissions(
-            storage.paths().config_file(),
-            std::fs::Permissions::from_mode(0o000),
-        )
-        .unwrap();
+        storage.save_config(&AppConfig::default()).expect("seed config");
+        std::fs::set_permissions(storage.paths().config_file(), std::fs::Permissions::from_mode(0o000)).unwrap();
         (storage, temp)
     }
 
@@ -691,10 +657,7 @@ mod tests {
 
         let result = create_project_committed(&projects, &storage, new_project.clone()).await;
 
-        assert!(
-            result.is_err(),
-            "a persistence failure must be reported, not swallowed"
-        );
+        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
         assert!(
             projects.read().await.is_empty(),
             "memory must not contain a project disk never recorded"
@@ -717,10 +680,7 @@ mod tests {
 
         let result = delete_project_committed(&projects, &storage, id).await;
 
-        assert!(
-            result.is_err(),
-            "a persistence failure must be reported, not swallowed"
-        );
+        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
         assert!(
             projects.read().await.contains_key(&id),
             "memory must still contain the project a failed deletion could not persist"
@@ -811,19 +771,10 @@ mod tests {
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
 
         let result = update_project_committed(
-            &projects,
-            &storage,
-            id,
-            Some("New Name".to_string()),
-            None,
-            None,
-        )
-        .await;
+            &projects, &storage, id, Some("New Name".to_string()), None, None,
+        ).await;
 
-        assert!(
-            result.is_err(),
-            "a persistence failure must be reported, not swallowed"
-        );
+        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
         assert_eq!(
             projects.read().await.get(&id).unwrap().name,
             original_name,
@@ -842,9 +793,8 @@ mod tests {
     fn registered_workspace() -> RegisteredWorkspace {
         let root = TempDir::new().expect("workspace root tempdir");
         let registry_dir = TempDir::new().expect("registry tempdir");
-        let mut registry =
-            WorkspaceRegistry::load_from(registry_dir.path().join("workspaces.toml"))
-                .expect("a missing registry file should load empty");
+        let mut registry = WorkspaceRegistry::load_from(registry_dir.path().join("workspaces.toml"))
+            .expect("a missing registry file should load empty");
         let workspace = crate::domain::Workspace::new(
             "ws".to_string(),
             crate::domain::WorkspaceRoot::try_new(root.path()).expect("real dir must validate"),
@@ -868,15 +818,9 @@ mod tests {
         let ws = registered_workspace();
         let workspace_id = ws.id;
 
-        let result = attach_project_to_workspace_committed(
-            &projects,
-            &ws.registry,
-            &storage,
-            id,
-            workspace_id,
-        )
-        .await
-        .expect("attaching a standalone project should succeed");
+        let result = attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, workspace_id)
+            .await
+            .expect("attaching a standalone project should succeed");
 
         assert_eq!(result.scope.workspace_id(), Some(workspace_id));
         assert_eq!(
@@ -902,20 +846,14 @@ mod tests {
         let mut existing = make_test_project(Uuid::new_v4());
         let id = existing.id;
         let original_workspace_id = Uuid::new_v4();
-        existing.scope = ProjectScope::InWorkspace {
-            workspace_id: original_workspace_id,
-        };
+        existing.scope = ProjectScope::InWorkspace { workspace_id: original_workspace_id };
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
         let ws = registered_workspace();
 
         let result =
-            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, ws.id)
-                .await;
+            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, ws.id).await;
 
-        assert!(
-            result.is_err(),
-            "re-parenting an already-attached project must be refused"
-        );
+        assert!(result.is_err(), "re-parenting an already-attached project must be refused");
         assert_eq!(
             projects.read().await.get(&id).unwrap().scope.workspace_id(),
             Some(original_workspace_id),
@@ -929,19 +867,11 @@ mod tests {
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
         let ws = registered_workspace();
 
-        let result = attach_project_to_workspace_committed(
-            &projects,
-            &ws.registry,
-            &storage,
-            Uuid::new_v4(),
-            ws.id,
-        )
-        .await;
+        let result =
+            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, Uuid::new_v4(), ws.id)
+                .await;
 
-        assert!(
-            result.is_err(),
-            "attaching a project that does not exist must be refused"
-        );
+        assert!(result.is_err(), "attaching a project that does not exist must be refused");
     }
 
     #[tokio::test]
@@ -952,14 +882,9 @@ mod tests {
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
         let ws = registered_workspace();
 
-        let result = attach_project_to_workspace_committed(
-            &projects,
-            &ws.registry,
-            &storage,
-            id,
-            Uuid::new_v4(),
-        )
-        .await;
+        let result =
+            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, Uuid::new_v4())
+                .await;
 
         assert_eq!(result.unwrap_err(), "Workspace not found");
         assert_eq!(
@@ -992,8 +917,7 @@ mod tests {
         let ws = registered_workspace();
 
         let result =
-            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, ws.id)
-                .await;
+            attach_project_to_workspace_committed(&projects, &ws.registry, &storage, id, ws.id).await;
 
         let error = result.expect_err("a persistence failure must be reported, not swallowed");
         assert!(
@@ -1012,9 +936,7 @@ mod tests {
         let (storage, _temp) = create_test_storage();
         let mut existing = make_test_project(Uuid::new_v4());
         let id = existing.id;
-        existing.scope = ProjectScope::InWorkspace {
-            workspace_id: Uuid::new_v4(),
-        };
+        existing.scope = ProjectScope::InWorkspace { workspace_id: Uuid::new_v4() };
         let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::from([(id, existing)]));
 
         let result = detach_project_from_workspace_committed(&projects, &storage, id)
@@ -1043,10 +965,7 @@ mod tests {
 
         let result = detach_project_from_workspace_committed(&projects, &storage, id).await;
 
-        assert!(
-            result.is_err(),
-            "detaching an already-standalone project must be refused"
-        );
+        assert!(result.is_err(), "detaching an already-standalone project must be refused");
     }
 
     #[tokio::test]
@@ -1057,10 +976,7 @@ mod tests {
         let result =
             detach_project_from_workspace_committed(&projects, &storage, Uuid::new_v4()).await;
 
-        assert!(
-            result.is_err(),
-            "detaching a project that does not exist must be refused"
-        );
+        assert!(result.is_err(), "detaching a project that does not exist must be refused");
     }
 
     #[cfg(unix)]
@@ -1078,10 +994,7 @@ mod tests {
 
         let result = detach_project_from_workspace_committed(&projects, &storage, id).await;
 
-        assert!(
-            result.is_err(),
-            "a persistence failure must be reported, not swallowed"
-        );
+        assert!(result.is_err(), "a persistence failure must be reported, not swallowed");
         assert_eq!(
             projects.read().await.get(&id).unwrap().scope.workspace_id(),
             Some(workspace_id),
@@ -1110,46 +1023,28 @@ mod tests {
         std::fs::write(&registry_file, "this is [[not toml").unwrap();
         let reloaded = WorkspaceRegistry::load_from(registry_file)
             .expect("a corrupt registry is quarantined, not fatal");
-        assert!(
-            reloaded.get(&lost.id).is_none(),
-            "the workspace must now be missing"
-        );
+        assert!(reloaded.get(&lost.id).is_none(), "the workspace must now be missing");
         let survivor = registered_workspace();
 
-        let refused = attach_project_to_workspace_committed(
-            &projects,
-            &survivor.registry,
-            &storage,
-            id,
-            survivor.id,
-        )
-        .await;
-        assert!(
-            refused.is_err(),
-            "a dangling membership must not be silently re-parented"
-        );
+        let refused =
+            attach_project_to_workspace_committed(&projects, &survivor.registry, &storage, id, survivor.id)
+                .await;
+        assert!(refused.is_err(), "a dangling membership must not be silently re-parented");
 
         let detached = detach_project_from_workspace_committed(&projects, &storage, id)
             .await
             .expect("detaching must not require the lost workspace to exist");
         assert_eq!(detached.scope.workspace_id(), None);
         assert_eq!(
-            storage.load_config().unwrap().projects[&id.to_string()]
-                .scope
-                .workspace_id(),
+            storage.load_config().unwrap().projects[&id.to_string()].scope.workspace_id(),
             None,
             "the detachment must be persisted"
         );
 
-        let reattached = attach_project_to_workspace_committed(
-            &projects,
-            &survivor.registry,
-            &storage,
-            id,
-            survivor.id,
-        )
-        .await
-        .expect("a detached project is attachable again");
+        let reattached =
+            attach_project_to_workspace_committed(&projects, &survivor.registry, &storage, id, survivor.id)
+                .await
+                .expect("a detached project is attachable again");
         assert_eq!(reattached.scope.workspace_id(), Some(survivor.id));
     }
 }

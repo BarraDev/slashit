@@ -58,9 +58,16 @@ Task       1    ── 0..1  Task Checkout  (according to lifecycle state)
 - **A Workspace with members cannot be deleted.** Deletion is refused while
   any Project's scope still names it, so no Project is left pointing at a
   Workspace that no longer exists.
-
-- **A Conversation belongs to its Project.** The Project's primary Conversation has its own durable id and an ordered SlashIt-owned history. It can be opened and used when the Project has no Tasks and does not require a Task Checkout. A Workspace member Project keeps its own Conversation; Workspaces do not own Conversations.
-- **Tasks are Project resources, not Conversation owners.** The Project Coordinator can discuss bounded Task metadata and propose a structured delegation to one existing Task. A human must approve the exact request before a Task Worker runs in that Task's existing Checkout. The Worker result is recorded back into the Project Conversation.
+- **A Conversation belongs to its Project.** The Project's primary
+  Conversation has its own durable id and an ordered SlashIt-owned history.
+  It can be opened and used when the Project has no Tasks and does not
+  require a Task Checkout. A Workspace member Project keeps its own
+  Conversation; Workspaces do not own Conversations.
+- **Tasks are Project resources, not Conversation owners.** The Project
+  Coordinator can discuss bounded Task metadata and propose a structured
+  delegation to one existing Task. A human must approve the exact request
+  before a Task Worker runs in that Task's existing Checkout. The Worker
+  result is recorded back into the Project Conversation.
 - **A Task Checkout belongs to exactly one Task.** It is created or
   reattached when the Task is executed or when a checkout is requested for
   it, and it survives the end of a run, so the next run continues from the

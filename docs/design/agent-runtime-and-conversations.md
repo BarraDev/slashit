@@ -66,6 +66,26 @@ result is durable, recovery continues with a fresh Coordinator Run rather than
 rerunning the Worker. This prevents automatic replay; it does not promise
 exactly-once external or repository side effects across crashes.
 
+### Deleting a Project
+
+Deleting a Project removes its Conversation, so the order of writes matters.
+Deletion first takes the Project's Conversation lock and refuses while a
+Conversation Run is live. It then writes a durable `<project-id>.delete-pending`
+record next to the Conversation files, removes the Project from config, deletes
+the Conversation document and then its pointer, and finally clears the record.
+The pointer is the last thing removed, so a partial cleanup always leaves a
+reference from which it can be retried.
+
+At startup each record is resolved against the config as loaded without
+salvage and with an explicit `projects` section; a fallback or defaulted config
+cannot prove that a Project is gone, so when that load fails every record is
+left for a later start. If the Project is still present, removal
+never committed and the record is discarded. If it is absent, the record
+authorizes the retry, including a strict scan for a Conversation document whose
+pointer was never published. Documents are only deleted when they prove both
+their own id and their owning Project. Any failure leaves the record in place
+and is reported at startup rather than treated as success.
+
 ## Supervision boundaries
 
 - Managed supervision covers only executions SlashIt started or explicitly
@@ -88,8 +108,8 @@ carried out), and the ended `Stopped` and `Failed`. `get_task_run` and
 `get_live_runs` read the registry, and `AgentEvent::RunState` announces each
 change, with the ended states sent last. PR side-effect reservations share an
 executor map for task-exclusivity but are not provider runs and are excluded
-from live-run and agent-count projections. Nothing about a live Run is persisted: after a restart there is no Run until
-SlashIt starts one. Project Conversation runs are separately registered in the
+from live-run and agent-count projections. Nothing about a live Run is
+persisted: after a restart there is no Run until SlashIt starts one. Project Conversation runs are separately registered in the
 same executor by Conversation UUID, share its admission capacity, and expose a
 stop signal without manufacturing a Task identity. `AgentSlotStatus`
 and the workflow `AgentSlot`s are static templates that no execution updates,

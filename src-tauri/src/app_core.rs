@@ -193,10 +193,12 @@ pub async fn build_state_with_paths(
         report.projects = projects.len();
     }
 
-    // Recovery uses only a successfully loaded config. Treating a fallback
-    // empty config as authoritative could delete history for a live Project.
-    // A present Project means removal never committed; an absent one means the
-    // marker authorizes retrying Conversation cleanup after restart.
+    // Absence of a Project is trusted only from a config loaded without
+    // salvage: a fallback or defaulted config makes every Project look
+    // deleted and would destroy a live Project's history. Without that
+    // proof every record is left for a later start. With it, a present
+    // Project means its removal never committed (drop the record); an absent
+    // one means the record authorizes finishing Conversation cleanup.
     if projects_are_authoritative {
         match app_state.storage.pending_project_conversation_deletions() {
             Ok(pending) => {
