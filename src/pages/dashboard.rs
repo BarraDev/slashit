@@ -149,7 +149,7 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
 
     view! {
         <div class="h-full flex flex-col">
-            <ProjectConversation project_id=project_id.clone() />
+            <ProjectConversation project_id=project_id.clone() on_tasks_changed=refresh_tasks />
             {move || {
                 let project_id_kanban = project_id_for_kanban.clone();
                 let project_id_bulk = project_id_for_bulk.clone();

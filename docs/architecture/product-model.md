@@ -68,6 +68,16 @@ Task       1    ── 0..1  Task Checkout  (according to lifecycle state)
   delegation to one existing Task. A human must approve the exact request
   before a Task Worker runs in that Task's existing Checkout. The Worker
   result is recorded back into the Project Conversation.
+- **The Coordinator operates SlashIt through explicit capabilities.** It
+  does not edit repository files, own a Task Checkout or run Task
+  implementation. Creating a Task and editing a Task's title, description,
+  priority or category are Human-gated capabilities: the Coordinator
+  proposes, a Human approves the exact proposal, and the result is an
+  ordinary Project Task in Backlog or the same Task with those fields
+  changed. Neither capability queues, starts or checks out a Task;
+  execution stays Task lifecycle scope. Today the Coordinator's scope is one
+  Project. A Workspace-level Coordinator is possible later and is not
+  implemented.
 - **A Task Checkout belongs to exactly one Task.** It is created or
   reattached when the Task is executed or when a checkout is requested for
   it, and it survives the end of a run, so the next run continues from the
@@ -261,6 +271,7 @@ The procedure is in [development-workflow.md](../development-workflow.md).
 | Project, ProjectScope | `domain::Project`, `domain::ProjectScope` (`Project.scope`); attach/detach in `commands/project.rs` |
 | Task | `domain::Task` |
 | Project Conversation | `domain::conversation::Conversation`, private storage in `commands/conversation.rs` and `config::Storage` |
+| Coordinator Task capabilities | `domain::conversation::ProjectAction`, executed by `conversation_actions.rs` through `lifecycle::create` and `lifecycle::record_if_changed` |
 | Task Checkout | `Task.worktree_path`, `branch_name`, `base_commit`, `branch_origin` (`domain::BranchOrigin`); `worktree::WorktreeManager` |
 | Base of a Task's branch | `worktree::default_base`, `Project.base` (`domain::ProjectBase`), `worktree::project_base` |
 | Repository readiness and setup | `worktree::readiness`, `worktree::remote_head`, `worktree::vcs_init`; `commands/repository_setup.rs` |

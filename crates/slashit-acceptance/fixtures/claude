@@ -228,6 +228,12 @@ elif [ -n "$is_run" ] && grep -q '"current_message"' "$prompt_file" 2>/dev/null;
     else
         result=${SLASHIT_FAKE_COORDINATOR_OUTPUT:-'{"type":"reply","text":"Fake Coordinator reply."}'}
     fi
+    # A journey that cannot know its Task ids up front writes the exact output
+    # for the Nth Coordinator run to `.coordinator-output/N` in the marker dir.
+    scripted_output="$SLASHIT_FAKE_AGENT_MARKERS/.coordinator-output/$coordinator_position"
+    if [ -r "$scripted_output" ]; then
+        result=$(cat "$scripted_output")
+    fi
     if [ "$result" = "delegate_to_task" ]; then
         target=${SLASHIT_FAKE_COORDINATOR_TARGET_TASK_ID:-}
         if [ -z "$target" ] && [ -r "$SLASHIT_FAKE_AGENT_MARKERS/.coordinator-target/id" ]; then

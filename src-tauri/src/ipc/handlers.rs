@@ -165,54 +165,25 @@ async fn handle_create_task(
     };
 
     let priority = parse_priority(priority.as_deref());
-    let now = chrono::Utc::now();
-    let id = Uuid::new_v4();
-
+    let new = crate::domain::NewTask {
+        id: Uuid::new_v4(),
+        project_id: project_uuid,
+        title,
+        description,
+        model: "default".to_string(),
+        planning_mode: false,
+        dependencies: Vec::new(),
+        category: Default::default(),
+        priority,
+        complexity: Default::default(),
+        impact: Default::default(),
+        security_severity: Default::default(),
+        github_issue_url: None,
+        gitlab_issue_url: None,
+        linear_ticket_id: None,
+    };
     let result = crate::lifecycle::create(&ctx.tasks, &ctx.storage, project_uuid, move |existing| {
-        let position = crate::domain::Task::next_backlog_position(existing, project_uuid);
-        crate::domain::Task {
-            id,
-            project_id: project_uuid,
-            title,
-            description,
-            status: TaskStatus::Backlog,
-            model: "default".to_string(),
-            planning_mode: false,
-            dependencies: Vec::new(),
-            worktree_id: None,
-            jj_change_id: None,
-            category: Default::default(),
-            priority,
-            complexity: Default::default(),
-            impact: Default::default(),
-            security_severity: Default::default(),
-            phase: Default::default(),
-            phase_progress: 0,
-            overall_progress: 0,
-            subtasks: Vec::new(),
-            sequence_number: 0,
-            position,
-            github_issue_url: None,
-            gitlab_issue_url: None,
-            linear_ticket_id: None,
-            jira_issue_key: None,
-            pr_url: None,
-            external_refs: Vec::new(),
-            qa_signoff: None,
-            human_review: Default::default(),
-            stuck_since: None,
-            error_message: None,
-            worktree_path: None,
-            branch_name: None,
-            base_commit: None,
-            branch_origin: None,
-            pending_republish: None,
-            cleanup_in_flight: false,
-            pr_review_plan: None,
-            activity: Vec::new(),
-            created_at: now,
-            updated_at: now,
-        }
+        crate::domain::Task::new_backlog(existing, new)
     })
     .await;
 

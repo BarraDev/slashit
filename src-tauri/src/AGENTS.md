@@ -16,6 +16,7 @@ Backend source for Tauri v2. This folder contains all Rust backend code organize
 - **worktree/** - Git worktrees, the only Task Checkout backend, committing a Task Checkout's changes, proving a commit reached a pull request's remote branch (`delivery`: an exact-commit ancestry check after an explicit refresh, never inferred from a clean tree; a fix's recorded effect, everything that changed in the checkout during its agent's run, must still be in the remote branch as refreshed when a reply is posted, and it means "attributed to that run", not "satisfies the review comment"), task diffs, restacking a task branch onto a new base, scanning for Task Checkouts and task branches no Task owns and reclaiming them one at a time on request, the base a task branch starts from (origin's default branch, else the project's local base), and a project's repository readiness and explicit setup (version control initialization, detecting origin's default branch)
 - **queue/** - Task queue, admission, the disk-space start guard, the executor that launches agent runs, and the tool calls a run keeps for its task's activity timeline. The executor's handle maps are the one live-run registry: `task_run` and `live_runs` answer whether SlashIt owns a run for a task and in which `AgentStatus` (starting, running, stopping), and `AgentEvent::RunState` announces every change. A task's persisted status never answers that question
 - **pty/** - Terminal (PTY) sessions
+- **conversation_actions.rs** - Human-gated Task operations proposed from a Project Conversation (create, edit): the proposal, the decision, and the recoverable write order that keeps a retried approval from repeating its effect
 - **pr_status.rs** - What GitHub last said about the pull requests linked to tasks: the one place `gh pr view` runs for a status (bounded by a timeout), and the in-memory cache the executor's poll, the refresh commands and the board share. Never persisted
 - **storage_accounting/** - Read-only measurement of the disk SlashIt uses: which of it SlashIt owns, which is rebuildable, and how full the disk is. Never deletes anything
 - **ipc/** - Control channel server for the `slashit` CLI (see below)
@@ -71,7 +72,7 @@ crate: a Unix socket on Linux and macOS, a named pipe on Windows, and an
 optional loopback-only TCP listener that is off by default and requires a
 bearer token.
 
-Treat it as a privileged interface. `CreateTask` + `MoveTask(in_progress)`
+Treat it as a privileged interface. `IpcRequest::CreateTask` + `MoveTask(in_progress)`
 reaches the queue executor, which spawns an agent with full tool access, so it
 is a code-execution channel. Verbs with that reach are marked by
 `IpcRequest::spawns_agent()` and are denied to any peer the OS did not
