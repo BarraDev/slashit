@@ -224,6 +224,7 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         if !runs[6].prompt.as_deref().unwrap_or_default().contains("fake Worker completed approved work") { bail!("fresh Coordinator retry did not receive the persisted Worker result"); }
 
         submit_message(session.driver(), "What should we do next?").await?;
+        await_and_release_provider_run(&agent).await?;
         await_provider_invocation_count(&agent, 8).await?;
         let continued = await_conversation_idle(session.driver(), &project_id, 8).await?;
         let final_run_count = agent
