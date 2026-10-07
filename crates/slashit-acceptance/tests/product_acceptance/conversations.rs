@@ -223,10 +223,18 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         if runs.iter().any(|run| run.args.iter().any(|arg| arg == "--resume" || arg == "--session-id")) { bail!("a fresh Run depended on provider continuity"); }
         if !runs[6].prompt.as_deref().unwrap_or_default().contains("fake Worker completed approved work") { bail!("fresh Coordinator retry did not receive the persisted Worker result"); }
 
-        send_message(session.driver(), "What should we do next?", "Fake Coordinator reply.").await?;
-        let continued = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
+        submit_message(session.driver(), "What should we do next?").await?;
+        await_provider_invocation_count(&agent, 8).await?;
+        let continued = await_conversation_idle(session.driver(), &project_id, 8).await?;
+        let entries = continued["conversation"]["entries"].as_array().context("continued Conversation entries missing")?;
+        if !entries.iter().any(|entry| entry["kind"]["text"] == "Coordinator reviewed the Worker result.")
+            || !entries.iter().any(|entry| entry["kind"]["text"] == "Fake Coordinator reply.")
+        {
+            bail!("Conversation did not persist both the mediated reply and the later ordinary reply: {continued}");
+        }
+        await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Fake Coordinator reply.").await?;
         if continued["conversation"]["id"] != conversation_id { bail!("continued chat changed Conversation identity"); }
-        if continued["conversation"]["entries"].as_array().map_or(0, Vec::len) < 8 { bail!("Conversation did not remain open after Worker mediation"); }
+        if entries.len() < 8 { bail!("Conversation did not remain open after Worker mediation"); }
         context.close_session(session, "delegation", &Ok(())).await?;
         Ok::<_, anyhow::Error>(())
     }.await;
@@ -257,6 +265,24 @@ async fn await_blocked_provider_run(agent: &FakeAgent) -> Result<()> {
         }
         if started.elapsed() > EXECUTION_DEADLINE {
             bail!("fake provider did not reach its deterministic blocking gate");
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn await_provider_invocation_count(agent: &FakeAgent, expected: usize) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let count = agent
+            .invocations()?
+            .iter()
+            .filter(|invocation| invocation.prompt.is_some())
+            .count();
+        if count >= expected {
+            return Ok(());
+        }
+        if started.elapsed() > EXECUTION_DEADLINE {
+            bail!("expected {expected} provider invocations, observed {count}");
         }
         tokio::time::sleep(POLL).await;
     }
