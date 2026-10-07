@@ -126,12 +126,35 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         await_text(session.driver(), "[data-testid=\"conversation-worker-result\"]", "fake Worker completed approved work").await?;
         if let Err(error) = await_text(session.driver(), "[data-testid=\"conversation-message\"]", "Coordinator reviewed the Worker result.").await {
             let latest = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
-            let prompts = agent.invocations()?.into_iter().filter_map(|run| run.prompt.map(|prompt| json!({
-                "working_dir":run.working_dir,
-                "args":run.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>(),
-                "prompt":prompt,
-            }))).collect::<Vec<_>>();
-            bail!("{error}; persisted snapshot after timeout: {latest}; fake provider runs: {prompts:#?}");
+            let entries = latest["conversation"]["entries"].as_array().map(|entries| entries.iter().rev().take(12).map(|entry| json!({
+                "role":entry["role"],
+                "kind":entry["kind"]["kind"],
+                "text_excerpt":entry["kind"]["text"].as_str().map(|text| text.chars().take(160).collect::<String>()),
+            })).collect::<Vec<_>>()).unwrap_or_default();
+            let actions = latest["conversation"]["actions"].as_array().map(|actions| actions.iter().map(|action| json!({
+                "id":action["id"],
+                "status":action["status"],
+                "coordinator_replied":action["coordinator_replied"],
+            })).collect::<Vec<_>>()).unwrap_or_default();
+            let state_summary = json!({
+                "conversation_id":latest["conversation"]["id"],
+                "revision":latest["conversation"]["revision"],
+                "coordinator_live":latest["coordinator_live"],
+                "worker_live":latest["worker_live"],
+                "recent_entries":entries,
+                "actions":actions,
+            });
+            let runs = agent.invocations()?.into_iter().filter_map(|run| run.prompt.map(|prompt| {
+                let excerpt = prompt.chars().take(1000).collect::<String>();
+                let truncated = prompt.chars().count() > 1000;
+                json!({
+                    "working_directory":run.working_dir.file_name(),
+                    "has_returned_action":prompt.contains("\"returned_action\""),
+                    "has_worker_result":prompt.contains("fake Worker completed approved work"),
+                    "prompt_excerpt":if truncated { format!("{excerpt}… [truncated]") } else { excerpt },
+                })
+            })).collect::<Vec<_>>();
+            bail!("{error}; persisted state summary: {state_summary}; fake provider run diagnostics: {runs:#?}");
         }
 
         let conversation = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
