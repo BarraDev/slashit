@@ -67,7 +67,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let request = initial_begin_request.run(());
         let publish = initial_publish.clone();
         spawn_local(async move {
-            match conversation_service::get_project_conversation(id).await {
+            match conversation_service::open_project_conversation(id).await {
                 Ok(value) => publish.run((request, value)),
                 Err(error) => set_error.set(Some(error)),
             }
@@ -150,13 +150,19 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let retry_publish = publish_snapshot.clone();
     let retry_coordinator = Callback::new(move |()| {
         if busy.get_untracked() { return; }
+        let Some(current) = snapshot.get_untracked() else { return; };
+        let Some(action_id) = current.conversation.actions.iter()
+            .find(|action| action.status == ConversationActionStatus::Returned && !action.coordinator_replied)
+            .map(|action| action.id.to_string()) else { return; };
         set_busy.set(true);
         set_error.set(None);
         let id = retry_project_id.clone();
         let request = retry_begin_request.run(());
         let publish = retry_publish.clone();
         spawn_local(async move {
-            match conversation_service::get_project_conversation(id).await {
+            match conversation_service::retry_project_conversation_continuation(
+                id, current.conversation.id.to_string(), current.conversation.revision, action_id,
+            ).await {
                 Ok(value) => publish.run((request, value)),
                 Err(error) => set_error.set(Some(error)),
             }
@@ -220,15 +226,21 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                     let status = if value.worker_live { "Worker is running in the Task Checkout" } else if value.coordinator_live { "Coordinator is responding" } else { "Conversation is ready" };
                     view! { <div data-testid="conversation-run-state" class="mb-2 text-xs text-white/50">{status}</div> }
                 })}
-                {move || snapshot.get().and_then(|value| value.continuation_error.map(|message| {
-                    let retry = retry_coordinator.clone();
-                    view! {
-                        <div data-testid="conversation-continuation-error" class="mb-3 rounded border border-amber-300/30 bg-amber-400/5 p-3 text-sm text-amber-100">
-                            <p>{message}</p>
-                            <button data-testid="conversation-retry-coordinator" class="mt-2 rounded border border-amber-200/30 px-3 py-1" disabled=move || busy.get() on:click=move |_| retry.run(())>"Retry Coordinator response"</button>
-                        </div>
-                    }
-                }))}
+                {move || {
+                    snapshot.get().and_then(|value| {
+                        value.conversation.actions.iter()
+                            .find(|action| action.status == ConversationActionStatus::Returned && !action.coordinator_replied)
+                            .map(|_| {
+                                let retry = retry_coordinator.clone();
+                                view! {
+                                    <div data-testid="conversation-continuation-error" class="mb-3 rounded border border-amber-300/30 bg-amber-400/5 p-3 text-sm text-amber-100">
+                                        <p>{value.continuation_error.unwrap_or_else(|| "The Worker result is saved and awaits a Coordinator response.".into())}</p>
+                                        <button data-testid="conversation-retry-coordinator" class="mt-2 rounded border border-amber-200/30 px-3 py-1" disabled=move || busy.get() on:click=move |_| retry.run(())>"Retry Coordinator response"</button>
+                                    </div>
+                                }
+                            })
+                    })
+                }}
                 {move || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value)).then(|| view! {
                     <p data-testid="conversation-awaiting-mediation" class="mb-2 text-xs text-amber-100/80">"A saved Worker result must be reviewed before you send another message."</p>
                 })}

@@ -54,6 +54,14 @@ async fn zero_task_project_conversation_replies_and_survives_restart() {
             if !run.args.iter().any(|arg| arg == "Read,Glob,Grep") { bail!("Project Coordinator was not restricted to read-only tools"); }
             if run.args.iter().any(|arg| arg == "--resume" || arg == "--session-id") { bail!("Coordinator run depended on provider session continuity"); }
         }
+        let second_prompt = runs[1].prompt.as_deref().unwrap_or_default();
+        let projection_json = second_prompt
+            .split_once("Project context projection (JSON):\n")
+            .and_then(|(_, rest)| rest.split_once("\n\nReturn exactly one JSON object").map(|(json, _)| json))
+            .context("second Coordinator projection JSON missing")?;
+        let projection: Value = serde_json::from_str(projection_json)?;
+        if projection["current_message"] != "Can we keep discussing?" { bail!("second turn current_message was wrong: {projection}"); }
+        if projection["recent_history"].to_string().contains("Can we keep discussing?") { bail!("current Human message was duplicated into recent history: {projection}"); }
         context.close_session(session, "zero-tasks", &Ok(())).await?;
 
         let restarted = context.start_session("zero-tasks-restart").await?;
@@ -92,7 +100,9 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         ui::invoke(session.driver(), "create_worktree", json!({"taskId":task_id})).await?;
         let target_config = agent.marker_dir().join(".coordinator-target");
         std::fs::create_dir_all(&target_config)?;
-        std::fs::write(target_config.join("id"), &task_id)?;
+        let stale_target = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Task to remove before rejection","description":"A stale proposal target","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
+        let stale_target_id = created_id(stale_target, "create stale proposal target")?;
+        std::fs::write(target_config.join("id"), &stale_target_id)?;
         let unrelated = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Unrelated private Task sentinel","description":"Must not enter the Worker projection","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
         let unrelated_task_id = created_id(unrelated, "create_task")?;
         open_board(session.driver(), &project_id).await?;
@@ -108,12 +118,15 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         if field_value(session.driver(), "[data-testid=\"conversation-action-request\"]").await? != "Add the approved marker." { bail!("the exact proposed request is not visible in its editable field"); }
         if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 1 { bail!("Worker ran before approval"); }
 
-        // Rejection is durable and must never start a Worker.
+        // Rejection remains a Conversation decision even if its target was
+        // deleted after proposal. It must never start a Worker.
+        ui::invoke(session.driver(), "delete_task", json!({"taskId":stale_target_id})).await?;
         ui::visible(session.driver(), "[data-testid=\"conversation-action-reject\"]").await?.click().await?;
         let rejected = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
         if rejected["conversation"]["actions"].as_array().and_then(|actions| actions.first()).is_none_or(|action| action["status"] != "rejected") { bail!("rejection was not persisted"); }
         if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 1 { bail!("reject started a Worker"); }
 
+        std::fs::write(target_config.join("id"), &task_id)?;
         send_message(session.driver(), "Please propose the Task work again.", "Coordinator proposes Task work").await?;
         let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
         let proposal_text = proposal.text().await?;
@@ -132,6 +145,13 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         if !super::text_of(session.driver(), "[data-testid=\"conversation-history\"]").await?.unwrap_or_default().contains("fake Worker completed approved work") {
             bail!("a failed Coordinator follow-up hid the durable Worker result");
         }
+        let before_explicit_retry = agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count();
+        for _ in 0..3 {
+            let pending = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
+            if pending["conversation"]["actions"].as_array().is_none_or(|actions| !actions.iter().any(|action| action["status"] == "returned" && action["coordinator_replied"] == false)) { bail!("GET did not preserve the visible unmediated result: {pending}"); }
+        }
+        let after_reads = agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count();
+        if after_reads != before_explicit_retry { bail!("GET unexpectedly launched provider work ({before_explicit_retry} -> {after_reads})"); }
         ui::visible(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?.click().await?;
         await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Coordinator reviewed the Worker result.").await?;
         let worker_runs = agent.invocations()?.iter().filter(|run| run.prompt.as_deref().is_some_and(|prompt| prompt.contains("Execute only approved_request in this Task Checkout"))).count();

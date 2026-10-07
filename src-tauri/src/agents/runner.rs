@@ -16,9 +16,17 @@ pub const READ_ONLY_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
 /// `--tools`. Redundant while `--tools` behaves as documented; it keeps the
 /// run read-only if a later CLI adds one of these back to the default set.
 pub const READ_ONLY_DENIED_TOOLS: &[&str] = &[
-    "Bash", "PowerShell", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
+    "Bash",
+    "PowerShell",
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
     // The subagent tool, under its older and current names.
-    "Task", "Agent", "Skill",
+    "Task",
+    "Agent",
+    "Skill",
 ];
 
 /// The oldest Claude Code release that accepts `--restricted`.
@@ -71,13 +79,19 @@ pub fn result_failure_reason(event: &serde_json::Value) -> Option<String> {
     if event.get("type").and_then(|t| t.as_str()) != Some("result") {
         return None;
     }
-    let is_error = event.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+    let is_error = event
+        .get("is_error")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false);
     let subtype = event.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
     if !is_error && !subtype.contains("error") && !subtype.contains("max_turns") {
         return None;
     }
 
-    let terminal_reason = event.get("terminal_reason").and_then(|s| s.as_str()).unwrap_or("");
+    let terminal_reason = event
+        .get("terminal_reason")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
     let mut reason = if !subtype.is_empty() && subtype != "success" {
         subtype.to_string()
     } else if !terminal_reason.is_empty() {
@@ -116,7 +130,10 @@ pub fn result_failure_reason(event: &serde_json::Value) -> Option<String> {
 /// `s` on one line: its non-blank lines, ended by `\n` or `\r`, joined with
 /// ` / `.
 fn one_line(s: &str) -> String {
-    s.split(['\n', '\r']).filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().join(" / ")
+    s.split(['\n', '\r'])
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// `s` on one line (see [`one_line`]), cut to its first `max` characters
@@ -180,9 +197,11 @@ fn failed_exit_reason(
     let signal: Option<i32> = None;
 
     let (head, structured, prompt_failure) = match (status.code(), signal) {
-        (Some(code), _) => {
-            (format!("Exit code {code}"), result_event.and_then(result_failure_reason), prompt_failure)
-        }
+        (Some(code), _) => (
+            format!("Exit code {code}"),
+            result_event.and_then(result_failure_reason),
+            prompt_failure,
+        ),
         (None, Some(signal)) => (format!("Terminated by signal {signal}"), None, None),
         (None, None) => ("Exit code unknown".to_string(), None, None),
     };
@@ -290,7 +309,10 @@ pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
             push("--restricted");
             true
         }
-        ToolAccess::Full { auto_approve, permission_mode } => {
+        ToolAccess::Full {
+            auto_approve,
+            permission_mode,
+        } => {
             if !auto_approve.is_empty() {
                 push("--allowedTools");
                 push(&auto_approve.join(","));
@@ -360,19 +382,30 @@ pub fn claude_args(config: &ClaudeRunConfig) -> Vec<std::ffi::OsString> {
 pub enum ClaudeEvent {
     /// Session initialized
     #[serde(rename = "system_init")]
-    SystemInit { session_id: String, model: Option<String>, message: Option<String> },
+    SystemInit {
+        session_id: String,
+        model: Option<String>,
+        message: Option<String>,
+    },
     /// Partial text output (streaming)
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
     /// Agent is using a tool
     #[serde(rename = "tool_use")]
-    ToolUse { tool: String, input: Option<serde_json::Value> },
+    ToolUse {
+        tool: String,
+        input: Option<serde_json::Value>,
+    },
     /// Full assistant message received
     #[serde(rename = "assistant_message")]
     AssistantMessage { content: serde_json::Value },
     /// Final result
     #[serde(rename = "result")]
-    Result { session_id: String, text: String, is_error: bool },
+    Result {
+        session_id: String,
+        text: String,
+        is_error: bool,
+    },
     /// Error during execution
     #[serde(rename = "error")]
     Error { message: String },
@@ -517,7 +550,8 @@ impl ClaudeRunner {
         // nothing pointing at it.
         cmd.kill_on_drop(true);
 
-        let mut child = cmd.spawn()
+        let mut child = cmd
+            .spawn()
             .map_err(|e| format!("Failed to spawn claude: {}. Is claude CLI installed?", e))?;
         eprintln!("[claude-runner] spawned pid={:?}", child.id());
 
@@ -566,8 +600,11 @@ impl ClaudeRunner {
         let handle = runner.start_reader(stdout);
         *runner.reader_handle.lock().await = Some(handle);
         *runner.stderr_handle.lock().await = stderr.map(Self::start_stderr_drain);
-        *runner.prompt_writer.lock().await =
-            Some(Self::start_prompt_writer(stdin, config.prompt, prompt_written));
+        *runner.prompt_writer.lock().await = Some(Self::start_prompt_writer(
+            stdin,
+            config.prompt,
+            prompt_written,
+        ));
 
         Ok(runner)
     }
@@ -633,9 +670,9 @@ impl ClaudeRunner {
         match writer.await {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(error),
-            Err(tauri::Error::JoinError(error)) if error.is_panic() => {
-                Some(format!("The task writing the prompt to claude's stdin panicked: {error}"))
-            }
+            Err(tauri::Error::JoinError(error)) if error.is_panic() => Some(format!(
+                "The task writing the prompt to claude's stdin panicked: {error}"
+            )),
             Err(_) => Some("claude exited before it read the whole prompt from stdin".to_string()),
         }
     }
@@ -662,6 +699,28 @@ impl ClaudeRunner {
     /// Get the accumulated text output from all TextDelta and Result events.
     pub async fn get_output(&self) -> String {
         self.accumulated_output.read().await.clone()
+    }
+
+    /// Return the semantic answer from Claude's authoritative final `result`
+    /// event. Assistant messages, text deltas, and tool events remain useful
+    /// progress/transcript data, but must not be concatenated into a strict
+    /// application response.
+    ///
+    /// Call after [`Self::wait`] succeeds so process, prompt-delivery, and
+    /// Claude-level errors have already been rejected.
+    pub async fn final_result_text(&self) -> Result<String, String> {
+        let result = self.result_event.read().await;
+        let Some(event) = result.as_ref() else {
+            return Err("Claude completed without an authoritative result event".into());
+        };
+        if let Some(error) = result_failure_reason(event) {
+            return Err(error);
+        }
+        event
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "Claude result event did not contain textual semantic output".into())
     }
 
     /// The verbatim stdout transcript (every line, newline-joined), for a
@@ -720,7 +779,10 @@ impl ClaudeRunner {
                 Self::kill_process_group(pid);
             }
 
-            child.kill().await.map_err(|e| format!("Failed to kill claude: {}", e))
+            child
+                .kill()
+                .await
+                .map_err(|e| format!("Failed to kill claude: {}", e))
         };
 
         // Taken only after the child lock is released: `wait()` holds that
@@ -819,7 +881,10 @@ impl ClaudeRunner {
         // child with a lot to say can still reach the exit waited for above.
         let stderr_handle = self.stderr_handle.lock().await.take();
 
-        let status = child.wait().await.map_err(|e| format!("Wait failed: {}", e))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("Wait failed: {}", e))?;
 
         // Recorded before either of the two `Err` returns below so a caller
         // that only wants the raw exit outcome (not this method's own blend
@@ -855,7 +920,10 @@ impl ClaudeRunner {
 
         if !status.success() {
             if !stderr_text.is_empty() {
-                self.accumulated_output.write().await.push_str(&format!("\n--- STDERR ---\n{}", stderr_text));
+                self.accumulated_output
+                    .write()
+                    .await
+                    .push_str(&format!("\n--- STDERR ---\n{}", stderr_text));
             }
             if let Some(reason) = restricted_unsupported_reason(&stderr_text) {
                 return Err(reason);
@@ -881,7 +949,10 @@ impl ClaudeRunner {
         // Any error result counts, even one a later success followed.
         if self.result_is_error.load(Ordering::SeqCst) {
             let event = self.result_event.read().await;
-            return Err(event.as_ref().and_then(result_failure_reason).unwrap_or_else(|| "error".to_string()));
+            return Err(event
+                .as_ref()
+                .and_then(result_failure_reason)
+                .unwrap_or_else(|| "error".to_string()));
         }
 
         Ok(true)
@@ -964,9 +1035,16 @@ impl ClaudeRunner {
                                     ClaudeEvent::AssistantMessage { content } => {
                                         if let Some(arr) = content.as_array() {
                                             for block in arr {
-                                                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                                        accumulated_output.write().await.push_str(text);
+                                                if block.get("type").and_then(|t| t.as_str())
+                                                    == Some("text")
+                                                {
+                                                    if let Some(text) =
+                                                        block.get("text").and_then(|t| t.as_str())
+                                                    {
+                                                        accumulated_output
+                                                            .write()
+                                                            .await
+                                                            .push_str(text);
                                                     }
                                                 }
                                             }
@@ -987,9 +1065,7 @@ impl ClaudeRunner {
                         Err(_) => {
                             // Non-JSON line — treat as raw text
                             accumulated_output.write().await.push_str(&line);
-                            let _ = event_tx.send(ClaudeEvent::TextDelta {
-                                text: line,
-                            });
+                            let _ = event_tx.send(ClaudeEvent::TextDelta { text: line });
                         }
                     }
                 }
@@ -1008,8 +1084,14 @@ async fn parse_claude_event(
     match msg_type {
         "system" => {
             let subtype = json.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
-            let sid = json.get("session_id").and_then(|s| s.as_str()).map(|s| s.to_string());
-            let model = json.get("model").and_then(|s| s.as_str()).map(|s| s.to_string());
+            let sid = json
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            let model = json
+                .get("model")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
             if let Some(ref s) = sid {
                 *session_id.lock().await = Some(s.clone());
             }
@@ -1023,14 +1105,21 @@ async fn parse_claude_event(
         "assistant" => {
             // Full assistant message with content blocks
             let message = json.get("message")?;
-            let content = message.get("content").cloned().unwrap_or(serde_json::Value::Null);
+            let content = message
+                .get("content")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
 
             // Check for tool_use blocks in content
             if let Some(arr) = content.as_array() {
                 for block in arr {
                     if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
                         if block_type == "tool_use" {
-                            let tool = block.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
+                            let tool = block
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
                             let input = block.get("input").cloned();
                             return Some(ClaudeEvent::ToolUse { tool, input });
                         }
@@ -1042,15 +1131,30 @@ async fn parse_claude_event(
         }
 
         "result" => {
-            let text = json.get("result").and_then(|r| r.as_str()).unwrap_or("").to_string();
-            let is_error = json.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
-            let sid = json.get("session_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            let text = json
+                .get("result")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+            let is_error = json
+                .get("is_error")
+                .and_then(|e| e.as_bool())
+                .unwrap_or(false);
+            let sid = json
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
 
             if !sid.is_empty() {
                 *session_id.lock().await = Some(sid.clone());
             }
 
-            Some(ClaudeEvent::Result { session_id: sid, text, is_error })
+            Some(ClaudeEvent::Result {
+                session_id: sid,
+                text,
+                is_error,
+            })
         }
 
         // Stream events (content_block_delta with text_delta)
@@ -1058,7 +1162,11 @@ async fn parse_claude_event(
             let delta = json.get("delta")?;
             let delta_type = delta.get("type").and_then(|t| t.as_str())?;
             if delta_type == "text_delta" {
-                let text = delta.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let text = delta
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 Some(ClaudeEvent::TextDelta { text })
             } else {
                 None
@@ -1069,7 +1177,11 @@ async fn parse_claude_event(
             let block = json.get("content_block")?;
             let block_type = block.get("type").and_then(|t| t.as_str())?;
             if block_type == "tool_use" {
-                let tool = block.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
+                let tool = block
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
                 Some(ClaudeEvent::ToolUse { tool, input: None })
             } else {
                 None
@@ -1121,22 +1233,44 @@ mod args_tests {
         assert_eq!(available, "Read,Glob,Grep");
         for tool in available.split(',') {
             assert!(
-                !["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"].contains(&tool),
+                ![
+                    "Bash",
+                    "Edit",
+                    "Write",
+                    "NotebookEdit",
+                    "WebFetch",
+                    "WebSearch"
+                ]
+                .contains(&tool),
                 "{tool} must not be available to a read-only run"
             );
         }
         assert_eq!(value_of(&args, "--allowedTools"), Some("Read,Glob,Grep"));
 
         let denied = value_of(&args, "--disallowedTools").expect("read-only runs deny by name too");
-        for tool in ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Agent"] {
-            assert!(denied.split(',').any(|d| d == tool), "{tool} should be denied, got {denied}");
+        for tool in [
+            "Bash",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "Agent",
+        ] {
+            assert!(
+                denied.split(',').any(|d| d == tool),
+                "{tool} should be denied, got {denied}"
+            );
         }
     }
 
     #[test]
     fn read_only_never_bypasses_permissions_and_is_restricted() {
         let args = args(&config(ToolAccess::ReadOnly));
-        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "{args:?}"
+        );
         assert_eq!(value_of(&args, "--permission-mode"), Some("dontAsk"));
         assert!(args.iter().any(|a| a == "--restricted"), "{args:?}");
     }
@@ -1146,7 +1280,10 @@ mod args_tests {
         let mut cfg = config(ToolAccess::ReadOnly);
         cfg.disable_mcp = false;
         let args = args(&cfg);
-        assert_eq!(args.iter().filter(|a| *a == "--strict-mcp-config").count(), 1);
+        assert_eq!(
+            args.iter().filter(|a| *a == "--strict-mcp-config").count(),
+            1
+        );
     }
 
     #[test]
@@ -1155,7 +1292,10 @@ mod args_tests {
             auto_approve: vec!["Read".into(), "Edit".into(), "Bash".into()],
             permission_mode: None,
         }));
-        assert!(!args.iter().any(|a| a == "--tools" || a == "--restricted"), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a == "--tools" || a == "--restricted"),
+            "{args:?}"
+        );
         assert_eq!(value_of(&args, "--allowedTools"), Some("Read,Edit,Bash"));
         assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
         assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
@@ -1168,7 +1308,9 @@ mod args_tests {
             permission_mode: Some("acceptEdits".into()),
         }));
         assert_eq!(value_of(&args, "--permission-mode"), Some("acceptEdits"));
-        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions" || a == "--allowedTools"));
+        assert!(!args
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions" || a == "--allowedTools"));
     }
 
     #[test]
@@ -1185,7 +1327,10 @@ mod args_tests {
     /// argument carries any of the prompt's text.
     #[test]
     fn the_prompt_is_not_passed_in_argv() {
-        let full = ToolAccess::Full { auto_approve: vec!["Read".into()], permission_mode: None };
+        let full = ToolAccess::Full {
+            auto_approve: vec!["Read".into()],
+            permission_mode: None,
+        };
         for tools in [ToolAccess::ReadOnly, full] {
             let mut cfg = config(tools);
             cfg.prompt = "PROMPT-LINE-ONE\n--tools Bash\n".into();
@@ -1193,7 +1338,9 @@ mod args_tests {
             assert_eq!(args[0], "-p");
             assert_eq!(args[1], "--verbose", "-p is a bare flag: {args:?}");
             assert!(
-                !args.iter().any(|a| a.contains("PROMPT-LINE-ONE") || a.contains("--tools Bash")),
+                !args
+                    .iter()
+                    .any(|a| a.contains("PROMPT-LINE-ONE") || a.contains("--tools Bash")),
                 "the prompt leaked into argv: {args:?}"
             );
             assert_ne!(value_of(&args, "--tools"), Some("Bash"), "{args:?}");
@@ -1225,7 +1372,10 @@ mod failure_reason_tests {
             "type": "result", "subtype": "error_during_execution", "is_error": true,
             "errors": ["first", "  ", "second"], "result": "MODEL TEXT",
         });
-        assert_eq!(result_failure_reason(&event).as_deref(), Some("error_during_execution: first; second"));
+        assert_eq!(
+            result_failure_reason(&event).as_deref(),
+            Some("error_during_execution: first; second")
+        );
     }
 
     #[test]
@@ -1248,7 +1398,8 @@ mod failure_reason_tests {
 
     #[test]
     fn a_successful_result_or_another_event_is_no_failure() {
-        let success = json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"});
+        let success =
+            json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"});
         assert_eq!(result_failure_reason(&success), None);
         let assistant = json!({"type": "assistant", "is_error": true, "subtype": "error"});
         assert_eq!(result_failure_reason(&assistant), None);
@@ -1264,7 +1415,9 @@ mod failure_reason_tests {
         let reason = result_failure_reason(&event).expect("an error result");
         assert!(!reason.contains('\n'), "{reason}");
         assert!(reason.ends_with('…'), "{reason}");
-        let quoted = reason.strip_prefix("error_during_execution: ").expect("labelled");
+        let quoted = reason
+            .strip_prefix("error_during_execution: ")
+            .expect("labelled");
         assert_eq!(quoted.chars().count(), RESULT_TEXT_LIMIT + 1);
 
         let errors: Vec<String> = (0..1_000).map(|i| format!("error number {i}")).collect();
@@ -1276,8 +1429,14 @@ mod failure_reason_tests {
 
     #[test]
     fn a_carriage_return_ends_a_line_too() {
-        assert_eq!(truncate_one_line("first\r\nsecond\rthird\n\r\n", 100), "first / second / third");
-        assert_eq!(truncate_one_line_tail("first\r\nsecond\rthird", 100), "first / second / third");
+        assert_eq!(
+            truncate_one_line("first\r\nsecond\rthird\n\r\n", 100),
+            "first / second / third"
+        );
+        assert_eq!(
+            truncate_one_line_tail("first\r\nsecond\rthird", 100),
+            "first / second / third"
+        );
     }
 
     /// The tail variant keeps the end, which is where a run's output says
@@ -1300,14 +1459,23 @@ mod failure_reason_tests {
     #[cfg(unix)]
     #[test]
     fn a_failed_exit_without_an_error_result_falls_back_in_order() {
-        let success = json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"});
-        assert_eq!(failed_exit_reason(exited(2), "", Some(&success), None), "Exit code 2 — no details");
+        let success =
+            json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"});
+        assert_eq!(
+            failed_exit_reason(exited(2), "", Some(&success), None),
+            "Exit code 2 — no details"
+        );
         assert_eq!(
             failed_exit_reason(exited(2), "", Some(&success), Some("prompt cut short")),
             "Exit code 2 — prompt cut short"
         );
         assert_eq!(
-            failed_exit_reason(exited(2), "first\nlast line\n\n", Some(&success), Some("prompt cut short")),
+            failed_exit_reason(
+                exited(2),
+                "first\nlast line\n\n",
+                Some(&success),
+                Some("prompt cut short")
+            ),
             "Exit code 2 — last line"
         );
     }
@@ -1317,7 +1485,9 @@ mod failure_reason_tests {
     fn a_long_stderr_line_is_bounded() {
         let stderr = "x".repeat(10_000);
         let reason = failed_exit_reason(exited(1), &stderr, None, None);
-        let quoted = reason.strip_prefix("Exit code 1 — ").expect("exit code first");
+        let quoted = reason
+            .strip_prefix("Exit code 1 — ")
+            .expect("exit code first");
         assert_eq!(quoted.chars().count(), STDERR_LINE_LIMIT + 1);
     }
 
@@ -1327,7 +1497,8 @@ mod failure_reason_tests {
     #[test]
     fn a_signalled_exit_reports_the_signal_only() {
         let killed = std::os::unix::process::ExitStatusExt::from_raw(libc::SIGKILL);
-        let error = json!({"type": "result", "subtype": "error_during_execution", "is_error": true});
+        let error =
+            json!({"type": "result", "subtype": "error_during_execution", "is_error": true});
         assert_eq!(
             failed_exit_reason(killed, "", Some(&error), Some("prompt cut short")),
             "Terminated by signal 9 — no details"
@@ -1496,7 +1667,11 @@ mod tests {
 
     impl Fixture {
         fn config_with_prompt(&self, prompt: &str, tools: ToolAccess) -> ClaudeRunConfig {
-            ClaudeRunConfig { prompt: prompt.to_string(), tools, ..self.config() }
+            ClaudeRunConfig {
+                prompt: prompt.to_string(),
+                tools,
+                ..self.config()
+            }
         }
 
         async fn start_with(&self, config: ClaudeRunConfig) -> ClaudeRunner {
@@ -1512,7 +1687,8 @@ mod tests {
 
         /// The arguments the `stdin_echo` fixture was started with.
         fn recorded_argv(&self) -> Vec<Vec<u8>> {
-            let raw = std::fs::read(self.dir.path().join("argv")).expect("the fixture recorded argv");
+            let raw =
+                std::fs::read(self.dir.path().join("argv")).expect("the fixture recorded argv");
             let mut fields: Vec<Vec<u8>> = raw.split(|b| *b == 0).map(<[u8]>::to_vec).collect();
             // Every field is NUL-terminated, which leaves one empty piece.
             assert_eq!(fields.pop().as_deref(), Some(&[][..]));
@@ -1566,6 +1742,58 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn final_semantic_result_uses_only_the_authoritative_result_event() {
+        let fixture = Fixture::new("semantic_result");
+        let runner = fixture
+            .start_with(fixture.config_with_prompt("Coordinator turn", read_only()))
+            .await;
+        assert_eq!(
+            bounded("Coordinator semantic result", &runner).await,
+            Ok(true)
+        );
+        assert_eq!(
+            runner.final_result_text().await.unwrap(),
+            r#"{"type":"reply","text":"hello"}"#
+        );
+        let transcript = runner.get_output().await;
+        assert!(
+            transcript
+                .matches(r#"{"type":"reply","text":"hello"}"#)
+                .count()
+                >= 2
+        );
+        assert_ne!(transcript, runner.final_result_text().await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worker_semantic_result_uses_final_result_after_assistant_and_tool_events() {
+        let fixture = Fixture::new("semantic_result");
+        let runner = fixture
+            .start_with(fixture.config_with_prompt(
+                "Execute only approved_request in this Task Checkout",
+                full(),
+            ))
+            .await;
+        assert_eq!(bounded("Worker semantic result", &runner).await, Ok(true));
+        assert_eq!(
+            runner.final_result_text().await.unwrap(),
+            "Worker changed the requested file and ran validation."
+        );
+        assert!(runner
+            .get_output()
+            .await
+            .contains("Worker changed the requested file"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn final_semantic_result_still_rejects_error_result_events() {
+        let fixture = Fixture::new(CLAUDE_LEVEL_ERROR);
+        let runner = fixture.start().await;
+        assert!(bounded("Claude-level failure", &runner).await.is_err());
+        assert!(runner.final_result_text().await.is_err());
+    }
+
     /// The same case in the shape production uses.
     ///
     /// In the desktop app the queue loop is itself started with
@@ -1611,7 +1839,10 @@ mod tests {
     async fn the_first_subscriber_sees_what_the_agent_wrote_before_it_subscribed() {
         let fixture = Fixture::new(STREAMING);
         let runner = fixture.start().await;
-        assert_eq!(bounded("finish before subscribing", &runner).await, Ok(true));
+        assert_eq!(
+            bounded("finish before subscribing", &runner).await,
+            Ok(true)
+        );
 
         let mut events = runner.subscribe();
         drop(runner);
@@ -1619,7 +1850,10 @@ mod tests {
         while let Ok(event) = events.recv().await {
             seen.push(describe(&event));
         }
-        assert_eq!(seen, vec!["system_init", "assistant_message", "text_delta", "result"]);
+        assert_eq!(
+            seen,
+            vec!["system_init", "assistant_message", "text_delta", "result"]
+        );
     }
 
     async fn streaming_round(fixture: &Fixture, attempt: usize) {
@@ -1798,8 +2032,13 @@ mod tests {
     async fn a_failure_with_no_stderr_reports_the_result_event_reason() {
         let fixture = Fixture::new(MAX_TURNS);
         let runner = fixture.start().await;
-        let error = bounded("max turns", &runner).await.expect_err("exit 1 is a failure");
-        assert_eq!(error, "Exit code 1 — error_max_turns: Reached maximum number of turns (1)");
+        let error = bounded("max turns", &runner)
+            .await
+            .expect_err("exit 1 is a failure");
+        assert_eq!(
+            error,
+            "Exit code 1 — error_max_turns: Reached maximum number of turns (1)"
+        );
         assert_eq!(runner.exit_status().await, Some((false, Some(1))));
     }
 
@@ -1809,7 +2048,9 @@ mod tests {
     async fn a_failure_with_stderr_and_a_result_reports_both() {
         let fixture = Fixture::new(API_ERROR);
         let runner = fixture.start().await;
-        let error = bounded("api error", &runner).await.expect_err("exit 1 is a failure");
+        let error = bounded("api error", &runner)
+            .await
+            .expect_err("exit 1 is a failure");
         assert_eq!(
             error,
             "Exit code 1 — api_error (API status 404): There is an issue with the selected \
@@ -1824,7 +2065,9 @@ mod tests {
     async fn a_failure_with_malformed_output_falls_back_to_the_exit_code() {
         let fixture = Fixture::new(MALFORMED_RESULT);
         let runner = fixture.start().await;
-        let error = bounded("malformed", &runner).await.expect_err("exit 1 is a failure");
+        let error = bounded("malformed", &runner)
+            .await
+            .expect_err("exit 1 is a failure");
         assert_eq!(error, "Exit code 1 — no details");
     }
 
@@ -1844,24 +2087,35 @@ mod tests {
             .expect("kill must succeed");
         assert!(!is_alive(pid));
 
-        let error = bounded("wait after kill", &runner).await.expect_err("a killed run failed");
+        let error = bounded("wait after kill", &runner)
+            .await
+            .expect_err("a killed run failed");
         assert_eq!(error, "Terminated by signal 9 — no details");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cli_without_restricted_fails_a_read_only_run_with_an_actionable_reason() {
         let fixture = Fixture::new(NO_RESTRICTED);
-        let config = ClaudeRunConfig { tools: ToolAccess::ReadOnly, ..fixture.config() };
+        let config = ClaudeRunConfig {
+            tools: ToolAccess::ReadOnly,
+            ..fixture.config()
+        };
         let runner = ClaudeRunner::start_program(&fixture.program, config)
             .await
             .expect("fixture should spawn");
         let error = bounded("read-only on an old CLI", &runner)
             .await
             .expect_err("a CLI that rejects --restricted must fail the run");
-        assert_eq!(Some(error), restricted_unsupported_reason("error: unknown option '--restricted'"));
+        assert_eq!(
+            Some(error),
+            restricted_unsupported_reason("error: unknown option '--restricted'")
+        );
 
         let runner = fixture.start().await;
-        assert_eq!(bounded("full access on an old CLI", &runner).await, Ok(true));
+        assert_eq!(
+            bounded("full access on an old CLI", &runner).await,
+            Ok(true)
+        );
     }
 
     #[test]
@@ -1870,8 +2124,14 @@ mod tests {
             .expect("the unknown-option error is recognised");
         assert!(reason.contains("update Claude Code"), "{reason}");
         assert!(reason.contains(RESTRICTED_MIN_VERSION), "{reason}");
-        assert_eq!(restricted_unsupported_reason("error: unknown option '--no-such-flag'"), None);
-        assert_eq!(restricted_unsupported_reason("something went wrong in the CLI"), None);
+        assert_eq!(
+            restricted_unsupported_reason("error: unknown option '--no-such-flag'"),
+            None
+        );
+        assert_eq!(
+            restricted_unsupported_reason("something went wrong in the CLI"),
+            None
+        );
         assert_eq!(restricted_unsupported_reason(""), None);
     }
 
@@ -2074,7 +2334,10 @@ mod tests {
         let runner = fixture.start().await;
         let leader_pid = unix_announced_pid(&fixture, "blocked.pid").await;
         let descendant_pid = unix_announced_pid(&fixture, "descendant.pid").await;
-        assert!(unix_pid_is_alive(leader_pid), "the leader must still be running");
+        assert!(
+            unix_pid_is_alive(leader_pid),
+            "the leader must still be running"
+        );
         assert!(
             unix_pid_is_alive(descendant_pid),
             "the descendant must be running before cancellation"
@@ -2117,13 +2380,22 @@ mod tests {
             assert_eq!(bounded(label, &runner).await, Ok(true), "{label}");
 
             let argv = fixture.recorded_argv();
-            assert_eq!(argv, expected_argv, "{label}: the child got exactly claude_args");
+            assert_eq!(
+                argv, expected_argv,
+                "{label}: the child got exactly claude_args"
+            );
             assert!(
-                !argv.iter().any(|a| a.windows(13).any(|w| w == b"PROMPT-MARKER")),
+                !argv
+                    .iter()
+                    .any(|a| a.windows(13).any(|w| w == b"PROMPT-MARKER")),
                 "{label}: the prompt leaked into argv"
             );
             assert_eq!(fixture.recorded_prompt(), prompt.as_bytes(), "{label}");
-            assert_eq!(runner.get_output().await, prompt.len().to_string(), "{label}");
+            assert_eq!(
+                runner.get_output().await,
+                prompt.len().to_string(),
+                "{label}"
+            );
         }
     }
 
@@ -2132,12 +2404,18 @@ mod tests {
         let fixture = Fixture::new(STDIN_ECHO);
         let mut prompt = String::new();
         for line in 0..200 {
-            prompt.push_str(&format!("line {line}: ünïcødé ✓ 漢字 🦀 \t tab \r cr \x01\x1b[31m\x7f\n"));
+            prompt.push_str(&format!(
+                "line {line}: ünïcødé ✓ 漢字 🦀 \t tab \r cr \x01\x1b[31m\x7f\n"
+            ));
         }
-        prompt.push_str("\n\n-p --dangerously-skip-permissions\n$(echo not run) `x` 'q' \"dq\" \\ \n");
+        prompt.push_str(
+            "\n\n-p --dangerously-skip-permissions\n$(echo not run) `x` 'q' \"dq\" \\ \n",
+        );
         prompt.push_str("no trailing newline");
 
-        let runner = fixture.start_with(fixture.config_with_prompt(&prompt, read_only())).await;
+        let runner = fixture
+            .start_with(fixture.config_with_prompt(&prompt, read_only()))
+            .await;
         assert_eq!(bounded("unicode prompt", &runner).await, Ok(true));
         assert_eq!(fixture.recorded_prompt(), prompt.as_bytes());
     }
@@ -2161,7 +2439,9 @@ mod tests {
             "a {OVER_ARG_LIMIT_PROMPT}-byte argument should exceed MAX_ARG_STRLEN"
         );
 
-        let runner = fixture.start_with(fixture.config_with_prompt(&prompt, full())).await;
+        let runner = fixture
+            .start_with(fixture.config_with_prompt(&prompt, full()))
+            .await;
         assert_eq!(bounded("large prompt", &runner).await, Ok(true));
         assert_eq!(fixture.recorded_prompt().len(), prompt.len());
         assert_eq!(fixture.recorded_prompt(), prompt.as_bytes());
@@ -2179,8 +2459,16 @@ mod tests {
                 .await
                 .expect_err("an undelivered prompt must not be reported as success");
             assert!(error.contains("prompt"), "attempt {attempt}: {error}");
-            assert_eq!(runner.exit_status().await, Some((true, Some(0))), "attempt {attempt}");
-            assert_eq!(runner.prompt_failure().await, Some(error), "attempt {attempt}");
+            assert_eq!(
+                runner.exit_status().await,
+                Some((true, Some(0))),
+                "attempt {attempt}"
+            );
+            assert_eq!(
+                runner.prompt_failure().await,
+                Some(error),
+                "attempt {attempt}"
+            );
         }
     }
 
@@ -2231,7 +2519,10 @@ mod tests {
         let config = fixture.config_with_prompt(&filler(UNBUFFERABLE_PROMPT), full());
         let runner = fixture.start_with(config).await;
         let pid = blocked_pid(&fixture).await;
-        assert!(!runner.prompt_writer_finished().await, "setup: the writer must be blocked");
+        assert!(
+            !runner.prompt_writer_finished().await,
+            "setup: the writer must be blocked"
+        );
 
         tokio::time::timeout(DEADLINE, runner.kill())
             .await
@@ -2240,7 +2531,9 @@ mod tests {
         assert!(!is_alive(pid));
         writer_ends(&runner, "blocked child").await;
 
-        let error = bounded("wait after kill", &runner).await.expect_err("a killed run failed");
+        let error = bounded("wait after kill", &runner)
+            .await
+            .expect_err("a killed run failed");
         assert!(!error.is_empty());
     }
 
@@ -2270,17 +2563,25 @@ mod tests {
         let runner = fixture.start_with(config).await;
         let holder = KillOnDrop(unix_announced_pid(&fixture, "holder.pid").await);
         let pid = blocked_pid(&fixture).await;
-        assert!(!runner.prompt_writer_finished().await, "setup: the writer must be blocked");
+        assert!(
+            !runner.prompt_writer_finished().await,
+            "setup: the writer must be blocked"
+        );
 
         tokio::time::timeout(DEADLINE, runner.kill())
             .await
             .expect("kill must not wait for the prompt writer")
             .expect("kill must succeed");
         assert!(!is_alive(pid));
-        assert!(unix_pid_is_alive(holder.0), "setup: the pipe must still have a reader");
+        assert!(
+            unix_pid_is_alive(holder.0),
+            "setup: the pipe must still have a reader"
+        );
         writer_ends(&runner, "pipe held elsewhere").await;
 
-        let error = bounded("wait after kill", &runner).await.expect_err("a killed run failed");
+        let error = bounded("wait after kill", &runner)
+            .await
+            .expect_err("a killed run failed");
         assert!(!error.is_empty());
     }
 
@@ -2307,13 +2608,19 @@ mod tests {
                 disable_mcp: true,
                 additional_dirs: Vec::new(),
             };
-            let runner = ClaudeRunner::start(config).await.expect("claude should start");
+            let runner = ClaudeRunner::start(config)
+                .await
+                .expect("claude should start");
             let result = tokio::time::timeout(Duration::from_secs(120), runner.wait())
                 .await
                 .unwrap_or_else(|_| panic!("{label}: the real CLI did not finish"));
             assert_eq!(result, Ok(true), "{label}: {}", runner.get_output().await);
             assert_eq!(runner.prompt_failure().await, None, "{label}");
-            assert!(runner.get_output().await.contains("PONG"), "{label}: {}", runner.get_output().await);
+            assert!(
+                runner.get_output().await.contains("PONG"),
+                "{label}: {}",
+                runner.get_output().await
+            );
         }
     }
 }

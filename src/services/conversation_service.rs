@@ -14,6 +14,9 @@ extern "C" {
 struct ProjectArgs { project_id: String }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct RetryArgs { project_id: String, conversation_id: String, revision: u64, action_id: String }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct MessageArgs { project_id: String, message: String }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +30,14 @@ async fn snapshot(promise: js_sys::Promise) -> Result<ConversationSnapshot, Stri
 pub async fn get_project_conversation(project_id: String) -> Result<ConversationSnapshot, String> {
     let args = serde_wasm_bindgen::to_value(&ProjectArgs { project_id }).map_err(|error| error.to_string())?;
     snapshot(raw_invoke("get_project_conversation", args)).await
+}
+pub async fn open_project_conversation(project_id: String) -> Result<ConversationSnapshot, String> {
+    let args = serde_wasm_bindgen::to_value(&ProjectArgs { project_id }).map_err(|error| error.to_string())?;
+    snapshot(raw_invoke("open_project_conversation", args)).await
+}
+pub async fn retry_project_conversation_continuation(project_id: String, conversation_id: String, revision: u64, action_id: String) -> Result<ConversationSnapshot, String> {
+    let args = serde_wasm_bindgen::to_value(&RetryArgs { project_id, conversation_id, revision, action_id }).map_err(|error| error.to_string())?;
+    snapshot(raw_invoke("retry_project_conversation_continuation", args)).await
 }
 pub async fn send_project_message(project_id: String, message: String) -> Result<ConversationSnapshot, String> {
     let args = serde_wasm_bindgen::to_value(&MessageArgs { project_id, message }).map_err(|error| error.to_string())?;

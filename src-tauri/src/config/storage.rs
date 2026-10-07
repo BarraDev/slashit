@@ -120,30 +120,51 @@ fn parse_github_url(url: &str, is_pr: bool) -> Option<ExternalRef> {
     let repo = repo_part.split(segment).next()?.to_string();
 
     if is_pr {
-        Some(ExternalRef::GithubPr { url: url.to_string(), number, repo, state: None })
+        Some(ExternalRef::GithubPr {
+            url: url.to_string(),
+            number,
+            repo,
+            state: None,
+        })
     } else {
-        Some(ExternalRef::GithubIssue { url: url.to_string(), number, repo, state: None })
+        Some(ExternalRef::GithubIssue {
+            url: url.to_string(),
+            number,
+            repo,
+            state: None,
+        })
     }
 }
 
 fn migrate_task_refs(task: &mut Task) {
-    if !task.external_refs.is_empty() { return; }
+    if !task.external_refs.is_empty() {
+        return;
+    }
 
     if let Some(url) = task.github_issue_url.as_ref() {
-        if let Some(r) = parse_github_url(url, false) { task.external_refs.push(r); }
+        if let Some(r) = parse_github_url(url, false) {
+            task.external_refs.push(r);
+        }
     }
     if let Some(url) = task.pr_url.as_ref() {
-        if let Some(r) = parse_github_url(url, true) { task.external_refs.push(r); }
+        if let Some(r) = parse_github_url(url, true) {
+            task.external_refs.push(r);
+        }
     }
     if let Some(key) = task.jira_issue_key.as_ref() {
         let project = key.split('-').next().unwrap_or("").to_string();
-        task.external_refs.push(ExternalRef::JiraTicket { key: key.clone(), project });
+        task.external_refs.push(ExternalRef::JiraTicket {
+            key: key.clone(),
+            project,
+        });
     }
     if let Some(id) = task.linear_ticket_id.as_ref() {
-        task.external_refs.push(ExternalRef::LinearTicket { id: id.clone() });
+        task.external_refs
+            .push(ExternalRef::LinearTicket { id: id.clone() });
     }
     if let Some(url) = task.gitlab_issue_url.as_ref() {
-        task.external_refs.push(ExternalRef::GitlabIssue { url: url.clone() });
+        task.external_refs
+            .push(ExternalRef::GitlabIssue { url: url.clone() });
     }
 }
 
@@ -188,9 +209,12 @@ impl Storage {
         }
         let id: Uuid = fs::read_to_string(&pointer)
             .with_context(|| format!("Failed to read primary Conversation pointer {pointer:?}"))?
-            .trim().parse().context("Invalid primary Conversation identity")?;
+            .trim()
+            .parse()
+            .context("Invalid primary Conversation identity")?;
         let path = self.paths.conversation_file(id);
-        let bytes = fs::read(&path).with_context(|| format!("Failed to read Conversation {path:?}"))?;
+        let bytes =
+            fs::read(&path).with_context(|| format!("Failed to read Conversation {path:?}"))?;
         let conversation: Conversation = serde_json::from_slice(&bytes)
             .with_context(|| format!("Failed to parse Conversation {path:?}"))?;
         if conversation.id != id || conversation.project_id != project_id {
@@ -210,7 +234,8 @@ impl Storage {
         write_private_atomic(
             &self.paths.primary_conversation_file(project_id),
             conversation.id.to_string().as_bytes(),
-        ).context("Failed to persist primary Conversation pointer")?;
+        )
+        .context("Failed to persist primary Conversation pointer")?;
         Ok(conversation)
     }
 
@@ -220,9 +245,38 @@ impl Storage {
         if conversation.id.is_nil() || conversation.project_id.is_nil() {
             anyhow::bail!("Conversation and Project identities must be valid");
         }
-        let bytes = serde_json::to_vec_pretty(conversation).context("Failed to serialize Conversation")?;
+        let bytes =
+            serde_json::to_vec_pretty(conversation).context("Failed to serialize Conversation")?;
         write_private_atomic(&self.paths.conversation_file(conversation.id), &bytes)
             .context("Failed to atomically persist Conversation")
+    }
+
+    /// Remove a Project's primary pointer and its document only when the
+    /// pointer parses and the document confirms both identities. A malformed
+    /// or mismatched pointer never authorizes deleting an arbitrary file.
+    pub fn delete_project_conversation(&self, project_id: Uuid) -> Result<()> {
+        let pointer = self.paths.primary_conversation_file(project_id);
+        if !pointer.exists() {
+            return Ok(());
+        }
+        let raw = fs::read_to_string(&pointer)
+            .with_context(|| format!("Failed to read Conversation pointer {pointer:?}"))?;
+        let conversation_id = raw.trim().parse::<Uuid>().ok();
+        if let Some(conversation_id) = conversation_id {
+            let document = self.paths.conversation_file(conversation_id);
+            if let Ok(bytes) = fs::read(&document) {
+                if let Ok(conversation) = serde_json::from_slice::<Conversation>(&bytes) {
+                    if conversation.id == conversation_id && conversation.project_id == project_id {
+                        fs::remove_file(&document).with_context(|| {
+                            format!("Failed to remove Project Conversation {document:?}")
+                        })?;
+                    }
+                }
+            }
+        }
+        fs::remove_file(&pointer)
+            .with_context(|| format!("Failed to remove Conversation pointer {pointer:?}"))?;
+        Ok(())
     }
 
     pub fn new() -> Result<Self> {
@@ -263,9 +317,9 @@ impl Storage {
     /// [`Self::read_config_strict`], which `update_config` uses instead.
     fn read_config(&self) -> Result<AppConfig> {
         if self.config_file.exists() {
-            let contents = fs::read_to_string(&self.config_file)
-                .context("Failed to read config file")?;
-            
+            let contents =
+                fs::read_to_string(&self.config_file).context("Failed to read config file")?;
+
             // Try to parse the config file
             match toml::from_str::<AppConfig>(&contents) {
                 Ok(config) => Ok(config),
@@ -282,15 +336,20 @@ impl Storage {
                             eprintln!("  Context: ...{}...", &contents[context_start..context_end]);
                         }
                     }
-                    
+
                     // Try partial recovery: parse as generic TOML value first
                     if let Ok(value) = toml::from_str::<toml::Value>(&contents) {
-                        eprintln!("  Config file is valid TOML but doesn't match AppConfig structure");
-                        eprintln!("  Top-level keys: {:?}", value.as_table().map(|t| t.keys().collect::<Vec<_>>()));
-                        
+                        eprintln!(
+                            "  Config file is valid TOML but doesn't match AppConfig structure"
+                        );
+                        eprintln!(
+                            "  Top-level keys: {:?}",
+                            value.as_table().map(|t| t.keys().collect::<Vec<_>>())
+                        );
+
                         // Attempt to extract what we can
                         let mut config = AppConfig::default();
-                        
+
                         // Try to recover UI preferences
                         if let Some(ui) = value.get("ui_preferences") {
                             if let Ok(ui_prefs) = ui.clone().try_into::<UiPreferences>() {
@@ -298,7 +357,7 @@ impl Storage {
                                 eprintln!("  Recovered: ui_preferences");
                             }
                         }
-                        
+
                         // Try to recover JJ config
                         if let Some(jj) = value.get("jj_config") {
                             if let Ok(jj_config) = jj.clone().try_into::<JjConfig>() {
@@ -306,9 +365,11 @@ impl Storage {
                                 eprintln!("  Recovered: jj_config");
                             }
                         }
-                        
-                        eprintln!("  Using partial recovery with defaults for unrecoverable sections");
-                        
+
+                        eprintln!(
+                            "  Using partial recovery with defaults for unrecoverable sections"
+                        );
+
                         // Backup the old config before we potentially overwrite it
                         let backup_path = self.config_file.with_extension("toml.backup");
                         if let Err(e) = fs::copy(&self.config_file, &backup_path) {
@@ -316,10 +377,10 @@ impl Storage {
                         } else {
                             eprintln!("  Backed up old config to: {:?}", backup_path);
                         }
-                        
+
                         return Ok(config);
                     }
-                    
+
                     // Config file is corrupted/invalid TOML - backup and reset
                     eprintln!("  Config file is not valid TOML, backing up and resetting");
                     let backup_path = self.config_file.with_extension("toml.corrupted");
@@ -328,7 +389,7 @@ impl Storage {
                     } else {
                         eprintln!("  Moved corrupted config to: {:?}", backup_path);
                     }
-                    
+
                     Ok(AppConfig::default())
                 }
             }
@@ -361,8 +422,8 @@ impl Storage {
             return Ok(AppConfig::default());
         }
 
-        let contents = fs::read_to_string(&self.config_file)
-            .context("Failed to read config file")?;
+        let contents =
+            fs::read_to_string(&self.config_file).context("Failed to read config file")?;
 
         toml::from_str::<AppConfig>(&contents).map_err(|parse_error| {
             anyhow::anyhow!(
@@ -438,8 +499,7 @@ impl Storage {
     ///
     /// Assumes [`Self::config_tx`] is already held by the caller.
     fn write_config(&self, config: &AppConfig) -> Result<()> {
-        let contents = toml::to_string_pretty(config)
-            .context("Failed to serialize config")?;
+        let contents = toml::to_string_pretty(config).context("Failed to serialize config")?;
         write_private_atomic(&self.config_file, contents.as_bytes())
             .context("Failed to write config file")?;
         self.refresh_routes(config);
@@ -685,8 +745,7 @@ impl Storage {
         if legacy_dir.is_dir() {
             for entry in fs::read_dir(&legacy_dir).context("Failed to read tasks directory")? {
                 let path = entry?.path();
-                if path.extension().is_some_and(|ext| ext == "toml")
-                    && !seen_files.contains(&path)
+                if path.extension().is_some_and(|ext| ext == "toml") && !seen_files.contains(&path)
                 {
                     files.push(path);
                 }
@@ -785,15 +844,51 @@ mod tests {
         let mut changed = conversation.clone();
         changed.push(
             crate::domain::conversation::Role::Human,
-            crate::domain::conversation::EntryKind::HumanMessage { text: "No tasks needed".into() },
+            crate::domain::conversation::EntryKind::HumanMessage {
+                text: "No tasks needed".into(),
+            },
         );
         storage.save_conversation(&changed).unwrap();
         let restarted_storage = storage.clone();
-        let restored = restarted_storage.load_primary_conversation(project_id).unwrap().unwrap();
+        let restored = restarted_storage
+            .load_primary_conversation(project_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(restored.id, conversation.id);
         assert_eq!(restored.project_id, project_id);
         assert_eq!(restored.entries.len(), 1);
-        assert!(restarted_storage.load_primary_conversation(Uuid::new_v4()).unwrap().is_none());
+        assert!(restarted_storage
+            .load_primary_conversation(Uuid::new_v4())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn deleting_project_conversation_removes_owned_pointer_and_document() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let conversation = storage.create_primary_conversation(project_id).unwrap();
+        let document = storage.paths.conversation_file(conversation.id);
+        let pointer = storage.paths.primary_conversation_file(project_id);
+        storage.delete_project_conversation(project_id).unwrap();
+        assert!(!pointer.exists());
+        assert!(!document.exists());
+    }
+
+    #[test]
+    fn mismatched_conversation_pointer_never_deletes_another_projects_document() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let other_project_id = Uuid::new_v4();
+        let other = storage
+            .create_primary_conversation(other_project_id)
+            .unwrap();
+        let pointer = storage.paths.primary_conversation_file(project_id);
+        write_private_atomic(&pointer, other.id.to_string().as_bytes()).unwrap();
+        let document = storage.paths.conversation_file(other.id);
+        storage.delete_project_conversation(project_id).unwrap();
+        assert!(!pointer.exists());
+        assert!(document.exists());
     }
 
     #[test]
@@ -802,8 +897,16 @@ mod tests {
         assert!(storage.unreadable_task_files().unwrap().is_empty());
         let legacy = storage.legacy_tasks_dir();
         fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join(format!("{}.toml", Uuid::new_v4())), "tasks = [ not toml").unwrap();
-        fs::write(legacy.join(format!("{}.toml", Uuid::new_v4())), "version = 1\ntasks = []\n").unwrap();
+        fs::write(
+            legacy.join(format!("{}.toml", Uuid::new_v4())),
+            "tasks = [ not toml",
+        )
+        .unwrap();
+        fs::write(
+            legacy.join(format!("{}.toml", Uuid::new_v4())),
+            "version = 1\ntasks = []\n",
+        )
+        .unwrap();
         assert_eq!(storage.unreadable_task_files().unwrap().len(), 1);
         assert!(storage.load_all_tasks().unwrap().is_empty());
     }
@@ -813,7 +916,7 @@ mod tests {
     #[test]
     fn test_appconfig_default_values() {
         let config = AppConfig::default();
-        
+
         assert!(config.projects.is_empty());
         assert!(config.repositories.is_empty());
         assert!(config.agent_configs.is_empty());
@@ -827,7 +930,7 @@ mod tests {
         // Empty TOML should use all defaults
         let toml_str = "";
         let config: AppConfig = toml::from_str(toml_str).expect("Should parse empty TOML");
-        
+
         assert!(config.projects.is_empty());
         assert!(config.repositories.is_empty());
         assert_eq!(config.jj_config.default_branch, "main");
@@ -842,7 +945,7 @@ mod tests {
 theme = "light"
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Should parse partial TOML");
-        
+
         // Specified values should be used
         assert_eq!(config.ui_preferences.theme, "light");
         // Missing sidebar_width should use default
@@ -862,9 +965,12 @@ user_email = "test@example.com"
 default_branch = "develop"
 "#;
         let config: AppConfig = toml::from_str(toml_str).expect("Should parse jj_config only");
-        
+
         assert_eq!(config.jj_config.user_name, Some("Test User".to_string()));
-        assert_eq!(config.jj_config.user_email, Some("test@example.com".to_string()));
+        assert_eq!(
+            config.jj_config.user_email,
+            Some("test@example.com".to_string())
+        );
         assert_eq!(config.jj_config.default_branch, "develop");
         // Other sections should have defaults
         assert!(config.projects.is_empty());
@@ -882,8 +988,9 @@ sidebar_width = 350
 [jj_config]
 default_branch = "main"
 "#;
-        let config: AppConfig = toml::from_str(toml_str).expect("Should parse without repositories");
-        
+        let config: AppConfig =
+            toml::from_str(toml_str).expect("Should parse without repositories");
+
         // repositories should default to empty HashMap
         assert!(config.repositories.is_empty());
         assert!(config.projects.is_empty());
@@ -895,9 +1002,9 @@ default_branch = "main"
     #[test]
     fn test_load_config_no_file_returns_default() {
         let (storage, _temp) = create_test_storage();
-        
+
         let config = storage.load_config().expect("Should load default config");
-        
+
         assert!(config.projects.is_empty());
         assert_eq!(config.ui_preferences.theme, "dark");
     }
@@ -905,20 +1012,20 @@ default_branch = "main"
     #[test]
     fn test_save_and_load_config_roundtrip() {
         let (storage, _temp) = create_test_storage();
-        
+
         // Create a config with some data
         let mut config = AppConfig::default();
         config.ui_preferences.theme = "custom-theme".to_string();
         config.ui_preferences.sidebar_width = 400;
         config.jj_config.user_name = Some("Test User".to_string());
         config.jj_config.default_branch = "develop".to_string();
-        
+
         // Save it
         storage.save_config(&config).expect("Should save config");
-        
+
         // Load it back
         let loaded = storage.load_config().expect("Should load config");
-        
+
         assert_eq!(loaded.ui_preferences.theme, "custom-theme");
         assert_eq!(loaded.ui_preferences.sidebar_width, 400);
         assert_eq!(loaded.jj_config.user_name, Some("Test User".to_string()));
@@ -946,10 +1053,10 @@ foo = "bar"
 baz = 123
 "#;
         fs::write(&storage.config_file, weird_toml).expect("Should write test file");
-        
+
         // Should still load successfully, using defaults for missing/invalid parts
         let config = storage.load_config().expect("Should load with recovery");
-        
+
         // The valid parts should be recovered
         assert_eq!(config.ui_preferences.theme, "light");
         assert_eq!(config.ui_preferences.sidebar_width, 250);
@@ -1025,12 +1132,15 @@ baz = 123
         let written = toml::to_string_pretty(&seed).expect("serialize");
         assert!(written.contains("placement = \"managed\""), "{written}");
 
-        for (spelling, expected) in
-            [("auto", WorktreePlacement::Auto), ("managed", WorktreePlacement::Managed)]
-        {
+        for (spelling, expected) in [
+            ("auto", WorktreePlacement::Auto),
+            ("managed", WorktreePlacement::Managed),
+        ] {
             let (storage, _temp) = create_test_storage();
-            let on_disk = written
-                .replace("placement = \"managed\"", &format!("placement = \"{spelling}\""));
+            let on_disk = written.replace(
+                "placement = \"managed\"",
+                &format!("placement = \"{spelling}\""),
+            );
             fs::write(&storage.config_file, &on_disk).expect("write fixture");
 
             let read = storage.read_config_strict().expect(spelling);
@@ -1039,8 +1149,15 @@ baz = 123
                 .update_config(|config| config.ui_preferences.theme = "light".to_string())
                 .expect(spelling);
             let after = storage.read_config_strict().expect(spelling);
-            assert_eq!(after.jj_config.user_name.as_deref(), Some("Kept"), "{spelling}");
-            assert_eq!(after.worktree.placement, expected, "{spelling}: the spelling is kept");
+            assert_eq!(
+                after.jj_config.user_name.as_deref(),
+                Some("Kept"),
+                "{spelling}"
+            );
+            assert_eq!(
+                after.worktree.placement, expected,
+                "{spelling}: the spelling is kept"
+            );
         }
     }
 
@@ -1051,7 +1168,9 @@ baz = 123
         fs::write(&storage.config_file, &poisoned).expect("write fixture");
 
         let result = storage.update_config(|config| {
-            config.projects.insert("new".to_string(), unreachable_project());
+            config
+                .projects
+                .insert("new".to_string(), unreachable_project());
         });
 
         assert!(
@@ -1098,7 +1217,9 @@ baz = 123
 
         storage
             .update_config(|config| {
-                config.projects.insert("new".to_string(), unreachable_project());
+                config
+                    .projects
+                    .insert("new".to_string(), unreachable_project());
             })
             .expect("a fully parsable config must still be updatable");
 
@@ -1167,17 +1288,19 @@ baz = 123
     #[test]
     fn test_load_config_corrupted_toml_returns_default() {
         let (storage, _temp) = create_test_storage();
-        
+
         // Write completely invalid TOML
         let corrupted = "this is not valid TOML { [ ] } @#$%";
         fs::write(&storage.config_file, corrupted).expect("Should write test file");
-        
+
         // Should return default config (after backing up the corrupted file)
-        let config = storage.load_config().expect("Should handle corrupted config");
-        
+        let config = storage
+            .load_config()
+            .expect("Should handle corrupted config");
+
         assert!(config.projects.is_empty());
         assert_eq!(config.ui_preferences.theme, "dark");
-        
+
         // Check that a backup was created
         let backup_path = storage.config_file.with_extension("toml.corrupted");
         assert!(backup_path.exists(), "Corrupted config should be backed up");
@@ -1187,11 +1310,11 @@ baz = 123
 
     #[test]
     fn test_project_persistence_in_config() {
-        use crate::domain::{Project, AgentType, AgentConfig};
+        use crate::domain::{AgentConfig, AgentType, Project};
         use std::collections::HashMap;
-        
+
         let (storage, _temp) = create_test_storage();
-        
+
         // Create a config with projects
         let mut config = AppConfig::default();
         let project_id = Uuid::new_v4();
@@ -1215,24 +1338,27 @@ baz = 123
             updated_at: chrono::Utc::now(),
         };
         config.projects.insert(project_id.to_string(), project);
-        
+
         // Save and reload
         storage.save_config(&config).expect("Should save config");
         let loaded = storage.load_config().expect("Should load config");
-        
+
         assert_eq!(loaded.projects.len(), 1);
         assert!(loaded.projects.contains_key(&project_id.to_string()));
-        assert_eq!(loaded.projects.get(&project_id.to_string()).unwrap().name, "Test Project");
+        assert_eq!(
+            loaded.projects.get(&project_id.to_string()).unwrap().name,
+            "Test Project"
+        );
     }
 
     // ==================== Repository Persistence Tests ====================
 
     #[test]
     fn test_repository_persistence_in_config() {
-        use crate::domain::{Repository, RemoteType};
-        
+        use crate::domain::{RemoteType, Repository};
+
         let (storage, _temp) = create_test_storage();
-        
+
         // Create a config with repositories
         let mut config = AppConfig::default();
         let repo_id = Uuid::new_v4();
@@ -1244,14 +1370,21 @@ baz = 123
             created_at: chrono::Utc::now(),
         };
         config.repositories.insert(repo_id.to_string(), repo);
-        
+
         // Save and reload
         storage.save_config(&config).expect("Should save config");
         let loaded = storage.load_config().expect("Should load config");
-        
+
         assert_eq!(loaded.repositories.len(), 1);
         assert!(loaded.repositories.contains_key(&repo_id.to_string()));
-        assert_eq!(loaded.repositories.get(&repo_id.to_string()).unwrap().local_path, "/path/to/repo");
+        assert_eq!(
+            loaded
+                .repositories
+                .get(&repo_id.to_string())
+                .unwrap()
+                .local_path,
+            "/path/to/repo"
+        );
     }
 
     // ==================== JjConfig Tests ====================
@@ -1259,7 +1392,7 @@ baz = 123
     #[test]
     fn test_jjconfig_default() {
         let config = JjConfig::default();
-        
+
         assert!(config.user_name.is_none());
         assert!(config.user_email.is_none());
         assert_eq!(config.default_branch, "main");
@@ -1272,7 +1405,7 @@ baz = 123
 user_name = "Test"
 "#;
         let config: JjConfig = toml::from_str(toml_str).expect("Should parse");
-        
+
         assert_eq!(config.user_name, Some("Test".to_string()));
         assert!(config.user_email.is_none());
         assert_eq!(config.default_branch, "main"); // default
@@ -1283,7 +1416,7 @@ user_name = "Test"
     #[test]
     fn test_uipreferences_default() {
         let prefs = UiPreferences::default();
-        
+
         assert_eq!(prefs.theme, "dark");
         assert_eq!(prefs.sidebar_width, 300);
     }
@@ -1293,7 +1426,7 @@ user_name = "Test"
         // Parse with only theme specified
         let toml_str = r#"theme = "light""#;
         let prefs: UiPreferences = toml::from_str(toml_str).expect("Should parse");
-        
+
         assert_eq!(prefs.theme, "light");
         assert_eq!(prefs.sidebar_width, 300); // default
     }
@@ -1303,20 +1436,24 @@ user_name = "Test"
     #[test]
     fn test_save_and_load_project_tasks() {
         let (storage, _temp) = create_test_storage();
-        
+
         let project_id = Uuid::new_v4();
         let task = crate::test_helpers::create_test_task("Test Task");
         let mut task = task;
         task.project_id = project_id;
-        
+
         let tasks = vec![task.clone()];
-        
+
         // Save tasks
-        storage.save_project_tasks(project_id, &tasks).expect("Should save tasks");
-        
+        storage
+            .save_project_tasks(project_id, &tasks)
+            .expect("Should save tasks");
+
         // Load tasks
-        let loaded = storage.load_project_tasks(project_id).expect("Should load tasks");
-        
+        let loaded = storage
+            .load_project_tasks(project_id)
+            .expect("Should load tasks");
+
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].title, "Test Task");
         assert_eq!(loaded[0].project_id, project_id);
@@ -1325,31 +1462,37 @@ user_name = "Test"
     #[test]
     fn test_load_nonexistent_project_tasks_returns_empty() {
         let (storage, _temp) = create_test_storage();
-        
+
         let project_id = Uuid::new_v4();
-        let tasks = storage.load_project_tasks(project_id).expect("Should return empty vec");
-        
+        let tasks = storage
+            .load_project_tasks(project_id)
+            .expect("Should return empty vec");
+
         assert!(tasks.is_empty());
     }
 
     #[test]
     fn test_delete_project_tasks() {
         let (storage, _temp) = create_test_storage();
-        
+
         let project_id = Uuid::new_v4();
         let task = crate::test_helpers::create_test_task("Test Task");
         let tasks = vec![task];
-        
+
         // Save tasks
-        storage.save_project_tasks(project_id, &tasks).expect("Should save");
-        
+        storage
+            .save_project_tasks(project_id, &tasks)
+            .expect("Should save");
+
         // An unroutable project (no config loaded) keeps the legacy filename.
         let path = storage.legacy_tasks_path(project_id);
         assert!(path.exists());
-        
+
         // Delete tasks
-        storage.delete_project_tasks(project_id).expect("Should delete");
-        
+        storage
+            .delete_project_tasks(project_id)
+            .expect("Should delete");
+
         // Verify file is gone
         assert!(!path.exists());
     }
@@ -1372,8 +1515,12 @@ user_name = "Test"
         task3.project_id = project1_id;
 
         // Save tasks
-        storage.save_project_tasks(project1_id, &[task1, task3]).expect("Should save");
-        storage.save_project_tasks(project2_id, &[task2]).expect("Should save");
+        storage
+            .save_project_tasks(project1_id, &[task1, task3])
+            .expect("Should save");
+        storage
+            .save_project_tasks(project2_id, &[task2])
+            .expect("Should save");
 
         // Load all tasks
         let all_tasks = storage.load_all_tasks().expect("Should load all");
@@ -1613,8 +1760,15 @@ user_name = "Test"
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&storage.config_file).unwrap().permissions().mode();
-            assert_eq!(mode & 0o077, 0, "config.toml must not be group/world readable");
+            let mode = fs::metadata(&storage.config_file)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "config.toml must not be group/world readable"
+            );
         }
     }
 
@@ -1630,7 +1784,11 @@ user_name = "Test"
         let tmp = unique_temp_path(&storage.config_file);
         create_owner_only_file(&tmp, b"secret").unwrap();
         let mode = fs::metadata(&tmp).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "temp file must be owner-only at creation");
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "temp file must be owner-only at creation"
+        );
         fs::remove_file(&tmp).unwrap();
     }
 
@@ -1643,7 +1801,11 @@ user_name = "Test"
         for _ in 0..1000 {
             let tmp = unique_temp_path(path);
             assert!(seen.insert(tmp.clone()), "temp path collided: {tmp:?}");
-            assert_eq!(tmp.parent(), path.parent(), "temp file must stay a sibling of the destination");
+            assert_eq!(
+                tmp.parent(),
+                path.parent(),
+                "temp file must stay a sibling of the destination"
+            );
         }
     }
 
@@ -1689,7 +1851,10 @@ user_name = "Test"
             .filter_map(|e| e.ok())
             .filter(|e| e.path() != *path)
             .collect();
-        assert!(leftovers.is_empty(), "unexpected leftover temp files: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "unexpected leftover temp files: {leftovers:?}"
+        );
     }
 
     // ==================== parse_github_url Tests ====================
@@ -1699,7 +1864,12 @@ user_name = "Test"
         let result = parse_github_url("https://github.com/owner/repo/issues/123", false);
         assert!(result.is_some());
         match result.unwrap() {
-            ExternalRef::GithubIssue { number, repo, url, state } => {
+            ExternalRef::GithubIssue {
+                number,
+                repo,
+                url,
+                state,
+            } => {
                 assert_eq!(number, 123);
                 assert_eq!(repo, "owner/repo");
                 assert_eq!(url, "https://github.com/owner/repo/issues/123");
@@ -1714,7 +1884,12 @@ user_name = "Test"
         let result = parse_github_url("https://github.com/owner/repo/pull/456", true);
         assert!(result.is_some());
         match result.unwrap() {
-            ExternalRef::GithubPr { number, repo, url, state } => {
+            ExternalRef::GithubPr {
+                number,
+                repo,
+                url,
+                state,
+            } => {
                 assert_eq!(number, 456);
                 assert_eq!(repo, "owner/repo");
                 assert_eq!(url, "https://github.com/owner/repo/pull/456");
@@ -1786,7 +1961,9 @@ user_name = "Test"
     #[test]
     fn test_migrate_task_refs_already_migrated_skipped() {
         let mut task = crate::test_helpers::create_test_task("Already Migrated");
-        task.external_refs.push(ExternalRef::LinearTicket { id: "existing".to_string() });
+        task.external_refs.push(ExternalRef::LinearTicket {
+            id: "existing".to_string(),
+        });
         task.github_issue_url = Some("https://github.com/owner/repo/issues/1".to_string());
 
         migrate_task_refs(&mut task);
@@ -1893,11 +2070,26 @@ user_name = "Test"
 
         assert_eq!(task.external_refs.len(), 5);
         // Verify order: GithubIssue, GithubPr, JiraTicket, LinearTicket, GitlabIssue
-        assert!(matches!(&task.external_refs[0], ExternalRef::GithubIssue { number: 10, .. }));
-        assert!(matches!(&task.external_refs[1], ExternalRef::GithubPr { number: 20, .. }));
-        assert!(matches!(&task.external_refs[2], ExternalRef::JiraTicket { .. }));
-        assert!(matches!(&task.external_refs[3], ExternalRef::LinearTicket { .. }));
-        assert!(matches!(&task.external_refs[4], ExternalRef::GitlabIssue { .. }));
+        assert!(matches!(
+            &task.external_refs[0],
+            ExternalRef::GithubIssue { number: 10, .. }
+        ));
+        assert!(matches!(
+            &task.external_refs[1],
+            ExternalRef::GithubPr { number: 20, .. }
+        ));
+        assert!(matches!(
+            &task.external_refs[2],
+            ExternalRef::JiraTicket { .. }
+        ));
+        assert!(matches!(
+            &task.external_refs[3],
+            ExternalRef::LinearTicket { .. }
+        ));
+        assert!(matches!(
+            &task.external_refs[4],
+            ExternalRef::GitlabIssue { .. }
+        ));
     }
 
     #[test]
@@ -1920,8 +2112,14 @@ user_name = "Test"
 
         // Malformed github URL is skipped, but jira and linear still migrate
         assert_eq!(task.external_refs.len(), 2);
-        assert!(matches!(&task.external_refs[0], ExternalRef::JiraTicket { .. }));
-        assert!(matches!(&task.external_refs[1], ExternalRef::LinearTicket { .. }));
+        assert!(matches!(
+            &task.external_refs[0],
+            ExternalRef::JiraTicket { .. }
+        ));
+        assert!(matches!(
+            &task.external_refs[1],
+            ExternalRef::LinearTicket { .. }
+        ));
     }
 
     #[test]
