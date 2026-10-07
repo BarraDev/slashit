@@ -131,7 +131,7 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
                 "kind":entry["kind"]["kind"],
                 "text_excerpt":entry["kind"]["text"].as_str().map(|text| text.chars().take(160).collect::<String>()),
             })).collect::<Vec<_>>()).unwrap_or_default();
-            let actions = latest["conversation"]["actions"].as_array().map(|actions| actions.iter().map(|action| json!({
+            let actions = latest["conversation"]["actions"].as_array().map(|actions| actions.iter().take(8).map(|action| json!({
                 "id":action["id"],
                 "status":action["status"],
                 "coordinator_replied":action["coordinator_replied"],
@@ -148,12 +148,12 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
                 let excerpt = prompt.chars().take(1000).collect::<String>();
                 let truncated = prompt.chars().count() > 1000;
                 json!({
-                    "working_directory":run.working_dir.file_name(),
+                    "working_directory":run.working_dir.file_name().and_then(|name| name.to_str()).unwrap_or("<non-utf8>"),
                     "has_returned_action":prompt.contains("\"returned_action\""),
                     "has_worker_result":prompt.contains("fake Worker completed approved work"),
                     "prompt_excerpt":if truncated { format!("{excerpt}… [truncated]") } else { excerpt },
                 })
-            })).collect::<Vec<_>>();
+            })).take(8).collect::<Vec<_>>();
             bail!("{error}; persisted state summary: {state_summary}; fake provider run diagnostics: {runs:#?}");
         }
 
