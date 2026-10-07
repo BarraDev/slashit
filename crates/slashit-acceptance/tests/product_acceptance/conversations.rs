@@ -43,7 +43,7 @@ async fn zero_task_project_conversation_replies_and_survives_restart() {
         for run in &runs {
             let prompt = run.prompt.as_deref().unwrap_or_default();
             if !prompt.contains("\"tasks\":[]") { bail!("Coordinator projection did not prove an empty Task index: {prompt}"); }
-            if !run.working_dir.starts_with(context.state().data_home().join("slashit-app")) { bail!("no-Task Coordinator ran outside SlashIt's data area: {}", run.working_dir.display()); }
+            if run.working_dir.starts_with(context.state().data_home().join("slashit-app")) { bail!("Coordinator without a repository root was given access to SlashIt's private data directory: {}", run.working_dir.display()); }
             if run.args.iter().any(|arg| arg == "--dangerously-skip-permissions") { bail!("Project Coordinator received mutating tool access"); }
             if !run.args.iter().any(|arg| arg == "Read,Glob,Grep") { bail!("Project Coordinator was not restricted to read-only tools"); }
             if run.args.iter().any(|arg| arg == "--resume" || arg == "--session-id") { bail!("Coordinator run depended on provider session continuity"); }
