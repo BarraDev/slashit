@@ -61,6 +61,9 @@ pub struct StartupReport {
     /// registration of their branch. The reference is kept, and the task says
     /// what the user can do about it.
     pub locked_worktrees: usize,
+    /// Durable Project Conversation cleanup records that could not be
+    /// completed during startup. Each record remains on disk for a later retry.
+    pub project_conversation_cleanup_failures: Vec<String>,
 }
 
 /// Resolve the OS directories and build state from what is on disk.
@@ -81,10 +84,17 @@ pub async fn build_state_with_paths(
     // Config must be read before the worktree manager is built: it carries the
     // worktree placement policy, and it populates Storage's project routing
     // table, which every later task load depends on.
-    let loaded_config = storage.load_config().unwrap_or_else(|e| {
-        eprintln!("Warning: Failed to load config from disk: {e}");
-        config::storage::AppConfig::default()
-    });
+    let (loaded_config, projects_are_authoritative) = match storage.load_config_strict() {
+        Ok(config) => (config, true),
+        Err(e) => {
+            eprintln!("Warning: Failed to load complete config from disk: {e}");
+            let recovered = storage.load_config().unwrap_or_else(|recovery_error| {
+                eprintln!("Warning: Failed to recover config from disk: {recovery_error}");
+                config::storage::AppConfig::default()
+            });
+            (recovered, false)
+        }
+    };
 
     let task_state = commands::task::TaskState::new();
     let queue_state = commands::queue::QueueState::new(task_state.tasks.clone());
@@ -116,6 +126,7 @@ pub async fn build_state_with_paths(
         project: project_state,
         workspace: commands::workspace::WorkspaceState::load(&paths)?,
         task: task_state,
+        conversation: commands::conversation::ConversationState::new(),
         agent: commands::agent::AgentState::new(),
         session: commands::session::SessionState::new(),
         jj: commands::jj::JjState::new(),
@@ -180,6 +191,47 @@ pub async fn build_state_with_paths(
             }
         }
         report.projects = projects.len();
+    }
+
+    // Absence of a Project is trusted only from a config loaded without
+    // salvage: a fallback or defaulted config makes every Project look
+    // deleted and would destroy a live Project's history. Without that
+    // proof every record is left for a later start. With it, a present
+    // Project means its removal never committed (drop the record); an absent
+    // one means the record authorizes finishing Conversation cleanup.
+    if projects_are_authoritative {
+        match app_state.storage.pending_project_conversation_deletions() {
+            Ok(pending) => {
+                let projects = app_state.project.projects.read().await;
+                for project_id in pending {
+                    if projects.contains_key(&project_id) {
+                        if let Err(error) = app_state.storage
+                            .clear_project_conversation_deletion_pending(project_id)
+                        {
+                            eprintln!("Warning: Failed to clear uncommitted Project deletion record for {project_id}: {error}");
+                            report.project_conversation_cleanup_failures.push(format!(
+                                "{project_id}: could not clear uncommitted deletion marker: {error}"
+                            ));
+                        }
+                    } else {
+                        let result = app_state.storage.delete_project_conversation(project_id)
+                            .and_then(|()| app_state.storage.clear_project_conversation_deletion_pending(project_id));
+                        if let Err(error) = result {
+                            eprintln!("Warning: Project Conversation cleanup remains pending for {project_id}: {error}");
+                            report.project_conversation_cleanup_failures.push(format!(
+                                "{project_id}: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("Warning: Failed to discover pending Project Conversation cleanup: {error}");
+                report.project_conversation_cleanup_failures.push(format!(
+                    "could not discover pending cleanup records: {error}"
+                ));
+            }
+        }
     }
 
     let loaded_tasks = app_state.storage.load_all_tasks().unwrap_or_else(|e| {
@@ -631,6 +683,90 @@ mod tests {
         assert!(state.task.tasks.read().await.is_empty());
         assert!(state.project.projects.read().await.is_empty());
         assert!(state.repository.repositories.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_retries_committed_project_conversation_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let seed = Storage::with_paths((*paths).clone());
+        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let conversation = seed.create_primary_conversation(project_id).unwrap();
+        let pointer = paths.primary_conversation_file(project_id);
+        let document = paths.conversation_file(conversation.id);
+        std::fs::write(&document, "malformed Conversation").unwrap();
+        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+
+        // First fresh AppState models restart after committed deletion. The
+        // malformed document blocks cleanup, so the durable retry record must
+        // survive this startup too.
+        let (first_state, first_report) = build_state_with_paths(paths.clone()).await.unwrap();
+        assert_eq!(first_report.projects, 0);
+        assert_eq!(first_report.project_conversation_cleanup_failures.len(), 1);
+        assert!(!first_state.project.projects.read().await.contains_key(&project_id));
+        assert!(pointer.exists());
+        assert!(document.exists());
+        assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
+
+        // Repair the unreadable document, then a later restart retries and
+        // finishes the same deletion.
+        seed.save_conversation(&conversation).unwrap();
+        let (state, report) = build_state_with_paths(paths.clone()).await.unwrap();
+
+        assert_eq!(report.projects, 0);
+        assert!(report.project_conversation_cleanup_failures.is_empty());
+        assert!(!state.project.projects.read().await.contains_key(&project_id));
+        assert!(!pointer.exists());
+        assert!(!document.exists());
+        assert!(!paths.pending_project_conversation_deletion_file(project_id).exists());
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_recover_deletions_from_a_salvaged_config() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let seed = Storage::with_paths((*paths).clone());
+        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let conversation = seed.create_primary_conversation(project_id).unwrap();
+        let pointer = paths.primary_conversation_file(project_id);
+        let document = paths.conversation_file(conversation.id);
+        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+
+        // `load_config` salvages this structurally invalid section as an Ok
+        // partial default, but absence of Projects is not authoritative.
+        std::fs::write(paths.config_file(), "[worktree]\nplacement = \"shared_root\"\n").unwrap();
+        assert!(seed.load_config_strict().is_err());
+
+        let (_state, _report) = build_state_with_paths(paths.clone()).await.unwrap();
+
+        assert!(pointer.exists());
+        assert!(document.exists());
+        assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
+    }
+
+    #[tokio::test]
+    async fn startup_requires_explicit_projects_section_before_cleanup_recovery() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let seed = Storage::with_paths((*paths).clone());
+        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let conversation = seed.create_primary_conversation(project_id).unwrap();
+        let pointer = paths.primary_conversation_file(project_id);
+        let document = paths.conversation_file(conversation.id);
+        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+
+        // A syntactically valid config still cannot prove Project absence if
+        // it predates or lost the projects section; serde would default it.
+        std::fs::write(paths.config_file(), "[ui_preferences]\n").unwrap();
+        assert!(seed.load_config_strict().is_err());
+        let (_state, _report) = build_state_with_paths(paths.clone()).await.unwrap();
+
+        assert!(pointer.exists());
+        assert!(document.exists());
+        assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
     }
 
     #[tokio::test]

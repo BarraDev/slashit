@@ -360,6 +360,28 @@ impl AppPaths {
         self.data_dir.join("pr-helper-logs")
     }
 
+    /// Durable Project Conversation documents and their primary references.
+    /// Conversation documents are keyed by their own identity; the small
+    /// per-Project pointer permits one primary Conversation today without
+    /// making additional Conversations impossible later.
+    pub fn conversations_dir(&self) -> PathBuf {
+        self.data_dir.join("conversations")
+    }
+
+    pub fn primary_conversation_file(&self, project_id: Uuid) -> PathBuf {
+        self.conversations_dir().join(format!("{project_id}.primary"))
+    }
+
+    /// Durable recovery records for Project deletions whose Conversation
+    /// cleanup may not have completed before process exit.
+    pub fn pending_project_conversation_deletion_file(&self, project_id: Uuid) -> PathBuf {
+        self.conversations_dir().join(format!("{project_id}.delete-pending"))
+    }
+
+    pub fn conversation_file(&self, conversation_id: Uuid) -> PathBuf {
+        self.conversations_dir().join(format!("{conversation_id}.json"))
+    }
+
     // --- Machine-local files -----------------------------------------------
 
     /// Terminal session metadata. Machine-local, so always under `data_dir`.

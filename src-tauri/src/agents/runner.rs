@@ -664,6 +664,28 @@ impl ClaudeRunner {
         self.accumulated_output.read().await.clone()
     }
 
+    /// Return the semantic answer from Claude's authoritative final `result`
+    /// event. Assistant messages, text deltas, and tool events remain useful
+    /// progress/transcript data, but must not be concatenated into a strict
+    /// application response.
+    ///
+    /// Call after [`Self::wait`] succeeds so process, prompt-delivery, and
+    /// Claude-level errors have already been rejected.
+    pub async fn final_result_text(&self) -> Result<String, String> {
+        let result = self.result_event.read().await;
+        let Some(event) = result.as_ref() else {
+            return Err("Claude completed without an authoritative result event".into());
+        };
+        if let Some(error) = result_failure_reason(event) {
+            return Err(error);
+        }
+        event
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "Claude result event did not contain textual semantic output".into())
+    }
+
     /// The verbatim stdout transcript (every line, newline-joined), for a
     /// caller that needs to reparse the raw `stream-json` stream under its
     /// own extraction/error-classification rules rather than this runner's
@@ -1564,6 +1586,58 @@ mod tests {
                  stdout reader can produce"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn final_semantic_result_uses_only_the_authoritative_result_event() {
+        let fixture = Fixture::new("semantic_result");
+        let runner = fixture
+            .start_with(fixture.config_with_prompt("Coordinator turn", read_only()))
+            .await;
+        assert_eq!(
+            bounded("Coordinator semantic result", &runner).await,
+            Ok(true)
+        );
+        assert_eq!(
+            runner.final_result_text().await.unwrap(),
+            r#"{"type":"reply","text":"hello"}"#
+        );
+        let transcript = runner.get_output().await;
+        assert!(
+            transcript
+                .matches(r#"{"type":"reply","text":"hello"}"#)
+                .count()
+                >= 2
+        );
+        assert_ne!(transcript, runner.final_result_text().await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worker_semantic_result_uses_final_result_after_assistant_and_tool_events() {
+        let fixture = Fixture::new("semantic_result");
+        let runner = fixture
+            .start_with(fixture.config_with_prompt(
+                "Execute only approved_request in this Task Checkout",
+                full(),
+            ))
+            .await;
+        assert_eq!(bounded("Worker semantic result", &runner).await, Ok(true));
+        assert_eq!(
+            runner.final_result_text().await.unwrap(),
+            "Worker changed the requested file and ran validation."
+        );
+        assert!(runner
+            .get_output()
+            .await
+            .contains("Worker changed the requested file"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn final_semantic_result_still_rejects_error_result_events() {
+        let fixture = Fixture::new(CLAUDE_LEVEL_ERROR);
+        let runner = fixture.start().await;
+        assert!(bounded("Claude-level failure", &runner).await.is_err());
+        assert!(runner.final_result_text().await.is_err());
     }
 
     /// The same case in the shape production uses.

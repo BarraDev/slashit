@@ -42,6 +42,8 @@ mod board_identity;
 mod disk_pressure;
 #[path = "product_acceptance/checkout_recovery.rs"]
 mod checkout_recovery;
+#[path = "product_acceptance/conversations.rs"]
+mod conversations;
 #[path = "product_acceptance/developer_tools.rs"]
 mod developer_tools;
 #[path = "product_acceptance/git_fixture.rs"]

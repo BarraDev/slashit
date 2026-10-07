@@ -39,6 +39,7 @@ pub struct AppState {
     pub project: commands::project::ProjectState,
     pub workspace: commands::workspace::WorkspaceState,
     pub task: commands::task::TaskState,
+    pub conversation: commands::conversation::ConversationState,
     pub agent: commands::agent::AgentState,
     pub session: commands::session::SessionState,
     pub jj: commands::jj::JjState,
@@ -144,10 +145,23 @@ pub fn run() {
     let (app_state, report) = tauri::async_runtime::block_on(app_core::build_state())
         .expect("Failed to build application state");
 
-    println!(
-        "SlashIt: Loaded {} repositories, {} projects, {} tasks from disk",
-        report.repositories, report.projects, report.tasks
-    );
+    if report.project_conversation_cleanup_failures.is_empty() {
+        println!(
+            "SlashIt: Loaded {} repositories, {} projects, {} tasks from disk",
+            report.repositories, report.projects, report.tasks
+        );
+    } else {
+        eprintln!(
+            "SlashIt: Startup incomplete: loaded {} repositories, {} projects, {} tasks; {} Project Conversation cleanup recovery issue(s) need attention",
+            report.repositories,
+            report.projects,
+            report.tasks,
+            report.project_conversation_cleanup_failures.len()
+        );
+        for failure in &report.project_conversation_cleanup_failures {
+            eprintln!("SlashIt: Pending Project Conversation cleanup: {failure}");
+        }
+    }
     if report.migrated_projects > 0 {
         if report.unsaved_migrated_projects > 0 {
             println!(
@@ -312,6 +326,12 @@ pub fn run() {
             initialize_project_vcs,
             create_project,
             list_projects,
+            get_project_conversation,
+            open_project_conversation,
+            send_project_message,
+            retry_project_conversation_continuation,
+            act_on_project_conversation,
+            stop_project_conversation,
             get_project,
             delete_project,
             update_project,

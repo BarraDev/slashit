@@ -39,6 +39,7 @@ pub mod task_edit_modal;
 pub mod task_context_menu;
 pub mod custom_select;
 pub mod project_rail;
+pub mod project_conversation;
 pub mod quit_dialog;
 pub mod diff_viewer;
 pub mod update_banner;

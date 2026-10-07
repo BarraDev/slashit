@@ -65,6 +65,7 @@ pub(crate) async fn active_agent_count(
     // Those records are excluded above, so this counts each owned provider
     // exactly once while still covering that pre-record window.
     executor_execution_ids.len() + executor_task_ids.len() + legacy_count
+        + executor.map_or(0, crate::queue::TaskExecutor::counted_project_run_count)
 }
 
 #[tauri::command]

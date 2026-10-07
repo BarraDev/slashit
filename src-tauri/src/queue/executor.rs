@@ -334,6 +334,31 @@ struct RunningTask {
     execution_id: Option<Uuid>,
 }
 
+/// A fresh Project Conversation Run registered with the existing executor.
+/// Its provider future holds this lease until it has killed/reaped Claude and
+/// persisted the semantic outcome. The key is Conversation identity, never a
+/// synthetic Task id.
+pub struct ProjectRunLease {
+    conversation_id: Uuid,
+    owners: Arc<std::sync::Mutex<HashMap<Uuid, ProjectRunOwner>>>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    _permit: Option<AdmissionPermit>,
+}
+
+struct ProjectRunOwner {
+    cancel: tokio::sync::watch::Sender<bool>,
+    counts_as_agent: bool,
+}
+
+impl ProjectRunLease {
+    pub fn cancel_receiver(&self) -> tokio::sync::watch::Receiver<bool> { self.cancel_rx.clone() }
+    pub fn is_cancelled(&self) -> bool { *self.cancel_rx.borrow() }
+}
+
+impl Drop for ProjectRunLease {
+    fn drop(&mut self) { self.owners.lock().unwrap().remove(&self.conversation_id); }
+}
+
 /// A review/fix flow the executor can still reach, on exactly the same
 /// footing as [`RunningTask`] and for the same reason: `reviewing_handles`
 /// used to store a bare `JoinHandle<()>`, which nothing could stop -- an
@@ -744,6 +769,9 @@ pub struct TaskExecutor {
     /// why this is a blocking `std::sync::Mutex` rather than the `tokio::
     /// sync::RwLock` the other two handle maps use.
     pr_helper_handles: Arc<std::sync::Mutex<HashMap<Uuid, PrHelperOwner>>>,
+    /// Project Conversation Runs share this executor's admission gate and
+    /// cancellation ownership. They are keyed by Conversation identity.
+    project_runs: Arc<std::sync::Mutex<HashMap<Uuid, ProjectRunOwner>>>,
     /// The one admission gate ordinary execution and AI review/fix share.
     ///
     /// See [`crate::queue::admission`] for why this is a semaphore-backed
@@ -970,6 +998,7 @@ impl TaskExecutor {
             reviewing_handles: Arc::new(RwLock::new(HashMap::new())),
             ending_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pr_helper_handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            project_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             admission: Admission::new(initial_limit),
             reserved_permits: Arc::new(RwLock::new(HashMap::new())),
             lifecycle: config.lifecycle,
@@ -1059,6 +1088,39 @@ impl TaskExecutor {
         self.running_handles.read().await.len()
             + self.reviewing_handles.read().await.len()
             + self.pr_helper_handles.lock().unwrap().len()
+            + self.counted_project_run_count()
+    }
+
+    /// Register one Project-scoped fresh Run with the same capacity gate used
+    /// by Task execution. A Task Worker passes `reserve_capacity = false`
+    /// because its Task ownership lease already holds that capacity.
+    pub async fn begin_project_run(&self, conversation_id: Uuid, reserve_capacity: bool) -> Result<ProjectRunLease, String> {
+        let permit = if reserve_capacity {
+            self.start_guard.check().await.map_err(|block| block.to_string())?;
+            self.reconcile_admission().await;
+            Some(self.admission.try_acquire().ok_or("No agent capacity is available right now")?)
+        } else { None };
+        let mut owners = self.project_runs.lock().unwrap();
+        if owners.contains_key(&conversation_id) { return Err("A Run is already active for this Conversation".into()); }
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        owners.insert(conversation_id, ProjectRunOwner { cancel: cancel_tx.clone(), counts_as_agent: reserve_capacity });
+        Ok(ProjectRunLease { conversation_id, owners: self.project_runs.clone(), cancel_rx, _permit: permit })
+    }
+
+    pub fn project_run_is_live(&self, conversation_id: Uuid) -> bool {
+        self.project_runs.lock().unwrap().contains_key(&conversation_id)
+    }
+
+    pub fn active_project_run_count(&self) -> usize { self.project_runs.lock().unwrap().len() }
+
+    pub(crate) fn counted_project_run_count(&self) -> usize {
+        self.project_runs.lock().unwrap().values().filter(|owner| owner.counts_as_agent).count()
+    }
+
+    pub fn stop_project_run(&self, conversation_id: Uuid) -> Result<(), String> {
+        let owners = self.project_runs.lock().unwrap();
+        let sender = owners.get(&conversation_id).map(|owner| owner.cancel.clone()).ok_or("No live Run for this Conversation")?;
+        sender.send(true).map_err(|_| "Conversation Run already ended".to_string())
     }
 
     /// Return the executor-owned provider flows in two forms for safety
@@ -5718,6 +5780,47 @@ mod tests {
         })
         .expect("serialises");
         assert_eq!(value, serde_json::json!({"type": "output", "task_id": "t", "text": "hello"}));
+    }
+
+    #[tokio::test]
+    async fn project_conversation_runs_use_executor_ownership_without_a_task_id() {
+        let (executor, _temps) = test_executor();
+        let conversation_id = Uuid::new_v4();
+        let lease = executor.begin_project_run(conversation_id, true).await.expect("admit Project Coordinator");
+        assert!(executor.project_run_is_live(conversation_id));
+        assert_eq!(executor.active_project_run_count(), 1);
+        assert_eq!(executor.running_task_count().await, 1);
+        assert!(executor.begin_project_run(conversation_id, true).await.is_err(), "one Run per Conversation");
+
+        let mut cancelled = lease.cancel_receiver();
+        executor.stop_project_run(conversation_id).expect("stop Coordinator");
+        cancelled.changed().await.expect("stop signal");
+        assert!(*cancelled.borrow());
+
+        drop(lease);
+        assert!(!executor.project_run_is_live(conversation_id));
+        assert_eq!(executor.running_task_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn delegated_worker_is_counted_once_across_task_and_conversation_ownership() {
+        let (executor, _temps) = test_executor();
+        let task_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let task_lease = executor.try_begin_pr_helper(task_id).await.expect("admit Task Worker");
+        let worker_run = executor.begin_project_run(conversation_id, false).await.expect("register Worker Conversation run");
+
+        assert_eq!(executor.active_project_run_count(), 1, "the run remains live for stop/recovery");
+        assert_eq!(executor.running_task_count().await, 1, "shutdown waits on the process once");
+        assert_eq!(
+            crate::commands::agent::active_agent_count(&executor.executions, Some(&executor)).await,
+            1,
+            "Task and Conversation ownership refer to one provider process"
+        );
+
+        drop(worker_run);
+        drop(task_lease);
+        assert_eq!(executor.running_task_count().await, 0);
     }
 
     /// A `TaskExecutor` over nothing but temporary directories.

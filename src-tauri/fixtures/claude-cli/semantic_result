@@ -1,0 +1,21 @@
+#!/bin/sh
+# Models Claude Code stream-json: assistant messages are progress while the
+# final `result` field is the one authoritative semantic answer.
+prompt=$(cat)
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-semantic"}'
+case "$prompt" in
+  *'Execute only approved_request'*)
+    final='Worker changed the requested file and ran validation.'
+    assistant='Worker changed the requested file and ran validation.'
+    ;;
+  *)
+    final='{"type":"reply","text":"hello"}'
+    assistant='{"type":"reply","text":"hello"}'
+    ;;
+esac
+escaped=$(printf '%s' "$final" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"%s"}]}}\n' "$assistant"
+if printf '%s' "$prompt" | grep -q 'Execute only approved_request'; then
+    printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_work","name":"Edit","input":{}}]}}'
+fi
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s-semantic","result":"%s"}\n' "$escaped"

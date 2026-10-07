@@ -97,10 +97,23 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     let bound = crate::ipc::BoundIpc::bind(&paths, &ipc_config).await?;
 
     let (state, report) = build_state().await?;
-    println!(
-        "slashitd: loaded {} repositories, {} projects, {} tasks",
-        report.repositories, report.projects, report.tasks
-    );
+    if report.project_conversation_cleanup_failures.is_empty() {
+        println!(
+            "slashitd: loaded {} repositories, {} projects, {} tasks",
+            report.repositories, report.projects, report.tasks
+        );
+    } else {
+        eprintln!(
+            "slashitd: startup incomplete: loaded {} repositories, {} projects, {} tasks; {} Project Conversation cleanup recovery issue(s) need attention",
+            report.repositories,
+            report.projects,
+            report.tasks,
+            report.project_conversation_cleanup_failures.len()
+        );
+        for failure in &report.project_conversation_cleanup_failures {
+            eprintln!("slashitd: pending Project Conversation cleanup: {failure}");
+        }
+    }
     if report.migrated_projects > 0 {
         println!(
             "slashitd: migrated tasks in {} project(s); adopted {} worktree(s), cleared {}",

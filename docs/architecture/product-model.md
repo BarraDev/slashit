@@ -43,6 +43,7 @@ development process, not of the product.
 
 ```text
 Workspace  0..1 ── 0..n  Project     (membership stored on the Project)
+Project    1    ── 1      primary Conversation
 Project    1    ── 0..n  Task
 Task       1    ── 0..1  Task Checkout  (according to lifecycle state)
 ```
@@ -57,6 +58,16 @@ Task       1    ── 0..1  Task Checkout  (according to lifecycle state)
 - **A Workspace with members cannot be deleted.** Deletion is refused while
   any Project's scope still names it, so no Project is left pointing at a
   Workspace that no longer exists.
+- **A Conversation belongs to its Project.** The Project's primary
+  Conversation has its own durable id and an ordered SlashIt-owned history.
+  It can be opened and used when the Project has no Tasks and does not
+  require a Task Checkout. A Workspace member Project keeps its own
+  Conversation; Workspaces do not own Conversations.
+- **Tasks are Project resources, not Conversation owners.** The Project
+  Coordinator can discuss bounded Task metadata and propose a structured
+  delegation to one existing Task. A human must approve the exact request
+  before a Task Worker runs in that Task's existing Checkout. The Worker
+  result is recorded back into the Project Conversation.
 - **A Task Checkout belongs to exactly one Task.** It is created or
   reattached when the Task is executed or when a checkout is requested for
   it, and it survives the end of a run, so the next run continues from the
@@ -249,6 +260,7 @@ The procedure is in [development-workflow.md](../development-workflow.md).
 | Workspace | `domain::Workspace`, `config::WorkspaceRegistry` (`workspaces.toml`), `commands/workspace.rs` |
 | Project, ProjectScope | `domain::Project`, `domain::ProjectScope` (`Project.scope`); attach/detach in `commands/project.rs` |
 | Task | `domain::Task` |
+| Project Conversation | `domain::conversation::Conversation`, private storage in `commands/conversation.rs` and `config::Storage` |
 | Task Checkout | `Task.worktree_path`, `branch_name`, `base_commit`, `branch_origin` (`domain::BranchOrigin`); `worktree::WorktreeManager` |
 | Base of a Task's branch | `worktree::default_base`, `Project.base` (`domain::ProjectBase`), `worktree::project_base` |
 | Repository readiness and setup | `worktree::readiness`, `worktree::remote_head`, `worktree::vcs_init`; `commands/repository_setup.rs` |

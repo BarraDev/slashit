@@ -78,7 +78,8 @@ use_tool() {
 # record always has its prompt next to it.
 if [ -n "$is_run" ]; then
     mkdir -p "$SLASHIT_FAKE_AGENT_MARKERS/.prompts"
-    cat > "$SLASHIT_FAKE_AGENT_MARKERS/.prompts/$position"
+    prompt_file="$SLASHIT_FAKE_AGENT_MARKERS/.prompts/$position"
+    cat > "$prompt_file"
 fi
 
 # Written in a staging directory and moved into place, because the test polls
@@ -197,5 +198,54 @@ if [ -n "$is_run" ] && [ "$failing" -gt 0 ]; then
     fi
 fi
 
-printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","result":"fake agent completed without changing the repository"}\n' "$session"
+coordinator_position=0
+if [ -n "$is_run" ] && grep -q '"current_message"' "$prompt_file" 2>/dev/null; then
+    coordinator_position=1
+    while ! mkdir "$SLASHIT_FAKE_AGENT_MARKERS/.coordinator-$coordinator_position" 2>/dev/null; do
+        coordinator_position=$((coordinator_position + 1))
+    done
+fi
+
+fail_after_worker=${SLASHIT_FAKE_COORDINATOR_FAIL_AFTER_WORKER:-0}
+if [ "$fail_after_worker" -gt 0 ] &&
+    grep -q '"returned_action"' "$prompt_file" 2>/dev/null &&
+    ! grep -q '"current_message"' "$prompt_file" 2>/dev/null &&
+    mkdir "$SLASHIT_FAKE_AGENT_MARKERS/.returned-action-failed" 2>/dev/null; then
+    printf '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"%s","result":"fake Coordinator was scripted to fail this run"}\n' "$session"
+    exit 0
+fi
+
+result="fake agent completed without changing the repository"
+if [ -n "$is_run" ] && grep -q '"returned_action"' "$prompt_file" 2>/dev/null &&
+    ! grep -q '"current_message"' "$prompt_file" 2>/dev/null; then
+    result='{"type":"reply","text":"Coordinator reviewed the Worker result."}'
+elif [ -n "$is_run" ] && grep -q '"current_message"' "$prompt_file" 2>/dev/null; then
+    forced_delegate_position=${SLASHIT_FAKE_COORDINATOR_DELEGATE_POSITION:-0}
+    if [ "$coordinator_position" -eq "$forced_delegate_position" ]; then
+        result=${SLASHIT_FAKE_COORDINATOR_OUTPUT:-'{"type":"reply","text":"Fake Coordinator reply."}'}
+    elif [ "$coordinator_position" -gt 2 ]; then
+        result='{"type":"reply","text":"Fake Coordinator reply."}'
+    else
+        result=${SLASHIT_FAKE_COORDINATOR_OUTPUT:-'{"type":"reply","text":"Fake Coordinator reply."}'}
+    fi
+    if [ "$result" = "delegate_to_task" ]; then
+        target=${SLASHIT_FAKE_COORDINATOR_TARGET_TASK_ID:-}
+        if [ -z "$target" ] && [ -r "$SLASHIT_FAKE_AGENT_MARKERS/.coordinator-target/id" ]; then
+            target=$(cat "$SLASHIT_FAKE_AGENT_MARKERS/.coordinator-target/id")
+        fi
+        if [ -z "$target" ]; then
+            task_object=$(grep -o '{[^}]*"title":"Existing Task"[^}]*}' "$prompt_file" | head -n 1)
+            target=$(printf '%s\n' "$task_object" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+        fi
+        if [ -z "$target" ]; then
+            echo "fake Coordinator could not find the requested target Task" >&2
+            exit 2
+        fi
+        result="{\"type\":\"delegate_to_task\",\"text\":\"The existing Task is the right execution boundary.\",\"target_task_id\":\"$target\",\"request\":\"Add the approved marker.\"}"
+    fi
+elif [ -n "$is_run" ] && grep -q '"approved_request"' "$prompt_file" 2>/dev/null; then
+    result="fake Worker completed approved work"
+fi
+escaped_result=$(printf '%s' "$result" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s","result":"%s"}\n' "$session" "$escaped_result"
 exit 0
