@@ -225,7 +225,15 @@ async fn field_value(driver: &WebDriver, selector: &str) -> Result<String> {
 async fn await_text(driver: &WebDriver, selector: &str, text: &str) -> Result<()> {
     let started = Instant::now();
     loop {
-        if super::text_of(driver, selector).await?.is_some_and(|actual| actual.contains(text)) { return Ok(()); }
+        let matches = super::page(
+            driver,
+            "return Array.from(document.querySelectorAll(arguments[0]), element => element.textContent || '');",
+            vec![Value::String(selector.to_owned())],
+        ).await?;
+        let shown = matches.as_array().is_some_and(|elements| {
+            elements.iter().filter_map(Value::as_str).any(|element| element.contains(text))
+        });
+        if shown { return Ok(()); }
         if started.elapsed() > EXECUTION_DEADLINE { bail!("{selector} never displayed {text:?}"); }
         tokio::time::sleep(POLL).await;
     }
