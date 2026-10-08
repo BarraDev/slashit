@@ -1,5 +1,6 @@
 //! Test-only Git fixture shared by the desktop journeys and ordinary helper tests.
 
+use super::git_support::git_command;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -98,19 +99,17 @@ impl GitFixture {
     /// answers with its exit status alone, which is why this does not go
     /// through [`git`], whose job is to fail the journey when a command fails.
     pub(crate) fn has_branch(&self, branch: &str) -> Result<bool> {
-        let status = std::process::Command::new("git")
-            .args([
+        let status = git_command(
+            &self.path,
+            &[
                 "rev-parse",
                 "--verify",
                 "--quiet",
                 &format!("refs/heads/{branch}"),
-            ])
-            .current_dir(&self.path)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .with_context(|| format!("could not look up branch {branch}"))?;
+            ],
+        )
+        .output()
+        .with_context(|| format!("could not look up branch {branch}"))?;
         Ok(status.status.success())
     }
 
@@ -122,12 +121,7 @@ impl GitFixture {
     /// cleanup that left the record behind would leave the repository unable
     /// to give this branch a worktree again.
     pub(crate) fn registers_worktree(&self, path: &Path) -> Result<bool> {
-        let output = std::process::Command::new("git")
-            .args(["worktree", "list", "--porcelain"])
-            .current_dir(&self.path)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
+        let output = git_command(&self.path, &["worktree", "list", "--porcelain"])
             .output()
             .context("could not list the fixture's worktrees")?;
         if !output.status.success() {
@@ -145,19 +139,17 @@ impl GitFixture {
 
     /// The commit `branch` points at, or `None` if there is no such branch.
     pub(crate) fn branch_tip(&self, branch: &str) -> Result<Option<String>> {
-        let output = std::process::Command::new("git")
-            .args([
+        let output = git_command(
+            &self.path,
+            &[
                 "rev-parse",
                 "--verify",
                 "--quiet",
                 &format!("refs/heads/{branch}"),
-            ])
-            .current_dir(&self.path)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .with_context(|| format!("could not resolve branch {branch}"))?;
+            ],
+        )
+        .output()
+        .with_context(|| format!("could not resolve branch {branch}"))?;
         if !output.status.success() {
             return Ok(None);
         }
@@ -174,12 +166,7 @@ impl GitFixture {
     /// one in the commit survives for as long as something still points at
     /// that commit.
     pub(crate) fn file_at(&self, revision: &str, file: &str) -> Result<Option<String>> {
-        let output = std::process::Command::new("git")
-            .args(["show", &format!("{revision}:{file}")])
-            .current_dir(&self.path)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
+        let output = git_command(&self.path, &["show", &format!("{revision}:{file}")])
             .output()
             .with_context(|| format!("could not read {file} at {revision}"))?;
         if !output.status.success() {
@@ -195,14 +182,12 @@ impl GitFixture {
     /// product able to find it again. That is the question a destructive
     /// journey is really asking about the work an agent produced.
     pub(crate) fn refs_reaching(&self, commit: &str) -> Result<Vec<String>> {
-        let output = std::process::Command::new("git")
-            .args(["for-each-ref", "--contains", commit, "--format=%(refname)"])
-            .current_dir(&self.path)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .with_context(|| format!("could not look for refs reaching {commit}"))?;
+        let output = git_command(
+            &self.path,
+            &["for-each-ref", "--contains", commit, "--format=%(refname)"],
+        )
+        .output()
+        .with_context(|| format!("could not look for refs reaching {commit}"))?;
         if !output.status.success() {
             bail!(
                 "git for-each-ref --contains failed: {}",
@@ -217,12 +202,7 @@ impl GitFixture {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let output = git_command(dir, args)
         .output()
         .with_context(|| format!("could not run git {args:?} in {}", dir.display()))?;
     if !output.status.success() {
@@ -241,7 +221,7 @@ fn resolve(path: &Path) -> PathBuf {
 
 #[cfg(all(test, not(feature = "run-acceptance")))]
 mod tests {
-    use super::GitFixture;
+    use super::{git_command, GitFixture};
     use anyhow::{bail, Context, Result};
     use std::path::{Path, PathBuf};
 
@@ -259,12 +239,7 @@ mod tests {
 
     /// Run a read-only git query in `dir` and return its trimmed output.
     fn query(dir: &Path, args: &[&str]) -> Result<String> {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
+        let output = git_command(dir, args)
             .output()
             .with_context(|| format!("could not run git {args:?}"))?;
         if !output.status.success() {

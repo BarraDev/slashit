@@ -7,7 +7,7 @@ use std::path::Path;
 /// and none of the variables that would point Git somewhere else: run from a
 /// Git hook, the environment names the hook's repository, and `GIT_DIR`
 /// overrides repository discovery from `dir`.
-fn git_command(dir: &Path, args: &[&str]) -> std::process::Command {
+pub(crate) fn git_command(dir: &Path, args: &[&str]) -> std::process::Command {
     let mut command = std::process::Command::new("git");
     command
         .args(args)
