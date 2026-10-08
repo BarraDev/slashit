@@ -14,6 +14,7 @@ anyhow = "1"
 # module, after the acceptance build strips it (src/wasm_names.rs).
 base64 = "0.22"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 # Default features. Trimming them to `["reqwest", "rustls"]` looks tempting --
 # `manager` can download browser drivers, which this harness never wants -- but

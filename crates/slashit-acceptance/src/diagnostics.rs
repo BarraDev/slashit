@@ -7,6 +7,7 @@
 //! error it was supposed to explain.
 
 use anyhow::Result;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use thirtyfour::prelude::*;
 
@@ -18,6 +19,101 @@ const MAX_SOURCE_BYTES: usize = 256 * 1024;
 /// oldest. Enough to compare a flake against its neighbours, few enough that
 /// `target/` does not grow without bound.
 const RETAINED_FAILURES: usize = 5;
+
+/// A low-cardinality outcome label. The detailed assertion remains in the
+/// test log; this label is safe to aggregate without copying page contents or
+/// task data into a second artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    AssertionOrProduct,
+    ApplicationCrash,
+    DriverOrSession,
+    Infrastructure,
+    HarnessPanic,
+}
+
+/// Classify only on concrete diagnostic markers. Unknown errors default to
+/// the test's own assertion/product path; the original error remains the
+/// authoritative explanation in libtest output.
+pub fn classify_failure(message: &str) -> FailureClass {
+    let message = message.to_ascii_lowercase();
+    if [
+        "segmentation fault",
+        "segfault",
+        "signal 11",
+        "renderer process crashed",
+        "application crashed",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        FailureClass::ApplicationCrash
+    } else if [
+        "webdriver",
+        "tauri-driver",
+        "invalid session",
+        "no such window",
+        "connection refused",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        FailureClass::DriverOrSession
+    } else if [
+        "xvfb",
+        "dbus",
+        "not installed",
+        "no application binary",
+        "could not create",
+        "permission denied",
+        "port is already",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+    {
+        FailureClass::Infrastructure
+    } else {
+        FailureClass::AssertionOrProduct
+    }
+}
+
+/// Stable, content-free timing record written both beside failed evidence
+/// and to the run-level JSONL index. The `session_logs` values are basenames,
+/// never absolute paths.
+#[derive(Debug, Serialize)]
+pub struct JourneyResult<'a> {
+    pub schema_version: u8,
+    pub journey: &'a str,
+    pub outcome: &'a str,
+    pub duration_ms: u64,
+    pub failure_class: Option<FailureClass>,
+    pub session_logs: &'a [String],
+}
+
+/// Save a per-journey JSON result and append it to a JSONL run index.
+/// Diagnostics must not replace a product failure, so I/O errors are returned
+/// for tests but callers in the harness report and suppress them.
+pub fn write_journey_result(
+    artifact_dir: &Path,
+    index_path: &Path,
+    result: &JourneyResult<'_>,
+) -> Result<()> {
+    if result.outcome != "passed" {
+        std::fs::create_dir_all(artifact_dir)?;
+        let json = serde_json::to_vec_pretty(result)?;
+        std::fs::write(artifact_dir.join("journey-result.json"), &json)?;
+    }
+    let line = serde_json::to_vec(result)?;
+    use std::io::Write;
+    let mut index = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(index_path)?;
+    index.write_all(&line)?;
+    index.write_all(b"\n")?;
+    Ok(())
+}
 
 /// Capture everything the live session can still tell us, into `dir`.
 ///
@@ -135,6 +231,79 @@ pub fn prune(root: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failure_classes_have_stable_markers() {
+        assert_eq!(
+            classify_failure("assertion failed: title mismatch"),
+            FailureClass::AssertionOrProduct
+        );
+        assert_eq!(
+            classify_failure("renderer process crashed with signal 11"),
+            FailureClass::ApplicationCrash
+        );
+        assert_eq!(
+            classify_failure("invalid WebDriver session"),
+            FailureClass::DriverOrSession
+        );
+        assert_eq!(
+            classify_failure("Xvfb is not installed"),
+            FailureClass::Infrastructure
+        );
+    }
+
+    #[test]
+    fn journey_result_is_written_as_json_and_jsonl_without_absolute_paths() {
+        let root = std::env::temp_dir().join(format!("slashit-diagnostics-{}", std::process::id()));
+        let artifact = root.join("failed-journey");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&artifact).expect("artifact directory");
+        let logs = ["0-project-provider.log".to_string()];
+        let result = JourneyResult {
+            schema_version: 1,
+            journey: "sample_journey",
+            outcome: "failed",
+            duration_ms: 1234,
+            failure_class: Some(FailureClass::DriverOrSession),
+            session_logs: &logs,
+        };
+        let index = root.join("journey-timings.jsonl");
+        write_journey_result(&artifact, &index, &result).expect("write result");
+        let parsed: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(artifact.join("journey-result.json")).expect("result file"),
+        )
+        .expect("valid result JSON");
+        assert_eq!(parsed["duration_ms"], 1234);
+        assert_eq!(parsed["failure_class"], "driver_or_session");
+        assert_eq!(parsed["session_logs"][0], "0-project-provider.log");
+        let line = std::fs::read_to_string(index).expect("JSONL index");
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.contains("sample_journey"));
+
+        let passed_artifact = root.join("passed-journey");
+        let passed = JourneyResult {
+            schema_version: 1,
+            journey: "passed_journey",
+            outcome: "passed",
+            duration_ms: 9,
+            failure_class: None,
+            session_logs: &[],
+        };
+        let index = root.join("journey-timings.jsonl");
+        write_journey_result(&passed_artifact, &index, &passed).expect("write passed result");
+        assert!(
+            !passed_artifact.exists(),
+            "green runs leave no artifact directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(index)
+                .expect("updated JSONL index")
+                .lines()
+                .count(),
+            2
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
     /// A four-byte character straddling the cap is the case that used to
     /// panic. Every offset across one is checked, so the boundary walk cannot
     /// be off by one in either direction.
@@ -143,7 +312,10 @@ mod tests {
         // "😀" is four bytes; "é" is two; "中" is three. Mixing widths means a
         // cap can land inside any of them.
         let text = "aé中😀".repeat(64);
-        assert!(text.len() > text.chars().count(), "the fixture must be wide");
+        assert!(
+            text.len() > text.chars().count(),
+            "the fixture must be wide"
+        );
 
         for limit in 0..text.len() + 8 {
             // The point of the test: this must not panic for any limit.
@@ -185,9 +357,7 @@ mod tests {
         let remaining = std::fs::read_dir(&root).expect("read root").count();
         assert_eq!(remaining, RETAINED_FAILURES);
         // The newest must be among the survivors.
-        assert!(root
-            .join(format!("run-{}", RETAINED_FAILURES + 2))
-            .exists());
+        assert!(root.join(format!("run-{}", RETAINED_FAILURES + 2)).exists());
 
         std::fs::remove_dir_all(&root).expect("clean up");
     }

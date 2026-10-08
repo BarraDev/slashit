@@ -29,6 +29,27 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 
+now_ms() { date +%s%3N; }
+build_started=$(now_ms)
+report_build_duration() {
+  local status=$? ended
+  ended=$(now_ms)
+  printf 'ACCEPTANCE_PHASE {"phase":"build_total","duration_ms":%d,"status":%d}\n' \
+    "$((ended - build_started))" "$status"
+}
+trap report_build_duration EXIT
+
+run_timed() {
+  local phase=$1 started ended status
+  shift
+  started=$(now_ms)
+  if "$@"; then status=0; else status=$?; fi
+  ended=$(now_ms)
+  printf 'ACCEPTANCE_PHASE {"phase":"%s","duration_ms":%d,"status":%d}\n' \
+    "$phase" "$((ended - started))" "$status"
+  return "$status"
+}
+
 fail() {
   echo "build-acceptance-app: $*" >&2
   exit 1
@@ -46,19 +67,19 @@ grep -Eq '"beforeBuildCommand": *"trunk build"' src-tauri/tauri.conf.json ||
 rm -f "$stamp"
 
 echo "==> trunk build (debug frontend)"
-trunk build
+run_timed frontend_build trunk build
 
 echo "==> strip the WebAssembly name section from dist/"
-cargo run --quiet -p slashit-acceptance --bin strip-wasm-names -- dist ||
+run_timed wasm_strip cargo run --quiet -p slashit-acceptance --bin strip-wasm-names -- dist ||
   fail "stripping or verifying the frontend module failed; see above"
 
 wasm=$(find dist -maxdepth 1 -name '*_bg.wasm' -print)
 
 echo "==> cargo tauri build --debug --no-bundle (embedding the stripped dist/)"
-cargo tauri build --debug --no-bundle --config '{"build":{"beforeBuildCommand":null}}'
+run_timed tauri_app_build cargo tauri build --debug --no-bundle --config '{"build":{"beforeBuildCommand":null}}'
 
 echo "==> verify the acceptance application"
-cargo run --quiet -p slashit-acceptance --bin strip-wasm-names -- --check dist ||
+run_timed build_verification cargo run --quiet -p slashit-acceptance --bin strip-wasm-names -- --check dist ||
   fail "dist/ was rebuilt during the Tauri build; the binary embeds an unstripped module"
 [[ -x $binary ]] || fail "no application binary at $binary"
 # dist/ is embedded with include_bytes!, so a changed module forces a rebuild.

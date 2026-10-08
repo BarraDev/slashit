@@ -77,6 +77,27 @@ The harness's own unit tests — port reservation, process-group teardown, state
 roots, artifact pruning — need none of that and run in the ordinary
 `cargo test` sweep.
 
+### Timing and failure records
+
+The build script prints `ACCEPTANCE_PHASE` JSON lines for the frontend build,
+WASM processing, Tauri application build, verification and total build time.
+The runner prints setup and desktop execution durations. Each journey prints
+one `ACCEPTANCE_RESULT_JSON` record and appends the same content to a
+run-specific `target/acceptance/journey-timings-*.jsonl` file. It contains the
+journey name, elapsed milliseconds, outcome, a low-cardinality failure class,
+and provider-log basenames; it does not copy assertion text, page content or
+environment values into the timing record.
+
+Failed journeys also retain `journey-result.json` beside their existing
+screenshots, page source and `*-provider.log`. The provider log records
+`tauri-driver` output and any output its native driver/application descendants
+inherit; the harness does not configure a separate product application log.
+Failure classes are diagnostic hints based on concrete error markers. The
+original libtest failure and captured page evidence remain authoritative.
+CI artifact names include the workflow attempt so a failed rerun cannot collide
+with an artifact from an earlier attempt. Failures before the test runner
+creates `target/acceptance` remain available in their GitHub Actions step logs.
+
 ### Configuration
 
 | Variable | Meaning |
