@@ -276,7 +276,7 @@ impl TestContext {
                 "[acceptance] could not write timing diagnostics for {}: {error:#}",
                 self.name
             );
-        } else if let Ok(json) = serde_json::to_string(&result) {
+        } else if let Ok(json) = serde_json::to_string(&result.json_value()) {
             println!("{}", context_result_line(&json));
         }
     }
