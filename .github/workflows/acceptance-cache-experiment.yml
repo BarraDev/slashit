@@ -4,13 +4,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/acceptance-cache-experiment.yml
-      - .github/actions/install-tauri-tools/**
-      - .github/actions/linux-build-deps/**
-      - Cargo.lock
-      - Cargo.toml
-      - crates/slashit-acceptance/**
-      - scripts/build-acceptance-app.sh
-      - scripts/run-desktop-acceptance.sh
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -41,7 +35,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: acceptance-experiment-pr-${{ github.event.pull_request.number }}-${{ matrix.topology == 'shared' && 'all' || 'harness' }}
+          shared-key: acceptance-experiment-${{ github.event.pull_request.number || github.ref_name }}-${{ matrix.topology == 'shared' && 'all' || 'harness' }}
 
       - name: Install trunk
         uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
@@ -84,7 +78,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: acceptance-experiment-pr-${{ github.event.pull_request.number }}-${{ matrix.topology == 'shared' && 'all' || format('shard-{0}', matrix.shard) }}
+          shared-key: acceptance-experiment-${{ github.event.pull_request.number || github.ref_name }}-${{ matrix.topology == 'shared' && 'all' || format('shard-{0}', matrix.shard) }}
 
       - name: Install trunk
         uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
