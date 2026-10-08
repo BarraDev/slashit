@@ -1,0 +1,101 @@
+name: Acceptance cache experiment
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/acceptance-cache-experiment.yml
+      - .github/actions/install-tauri-tools/**
+      - .github/actions/linux-build-deps/**
+      - Cargo.lock
+      - Cargo.toml
+      - crates/slashit-acceptance/**
+      - scripts/build-acceptance-app.sh
+      - scripts/run-desktop-acceptance.sh
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        topology: [isolated, shared]
+    name: Harness (${{ matrix.topology }} cache)
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install Linux dependencies
+        uses: ./.github/actions/linux-build-deps
+        with:
+          webdriver: 'true'
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: acceptance-experiment-pr-${{ github.event.pull_request.number }}-${{ matrix.topology == 'shared' && 'all' || 'harness' }}
+
+      - name: Install trunk
+        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
+        with:
+          version: latest
+
+      - name: Install the Tauri CLI and tauri-driver
+        uses: ./.github/actions/install-tauri-tools
+
+      - name: Build application
+        run: scripts/build-acceptance-app.sh
+
+      - name: Run harness acceptance tests
+        run: scripts/run-desktop-acceptance.sh --harness
+
+  product:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+        topology: [isolated, shared]
+    name: Product shard ${{ matrix.shard }} (${{ matrix.topology }} cache)
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install Linux dependencies
+        uses: ./.github/actions/linux-build-deps
+        with:
+          webdriver: 'true'
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: acceptance-experiment-pr-${{ github.event.pull_request.number }}-${{ matrix.topology == 'shared' && 'all' || format('shard-{0}', matrix.shard) }}
+
+      - name: Install trunk
+        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
+        with:
+          version: latest
+
+      - name: Install the Tauri CLI and tauri-driver
+        uses: ./.github/actions/install-tauri-tools
+
+      - name: Build application
+        run: scripts/build-acceptance-app.sh
+
+      - name: Run product shard ${{ matrix.shard }}
+        run: scripts/run-desktop-acceptance.sh --shard ${{ matrix.shard }}
