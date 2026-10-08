@@ -603,7 +603,9 @@ mod tests {
         let mut conversation = world.conversation();
         let id = world.propose(&mut conversation, CREATE).await.unwrap();
         world.storage.save_conversation(&conversation).unwrap();
-        let _durable = block_conversation_persistence(&world, &conversation);
+        let durable = block_conversation_persistence(&world, &conversation);
+        // Renaming a file onto a directory fails regardless of privileges.
+        assert!(world.paths.conversation_file(conversation.id).is_dir());
 
         assert!(decide(&world.scope(), &mut conversation, id, Decision::Approve).await.is_err());
         assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Proposed);
@@ -612,6 +614,22 @@ mod tests {
 
         assert!(decide(&world.scope(), &mut conversation, id, Decision::Reject).await.is_err());
         assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Proposed);
+
+        // The durable Conversation is untouched: no Task, no Human decision, still Proposed.
+        unblock_conversation_persistence(&world, &conversation, &durable);
+        let persisted = world.storage.load_primary_conversation(world.project_id).unwrap().unwrap();
+        assert_eq!(persisted.project_action(id).unwrap().status, ProjectActionStatus::Proposed);
+        assert!(persisted.entries.iter().all(|e| !matches!(e.kind, EntryKind::ProjectActionDecision { .. })));
+        assert!(world.storage.load_project_tasks(world.project_id).unwrap().is_empty());
+
+        // Retrying with the same in-memory object now succeeds exactly once.
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+        assert_eq!(world.tasks.read().await.len(), 1);
+        let persisted = world.storage.load_primary_conversation(world.project_id).unwrap().unwrap();
+        assert_eq!(persisted.project_action(id).unwrap().status, ProjectActionStatus::Applied);
+        let decisions = persisted.entries.iter()
+            .filter(|e| matches!(e.kind, EntryKind::ProjectActionDecision { .. })).count();
+        assert_eq!(decisions, 1);
     }
 
     #[tokio::test]
