@@ -244,6 +244,8 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: acceptance
 
       - name: Install trunk
         uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
@@ -305,16 +307,15 @@ jobs:
         with:
           webdriver: 'true'
 
-      # All three matrix instances share one job name, so without a per-shard
-      # key they would race to save a cache under the same key; the cache
-      # backend is save-once-wins, so two of the three shards would save
-      # nothing. The three shards build the identical binary from the
-      # identical Cargo.lock, so this only affects which jobs get a cache hit
-      # on their own timeline, never correctness.
+      # The harness and product shards build the same acceptance application
+      # from the same lockfile. A common key lets every job reuse whichever
+      # runner saved the cache first, including across Rust environment
+      # fingerprints. On a fully cold run they may all miss before the first
+      # job saves; later runs can restore the shared cache.
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: acceptance-product-shard-${{ matrix.shard }}
+          shared-key: acceptance
 
       - name: Install trunk
         uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
