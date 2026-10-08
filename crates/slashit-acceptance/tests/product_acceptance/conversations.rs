@@ -307,7 +307,9 @@ async fn coordinator_creates_and_edits_tasks_only_after_human_approval() {
         submit_message(session.driver(), "Make that more precise and urgent.").await?;
         await_text(session.driver(), proposal, "Add a dark mode toggle").await?;
         let shown = ui::visible(session.driver(), proposal).await?.text().await?;
-        if !shown.contains("Edit Task") || !shown.contains("Add dark mode → Add a dark mode toggle") || !shown.contains("high → urgent") || shown.contains("Description") { bail!("the exact edit is not visible: {shown}"); }
+        // The action label is upper-cased by CSS too, so compare it case-insensitively.
+        let lowered = shown.to_lowercase();
+        if !lowered.contains("edit task") || !shown.contains("Add dark mode → Add a dark mode toggle") || !shown.contains("high → urgent") || lowered.contains("description") { bail!("the exact edit is not visible: {shown}"); }
         ui::visible(session.driver(), "[data-testid=\"project-action-approve\"]").await?.click().await?;
         await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Task updated: Add dark mode").await?;
         await_text(session.driver(), "[data-testid=\"task-title\"]", "Add a dark mode toggle").await?;
