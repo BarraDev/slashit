@@ -308,10 +308,11 @@ jobs:
           webdriver: 'true'
 
       # The harness and product shards build the same acceptance application
-      # from the same lockfile. A common key lets every job reuse whichever
-      # runner saved the cache first, including across Rust environment
-      # fingerprints. On a fully cold run they may all miss before the first
-      # job saves; later runs can restore the shared cache.
+      # from the same lockfile. The shared key removes the job ID so jobs with
+      # the same Rust environment fingerprint can reuse one another's cache.
+      # rust-cache still separates different Rust environments and lockfiles.
+      # On a fully cold run they may all miss before the first job saves; later
+      # runs can restore the cache for their matching environment.
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
