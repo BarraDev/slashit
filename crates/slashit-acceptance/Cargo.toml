@@ -29,11 +29,8 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-# Only the product journeys need this, and only to read the task store back:
-# proving a task persisted means finding its record, not finding its id, title
-# and status loose in the same file. Pinned to the version the application
-# already writes with, so the harness reads what the product wrote.
 [dev-dependencies]
+# The helper assertions read the task-store TOML the same way the product writes it.
 toml = "0.8"
 # Only to crop an element screenshot: WebKitWebDriver pads one by the
 # element's offset (see tests/readme_screenshots.rs).
