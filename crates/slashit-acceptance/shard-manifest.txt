@@ -11,30 +11,20 @@
 # The harness suite (tests/acceptance.rs) is not sharded; it always runs whole, in its own CI
 # job ("Desktop acceptance / harness"), and does not belong in this file.
 #
-# Shards are balanced by measured hosted-CI duration, not by test count, using the
-# `--test-threads=1` per-test timings from CI run 36669879622 (commit b1313670, the run this
-# manifest was built against): shard totals are 163.8s / 165.6s / 165.3s out of 494.7s. The two
-# ~78s cleanup-refusal journeys (NO_RETRY_WINDOW) are deliberately split across different
-# shards. Rebalance by editing this file; the coverage check does not care about balance, only
-# about complete, non-overlapping assignment.
+# The nine non-desktop helper/predicate tests now run as ordinary acceptance-crate unit tests;
+# this manifest covers only the 37 journeys that launch the product application. Their current
+# grouping had nearly balanced execution in hosted run 37723618840: 223.7s / 210.2s / 174.0s.
+# The grouping is retained after removing the helper rows. Rebalance after collecting timings for
+# the current assignment; the coverage check proves completeness and non-overlap, not balance.
 
 1	a_cleanup_git_abandons_partway_keeps_everything_and_only_an_explicit_retry_finishes_it
 1	a_task_moved_into_progress_runs_its_agent_and_reaches_human_review
 1	cleaning_up_one_task_leaves_another_worktree_registered
 1	deleting_a_task_removes_its_worktree_without_destroying_its_work
-1	git_fixture::a_fixture_created_in_a_later_second_still_pushes_its_own_main
-1	git_fixture::a_fixture_never_takes_over_an_origin_that_already_exists
-1	git_fixture::git_predicates_answer_yes_and_no_and_report_git_failing
-1	git_fixture::fixtures_created_together_in_one_state_root_each_get_their_own_origin
 1	human_review::a_failed_pull_request_keeps_the_approval_and_retrying_needs_no_second_approval
 1	human_review::closing_a_reviewed_task_without_merging_is_confirmed_first_and_keeps_its_work
 1	pr_status::a_pull_requests_ci_status_shows_on_its_card_and_in_its_drawer
 1	stopping_a_running_task_ends_its_agent_and_does_not_restart_it
-1	tests::a_record_carrying_the_id_title_and_status_together_is_the_proof
-1	tests::a_record_that_does_not_match_is_not_the_proof
-1	tests::no_run_without_an_identity_of_its_own_is_taken_as_the_retry
-1	tests::the_retry_is_found_by_session_whatever_order_the_records_arrive_in
-1	tests::values_split_across_two_records_are_not_a_persisted_task
 1	the_task_drawer_shows_a_running_task_live_and_stops_it
 
 2	a_done_cleanup_that_fails_keeps_everything_and_only_an_explicit_retry_finishes_it
