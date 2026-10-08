@@ -47,7 +47,7 @@ jobs:
       - name: Install pinned Trunk
         uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
         with:
-          version: 0.21.14
+          version: v0.21.14
 
       - name: Install the Tauri CLI and tauri-driver
         uses: ./.github/actions/install-tauri-tools
