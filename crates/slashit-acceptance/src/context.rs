@@ -290,19 +290,6 @@ fn context_result_line(json: &str) -> String {
     format!("ACCEPTANCE_CONTEXT_RESULT_JSON={json}")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::context_result_line;
-
-    #[test]
-    fn context_diagnostic_does_not_use_the_runner_result_prefix() {
-        let line = context_result_line(r#"{"journey":"example","outcome":"failed"}"#);
-
-        assert!(line.starts_with("ACCEPTANCE_CONTEXT_RESULT_JSON="));
-        assert!(!line.starts_with("ACCEPTANCE_RESULT_JSON="));
-    }
-}
-
 impl Drop for TestContext {
     fn drop(&mut self) {
         if self.result_recorded.get() {
@@ -318,5 +305,18 @@ impl Drop for TestContext {
             if panicking { "panicked" } else { "abandoned" },
             Some(diagnostics::FailureClass::HarnessPanic),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::context_result_line;
+
+    #[test]
+    fn context_diagnostic_does_not_use_the_runner_result_prefix() {
+        let line = context_result_line(r#"{"journey":"example","outcome":"failed"}"#);
+
+        assert!(line.starts_with("ACCEPTANCE_CONTEXT_RESULT_JSON="));
+        assert!(!line.starts_with("ACCEPTANCE_RESULT_JSON="));
     }
 }
