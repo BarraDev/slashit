@@ -1,0 +1,102 @@
+name: Acceptance cold-build benchmark
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/acceptance-build-benchmark.yml
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Cold build (${{ matrix.variant }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # Keep the variants off separate concurrent runners so they do not
+      # contend with one another while comparing compile and link times.
+      max-parallel: 1
+      matrix:
+        variant:
+          - baseline
+          - dev-debug-1
+          - lld
+          - mold
+    env:
+      # Match acceptance CI. No rust-cache step is used, so each variant is a
+      # cold Cargo target and none can add a cache entry near the quota limit.
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install Linux dependencies
+        uses: ./.github/actions/linux-build-deps
+        with:
+          webdriver: 'true'
+
+      - name: Install pinned Trunk
+        uses: jetli/trunk-action@1346cc09eace4beb84e403e199a471346d4684c9 # v0.5.1
+        with:
+          version: v0.21.14
+
+      - name: Install the Tauri CLI and tauri-driver
+        uses: ./.github/actions/install-tauri-tools
+
+      - name: Configure candidate
+        shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+
+          case "$VARIANT" in
+            baseline)
+              echo "Using the current development profile and system linker"
+              ;;
+            dev-debug-1)
+              # Lower symbol detail while leaving the dev profile's debug
+              # assertions and overflow checks enabled.
+              echo "CARGO_PROFILE_DEV_DEBUG=1" >> "$GITHUB_ENV"
+              ;;
+            lld|mold)
+              sudo apt-get update
+              sudo apt-get install --no-install-recommends -y clang "$VARIANT"
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang" >> "$GITHUB_ENV"
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C link-arg=-fuse-ld=$VARIANT" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "unknown benchmark variant: $VARIANT" >&2
+              exit 2
+              ;;
+          esac
+
+      - name: Build the real acceptance application
+        run: scripts/build-acceptance-app.sh
+
+      # Compile the product assertion target under each candidate profile;
+      # the smoke run below exercises the real packaged Tauri app and restart
+      # persistence path without repeating the whole product suite four times.
+      - name: Compile product acceptance assertions
+        run: cargo test --no-run -p slashit-acceptance --features run-acceptance --test product_acceptance
+
+      - name: Run real-app restart smoke journey
+        run: scripts/run-desktop-acceptance.sh --harness --exact state_survives_restart
+
+      - name: Preserve benchmark failure evidence
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v7.0.1
+        with:
+          name: acceptance-build-benchmark-${{ matrix.variant }}-attempt-${{ github.run_attempt }}
+          path: target/acceptance
+          if-no-files-found: ignore
+          retention-days: 7
