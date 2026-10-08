@@ -7,7 +7,6 @@
 //! error it was supposed to explain.
 
 use anyhow::Result;
-use serde::Serialize;
 use std::path::{Path, PathBuf};
 use thirtyfour::prelude::*;
 
@@ -23,8 +22,7 @@ const RETAINED_FAILURES: usize = 5;
 /// A low-cardinality outcome label. The detailed assertion remains in the
 /// test log; this label is safe to aggregate without copying page contents or
 /// task data into a second artifact.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailureClass {
     AssertionOrProduct,
     ApplicationCrash,
@@ -81,7 +79,7 @@ pub fn classify_failure(message: &str) -> FailureClass {
 /// Stable, content-free timing record written both beside failed evidence
 /// and to the run-level JSONL index. The `session_logs` values are basenames,
 /// never absolute paths.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct JourneyResult<'a> {
     pub schema_version: u8,
     pub journey: &'a str,
@@ -89,6 +87,45 @@ pub struct JourneyResult<'a> {
     pub duration_ms: u64,
     pub failure_class: Option<FailureClass>,
     pub session_logs: &'a [String],
+}
+
+impl FailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AssertionOrProduct => "assertion_or_product",
+            Self::ApplicationCrash => "application_crash",
+            Self::DriverOrSession => "driver_or_session",
+            Self::Infrastructure => "infrastructure",
+            Self::HarnessPanic => "harness_panic",
+        }
+    }
+}
+
+impl JourneyResult<'_> {
+    pub fn json_value(&self) -> serde_json::Value {
+        let mut fields = serde_json::Map::new();
+        fields.insert("schema_version".into(), self.schema_version.into());
+        fields.insert("journey".into(), self.journey.into());
+        fields.insert("outcome".into(), self.outcome.into());
+        fields.insert("duration_ms".into(), self.duration_ms.into());
+        fields.insert(
+            "failure_class".into(),
+            self.failure_class
+                .map(|class| serde_json::Value::String(class.as_str().into()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        fields.insert(
+            "session_logs".into(),
+            serde_json::Value::Array(
+                self.session_logs
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+        serde_json::Value::Object(fields)
+    }
 }
 
 /// Save a per-journey JSON result and append it to a JSONL run index.
@@ -101,10 +138,10 @@ pub fn write_journey_result(
 ) -> Result<()> {
     if result.outcome != "passed" {
         std::fs::create_dir_all(artifact_dir)?;
-        let json = serde_json::to_vec_pretty(result)?;
+        let json = serde_json::to_vec_pretty(&result.json_value())?;
         std::fs::write(artifact_dir.join("journey-result.json"), &json)?;
     }
-    let line = serde_json::to_vec(result)?;
+    let line = serde_json::to_vec(&result.json_value())?;
     use std::io::Write;
     let mut index = std::fs::OpenOptions::new()
         .create(true)

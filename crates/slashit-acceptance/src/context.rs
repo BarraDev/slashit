@@ -276,10 +276,18 @@ impl TestContext {
                 "[acceptance] could not write timing diagnostics for {}: {error:#}",
                 self.name
             );
-        } else if let Ok(json) = serde_json::to_string(&result) {
-            println!("ACCEPTANCE_RESULT_JSON={json}");
+        } else if let Ok(json) = serde_json::to_string(&result.json_value()) {
+            println!("{}", context_result_line(&json));
         }
     }
+}
+
+/// Keep the in-test diagnostic distinct from the runner's canonical result
+/// line, which it replays from the timing index after libtest exits. On a
+/// failing test libtest also prints captured stdout, so sharing that prefix
+/// would emit the same structured record twice.
+fn context_result_line(json: &str) -> String {
+    format!("ACCEPTANCE_CONTEXT_RESULT_JSON={json}")
 }
 
 impl Drop for TestContext {
@@ -297,5 +305,18 @@ impl Drop for TestContext {
             if panicking { "panicked" } else { "abandoned" },
             Some(diagnostics::FailureClass::HarnessPanic),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::context_result_line;
+
+    #[test]
+    fn context_diagnostic_does_not_use_the_runner_result_prefix() {
+        let line = context_result_line(r#"{"journey":"example","outcome":"failed"}"#);
+
+        assert!(line.starts_with("ACCEPTANCE_CONTEXT_RESULT_JSON="));
+        assert!(!line.starts_with("ACCEPTANCE_RESULT_JSON="));
     }
 }
