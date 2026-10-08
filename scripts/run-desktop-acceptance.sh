@@ -40,6 +40,42 @@ fail() {
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+now_ms() { date +%s%3N; }
+setup_started=$(now_ms)
+
+run_timed() {
+  local phase=$1 started ended status
+  shift
+  started=$(now_ms)
+  if "$@"; then status=0; else status=$?; fi
+  ended=$(now_ms)
+  printf 'ACCEPTANCE_PHASE {"phase":"%s","duration_ms":%d,"status":%d}\n' \
+    "$phase" "$((ended - started))" "$status"
+  return "$status"
+}
+
+run_suite() {
+  local status
+  if run_timed execution "$@"; then status=0; else status=$?; fi
+  if [[ -f ${SLASHIT_ACCEPTANCE_TIMING_FILE:-} ]]; then
+    while IFS= read -r record; do
+      printf 'ACCEPTANCE_RESULT_JSON=%s\n' "$record"
+    done <"$SLASHIT_ACCEPTANCE_TIMING_FILE"
+  fi
+  return "$status"
+}
+
+report_setup_duration() {
+  printf 'ACCEPTANCE_PHASE {"phase":"setup","duration_ms":%d,"status":0}\n' \
+    "$(( $(now_ms) - setup_started ))"
+}
+
+prepare_timing_index() {
+  local suffix=${shard:-all}
+  mkdir -p target/acceptance
+  export SLASHIT_ACCEPTANCE_TIMING_FILE="$root/target/acceptance/journey-timings-${target}-${suffix}-$$.jsonl"
+  : >"$SLASHIT_ACCEPTANCE_TIMING_FILE"
+}
 
 manifest=crates/slashit-acceptance/shard-manifest.txt
 
@@ -141,7 +177,10 @@ fi
 
 if ((visible)); then
   echo "display: visible, on your session (DISPLAY=${DISPLAY:-unset}, WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-unset})"
-  exec "${cargo_test[@]}"
+  report_setup_duration
+  prepare_timing_index
+  run_suite "${cargo_test[@]}"
+  exit $?
 fi
 
 command -v Xvfb >/dev/null ||
@@ -210,6 +249,8 @@ cat >"$scratch/session.conf" <<EOF
 EOF
 
 echo "bus:     private D-Bus session for this run, no service activation"
+report_setup_duration
+prepare_timing_index
 
 # Only this process tree sees these. GDK_BACKEND=x11 pins GTK and WebKit to
 # the private X display even though a Wayland session is running, and the
@@ -218,6 +259,6 @@ echo "bus:     private D-Bus session for this run, no service activation"
 # icon registers over the D-Bus session bus, and on the real bus it shows up
 # in the real panel. dbus-run-session gives the run a bus of its own and
 # stops it afterwards.
-env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+run_suite env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
   DISPLAY="$display" GDK_BACKEND=x11 \
   dbus-run-session --config-file="$scratch/session.conf" -- "${cargo_test[@]}"

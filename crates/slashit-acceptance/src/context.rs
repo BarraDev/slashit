@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Where the harness finds the things it does not build itself.
 pub struct Environment {
@@ -85,6 +86,9 @@ pub struct TestContext {
     state: StateRoot,
     artifacts: PathBuf,
     sessions_started: Cell<usize>,
+    started: Instant,
+    session_logs: RefCell<Vec<PathBuf>>,
+    result_recorded: Cell<bool>,
     /// Extra variables for the application process tree, on top of the ones
     /// the state root sets.
     ///
@@ -121,6 +125,9 @@ impl TestContext {
             state,
             artifacts,
             sessions_started: Cell::new(0),
+            started: Instant::now(),
+            session_logs: RefCell::new(Vec::new()),
+            result_recorded: Cell::new(false),
             child_env: RefCell::new(Vec::new()),
         })
     }
@@ -148,9 +155,8 @@ impl TestContext {
     pub async fn start_session(&self, label: &str) -> Result<Session> {
         let index = self.sessions_started.get();
         self.sessions_started.set(index + 1);
-        let log = self
-            .artifacts
-            .join(format!("{index}-{label}-provider.log"));
+        let log = self.artifacts.join(format!("{index}-{label}-provider.log"));
+        self.session_logs.borrow_mut().push(log.clone());
         // Copied out before the await: holding the borrow across it would let
         // a `set_child_env` from another task panic the whole run.
         let child_env = self.child_env.borrow().clone();
@@ -195,6 +201,10 @@ impl TestContext {
         // evidence or the report.
         if let Err(error) = outcome {
             self.state.keep();
+            self.record_result(
+                "failed",
+                Some(diagnostics::classify_failure(&format!("{error:#}"))),
+            );
             panic!(
                 "{} failed:\n{error:?}\n\nartifacts: {}\nstate root (preserved): {}",
                 self.name,
@@ -219,11 +229,94 @@ impl TestContext {
         if let Err(error) = self.state.cleanup() {
             leaks.push(format!("{error:#}"));
         }
-        assert!(
-            leaks.is_empty(),
-            "{} passed but could not clean up after itself:\n  {}",
-            self.name,
-            leaks.join("\n  ")
+        if !leaks.is_empty() {
+            let message = leaks.join("\n  ");
+            self.record_result("failed", Some(diagnostics::classify_failure(&message)));
+            panic!(
+                "{} passed but could not clean up after itself:\n  {}",
+                self.name, message
+            );
+        }
+        self.record_result("passed", None);
+    }
+
+    fn record_result(
+        &self,
+        outcome: &'static str,
+        failure_class: Option<diagnostics::FailureClass>,
+    ) {
+        if self.result_recorded.replace(true) {
+            return;
+        }
+        let session_logs = self
+            .session_logs
+            .borrow()
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let elapsed = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let result = diagnostics::JourneyResult {
+            schema_version: 1,
+            journey: &self.name,
+            outcome,
+            duration_ms: elapsed,
+            failure_class,
+            session_logs: &session_logs,
+        };
+        let index = std::env::var_os("SLASHIT_ACCEPTANCE_TIMING_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                self.environment
+                    .artifacts_root
+                    .join("journey-timings.jsonl")
+            });
+        if let Err(error) = diagnostics::write_journey_result(&self.artifacts, &index, &result) {
+            eprintln!(
+                "[acceptance] could not write timing diagnostics for {}: {error:#}",
+                self.name
+            );
+        } else if let Ok(json) = serde_json::to_string(&result.json_value()) {
+            println!("{}", context_result_line(&json));
+        }
+    }
+}
+
+/// Keep the in-test diagnostic distinct from the runner's canonical result
+/// line, which it replays from the timing index after libtest exits. On a
+/// failing test libtest also prints captured stdout, so sharing that prefix
+/// would emit the same structured record twice.
+fn context_result_line(json: &str) -> String {
+    format!("ACCEPTANCE_CONTEXT_RESULT_JSON={json}")
+}
+
+impl Drop for TestContext {
+    fn drop(&mut self) {
+        if self.result_recorded.get() {
+            return;
+        }
+        let panicking = std::thread::panicking();
+        if panicking {
+            // Preserve state and the provider-tree log for an unexpected
+            // panic that bypassed finish(outcome).
+            self.state.keep();
+        }
+        self.record_result(
+            if panicking { "panicked" } else { "abandoned" },
+            Some(diagnostics::FailureClass::HarnessPanic),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::context_result_line;
+
+    #[test]
+    fn context_diagnostic_does_not_use_the_runner_result_prefix() {
+        let line = context_result_line(r#"{"journey":"example","outcome":"failed"}"#);
+
+        assert!(line.starts_with("ACCEPTANCE_CONTEXT_RESULT_JSON="));
+        assert!(!line.starts_with("ACCEPTANCE_RESULT_JSON="));
     }
 }
