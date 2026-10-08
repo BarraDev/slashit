@@ -39,9 +39,10 @@ selected recent conversational messages, and a bounded index of Tasks. It uses
 read-only tools. Durable history and the projection sent to a provider are
 separate; provider transcripts and arbitrary Project records are not included.
 
-The strict output contract is either `Reply { text }` or
-`DelegateToTask { text, target_task_id, request }`. Prose cannot trigger an
-action. A proposal is persisted and displayed, but cannot start a Worker until
+The strict output contract is `Reply { text }`, `DelegateToTask { text,
+target_task_id, request }`, `CreateTask` or `EditTask` (see
+[Coordinator Task capabilities](#coordinator-task-capabilities)). Unknown types
+and fields are refused. Prose cannot trigger an action. A proposal is persisted and displayed, but cannot start a Worker until
 a Human explicitly approves it. Approval can replace the request; the saved
 approved request is the execution authority.
 
@@ -65,6 +66,51 @@ a checkout is marked interrupted and is not silently replayed. Once a Worker
 result is durable, recovery continues with a fresh Coordinator Run rather than
 rerunning the Worker. This prevents automatic replay; it does not promise
 exactly-once external or repository side effects across crashes.
+
+### Coordinator Task capabilities
+
+The Coordinator converses, analyzes and inspects; it operates SlashIt only
+through explicit structured capabilities, and it never edits repository files,
+owns a Task Checkout or executes Task implementation. The Human does not need
+to select a Task to talk to it.
+
+`CreateTask { title, description?, priority?, category? }` and `EditTask {
+target_task_id, title?, description?, priority?, category? }` are mutating,
+so each is a `ProjectAction` that waits for one explicit Human decision. This
+is separate from `TaskAction`, which models delegation to a Worker; both are
+stored in the Conversation, and Conversations saved before `ProjectAction`
+existed load unchanged. The card shows the exact fields to be created or
+changed. An edit shows each field as observed value to proposed value.
+Proposals are not editable before approval, so the executed mutation is the
+one on screen. Each decision applies to one action: a successful create or
+edit does not let the Coordinator propose and run another without a new
+Human decision.
+
+Approval runs through the normal Task stores: `Task::new_backlog` via
+`lifecycle::create`, and `lifecycle::record_if_changed`. The result is an
+ordinary Backlog Task, or the same Task with only the approved fields
+changed. Neither operation changes lifecycle status, queues or starts an
+agent, creates a Task Checkout, pushes or opens a pull request. The
+Conversation stores only the proposal, the decision and a Task reference as
+evidence, never a copy of the Task. Later Coordinator turns see the result
+through the bounded Task index and the action history.
+
+The Conversation and Task files cannot be written atomically together, so
+approval follows a recoverable order: persist `Approved`, apply to the Task
+store, persist `Applied` with the Task id. `CreateTask` reserves its Task id in
+the proposal, so a retry after a crash, restart or repeated click finds the
+Task rather than creating another; no title matching is involved. `EditTask` is
+a compare-and-set against the values the Human saw and runs inside the Task
+store's write. A Task that has since changed, been deleted, or belongs to
+another Project is refused and left untouched; a retry that finds every field
+already at its approved value records success. Reject changes no Task state.
+A Task created and then deleted between a crash and its retry is created
+again; the module documentation in `conversation_actions.rs` records this
+accepted edge.
+
+Project is today's Coordinator scope. Target Project and Task identity stay
+explicit in every call and are validated at that one boundary, which keeps a
+future Workspace-level Coordinator possible without implementing one now.
 
 ### Deleting a Project
 
@@ -141,8 +187,9 @@ recovery work. That is deliberately not tracked as one large issue now.
 ## Future scope
 
 The current implementation includes Project Conversations, ordinary replies,
-bounded Task visibility, `DelegateToTask`, explicit Human approval, and a
-Task-scoped Worker. Task creation, tracker synchronization, Workspace
+bounded Task visibility, Human-gated Task creation and editing, `DelegateToTask`,
+explicit Human approval, and a Task-scoped Worker. Moving or queueing Tasks,
+pull request and CI capabilities, tracker synchronization, Workspace
 Conversations, context compaction, multiple Workers, provider-session resume,
 and richer provider adapters remain future work. ACP remains an adapter
 boundary and is not part of the Project Conversation execution path.

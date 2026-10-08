@@ -250,6 +250,101 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
     context.finish(outcome);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn coordinator_creates_and_edits_tasks_only_after_human_approval() {
+    let context = TestContext::new("project_conversation_task_mutations").expect("harness setup");
+    let root = context.state().path().to_path_buf();
+    let agent = FakeAgent::install(&root).expect("install fake Claude");
+    context.set_child_env("PATH", agent.path_value().to_os_string());
+    context.set_child_env(
+        fake_agent::MARKER_DIR_VAR,
+        agent.marker_dir().as_os_str().to_os_string(),
+    );
+    // Each Coordinator run answers with the output scripted for its position.
+    let scripted = agent.marker_dir().join(".coordinator-output");
+    std::fs::create_dir_all(&scripted).expect("script directory");
+    std::fs::write(scripted.join("1"), r#"{"type":"create_task","text":"This looks worth tracking.","title":"Rejected idea","description":"Nobody asked for this."}"#).unwrap();
+    std::fs::write(scripted.join("2"), r#"{"type":"create_task","text":"Let us track the dark theme.","title":"Add dark mode","description":"Support a dark theme","priority":"high","category":"ui_ux"}"#).unwrap();
+
+    let outcome = async {
+        let session = context.start_session("task-mutations").await?;
+        let project_id = created_id(ui::invoke(session.driver(), "create_project", json!({
+            "name":"Coordinator Task Mutations", "repositoryId":Value::Null, "agentType":"claude_code"
+        })).await?, "create_project")?;
+        open_board(session.driver(), &project_id).await?;
+        ui::visible(session.driver(), PANEL).await?;
+        let list_tasks = || async { anyhow::Ok(serde_json::from_value::<Vec<Value>>(ui::invoke(session.driver(), "list_tasks", json!({"projectId":project_id})).await?)?) };
+        let proposal = "[data-testid=\"project-action-proposal\"]";
+
+        // 1. A rejected proposal changes nothing, and the Human saw what it would do.
+        submit_message(session.driver(), "We should capture some ideas.").await?;
+        await_text(session.driver(), proposal, "Rejected idea").await?;
+        let shown = ui::visible(session.driver(), proposal).await?.text().await?;
+        // The action label is upper-cased by CSS, and WebDriver returns rendered text.
+        if !shown.to_lowercase().contains("create task") || !shown.contains("Backlog") || !shown.contains("Nobody asked for this.") { bail!("the exact creation is not visible: {shown}"); }
+        if !list_tasks().await?.is_empty() { bail!("a proposal created a Task before approval"); }
+        ui::visible(session.driver(), "[data-testid=\"project-action-reject\"]").await?.click().await?;
+        await_text(session.driver(), "[data-testid=\"conversation-history\"]", "You rejected the proposal.").await?;
+        if !list_tasks().await?.is_empty() { bail!("rejecting a proposal created a Task"); }
+
+        // 2. An approved creation yields one ordinary Backlog Task on the board.
+        submit_message(session.driver(), "Then add dark mode.").await?;
+        await_text(session.driver(), proposal, "Add dark mode").await?;
+        let shown = ui::visible(session.driver(), proposal).await?.text().await?;
+        if !shown.contains("high") || !shown.contains("ui ux") { bail!("proposed metadata is not visible: {shown}"); }
+        ui::visible(session.driver(), "[data-testid=\"project-action-approve\"]").await?.click().await?;
+        await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Task created in Backlog: Add dark mode").await?;
+        await_text(session.driver(), "[data-testid=\"task-title\"]", "Add dark mode").await?;
+        let tasks = list_tasks().await?;
+        if tasks.len() != 1 { bail!("expected exactly one created Task, found {}", tasks.len()); }
+        let created = tasks[0].clone();
+        let task_id = created["id"].as_str().context("created Task id")?.to_string();
+        if created["status"] != "backlog" || created["priority"] != "high" || created["category"] != "ui_ux" || created["project_id"] != project_id.as_str() { bail!("the created Task is not the approved Backlog Task: {created}"); }
+        if !created["worktree_path"].is_null() || !created["branch_name"].is_null() || created["phase"] != "idle" { bail!("creating a Task started execution state: {created}"); }
+
+        // 3. An approved edit changes exactly the proposed fields.
+        std::fs::write(scripted.join("3"), format!(r#"{{"type":"edit_task","text":"Sharpen the wording.","target_task_id":"{task_id}","title":"Add a dark mode toggle","priority":"urgent"}}"#))?;
+        submit_message(session.driver(), "Make that more precise and urgent.").await?;
+        await_text(session.driver(), proposal, "Add a dark mode toggle").await?;
+        let shown = ui::visible(session.driver(), proposal).await?.text().await?;
+        // The action label is upper-cased by CSS too, so compare it case-insensitively.
+        let lowered = shown.to_lowercase();
+        if !lowered.contains("edit task") || !shown.contains("Add dark mode → Add a dark mode toggle") || !shown.contains("high → urgent") || lowered.contains("description") { bail!("the exact edit is not visible: {shown}"); }
+        ui::visible(session.driver(), "[data-testid=\"project-action-approve\"]").await?.click().await?;
+        await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Task updated: Add dark mode").await?;
+        await_text(session.driver(), "[data-testid=\"task-title\"]", "Add a dark mode toggle").await?;
+        let edited = list_tasks().await?.into_iter().next().context("edited Task missing")?;
+        if edited["title"] != "Add a dark mode toggle" || edited["priority"] != "urgent" || edited["category"] != "ui_ux" || edited["description"] != created["description"] || edited["status"] != "backlog" { bail!("the edit changed more or less than approved: {edited}"); }
+
+        // Nothing above may have started anything but the three Coordinator runs.
+        let invocations = agent.invocations()?;
+        let runs = invocations.iter().filter(|run| run.prompt.is_some()).collect::<Vec<_>>();
+        if runs.len() != 3 || runs.iter().any(|run| !run.prompt.as_deref().unwrap_or_default().contains("\"current_message\"")) { bail!("a Task operation started a Worker or agent Run: {} runs", runs.len()); }
+        context.close_session(session, "task-mutations", &Ok(())).await?;
+
+        // 4. After a restart the outcomes are durable and a replayed approval is inert.
+        let restarted = context.start_session("task-mutations-restart").await?;
+        open_board(restarted.driver(), &project_id).await?;
+        ui::visible(restarted.driver(), PANEL).await?;
+        let snapshot = ui::invoke(restarted.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
+        let statuses = snapshot["conversation"]["project_actions"].as_array().context("project actions missing")?.iter().map(|action| action["status"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>();
+        if statuses != ["rejected", "applied", "applied"] { bail!("project action outcomes did not survive restart: {statuses:?}"); }
+        await_text(restarted.driver(), "[data-testid=\"conversation-history\"]", "Task created in Backlog: Add dark mode").await?;
+        let controls = super::page(restarted.driver(), "return document.querySelectorAll('[data-testid=project-action-approve], [data-testid=project-action-reject]').length;", vec![]).await?;
+        if controls != 0 { bail!("a finished action still offers controls after restart"); }
+        let applied = snapshot["conversation"]["project_actions"][1]["id"].as_str().context("applied action id")?;
+        ui::invoke(restarted.driver(), "act_on_project_conversation", json!({
+            "projectId":project_id, "conversationId":snapshot["conversation"]["id"], "revision":snapshot["conversation"]["revision"],
+            "actionId":applied, "action":{"action":"approve","request":Value::Null}
+        })).await?;
+        let after = serde_json::from_value::<Vec<Value>>(ui::invoke(restarted.driver(), "list_tasks", json!({"projectId":project_id})).await?)?;
+        if after.len() != 1 { bail!("a replayed approval changed the Task count to {}", after.len()); }
+        context.close_session(restarted, "task-mutations-restart", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    context.finish(outcome);
+}
+
 async fn send_message(driver: &WebDriver, message: &str, expected: &str) -> Result<()> {
     submit_message(driver, message).await?;
     await_text(driver, "[data-testid=\"project-conversation\"]", expected).await

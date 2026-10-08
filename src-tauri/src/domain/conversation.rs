@@ -5,7 +5,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::{Task, TaskCategory, TaskPriority};
+
 pub const MESSAGE_LIMIT: usize = 16_000;
+pub const TASK_TITLE_LIMIT: usize = 200;
+pub const TASK_DESCRIPTION_LIMIT: usize = 8_000;
 pub const PROJECTION_MESSAGE_COUNT: usize = 16;
 pub const TASK_INDEX_LIMIT: usize = 40;
 
@@ -44,6 +48,228 @@ pub struct TaskAction {
     pub created_at: DateTime<Utc>,
 }
 
+/// Lifecycle of a [`ProjectAction`].
+///
+/// `Approved` is durable intent, not proof of effect: it means the Human said
+/// yes and SlashIt has not yet recorded the outcome. Only `Applied`, `Rejected`
+/// and `Refused` are terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectActionStatus {
+    Proposed,
+    Approved,
+    Applied,
+    Rejected,
+    Refused,
+}
+
+/// One field the Coordinator proposes to change on an existing Task, with the
+/// value SlashIt observed when the proposal was made.
+///
+/// `from` is filled in by SlashIt, never by the provider. Approval only applies
+/// the change while the Task still holds `from` (compare-and-set), so an edit
+/// cannot silently overwrite state that changed after the Human read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "field", rename_all = "snake_case")]
+pub enum FieldChange {
+    Title { from: String, to: String },
+    Description { from: Option<String>, to: String },
+    Priority { from: TaskPriority, to: TaskPriority },
+    Category { from: TaskCategory, to: TaskCategory },
+}
+
+impl FieldChange {
+    pub fn is_observed_in(&self, task: &Task) -> bool {
+        match self {
+            Self::Title { from, .. } => task.title == *from,
+            Self::Description { from, .. } => task.description == *from,
+            Self::Priority { from, .. } => task.priority == *from,
+            Self::Category { from, .. } => task.category == *from,
+        }
+    }
+
+    pub fn is_applied_to(&self, task: &Task) -> bool {
+        match self {
+            Self::Title { to, .. } => task.title == *to,
+            Self::Description { to, .. } => task.description.as_deref() == Some(to.as_str()),
+            Self::Priority { to, .. } => task.priority == *to,
+            Self::Category { to, .. } => task.category == *to,
+        }
+    }
+
+    pub fn apply(&self, task: &mut Task) {
+        match self {
+            Self::Title { to, .. } => task.title = to.clone(),
+            Self::Description { to, .. } => task.description = Some(to.clone()),
+            Self::Priority { to, .. } => task.priority = to.clone(),
+            Self::Category { to, .. } => task.category = to.clone(),
+        }
+    }
+
+    fn summary(&self) -> String {
+        let quote = |text: &str| text.chars().take(120).collect::<String>();
+        match self {
+            Self::Title { from, to } => format!("title {:?} -> {:?}", quote(from), quote(to)),
+            Self::Description { from, to } => format!(
+                "description {:?} -> {:?}",
+                quote(from.as_deref().unwrap_or("")),
+                quote(to)
+            ),
+            Self::Priority { from, to } => format!("priority {from:?} -> {to:?}"),
+            Self::Category { from, to } => format!("category {from:?} -> {to:?}"),
+        }
+    }
+}
+
+/// A SlashIt mutation the Coordinator proposes. Creating or editing a Task
+/// never queues, starts or checks out anything; execution stays Task lifecycle
+/// scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskMutation {
+    /// `task_id` is allocated when the proposal is made and persisted with it,
+    /// so an approved creation names the Task it will produce before that Task
+    /// exists. That is what makes a retried approval idempotent.
+    CreateTask {
+        task_id: Uuid,
+        title: String,
+        description: Option<String>,
+        priority: TaskPriority,
+        category: TaskCategory,
+    },
+    EditTask {
+        target_task_id: Uuid,
+        target_task_title: String,
+        changes: Vec<FieldChange>,
+    },
+}
+
+impl TaskMutation {
+    pub fn create(
+        title: &str,
+        description: Option<&str>,
+        priority: Option<TaskPriority>,
+        category: Option<TaskCategory>,
+    ) -> Result<Self, String> {
+        Ok(Self::CreateTask {
+            task_id: Uuid::new_v4(),
+            title: validate_title(title)?,
+            description: description.map(validate_description).transpose()?,
+            priority: priority.unwrap_or_default(),
+            category: category.unwrap_or_default(),
+        })
+    }
+
+    /// Diff the proposed values against `target`. Values the Task already
+    /// holds are dropped; a proposal that changes nothing is refused.
+    pub fn edit(
+        target: &Task,
+        title: Option<&str>,
+        description: Option<&str>,
+        priority: Option<TaskPriority>,
+        category: Option<TaskCategory>,
+    ) -> Result<Self, String> {
+        let mut changes = Vec::new();
+        if let Some(title) = title {
+            let to = validate_title(title)?;
+            if to != target.title {
+                changes.push(FieldChange::Title { from: target.title.clone(), to });
+            }
+        }
+        if let Some(description) = description {
+            let to = validate_description(description)?;
+            if target.description.as_deref() != Some(to.as_str()) {
+                changes.push(FieldChange::Description { from: target.description.clone(), to });
+            }
+        }
+        if let Some(to) = priority {
+            if to != target.priority {
+                changes.push(FieldChange::Priority { from: target.priority.clone(), to });
+            }
+        }
+        if let Some(to) = category {
+            if to != target.category {
+                changes.push(FieldChange::Category { from: target.category.clone(), to });
+            }
+        }
+        if changes.is_empty() {
+            return Err("Coordinator proposed an edit that changes nothing".into());
+        }
+        Ok(Self::EditTask {
+            target_task_id: target.id,
+            target_task_title: target.title.chars().take(TASK_TITLE_LIMIT).collect(),
+            changes,
+        })
+    }
+
+    pub fn summary(&self) -> String {
+        let text = match self {
+            Self::CreateTask { title, description, priority, category, .. } => format!(
+                "Create Task {:?} (priority {priority:?}, category {category:?}){}",
+                title,
+                description.as_ref().map_or(String::new(), |d| format!(": {}", d.chars().take(600).collect::<String>()))
+            ),
+            Self::EditTask { target_task_id, target_task_title, changes } => format!(
+                "Edit Task {target_task_id} ({target_task_title:?}): {}",
+                changes.iter().map(FieldChange::summary).collect::<Vec<_>>().join("; ")
+            ),
+        };
+        text.chars().take(1500).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum ProjectActionOutcome {
+    Applied { task_id: Uuid, title: String },
+    Refused { reason: String },
+}
+
+/// A Human-gated SlashIt operation proposed from the Project Conversation.
+///
+/// Distinct from [`TaskAction`], which models delegation to a Task Worker. The
+/// Conversation records the proposal, the decision and the outcome reference;
+/// the Task itself stays owned by the normal Task store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectAction {
+    pub id: Uuid,
+    pub explanation: String,
+    pub mutation: TaskMutation,
+    pub status: ProjectActionStatus,
+    #[serde(default)]
+    pub outcome: Option<ProjectActionOutcome>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ProjectAction {
+    pub fn proposed(explanation: String, mutation: TaskMutation) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            explanation,
+            mutation,
+            status: ProjectActionStatus::Proposed,
+            outcome: None,
+            created_at: Utc::now(),
+        }
+    }
+}
+
+fn validate_title(value: &str) -> Result<String, String> {
+    let title = value.trim();
+    if title.is_empty() || title.chars().count() > TASK_TITLE_LIMIT {
+        return Err(format!("Task title must contain 1–{TASK_TITLE_LIMIT} characters"));
+    }
+    Ok(title.to_owned())
+}
+
+fn validate_description(value: &str) -> Result<String, String> {
+    let description = value.trim();
+    if description.is_empty() || description.len() > TASK_DESCRIPTION_LIMIT {
+        return Err(format!("Task description must contain 1–{TASK_DESCRIPTION_LIMIT} bytes"));
+    }
+    Ok(description.to_owned())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EntryKind {
@@ -72,6 +298,21 @@ pub enum EntryKind {
         role: Role,
         message: String,
     },
+    ProjectActionProposed {
+        action_id: Uuid,
+    },
+    ProjectActionDecision {
+        action_id: Uuid,
+        approved: bool,
+    },
+    ProjectActionApplied {
+        action_id: Uuid,
+        task_id: Uuid,
+    },
+    ProjectActionRefused {
+        action_id: Uuid,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +332,9 @@ pub struct Conversation {
     pub updated_at: DateTime<Utc>,
     pub entries: Vec<Entry>,
     pub actions: Vec<TaskAction>,
+    /// Absent in Conversations saved before Coordinator Task operations.
+    #[serde(default)]
+    pub project_actions: Vec<ProjectAction>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -103,6 +347,21 @@ pub enum CoordinatorOutput {
         text: String,
         target_task_id: Uuid,
         request: String,
+    },
+    CreateTask {
+        text: String,
+        title: String,
+        description: Option<String>,
+        priority: Option<TaskPriority>,
+        category: Option<TaskCategory>,
+    },
+    EditTask {
+        text: String,
+        target_task_id: Uuid,
+        title: Option<String>,
+        description: Option<String>,
+        priority: Option<TaskPriority>,
+        category: Option<TaskCategory>,
     },
 }
 
@@ -117,7 +376,12 @@ impl Conversation {
             updated_at: now,
             entries: Vec::new(),
             actions: Vec::new(),
+            project_actions: Vec::new(),
         }
+    }
+
+    pub fn project_action(&self, id: Uuid) -> Option<&ProjectAction> {
+        self.project_actions.iter().find(|action| action.id == id)
     }
 
     pub fn push(&mut self, role: Role, kind: EntryKind) {
@@ -157,6 +421,19 @@ impl Conversation {
                 Self::validate_text(text)?;
                 Self::validate_text(request)?;
             }
+            CoordinatorOutput::CreateTask { text, title, description, .. } => {
+                Self::validate_text(text)?;
+                validate_title(title)?;
+                description.as_deref().map(validate_description).transpose()?;
+            }
+            CoordinatorOutput::EditTask { text, title, description, priority, category, .. } => {
+                Self::validate_text(text)?;
+                if title.is_none() && description.is_none() && priority.is_none() && category.is_none() {
+                    return Err("EditTask must propose at least one field".into());
+                }
+                title.as_deref().map(validate_title).transpose()?;
+                description.as_deref().map(validate_description).transpose()?;
+            }
         }
         Ok(output)
     }
@@ -190,6 +467,10 @@ impl Conversation {
                 EntryKind::WorkerStarted { action_id } => Some(serde_json::json!({"kind":"worker_started","action_id":action_id})),
                 EntryKind::WorkerResult { action_id, result } => Some(serde_json::json!({"kind":"worker_result","action_id":action_id,"result":result.chars().take(3000).collect::<String>()})),
                 EntryKind::RunFailed { role, message } => Some(serde_json::json!({"kind":"run_failed","role":role,"message":message.chars().take(1000).collect::<String>()})),
+                EntryKind::ProjectActionProposed { action_id } => self.project_action(*action_id).map(|action| serde_json::json!({"kind":"project_action_proposed","action_id":action_id,"summary":action.mutation.summary()})),
+                EntryKind::ProjectActionDecision { action_id, approved } => self.project_action(*action_id).map(|action| serde_json::json!({"kind":"project_action_decision","action_id":action_id,"approved":approved,"summary":action.mutation.summary()})),
+                EntryKind::ProjectActionApplied { action_id, task_id } => Some(serde_json::json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id})),
+                EntryKind::ProjectActionRefused { action_id, reason } => Some(serde_json::json!({"kind":"project_action_refused","action_id":action_id,"reason":reason.chars().take(1000).collect::<String>()})),
             }).take(PROJECTION_MESSAGE_COUNT).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>();
         serde_json::json!({
             "project": {"name": project_name, "root": project_root},

@@ -261,6 +261,27 @@ fn with_home_as_tilde(text: &str, home: &str) -> String {
     out
 }
 
+/// The caller-chosen fields of a new task; everything else starts at its
+/// initial value in [`Task::new_backlog`].
+#[derive(Debug, Clone)]
+pub struct NewTask {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub title: String,
+    pub description: Option<String>,
+    pub model: String,
+    pub planning_mode: bool,
+    pub dependencies: Vec<Uuid>,
+    pub category: TaskCategory,
+    pub priority: TaskPriority,
+    pub complexity: TaskComplexity,
+    pub impact: TaskImpact,
+    pub security_severity: SecuritySeverity,
+    pub github_issue_url: Option<String>,
+    pub gitlab_issue_url: Option<String>,
+    pub linear_ticket_id: Option<String>,
+}
+
 impl Task {
     /// Why nothing but the restack's own recovery may change this task's
     /// branch or checkout right now, or `None`.
@@ -300,6 +321,58 @@ impl Task {
         self.overall_progress = 0;
         self.error_message = None;
         self.human_review.withdraw_approval();
+    }
+
+    /// A brand-new Backlog task: no checkout, no run, no progress.
+    ///
+    /// The one place a task's initial state is spelled out, shared by the
+    /// desktop command, the CLI handler and the Project Coordinator, so a task
+    /// is identical whichever front door created it.
+    pub fn new_backlog(existing: &HashMap<Uuid, Task>, new: NewTask) -> Task {
+        let now = chrono::Utc::now();
+        Task {
+            id: new.id,
+            project_id: new.project_id,
+            title: new.title,
+            description: new.description,
+            status: TaskStatus::Backlog,
+            model: new.model,
+            planning_mode: new.planning_mode,
+            dependencies: new.dependencies,
+            worktree_id: None,
+            jj_change_id: None,
+            category: new.category,
+            priority: new.priority,
+            complexity: new.complexity,
+            impact: new.impact,
+            security_severity: new.security_severity,
+            phase: TaskPhase::Idle,
+            phase_progress: 0,
+            overall_progress: 0,
+            subtasks: Vec::new(),
+            sequence_number: 0,
+            position: Task::next_backlog_position(existing, new.project_id),
+            github_issue_url: new.github_issue_url,
+            gitlab_issue_url: new.gitlab_issue_url,
+            linear_ticket_id: new.linear_ticket_id,
+            jira_issue_key: None,
+            pr_url: None,
+            external_refs: Vec::new(),
+            qa_signoff: None,
+            human_review: Default::default(),
+            stuck_since: None,
+            error_message: None,
+            worktree_path: None,
+            branch_name: None,
+            base_commit: None,
+            branch_origin: None,
+            pending_republish: None,
+            cleanup_in_flight: false,
+            pr_review_plan: None,
+            activity: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }
     }
 
     /// The position a newly created task should take in `project_id`'s

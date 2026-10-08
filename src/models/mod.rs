@@ -23,4 +23,4 @@ pub use agent::*;
 pub use roadmap::*;
 pub use github::*;
 pub use state_location::*;
-pub use conversation::{ActionStatus as ConversationActionStatus, Conversation, Entry as ConversationEntry, EntryKind as ConversationEntryKind, HumanAction as ConversationHumanAction, Role as ConversationRole, Snapshot as ConversationSnapshot, TaskAction as ConversationTaskAction};
+pub use conversation::{ActionStatus as ConversationActionStatus, Conversation, Entry as ConversationEntry, EntryKind as ConversationEntryKind, HumanAction as ConversationHumanAction, ProjectAction as ConversationProjectAction, ProjectActionOutcome as ConversationProjectActionOutcome, ProjectActionStatus as ConversationProjectActionStatus, TaskMutation as ConversationTaskMutation, FieldChange as ConversationFieldChange, Role as ConversationRole, Snapshot as ConversationSnapshot, TaskAction as ConversationTaskAction};

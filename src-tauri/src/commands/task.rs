@@ -1,5 +1,5 @@
 use crate::domain::{
-    Task, TaskStatus, TaskCategory, TaskPriority, TaskComplexity,
+    Task, NewTask, TaskStatus, TaskCategory, TaskPriority, TaskComplexity,
     TaskImpact, SecuritySeverity, TaskPhase, Subtask,
 };
 use crate::domain::task::ExternalRef;
@@ -80,60 +80,31 @@ pub async fn create_task(
     state: tauri::State<'_, crate::AppState>,
     params: CreateTaskParams,
 ) -> Result<Task, String> {
-    let id = Uuid::new_v4();
     let project_id = Uuid::parse_str(&params.project_id).map_err(|e| e.to_string())?;
     let dependencies = params.dependencies
         .into_iter()
         .filter_map(|d| Uuid::parse_str(&d).ok())
         .collect();
 
-    let now = chrono::Utc::now();
-
+    let new = NewTask {
+        id: Uuid::new_v4(),
+        project_id,
+        title: params.title,
+        description: params.description,
+        model: params.model,
+        planning_mode: params.planning_mode,
+        dependencies,
+        category: params.category.unwrap_or_default(),
+        priority: params.priority.unwrap_or_default(),
+        complexity: params.complexity.unwrap_or_default(),
+        impact: params.impact.unwrap_or_default(),
+        security_severity: params.security_severity.unwrap_or_default(),
+        github_issue_url: params.github_issue_url,
+        gitlab_issue_url: params.gitlab_issue_url,
+        linear_ticket_id: params.linear_ticket_id,
+    };
     crate::lifecycle::create(&state.task.tasks, &state.storage, project_id, move |existing| {
-        let position = Task::next_backlog_position(existing, project_id);
-        Task {
-            id,
-            project_id,
-            title: params.title,
-            description: params.description,
-            status: TaskStatus::Backlog,
-            model: params.model,
-            planning_mode: params.planning_mode,
-            dependencies,
-            worktree_id: None,
-            jj_change_id: None,
-            category: params.category.unwrap_or_default(),
-            priority: params.priority.unwrap_or_default(),
-            complexity: params.complexity.unwrap_or_default(),
-            impact: params.impact.unwrap_or_default(),
-            security_severity: params.security_severity.unwrap_or_default(),
-            phase: TaskPhase::Idle,
-            phase_progress: 0,
-            overall_progress: 0,
-            subtasks: Vec::new(),
-            sequence_number: 0,
-            position,
-            github_issue_url: params.github_issue_url,
-            gitlab_issue_url: params.gitlab_issue_url,
-            linear_ticket_id: params.linear_ticket_id,
-            jira_issue_key: None,
-            pr_url: None,
-            external_refs: Vec::new(),
-            qa_signoff: None,
-            human_review: Default::default(),
-            stuck_since: None,
-            error_message: None,
-            worktree_path: None,
-            branch_name: None,
-            base_commit: None,
-            branch_origin: None,
-            pending_republish: None,
-            cleanup_in_flight: false,
-            pr_review_plan: None,
-            activity: Vec::new(),
-            created_at: now,
-            updated_at: now,
-        }
+        Task::new_backlog(existing, new)
     })
     .await
 }

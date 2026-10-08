@@ -1,4 +1,4 @@
-use crate::models::{ConversationActionStatus, ConversationEntryKind, ConversationHumanAction, ConversationRole, ConversationSnapshot};
+use crate::models::{ConversationActionStatus, ConversationEntryKind, ConversationFieldChange, ConversationHumanAction, ConversationProjectAction, ConversationProjectActionOutcome, ConversationProjectActionStatus, ConversationRole, ConversationSnapshot, ConversationTaskMutation};
 use crate::services::conversation_service;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -25,6 +25,84 @@ fn plain_approval_request(approved: bool, edit: Option<String>) -> Option<String
     if approved { None } else { edit }
 }
 
+/// What a Project action card shows the Human: exactly the fields that will be
+/// created or changed, as labelled rows rather than raw JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MutationView {
+    heading: &'static str,
+    title: String,
+    rows: Vec<(String, String)>,
+}
+
+fn words(value: &str) -> String {
+    value.replace('_', " ")
+}
+
+fn mutation_view(mutation: &ConversationTaskMutation) -> MutationView {
+    match mutation {
+        ConversationTaskMutation::CreateTask { title, description, priority, category, .. } => {
+            let mut rows = vec![
+                ("Status".to_string(), "Backlog".to_string()),
+                ("Priority".to_string(), words(priority)),
+                ("Category".to_string(), words(category)),
+            ];
+            if let Some(description) = description {
+                rows.push(("Description".to_string(), description.clone()));
+            }
+            MutationView { heading: "Create Task", title: title.clone(), rows }
+        }
+        ConversationTaskMutation::EditTask { target_task_id, target_task_title, changes } => {
+            let mut rows = vec![("Task ID".to_string(), target_task_id.to_string())];
+            rows.extend(changes.iter().map(|change| match change {
+                ConversationFieldChange::Title { from, to } => ("Title".to_string(), format!("{from} → {to}")),
+                ConversationFieldChange::Description { from, to } => ("Description".to_string(), format!("{} → {to}", from.as_deref().unwrap_or("(none)"))),
+                ConversationFieldChange::Priority { from, to } => ("Priority".to_string(), format!("{} → {}", words(from), words(to))),
+                ConversationFieldChange::Category { from, to } => ("Category".to_string(), format!("{} → {}", words(from), words(to))),
+            }));
+            MutationView { heading: "Edit Task", title: target_task_title.clone(), rows }
+        }
+    }
+}
+
+/// Only an undecided or approved-but-unfinished action offers controls. A
+/// finished one offers none, so a stale click cannot run it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectActionControls {
+    approve_label: Option<&'static str>,
+    can_reject: bool,
+}
+
+fn project_action_controls(status: ConversationProjectActionStatus) -> ProjectActionControls {
+    match status {
+        ConversationProjectActionStatus::Proposed => ProjectActionControls { approve_label: Some("Approve"), can_reject: true },
+        ConversationProjectActionStatus::Approved => ProjectActionControls { approve_label: Some("Retry approved action"), can_reject: false },
+        ConversationProjectActionStatus::Applied | ConversationProjectActionStatus::Rejected | ConversationProjectActionStatus::Refused => ProjectActionControls { approve_label: None, can_reject: false },
+    }
+}
+
+fn project_action_event_text(kind: &ConversationEntryKind, actions: &[ConversationProjectAction]) -> Option<String> {
+    let find = |id: &Uuid| actions.iter().find(|action| action.id == *id);
+    match kind {
+        ConversationEntryKind::ProjectActionProposed { action_id } => find(action_id).map(|action| {
+            let view = mutation_view(&action.mutation);
+            format!("Proposed: {} \"{}\"", view.heading, view.title)
+        }),
+        ConversationEntryKind::ProjectActionDecision { approved, .. } => Some(if *approved { "You approved the proposal.".to_string() } else { "You rejected the proposal.".to_string() }),
+        ConversationEntryKind::ProjectActionApplied { action_id, task_id } => find(action_id).map(|action| match &action.mutation {
+            ConversationTaskMutation::CreateTask { title, .. } => format!("Task created in Backlog: {title} (Task {task_id})"),
+            ConversationTaskMutation::EditTask { target_task_title, .. } => format!("Task updated: {target_task_title} (Task {task_id})"),
+        }),
+        ConversationEntryKind::ProjectActionRefused { reason, .. } => Some(format!("Nothing was changed: {reason}")),
+        _ => None,
+    }
+}
+
+fn pending_project_actions(snapshot: &ConversationSnapshot) -> Vec<ConversationProjectAction> {
+    snapshot.conversation.project_actions.iter()
+        .filter(|action| project_action_controls(action.status).approve_label.is_some())
+        .cloned().collect()
+}
+
 fn should_publish_snapshot(current: Option<(Uuid, u64)>, incoming: (Uuid, u64), request: u64, applied_request: u64) -> bool {
     match current {
         None => true,
@@ -36,7 +114,12 @@ fn should_publish_snapshot(current: Option<(Uuid, u64)>, incoming: (Uuid, u64), 
 }
 
 #[component]
-pub fn ProjectConversation(project_id: String) -> impl IntoView {
+pub fn ProjectConversation(
+    project_id: String,
+    /// Called after an approval finishes, so the board re-reads Tasks the
+    /// Coordinator may have just created or edited instead of waiting for its poll.
+    #[prop(optional)] on_tasks_changed: Option<Callback<()>>,
+) -> impl IntoView {
     let (snapshot, set_snapshot) = signal(None::<ConversationSnapshot>);
     let (draft, set_draft) = signal(String::new());
     let (edits, set_edits) = signal(HashMap::<String, String>::new());
@@ -133,7 +216,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let refresh_publish = approve_publish.clone();
         spawn_local(async move {
             match conversation_service::act_on_project_conversation(id, current.conversation.id.to_string(), current.conversation.revision, action_id, ConversationHumanAction::Approve { request }).await {
-                Ok(value) => publish.run((request_id, value)), Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
+                Ok(value) => { publish.run((request_id, value)); if let Some(refresh_board) = on_tasks_changed { refresh_board.run(()); } }, Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
             }
             set_busy.set(false);
         });
@@ -192,6 +275,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                 <div class="mb-3 max-h-72 space-y-2 overflow-y-auto" data-testid="conversation-history">
                     {move || snapshot.get().map(|value| {
                         let actions = value.conversation.actions;
+                        let project_actions = value.conversation.project_actions;
                         value.conversation.entries.into_iter().filter_map(|entry| {
                             let (testid, text) = match entry.kind {
                                 ConversationEntryKind::HumanMessage { text } | ConversationEntryKind::CoordinatorReply { text } => ("conversation-message", Some(text)),
@@ -200,6 +284,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                 ConversationEntryKind::WorkerStarted { action_id } => ("conversation-action-event", actions.iter().find(|action| action.id == action_id).map(|action| format!("Worker started in Task Checkout: {}", action.target_task_title))),
                                 ConversationEntryKind::WorkerResult { result, .. } => ("conversation-worker-result", Some(result)),
                                 ConversationEntryKind::RunFailed { message, .. } => ("conversation-run-failed", Some(message)),
+                                ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", project_action_event_text(kind, &project_actions)),
                             };
                             let role = match entry.role { ConversationRole::Human => "You", ConversationRole::Coordinator => "Coordinator", ConversationRole::Worker => "Worker" };
                             text.map(|text| view! { <article data-testid=testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 text-xs font-medium text-white/50">{role}</div><div class="whitespace-pre-wrap text-sm text-white/90">{text}</div></article> })
@@ -231,6 +316,34 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                 </div>
                             </article>
                         }
+                        }
+                    />
+                </div>
+                <div class="mb-3 space-y-2" data-testid="project-actions">
+                    <For
+                        each=move || snapshot.get().map(|value| pending_project_actions(&value)).unwrap_or_default()
+                        key=|action| (action.id, action.status)
+                        children=move |action| {
+                            let view = mutation_view(&action.mutation);
+                            let controls = project_action_controls(action.status);
+                            let approve_id = action.id.to_string(); let reject_id = approve_id.clone();
+                            let approve_action = approve_action.clone(); let reject_action = reject_action.clone();
+                            let status = format!("{:?}", action.status).to_lowercase();
+                            view! {
+                                <article data-testid="project-action-proposal" data-status=status class="rounded-lg border border-amber-300/30 bg-amber-400/5 p-3">
+                                    <div class="text-xs uppercase tracking-wide text-amber-200">{format!("Coordinator proposes: {}", view.heading)}</div>
+                                    <div class="mt-1 font-medium text-white" data-testid="project-action-title">{view.title}</div>
+                                    <p class="mt-2 whitespace-pre-wrap text-sm text-white/75">{action.explanation}</p>
+                                    <dl class="mt-2 space-y-1 text-sm" data-testid="project-action-details">
+                                        {view.rows.into_iter().map(|(label, value)| view! { <div class="flex gap-2"><dt class="w-24 shrink-0 text-xs text-white/50">{label}</dt><dd class="whitespace-pre-wrap break-words text-white/90">{value}</dd></div> }).collect_view()}
+                                    </dl>
+                                    <p class="mt-2 text-xs text-white/50">"Approving only changes this Task's record. It does not start any work."</p>
+                                    <div class="mt-2 flex gap-2">
+                                        {controls.approve_label.map(|label| view! { <button data-testid="project-action-approve" class="rounded bg-emerald-700 px-3 py-1 text-sm" disabled=move || busy.get() on:click=move |_| approve_action.run((approve_id.clone(), None))>{label}</button> })}
+                                        {controls.can_reject.then(|| view! { <button data-testid="project-action-reject" class="rounded border border-white/20 px-3 py-1 text-sm" disabled=move || busy.get() on:click=move |_| reject_action.run(reject_id.clone())>"Reject"</button> })}
+                                    </div>
+                                </article>
+                            }
                         }
                     />
                 </div>
@@ -267,8 +380,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::{plain_approval_request, should_poll_snapshot, should_publish_snapshot, shown_request};
-    use uuid::Uuid;
+    use super::*;
 
     #[test]
     fn polling_continues_until_a_live_run_is_absent_from_the_snapshot() {
@@ -317,5 +429,73 @@ mod tests {
     fn an_approved_action_shows_its_persisted_request_not_a_stale_edit() {
         assert_eq!(shown_request(true, Some("B".into()), "A".into()), "A");
         assert_eq!(plain_approval_request(true, Some("B".into())), None);
+    }
+
+    #[test]
+    fn a_create_proposal_shows_exactly_what_will_be_created() {
+        let view = mutation_view(&ConversationTaskMutation::CreateTask { task_id: Uuid::new_v4(), title: "Add dark mode".into(), description: Some("Support a dark theme".into()), priority: "high".into(), category: "ui_ux".into() });
+        assert_eq!((view.heading, view.title.as_str()), ("Create Task", "Add dark mode"));
+        assert_eq!(view.rows, vec![
+            ("Status".to_string(), "Backlog".to_string()), ("Priority".to_string(), "high".to_string()),
+            ("Category".to_string(), "ui ux".to_string()), ("Description".to_string(), "Support a dark theme".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn an_edit_proposal_shows_each_approved_change_from_its_observed_value() {
+        let id = Uuid::new_v4();
+        let view = mutation_view(&ConversationTaskMutation::EditTask { target_task_id: id, target_task_title: "Old".into(), changes: vec![
+            ConversationFieldChange::Title { from: "Old".into(), to: "New".into() },
+            ConversationFieldChange::Description { from: None, to: "Why".into() },
+            ConversationFieldChange::Priority { from: "medium".into(), to: "urgent".into() },
+        ] });
+        assert_eq!(view.heading, "Edit Task");
+        assert_eq!(view.rows, vec![
+            ("Task ID".to_string(), id.to_string()), ("Title".to_string(), "Old → New".to_string()),
+            ("Description".to_string(), "(none) → Why".to_string()), ("Priority".to_string(), "medium → urgent".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn approve_and_reject_serialize_to_the_commands_the_backend_accepts() {
+        // The card sends `Approve { request: None }`: Project actions are not
+        // editable, so the Human approves exactly the proposal on screen.
+        assert_eq!(serde_json::to_value(ConversationHumanAction::Approve { request: None }).unwrap(), serde_json::json!({"action":"approve","request":null}));
+        assert_eq!(serde_json::to_value(ConversationHumanAction::Reject).unwrap(), serde_json::json!({"action":"reject"}));
+    }
+
+    #[test]
+    fn only_unfinished_actions_offer_controls() {
+        use ConversationProjectActionStatus::*;
+        assert_eq!(project_action_controls(Proposed), ProjectActionControls { approve_label: Some("Approve"), can_reject: true });
+        assert_eq!(project_action_controls(Approved), ProjectActionControls { approve_label: Some("Retry approved action"), can_reject: false });
+        for finished in [Applied, Rejected, Refused] {
+            assert_eq!(project_action_controls(finished), ProjectActionControls { approve_label: None, can_reject: false });
+        }
+    }
+
+    #[test]
+    fn completed_actions_report_their_result_and_leave_no_pending_card() {
+        let task_id = Uuid::new_v4();
+        let action = ConversationProjectAction { id: Uuid::new_v4(), explanation: "why".into(), status: ConversationProjectActionStatus::Applied,
+            mutation: ConversationTaskMutation::CreateTask { task_id, title: "Add dark mode".into(), description: None, priority: "medium".into(), category: "feature".into() },
+            outcome: Some(ConversationProjectActionOutcome::Applied { task_id, title: "Add dark mode".into() }), created_at: String::new() };
+        let text = project_action_event_text(&ConversationEntryKind::ProjectActionApplied { action_id: action.id, task_id }, std::slice::from_ref(&action)).unwrap();
+        assert_eq!(text, format!("Task created in Backlog: Add dark mode (Task {task_id})"));
+        let refused = project_action_event_text(&ConversationEntryKind::ProjectActionRefused { action_id: action.id, reason: "The Task changed after this edit was proposed; nothing was changed".into() }, &[]).unwrap();
+        assert!(refused.starts_with("Nothing was changed:"));
+    }
+
+    #[test]
+    fn project_action_snapshots_decode_from_the_backend_wire_shape() {
+        let task_id = Uuid::new_v4();
+        let wire = serde_json::json!({"conversation":{"id":Uuid::new_v4(),"project_id":Uuid::new_v4(),"revision":2,"created_at":"","updated_at":"","entries":[],"actions":[],
+            "project_actions":[{"id":Uuid::new_v4(),"explanation":"e","status":"proposed","created_at":"",
+                "mutation":{"kind":"create_task","task_id":task_id,"title":"T","description":null,"priority":"medium","category":"feature"}}]},
+            "coordinator_live":false,"worker_live":false,"run_status":null});
+        let snapshot: ConversationSnapshot = serde_json::from_value(wire).unwrap();
+        assert_eq!(pending_project_actions(&snapshot).len(), 1);
+        let legacy = serde_json::json!({"conversation":{"id":Uuid::new_v4(),"project_id":Uuid::new_v4(),"revision":0,"created_at":"","updated_at":"","entries":[],"actions":[]},"coordinator_live":false,"worker_live":false,"run_status":null});
+        assert!(pending_project_actions(&serde_json::from_value(legacy).unwrap()).is_empty());
     }
 }
