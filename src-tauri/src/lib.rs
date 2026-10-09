@@ -16,6 +16,7 @@ pub mod pr_status;
 /// Building `AppState` once, for whichever front end wants it.
 pub mod lifecycle;
 pub mod conversation_actions;
+pub mod coordinator_reads;
 pub mod app_core;
 /// Headless execution, sharing the whole stack with the GUI.
 pub mod daemon;

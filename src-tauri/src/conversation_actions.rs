@@ -99,7 +99,10 @@ pub fn record_proposal(
                 )?,
             )
         }
-        CoordinatorOutput::Reply { .. } | CoordinatorOutput::DelegateToTask { .. } => {
+        CoordinatorOutput::Reply { .. }
+        | CoordinatorOutput::DelegateToTask { .. }
+        | CoordinatorOutput::InspectTask { .. }
+        | CoordinatorOutput::ListTasks { .. } => {
             return Err("Output is not a Project action".into());
         }
     };

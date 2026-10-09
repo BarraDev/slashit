@@ -112,6 +112,25 @@ Project is today's Coordinator scope. Target Project and Task identity stay
 explicit in every call and are validated at that one boundary, which keeps a
 future Workspace-level Coordinator possible without implementing one now.
 
+### Read capabilities
+
+The Coordinator reads current state by asking for it, not by receiving all of
+it. Two read-only capabilities exist: `inspect_task` (one Task) and
+`list_tasks` (a status-filtered page, at most 20 Tasks, with a total and a
+`truncated` flag). SlashIt answers from the Task store inside the same turn and
+feeds the result to a fresh Coordinator run; a turn may perform at most three
+reads before it must reply or propose. The always-present Task index carries no
+descriptions, so a Task's detail is only in context when the Coordinator asked
+for it.
+
+Reads are scoped to the Conversation's Project, and a Task in another Project
+answers exactly like a missing one. A result is a fixed projection: it names a
+Task's branch and whether it has a checkout but never a local path, and bounds
+every text field and list. Results are not persisted, change nothing, and are
+presented as untrusted evidence; only the Coordinator's own structured output
+can invoke a capability. Pull request, CI and run state are not yet readable
+here. See `coordinator_reads.rs`.
+
 ### Deleting a Project
 
 Deleting a Project removes its Conversation, so the order of writes matters.
