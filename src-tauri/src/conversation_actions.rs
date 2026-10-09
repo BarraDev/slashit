@@ -298,7 +298,17 @@ enum MoveCheck {
 /// Move a Task through the same transition the board uses: the one classifier,
 /// the same activity record, the same reset of execution state. The target is
 /// only ever `Backlog` (see [`coordinator_may_move`]), so nothing here queues,
-/// starts or checks out anything, and no running owner needs ending.
+/// starts or checks out anything.
+///
+/// Unlike the board, this does not call `end_active_ownership`. That ends a
+/// live run or reviewer before the write, which is an external side effect
+/// ahead of a fallible store write and ahead of the compare-and-set below. It
+/// is only needed for a Task whose status disagrees with its owner: a
+/// promotion to In Progress is atomic with the start of a run, so a Task still
+/// in Queue has none, and a Task in Error has already ended its run. Should
+/// either status ever coexist with a live owner, the move would leave that
+/// owner running against a Backlog Task; the Coordinator path holds no
+/// executor handle to close that, and the board remains the way to stop one.
 ///
 /// The lifecycle lease is held so a move cannot interleave with another
 /// transition of the same Task, and the status compare-and-set runs inside the
@@ -324,9 +334,18 @@ async fn move_task(
             Some(task) if task.status == *to => verdict = MoveCheck::AlreadyApplied(task.title.clone()),
             Some(task) if task.status != *from => verdict = MoveCheck::Stale,
             Some(task) if !coordinator_may_move(&task.status, to) => verdict = MoveCheck::NotAllowed,
-            Some(task) => {
+            Some(_) => {
+                // The end of the destination column, taken before the Task
+                // leaves its own status so it can never count itself. Status
+                // and position land in the same staged write.
+                let position = (*to == TaskStatus::Backlog)
+                    .then(|| Task::next_backlog_position(staged, scope.project_id));
+                let task = staged.get_mut(&task_id).expect("checked present above");
                 let previous = task.status.clone();
                 task.status = to.clone();
+                if let Some(position) = position {
+                    task.position = position;
+                }
                 task.record_move(&previous);
                 if let StatusTransitionEffect::ResetExecutionState =
                     lifecycle::classify_status_transition(&previous, to)
@@ -997,6 +1016,27 @@ mod tests {
         assert_eq!((after.phase, after.error_message.clone()), (crate::domain::TaskPhase::Idle, None));
         assert_eq!(after.worktree_path.as_deref(), Some("/tmp/checkout"), "moving never discards a checkout");
         assert_eq!(after.branch_name.as_deref(), Some("slashit/failed"));
+        assert_eq!((after.phase_progress, after.overall_progress), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_moved_task_takes_the_end_of_the_backlog_without_colliding() {
+        let world = World::new();
+        let moving = world.seed_task(world.project_id, "Moving").await;
+        place(&world, moving.id, TaskStatus::Queue).await;
+        let first = world.seed_task(world.project_id, "First").await;
+        let second = world.seed_task(world.project_id, "Second").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &move_json(moving.id, "backlog")).await.unwrap();
+
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        let tasks = world.tasks.read().await;
+        let mut positions: Vec<i32> = [moving.id, first.id, second.id].iter().map(|id| tasks[id].position).collect();
+        assert_eq!(tasks[&moving.id].position, tasks[&second.id].position + 1, "lands after the last card");
+        positions.sort_unstable();
+        positions.dedup();
+        assert_eq!(positions.len(), 3, "no two cards share a position");
     }
 
     #[tokio::test]
