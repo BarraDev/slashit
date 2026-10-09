@@ -3,7 +3,12 @@
 //! The Coordinator never receives the whole Project. It asks for one Task
 //! (`inspect_task`) or a filtered page of Tasks (`list_tasks`), and SlashIt
 //! answers from the Task store with a fixed, bounded projection. Nothing here
-//! writes, queues, starts an agent or reaches outside the Task store.
+//! writes, queues, starts an agent or reaches outside SlashIt's own state. It
+//! also reads one Task's recent activity (`inspect_task_activity`) and the last
+//! pull request and CI state SlashIt heard for it (`inspect_task_pull_request`).
+//! The pull request read answers from the status cache only; it never asks
+//! GitHub, so it is fast, cannot hang a turn, and says when data is stale or
+//! absent.
 //!
 //! Every lookup is scoped to the Conversation's Project. A Task id that is
 //! unknown and one that belongs to another Project produce the same answer,
@@ -22,7 +27,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::domain::conversation::CoordinatorOutput;
-use crate::domain::{Task, TaskStatus};
+use crate::domain::{ExternalRef, Task, TaskStatus};
+use crate::pr_status::{PrKey, PrStatuses};
 
 /// Reads one Coordinator turn may perform before it must answer.
 pub const READS_PER_TURN: usize = 3;
@@ -33,6 +39,11 @@ pub const DESCRIPTION_CHARS: usize = 4_000;
 pub const ERROR_CHARS: usize = 1_000;
 pub const SUBTASKS_SHOWN: usize = 20;
 pub const DEPENDENCIES_SHOWN: usize = 20;
+pub const ACTIVITY_DEFAULT_LIMIT: usize = 15;
+pub const ACTIVITY_MAX_LIMIT: usize = 30;
+pub const ACTIVITY_DETAIL_CHARS: usize = 300;
+pub const PULL_REQUESTS_SHOWN: usize = 5;
+pub const CHECK_NAME_CHARS: usize = 120;
 
 fn clip(value: &str, limit: usize) -> (String, bool) {
     let mut chars = value.chars();
@@ -129,11 +140,109 @@ fn list_tasks(
     })
 }
 
+/// Milestones only: tool calls are detail, and would crowd out what happened.
+fn inspect_task_activity(
+    tasks: &HashMap<Uuid, Task>,
+    project_id: Uuid,
+    task_id: Uuid,
+    limit: Option<usize>,
+) -> Value {
+    let Some(task) = tasks
+        .get(&task_id)
+        .filter(|task| task.project_id == project_id)
+    else {
+        return not_found();
+    };
+    let limit = limit
+        .unwrap_or(ACTIVITY_DEFAULT_LIMIT)
+        .clamp(1, ACTIVITY_MAX_LIMIT);
+    let timeline = slashit_activity::timeline(task.created_at, [], &task.activity);
+    let milestones: Vec<_> = timeline.iter().filter(|item| !item.is_tool()).collect();
+    let skipped = milestones.len().saturating_sub(limit);
+    let events: Vec<Value> = milestones
+        .into_iter()
+        .skip(skipped)
+        .map(|item| {
+            json!({
+                "at": item.at,
+                "event": item.kind_name(),
+                "title": item.title(),
+                "detail": item.detail().map(|detail| clip(&detail, ACTIVITY_DETAIL_CHARS).0),
+            })
+        })
+        .collect();
+    json!({
+        "outcome": "found",
+        "task_id": task.id,
+        "status": task.status,
+        "events_returned": events.len(),
+        "earlier_events_omitted": skipped,
+        "events": events,
+    })
+}
+
+fn inspect_task_pull_request(
+    tasks: &HashMap<Uuid, Task>,
+    project_id: Uuid,
+    task_id: Uuid,
+    statuses: &PrStatuses,
+) -> Value {
+    let Some(task) = tasks
+        .get(&task_id)
+        .filter(|task| task.project_id == project_id)
+    else {
+        return not_found();
+    };
+    let linked: Vec<(&str, u32, Option<&str>)> = task
+        .external_refs
+        .iter()
+        .filter_map(|reference| match reference {
+            ExternalRef::GithubPr { number, repo, state, .. } => {
+                Some((repo.as_str(), *number, state.as_deref()))
+            }
+            _ => None,
+        })
+        .collect();
+    let pull_requests: Vec<Value> = linked
+        .iter()
+        .take(PULL_REQUESTS_SHOWN)
+        .map(|(repo, number, recorded_state)| {
+            let entry = statuses.get(&PrKey::new(*repo, *number));
+            let live = entry.as_ref().and_then(|entry| entry.status.as_ref()).map(|status| {
+                json!({
+                    "state": status.state,
+                    "checks": status.checks,
+                    "failing_checks": status.failing_checks.iter().map(|name| clip(name, CHECK_NAME_CHARS).0).collect::<Vec<_>>(),
+                    "failing_check_count": status.failing_check_count,
+                    "review_decision": status.review_decision,
+                    "mergeable": status.mergeable,
+                })
+            });
+            json!({
+                "repo": repo,
+                "number": number,
+                "recorded_state": recorded_state,
+                "live": live,
+                "live_read_at": entry.as_ref().and_then(|entry| entry.fetched_at),
+                "last_refresh_failed": entry.as_ref().is_some_and(|entry| entry.error.is_some()),
+            })
+        })
+        .collect();
+    json!({
+        "outcome": "found",
+        "task_id": task.id,
+        "pull_requests_total": linked.len(),
+        "pull_requests": pull_requests,
+        "note": "`live` is SlashIt's last cached reading, not a fresh query; null means none is available.",
+    })
+}
+
 /// Answers a read capability, or `None` when `output` is not one.
 pub fn read(
     output: &CoordinatorOutput,
     project_id: Uuid,
     tasks: &HashMap<Uuid, Task>,
+    pr_statuses: &PrStatuses,
 ) -> Option<Value> {
     match output {
         CoordinatorOutput::InspectTask { target_task_id } => {
@@ -145,6 +254,15 @@ pub fn read(
             status.as_ref(),
             limit.map(usize::from),
         )),
+        CoordinatorOutput::InspectTaskActivity { target_task_id, limit } => Some(inspect_task_activity(
+            tasks,
+            project_id,
+            *target_task_id,
+            limit.map(usize::from),
+        )),
+        CoordinatorOutput::InspectTaskPullRequest { target_task_id } => Some(
+            inspect_task_pull_request(tasks, project_id, *target_task_id, pr_statuses),
+        ),
         _ => None,
     }
 }
@@ -213,7 +331,15 @@ mod tests {
     use super::*;
     use crate::domain::conversation::Conversation;
     use crate::domain::{NewTask, SecuritySeverity, TaskCategory, TaskComplexity, TaskImpact, TaskPriority};
+    use crate::pr_status::{ChecksState, PrState, PrStatus, ReviewDecision};
+    use crate::test_helpers::no_github;
+    use slashit_activity::{Column, Kind};
     use std::sync::{Arc, Mutex};
+
+    /// [`super::read`] with no GitHub to ask and an empty status cache.
+    fn read(output: &CoordinatorOutput, project_id: Uuid, tasks: &HashMap<Uuid, Task>) -> Option<Value> {
+        super::read(output, project_id, tasks, &no_github())
+    }
 
     fn task(project_id: Uuid, title: &str, status: TaskStatus, position: i32) -> Task {
         let mut task = Task::new_backlog(
@@ -364,6 +490,135 @@ mod tests {
         let result = read(&list, Uuid::new_v4(), &HashMap::new()).unwrap();
         assert_eq!(result["returned"], 0);
         assert_eq!(result["truncated"], false);
+    }
+
+    fn activity(id: Uuid, limit: Option<u8>) -> CoordinatorOutput {
+        CoordinatorOutput::InspectTaskActivity { target_task_id: id, limit }
+    }
+
+    fn pull_request(id: Uuid) -> CoordinatorOutput {
+        CoordinatorOutput::InspectTaskPullRequest { target_task_id: id }
+    }
+
+    #[test]
+    fn activity_is_recent_milestones_without_tool_noise() {
+        let project = Uuid::new_v4();
+        let mut subject = task(project, "Subject", TaskStatus::Error, 0);
+        subject.record_activity(Kind::RunStarted { run: 1, addressing_feedback: false });
+        for n in 0..5 {
+            subject.record_activity(Kind::ToolUsed { run: 1, tool: "Edit".into(), detail: Some(format!("f{n}")), count: 1 });
+        }
+        subject.record_activity(Kind::RunFailed { run: Some(1), reason: "r".repeat(ACTIVITY_DETAIL_CHARS * 2) });
+        let id = subject.id;
+        let result = read(&activity(id, None), project, &store(vec![subject])).unwrap();
+        let events = result["events"].as_array().unwrap();
+        let names: Vec<_> = events.iter().map(|e| e["event"].as_str().unwrap()).collect();
+        assert_eq!(names, ["created", "run_started", "run_failed"]);
+        assert_eq!(events[2]["detail"].as_str().unwrap().chars().count(), ACTIVITY_DETAIL_CHARS);
+        assert_eq!(result["earlier_events_omitted"], 0);
+    }
+
+    #[test]
+    fn activity_keeps_the_newest_events_within_the_limit() {
+        let project = Uuid::new_v4();
+        let mut subject = task(project, "Subject", TaskStatus::Backlog, 0);
+        for run in 1..=ACTIVITY_MAX_LIMIT as u32 + 10 {
+            subject.record_activity(Kind::RunStarted { run, addressing_feedback: false });
+        }
+        let id = subject.id;
+        let tasks = store(vec![subject]);
+        let capped = read(&activity(id, Some(200)), project, &tasks).unwrap();
+        assert_eq!(capped["events_returned"], ACTIVITY_MAX_LIMIT);
+        assert_eq!(capped["earlier_events_omitted"], 11);
+        let last = capped["events"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["title"], format!("Coding started (attempt {})", ACTIVITY_MAX_LIMIT + 10));
+        assert_eq!(read(&activity(id, Some(2)), project, &tasks).unwrap()["events_returned"], 2);
+    }
+
+    #[test]
+    fn activity_and_pull_request_reads_do_not_cross_projects() {
+        let project = Uuid::new_v4();
+        let mut foreign = task(Uuid::new_v4(), "Secret", TaskStatus::Backlog, 0);
+        foreign.record_activity(Kind::Moved { from: Column::Backlog, to: Column::Queue });
+        let foreign_id = foreign.id;
+        let tasks = store(vec![foreign]);
+        let missing = read(&inspect(Uuid::new_v4()), project, &tasks).unwrap();
+        assert_eq!(read(&activity(foreign_id, None), project, &tasks).unwrap(), missing);
+        assert_eq!(read(&pull_request(foreign_id), project, &tasks).unwrap(), missing);
+    }
+
+    #[test]
+    fn pull_request_read_works_without_any_cached_status() {
+        let project = Uuid::new_v4();
+        let mut subject = task(project, "Subject", TaskStatus::PrCreated, 0);
+        subject.external_refs.push(ExternalRef::GithubPr {
+            url: "https://github.com/o/r/pull/7".into(),
+            number: 7,
+            repo: "o/r".into(),
+            state: Some("OPEN".into()),
+        });
+        let plain = task(project, "Plain", TaskStatus::Backlog, 1);
+        let (id, plain_id) = (subject.id, plain.id);
+        let tasks = store(vec![subject, plain]);
+        let result = read(&pull_request(id), project, &tasks).unwrap();
+        let pr = &result["pull_requests"][0];
+        assert_eq!((pr["repo"].as_str(), pr["number"].as_u64()), (Some("o/r"), Some(7)));
+        assert_eq!(pr["recorded_state"], "OPEN");
+        assert!(pr["live"].is_null());
+        let none = read(&pull_request(plain_id), project, &tasks).unwrap();
+        assert_eq!(none["pull_requests_total"], 0);
+    }
+
+    #[test]
+    fn pull_request_read_reports_cached_ci_and_bounds_check_names() {
+        let project = Uuid::new_v4();
+        let mut subject = task(project, "Subject", TaskStatus::PrCreated, 0);
+        subject.external_refs.push(ExternalRef::GithubPr {
+            url: "https://github.com/o/r/pull/7".into(),
+            number: 7,
+            repo: "o/r".into(),
+            state: None,
+        });
+        let id = subject.id;
+        let statuses = no_github();
+        statuses.remember(
+            &PrKey::new("o/r", 7),
+            PrStatus {
+                state: PrState::Open,
+                checks: ChecksState::Failing,
+                failing_checks: vec!["c".repeat(CHECK_NAME_CHARS * 2)],
+                failing_check_count: 1,
+                review_decision: Some(ReviewDecision::ChangesRequested),
+                mergeable: None,
+            },
+        );
+        let result =
+            super::read(&pull_request(id), project, &store(vec![subject]), &statuses).unwrap();
+        let live = &result["pull_requests"][0]["live"];
+        assert_eq!(live["checks"], "failing");
+        assert_eq!(live["review_decision"], "changes_requested");
+        assert_eq!(live["failing_checks"][0].as_str().unwrap().chars().count(), CHECK_NAME_CHARS);
+        assert!(!result["pull_requests"][0]["live_read_at"].is_null());
+    }
+
+    #[test]
+    fn new_read_requests_are_strictly_parsed() {
+        let id = Uuid::new_v4();
+        assert!(matches!(
+            Conversation::parse_output(&format!(r#"{{"type":"inspect_task_activity","target_task_id":"{id}","limit":5}}"#)),
+            Ok(CoordinatorOutput::InspectTaskActivity { limit: Some(5), .. })
+        ));
+        assert!(matches!(
+            Conversation::parse_output(&format!(r#"{{"type":"inspect_task_pull_request","target_task_id":"{id}"}}"#)),
+            Ok(CoordinatorOutput::InspectTaskPullRequest { .. })
+        ));
+        for bad in [
+            format!(r#"{{"type":"inspect_task_activity","target_task_id":"{id}","limit":0}}"#),
+            format!(r#"{{"type":"inspect_task_pull_request","target_task_id":"{id}","refresh":true}}"#),
+            r#"{"type":"inspect_task_pull_request"}"#.to_owned(),
+        ] {
+            assert!(Conversation::parse_output(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
