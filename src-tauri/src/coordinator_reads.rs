@@ -151,26 +151,33 @@ pub fn read(
 
 /// Runs the Coordinator, answering its read requests until it returns a
 /// non-read output. `run` performs one fresh Coordinator run for a prompt and
-/// returns its raw output with whatever guard must outlive the turn;
-/// `read_state` answers one read from current state. A turn gets at most
-/// [`READS_PER_TURN`] reads, so context growth is bounded.
+/// returns its raw output with the guard that must outlive the turn; it is
+/// handed the previous run's guard so one lease can span the whole turn and a
+/// Stop between reads is not lost. `read_state` answers one read from current
+/// state. A turn gets at most [`READS_PER_TURN`] reads. A read requested past
+/// that budget is refused once with a notice, so the Coordinator can still
+/// answer from what it already collected; asking again ends the turn.
 pub async fn drive<G, Run, RunFut, ReadFut>(
     base_prompt: &str,
     mut run: Run,
     mut read_state: impl FnMut(CoordinatorOutput) -> ReadFut,
 ) -> Result<(CoordinatorOutput, G), String>
 where
-    Run: FnMut(String) -> RunFut,
+    Run: FnMut(String, Option<G>) -> RunFut,
     RunFut: Future<Output = Result<(Result<String, String>, G), String>>,
     ReadFut: Future<Output = Result<Value, CoordinatorOutput>>,
 {
     let mut evidence: Vec<Value> = Vec::new();
+    let mut refused = false;
+    let mut guard: Option<G> = None;
     loop {
         let prompt = if evidence.is_empty() {
             base_prompt.to_owned()
         } else {
             let remaining = READS_PER_TURN - evidence.len();
-            let availability = if remaining == 0 {
+            let availability = if refused {
+                "Your last read request was refused: the read budget for this turn is spent. Answer or propose now from the results above.".to_owned()
+            } else if remaining == 0 {
                 "No further reads are available this turn; answer or propose now.".to_owned()
             } else {
                 format!("{remaining} more read(s) are available this turn.")
@@ -180,18 +187,22 @@ where
                 Value::Array(evidence.clone())
             )
         };
-        let (raw, guard) = run(prompt).await?;
+        let (raw, next_guard) = run(prompt, guard.take()).await?;
         let output = crate::domain::conversation::Conversation::parse_output(&raw?)?;
         match read_state(output).await {
-            Err(output) => return Ok((output, guard)),
+            Err(output) => return Ok((output, next_guard)),
             Ok(result) => {
                 if evidence.len() == READS_PER_TURN {
-                    return Err(format!(
-                        "The Coordinator asked for more than {READS_PER_TURN} reads in one turn"
-                    ));
+                    if refused {
+                        return Err(format!(
+                            "The Coordinator kept asking for reads after the {READS_PER_TURN}-read budget"
+                        ));
+                    }
+                    refused = true;
+                } else {
+                    evidence.push(result);
                 }
-                evidence.push(result);
-                drop(guard);
+                guard = Some(next_guard);
             }
         }
     }
@@ -395,7 +406,7 @@ mod tests {
         let seen = prompts.clone();
         let result = drive(
             "BASE",
-            move |prompt| {
+            move |prompt, _guard: Option<()>| {
                 seen.lock().unwrap().push(prompt);
                 let next = script.lock().unwrap().next().expect("script exhausted");
                 async move { Ok((Ok(next), ())) }
@@ -433,14 +444,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_turn_that_never_stops_reading_is_refused_after_the_budget() {
+    async fn a_read_past_the_budget_is_refused_once_and_the_turn_can_still_answer() {
         let project = Uuid::new_v4();
         let list = r#"{"type":"list_tasks"}"#.to_owned();
+        let mut script = vec![list; READS_PER_TURN + 1];
+        script.push(r#"{"type":"reply","text":"Here is what I found."}"#.into());
+        let (result, prompts) = drive_script(script, project, HashMap::new()).await;
+        assert!(matches!(result, Ok(CoordinatorOutput::Reply { .. })));
+        assert_eq!(prompts.len(), READS_PER_TURN + 2);
+        assert!(prompts[READS_PER_TURN].contains("No further reads are available"));
+        assert!(prompts.last().unwrap().contains("read budget for this turn is spent"));
+        // The refused read added no evidence: the same three results remain.
+        assert_eq!(
+            prompts[READS_PER_TURN].matches("\"outcome\"").count(),
+            prompts.last().unwrap().matches("\"outcome\"").count()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_keeps_reading_after_the_refusal_ends() {
+        let list = r#"{"type":"list_tasks"}"#.to_owned();
         let (result, prompts) =
-            drive_script(vec![list; READS_PER_TURN + 1], project, HashMap::new()).await;
-        assert!(result.unwrap_err().contains("more than"));
-        assert_eq!(prompts.len(), READS_PER_TURN + 1);
-        assert!(prompts.last().unwrap().contains("No further reads are available"));
+            drive_script(vec![list; READS_PER_TURN + 2], Uuid::new_v4(), HashMap::new()).await;
+        assert!(result.unwrap_err().contains("budget"));
+        assert_eq!(prompts.len(), READS_PER_TURN + 2);
+    }
+
+    #[tokio::test]
+    async fn the_run_guard_is_carried_across_reads() {
+        let list = r#"{"type":"list_tasks"}"#.to_owned();
+        let script = Arc::new(Mutex::new(
+            vec![list, r#"{"type":"reply","text":"ok"}"#.to_owned()].into_iter(),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let result = drive(
+            "BASE",
+            move |_prompt, guard: Option<u32>| {
+                log.lock().unwrap().push(guard);
+                let next = script.lock().unwrap().next().unwrap();
+                async move { Ok((Ok(next), 7u32)) }
+            },
+            |output| async move { read(&output, Uuid::new_v4(), &HashMap::new()).ok_or(output) },
+        )
+        .await;
+        assert!(matches!(result, Ok((CoordinatorOutput::Reply { .. }, 7))));
+        assert_eq!(*seen.lock().unwrap(), [None, Some(7)]);
     }
 
     #[tokio::test]

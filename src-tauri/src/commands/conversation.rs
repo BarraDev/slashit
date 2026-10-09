@@ -14,7 +14,7 @@ use uuid::Uuid;
 /// The structured-output contract both Coordinator prompts state. Every
 /// non-reply type is only a proposal: SlashIt applies nothing without a
 /// separate, explicit Human decision.
-const OUTPUT_SCHEMAS: &str = r#"Ordinary response: {"type":"reply","text":"..."}. Delegation: {"type":"delegate_to_task","text":"explanation","target_task_id":"UUID","request":"bounded request"}. Create a Backlog Task: {"type":"create_task","text":"why","title":"...","description":"optional","priority":"urgent|high|medium|low (optional)","category":"feature|bug_fix|refactoring|documentation|security|performance|ui_ux|infrastructure|testing (optional)"}. Edit a Task: {"type":"edit_task","text":"why","target_task_id":"UUID","title":"optional","description":"optional","priority":"optional","category":"optional"} with only the fields to change. Creating or editing a Task never starts work on it. Read-only lookups SlashIt answers immediately from current state, so ask instead of guessing; they change nothing and are not proposals: {"type":"inspect_task","target_task_id":"UUID"} returns one Task's details; {"type":"list_tasks","status":"backlog|queue|in_progress|ai_review|human_review|done|pr_created|error (optional)","limit":1-20 (optional)"} returns a page of Tasks with a total and a truncated flag. At most 3 lookups per turn, then answer."#;
+const OUTPUT_SCHEMAS: &str = r#"Ordinary response: {"type":"reply","text":"..."}. Delegation: {"type":"delegate_to_task","text":"explanation","target_task_id":"UUID","request":"bounded request"}. Create a Backlog Task: {"type":"create_task","text":"why","title":"...","description":"optional","priority":"urgent|high|medium|low (optional)","category":"feature|bug_fix|refactoring|documentation|security|performance|ui_ux|infrastructure|testing (optional)"}. Edit a Task: {"type":"edit_task","text":"why","target_task_id":"UUID","title":"optional","description":"optional","priority":"optional","category":"optional"} with only the fields to change. Creating or editing a Task never starts work on it. Read-only lookups SlashIt answers immediately from current state, so ask instead of guessing; they change nothing and are not proposals: {"type":"inspect_task","target_task_id":"UUID"} returns one Task's details; {"type":"list_tasks","status":"backlog|queue|in_progress|ai_review|human_review|done|pr_created|error (optional)","limit":10} where limit is an optional integer 1-20 returns a page of Tasks with a total and a truncated flag. At most 3 lookups per turn, then answer."#;
 
 struct CoordinatorWorkingDirectory {
     path: String,
@@ -455,9 +455,16 @@ async fn coordinator_turn(
 ) -> Result<(CoordinatorOutput, crate::queue::ProjectRunLease), String> {
     crate::coordinator_reads::drive(
         base_prompt,
-        |prompt| {
+        |prompt, lease| {
             let config = config_for(prompt);
-            run_with_cancellation(executor, conversation_id, config, true, None)
+            async move {
+                // One lease spans the whole turn, so the Conversation stays
+                // live between reads and a Stop cannot fall into a gap.
+                match lease {
+                    Some(lease) => Ok(run_with_lease(lease, config, None).await),
+                    None => run_with_cancellation(executor, conversation_id, config, true, None).await,
+                }
+            }
         },
         |output| async move {
             let tasks = state.task.tasks.read().await;
