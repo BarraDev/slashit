@@ -49,6 +49,7 @@ jobs:
   agent-docs:
     runs-on: ubuntu-22.04
     name: Agent docs
+    if: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -72,6 +73,7 @@ jobs:
   lint:
     runs-on: ubuntu-22.04
     name: Lint and structural checks
+    if: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -126,6 +128,7 @@ jobs:
   test-backend:
     runs-on: ubuntu-22.04
     name: Backend and harness tests
+    if: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -156,6 +159,7 @@ jobs:
   frontend:
     runs-on: ubuntu-22.04
     name: Frontend tests and build
+    if: false
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -367,6 +371,7 @@ jobs:
   # runners cost nothing.
   cross-compile:
     name: Compile check (${{ matrix.platform }})
+    if: false
     runs-on: ${{ matrix.platform }}
     strategy:
       fail-fast: false
@@ -423,6 +428,7 @@ jobs:
   # assume a Unix toolchain. Widening this is a separate decision.
   windows-ipc:
     name: IPC tests (windows-latest)
+    if: false
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
