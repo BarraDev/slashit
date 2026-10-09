@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{Task, TaskCategory, TaskPriority};
+use super::{Task, TaskCategory, TaskPriority, TaskStatus};
 
 pub const MESSAGE_LIMIT: usize = 16_000;
 pub const TASK_TITLE_LIMIT: usize = 200;
@@ -363,6 +363,15 @@ pub enum CoordinatorOutput {
         priority: Option<TaskPriority>,
         category: Option<TaskCategory>,
     },
+    /// Read-only: answered by SlashIt from current state, never a proposal.
+    InspectTask {
+        target_task_id: Uuid,
+    },
+    /// Read-only: a bounded, filtered page of this Project's Tasks.
+    ListTasks {
+        status: Option<TaskStatus>,
+        limit: Option<u8>,
+    },
 }
 
 impl Conversation {
@@ -433,6 +442,12 @@ impl Conversation {
                 }
                 title.as_deref().map(validate_title).transpose()?;
                 description.as_deref().map(validate_description).transpose()?;
+            }
+            CoordinatorOutput::InspectTask { .. } => {}
+            CoordinatorOutput::ListTasks { limit, .. } => {
+                if *limit == Some(0) {
+                    return Err("ListTasks limit must be at least 1".into());
+                }
             }
         }
         Ok(output)
