@@ -115,9 +115,12 @@ future Workspace-level Coordinator possible without implementing one now.
 ### Read capabilities
 
 The Coordinator reads current state by asking for it, not by receiving all of
-it. Two read-only capabilities exist: `inspect_task` (one Task) and
-`list_tasks` (a status-filtered page, at most 20 Tasks, with a total and a
-`truncated` flag). SlashIt answers from the Task store inside the same turn and
+it. Four read-only capabilities exist: `inspect_task` (one Task), `list_tasks`
+(a status-filtered page, at most 20 Tasks, with a total and a `truncated`
+flag), `inspect_task_activity` (a Task's most recent milestones, at most 30,
+tool calls excluded, with a count of earlier ones omitted) and
+`inspect_task_pull_request` (a Task's linked pull requests with SlashIt's last
+cached state, checks and review decision). SlashIt answers from the Task store inside the same turn and
 feeds the result to a fresh Coordinator run; a turn may perform at most three
 reads before it must reply or propose. The always-present Task index carries no
 descriptions, so a Task's detail is only in context when the Coordinator asked
@@ -128,8 +131,10 @@ answers exactly like a missing one. A result is a fixed projection: it names a
 Task's branch and whether it has a checkout but never a local path, and bounds
 every text field and list. Results are not persisted, change nothing, and are
 presented as untrusted evidence; only the Coordinator's own structured output
-can invoke a capability. Pull request, CI and run state are not yet readable
-here. See `coordinator_reads.rs`.
+can invoke a capability. The pull request read answers from the status cache
+and never queries GitHub: `live` is null when nothing has been read, and
+`live_read_at` dates what was. Task run state is read through the activity
+milestones; there is no separate run read. See `coordinator_reads.rs`.
 
 ### Deleting a Project
 

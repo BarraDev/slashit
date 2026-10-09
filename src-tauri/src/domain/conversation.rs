@@ -427,6 +427,15 @@ pub enum CoordinatorOutput {
         status: Option<TaskStatus>,
         limit: Option<u8>,
     },
+    /// Read-only: the most recent milestones of one Task's activity.
+    InspectTaskActivity {
+        target_task_id: Uuid,
+        limit: Option<u8>,
+    },
+    /// Read-only: the last known pull request and CI state of one Task.
+    InspectTaskPullRequest {
+        target_task_id: Uuid,
+    },
 }
 
 impl Conversation {
@@ -499,10 +508,10 @@ impl Conversation {
                 description.as_deref().map(validate_description).transpose()?;
             }
             CoordinatorOutput::MoveTask { text, .. } => Self::validate_text(text)?,
-            CoordinatorOutput::InspectTask { .. } => {}
-            CoordinatorOutput::ListTasks { limit, .. } => {
+            CoordinatorOutput::InspectTask { .. } | CoordinatorOutput::InspectTaskPullRequest { .. } => {}
+            CoordinatorOutput::ListTasks { limit, .. } | CoordinatorOutput::InspectTaskActivity { limit, .. } => {
                 if *limit == Some(0) {
-                    return Err("ListTasks limit must be at least 1".into());
+                    return Err("A read limit must be at least 1".into());
                 }
             }
         }
