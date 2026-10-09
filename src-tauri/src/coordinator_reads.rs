@@ -6,6 +6,8 @@
 //! writes, queues, starts an agent or reaches outside SlashIt's own state. It
 //! also reads one Task's recent activity (`inspect_task_activity`) and the last
 //! pull request and CI state SlashIt heard for it (`inspect_task_pull_request`).
+//! `inspect_project` reports the Conversation's own Project: its name, Workspace,
+//! default base branch and Task counts per status, never a filesystem path.
 //! The pull request read answers from the status cache only; it never asks
 //! GitHub, so it is fast, cannot hang a turn, and says when data is stale or
 //! absent.
@@ -44,6 +46,16 @@ pub const ACTIVITY_MAX_LIMIT: usize = 30;
 pub const ACTIVITY_DETAIL_CHARS: usize = 300;
 pub const PULL_REQUESTS_SHOWN: usize = 5;
 pub const CHECK_NAME_CHARS: usize = 120;
+pub const PROJECT_NAME_CHARS: usize = 200;
+pub const BRANCH_NAME_CHARS: usize = 200;
+
+/// What `inspect_project` may say about the Conversation's Project, gathered
+/// by the caller from state it already holds. Carries no path.
+pub struct ProjectFacts {
+    pub name: String,
+    pub workspace: Option<(Uuid, String)>,
+    pub base_branch: Option<String>,
+}
 
 fn clip(value: &str, limit: usize) -> (String, bool) {
     let mut chars = value.chars();
@@ -237,12 +249,36 @@ fn inspect_task_pull_request(
     })
 }
 
+fn inspect_project(tasks: &HashMap<Uuid, Task>, project_id: Uuid, facts: &ProjectFacts) -> Value {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for task in tasks.values().filter(|task| task.project_id == project_id) {
+        let status = serde_json::to_value(&task.status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        *counts.entry(status).or_default() += 1;
+    }
+    json!({
+        "outcome": "found",
+        "project_id": project_id,
+        "name": clip(&facts.name, PROJECT_NAME_CHARS).0,
+        "workspace": facts.workspace.as_ref().map(|(id, name)| json!({
+            "id": id,
+            "name": clip(name, PROJECT_NAME_CHARS).0,
+        })),
+        "default_base_branch": facts.base_branch.as_deref().map(|branch| clip(branch, BRANCH_NAME_CHARS).0),
+        "tasks_total": counts.values().sum::<usize>(),
+        "tasks_by_status": counts,
+    })
+}
+
 /// Answers a read capability, or `None` when `output` is not one.
 pub fn read(
     output: &CoordinatorOutput,
     project_id: Uuid,
     tasks: &HashMap<Uuid, Task>,
     pr_statuses: &PrStatuses,
+    project: &ProjectFacts,
 ) -> Option<Value> {
     match output {
         CoordinatorOutput::InspectTask { target_task_id } => {
@@ -263,6 +299,7 @@ pub fn read(
         CoordinatorOutput::InspectTaskPullRequest { target_task_id } => Some(
             inspect_task_pull_request(tasks, project_id, *target_task_id, pr_statuses),
         ),
+        CoordinatorOutput::InspectProject {} => Some(inspect_project(tasks, project_id, project)),
         _ => None,
     }
 }
@@ -338,7 +375,11 @@ mod tests {
 
     /// [`super::read`] with no GitHub to ask and an empty status cache.
     fn read(output: &CoordinatorOutput, project_id: Uuid, tasks: &HashMap<Uuid, Task>) -> Option<Value> {
-        super::read(output, project_id, tasks, &no_github())
+        super::read(output, project_id, tasks, &no_github(), &facts())
+    }
+
+    fn facts() -> ProjectFacts {
+        ProjectFacts { name: "Alpha".into(), workspace: None, base_branch: None }
     }
 
     fn task(project_id: Uuid, title: &str, status: TaskStatus, position: i32) -> Task {
@@ -593,7 +634,7 @@ mod tests {
             },
         );
         let result =
-            super::read(&pull_request(id), project, &store(vec![subject]), &statuses).unwrap();
+            super::read(&pull_request(id), project, &store(vec![subject]), &statuses, &facts()).unwrap();
         let live = &result["pull_requests"][0]["live"];
         assert_eq!(live["checks"], "failing");
         assert_eq!(live["review_decision"], "changes_requested");
@@ -618,6 +659,98 @@ mod tests {
             r#"{"type":"inspect_task_pull_request"}"#.to_owned(),
         ] {
             assert!(Conversation::parse_output(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn project_read_counts_only_this_projects_tasks_by_status() {
+        let project = Uuid::new_v4();
+        let tasks = store(vec![
+            task(project, "A", TaskStatus::Backlog, 0),
+            task(project, "B", TaskStatus::Backlog, 1),
+            task(project, "C", TaskStatus::Done, 2),
+            task(Uuid::new_v4(), "Foreign", TaskStatus::Error, 0),
+        ]);
+        let result = read(&CoordinatorOutput::InspectProject {}, project, &tasks).unwrap();
+        assert_eq!(result["outcome"], "found");
+        assert_eq!(result["project_id"], project.to_string());
+        assert_eq!(result["tasks_total"], 3);
+        assert_eq!(result["tasks_by_status"], json!({"backlog": 2, "done": 1}));
+    }
+
+    #[test]
+    fn project_read_reports_missing_optional_metadata_as_null() {
+        let result = read(&CoordinatorOutput::InspectProject {}, Uuid::new_v4(), &HashMap::new()).unwrap();
+        assert!(result["workspace"].is_null());
+        assert!(result["default_base_branch"].is_null());
+        assert_eq!(result["tasks_total"], 0);
+        assert_eq!(result["tasks_by_status"], json!({}));
+    }
+
+    #[test]
+    fn project_read_names_the_workspace_and_base_without_any_path() {
+        let workspace_id = Uuid::new_v4();
+        let facts = ProjectFacts {
+            name: "Alpha".into(),
+            workspace: Some((workspace_id, "Studio".into())),
+            base_branch: Some("main".into()),
+        };
+        let result = super::read(
+            &CoordinatorOutput::InspectProject {},
+            Uuid::new_v4(),
+            &HashMap::new(),
+            &no_github(),
+            &facts,
+        )
+        .unwrap();
+        assert_eq!(result["name"], "Alpha");
+        assert_eq!(result["workspace"], json!({"id": workspace_id.to_string(), "name": "Studio"}));
+        assert_eq!(result["default_base_branch"], "main");
+        let keys: Vec<_> = result.as_object().unwrap().keys().cloned().collect();
+        assert!(keys.iter().all(|key| !key.contains("path") && !key.contains("root")), "{keys:?}");
+    }
+
+    #[test]
+    fn project_read_bounds_its_text_fields() {
+        let facts = ProjectFacts {
+            name: "n".repeat(PROJECT_NAME_CHARS * 3),
+            workspace: Some((Uuid::new_v4(), "w".repeat(PROJECT_NAME_CHARS * 3))),
+            base_branch: Some("b".repeat(BRANCH_NAME_CHARS * 3)),
+        };
+        let result = super::read(
+            &CoordinatorOutput::InspectProject {},
+            Uuid::new_v4(),
+            &HashMap::new(),
+            &no_github(),
+            &facts,
+        )
+        .unwrap();
+        let chars = |value: &Value| value.as_str().unwrap().chars().count();
+        assert_eq!(chars(&result["name"]), PROJECT_NAME_CHARS);
+        assert_eq!(chars(&result["workspace"]["name"]), PROJECT_NAME_CHARS);
+        assert_eq!(chars(&result["default_base_branch"]), BRANCH_NAME_CHARS);
+    }
+
+    #[test]
+    fn project_read_does_not_change_the_tasks() {
+        let project = Uuid::new_v4();
+        let tasks = store(vec![task(project, "A", TaskStatus::Queue, 0)]);
+        let before = serde_json::to_value(&tasks).unwrap();
+        read(&CoordinatorOutput::InspectProject {}, project, &tasks).unwrap();
+        assert_eq!(serde_json::to_value(&tasks).unwrap(), before);
+    }
+
+    #[test]
+    fn project_read_is_strictly_parsed() {
+        assert!(matches!(
+            Conversation::parse_output(r#"{"type":"inspect_project"}"#),
+            Ok(CoordinatorOutput::InspectProject {})
+        ));
+        for bad in [
+            r#"{"type":"inspect_project","project_id":"x"}"#,
+            r#"{"type":"inspect_project","path":"/etc"}"#,
+        ] {
+            assert!(Conversation::parse_output(bad).is_err(), "{bad}");
         }
     }
 

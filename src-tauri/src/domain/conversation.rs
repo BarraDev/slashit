@@ -436,6 +436,8 @@ pub enum CoordinatorOutput {
     InspectTaskPullRequest {
         target_task_id: Uuid,
     },
+    /// Read-only: this Project's name, Workspace, base branch and Task counts.
+    InspectProject {},
 }
 
 impl Conversation {
@@ -508,7 +510,9 @@ impl Conversation {
                 description.as_deref().map(validate_description).transpose()?;
             }
             CoordinatorOutput::MoveTask { text, .. } => Self::validate_text(text)?,
-            CoordinatorOutput::InspectTask { .. } | CoordinatorOutput::InspectTaskPullRequest { .. } => {}
+            CoordinatorOutput::InspectTask { .. }
+            | CoordinatorOutput::InspectTaskPullRequest { .. }
+            | CoordinatorOutput::InspectProject {} => {}
             CoordinatorOutput::ListTasks { limit, .. } | CoordinatorOutput::InspectTaskActivity { limit, .. } => {
                 if *limit == Some(0) {
                     return Err("A read limit must be at least 1".into());
