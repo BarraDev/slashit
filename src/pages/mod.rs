@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 
+pub mod conversations;
 pub mod dashboard;
 pub mod agent;
 pub mod spec;
@@ -15,6 +16,7 @@ pub mod workspaces;
 pub mod github_issues;
 pub mod github_prs;
 
+pub use conversations::*;
 pub use dashboard::*;
 pub use agent::*;
 pub use spec::*;

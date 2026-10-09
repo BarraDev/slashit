@@ -28,8 +28,10 @@ async fn zero_task_project_conversation_replies_and_survives_restart() {
         let project_id = created_id(ui::invoke(session.driver(), "create_project", json!({
             "name":"Zero Task Conversation", "repositoryId":Value::Null, "agentType":"claude_code"
         })).await?, "create_project")?;
-        open_board(session.driver(), &project_id).await?;
-        ui::visible(session.driver(), PANEL).await?;
+        open_conversations(session.driver(), &project_id).await?;
+        open_nav(session.driver(), "dashboard", KANBAN_BOARD).await?;
+        if text_of(session.driver(), PANEL).await?.is_some() { bail!("the Project conversation is still rendered on the Kanban page"); }
+        open_nav(session.driver(), "conversations", PANEL).await?;
         let tasks: Vec<Value> = serde_json::from_value(ui::invoke(session.driver(), "list_tasks", json!({"projectId":project_id})).await?)?;
         if !tasks.is_empty() { bail!("the no-Task fixture unexpectedly has {} Tasks", tasks.len()); }
 
@@ -71,8 +73,7 @@ async fn zero_task_project_conversation_replies_and_survives_restart() {
         context.close_session(session, "zero-tasks", &Ok(())).await?;
 
         let restarted = context.start_session("zero-tasks-restart").await?;
-        open_board(restarted.driver(), &project_id).await?;
-        ui::visible(restarted.driver(), PANEL).await?;
+        open_conversations(restarted.driver(), &project_id).await?;
         let restored = ui::invoke(restarted.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
         if restored["conversation"]["id"] != conversation_id { bail!("restart changed the primary Conversation identity"); }
         if restored["coordinator_live"] != false || restored["worker_live"] != false { bail!("restart fabricated a live Run"); }
@@ -119,12 +120,16 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         std::fs::write(target_config.join("id"), &task_id)?;
         let unrelated = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Unrelated private Task sentinel","description":"Must not enter the Worker projection","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
         let unrelated_task_id = created_id(unrelated, "create_task")?;
-        open_board(session.driver(), &project_id).await?;
-        ui::visible(session.driver(), PANEL).await?;
+        open_conversations(session.driver(), &project_id).await?;
 
         // No proposal may start the Worker. The fixture's invocation count
         // stays at the Coordinator until the exact payload is approved.
         submit_message(session.driver(), "Please make a small change in Existing Task.").await?;
+        await_blocked_provider_run(&agent).await?;
+        // Leaving the page must neither stop the live run nor lose its state.
+        open_nav(session.driver(), "dashboard", KANBAN_BOARD).await?;
+        open_nav(session.driver(), "conversations", PANEL).await?;
+        ui::visible(session.driver(), "[data-testid=\"conversation-stop\"]").await?;
         await_and_release_provider_run(&agent).await?;
         await_text(session.driver(), PANEL, "Coordinator proposes Task work").await?;
         let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
@@ -271,8 +276,7 @@ async fn coordinator_creates_and_edits_tasks_only_after_human_approval() {
         let project_id = created_id(ui::invoke(session.driver(), "create_project", json!({
             "name":"Coordinator Task Mutations", "repositoryId":Value::Null, "agentType":"claude_code"
         })).await?, "create_project")?;
-        open_board(session.driver(), &project_id).await?;
-        ui::visible(session.driver(), PANEL).await?;
+        open_conversations(session.driver(), &project_id).await?;
         let list_tasks = || async { anyhow::Ok(serde_json::from_value::<Vec<Value>>(ui::invoke(session.driver(), "list_tasks", json!({"projectId":project_id})).await?)?) };
         let proposal = "[data-testid=\"project-action-proposal\"]";
 
@@ -324,8 +328,7 @@ async fn coordinator_creates_and_edits_tasks_only_after_human_approval() {
 
         // 4. After a restart the outcomes are durable and a replayed approval is inert.
         let restarted = context.start_session("task-mutations-restart").await?;
-        open_board(restarted.driver(), &project_id).await?;
-        ui::visible(restarted.driver(), PANEL).await?;
+        open_conversations(restarted.driver(), &project_id).await?;
         let snapshot = ui::invoke(restarted.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
         let statuses = snapshot["conversation"]["project_actions"].as_array().context("project actions missing")?.iter().map(|action| action["status"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>();
         if statuses != ["rejected", "applied", "applied"] { bail!("project action outcomes did not survive restart: {statuses:?}"); }
@@ -343,6 +346,20 @@ async fn coordinator_creates_and_edits_tasks_only_after_human_approval() {
         Ok::<_, anyhow::Error>(())
     }.await;
     context.finish(outcome);
+}
+
+/// Open the Conversations page from the Project navigation.
+async fn open_conversations(driver: &WebDriver, project_id: &str) -> Result<()> {
+    open_board(driver, project_id).await?;
+    open_nav(driver, "conversations", PANEL).await
+}
+
+/// Click a Project navigation item and wait for the page it opens.
+async fn open_nav(driver: &WebDriver, page: &str, landmark: &str) -> Result<()> {
+    ui::visible(driver, &format!("[data-testid=\"nav-{page}\"]")).await?.click().await
+        .with_context(|| format!("could not open the {page} page"))?;
+    ui::visible(driver, landmark).await.with_context(|| format!("the {page} page did not render {landmark}"))?;
+    Ok(())
 }
 
 async fn send_message(driver: &WebDriver, message: &str, expected: &str) -> Result<()> {
