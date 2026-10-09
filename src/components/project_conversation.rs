@@ -61,6 +61,15 @@ fn mutation_view(mutation: &ConversationTaskMutation) -> MutationView {
             }));
             MutationView { heading: "Edit Task", title: target_task_title.clone(), rows }
         }
+        ConversationTaskMutation::MoveTask { target_task_id, target_task_title, from, to } => MutationView {
+            heading: "Move Task",
+            title: target_task_title.clone(),
+            rows: vec![
+                ("Task ID".to_string(), target_task_id.to_string()),
+                ("Status".to_string(), format!("{} → {}", words(from), words(to))),
+                ("Effect".to_string(), "Reorganizes the board only; no work is started".to_string()),
+            ],
+        },
     }
 }
 
@@ -91,6 +100,7 @@ fn project_action_event_text(kind: &ConversationEntryKind, actions: &[Conversati
         ConversationEntryKind::ProjectActionApplied { action_id, task_id } => find(action_id).map(|action| match &action.mutation {
             ConversationTaskMutation::CreateTask { title, .. } => format!("Task created in Backlog: {title} (Task {task_id})"),
             ConversationTaskMutation::EditTask { target_task_title, .. } => format!("Task updated: {target_task_title} (Task {task_id})"),
+            ConversationTaskMutation::MoveTask { target_task_title, to, .. } => format!("Task moved to {}: {target_task_title} (Task {task_id})", words(to)),
         }),
         ConversationEntryKind::ProjectActionRefused { reason, .. } => Some(format!("Nothing was changed: {reason}")),
         _ => None,
@@ -454,6 +464,20 @@ mod tests {
             ("Task ID".to_string(), id.to_string()), ("Title".to_string(), "Old → New".to_string()),
             ("Description".to_string(), "(none) → Why".to_string()), ("Priority".to_string(), "medium → urgent".to_string()),
         ]);
+    }
+
+    #[test]
+    fn a_move_proposal_states_the_status_change_and_that_no_work_starts() {
+        let id = Uuid::new_v4();
+        let mutation = ConversationTaskMutation::MoveTask { target_task_id: id, target_task_title: "Old".into(), from: "queue".into(), to: "backlog".into() };
+        let view = mutation_view(&mutation);
+        assert_eq!(view.heading, "Move Task");
+        assert_eq!(view.rows, vec![
+            ("Task ID".to_string(), id.to_string()), ("Status".to_string(), "queue → backlog".to_string()),
+            ("Effect".to_string(), "Reorganizes the board only; no work is started".to_string()),
+        ]);
+        let wire = serde_json::json!({"kind":"move_task","target_task_id":id,"target_task_title":"Old","from":"queue","to":"backlog"});
+        assert_eq!(serde_json::from_value::<ConversationTaskMutation>(wire).unwrap(), mutation);
     }
 
     #[test]

@@ -142,6 +142,14 @@ pub enum TaskMutation {
         target_task_title: String,
         changes: Vec<FieldChange>,
     },
+    /// Return a Task to Backlog. `from` is the status SlashIt observed when the
+    /// proposal was made; approval only moves a Task that still holds it.
+    MoveTask {
+        target_task_id: Uuid,
+        target_task_title: String,
+        from: TaskStatus,
+        to: TaskStatus,
+    },
 }
 
 impl TaskMutation {
@@ -202,6 +210,29 @@ impl TaskMutation {
         })
     }
 
+    /// Propose moving `target` to `to`, if the Coordinator may do so.
+    ///
+    /// [`coordinator_may_move`] is deliberately narrower than the board: a
+    /// move into any column that starts, resumes or finishes work belongs to
+    /// the Task lifecycle, not to a conversational proposal.
+    pub fn move_task(target: &Task, to: TaskStatus) -> Result<Self, String> {
+        if target.status == to {
+            return Err("Coordinator proposed a move that changes nothing".into());
+        }
+        if !coordinator_may_move(&target.status, &to) {
+            return Err(format!(
+                "The Coordinator cannot move a Task from {:?} to {to:?}",
+                target.status
+            ));
+        }
+        Ok(Self::MoveTask {
+            target_task_id: target.id,
+            target_task_title: target.title.chars().take(TASK_TITLE_LIMIT).collect(),
+            from: target.status.clone(),
+            to,
+        })
+    }
+
     pub fn summary(&self) -> String {
         let text = match self {
             Self::CreateTask { title, description, priority, category, .. } => format!(
@@ -213,9 +244,27 @@ impl TaskMutation {
                 "Edit Task {target_task_id} ({target_task_title:?}): {}",
                 changes.iter().map(FieldChange::summary).collect::<Vec<_>>().join("; ")
             ),
+            Self::MoveTask { target_task_id, target_task_title, from, to } => format!(
+                "Move Task {target_task_id} ({target_task_title:?}) from {from:?} to {to:?}; \
+                 no work is started"
+            ),
         };
         text.chars().take(1500).collect()
     }
+}
+
+/// The only Task moves a Project Conversation may propose: returning a Task
+/// that is waiting (`Queue`) or has failed (`Error`) to `Backlog`.
+///
+/// Every other destination is an execution decision. `Queue` and `InProgress`
+/// make the Task eligible to run, `AiReview` and `HumanReview` and `PrCreated`
+/// are outcomes of work, and `Done` removes the Task Checkout. Those stay with
+/// the normal Task lifecycle (queueing is its own capability).
+pub fn coordinator_may_move(from: &TaskStatus, to: &TaskStatus) -> bool {
+    matches!(
+        (from, to),
+        (TaskStatus::Queue | TaskStatus::Error, TaskStatus::Backlog)
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +412,12 @@ pub enum CoordinatorOutput {
         priority: Option<TaskPriority>,
         category: Option<TaskCategory>,
     },
+    /// Proposal to return a Queued or failed Task to Backlog. Never starts work.
+    MoveTask {
+        text: String,
+        target_task_id: Uuid,
+        to: TaskStatus,
+    },
     /// Read-only: answered by SlashIt from current state, never a proposal.
     InspectTask {
         target_task_id: Uuid,
@@ -443,6 +498,7 @@ impl Conversation {
                 title.as_deref().map(validate_title).transpose()?;
                 description.as_deref().map(validate_description).transpose()?;
             }
+            CoordinatorOutput::MoveTask { text, .. } => Self::validate_text(text)?,
             CoordinatorOutput::InspectTask { .. } => {}
             CoordinatorOutput::ListTasks { limit, .. } => {
                 if *limit == Some(0) {

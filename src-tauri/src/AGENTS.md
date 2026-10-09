@@ -73,7 +73,7 @@ crate: a Unix socket on Linux and macOS, a named pipe on Windows, and an
 optional loopback-only TCP listener that is off by default and requires a
 bearer token.
 
-Treat it as a privileged interface. `IpcRequest::CreateTask` + `MoveTask(in_progress)`
+Treat it as a privileged interface. `IpcRequest::CreateTask` + `IpcRequest::MoveTask(in_progress)`
 reaches the queue executor, which spawns an agent with full tool access, so it
 is a code-execution channel. Verbs with that reach are marked by
 `IpcRequest::spawns_agent()` and are denied to any peer the OS did not
