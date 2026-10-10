@@ -357,6 +357,9 @@ async fn open_conversations(driver: &WebDriver, project_id: &str) -> Result<()> 
     ui::assert_frontend_is_real(driver).await?;
     ui::visible(driver, &format!("[data-testid=\"rail-project-{project_id}\"]")).await?
         .click().await.context("could not select the project in the rail")?;
+    // Hold the formerly racy state: the pointer on a fully expanded rail, whose
+    // overlay covers the navigation item. `open_nav` must still get through.
+    await_rail(driver, "return rail.classList.contains('expanded') && rail.getBoundingClientRect().width >= 180;").await?;
     open_nav(driver, "conversations", PANEL).await
 }
 
@@ -368,11 +371,39 @@ async fn await_board_task_title(driver: &WebDriver, title: &str) -> Result<()> {
 }
 
 /// Click a Project navigation item and wait for the page it opens.
+///
+/// Selecting a Project leaves the pointer on the Project Rail, which expands
+/// on hover into a 180px overlay over the Sidebar. That overlay covers the
+/// centre of every navigation item, so clicking before it has collapsed is
+/// intercepted, or lands on the rail instead. Park the pointer on the page
+/// and wait for the rail to be back at its collapsed width first.
 async fn open_nav(driver: &WebDriver, page: &str, landmark: &str) -> Result<()> {
+    release_rail(driver).await?;
     ui::visible(driver, &format!("[data-testid=\"nav-{page}\"]")).await?.click().await
         .with_context(|| format!("could not open the {page} page"))?;
     ui::visible(driver, landmark).await.with_context(|| format!("the {page} page did not render {landmark}"))?;
     Ok(())
+}
+
+/// Move the pointer off the Project Rail and wait until it has collapsed.
+async fn release_rail(driver: &WebDriver) -> Result<()> {
+    let main = ui::visible(driver, "main").await?;
+    driver.action_chain().move_to_element_center(&main).perform().await
+        .context("could not move the pointer off the project rail")?;
+    await_rail(driver, "return !rail.classList.contains('expanded') && rail.getBoundingClientRect().width <= 48;").await
+}
+
+/// Wait until the Project Rail satisfies a predicate over `rail`.
+async fn await_rail(driver: &WebDriver, predicate: &str) -> Result<()> {
+    let script = format!("const rail = document.querySelector('[data-testid=\"project-rail\"]'); return !!rail && (() => {{ {predicate} }})();");
+    let started = Instant::now();
+    loop {
+        if super::page(driver, &script, vec![]).await? == Value::Bool(true) { return Ok(()); }
+        if started.elapsed() > ui::ELEMENT_TIMEOUT {
+            bail!("the project rail never reached the expected state: {predicate}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn send_message(driver: &WebDriver, message: &str, expected: &str) -> Result<()> {
