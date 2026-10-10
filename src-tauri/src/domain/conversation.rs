@@ -440,6 +440,16 @@ pub enum CoordinatorOutput {
     InspectProject {},
 }
 
+/// Scope attached to every projected Human decision on a proposal.
+pub const DECISION_SCOPE: &str = "this_proposal_only";
+
+/// How the Coordinator must read decisions in `recent_history`.
+pub const HISTORY_SEMANTICS: &str = "A decision entry records the Human's answer to one specific earlier proposal and applies to that proposal only. It is not a standing instruction. A rejected proposal never forbids a later proposal. When the current message explicitly asks for the same or an equivalent change again, treat it as a new request and propose it again; SlashIt will ask for a new approval.";
+
+fn decision_label(approved: bool) -> &'static str {
+    if approved { "approved" } else { "rejected" }
+}
+
 impl Conversation {
     pub fn new(project_id: Uuid) -> Self {
         let now = Utc::now();
@@ -547,18 +557,19 @@ impl Conversation {
                 EntryKind::ActionProposed { action_id } => self.actions.iter().find(|action| action.id == *action_id).map(|action|
                     serde_json::json!({"kind":"action_proposed", "target_task_id":action.target_task_id,"target_task_title":action.target_task_title.chars().take(500).collect::<String>(),"request":action.request.chars().take(3000).collect::<String>(),"explanation":action.explanation.chars().take(2000).collect::<String>()})),
                 EntryKind::ActionDecision { action_id, approved, request } => self.actions.iter().find(|action| action.id == *action_id).map(|action|
-                    serde_json::json!({"kind":"action_decision","approved":approved,"target_task_id":action.target_task_id,"target_task_title":action.target_task_title.chars().take(500).collect::<String>(),"request":request.as_deref().unwrap_or(&action.request).chars().take(3000).collect::<String>()})),
+                    serde_json::json!({"kind":"action_decision","approved":approved,"decision":decision_label(*approved),"scope":DECISION_SCOPE,"target_task_id":action.target_task_id,"target_task_title":action.target_task_title.chars().take(500).collect::<String>(),"request":request.as_deref().unwrap_or(&action.request).chars().take(3000).collect::<String>()})),
                 EntryKind::WorkerStarted { action_id } => Some(serde_json::json!({"kind":"worker_started","action_id":action_id})),
                 EntryKind::WorkerResult { action_id, result } => Some(serde_json::json!({"kind":"worker_result","action_id":action_id,"result":result.chars().take(3000).collect::<String>()})),
                 EntryKind::RunFailed { role, message } => Some(serde_json::json!({"kind":"run_failed","role":role,"message":message.chars().take(1000).collect::<String>()})),
                 EntryKind::ProjectActionProposed { action_id } => self.project_action(*action_id).map(|action| serde_json::json!({"kind":"project_action_proposed","action_id":action_id,"summary":action.mutation.summary()})),
-                EntryKind::ProjectActionDecision { action_id, approved } => self.project_action(*action_id).map(|action| serde_json::json!({"kind":"project_action_decision","action_id":action_id,"approved":approved,"summary":action.mutation.summary()})),
+                EntryKind::ProjectActionDecision { action_id, approved } => self.project_action(*action_id).map(|action| serde_json::json!({"kind":"project_action_decision","action_id":action_id,"approved":approved,"decision":decision_label(*approved),"scope":DECISION_SCOPE,"summary":action.mutation.summary()})),
                 EntryKind::ProjectActionApplied { action_id, task_id } => Some(serde_json::json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id})),
                 EntryKind::ProjectActionRefused { action_id, reason } => Some(serde_json::json!({"kind":"project_action_refused","action_id":action_id,"reason":reason.chars().take(1000).collect::<String>()})),
             }).take(PROJECTION_MESSAGE_COUNT).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>();
         serde_json::json!({
             "project": {"name": project_name, "root": project_root},
             "current_message": current_message,
+            "history_semantics": HISTORY_SEMANTICS,
             "recent_history": recent,
             "tasks": tasks.iter().take(TASK_INDEX_LIMIT).collect::<Vec<_>>(),
         })
@@ -632,6 +643,38 @@ mod tests {
         assert!(projection.to_string().contains("action_decision"));
         assert!(projection.to_string().contains("Task A"));
         assert!(!projection["recent_history"].to_string().contains("why?"));
+    }
+
+    #[test]
+    fn projected_decisions_state_their_scope_and_stored_conversations_stay_unchanged() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        let action = ProjectAction::proposed(
+            "Add Task".into(),
+            TaskMutation::MoveTask {
+                target_task_id: Uuid::new_v4(),
+                target_task_title: "T".into(),
+                from: TaskStatus::Queue,
+                to: TaskStatus::Backlog,
+            },
+        );
+        let action_id = action.id;
+        conversation.project_actions.push(action);
+        conversation.push(Role::Coordinator, EntryKind::ProjectActionProposed { action_id });
+        conversation.push(Role::Human, EntryKind::ProjectActionDecision { action_id, approved: false });
+
+        // Nothing about the projection is persisted, so older documents load as before.
+        let stored = serde_json::to_string(&conversation).unwrap();
+        assert!(!stored.contains("this_proposal_only") && !stored.contains("history_semantics"));
+        let reloaded: Conversation = serde_json::from_str(&stored).unwrap();
+
+        let projection = reloaded.coordinator_projection("Add it again", "Project", None, &[]);
+        assert!(projection["history_semantics"].as_str().unwrap().contains("that proposal only"));
+        let decision = &projection["recent_history"][1];
+        assert_eq!(decision["kind"], "project_action_decision");
+        assert_eq!(decision["approved"], false);
+        assert_eq!(decision["decision"], "rejected");
+        assert_eq!(decision["scope"], "this_proposal_only");
+        assert_eq!(projection["current_message"], "Add it again");
     }
 
     #[test]
