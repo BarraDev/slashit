@@ -111,8 +111,13 @@ itself; see Isolation below.
 ### Arch Linux
 
 Arch ships no `WebKitWebDriver` binary at all: `webkit2gtk-4.1` installs no
-`/usr/bin` entries. Extracting Debian's `webkit2gtk-driver` package for the
-same upstream version works. Because it needs its own ICU, point the harness
+`/usr/bin` entries, and the standard packages do not provide a compatible
+one. Without it every journey fails at session start, waiting for
+`tauri-driver` to accept a connection; that is a missing local driver, not a
+product failure. Extracting Debian's `webkit2gtk-driver` package for the
+same upstream version is a workaround worth investigating for local use; this
+note does not guarantee it works on every machine. Hosted Linux CI provides
+the authoritative desktop acceptance result. Because it needs its own ICU, point the harness
 at a wrapper rather than exporting `LD_LIBRARY_PATH` into the whole test run:
 
 ```bash

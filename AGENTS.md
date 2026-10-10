@@ -55,7 +55,8 @@ scripts/run-desktop-acceptance.sh
 ```
 
 See `crates/slashit-acceptance/README.md` for what the harness guarantees and
-how to run it on Arch, which ships no `WebKitWebDriver`.
+how to run it on Arch, which ships no `WebKitWebDriver` (local driver
+troubleshooting; hosted Linux CI is the authoritative acceptance result).
 
 ## Project Structure
 
