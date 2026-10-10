@@ -754,4 +754,23 @@ mod queue_settings {
         assert_eq!(queue.get("fifo_ordering").and_then(|v| v.as_bool()), Some(false));
         assert_eq!(queue.get("use_coderabbit").and_then(|v| v.as_bool()), Some(false));
     }
+
+    #[tokio::test]
+    async fn a_hand_edited_limit_the_queue_cannot_run_under_is_brought_into_range() {
+        for (written, expected) in [(0, 1), (99, 10)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = paths_in(tmp.path());
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::write(
+                paths.config_file(),
+                format!("[queue]\nparallel_task_limit = {written}\nauto_promote = false\n"),
+            )
+            .unwrap();
+
+            let config = running(&launch(&paths).await).await;
+
+            assert_eq!(config.parallel_task_limit, expected, "written {written}");
+            assert!(!config.auto_promote, "the other fields are kept");
+        }
+    }
 }

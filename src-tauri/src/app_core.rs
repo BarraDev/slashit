@@ -97,7 +97,13 @@ pub async fn build_state_with_paths(
     };
 
     let task_state = commands::task::TaskState::new();
-    let queue_state = commands::queue::QueueState::new(task_state.tasks.clone(), loaded_config.queue.clone());
+    // A hand-edited limit the Queue cannot run under (0 would stop every Task)
+    // is brought into range rather than trusted.
+    let (queue_config, queue_warning) = loaded_config.queue.clone().bounded();
+    if let Some(warning) = queue_warning {
+        eprintln!("Warning: saved Queue settings: {warning}; running with {}", queue_config.parallel_task_limit);
+    }
+    let queue_state = commands::queue::QueueState::new(task_state.tasks.clone(), queue_config);
     let project_state = commands::project::ProjectState::new();
     let repository_state = commands::repository::RepositoryState::new();
     let executor = Arc::new(tokio::sync::OnceCell::new());

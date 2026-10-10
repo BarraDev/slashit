@@ -43,4 +43,15 @@ impl QueueConfig {
         }
         Ok(())
     }
+
+    /// The settings to run under when read from a file someone may have
+    /// edited by hand: a limit outside the bounds is brought to the nearest
+    /// bound, and the message says so. Every other field is kept.
+    pub fn bounded(mut self) -> (Self, Option<String>) {
+        let warning = self.validate().err();
+        self.parallel_task_limit = self
+            .parallel_task_limit
+            .clamp(MIN_PARALLEL_TASK_LIMIT, MAX_PARALLEL_TASK_LIMIT);
+        (self, warning)
+    }
 }
