@@ -61,6 +61,15 @@ fn mutation_view(mutation: &ConversationTaskMutation) -> MutationView {
             }));
             MutationView { heading: "Edit Task", title: target_task_title.clone(), rows }
         }
+        ConversationTaskMutation::EnqueueTask { target_task_id, target_task_title, from } => MutationView {
+            heading: "Queue Task",
+            title: target_task_title.clone(),
+            rows: vec![
+                ("Task ID".to_string(), target_task_id.to_string()),
+                ("Status".to_string(), format!("{} → queue", words(from))),
+                ("Effect".to_string(), "Only queues the Task. SlashIt's scheduler starts it when capacity allows, and the Task prepares its own checkout then".to_string()),
+            ],
+        },
         ConversationTaskMutation::MoveTask { target_task_id, target_task_title, from, to } => MutationView {
             heading: "Move Task",
             title: target_task_title.clone(),
@@ -101,6 +110,10 @@ fn project_action_event_text(kind: &ConversationEntryKind, actions: &[Conversati
             ConversationTaskMutation::CreateTask { title, .. } => format!("Task created in Backlog: {title} (Task {task_id})"),
             ConversationTaskMutation::EditTask { target_task_title, .. } => format!("Task updated: {target_task_title} (Task {task_id})"),
             ConversationTaskMutation::MoveTask { target_task_title, to, .. } => format!("Task moved to {}: {target_task_title} (Task {task_id})", words(to)),
+            ConversationTaskMutation::EnqueueTask { target_task_title, .. } => match action.outcome {
+                Some(ConversationProjectActionOutcome::AlreadyQueued { .. }) => format!("Task was already in the queue: {target_task_title} (Task {task_id}); SlashIt cannot tell whether this approval queued it"),
+                _ => format!("Task queued: {target_task_title} (Task {task_id})"),
+            },
         }),
         ConversationEntryKind::ProjectActionRefused { reason, .. } => Some(format!("Nothing was changed: {reason}")),
         _ => None,
@@ -510,6 +523,23 @@ mod tests {
         assert_eq!(text, format!("Task created in Backlog: Add dark mode (Task {task_id})"));
         let refused = project_action_event_text(&ConversationEntryKind::ProjectActionRefused { action_id: action.id, reason: "The Task changed after this edit was proposed; nothing was changed".into() }, &[]).unwrap();
         assert!(refused.starts_with("Nothing was changed:"));
+    }
+
+    #[test]
+    fn a_queue_proposal_says_it_only_queues_and_a_found_task_is_not_claimed() {
+        let task_id = Uuid::new_v4();
+        let mut action = ConversationProjectAction { id: Uuid::new_v4(), explanation: "why".into(), status: ConversationProjectActionStatus::Applied,
+            mutation: ConversationTaskMutation::EnqueueTask { target_task_id: task_id, target_task_title: "Build it".into(), from: "backlog".into() },
+            outcome: Some(ConversationProjectActionOutcome::Applied { task_id, title: "Build it".into() }), created_at: String::new() };
+        let view = mutation_view(&action.mutation);
+        assert_eq!(view.heading, "Queue Task");
+        assert!(view.rows.iter().any(|(name, value)| name == "Status" && value == "backlog → queue"));
+        assert!(view.rows.iter().any(|(name, value)| name == "Effect" && value.starts_with("Only queues the Task")));
+        let applied = ConversationEntryKind::ProjectActionApplied { action_id: action.id, task_id };
+        assert_eq!(project_action_event_text(&applied, std::slice::from_ref(&action)).unwrap(), format!("Task queued: Build it (Task {task_id})"));
+        action.outcome = Some(ConversationProjectActionOutcome::AlreadyQueued { task_id, title: "Build it".into() });
+        let found = project_action_event_text(&applied, std::slice::from_ref(&action)).unwrap();
+        assert!(found.starts_with("Task was already in the queue") && found.contains("cannot tell"), "{found}");
     }
 
     #[test]

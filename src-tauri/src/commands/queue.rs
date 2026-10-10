@@ -293,3 +293,110 @@ mod lifecycle_ownership {
         );
     }
 }
+
+/// The Coordinator's approved enqueue and the board's single-Task enqueue
+/// (`reorder_task` with `expected_status`, which the drawer's Start and the
+/// card menu's "Add to Queue" reach) must leave a Task in the same state.
+#[cfg(test)]
+mod enqueue_parity {
+    use super::*;
+    use crate::test_helpers::create_test_task_full;
+    use tauri::Manager;
+
+    #[tokio::test]
+    async fn the_lifecycle_enqueue_matches_the_boards_single_task_enqueue() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _report) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state should build under a fresh tempdir");
+
+        let project_id = Uuid::new_v4();
+        let mut board = Vec::new();
+        for (title, status, position) in [
+            ("waiting a", TaskStatus::Queue, 0),
+            ("waiting b", TaskStatus::Queue, 1),
+            ("via board", TaskStatus::Backlog, 0),
+            ("via lifecycle", TaskStatus::Backlog, 1),
+        ] {
+            let mut task = create_test_task_full(title, project_id, status, position);
+            // Leftovers an enqueue must reset, identically on both paths.
+            task.phase_progress = 40;
+            task.overall_progress = 40;
+            task.error_message = Some("old failure".into());
+            board.push(task);
+        }
+        let by_board = board[2].id;
+        let by_lifecycle = board[3].id;
+        {
+            let mut tasks = state.task.tasks.write().await;
+            for task in &board {
+                tasks.insert(task.id, task.clone());
+            }
+        }
+        state.storage.save_project_tasks(project_id, &board).expect("seed the board");
+
+        let app = tauri::test::mock_app();
+        app.manage(state);
+        let live: &crate::AppState = app.state::<crate::AppState>().inner();
+
+        crate::commands::task::reorder_task(
+            app.state(),
+            by_board.to_string(),
+            Some(TaskStatus::Queue),
+            0,
+            None,
+            Some(TaskStatus::Backlog),
+        )
+        .await
+        .expect("board enqueue");
+
+        let board_after = live.task.tasks.read().await[&by_board].clone();
+
+        // Same starting column for the second Task: restore the neighbours.
+        {
+            let mut tasks = live.task.tasks.write().await;
+            for task in &board[..2] {
+                tasks.insert(task.id, task.clone());
+            }
+            tasks.remove(&by_board);
+        }
+        let verdict = crate::lifecycle::enqueue_leased(
+            &live.task.tasks,
+            &live.storage,
+            project_id,
+            by_lifecycle,
+            &TaskStatus::Backlog,
+        )
+        .await
+        .expect("lifecycle enqueue");
+        assert!(matches!(verdict, crate::lifecycle::EnqueueVerdict::Queued(_)), "{verdict:?}");
+
+        let tasks = live.task.tasks.read().await;
+        let after = &tasks[&by_lifecycle];
+        assert_eq!(after.status, TaskStatus::Queue);
+        assert_eq!(after.position, 0);
+        assert_eq!((after.phase_progress, after.overall_progress), (0, 0));
+        assert_eq!(after.error_message, None);
+        assert_eq!(after.phase, crate::domain::TaskPhase::Idle);
+        assert_eq!(tasks[&board[0].id].position, 1);
+        assert_eq!(tasks[&board[1].id].position, 2);
+        let kinds = |task: &Task| {
+            task.activity.iter().map(|entry| format!("{:?}", entry.kind)).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            (after.status.clone(), after.position, after.phase.clone(), after.phase_progress, after.overall_progress),
+            (board_after.status.clone(), board_after.position, board_after.phase.clone(), board_after.phase_progress, board_after.overall_progress),
+        );
+        assert_eq!(after.error_message, board_after.error_message);
+        assert_eq!(after.human_review, board_after.human_review);
+        assert_eq!(kinds(after), kinds(&board_after), "both paths record the same activity");
+        assert_eq!(kinds(after).len(), 1, "one move is recorded: {:?}", kinds(after));
+        assert!(kinds(after)[0].contains("Moved"), "{:?}", kinds(after));
+    }
+}

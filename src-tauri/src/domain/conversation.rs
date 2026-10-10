@@ -150,6 +150,16 @@ pub enum TaskMutation {
         from: TaskStatus,
         to: TaskStatus,
     },
+    /// Put a Backlog Task in the queue. `from` is the status SlashIt observed
+    /// when the proposal was made (only `Backlog` is accepted); approval only
+    /// queues a Task that still holds it. It never starts anything: the
+    /// scheduler admits queued Tasks, and the executor creates or reattaches
+    /// the Task Checkout.
+    EnqueueTask {
+        target_task_id: Uuid,
+        target_task_title: String,
+        from: TaskStatus,
+    },
 }
 
 impl TaskMutation {
@@ -233,6 +243,24 @@ impl TaskMutation {
         })
     }
 
+    /// Propose queueing `target`, if it is a Backlog Task that can run.
+    pub fn enqueue_task(target: &Task) -> Result<Self, String> {
+        if target.status != TaskStatus::Backlog {
+            return Err(format!(
+                "The Coordinator can only queue a Backlog Task, and this one is in {:?}",
+                target.status
+            ));
+        }
+        if target.cleanup_in_flight || target.republish_pending_refusal().is_some() {
+            return Err("This Task cannot run until an unfinished checkout operation is resolved".into());
+        }
+        Ok(Self::EnqueueTask {
+            target_task_id: target.id,
+            target_task_title: target.title.chars().take(TASK_TITLE_LIMIT).collect(),
+            from: target.status.clone(),
+        })
+    }
+
     pub fn summary(&self) -> String {
         let text = match self {
             Self::CreateTask { title, description, priority, category, .. } => format!(
@@ -247,6 +275,10 @@ impl TaskMutation {
             Self::MoveTask { target_task_id, target_task_title, from, to } => format!(
                 "Move Task {target_task_id} ({target_task_title:?}) from {from:?} to {to:?}; \
                  no work is started"
+            ),
+            Self::EnqueueTask { target_task_id, target_task_title, from } => format!(
+                "Queue Task {target_task_id} ({target_task_title:?}) from {from:?}; SlashIt's \
+                 scheduler decides when it starts and the executor prepares its checkout"
             ),
         };
         text.chars().take(1500).collect()
@@ -271,6 +303,9 @@ pub fn coordinator_may_move(from: &TaskStatus, to: &TaskStatus) -> bool {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ProjectActionOutcome {
     Applied { task_id: Uuid, title: String },
+    /// Approval found the Task already in Queue. The record cannot say which
+    /// front door queued it, so this does not claim it was this approval.
+    AlreadyQueued { task_id: Uuid, title: String },
     Refused { reason: String },
 }
 
@@ -418,6 +453,12 @@ pub enum CoordinatorOutput {
         target_task_id: Uuid,
         to: TaskStatus,
     },
+    /// Proposal to put a Backlog Task in the queue. SlashIt's scheduler, not the
+    /// Coordinator, decides when it starts.
+    EnqueueTask {
+        text: String,
+        target_task_id: Uuid,
+    },
     /// Read-only: answered by SlashIt from current state, never a proposal.
     InspectTask {
         target_task_id: Uuid,
@@ -519,7 +560,7 @@ impl Conversation {
                 title.as_deref().map(validate_title).transpose()?;
                 description.as_deref().map(validate_description).transpose()?;
             }
-            CoordinatorOutput::MoveTask { text, .. } => Self::validate_text(text)?,
+            CoordinatorOutput::MoveTask { text, .. } | CoordinatorOutput::EnqueueTask { text, .. } => Self::validate_text(text)?,
             CoordinatorOutput::InspectTask { .. }
             | CoordinatorOutput::InspectTaskPullRequest { .. }
             | CoordinatorOutput::InspectProject {} => {}
@@ -563,7 +604,10 @@ impl Conversation {
                 EntryKind::RunFailed { role, message } => Some(serde_json::json!({"kind":"run_failed","role":role,"message":message.chars().take(1000).collect::<String>()})),
                 EntryKind::ProjectActionProposed { action_id } => self.project_action(*action_id).map(|action| serde_json::json!({"kind":"project_action_proposed","action_id":action_id,"summary":action.mutation.summary()})),
                 EntryKind::ProjectActionDecision { action_id, approved } => self.project_action(*action_id).map(|action| serde_json::json!({"kind":"project_action_decision","action_id":action_id,"approved":approved,"decision":decision_label(*approved),"scope":DECISION_SCOPE,"summary":action.mutation.summary()})),
-                EntryKind::ProjectActionApplied { action_id, task_id } => Some(serde_json::json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id})),
+                EntryKind::ProjectActionApplied { action_id, task_id } => Some(match self.project_action(*action_id).and_then(|action| action.outcome.as_ref()) {
+                    Some(ProjectActionOutcome::AlreadyQueued { .. }) => serde_json::json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id,"outcome":"found_already_queued"}),
+                    _ => serde_json::json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id}),
+                }),
                 EntryKind::ProjectActionRefused { action_id, reason } => Some(serde_json::json!({"kind":"project_action_refused","action_id":action_id,"reason":reason.chars().take(1000).collect::<String>()})),
             }).take(PROJECTION_MESSAGE_COUNT).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>();
         serde_json::json!({

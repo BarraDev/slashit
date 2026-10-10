@@ -25,10 +25,10 @@ pub enum ProjectActionStatus { Proposed, Approved, Applied, Rejected, Refused }
 pub enum FieldChange { Title { from: String, to: String }, Description { from: Option<String>, to: String }, Priority { from: String, to: String }, Category { from: String, to: String } }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TaskMutation { CreateTask { task_id: Uuid, title: String, description: Option<String>, priority: String, category: String }, EditTask { target_task_id: Uuid, target_task_title: String, changes: Vec<FieldChange> }, MoveTask { target_task_id: Uuid, target_task_title: String, from: String, to: String } }
+pub enum TaskMutation { CreateTask { task_id: Uuid, title: String, description: Option<String>, priority: String, category: String }, EditTask { target_task_id: Uuid, target_task_title: String, changes: Vec<FieldChange> }, MoveTask { target_task_id: Uuid, target_task_title: String, from: String, to: String }, EnqueueTask { target_task_id: Uuid, target_task_title: String, from: String } }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
-pub enum ProjectActionOutcome { Applied { task_id: Uuid, title: String }, Refused { reason: String } }
+pub enum ProjectActionOutcome { Applied { task_id: Uuid, title: String }, AlreadyQueued { task_id: Uuid, title: String }, Refused { reason: String } }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectAction { pub id: Uuid, pub explanation: String, pub mutation: TaskMutation, pub status: ProjectActionStatus, #[serde(default)] pub outcome: Option<ProjectActionOutcome>, pub created_at: String }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

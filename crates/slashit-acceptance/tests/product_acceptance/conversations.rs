@@ -2,6 +2,7 @@
 //! path and a separately approved Task Worker delegation.
 
 use super::*;
+use super::task_runs::{create_task, register_project};
 use slashit_acceptance::fake_agent::{self, FakeAgent};
 
 const PANEL: &str = "[data-testid=\"project-conversation\"]";
@@ -343,6 +344,106 @@ async fn coordinator_creates_and_edits_tasks_only_after_human_approval() {
         let after = serde_json::from_value::<Vec<Value>>(ui::invoke(restarted.driver(), "list_tasks", json!({"projectId":project_id})).await?)?;
         if after.len() != 1 { bail!("a replayed approval changed the Task count to {}", after.len()); }
         context.close_session(restarted, "task-mutations-restart", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    context.finish(outcome);
+}
+
+/// A Coordinator proposal to queue a Backlog Task, from rejection through
+/// approval and the scheduler's own promotion to a restart.
+///
+/// Automatic promotion is switched off while the approval is made, so the
+/// journey can hold the Task in Queue and show that approving only queues it:
+/// no checkout, no branch and no Worker exist until the scheduler is allowed
+/// to promote. The Task is then run to Human Review by the real executor.
+#[tokio::test(flavor = "multi_thread")]
+async fn coordinator_queues_a_backlog_task_only_after_human_approval() {
+    let context = TestContext::new("project_conversation_enqueue").expect("harness setup");
+    let root = context.state().path().to_path_buf();
+    let agent = FakeAgent::install(&root).expect("install fake Claude");
+    context.set_child_env("PATH", agent.path_value().to_os_string());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir().as_os_str().to_os_string());
+    let scripted = agent.marker_dir().join(".coordinator-output");
+    std::fs::create_dir_all(&scripted).expect("script directory");
+
+    let outcome = async {
+        super::start_on_the_legacy_auto_placement(&context.state().config_file())?;
+        let repository = GitFixture::create(&root.join("fixture-repo"))?;
+        let session = context.start_session("enqueue").await?;
+        let driver = session.driver();
+        let project_id = register_project(driver, &repository).await?;
+        let (task_id, title) = create_task(driver, &project_id, "Queue me", &[]).await?;
+        // Held in Queue until the journey chooses otherwise.
+        ui::invoke(driver, "update_queue_config", json!({ "autoPromote": false })).await?;
+        let proposal = "[data-testid=\"project-action-proposal\"]";
+        let history = "[data-testid=\"conversation-history\"]";
+        let task_record = || async {
+            let listed = ui::invoke(driver, "list_tasks", json!({ "projectId": project_id })).await?;
+            super::find_task(&listed, &task_id).context("the Task is no longer listed")
+        };
+        let worker_runs = || anyhow::Ok(agent.invocations()?.iter().filter(|run| {
+            run.prompt.as_deref().is_some_and(|prompt| !prompt.contains("\"current_message\""))
+        }).count());
+        let enqueue = format!(r#"{{"type":"enqueue_task","text":"This is ready to build.","target_task_id":"{task_id}"}}"#);
+        std::fs::write(scripted.join("1"), &enqueue)?;
+        std::fs::write(scripted.join("2"), &enqueue)?;
+        open_conversations(driver, &project_id).await?;
+
+        // 1. A rejected proposal changes nothing, and the Human saw what it would do.
+        submit_message(driver, "Please get this started.").await?;
+        await_text(driver, proposal, &title).await?;
+        let shown = ui::visible(driver, proposal).await?.text().await?;
+        let lowered = shown.to_lowercase();
+        if !lowered.contains("queue task") || !lowered.contains("backlog → queue") || !lowered.contains("only queues the task") { bail!("the exact enqueue is not visible: {shown}"); }
+        if task_record().await?["status"] != "backlog" { bail!("a proposal moved the Task before approval"); }
+        ui::visible(driver, "[data-testid=\"project-action-reject\"]").await?.click().await?;
+        await_text(driver, history, "You rejected the proposal.").await?;
+        let rejected = task_record().await?;
+        if rejected["status"] != "backlog" || !rejected["worktree_path"].is_null() { bail!("rejecting a proposal changed the Task: {rejected}"); }
+
+        // 2. Approval queues the Task and nothing more.
+        submit_message(driver, "Yes, please queue it.").await?;
+        await_text(driver, proposal, &title).await?;
+        ui::visible(driver, "[data-testid=\"project-action-approve\"]").await?.click().await?;
+        await_text(driver, history, &format!("Task queued: {title}")).await?;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(8) {
+            let queued = task_record().await?;
+            if queued["status"] != "queue" || !queued["worktree_path"].is_null() || !queued["branch_name"].is_null() || queued["phase"] != "idle" {
+                bail!("approving started more than the queue: {queued}");
+            }
+            if worker_runs()? != 0 { bail!("approving started a Worker before the scheduler promoted the Task"); }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // 3. The scheduler's normal promotion runs it, once.
+        ui::invoke(driver, "update_queue_config", json!({ "autoPromote": true })).await?;
+        let settled = super::await_status(driver, &project_id, &task_id, &["human_review", "error"]).await?;
+        if settled["status"] != "human_review" || settled["worktree_path"].is_null() || settled["branch_name"].is_null() {
+            bail!("the queued Task did not run through the executor to Human Review: {settled}");
+        }
+        if worker_runs()? != 1 { bail!("expected exactly one Task run, found {}", worker_runs()?); }
+        context.close_session(session, "enqueue", &Ok(())).await?;
+
+        // 4. After a restart the outcomes are durable and nothing is replayed.
+        let restarted = context.start_session("enqueue-restart").await?;
+        open_conversations(restarted.driver(), &project_id).await?;
+        let snapshot = ui::invoke(restarted.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
+        let statuses = snapshot["conversation"]["project_actions"].as_array().context("project actions missing")?.iter().map(|action| action["status"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>();
+        if statuses != ["rejected", "applied"] { bail!("project action outcomes did not survive restart: {statuses:?}"); }
+        let controls = super::page(restarted.driver(), "return document.querySelectorAll('[data-testid=project-action-approve], [data-testid=project-action-reject]').length;", vec![]).await?;
+        if controls != 0 { bail!("a finished action still offers controls after restart"); }
+        let applied = snapshot["conversation"]["project_actions"][1]["id"].as_str().context("applied action id")?;
+        ui::invoke(restarted.driver(), "act_on_project_conversation", json!({
+            "projectId":project_id, "conversationId":snapshot["conversation"]["id"], "revision":snapshot["conversation"]["revision"],
+            "actionId":applied, "action":{"action":"approve","request":Value::Null}
+        })).await?;
+        let listed = ui::invoke(restarted.driver(), "list_tasks", json!({ "projectId": project_id })).await?;
+        let after = super::find_task(&listed, &task_id).context("the Task is no longer listed")?;
+        if after["status"] != "human_review" { bail!("a replayed approval or the restart moved the Task: {after}"); }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        if worker_runs()? != 1 { bail!("a restart or replayed approval ran the Task again: {} runs", worker_runs()?); }
+        context.close_session(restarted, "enqueue-restart", &Ok(())).await?;
         Ok::<_, anyhow::Error>(())
     }.await;
     context.finish(outcome);
