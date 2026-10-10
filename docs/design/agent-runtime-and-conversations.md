@@ -220,3 +220,5 @@ is one continuous Conversation per Project with bounded, rebuilt provider
 context, not several concurrent Conversations; see
 [project-conversation-history.md](project-conversation-history.md). ACP remains
 an adapter boundary and is not part of the Project Conversation execution path.
+A possible extension architecture is recorded, as a direction only, in
+[extensibility-direction.md](extensibility-direction.md).
