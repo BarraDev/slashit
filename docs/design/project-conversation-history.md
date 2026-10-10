@@ -88,8 +88,10 @@ ordinary Human turn; the Worker-result continuation reuses its
    requests and the Project. None reads older Conversation entries, so anything
    outside the window is unreachable.
 4. **Silent per-entry truncation, no total budget.** Text is cut per entry
-   (4,000 characters for messages, 3,000 for requests and Worker results, 1,000
-   for failures) with no marker. There is no overall size budget, only the
+   (4,000 characters for messages, 3,000 for requests and Worker results, 2,000
+   for action explanations, 1,000 for failures and Task-action refusal reasons,
+   500 for action target titles, and 1,500 for Task-action summaries) with no
+   marker. There is no overall size budget, only the
    product of the entry count and the per-entry caps. The prompt travels over
    stdin, so the operating system argument limit is not the constraint; the
    provider's context window and cost are.
