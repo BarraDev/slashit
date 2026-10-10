@@ -124,12 +124,7 @@ fn should_publish_snapshot(current: Option<(Uuid, u64)>, incoming: (Uuid, u64), 
 }
 
 #[component]
-pub fn ProjectConversation(
-    project_id: String,
-    /// Called after an approval finishes, so the board re-reads Tasks the
-    /// Coordinator may have just created or edited instead of waiting for its poll.
-    #[prop(optional)] on_tasks_changed: Option<Callback<()>>,
-) -> impl IntoView {
+pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let (snapshot, set_snapshot) = signal(None::<ConversationSnapshot>);
     let (draft, set_draft) = signal(String::new());
     let (edits, set_edits) = signal(HashMap::<String, String>::new());
@@ -172,7 +167,14 @@ pub fn ProjectConversation(
         let request = initial_begin_request.run(());
         let publish = initial_publish.clone();
         spawn_local(async move {
-            match conversation_service::open_project_conversation(id).await {
+            // Opening takes the Project lock, which a live run holds, so a page
+            // remounted mid-run reads first and only opens a Conversation that
+            // has never been opened.
+            let loaded = match conversation_service::get_project_conversation(id.clone()).await {
+                Ok(value) => Ok(value),
+                Err(_) => conversation_service::open_project_conversation(id).await,
+            };
+            match loaded {
                 Ok(value) => publish.run((request, value)),
                 Err(error) => set_error.set(Some(error)),
             }
@@ -226,7 +228,7 @@ pub fn ProjectConversation(
         let refresh_publish = approve_publish.clone();
         spawn_local(async move {
             match conversation_service::act_on_project_conversation(id, current.conversation.id.to_string(), current.conversation.revision, action_id, ConversationHumanAction::Approve { request }).await {
-                Ok(value) => { publish.run((request_id, value)); if let Some(refresh_board) = on_tasks_changed { refresh_board.run(()); } }, Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
+                Ok(value) => publish.run((request_id, value)), Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
             }
             set_busy.set(false);
         });
@@ -275,14 +277,14 @@ pub fn ProjectConversation(
         });
     });
     view! {
-            <section data-testid="project-conversation" class="mb-6 rounded-xl border border-white/10 bg-zinc-900/70 p-4">
-                <header class="mb-3 flex items-center justify-between">
+            <section data-testid="project-conversation" class="flex h-full min-h-0 flex-col rounded-xl border border-white/10 bg-zinc-900/70 p-4">
+                <header class="mb-3 flex shrink-0 items-center justify-between">
                     <div><h2 class="text-lg font-semibold text-white">"Project Conversation"</h2><p class="text-xs text-white/50">"Talk with the Project Coordinator. Task work always asks for approval."</p></div>
                     <Show when=move || snapshot.get().is_some_and(|s| s.coordinator_live || s.worker_live)>
                         <button data-testid="conversation-stop" class="rounded-md border border-red-400/40 px-3 py-1 text-sm text-red-200" on:click=move |_| { let id = stop_id.get_value(); spawn_local(async move { if let Err(error) = conversation_service::stop_project_conversation(id).await { set_error.set(Some(error)); } }); }>"Stop run"</button>
                     </Show>
                 </header>
-                <div class="mb-3 max-h-72 space-y-2 overflow-y-auto" data-testid="conversation-history">
+                <div class="mb-3 min-h-0 flex-1 space-y-2 overflow-y-auto" data-testid="conversation-history">
                     {move || snapshot.get().map(|value| {
                         let actions = value.conversation.actions;
                         let project_actions = value.conversation.project_actions;
@@ -301,7 +303,7 @@ pub fn ProjectConversation(
                         }).collect_view()
                     })}
                 </div>
-                <div class="mb-3 space-y-2">
+                <div class="mb-3 max-h-[40%] shrink-0 space-y-2 overflow-y-auto">
                     <For
                         each=move || snapshot.get().map(|value| value.conversation.actions.into_iter().filter(|action| matches!(action.status, ConversationActionStatus::Proposed | ConversationActionStatus::Approved)).collect::<Vec<_>>()).unwrap_or_default()
                         key=|action| action.id
@@ -329,7 +331,7 @@ pub fn ProjectConversation(
                         }
                     />
                 </div>
-                <div class="mb-3 space-y-2" data-testid="project-actions">
+                <div class="mb-3 max-h-[40%] shrink-0 space-y-2 overflow-y-auto" data-testid="project-actions">
                     <For
                         each=move || snapshot.get().map(|value| pending_project_actions(&value)).unwrap_or_default()
                         key=|action| (action.id, action.status)
@@ -359,7 +361,7 @@ pub fn ProjectConversation(
                 </div>
                 {move || snapshot.get().map(|value| {
                     let status = if value.worker_live { "Worker is running in the Task Checkout" } else if value.coordinator_live { "Coordinator is responding" } else { "Conversation is ready" };
-                    view! { <div data-testid="conversation-run-state" class="mb-2 text-xs text-white/50">{status}</div> }
+                    view! { <div data-testid="conversation-run-state" class="mb-2 shrink-0 text-xs text-white/50">{status}</div> }
                 })}
                 {move || {
                     snapshot.get().and_then(|value| {
@@ -377,9 +379,9 @@ pub fn ProjectConversation(
                     })
                 }}
                 {move || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value)).then(|| view! {
-                    <p data-testid="conversation-awaiting-mediation" class="mb-2 text-xs text-amber-100/80">"A saved Worker result must be reviewed before you send another message."</p>
+                    <p data-testid="conversation-awaiting-mediation" class="mb-2 shrink-0 text-xs text-amber-100/80">"A saved Worker result must be reviewed before you send another message."</p>
                 })}
-                <form class="flex items-end gap-2" on:submit=move |event: web_sys::SubmitEvent| { event.prevent_default(); on_send(); }>
+                <form class="flex shrink-0 items-end gap-2" on:submit=move |event: web_sys::SubmitEvent| { event.prevent_default(); on_send(); }>
                     <textarea data-testid="conversation-message-input" class="min-h-16 flex-1 rounded-lg border border-white/10 bg-black/30 p-3 text-sm text-white" placeholder="Ask about this Project…" prop:value=draft disabled=move || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value)) on:input=move |event| set_draft.set(event_target_value(&event))></textarea>
                     <button data-testid="conversation-send" type="submit" class="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium" disabled=move || busy.get() || draft.get().trim().is_empty() || snapshot.get().is_some_and(|value| has_unmediated_worker_result(&value))>"Send"</button>
                 </form>

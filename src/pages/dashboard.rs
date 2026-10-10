@@ -3,7 +3,7 @@ use leptos::task::spawn_local;
 use leptos::callback::Callback;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use crate::components::{Kanban, bulk_actions::BulkActions, toast, project_conversation::ProjectConversation};
+use crate::components::{Kanban, bulk_actions::BulkActions, toast};
 use crate::components::task_live::ResponseOrder;
 use crate::services::list_tasks;
 use crate::models::Task;
@@ -149,7 +149,6 @@ pub fn Dashboard(project_id: String) -> impl IntoView {
 
     view! {
         <div class="h-full flex flex-col">
-            <ProjectConversation project_id=project_id.clone() on_tasks_changed=refresh_tasks />
             {move || {
                 let project_id_kanban = project_id_for_kanban.clone();
                 let project_id_bulk = project_id_for_bulk.clone();

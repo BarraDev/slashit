@@ -181,6 +181,18 @@ pub fn Sidebar(
                 if collapsed.get() { "p-1.5" } else { "p-3" }
             )>
                 <SidebarNavItem
+                    page="conversations".to_string()
+                    current_page=current_page
+                    on_navigate=on_navigate
+                    label="Conversations".to_string()
+                    shortcut="".to_string()
+                    collapsed=collapsed
+                >
+                    <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h8M8 14h5m-9 6l2.3-3.4A8 8 0 1112 20H4z" />
+                    </svg>
+                </SidebarNavItem>
+                <SidebarNavItem
                     page="dashboard".to_string()
                     current_page=current_page
                     on_navigate=on_navigate

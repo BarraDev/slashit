@@ -138,6 +138,7 @@ pub fn App() -> impl IntoView {
                     let current_page = current_page;
                     let selected_project = selected_project;
                     move || match current_page.get().as_str() {
+                        "conversations" => view! { <Conversations project_id=selected_project.get() /> }.into_any(),
                         "dashboard" => view! { <Dashboard project_id=selected_project.get() /> }.into_any(),
                         "agent" => view! { <Agent project_id=selected_project.get() /> }.into_any(),
                         "roadmap" => view! { <Roadmap project_id=selected_project.get() /> }.into_any(),
