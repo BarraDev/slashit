@@ -773,4 +773,24 @@ mod queue_settings {
             assert!(!config.auto_promote, "the other fields are kept");
         }
     }
+
+    #[tokio::test]
+    async fn an_invalid_limit_is_repaired_on_the_recovery_path_without_re_enabling_promotion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        // Another section is unreadable, so the strict load fails and the
+        // recovery path supplies `[queue]`.
+        std::fs::write(
+            paths.config_file(),
+            "[worktree]\nplacement = \"a-variant-this-build-lacks\"\n\n[queue]\nparallel_task_limit = 0\nauto_promote = false\nfifo_ordering = false\n",
+        )
+        .unwrap();
+
+        let config = running(&launch(&paths).await).await;
+
+        assert_eq!(config.parallel_task_limit, 1);
+        assert!(!config.auto_promote, "repairing the limit must not re-enable promotion");
+        assert!(!config.fifo_ordering);
+    }
 }

@@ -5959,6 +5959,52 @@ mod tests {
         assert!(executor.running_handles.read().await.is_empty());
     }
 
+    /// Whatever a hand-edited `config.toml` says, the executor's Admission
+    /// gate is built from a limit inside the supported range.
+    #[tokio::test]
+    async fn admission_only_receives_validated_limits_from_a_saved_config() {
+        for (written, expected) in [(0u32, 1usize), (99, 10), (4, 4)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+                tmp.path().join("config"),
+                tmp.path().join("data"),
+                tmp.path().join("cache"),
+                tmp.path().join("runtime"),
+            ));
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::write(
+                paths.config_file(),
+                format!("[queue]\nparallel_task_limit = {written}\nauto_promote = false\n"),
+            )
+            .unwrap();
+            let (state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
+            let executor = TaskExecutor::new(TaskExecutorConfig {
+                tasks: state.task.tasks.clone(),
+                queue_manager: state.queue.manager.clone(),
+                executions: state.agent.executions.clone(),
+                logs: state.agent.logs.clone(),
+                projects: state.project.projects.clone(),
+                repositories: state.repository.repositories.clone(),
+                workspace_registry: state.workspace.registry.clone(),
+                storage: state.storage.clone(),
+                worktree_manager: state.worktree_manager.clone(),
+                events: crate::events::null_sink(),
+                lifecycle: state.task_lifecycle_locks.clone(),
+                start_guard: state.start_guard.clone(),
+                pr_statuses: state.pr_statuses.clone(),
+            });
+
+            executor.reconcile_admission().await;
+
+            let mut held = Vec::new();
+            while let Some(permit) = executor.admission.try_acquire() {
+                held.push(permit);
+            }
+            assert_eq!(held.len(), expected, "written limit {written}");
+            assert!(!state.queue.manager.read().await.config().auto_promote);
+        }
+    }
+
     /// The same Task, with auto_promote on, is promoted: without this the
     /// test above would pass for a Task nothing would ever promote.
     #[tokio::test]
