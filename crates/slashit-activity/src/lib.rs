@@ -153,6 +153,9 @@ pub enum Kind {
     },
     PrMerged { number: u32 },
     PrClosed { number: u32 },
+    /// A person completed approved changes locally: the task is Done, its
+    /// Task Checkout is gone, and its branch was neither merged nor pushed.
+    CompletedLocally,
 }
 
 fn one() -> u32 {
@@ -183,6 +186,7 @@ impl Kind {
             Self::PrLinked { url, .. } => Identity::PrLinked(url),
             Self::PrMerged { number } => Identity::PrMerged(*number),
             Self::PrClosed { number } => Identity::PrClosed(*number),
+            Self::CompletedLocally => Identity::CompletedLocally,
             Self::Moved { .. }
             | Self::ToolUsed { .. }
             | Self::ToolsOmitted { .. }
@@ -210,6 +214,7 @@ enum Identity<'a> {
     PrLinked(&'a str),
     PrMerged(u32),
     PrClosed(u32),
+    CompletedLocally,
 }
 
 /// Append `kind` at `at`, unless it is a once-only milestone already
@@ -315,6 +320,12 @@ pub fn one_line(text: &str, max: usize) -> String {
     let mut cut: String = joined.chars().take(max.saturating_sub(1)).collect();
     cut.push('…');
     cut
+}
+
+/// Whether a person completed the task locally: approved changes finished
+/// without a pull request, and never merged by SlashIt.
+pub fn completed_locally(entries: &[Entry]) -> bool {
+    entries.iter().any(|e| e.kind == Kind::CompletedLocally)
 }
 
 /// The number the next coding run gets: one past any run recorded, so a
@@ -480,7 +491,8 @@ impl Item<'_> {
                 | Kind::AiReviewApproved { .. }
                 | Kind::AiFixApplied { .. }
                 | Kind::PrLinked { .. }
-                | Kind::PrMerged { .. } => Tone::Good,
+                | Kind::PrMerged { .. }
+                | Kind::CompletedLocally => Tone::Good,
                 Kind::ReadyForReview { .. } => Tone::Attention,
                 Kind::Moved { to: Column::Done, .. } => Tone::Good,
                 _ => Tone::Neutral,
@@ -533,6 +545,7 @@ impl Item<'_> {
                 Kind::PrLinked { .. } => "pr_linked",
                 Kind::PrMerged { .. } => "pr_merged",
                 Kind::PrClosed { .. } => "pr_closed",
+                Kind::CompletedLocally => "completed_locally",
             },
         }
     }
@@ -578,6 +591,7 @@ fn kind_title(kind: &Kind) -> String {
         Kind::PrLinked { .. } => "Pull request linked".to_string(),
         Kind::PrMerged { .. } => "Pull request merged".to_string(),
         Kind::PrClosed { .. } => "Pull request closed without merge".to_string(),
+        Kind::CompletedLocally => "Completed locally, not merged".to_string(),
     }
 }
 

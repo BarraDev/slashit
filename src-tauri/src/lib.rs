@@ -391,6 +391,7 @@ pub fn run() {
             get_qa_history,
             check_recurring_issues,
             approve_task,
+            complete_task_locally,
             create_approved_task_pr,
             request_task_changes,
             get_attention_summary,

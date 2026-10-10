@@ -57,6 +57,13 @@ release will contain.
   unambiguous (Git's `HEAD` on a branch that agrees with `origin`, or the
   bookmark Jujutsu's `trunk()` names), otherwise chosen in the new
   Settings > Repository tab. Checking out another branch does not move it.
+- **Complete approved changes locally.** In a project that cannot take a pull
+  request, approved changes in Human Review offer Complete locally. After it
+  says what it does, the task becomes Done and its Task Checkout is removed; its
+  branch is kept, never merged or pushed, and the task records that it was
+  completed locally. A checkout Git will not remove keeps the task in Human
+  Review, and asking again once it is dealt with finishes the job. A project
+  that can open a pull request is still delivered with Create PR.
 - **Explicit repository setup.** Settings > Repository shows whether a project
   can run tasks and why not, and offers Detect default branch (`git remote
   set-head origin --auto`, which reads `origin` and writes only

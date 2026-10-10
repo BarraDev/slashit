@@ -116,6 +116,20 @@ pub async fn create_approved_task_pr(
     retry_delivery(&state, task_id).await
 }
 
+/// Finish approved changes without a pull request, for a project SlashIt
+/// cannot open one for.
+///
+/// Nothing is merged, pushed or opened: the Task Checkout is removed and the
+/// task becomes Done, and its branch keeps the work.
+#[tauri::command]
+pub async fn complete_task_locally(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<Task, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    complete_locally(&state, task_id).await
+}
+
 /// Record a change request for a task in Human Review and queue it to run
 /// again with that feedback.
 ///
@@ -159,6 +173,83 @@ pub(crate) async fn retry_delivery(
     }
     let pr = deliver(state, task_id).await;
     Ok(ApprovalOutcome { task: current(state, task_id).await.unwrap_or(task), pr: Some(pr) })
+}
+
+/// Complete an approved task locally: the one lifecycle terminalization, asked
+/// for by a person, with the Human Review conditions checked under the task's
+/// lease.
+///
+/// Every refusal leaves the task exactly as it was. The checkout is removed
+/// first and `Done` is committed, with the activity entry that says the work
+/// was completed locally, in the same write that clears it, so no state
+/// exists in which the task is Done while its checkout remains, or the entry
+/// is recorded while the checkout was kept. Asked again once it is done, it
+/// answers with the task and does nothing. A crash during the removal leaves
+/// the task in Human Review with `cleanup_in_flight` set; asking again is the
+/// explicit way out that `Origin::User` allows, and it removes what is left
+/// and commits once.
+///
+/// The branch is never touched, and nothing here pushes or opens a pull
+/// request. A project that can take one is refused: that work is delivered.
+pub(crate) async fn complete_locally(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<Task, String> {
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+
+    let task = current(state, task_id).await.ok_or("Task not found")?;
+    if task.completed_locally() {
+        return Ok(task);
+    }
+    check_reviewable(&task, "completed locally")?;
+    if !task.human_review.is_approved() {
+        return Err(
+            "Approve the changes before completing them locally; this task has no approval."
+                .to_string(),
+        );
+    }
+    let has_pr = task.pr_url.is_some() || task.external_refs.iter().any(|r| r.is_pr());
+    if has_pr || state.task.deliveries.contains(task_id) {
+        return Err(
+            "This task has a pull request, or one is being opened, so it is delivered through \
+             that pull request, not completed locally."
+                .to_string(),
+        );
+    }
+    match pr_availability(state, task_id).await {
+        Ok(PrAvailability::Unavailable { .. }) => {}
+        Ok(PrAvailability::Available) => {
+            return Err(
+                "SlashIt can open a pull request for this project, so these changes are \
+                 delivered with Create PR, not completed locally."
+                    .to_string(),
+            )
+        }
+        Err(reason) => {
+            return Err(format!(
+                "SlashIt could not tell whether this project can take a pull request, so the \
+                 task was not completed: {reason}"
+            ))
+        }
+    }
+
+    let record = |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(t) = staged.get_mut(&task_id) {
+            t.overall_progress = 100;
+            t.phase = crate::domain::task::TaskPhase::Complete;
+            t.record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+        }
+    };
+    let mut request = crate::lifecycle::TerminalizeRequest::new(TaskStatus::Done);
+    request.on_success = Some(&record);
+    crate::lifecycle::terminalize_leased(
+        crate::commands::task::terminalize_ctx(state),
+        task_id,
+        crate::lifecycle::Origin::User,
+        request,
+    )
+    .await
+    .map_err(|refusal| refusal.to_string())
 }
 
 async fn record_approval(state: &crate::AppState, task_id: Uuid) -> Result<Task, String> {
@@ -633,6 +724,369 @@ mod tests {
         );
         assert_eq!(task.human_review.pending_feedback(), vec!["second round"]);
         assert_eq!(task.description.as_deref(), Some(DESCRIPTION));
+    }
+
+    // ---- Completing approved changes locally ----
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A project whose repository has no remote, a Task Checkout of its own
+    /// with committed work, and a task in Human Review that owns both.
+    struct Local {
+        _tmp: tempfile::TempDir,
+        state: crate::AppState,
+        repo: std::path::PathBuf,
+        project_id: Uuid,
+        task_id: Uuid,
+        branch: String,
+        worktree: std::path::PathBuf,
+    }
+
+    async fn local_project() -> Local {
+        let (tmp, state) = test_state().await;
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+
+        let repository_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        state.repository.repositories.write().await.insert(
+            repository_id,
+            crate::domain::Repository {
+                id: repository_id,
+                local_path: repo.to_str().unwrap().to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        let base = crate::domain::project::ProjectBase::LocalBranch { branch: "main".to_string() };
+        state.project.projects.write().await.insert(
+            project_id,
+            crate::domain::Project {
+                id: project_id,
+                name: "no remote".to_string(),
+                repository_id: Some(repository_id),
+                scope: crate::domain::project::ProjectScope::Standalone,
+                state_location: crate::config::paths::StateLocation::External,
+                base: Some(base.clone()),
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                agent_config: crate::domain::AgentConfig {
+                    agent_type: crate::domain::AgentType::ClaudeCode,
+                    command: "claude".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    model: None,
+                    api_key: None,
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        );
+
+        let branch = "task-local-done".to_string();
+        let (info, _) = state
+            .worktree_manager
+            .create_or_adopt(repo.to_str().unwrap(), &branch, Some(&base))
+            .await
+            .expect("a Task Checkout");
+        let worktree = std::path::PathBuf::from(&info.path);
+        git(&worktree, &["config", "user.email", "test@example.com"]);
+        git(&worktree, &["config", "user.name", "Test"]);
+        std::fs::write(worktree.join("work.txt"), "work\n").unwrap();
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-q", "-m", "task work"]);
+
+        let mut task = create_test_task_full("finish locally", project_id, TaskStatus::HumanReview, 0);
+        task.branch_name = Some(branch.clone());
+        task.worktree_path = Some(info.path.clone());
+        task.overall_progress = 90;
+        task.human_review.record_arrival();
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed the board");
+        Local { _tmp: tmp, state, repo, project_id, task_id, branch, worktree }
+    }
+
+    impl Local {
+        fn on_disk(&self) -> Task {
+            on_disk(&self.state, self.project_id, self.task_id)
+        }
+        async fn approve(&self) {
+            approve(&self.state, self.task_id, false).await.expect("approved");
+        }
+        async fn complete(&self) -> Result<Task, String> {
+            complete_locally(&self.state, self.task_id).await
+        }
+        fn branch_exists(&self) -> bool {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--verify", "-q", &format!("refs/heads/{}", self.branch)])
+                .current_dir(&self.repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        }
+        /// Everything about the task and its checkout that a refusal must
+        /// leave exactly as it found it.
+        async fn untouched(&self) {
+            let task = current(&self.state, self.task_id).await.unwrap();
+            assert_eq!(task.status, TaskStatus::HumanReview);
+            assert!(!task.completed_locally());
+            assert_eq!(task.overall_progress, 90, "a refusal does not touch progress");
+            assert!(task.worktree_path.is_some());
+            assert!(self.worktree.join("work.txt").exists(), "the checkout is still there");
+            assert!(self.branch_exists());
+            let disk = self.on_disk();
+            assert_eq!(disk.status, TaskStatus::HumanReview);
+            assert_eq!(disk.overall_progress, 90);
+            assert!(!disk.completed_locally());
+        }
+    }
+
+    fn completions(task: &Task) -> usize {
+        task.activity.iter().filter(|e| e.kind == slashit_activity::Kind::CompletedLocally).count()
+    }
+
+    #[tokio::test]
+    async fn an_approved_task_completes_locally_and_keeps_its_branch_and_history() {
+        let local = local_project().await;
+        local.approve().await;
+        let main_before = git(&local.repo, &["rev-parse", "main"]);
+        let branch_before = git(&local.repo, &["rev-parse", &local.branch]);
+
+        let done = local.complete().await.expect("completed");
+
+        assert_eq!(done.status, TaskStatus::Done);
+        assert!(done.completed_locally());
+        assert_eq!(done.overall_progress, 100, "a finished task shows it, as a merged one does");
+        assert_eq!(done.phase, crate::domain::task::TaskPhase::Complete);
+        assert!(done.worktree_path.is_none(), "the checkout is released");
+        assert!(!local.worktree.exists(), "and removed");
+        assert!(!done.cleanup_in_flight);
+        assert!(done.pr_url.is_none() && done.external_refs.iter().all(|r| !r.is_pr()));
+        assert_eq!(done.branch_name.as_deref(), Some(local.branch.as_str()));
+        assert!(local.branch_exists(), "the branch survives");
+        assert_eq!(git(&local.repo, &["rev-parse", &local.branch]), branch_before, "with its commits");
+        assert_eq!(git(&local.repo, &["rev-parse", "main"]), main_before, "and nothing reached main");
+        assert!(done.human_review.is_approved(), "the approval stays on the record");
+        assert_eq!(done.human_review.entries.len(), 1);
+        assert_eq!(done.human_review.arrivals, 1);
+
+        let timeline = task_timeline(&done);
+        assert_eq!(
+            timeline[timeline.len() - 3..],
+            ["You approved the changes", "Moved to Done", "Completed locally, not merged"]
+        );
+
+        // A restart reads the same thing.
+        let reloaded = local.on_disk();
+        assert!(reloaded.completed_locally());
+        assert_eq!(reloaded.overall_progress, 100);
+        assert_eq!(reloaded.phase, crate::domain::task::TaskPhase::Complete);
+        assert_eq!(reloaded.status, TaskStatus::Done);
+        assert!(reloaded.worktree_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn changes_nobody_approved_cannot_be_completed_locally() {
+        let local = local_project().await;
+        let refused = local.complete().await.expect_err("undecided");
+        assert!(refused.contains("Approve the changes"), "{refused}");
+        local.untouched().await;
+
+        // Changes requested then back in review: still no approval.
+        request_changes(&local.state, local.task_id, "more").await.expect("sent back");
+        {
+            let mut tasks = local.state.task.tasks.write().await;
+            let t = tasks.get_mut(&local.task_id).unwrap();
+            t.status = TaskStatus::HumanReview;
+            t.human_review.record_arrival();
+        }
+        let refused = local.complete().await.expect_err("a new review, undecided");
+        assert!(refused.contains("Approve the changes"), "{refused}");
+        assert!(local.worktree.join("work.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_task_outside_human_review_cannot_be_completed_locally() {
+        let local = local_project().await;
+        local.approve().await;
+        local.state.task.tasks.write().await.get_mut(&local.task_id).unwrap().status = TaskStatus::InProgress;
+        let refused = local.complete().await.expect_err("working");
+        assert!(refused.contains("Human Review"), "{refused}");
+        assert!(local.worktree.join("work.txt").exists());
+        assert!(!current(&local.state, local.task_id).await.unwrap().completed_locally());
+    }
+
+    #[tokio::test]
+    async fn a_task_an_agent_still_owns_is_refused_and_left_alone() {
+        let local = local_project().await;
+        local.approve().await;
+        let executor = crate::test_helpers::attach_test_executor(&local.state);
+        executor.register_fake_reviewing_owner_for_test(local.task_id).await;
+
+        let refused = local.complete().await.expect_err("owned");
+        assert!(refused.contains("still running"), "{refused}");
+        local.untouched().await;
+        assert_eq!(executor.running_task_count().await, 1, "refusing does not stop or end anything");
+        assert!(
+            crate::lifecycle::ExecutionOwnership::is_task_running(executor.as_ref(), local.task_id).await,
+            "the owner is still there"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_being_opened_blocks_completing_locally() {
+        let local = local_project().await;
+        local.approve().await;
+        let _mark = local.state.task.deliveries.start(local.task_id);
+        let refused = local.complete().await.expect_err("being delivered");
+        assert!(refused.contains("being opened"), "{refused}");
+        local.untouched().await;
+    }
+
+    #[tokio::test]
+    async fn a_checkout_git_will_not_remove_keeps_the_task_in_review_and_completes_on_retry() {
+        let local = local_project().await;
+        local.approve().await;
+        std::fs::write(local.worktree.join("unsaved.txt"), "not committed\n").unwrap();
+
+        let refused = local.complete().await.expect_err("uncommitted work");
+        assert!(refused.contains("was kept"), "{refused}");
+        local.untouched().await;
+        let task = current(&local.state, local.task_id).await.unwrap();
+        assert!(task.error_message.as_deref().is_some_and(|m| m.contains("was kept")));
+        assert!(!task.cleanup_in_flight, "the attempt is over");
+        assert!(local.worktree.join("unsaved.txt").exists(), "nothing the person wrote is gone");
+        assert_eq!(completions(&task), 0, "and no completion was claimed");
+
+        // Dealt with, asked again.
+        git(&local.worktree, &["add", "."]);
+        git(&local.worktree, &["commit", "-q", "-m", "keep it"]);
+        let done = local.complete().await.expect("completed on the second request");
+        assert_eq!(done.status, TaskStatus::Done);
+        assert_eq!(completions(&done), 1);
+        assert!(done.error_message.is_none(), "the earlier refusal is cleared");
+        assert!(!local.worktree.exists());
+        assert!(local.branch_exists());
+    }
+
+    #[tokio::test]
+    async fn asking_again_after_completion_changes_nothing() {
+        let local = local_project().await;
+        local.approve().await;
+        let first = local.complete().await.expect("completed");
+        let on_disk_first = serde_json::to_value(local.on_disk()).unwrap();
+
+        let second = local.complete().await.expect("idempotent");
+        let third = local.complete().await.expect("idempotent");
+
+        for again in [&second, &third] {
+            assert_eq!(again.status, TaskStatus::Done);
+            assert_eq!(completions(again), 1);
+            assert_eq!(again.activity, first.activity, "no second entry, no second move");
+            assert_eq!(again.updated_at, first.updated_at, "nothing was written");
+        }
+        assert_eq!(serde_json::to_value(local.on_disk()).unwrap(), on_disk_first);
+    }
+
+    #[tokio::test]
+    async fn two_requests_at_once_complete_the_task_once() {
+        let local = local_project().await;
+        local.approve().await;
+        let (a, b) = tokio::join!(local.complete(), local.complete());
+        let (a, b) = (a.expect("one completes"), b.expect("the other sees it done"));
+        assert_eq!(a.status, TaskStatus::Done);
+        assert_eq!(b.status, TaskStatus::Done);
+        let task = current(&local.state, local.task_id).await.unwrap();
+        assert_eq!(completions(&task), 1);
+        assert_eq!(
+            task.activity.iter().filter(|e| matches!(e.kind, slashit_activity::Kind::Moved { .. })).count(),
+            1
+        );
+    }
+
+    /// A process that died while removing the checkout leaves the task in
+    /// Human Review with `cleanup_in_flight` set. Asking again finishes the
+    /// job once, whether the removal got as far as the directory or not.
+    #[tokio::test]
+    async fn a_completion_interrupted_by_a_crash_is_finished_by_asking_again() {
+        for removed_before_crash in [false, true] {
+            let local = local_project().await;
+            local.approve().await;
+            {
+                let mut tasks = local.state.task.tasks.write().await;
+                let t = tasks.get_mut(&local.task_id).unwrap();
+                t.cleanup_in_flight = true;
+                let snapshot = t.clone();
+                local.state.storage.save_project_tasks(local.project_id, &[snapshot]).unwrap();
+            }
+            if removed_before_crash {
+                git(&local.repo, &["worktree", "remove", "--force", local.worktree.to_str().unwrap()]);
+            }
+            // What a restart sees: nothing is Done, nothing is lost.
+            let after_crash = local.on_disk();
+            assert_eq!(after_crash.status, TaskStatus::HumanReview);
+            assert_eq!(completions(&after_crash), 0);
+            assert!(after_crash.human_review.is_approved());
+
+            let done = local.complete().await.expect("finished");
+            assert_eq!(done.status, TaskStatus::Done, "removed_before_crash={removed_before_crash}");
+            assert!(!done.cleanup_in_flight);
+            assert!(done.worktree_path.is_none());
+            assert_eq!(completions(&done), 1);
+            assert!(local.branch_exists());
+            assert_eq!(completions(&local.on_disk()), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_project_that_can_open_a_pull_request_is_not_completed_locally() {
+        let local = local_project().await;
+        git(&local.repo, &["remote", "add", "origin", "https://github.com/BarraDev/example.git"]);
+        local.approve().await;
+
+        let refused = local.complete().await.expect_err("delivered by pull request");
+        assert!(refused.contains("Create PR"), "{refused}");
+        local.untouched().await;
+
+        // Delivery still sees the project as it did.
+        assert_eq!(pr_availability(&local.state, local.task_id).await, Ok(PrAvailability::Available));
+    }
+
+    #[tokio::test]
+    async fn a_task_with_a_pull_request_is_not_completed_locally() {
+        let local = local_project().await;
+        local.approve().await;
+        local.state.task.tasks.write().await.get_mut(&local.task_id).unwrap().pr_url =
+            Some("https://github.com/BarraDev/example/pull/1".to_string());
+        let refused = local.complete().await.expect_err("has a pull request");
+        assert!(refused.contains("pull request"), "{refused}");
+        assert!(local.worktree.join("work.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_remote_that_is_not_github_still_completes_locally() {
+        let local = local_project().await;
+        git(&local.repo, &["remote", "add", "origin", "https://gitlab.example.com/o/r.git"]);
+        local.approve().await;
+        let done = local.complete().await.expect("completed");
+        assert!(done.completed_locally());
     }
 
     /// An attempt marks its task until it ends, and one attempt ending never

@@ -305,6 +305,7 @@ fn a_rows_kind_name_is_its_stored_type() {
         Kind::PrLinked { url: String::new(), number: None },
         Kind::PrMerged { number: 1 },
         Kind::PrClosed { number: 1 },
+        Kind::CompletedLocally,
     ];
     let entries: Vec<Entry> =
         kinds.iter().enumerate().map(|(i, kind)| Entry { seq: i as u32 + 1, at: t(1), kind: kind.clone() }).collect();
@@ -442,4 +443,22 @@ fn appended_tool_rows_and_linked_urls_are_sanitized_too() {
 fn the_next_run_counts_past_a_start_dropped_from_a_full_timeline() {
     let entries = vec![Entry { seq: 1, at: t(1), kind: Kind::RunFailed { run: Some(7), reason: "x".into() } }];
     assert_eq!(next_run(&entries), 8);
+}
+
+#[test]
+fn a_local_completion_is_recorded_once_and_read_back() {
+    let mut entries = Vec::new();
+    assert!(!completed_locally(&entries));
+    assert!(record(&mut entries, t(1), Kind::CompletedLocally));
+    assert!(completed_locally(&entries));
+
+    // Asked again, it is the same milestone.
+    assert!(!record(&mut entries, t(2), Kind::CompletedLocally));
+    assert_eq!(entries.len(), 1);
+
+    let items = timeline(t(0), [], &entries);
+    let last = items.last().expect("a row");
+    assert_eq!(last.title(), "Completed locally, not merged");
+    assert_eq!(last.kind_name(), "completed_locally");
+    assert_eq!(last.tone(), Tone::Good);
 }

@@ -30,6 +30,13 @@ const CLOSE_CONSEQUENCES: &str = "[data-testid=\"close-without-merge-consequence
 const CLOSE_CANCEL: &str = "[data-testid=\"close-without-merge-cancel\"]";
 const CLOSE_CONFIRM: &str = "[data-testid=\"close-without-merge-confirm\"]";
 const CLOSE_ERROR: &str = "[data-testid=\"close-without-merge-error\"]";
+const HR_COMPLETE_LOCALLY: &str = "[data-testid=\"human-review-complete-locally\"]";
+const HR_COMPLETE_CONFIRM_BOX: &str = "[data-testid=\"human-review-complete-locally-confirm\"]";
+const HR_COMPLETE_CONSEQUENCES: &str = "[data-testid=\"human-review-complete-locally-consequences\"]";
+const HR_COMPLETE_CONFIRM: &str = "[data-testid=\"human-review-complete-locally-confirm-button\"]";
+const HR_COMPLETE_CANCEL: &str = "[data-testid=\"human-review-complete-locally-cancel\"]";
+const HR_ERROR: &str = "[data-testid=\"human-review-error\"]";
+const CARD_SYNC_PR: &str = "[data-testid=\"task-card-sync-pr\"]";
 const PR_CREATED_COLUMN: &str = "[data-testid=\"column-prcreated\"]";
 
 /// The lines the coding prompt fences each piece of feedback with
@@ -925,4 +932,181 @@ async fn drag_card_to(driver: &WebDriver, title: &str, column: &str) -> Result<(
         bail!("could not drag {title:?} to {column}");
     }
     Ok(())
+}
+
+// --- Journey: completing approved changes locally -------------------------------
+
+/// A project that cannot take a pull request: approved changes are completed
+/// locally only after saying what that does, a checkout Git will not remove
+/// keeps the task in Human Review, and the finished task keeps its branch,
+/// merges nothing, and says so after a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn approved_changes_are_completed_locally_without_merging_and_the_branch_survives_a_restart() {
+    let context = TestContext::new("human_review_complete_locally").expect("harness setup");
+    let outcome = complete_locally_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn complete_locally_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+    let (agent, gh) = install_fakes(context, &root)?;
+    context.set_child_env(fake_agent::WRITE_FILE_VAR, WORK_FILE);
+    // `origin` is the fixture's local bare repository, not a GitHub one.
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("complete-locally").await?;
+    let outcome = complete_approved_changes_locally(session.driver(), &agent, &gh, &repository).await;
+    context.close_session(session, "complete-locally", &outcome).await?;
+    let (executed, work) = outcome?;
+
+    assert_persisted(&root, &executed, "done")?;
+    let persisted = persisted_review(&root, &executed.id)?;
+    if persisted.entries != vec![("approved".to_string(), None)] {
+        bail!("the task file holds review {:?}", persisted.entries);
+    }
+
+    let session = context.start_session("complete-locally-restart").await?;
+    let outcome = still_completed_after_restart(session.driver(), &executed, &work, &repository).await;
+    context.close_session(session, "complete-locally-restart", &outcome).await?;
+    outcome
+}
+
+async fn complete_approved_changes_locally(
+    driver: &WebDriver,
+    agent: &FakeAgent,
+    gh: &FakeGh,
+    repository: &GitFixture,
+) -> Result<(ExecutedTask, EstablishedWork)> {
+    let executed = execute_one_task(driver, agent, repository).await?;
+    let work = establish_work(driver, repository, &executed).await?;
+    let main_before = repository.branch_tip("main")?;
+    let origin_main_before = repository.origin_tip("main")?;
+
+    // Nothing to complete until someone has approved.
+    open_reviewed_drawer(driver, &executed).await?;
+    await_text(driver, HR_APPROVE, |t| t != "Checking…", "the approve action").await?;
+    assert_not_offered(driver, HR_COMPLETE_LOCALLY, "Complete locally before any decision").await?;
+    let refusal = ui::invoke_expecting_refusal(driver, "complete_task_locally", json!({ "taskId": executed.id })).await?;
+    if !refusal.contains("Approve the changes") {
+        bail!("completing unapproved changes was refused for another reason: {refusal}");
+    }
+
+    click(driver, HR_APPROVE, "Approve").await?;
+    ui::visible(driver, HR_APPROVED).await.context("the drawer does not say Approved")?;
+    if attribute(driver, HR_DELIVERY, "data-delivery").await?.as_deref() != Some("unavailable") {
+        bail!("the drawer does not explain that no pull request can be created");
+    }
+    // A pull request cannot exist here, so the card offers no search for one.
+    await_gone(driver, CARD_SYNC_PR, "Sync PR on the card of a project that takes no pull request").await?;
+
+    // --- First: ask, read what it does, and cancel ---------------------------
+    click(driver, HR_COMPLETE_LOCALLY, "Complete locally").await?;
+    ui::visible(driver, HR_COMPLETE_CONFIRM_BOX).await.context("Complete locally did not ask first")?;
+    let text = await_text(driver, HR_COMPLETE_CONSEQUENCES, |t| !t.is_empty(), "the consequences").await?;
+    let worktree = executed.worktree_path.to_string_lossy();
+    for expected in [
+        "No pull request will be created.",
+        "Nothing will be merged into main",
+        &format!("Task Checkout at {worktree} will be removed"),
+        &format!("stay on the branch {}", work.branch),
+    ] {
+        if !text.contains(expected) {
+            bail!("the confirmation does not say {expected:?}: {text:?}");
+        }
+    }
+    click(driver, HR_COMPLETE_CANCEL, "Cancel").await?;
+    await_gone(driver, HR_COMPLETE_CONFIRM_BOX, "the confirmation, after Cancel").await?;
+    let task = read_task(driver, &executed).await?;
+    if status_of(&task) != Some("human_review") || !executed.worktree_path.is_dir() {
+        bail!("cancelling changed the task: {task}");
+    }
+
+    // --- Second: Git will not remove a checkout holding uncommitted work -----
+    let stray = executed.worktree_path.join("uncommitted-note.txt");
+    std::fs::write(&stray, "not committed\n").context("could not dirty the checkout")?;
+    click(driver, HR_COMPLETE_LOCALLY, "Complete locally").await?;
+    click(driver, HR_COMPLETE_CONFIRM, "Complete locally").await?;
+    let refused = await_text(driver, HR_ERROR, |t| !t.is_empty(), "why the task was not completed").await?;
+    if !refused.contains("was not completed") || !refused.contains("modified or untracked files") {
+        bail!("a refused completion was reported as {refused:?}");
+    }
+    let task = read_task(driver, &executed).await?;
+    if status_of(&task) != Some("human_review") || !stray.is_file() || !executed.worktree_path.is_dir() {
+        bail!("a refused completion changed the task or its checkout: {task}");
+    }
+    if attribute(driver, HR_DELIVERY, "data-delivery").await?.as_deref() == Some("completed_locally") {
+        bail!("the drawer claims a completion Git refused");
+    }
+    std::fs::remove_file(&stray).context("could not clean the checkout")?;
+
+    // --- Third: confirmed over a clean checkout ------------------------------
+    // The confirmation is still open after the refusal.
+    click(driver, HR_COMPLETE_CONFIRM, "Complete locally").await?;
+    await_text(
+        driver,
+        HR_DELIVERY,
+        |t| t.contains("Completed locally"),
+        "the completion in the drawer",
+    )
+    .await?;
+    if attribute(driver, HR_DELIVERY, "data-delivery").await?.as_deref() != Some("completed_locally") {
+        bail!("the drawer does not show the task as completed locally");
+    }
+    let said = await_text(driver, HR_DELIVERY, |t| !t.is_empty(), "the completion").await?;
+    for expected in ["Nothing was merged or pushed", &format!("branch {}", work.branch)] {
+        if !said.contains(expected) {
+            bail!("the drawer says {said:?}, not {expected:?}");
+        }
+    }
+    assert_not_offered(driver, HR_COMPLETE_LOCALLY, "Complete locally again").await?;
+
+    let settled = await_status(driver, &executed.project_id, &executed.id, &["done"]).await?;
+    await_worktree_removal(repository, &executed.worktree_path).await?;
+    if let Some(still) = await_worktree_path_cleared(driver, &executed).await? {
+        bail!("the completed task still records its checkout at {still}");
+    }
+    if settled.get("pr_url").is_some_and(|u| !u.is_null()) || !gh.invocations()?.is_empty() {
+        bail!("completing locally created a pull request");
+    }
+    if repository.origin_tip(&work.branch)?.is_some() {
+        bail!("{} was pushed although nothing may be", work.branch);
+    }
+    if repository.branch_tip("main")? != main_before || repository.origin_tip("main")? != origin_main_before {
+        bail!("completing locally changed main");
+    }
+    assert_work_survives(repository, &work, "completing the task locally")?;
+    assert_card_in_column(driver, DONE_COLUMN, &executed.title).await?;
+    assert_not_offered(driver, CARD_SYNC_PR, "Sync PR on a task completed locally").await?;
+    Ok((executed, work))
+}
+
+async fn still_completed_after_restart(
+    driver: &WebDriver,
+    executed: &ExecutedTask,
+    work: &EstablishedWork,
+    repository: &GitFixture,
+) -> Result<()> {
+    ui::assert_frontend_is_real(driver).await?;
+    show_on_board(driver, &executed.project_id, DONE_COLUMN, &executed.title).await?;
+    assert_not_offered(driver, CARD_SYNC_PR, "Sync PR on a task completed locally, after a restart").await?;
+    open_reviewed_drawer(driver, executed).await?;
+    ui::visible(driver, HR_APPROVED).await.context("after a restart the drawer does not say Approved")?;
+    if attribute(driver, HR_DELIVERY, "data-delivery").await?.as_deref() != Some("completed_locally") {
+        bail!("after a restart the drawer does not show the task as completed locally");
+    }
+    assert_not_offered(driver, HR_COMPLETE_LOCALLY, "Complete locally, after a restart").await?;
+
+    // Asking again is answered with the task, and records nothing more.
+    let again = ui::invoke(driver, "complete_task_locally", json!({ "taskId": executed.id })).await?;
+    let completions = again
+        .get("activity")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries.iter().filter(|e| e.pointer("/kind/type").and_then(Value::as_str) == Some("completed_locally")).count()
+        })
+        .unwrap_or_default();
+    if status_of(&again) != Some("done") || completions != 1 {
+        bail!("asking again after a restart answered {again}");
+    }
+    assert_work_survives(repository, work, "a restart after completing the task locally")
 }

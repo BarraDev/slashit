@@ -1,5 +1,6 @@
 //! Human Review decisions: approve, request changes, open the pull request
-//! for approved changes, and close a task without merging it.
+//! for approved changes, complete approved changes locally, and close a task
+//! without merging it.
 
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
@@ -80,6 +81,13 @@ pub async fn approve_task(task_id: String, create_pr: bool) -> Result<ApprovalOu
 
 pub async fn create_approved_task_pr(task_id: String) -> Result<ApprovalOutcome, String> {
     invoke("create_approved_task_pr", serde_json::json!({ "taskId": task_id })).await
+}
+
+/// Finish approved changes in a project that cannot take a pull request:
+/// the task becomes Done, its Task Checkout is removed and its branch is kept,
+/// unmerged. `Err` means the task was not completed and is where it was.
+pub async fn complete_task_locally(task_id: String) -> Result<Task, String> {
+    invoke("complete_task_locally", serde_json::json!({ "taskId": task_id })).await
 }
 
 /// `Err` means neither the feedback nor the requeue was recorded.

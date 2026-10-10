@@ -1,6 +1,7 @@
 //! The Human Review decision in the task drawer: the AI review summary, the
 //! review history, and the actions a person takes on the changes (approve,
-//! with or without a pull request, or request changes).
+//! with or without a pull request, complete them locally where no pull
+//! request can be opened, or request changes).
 //!
 //! What is shown is derived from the task record and the backend's answer
 //! about pull request availability; nothing here decides on its own that
@@ -12,10 +13,11 @@ use leptos::task::spawn_local;
 use uuid::Uuid;
 
 use crate::components::attention::Deliveries;
+use crate::components::close_without_merge_dialog::close_consequences;
 use crate::models::{review_findings, HumanReviewDecision, QaSignoff, QaStatus, Task, TaskStatus};
 use crate::services::human_review_service::{
-    approve_task, create_approved_task_pr, get_pr_availability, request_task_changes,
-    PrAvailability, PrDelivery,
+    approve_task, complete_task_locally, create_approved_task_pr, get_pr_availability,
+    request_task_changes, PrAvailability, PrDelivery,
 };
 
 /// The most findings listed before the rest are summarised as a count.
@@ -32,12 +34,18 @@ pub enum Delivery {
     Failed { reason: String },
     /// SlashIt cannot open one for this project.
     Unavailable { reason: String },
+    /// A person finished the task without one. The work is on its branch,
+    /// which was not merged.
+    CompletedLocally { branch: Option<String> },
     /// It can, and has not tried yet.
     NotAttempted,
 }
 
 impl Delivery {
     pub fn for_task(task: &Task, availability: Option<&PrAvailability>) -> Self {
+        if task.completed_locally() {
+            return Self::CompletedLocally { branch: task.branch_name.clone() };
+        }
         let recorded_pr = task
             .pr_url
             .clone()
@@ -63,6 +71,7 @@ impl Delivery {
     pub fn or_answer(self, answer: Option<&PrDelivery>) -> Self {
         match (self, answer) {
             (created @ Self::Created { .. }, _) => created,
+            (done @ Self::CompletedLocally { .. }, _) => done,
             (_, Some(PrDelivery::Failed { reason })) => Self::Failed { reason: reason.clone() },
             (_, Some(PrDelivery::Unavailable { reason })) => Self::Unavailable { reason: reason.clone() },
             (_, Some(PrDelivery::Created { url })) => Self::Created { url: Some(url.clone()) },
@@ -187,6 +196,7 @@ pub fn HumanReviewPanel(
     let error = RwSignal::new(None::<String>);
     let composing = RwSignal::new(false);
     let feedback = RwSignal::new(String::new());
+    let confirming_local = RwSignal::new(false);
 
     // Attempts to open the pull request are registered app-wide, so the
     // card and the header know the task is waiting on SlashIt while one runs,
@@ -264,6 +274,40 @@ pub fn HumanReviewPanel(
             };
             if let Some(d) = deliveries {
                 d.finish(task_id, attempted);
+            }
+            busy.try_set(false);
+        });
+    };
+
+    let complete_locally = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match complete_task_locally(task_id.to_string()).await {
+                // The task as it now is: Done, or still in Human Review with
+                // the reason Git kept its checkout.
+                Ok(updated) if updated.completed_locally() => {
+                    confirming_local.try_set(false);
+                    let title = updated.title.clone();
+                    apply_task.try_run(updated);
+                    crate::components::toast::success(format!(
+                        "'{title}' completed locally. Its branch was not merged."
+                    ));
+                }
+                Ok(updated) => {
+                    let reason = updated
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "SlashIt recorded no reason.".to_string());
+                    apply_task.try_run(updated);
+                    error.try_set(Some(format!("The task was not completed: {reason}")));
+                }
+                Err(e) => {
+                    error.try_set(Some(format!("The task was not completed: {e}")));
+                }
             }
             busy.try_set(false);
         });
@@ -497,10 +541,64 @@ pub fn HumanReviewPanel(
                         </div>
                     }.into_any(),
                     Delivery::Unavailable { reason } => view! {
-                        <div data-testid="human-review-delivery" data-delivery="unavailable" class="text-xs text-white/55 space-y-1">
+                        <div data-testid="human-review-delivery" data-delivery="unavailable" class="text-xs text-white/55 space-y-2">
                             <p>"SlashIt cannot create a GitHub pull request for this project."</p>
                             <p data-testid="human-review-pr-unavailable" class="text-white/45">{reason}</p>
-                            <p class="text-white/45">"Nothing was merged. The task stays in Human Review with its work on its branch."</p>
+                            <p class="text-white/45">"Nothing was merged. The task stays in Human Review with its work on its branch until you complete it."</p>
+                            <Show when=move || in_review.get()>
+                                <button
+                                    data-testid="human-review-complete-locally"
+                                    class="px-3 py-1.5 rounded-lg text-sm bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-50"
+                                    disabled=move || busy.get() || confirming_local.get()
+                                    on:click=move |_| {
+                                        error.set(None);
+                                        confirming_local.set(true);
+                                    }
+                                >
+                                    "Complete locally"
+                                </button>
+                                <Show when=move || confirming_local.get()>
+                                    <div data-testid="human-review-complete-locally-confirm" class="rounded-md border border-white/10 bg-black/20 p-2 space-y-2">
+                                        <p class="text-xs font-semibold text-white/70">"Complete locally?"</p>
+                                        <ul data-testid="human-review-complete-locally-consequences" class="list-disc pl-5 space-y-0.5 text-xs text-white/60">
+                                            {move || task.with(|t| t.as_ref().map(close_consequences).unwrap_or_default())
+                                                .into_iter()
+                                                .map(|line| view! { <li class="break-words">{line}</li> })
+                                                .collect_view()}
+                                        </ul>
+                                        <div class="flex gap-2">
+                                            <button
+                                                data-testid="human-review-complete-locally-confirm-button"
+                                                class="px-3 py-1.5 rounded-lg text-sm font-medium bg-emerald-500/25 text-emerald-100 hover:bg-emerald-500/35 disabled:opacity-50"
+                                                disabled=move || busy.get()
+                                                on:click=complete_locally
+                                            >
+                                                {move || if busy.get() { "Completing…" } else { "Complete locally" }}
+                                            </button>
+                                            <button
+                                                data-testid="human-review-complete-locally-cancel"
+                                                class="px-3 py-1.5 rounded-lg text-sm bg-white/5 text-white/60 hover:bg-white/10"
+                                                disabled=move || busy.get()
+                                                on:click=move |_| confirming_local.set(false)
+                                            >
+                                                "Cancel"
+                                            </button>
+                                        </div>
+                                    </div>
+                                </Show>
+                            </Show>
+                        </div>
+                    }.into_any(),
+                    Delivery::CompletedLocally { branch } => view! {
+                        <div data-testid="human-review-delivery" data-delivery="completed_locally" class="text-xs text-white/60 space-y-1">
+                            <p data-testid="human-review-completed-locally" class="font-medium text-emerald-200/90">"Completed locally."</p>
+                            <p>"Nothing was merged or pushed, and no pull request exists."</p>
+                            <p data-testid="human-review-completed-branch">
+                                {match branch {
+                                    Some(branch) => format!("The work is on the branch {branch} in your local repository. Its Task Checkout was removed."),
+                                    None => "This task has no branch recorded. Its Task Checkout was removed.".to_string(),
+                                }}
+                            </p>
                         </div>
                     }.into_any(),
                     Delivery::NotAttempted => view! {
@@ -605,6 +703,31 @@ mod tests {
             Delivery::for_task(&t, None),
             Delivery::Created { url: Some("https://github.com/o/r/pull/1".into()) }
         );
+    }
+
+    #[test]
+    fn a_task_completed_locally_reads_as_such_and_not_as_unavailable() {
+        let mut t = task(TaskStatus::Done);
+        t.branch_name = Some("task-1".into());
+        let unavailable = PrAvailability::Unavailable { reason: "no origin".into() };
+        // Done alone proves nothing about the branch.
+        assert_eq!(
+            Delivery::for_task(&t, Some(&unavailable)),
+            Delivery::Unavailable { reason: "no origin".into() }
+        );
+
+        let mut entries = Vec::new();
+        slashit_activity::record(&mut entries, chrono::Utc::now(), slashit_activity::Kind::CompletedLocally);
+        t.activity = entries;
+        assert!(t.completed_locally());
+        let done = Delivery::CompletedLocally { branch: Some("task-1".into()) };
+        assert_eq!(Delivery::for_task(&t, Some(&unavailable)), done);
+        assert_eq!(Delivery::for_task(&t, None), done, "no availability answer is needed");
+        assert_eq!(done.clone().or_answer(Some(&PrDelivery::Unavailable { reason: "x".into() })), done);
+
+        // The entry without the status is not a completion either.
+        t.status = TaskStatus::HumanReview;
+        assert!(!t.completed_locally());
     }
 
     #[test]
