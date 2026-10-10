@@ -557,41 +557,7 @@ pub const CLOSE_WITHOUT_MERGE_REQUIRED: &str =
      created and nothing is merged. SlashIt only does that after you confirm it, so the task was \
      left in Human Review.";
 
-/// Renumber `target_status`'s column so `task_id` sits at `new_position` and
-/// every card in that column has a distinct, gapless position.
-///
-/// Takes the map it should mutate rather than reading the live one, so the
-/// terminal path can run it inside
-/// [`crate::lifecycle::terminalize`](crate::lifecycle::terminalize)'s final
-/// write. Positions computed before a cleanup subprocess ran are stale by the
-/// time it finishes -- another card may have been dragged into the same column
-/// meanwhile -- and committing them would publish the card at a position that
-/// was correct a second ago.
-pub(crate) fn renumber_column(
-    staged: &mut HashMap<Uuid, Task>,
-    project_id: Uuid,
-    task_id: Uuid,
-    target_status: &TaskStatus,
-    new_position: i32,
-) {
-    let mut column: Vec<(Uuid, i32)> = staged
-        .values()
-        .filter(|t| t.project_id == project_id && t.status == *target_status && t.id != task_id)
-        .map(|t| (t.id, t.position))
-        .collect();
-    column.sort_by_key(|(_, pos)| *pos);
-
-    let clamped = new_position.max(0).min(column.len() as i32) as usize;
-    column.insert(clamped, (task_id, 0));
-
-    let now = chrono::Utc::now();
-    for (idx, (tid, _)) in column.iter().enumerate() {
-        if let Some(task) = staged.get_mut(tid) {
-            task.position = idx as i32;
-            task.updated_at = now;
-        }
-    }
-}
+pub(crate) use crate::lifecycle::renumber_column;
 
 /// Reorder a task within its column or when moving to a new column.
 /// `new_position` is the target position index in the destination column.

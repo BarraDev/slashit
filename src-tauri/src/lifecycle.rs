@@ -480,6 +480,126 @@ pub async fn create(
     Ok(task)
 }
 
+/// Renumber `target_status`'s column so `task_id` sits at `new_position` and
+/// every card in that column has a distinct, gapless position.
+///
+/// Takes the map it should mutate rather than reading the live one, so the
+/// terminal path can run it inside
+/// [`terminalize`]'s final
+/// write. Positions computed before a cleanup subprocess ran are stale by the
+/// time it finishes -- another card may have been dragged into the same column
+/// meanwhile -- and committing them would publish the card at a position that
+/// was correct a second ago.
+pub(crate) fn renumber_column(
+    staged: &mut HashMap<Uuid, Task>,
+    project_id: Uuid,
+    task_id: Uuid,
+    target_status: &TaskStatus,
+    new_position: i32,
+) {
+    let mut column: Vec<(Uuid, i32)> = staged
+        .values()
+        .filter(|t| t.project_id == project_id && t.status == *target_status && t.id != task_id)
+        .map(|t| (t.id, t.position))
+        .collect();
+    column.sort_by_key(|(_, pos)| *pos);
+
+    let clamped = new_position.max(0).min(column.len() as i32) as usize;
+    column.insert(clamped, (task_id, 0));
+
+    let now = chrono::Utc::now();
+    for (idx, (tid, _)) in column.iter().enumerate() {
+        if let Some(task) = staged.get_mut(tid) {
+            task.position = idx as i32;
+            task.updated_at = now;
+        }
+    }
+}
+
+/// What [`enqueue_leased`] found, and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnqueueVerdict {
+    /// The Task was in the column the caller saw and is now at the top of
+    /// Queue. Carries its title.
+    Queued(String),
+    /// The Task was already in Queue, so nothing was written. Which front door
+    /// put it there cannot be told from the record, and this does not claim to.
+    AlreadyQueued(String),
+    /// The Task is in another column than the caller saw; nothing was changed.
+    Moved(TaskStatus),
+    Missing,
+    OtherProject,
+    /// The Task cannot be run until something else is resolved, so queueing it
+    /// would only park it in Queue; nothing was changed.
+    Blocked(String),
+}
+
+/// Put a Task at the top of Queue provided it is still in `seen_in`, the
+/// column the caller saw it in.
+///
+/// The same transition the board's single-Task enqueue performs through
+/// `reorder_task` with `expected_status` (the drawer's Start and Retry and the
+/// card menu's "Add to Queue"): status, the activity record, the reset of
+/// execution state and the top-of-column position all land in one write. It
+/// only queues. Admission, the Task Checkout, the branch and the agent stay
+/// with the executor's scheduler.
+///
+/// The check and the change share the Task store's write, so the Task cannot
+/// move between them. The caller holds the Task's lifecycle lease. No owner is
+/// ended: a Task that is not in Queue or beyond has none, and any other
+/// `seen_in` is the caller's responsibility to refuse.
+pub async fn enqueue_leased(
+    tasks: &Tasks,
+    storage: &Storage,
+    project_id: Uuid,
+    task_id: Uuid,
+    seen_in: &TaskStatus,
+) -> Result<EnqueueVerdict, String> {
+    let verdict = std::sync::Mutex::new(EnqueueVerdict::Missing);
+    let revise = |staged: &mut HashMap<Uuid, Task>| -> bool {
+        let (found, changed) = match staged.get_mut(&task_id) {
+            None => (EnqueueVerdict::Missing, false),
+            Some(task) if task.project_id != project_id => (EnqueueVerdict::OtherProject, false),
+            Some(task) if task.status == TaskStatus::Queue => {
+                (EnqueueVerdict::AlreadyQueued(task.title.clone()), false)
+            }
+            Some(task) if task.status != *seen_in => (EnqueueVerdict::Moved(task.status.clone()), false),
+            Some(task) if task.cleanup_in_flight => (
+                EnqueueVerdict::Blocked(
+                    "An earlier cleanup of this Task's checkout is unfinished, so it cannot run yet".into(),
+                ),
+                false,
+            ),
+            Some(task) if task.republish_pending_refusal().is_some() => (
+                EnqueueVerdict::Blocked(
+                    "A restack of this Task's published branch is unfinished, so it cannot run yet".into(),
+                ),
+                false,
+            ),
+            Some(task) => {
+                let from = task.status.clone();
+                task.status = TaskStatus::Queue;
+                task.record_move(&from);
+                if classify_status_transition(&from, &TaskStatus::Queue)
+                    == StatusTransitionEffect::ResetExecutionState
+                {
+                    task.reset_execution_state();
+                }
+                let title = task.title.clone();
+                renumber_column(staged, project_id, task_id, &TaskStatus::Queue, 0);
+                (EnqueueVerdict::Queued(title), true)
+            }
+        };
+        *verdict.lock().unwrap() = found;
+        changed
+    };
+    match record_if_changed(tasks, storage, task_id, &revise).await {
+        Ok(_) => Ok(verdict.into_inner().unwrap()),
+        Err(_) if !tasks.read().await.contains_key(&task_id) => Ok(EnqueueVerdict::Missing),
+        Err(error) => Err(error),
+    }
+}
+
 /// Select, amend and durably commit a task the caller does not yet have the id
 /// of, under one write-lock hold.
 ///
