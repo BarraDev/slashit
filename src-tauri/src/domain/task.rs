@@ -461,6 +461,13 @@ impl Task {
         }
     }
 
+    /// Whether a person completed this task locally: approved changes finished
+    /// without a pull request. Done says the task is finished; this says the
+    /// branch was never merged by SlashIt.
+    pub fn completed_locally(&self) -> bool {
+        self.status == TaskStatus::Done && slashit_activity::completed_locally(&self.activity)
+    }
+
     /// The number the task's next coding run gets.
     pub fn next_run(&self) -> u32 {
         slashit_activity::next_run(&self.activity)

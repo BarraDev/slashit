@@ -2385,6 +2385,34 @@ fn next_card_id(column: &[Task], id: Uuid) -> Option<String> {
     column.get(at + 1).map(|task| task.id.to_string())
 }
 
+/// Whether a pull request is linked to the task.
+fn has_linked_pr(task: &Task) -> bool {
+    task.pr_url.is_some() || task.external_refs.iter().any(|r| r.is_pr())
+}
+
+/// Approved changes in Human Review with no pull request yet: the state in
+/// which the project's ability to take one decides what the card offers.
+fn awaiting_delivery(task: &Task) -> bool {
+    task.status == TaskStatus::HumanReview && task.human_review.is_approved() && !has_linked_pr(task)
+}
+
+/// Whether the card offers to find and link an existing pull request.
+///
+/// Only for changes someone approved (or a finished task), never for changes
+/// still waiting on a decision; never where the project takes no pull request
+/// (`pr_unavailable`), and never for a task completed locally, whose work is
+/// on a branch that was deliberately not delivered.
+fn offers_pr_sync(task: &Task, pr_unavailable: bool) -> bool {
+    !has_linked_pr(task)
+        && !pr_unavailable
+        && !task.completed_locally()
+        && match task.status {
+            TaskStatus::HumanReview => task.human_review.is_approved(),
+            TaskStatus::Done => true,
+            _ => false,
+        }
+}
+
 #[component]
 fn KanbanTaskCard(
     task: Task,
@@ -2750,16 +2778,26 @@ fn KanbanTaskCard(
                 }
                 // Visible PR review action for tasks that already have a PR.
                 {
-                    let has_pr = task.pr_url.is_some() || task.external_refs.iter().any(|r| r.is_pr());
-                    // Linking a pull request only makes sense for changes
-                    // someone approved (or a finished task), never for changes
-                    // still waiting on a decision.
-                    let can_sync_pr = !has_pr
-                        && match task.status {
-                            TaskStatus::HumanReview => task.human_review.is_approved(),
-                            TaskStatus::Done => true,
-                            _ => false,
-                        };
+                    let card_task = task.clone();
+                    let task_for_pr_review = task_for_pr_review.clone();
+                    // Whether SlashIt can say this task's project takes no pull
+                    // request at all, so there is none to find and link. Asked
+                    // only for approved changes still waiting in Human Review.
+                    let pr_unavailable = RwSignal::new(false);
+                    if awaiting_delivery(&card_task) {
+                        let id = card_task.id.to_string();
+                        spawn_local(async move {
+                            if let Ok(crate::services::human_review_service::PrAvailability::Unavailable { .. }) =
+                                crate::services::human_review_service::get_pr_availability(id).await
+                            {
+                                pr_unavailable.try_set(true);
+                            }
+                        });
+                    }
+                    move || {
+                    let task = card_task.clone();
+                    let has_pr = has_linked_pr(&task);
+                    let can_sync_pr = offers_pr_sync(&task, pr_unavailable.get());
 
                     (has_pr || can_sync_pr).then(|| {
                         let task_for_pr_review = task_for_pr_review.clone();
@@ -2866,6 +2904,7 @@ fn KanbanTaskCard(
                             </div>
                         }
                     })
+                    }
                 }
             </div>
             
@@ -2901,7 +2940,8 @@ fn KanbanTaskCard(
 mod tests {
     use super::approved_after_decision_change;
     use super::next_card_id;
-    use crate::models::Task;
+    use super::{awaiting_delivery, offers_pr_sync};
+    use crate::models::{HumanReviewDecision, HumanReviewEntry, Task, TaskStatus};
     use uuid::Uuid;
 
     fn column_task(id: u128, title: &str) -> Task {
@@ -2942,5 +2982,50 @@ mod tests {
         // A collaborator's Fix is approved automatically.
         assert!(approved_after_decision_change(false, true, true, false));
         assert!(!approved_after_decision_change(true, false, true, true));
+    }
+
+    fn approved(status: TaskStatus) -> Task {
+        let mut task = column_task(5, "approved");
+        task.status = status;
+        task.human_review.entries.push(HumanReviewEntry {
+            sequence: 1,
+            arrival: 1,
+            decision: HumanReviewDecision::Approved,
+            feedback: None,
+            decided_at: chrono::Utc::now(),
+        });
+        task
+    }
+
+    #[test]
+    fn sync_pr_is_offered_only_where_a_pull_request_could_exist() {
+        let waiting = approved(TaskStatus::HumanReview);
+        assert!(offers_pr_sync(&waiting, false));
+        assert!(awaiting_delivery(&waiting));
+        // No pull request can be linked in a project that takes none.
+        assert!(!offers_pr_sync(&waiting, true));
+
+        // Undecided changes are not offered.
+        let mut undecided = waiting.clone();
+        undecided.human_review.entries.clear();
+        assert!(!offers_pr_sync(&undecided, false));
+        assert!(!awaiting_delivery(&undecided));
+
+        // Already linked.
+        let mut linked = waiting.clone();
+        linked.pr_url = Some("https://github.com/o/r/pull/1".into());
+        assert!(!offers_pr_sync(&linked, false));
+        assert!(!awaiting_delivery(&linked));
+    }
+
+    #[test]
+    fn a_task_completed_locally_is_not_offered_a_pull_request_it_never_had() {
+        let finished = approved(TaskStatus::Done);
+        assert!(offers_pr_sync(&finished, false), "an ordinary finished task still can link one");
+
+        let mut local = finished;
+        slashit_activity::record(&mut local.activity, chrono::Utc::now(), slashit_activity::Kind::CompletedLocally);
+        assert!(local.completed_locally());
+        assert!(!offers_pr_sync(&local, false));
     }
 }

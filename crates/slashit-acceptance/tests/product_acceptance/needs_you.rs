@@ -557,13 +557,14 @@ async fn decide_twice(driver: &WebDriver, agent: &FakeAgent, repository: &GitFix
     click(driver, HR_APPROVE, "Approve").await?;
     ui::visible(driver, HR_APPROVED).await.context("the approval was not shown")?;
     await_header(driver, 0).await?;
-    let approved = await_card(driver, &executed.id, "Approved without attention", |c| {
+    await_card(driver, &executed.id, "Approved without attention", |c| {
         c.reason.is_none() && c.decision.as_deref() == Some("Approved")
     })
     .await?;
-    if !approved.sync_pr {
-        bail!("Sync PR is not offered for approved changes with no pull request");
-    }
+    // This project takes no pull request (plain Approve above), so there is
+    // none to find and link: the card stops offering Sync PR once SlashIt
+    // has said so.
+    await_card(driver, &executed.id, "no Sync PR where no pull request can exist", |c| !c.sync_pr).await?;
     let task = read_task(driver, &executed).await?;
     if status_of(&task) != Some("human_review") {
         bail!("approving without a pull request moved the task to {:?}", status_of(&task));

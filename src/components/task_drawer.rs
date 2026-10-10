@@ -455,6 +455,7 @@ pub fn TaskDrawer(
                         task.with(|t| t.as_ref().is_some_and(|t| {
                             t.status == TaskStatus::HumanReview
                                 || (t.status == TaskStatus::PrCreated && t.human_review.is_approved())
+                                || t.completed_locally()
                         }))
                     }>
                         <HumanReviewPanel task_id=task_id task=task apply_task=apply_task />

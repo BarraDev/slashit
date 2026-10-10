@@ -112,6 +112,13 @@ pub struct Task {
 }
 
 impl Task {
+    /// Whether a person completed this task locally: approved changes
+    /// finished without a pull request. Done alone does not say that the
+    /// branch was merged, and this says that it was not.
+    pub fn completed_locally(&self) -> bool {
+        self.status == TaskStatus::Done && slashit_activity::completed_locally(&self.activity)
+    }
+
     /// What happened to the task, oldest first.
     pub fn timeline(&self) -> Vec<slashit_activity::Item<'_>> {
         let decisions = self.human_review.entries.iter().map(|e| slashit_activity::Decision {
