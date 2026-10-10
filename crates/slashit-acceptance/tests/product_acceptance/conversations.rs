@@ -298,7 +298,7 @@ async fn coordinator_creates_and_edits_tasks_only_after_human_approval() {
         if !shown.contains("high") || !shown.contains("ui ux") { bail!("proposed metadata is not visible: {shown}"); }
         ui::visible(session.driver(), "[data-testid=\"project-action-approve\"]").await?.click().await?;
         await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Task created in Backlog: Add dark mode").await?;
-        await_text(session.driver(), "[data-testid=\"task-title\"]", "Add dark mode").await?;
+        await_board_task_title(session.driver(), "Add dark mode").await?;
         let tasks = list_tasks().await?;
         if tasks.len() != 1 { bail!("expected exactly one created Task, found {}", tasks.len()); }
         let created = tasks[0].clone();
@@ -316,7 +316,7 @@ async fn coordinator_creates_and_edits_tasks_only_after_human_approval() {
         if !lowered.contains("edit task") || !shown.contains("Add dark mode → Add a dark mode toggle") || !shown.contains("high → urgent") || lowered.contains("description") { bail!("the exact edit is not visible: {shown}"); }
         ui::visible(session.driver(), "[data-testid=\"project-action-approve\"]").await?.click().await?;
         await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Task updated: Add dark mode").await?;
-        await_text(session.driver(), "[data-testid=\"task-title\"]", "Add a dark mode toggle").await?;
+        await_board_task_title(session.driver(), "Add a dark mode toggle").await?;
         let edited = list_tasks().await?.into_iter().next().context("edited Task missing")?;
         if edited["title"] != "Add a dark mode toggle" || edited["priority"] != "urgent" || edited["category"] != "ui_ux" || edited["description"] != created["description"] || edited["status"] != "backlog" { bail!("the edit changed more or less than approved: {edited}"); }
 
@@ -349,8 +349,21 @@ async fn coordinator_creates_and_edits_tasks_only_after_human_approval() {
 }
 
 /// Open the Conversations page from the Project navigation.
+///
+/// The last page is restored on reload, so a restarted session may already be
+/// on this page and must not be expected to land on the board.
 async fn open_conversations(driver: &WebDriver, project_id: &str) -> Result<()> {
-    open_board(driver, project_id).await?;
+    driver.refresh().await.context("could not reload the application window")?;
+    ui::assert_frontend_is_real(driver).await?;
+    ui::visible(driver, &format!("[data-testid=\"rail-project-{project_id}\"]")).await?
+        .click().await.context("could not select the project in the rail")?;
+    open_nav(driver, "conversations", PANEL).await
+}
+
+/// Show a Task title on the board, then return to the conversation.
+async fn await_board_task_title(driver: &WebDriver, title: &str) -> Result<()> {
+    open_nav(driver, "dashboard", KANBAN_BOARD).await?;
+    await_text(driver, "[data-testid=\"task-title\"]", title).await?;
     open_nav(driver, "conversations", PANEL).await
 }
 

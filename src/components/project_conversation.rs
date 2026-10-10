@@ -167,7 +167,14 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let request = initial_begin_request.run(());
         let publish = initial_publish.clone();
         spawn_local(async move {
-            match conversation_service::open_project_conversation(id).await {
+            // Opening takes the Project lock, which a live run holds, so a page
+            // remounted mid-run reads first and only opens a Conversation that
+            // has never been opened.
+            let loaded = match conversation_service::get_project_conversation(id.clone()).await {
+                Ok(value) => Ok(value),
+                Err(_) => conversation_service::open_project_conversation(id).await,
+            };
+            match loaded {
                 Ok(value) => publish.run((request, value)),
                 Err(error) => set_error.set(Some(error)),
             }
