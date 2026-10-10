@@ -66,15 +66,42 @@ pub async fn enqueue_task(task_id: String, seen_in: TaskStatus) -> Result<Enqueu
     })
 }
 
-pub async fn update_queue_config(_project_id: String, config: QueueConfig) -> Result<(), String> {
+/// A rejected command, as the text the backend rejected it with.
+fn rejection_text(error: JsValue, command: &str) -> String {
+    error.as_string().unwrap_or_else(|| {
+        js_sys::JSON::stringify(&error)
+            .ok()
+            .and_then(|s| s.as_string())
+            .unwrap_or_else(|| format!("{command} failed"))
+    })
+}
+
+/// The Queue settings the backend is running under right now.
+pub async fn get_queue_config() -> Result<QueueConfig, String> {
+    let args = serde_wasm_bindgen::to_value(&serde_json::json!({})).map_err(|e| e.to_string())?;
+    let value = try_invoke("get_queue_config", args)
+        .await
+        .map_err(|error| rejection_text(error, "get_queue_config"))?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
+/// Save the Queue settings. The backend answers with the settings it is now
+/// running under, which is what the caller should show: it is the proof the
+/// change was saved, not an echo of what was asked for. A refusal -- the
+/// settings could not be written, or a value is out of range -- arrives as an
+/// error and leaves the running settings as they were.
+pub async fn update_queue_config(config: QueueConfig) -> Result<QueueConfig, String> {
     let args = serde_wasm_bindgen::to_value(&serde_json::json!({
         "parallelTaskLimit": config.parallel_task_limit,
         "autoPromote": config.auto_promote,
         "fifoOrdering": config.fifo_ordering,
         "useCoderabbit": config.use_coderabbit,
-    })).unwrap();
-    let response = invoke("update_queue_config", args).await;
-    serde_wasm_bindgen::from_value(response).map_err(|e| e.to_string())
+    }))
+    .map_err(|e| e.to_string())?;
+    let value = try_invoke("update_queue_config", args)
+        .await
+        .map_err(|error| rejection_text(error, "update_queue_config"))?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }
 
 pub async fn bulk_add_to_queue(task_ids: Vec<String>) -> Result<(), String> {

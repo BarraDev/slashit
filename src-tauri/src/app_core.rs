@@ -97,7 +97,7 @@ pub async fn build_state_with_paths(
     };
 
     let task_state = commands::task::TaskState::new();
-    let queue_state = commands::queue::QueueState::new(task_state.tasks.clone());
+    let queue_state = commands::queue::QueueState::new(task_state.tasks.clone(), loaded_config.queue.clone());
     let project_state = commands::project::ProjectState::new();
     let repository_state = commands::repository::RepositoryState::new();
     let executor = Arc::new(tokio::sync::OnceCell::new());
@@ -841,6 +841,7 @@ mod tests {
             jj_config: Default::default(),
             worktree: Default::default(),
             ui_preferences: Default::default(),
+            queue: Default::default(),
         };
         cfg.repositories
             .insert(repository.id.to_string(), repository);
@@ -1103,6 +1104,7 @@ mod tests {
             jj_config: Default::default(),
             worktree: Default::default(),
             ui_preferences: Default::default(),
+            queue: Default::default(),
         };
         cfg.repositories
             .insert(repository.id.to_string(), repository);
@@ -1199,6 +1201,7 @@ mod tests {
             jj_config: Default::default(),
             worktree: Default::default(),
             ui_preferences: Default::default(),
+            queue: Default::default(),
         };
         cfg.repositories.insert(repository.id.to_string(), repository);
         cfg.projects.insert(project.id.to_string(), project.clone());
@@ -1387,6 +1390,7 @@ mod tests {
             jj_config: Default::default(),
             worktree: Default::default(),
             ui_preferences: Default::default(),
+            queue: Default::default(),
         };
         cfg.projects.insert(project.id.to_string(), project.clone());
         cfg.repositories.insert(repository.id.to_string(), repository);
@@ -1640,6 +1644,7 @@ mod tests {
             jj_config: Default::default(),
             worktree: Default::default(),
             ui_preferences: Default::default(),
+            queue: Default::default(),
         };
         cfg.projects.insert(project.id.to_string(), project.clone());
         storage.save_config(&cfg).expect("save config");
@@ -1753,6 +1758,7 @@ mod tests {
             jj_config: Default::default(),
             worktree: Default::default(),
             ui_preferences: Default::default(),
+            queue: Default::default(),
         };
         let project_id = project.id;
         cfg.projects.insert(project_id.to_string(), project);

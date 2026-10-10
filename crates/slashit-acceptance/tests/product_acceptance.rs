@@ -64,6 +64,8 @@ mod needs_you;
 mod orphans;
 #[path = "product_acceptance/pr_status.rs"]
 mod pr_status;
+#[path = "product_acceptance/queue_settings.rs"]
+mod queue_settings;
 #[path = "product_acceptance/stacked_tasks.rs"]
 mod stacked_tasks;
 #[path = "product_acceptance/storage.rs"]

@@ -5863,6 +5863,22 @@ mod tests {
         start_guard: Arc<StartGuard>,
         pr_statuses: Arc<crate::pr_status::PrStatuses>,
     ) -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {
+        test_executor_configured(
+            events,
+            start_guard,
+            pr_statuses,
+            crate::config::queue::QueueConfig::default(),
+        )
+    }
+
+    /// An executor whose Queue starts under `queue_config`, as it does after
+    /// the settings saved by a previous run have been restored.
+    fn test_executor_configured(
+        events: SharedEventSink,
+        start_guard: Arc<StartGuard>,
+        pr_statuses: Arc<crate::pr_status::PrStatuses>,
+        queue_config: crate::config::queue::QueueConfig,
+    ) -> (Arc<TaskExecutor>, Vec<tempfile::TempDir>) {
         let (storage, storage_temp) = test_storage();
         let (registry, reg_temp) = test_registry();
         let paths_temp = tempfile::TempDir::new().expect("paths temp dir");
@@ -5872,7 +5888,7 @@ mod tests {
             tasks: tasks.clone(),
             queue_manager: Arc::new(RwLock::new(crate::queue::QueueManager::new(
                 tasks,
-                crate::config::queue::QueueConfig::default(),
+                queue_config,
             ))),
             executions: Arc::new(RwLock::new(HashMap::new())),
             logs: Arc::new(RwLock::new(HashMap::new())),
@@ -5894,6 +5910,77 @@ mod tests {
             pr_statuses,
         }));
         (executor, vec![storage_temp, reg_temp, paths_temp])
+    }
+
+    /// Settings restored at startup reach the executor's own Admission gate,
+    /// and a restored `auto_promote = false` keeps a queued Task queued.
+    #[tokio::test]
+    async fn restored_queue_settings_set_admission_and_hold_promotion_off() {
+        let restored = crate::config::queue::QueueConfig {
+            parallel_task_limit: 2,
+            auto_promote: false,
+            ..Default::default()
+        };
+        let (executor, _temps) = test_executor_configured(
+            crate::events::null_sink(),
+            crate::test_helpers::plenty_of_disk(),
+            crate::test_helpers::no_github(),
+            restored.clone(),
+        );
+
+        // Exactly the restored limit, not the default of three.
+        let first = executor.admission.try_acquire().expect("first slot");
+        let second = executor.admission.try_acquire().expect("second slot");
+        assert!(
+            executor.admission.try_acquire().is_none(),
+            "admission must hold the restored limit of 2, not the default"
+        );
+        drop((first, second));
+
+        let mut task = create_test_task_full("queued", Uuid::new_v4(), TaskStatus::Queue, 0);
+        task.phase = TaskPhase::Idle;
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+
+        for _ in 0..3 {
+            executor.check_and_execute().await;
+        }
+
+        assert_eq!(
+            executor.queue_manager.read().await.config(),
+            &restored,
+            "polling must not change the restored settings"
+        );
+        assert_eq!(
+            executor.tasks.read().await.get(&task_id).unwrap().status,
+            TaskStatus::Queue,
+            "a Task must not be promoted while auto_promote stays off"
+        );
+        assert!(executor.running_handles.read().await.is_empty());
+    }
+
+    /// The same Task, with auto_promote on, is promoted: without this the
+    /// test above would pass for a Task nothing would ever promote.
+    #[tokio::test]
+    async fn the_queue_promotes_the_same_task_when_auto_promote_is_on() {
+        let (executor, _temps) = test_executor_configured(
+            crate::events::null_sink(),
+            crate::test_helpers::plenty_of_disk(),
+            crate::test_helpers::no_github(),
+            crate::config::queue::QueueConfig::default(),
+        );
+        let mut task = create_test_task_full("queued", Uuid::new_v4(), TaskStatus::Queue, 0);
+        task.phase = TaskPhase::Idle;
+        let task_id = task.id;
+        executor.tasks.write().await.insert(task_id, task);
+
+        executor.check_and_execute().await;
+
+        assert_ne!(
+            executor.tasks.read().await.get(&task_id).unwrap().status,
+            TaskStatus::Queue,
+            "with auto_promote on the same Task leaves the Queue"
+        );
     }
 
     /// Regression guard for the PR #2 GUI startup panic.

@@ -61,3 +61,7 @@
 # journey to shard 3, rather than rebalancing the existing assignment.
 1	checkout_recovery::restarting_keeps_an_intact_checkout_adopts_a_moved_one_and_clears_a_gone_one
 3	stacked_tasks::a_task_stacked_on_a_parent_is_restacked_onto_the_default_branch_once_the_parent_lands
+
+# Queue settings journey: one launch to edit and queue, one restart. Placed in shard 3, the
+# shortest in the hosted timings recorded above.
+3	queue_settings::queue_settings_are_edited_in_settings_and_keep_a_queued_task_waiting_across_a_restart
