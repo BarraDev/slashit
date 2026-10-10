@@ -235,6 +235,8 @@ pub(crate) async fn complete_locally(
 
     let record = |staged: &mut HashMap<Uuid, Task>| {
         if let Some(t) = staged.get_mut(&task_id) {
+            t.overall_progress = 100;
+            t.phase = crate::domain::task::TaskPhase::Complete;
             t.record_activity(crate::domain::task::ActivityKind::CompletedLocally);
         }
     };
@@ -812,6 +814,7 @@ mod tests {
         let mut task = create_test_task_full("finish locally", project_id, TaskStatus::HumanReview, 0);
         task.branch_name = Some(branch.clone());
         task.worktree_path = Some(info.path.clone());
+        task.overall_progress = 90;
         task.human_review.record_arrival();
         let task_id = task.id;
         state.task.tasks.write().await.insert(task_id, task.clone());
@@ -844,11 +847,13 @@ mod tests {
             let task = current(&self.state, self.task_id).await.unwrap();
             assert_eq!(task.status, TaskStatus::HumanReview);
             assert!(!task.completed_locally());
+            assert_eq!(task.overall_progress, 90, "a refusal does not touch progress");
             assert!(task.worktree_path.is_some());
             assert!(self.worktree.join("work.txt").exists(), "the checkout is still there");
             assert!(self.branch_exists());
             let disk = self.on_disk();
             assert_eq!(disk.status, TaskStatus::HumanReview);
+            assert_eq!(disk.overall_progress, 90);
             assert!(!disk.completed_locally());
         }
     }
@@ -868,6 +873,8 @@ mod tests {
 
         assert_eq!(done.status, TaskStatus::Done);
         assert!(done.completed_locally());
+        assert_eq!(done.overall_progress, 100, "a finished task shows it, as a merged one does");
+        assert_eq!(done.phase, crate::domain::task::TaskPhase::Complete);
         assert!(done.worktree_path.is_none(), "the checkout is released");
         assert!(!local.worktree.exists(), "and removed");
         assert!(!done.cleanup_in_flight);
@@ -889,6 +896,8 @@ mod tests {
         // A restart reads the same thing.
         let reloaded = local.on_disk();
         assert!(reloaded.completed_locally());
+        assert_eq!(reloaded.overall_progress, 100);
+        assert_eq!(reloaded.phase, crate::domain::task::TaskPhase::Complete);
         assert_eq!(reloaded.status, TaskStatus::Done);
         assert!(reloaded.worktree_path.is_none());
     }

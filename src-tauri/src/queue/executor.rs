@@ -1775,7 +1775,7 @@ impl TaskExecutor {
                     // Dependency must have a branch
                     let branch = dep_task.branch_name.clone()?;
                     let is_done = dep_task.status == TaskStatus::Done;
-                    Some((branch, is_done, RecordedPr::of(dep_task)))
+                    Some((branch, is_done, RecordedPr::of(dep_task), dep_task.completed_locally()))
                 })
         } else {
             None
@@ -1783,7 +1783,24 @@ impl TaskExecutor {
         let base_branch = match dependency {
             None => None,
             // Done with no pull request: its work reached main without one.
-            Some((_, true, RecordedPr::None)) => None,
+            // Not a task completed locally: that one is Done with its branch
+            // kept precisely because nothing merged it, so Done proves
+            // nothing about main. It stacks like any unmerged dependency, and
+            // is refused when its branch is gone, because nothing says its
+            // work is anywhere else.
+            Some((_, true, RecordedPr::None, false)) => None,
+            Some((branch, _, RecordedPr::None, true))
+                if WorktreeManager::local_branch_exists(repo_path, &branch).await == Ok(false) =>
+            {
+                return (
+                    existing_branch,
+                    Err(format!(
+                        "it depends on the work on branch {branch}, which was completed locally \
+                         and was never merged, and that branch no longer exists; restore the \
+                         branch, or merge that work, before starting this task"
+                    )),
+                );
+            }
             // A dependency with a pull request whose branch git confirms is
             // gone is only taken as delivered when that pull request was
             // recorded as merged. A missing branch on its own proves
@@ -1793,7 +1810,7 @@ impl TaskExecutor {
             // was queued to build on. Only a definite answer from git
             // counts. An invalid name, or a git that could not be asked,
             // still goes to the stacked path, which refuses it and says why.
-            Some((branch, _, recorded))
+            Some((branch, _, recorded, _))
                 if recorded != RecordedPr::None
                     && WorktreeManager::local_branch_exists(repo_path, &branch).await == Ok(false) =>
             {
@@ -1823,7 +1840,7 @@ impl TaskExecutor {
                 });
                 None
             }
-            Some((branch, _, _)) => Some(branch),
+            Some((branch, ..)) => Some(branch),
         };
 
         // Acquire the task's worktree, or give up on this attempt.
@@ -6632,6 +6649,105 @@ mod tests {
             origin,
             Some(BranchOrigin::Stacked { parent_branch: "task-deadbeef".to_string() })
         );
+    }
+
+    /// Make the fixture's dependency a task completed locally: Done, no pull
+    /// request, its branch holding a commit that never reached `main`. The
+    /// task is round-tripped through its stored form, which is all a restart
+    /// has to go on.
+    async fn complete_dependency_locally(
+        executor: &TaskExecutor,
+        repo: &std::path::Path,
+        dependency_id: Uuid,
+        branch: &str,
+    ) -> String {
+        git_in(repo, &["checkout", "-q", "-b", branch]);
+        std::fs::write(repo.join("dependency.txt"), "the dependency's work\n").unwrap();
+        git_in(repo, &["add", "dependency.txt"]);
+        git_in(repo, &["commit", "-q", "-m", "dependency work"]);
+        let tip = git_in(repo, &["rev-parse", branch]);
+        git_in(repo, &["checkout", "-q", "main"]);
+
+        let mut tasks = executor.tasks.write().await;
+        let dependency = tasks.get_mut(&dependency_id).unwrap();
+        dependency.record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+        *dependency = serde_json::from_str(&serde_json::to_string(&*dependency).unwrap()).unwrap();
+        assert!(dependency.completed_locally());
+        tip
+    }
+
+    /// A dependency completed locally is Done with no pull request, but its
+    /// branch was never merged: a dependent task has to be built on that
+    /// branch, not started from the default base without its work.
+    #[tokio::test]
+    async fn a_task_depending_on_one_completed_locally_is_stacked_on_its_unmerged_branch() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-local01").await;
+        let tip = complete_dependency_locally(&executor, &repo, dependency_id, "task-local01").await;
+        assert!(!repo.join("dependency.txt").exists(), "main does not hold the work");
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+
+        let Acquired { info, what_happened, base_commit, origin, .. } =
+            acquired.expect("a stacked worktree");
+        assert_eq!(what_happened, "Created stacked worktree");
+        let worktree = std::path::Path::new(&info.path);
+        assert!(worktree.join("dependency.txt").exists(), "the dependent task receives the work");
+        assert_eq!(git_in(worktree, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(base_commit.as_deref(), Some(tip.as_str()));
+        assert_eq!(
+            origin,
+            Some(BranchOrigin::Stacked { parent_branch: "task-local01".to_string() })
+        );
+    }
+
+    /// Nothing says the work of a task completed locally is anywhere but its
+    /// branch, so a start that cannot find the branch is refused, and no
+    /// branch is created off the default base in its place.
+    #[tokio::test]
+    async fn a_task_depending_on_one_completed_locally_is_refused_when_its_branch_is_gone() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-local01").await;
+        complete_dependency_locally(&executor, &repo, dependency_id, "task-local01").await;
+        git_in(&repo, &["branch", "-D", "task-local01"]);
+        let refs_before = refs_of(&repo);
+
+        let (existing, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+
+        assert_eq!(existing, None);
+        let refused = acquired.err().expect("a missing unmerged branch refuses the start");
+        assert!(
+            refused.contains("task-local01") && refused.contains("completed locally"),
+            "the reason has to name the branch and why: {refused}"
+        );
+        assert_eq!(refs_of(&repo), refs_before, "no branch may be created off the default base instead");
+        assert_eq!(worktree_count(&repo), 1);
+    }
+
+    /// The same Done task with no pull request and no local completion is
+    /// still taken as delivered to `main`, branch or not.
+    #[tokio::test]
+    async fn a_done_dependency_without_a_pull_request_or_local_completion_starts_from_the_default_base() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-deadbeef").await;
+        publish_default_base(&repo);
+        let main_tip = git_in(&repo, &["rev-parse", "main"]);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+
+        let Acquired { info, what_happened, origin, .. } = acquired.expect("an ordinary worktree");
+        assert_eq!(what_happened, "Created worktree");
+        assert_eq!(git_in(std::path::Path::new(&info.path), &["rev-parse", "HEAD"]), main_tip);
+        assert_eq!(origin, Some(on_main()));
     }
 
     /// A retry that picks up the branch an earlier attempt left, with the
