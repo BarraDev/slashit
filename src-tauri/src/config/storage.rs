@@ -33,6 +33,10 @@ pub struct AppConfig {
     pub worktree: WorktreeConfig,
     #[serde(default)]
     pub ui_preferences: UiPreferences,
+    /// The Queue settings. Absent from files written before they were
+    /// persisted, which load as the defaults.
+    #[serde(default)]
+    pub queue: crate::config::QueueConfig,
 }
 
 /// How SlashIt places the worktrees it creates.
@@ -107,6 +111,7 @@ impl Default for AppConfig {
                 theme: "dark".to_string(),
                 sidebar_width: 300,
             },
+            queue: crate::config::QueueConfig::default(),
         }
     }
 }
@@ -469,6 +474,16 @@ impl Storage {
                             }
                         }
                         
+                        // Try to recover the Queue settings: forgetting an
+                        // `auto_promote = false` would start queued Tasks the
+                        // person had paused.
+                        if let Some(queue) = value.get("queue") {
+                            if let Ok(queue_config) = queue.clone().try_into::<crate::config::QueueConfig>() {
+                                config.queue = queue_config;
+                                eprintln!("  Recovered: queue");
+                            }
+                        }
+
                         eprintln!("  Using partial recovery with defaults for unrecoverable sections");
                         
                         // Backup the old config before we potentially overwrite it

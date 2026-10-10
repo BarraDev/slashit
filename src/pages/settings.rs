@@ -20,6 +20,7 @@ enum SettingsTab {
     General,
     Repository,
     Storage,
+    Queue,
     Jujutsu,
     Theme,
     Updates,
@@ -31,6 +32,7 @@ impl SettingsTab {
             SettingsTab::General => "General",
             SettingsTab::Repository => "Repository",
             SettingsTab::Storage => "Storage",
+            SettingsTab::Queue => "Queue",
             SettingsTab::Jujutsu => "Jujutsu",
             SettingsTab::Theme => "Theme",
             SettingsTab::Updates => "Updates",
@@ -44,6 +46,8 @@ impl SettingsTab {
             SettingsTab::Repository => "M6 3v12m0 0a3 3 0 103 3m-3-3a3 3 0 013 3m0 0h3a6 6 0 006-6V9m0 0a3 3 0 10-3-3 3 3 0 003 3z",
             // Database / stacked-discs outline.
             SettingsTab::Storage => "M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4",
+            // Stacked lines of differing length: a list waiting its turn.
+            SettingsTab::Queue => "M4 6h16M4 12h10M4 18h6",
             SettingsTab::Jujutsu => "M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15",
             SettingsTab::Theme => "M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z",
             // Download-into-tray. Deliberately not the Jujutsu refresh arrows:
@@ -119,6 +123,7 @@ pub fn Settings(
                                 SettingsTab::General,
                                 SettingsTab::Repository,
                                 SettingsTab::Storage,
+                                SettingsTab::Queue,
                                 SettingsTab::Jujutsu,
                                 SettingsTab::Theme,
                                 SettingsTab::Updates,
@@ -199,6 +204,10 @@ pub fn Settings(
                                         <crate::components::StorageSettings project_id=project_id.clone() />
                                         <crate::components::OrphanReclaim project_id=project_id.clone() />
                                     </div>
+                                }.into_any(),
+
+                                SettingsTab::Queue => view! {
+                                    <crate::components::QueueSettings />
                                 }.into_any(),
 
                                 SettingsTab::Jujutsu => view! {

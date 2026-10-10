@@ -581,7 +581,7 @@ fn strip_finding_prefixes(issue: &str) -> &str {
 
 
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueConfig {
     pub parallel_task_limit: u32,
     pub auto_promote: bool,

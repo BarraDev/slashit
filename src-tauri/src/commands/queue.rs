@@ -7,26 +7,29 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// The Queue's runtime state.
+///
+/// The [`QueueManager`] owns the one live copy of the [`QueueConfig`]; the
+/// executor reads it from there, and `config.toml` is where it is saved. There
+/// is no second copy to drift.
 #[derive(Clone)]
 pub struct QueueState {
     pub manager: Arc<RwLock<QueueManager>>,
-    pub config: Arc<RwLock<QueueConfig>>,
 }
 
 impl QueueState {
-    pub fn new(tasks: Tasks) -> Self {
-        let config = QueueConfig::default();
-        let manager = QueueManager::with_config(tasks);
+    /// A Queue running under `config`, which the caller loaded from
+    /// `config.toml` (or defaulted, on a fresh installation).
+    pub fn new(tasks: Tasks, config: QueueConfig) -> Self {
         Self {
-            manager: Arc::new(RwLock::new(manager)),
-            config: Arc::new(RwLock::new(config)),
+            manager: Arc::new(RwLock::new(QueueManager::new(tasks, config))),
         }
     }
 }
 
 impl Default for QueueState {
     fn default() -> Self {
-        Self::new(Arc::new(RwLock::new(HashMap::new())))
+        Self::new(Arc::new(RwLock::new(HashMap::new())), QueueConfig::default())
     }
 }
 
@@ -34,8 +37,7 @@ impl Default for QueueState {
 pub async fn get_queue_config(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<QueueConfig, String> {
-    let config = state.queue.config.read().await;
-    Ok(config.clone())
+    Ok(state.queue.manager.read().await.config().clone())
 }
 
 #[tauri::command]
@@ -46,26 +48,70 @@ pub async fn update_queue_config(
     fifo_ordering: Option<bool>,
     use_coderabbit: Option<bool>,
 ) -> Result<QueueConfig, String> {
-    let mut config = state.queue.config.write().await;
-    let mut manager = state.queue.manager.write().await;
+    let patch = QueueConfigPatch {
+        parallel_task_limit,
+        auto_promote,
+        fifo_ordering,
+        use_coderabbit,
+    };
+    let new_config = apply_queue_config_patch(&state.queue, &state.storage, patch).await?;
 
-    if let Some(limit) = parallel_task_limit {
-        config.parallel_task_limit = limit;
+    // The executor also reconciles before every admission decision; doing it
+    // here as well makes the new limit effective now rather than at the next
+    // poll. Absent in a process with no executor yet, which has nothing to
+    // reconcile.
+    if let Some(executor) = state.executor.get() {
+        executor.reconcile_admission().await;
     }
-    if let Some(auto) = auto_promote {
-        config.auto_promote = auto;
-    }
-    if let Some(fifo) = fifo_ordering {
-        config.fifo_ordering = fifo;
-    }
-    if let Some(cr) = use_coderabbit {
-        config.use_coderabbit = cr;
-    }
-
-    let new_config = config.clone();
-    manager.set_config(new_config.clone()).await;
 
     Ok(new_config)
+}
+
+/// The fields of a Queue settings update that were actually supplied.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct QueueConfigPatch {
+    pub parallel_task_limit: Option<u32>,
+    pub auto_promote: Option<bool>,
+    pub fifo_ordering: Option<bool>,
+    pub use_coderabbit: Option<bool>,
+}
+
+/// Validate, save and then apply a Queue settings update.
+///
+/// Saving comes first and the running Queue changes only if it succeeds: an
+/// update reported as failed must leave the running Queue as it was, and an
+/// update reported as succeeded must survive a restart. The manager's write
+/// lock is held across both, so two concurrent updates cannot interleave
+/// their read-modify-write.
+pub(crate) async fn apply_queue_config_patch(
+    queue: &QueueState,
+    storage: &crate::config::Storage,
+    patch: QueueConfigPatch,
+) -> Result<QueueConfig, String> {
+    let mut manager = queue.manager.write().await;
+
+    let mut next = manager.config().clone();
+    if let Some(limit) = patch.parallel_task_limit {
+        next.parallel_task_limit = limit;
+    }
+    if let Some(auto) = patch.auto_promote {
+        next.auto_promote = auto;
+    }
+    if let Some(fifo) = patch.fifo_ordering {
+        next.fifo_ordering = fifo;
+    }
+    if let Some(cr) = patch.use_coderabbit {
+        next.use_coderabbit = cr;
+    }
+    next.validate()?;
+
+    let persisted = next.clone();
+    storage
+        .update_config(move |config| config.queue = persisted)
+        .map_err(|e| format!("Queue settings were not saved: {e}"))?;
+
+    manager.set_config(next.clone()).await;
+    Ok(next)
 }
 
 /// Durably, rather than through a `QueueManager` method that only ever
@@ -398,5 +444,353 @@ mod enqueue_parity {
         assert_eq!(kinds(after), kinds(&board_after), "both paths record the same activity");
         assert_eq!(kinds(after).len(), 1, "one move is recorded: {:?}", kinds(after));
         assert!(kinds(after)[0].contains("Moved"), "{:?}", kinds(after));
+    }
+}
+
+#[cfg(test)]
+mod queue_settings {
+    use super::*;
+    use crate::config::paths::AppPaths;
+    use crate::config::Storage;
+
+    fn paths_in(root: &std::path::Path) -> Arc<AppPaths> {
+        Arc::new(AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        ))
+    }
+
+    /// Start the application over `paths`, as a launch does.
+    async fn launch(paths: &Arc<AppPaths>) -> crate::AppState {
+        crate::app_core::build_state_with_paths(paths.clone())
+            .await
+            .expect("build state")
+            .0
+    }
+
+    async fn running(state: &crate::AppState) -> QueueConfig {
+        state.queue.manager.read().await.config().clone()
+    }
+
+    /// Every field different from its default, so a field that is not saved
+    /// or not restored shows.
+    fn every_field_changed() -> QueueConfigPatch {
+        QueueConfigPatch {
+            parallel_task_limit: Some(7),
+            auto_promote: Some(false),
+            fifo_ordering: Some(false),
+            use_coderabbit: Some(false),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_installation_runs_under_the_defaults() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = launch(&paths_in(tmp.path())).await;
+
+        assert_eq!(running(&state).await, QueueConfig::default());
+        assert_eq!(
+            QueueConfig::default(),
+            QueueConfig {
+                parallel_task_limit: 3,
+                auto_promote: true,
+                fifo_ordering: true,
+                use_coderabbit: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn every_field_is_saved_and_applied() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let state = launch(&paths).await;
+
+        let applied = apply_queue_config_patch(&state.queue, &state.storage, every_field_changed())
+            .await
+            .expect("update");
+
+        let expected = QueueConfig {
+            parallel_task_limit: 7,
+            auto_promote: false,
+            fifo_ordering: false,
+            use_coderabbit: false,
+        };
+        assert_eq!(applied, expected);
+        assert_eq!(running(&state).await, expected, "the running Queue");
+        assert_eq!(
+            Storage::with_paths((*paths).clone()).load_config().unwrap().queue,
+            expected,
+            "the saved file"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_names_only_the_fields_it_changes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = launch(&paths_in(tmp.path())).await;
+
+        let applied = apply_queue_config_patch(
+            &state.queue,
+            &state.storage,
+            QueueConfigPatch {
+                auto_promote: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            applied,
+            QueueConfig {
+                auto_promote: false,
+                ..QueueConfig::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_promote_off_survives_a_restart() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        {
+            let state = launch(&paths).await;
+            apply_queue_config_patch(
+                &state.queue,
+                &state.storage,
+                QueueConfigPatch {
+                    auto_promote: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let restarted = launch(&paths).await;
+
+        assert!(
+            !running(&restarted).await.auto_promote,
+            "a restart must not turn automatic promotion back on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_limit_survives_a_restart_and_a_second_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        {
+            let state = launch(&paths).await;
+            apply_queue_config_patch(&state.queue, &state.storage, every_field_changed())
+                .await
+                .unwrap();
+        }
+        {
+            let second = launch(&paths).await;
+            assert_eq!(running(&second).await.parallel_task_limit, 7);
+        }
+
+        let third = launch(&paths).await;
+        assert_eq!(running(&third).await.parallel_task_limit, 7);
+        assert!(!running(&third).await.use_coderabbit);
+        assert!(!running(&third).await.fifo_ordering);
+    }
+
+    #[tokio::test]
+    async fn re_enabling_auto_promote_is_saved_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let state = launch(&paths).await;
+        for auto in [false, true] {
+            apply_queue_config_patch(
+                &state.queue,
+                &state.storage,
+                QueueConfigPatch {
+                    auto_promote: Some(auto),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(running(&launch(&paths).await).await.auto_promote);
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_is_reported_and_changes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The configuration directory is a file, so the settings cannot be
+        // written. Deterministic, with no permission or full-disk tricks.
+        std::fs::write(tmp.path().join("config"), b"not a directory").unwrap();
+        let paths = paths_in(tmp.path());
+        let queue = QueueState::default();
+        let storage = Storage::with_paths((*paths).clone());
+
+        let error = apply_queue_config_patch(&queue, &storage, every_field_changed())
+            .await
+            .expect_err("the write cannot succeed");
+
+        assert!(error.contains("not saved"), "{error}");
+        assert_eq!(
+            queue.manager.read().await.config(),
+            &QueueConfig::default(),
+            "a settings change that was not saved must not be applied either"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_limit_the_queue_cannot_run_under_is_refused_before_anything_is_saved() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let state = launch(&paths).await;
+
+        for limit in [0, 11] {
+            let error = apply_queue_config_patch(
+                &state.queue,
+                &state.storage,
+                QueueConfigPatch {
+                    parallel_task_limit: Some(limit),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("out of range");
+            assert!(error.contains("between 1 and 10"), "{error}");
+        }
+
+        assert_eq!(running(&state).await, QueueConfig::default());
+        assert!(
+            !paths.config_file().exists(),
+            "a refused update must not have written the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_config_written_before_queue_settings_existed_loads_the_defaults_and_keeps_its_other_sections() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "[ui_preferences]\ntheme = \"light\"\nsidebar_width = 410\n\n[jj_config]\ndefault_branch = \"trunk\"\n",
+        )
+        .unwrap();
+
+        let state = launch(&paths).await;
+        assert_eq!(running(&state).await, QueueConfig::default());
+
+        apply_queue_config_patch(
+            &state.queue,
+            &state.storage,
+            QueueConfigPatch {
+                auto_promote: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let saved = Storage::with_paths((*paths).clone()).load_config().unwrap();
+        assert!(!saved.queue.auto_promote);
+        assert_eq!(saved.ui_preferences.theme, "light");
+        assert_eq!(saved.ui_preferences.sidebar_width, 410);
+        assert_eq!(saved.jj_config.default_branch, "trunk");
+    }
+
+    #[tokio::test]
+    async fn a_partial_queue_section_keeps_what_it_says_and_defaults_the_rest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file(), "[queue]\nauto_promote = false\n").unwrap();
+
+        let state = launch(&paths).await;
+
+        assert_eq!(
+            running(&state).await,
+            QueueConfig {
+                auto_promote: false,
+                ..QueueConfig::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queue_section_survives_when_another_section_cannot_be_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "[worktree]\nplacement = \"a-variant-this-build-lacks\"\n\n[queue]\nparallel_task_limit = 2\nauto_promote = false\n",
+        )
+        .unwrap();
+
+        let state = launch(&paths).await;
+
+        let config = running(&state).await;
+        assert!(!config.auto_promote, "paused promotion must not be forgotten");
+        assert_eq!(config.parallel_task_limit, 2);
+    }
+
+    #[tokio::test]
+    async fn the_saved_file_names_the_settings_under_a_queue_section() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let state = launch(&paths).await;
+        apply_queue_config_patch(&state.queue, &state.storage, every_field_changed())
+            .await
+            .unwrap();
+
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        let table: toml::Value = toml::from_str(&text).unwrap();
+        let queue = table.get("queue").expect("a [queue] section");
+        assert_eq!(queue.get("parallel_task_limit").and_then(|v| v.as_integer()), Some(7));
+        assert_eq!(queue.get("auto_promote").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(queue.get("fifo_ordering").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(queue.get("use_coderabbit").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[tokio::test]
+    async fn a_hand_edited_limit_the_queue_cannot_run_under_is_brought_into_range() {
+        for (written, expected) in [(0, 1), (99, 10)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = paths_in(tmp.path());
+            std::fs::create_dir_all(paths.config_dir()).unwrap();
+            std::fs::write(
+                paths.config_file(),
+                format!("[queue]\nparallel_task_limit = {written}\nauto_promote = false\n"),
+            )
+            .unwrap();
+
+            let config = running(&launch(&paths).await).await;
+
+            assert_eq!(config.parallel_task_limit, expected, "written {written}");
+            assert!(!config.auto_promote, "the other fields are kept");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_limit_is_repaired_on_the_recovery_path_without_re_enabling_promotion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        // Another section is unreadable, so the strict load fails and the
+        // recovery path supplies `[queue]`.
+        std::fs::write(
+            paths.config_file(),
+            "[worktree]\nplacement = \"a-variant-this-build-lacks\"\n\n[queue]\nparallel_task_limit = 0\nauto_promote = false\nfifo_ordering = false\n",
+        )
+        .unwrap();
+
+        let config = running(&launch(&paths).await).await;
+
+        assert_eq!(config.parallel_task_limit, 1);
+        assert!(!config.auto_promote, "repairing the limit must not re-enable promotion");
+        assert!(!config.fifo_ordering);
     }
 }

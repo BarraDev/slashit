@@ -159,6 +159,19 @@ own root. A configuration that still says `"auto"` needs no change. Going back
 to an earlier version with it, though, would delegate to `wt` again on a
 machine that has it; set `"managed"` first if that matters.
 
+### Queue settings
+
+The Queue settings (Settings > Queue) are the `[queue]` section of
+`config.toml`: `parallel_task_limit` (1-10), `auto_promote`, `fifo_ordering`
+and `use_coderabbit`. They are read at startup, so a setting survives a
+restart; in particular, `auto_promote = false` keeps queued tasks queued until
+someone turns it back on. A configuration with no `[queue]` section, or with
+only some of its keys, runs the defaults for the rest (limit 3, everything
+else on). A change is saved before it is applied: if the file cannot be
+written, the form shows the error and the running Queue is left as it was.
+When the rest of the file cannot be parsed, the recovery path still keeps
+the `[queue]` section if that section itself is valid.
+
 ### Where a new task branch starts
 
 An ordinary task branch starts at an exact commit resolved from local refs,
