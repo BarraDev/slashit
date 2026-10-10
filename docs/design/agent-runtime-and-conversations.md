@@ -215,5 +215,8 @@ bounded Task visibility, Human-gated Task creation and editing, `DelegateToTask`
 explicit Human approval, and a Task-scoped Worker. Moving or queueing Tasks,
 pull request and CI capabilities, tracker synchronization, Workspace
 Conversations, context compaction, multiple Workers, provider-session resume,
-and richer provider adapters remain future work. ACP remains an adapter
-boundary and is not part of the Project Conversation execution path.
+and richer provider adapters remain future work. The Conversation direction
+is one continuous Conversation per Project with bounded, rebuilt provider
+context, not several concurrent Conversations; see
+[project-conversation-history.md](project-conversation-history.md). ACP remains
+an adapter boundary and is not part of the Project Conversation execution path.
