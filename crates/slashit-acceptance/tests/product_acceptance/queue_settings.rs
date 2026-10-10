@@ -100,6 +100,13 @@ async fn pause_promotion_and_queue_a_task(
         "Queued while automatic promotion is off.",
     )
     .await?;
+    // The window reloads on the page it was last on, which is Settings.
+    page(
+        driver,
+        "localStorage.setItem('slashit_current_page', 'dashboard'); return true;",
+        vec![],
+    )
+    .await?;
     open_board(driver, &prerequisites.project_id).await?;
     open_drawer(driver, &prerequisites.task_id, &prerequisites.title).await?;
     await_drawer_status(driver, "backlog").await?;
