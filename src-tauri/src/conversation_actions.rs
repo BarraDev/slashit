@@ -641,6 +641,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_repeated_request_after_a_rejection_is_a_new_proposal_needing_its_own_approval() {
+        let world = World::new();
+        let mut conversation = world.conversation();
+        let first = world.propose(&mut conversation, CREATE).await.unwrap();
+        decide(&world.scope(), &mut conversation, first, Decision::Reject).await.unwrap();
+
+        // The Human repeats the request and the Coordinator proposes it again.
+        conversation.push(Role::Human, EntryKind::HumanMessage { text: "Add the Task again".into() });
+        let second = world.propose(&mut conversation, CREATE).await.unwrap();
+
+        assert_ne!(first, second, "the repeat is a new proposal, not the old one revived");
+        assert_eq!(conversation.project_action(first).unwrap().status, ProjectActionStatus::Rejected);
+        assert_eq!(conversation.project_action(second).unwrap().status, ProjectActionStatus::Proposed);
+        assert!(world.tasks.read().await.is_empty(), "repeating a request must not create anything");
+
+        // The rejection stays in the durable history and in what the model sees.
+        let rejections = conversation.entries.iter().filter(|e| matches!(
+            e.kind, EntryKind::ProjectActionDecision { action_id, approved: false } if action_id == first
+        )).count();
+        assert_eq!(rejections, 1);
+        let projection = conversation.coordinator_projection("Add the Task again", "Project", None, &[]);
+        let history = projection["recent_history"].as_array().unwrap();
+        let decision = history.iter().find(|e| e["kind"] == "project_action_decision").unwrap();
+        assert_eq!(decision["decision"], "rejected");
+        assert_eq!(decision["scope"], "this_proposal_only");
+
+        // Only a fresh approval of the new proposal applies a mutation.
+        assert!(decide(&world.scope(), &mut conversation, first, Decision::Approve).await.is_err());
+        assert!(world.tasks.read().await.is_empty());
+        decide(&world.scope(), &mut conversation, second, Decision::Approve).await.unwrap();
+        assert_eq!(world.tasks.read().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn repeated_and_restarted_approvals_never_create_a_second_task() {
         let world = World::new();
         let mut conversation = world.conversation();
