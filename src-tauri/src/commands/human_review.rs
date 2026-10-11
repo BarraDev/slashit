@@ -271,10 +271,14 @@ async fn record_approval(state: &crate::AppState, task_id: Uuid) -> Result<Task,
     }
 
     let now = chrono::Utc::now();
+    // The exact commit being approved, read while the lease is held so that
+    // what is recorded is what the person decided on. Integrating later
+    // merges this commit and nothing newer.
+    let tip = crate::commands::integration::tip_to_approve(state, &task).await;
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(t) = staged.get_mut(&task_id) {
             if t.status == TaskStatus::HumanReview && t.human_review.current_decision().is_none() {
-                t.human_review.push(HumanReviewDecision::Approved, None, now);
+                t.human_review.approve(tip.clone(), now);
                 t.human_review.pr_error = None;
             }
         }
@@ -1102,5 +1106,31 @@ mod tests {
         assert!(deliveries.contains(task_id), "the second attempt is still running");
         drop(second);
         assert!(!deliveries.contains(task_id));
+    }
+
+    #[tokio::test]
+    async fn an_approval_records_the_exact_commit_that_was_approved() {
+        let local = local_project().await;
+        let tip = git(&local.repo, &["rev-parse", &format!("refs/heads/{}", local.branch)]);
+        local.approve().await;
+        let task = local.on_disk();
+        assert_eq!(task.human_review.approved_tip(), Some(tip.as_str()));
+
+        // Work committed afterwards is not covered by it.
+        git(&local.worktree, &["config", "user.email", "test@example.com"]);
+        std::fs::write(local.worktree.join("later.txt"), "later\n").unwrap();
+        git(&local.worktree, &["add", "."]);
+        git(&local.worktree, &["commit", "-q", "-m", "after the approval"]);
+        assert_eq!(local.on_disk().human_review.approved_tip(), Some(tip.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_task_without_a_branch_is_approved_without_a_commit() {
+        let (_tmp, state) = test_state().await;
+        let (project_id, task_id) = seed_in_review(&state).await;
+        approve(&state, task_id, false).await.expect("approved");
+        let task = on_disk(&state, project_id, task_id);
+        assert!(task.human_review.is_approved());
+        assert_eq!(task.human_review.approved_tip(), None);
     }
 }

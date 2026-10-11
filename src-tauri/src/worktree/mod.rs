@@ -3,6 +3,7 @@ mod commit;
 mod default_base;
 pub mod delivery;
 mod diff;
+pub mod integration;
 mod manager;
 mod orphans;
 mod ownership;

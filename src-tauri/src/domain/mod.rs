@@ -14,6 +14,7 @@ pub mod memory;
 pub mod appearance;
 pub mod jira;
 pub mod storage_usage;
+pub mod integration;
 
 pub use repository::*;
 pub use project::*;
@@ -23,6 +24,7 @@ pub use conversation::*;
 pub use agent::*;
 pub use session::*;
 pub use roadmap::*;
+pub use integration::*;
 
 #[cfg(test)]
 mod tests;
