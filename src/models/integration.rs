@@ -325,6 +325,12 @@ impl IntegrationPreview {
         })
     }
 
+    /// Whether the recorded integration also completes the task, so that
+    /// resuming it is resuming to completion.
+    pub fn completes_task(&self) -> bool {
+        self.integration.as_ref().is_some_and(|r| r.completes_task)
+    }
+
     /// Whether Discard is offered for a pending integration: once the branch
     /// holds the work, the backend refuses it.
     pub fn can_discard(&self) -> bool {

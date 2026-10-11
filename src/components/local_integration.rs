@@ -72,13 +72,7 @@ pub fn LocalIntegrationPanel(
         spawn_local(async move {
             match action.await {
                 Ok(updated) => {
-                    let failure = not_completed.filter(|_| !updated.completed_locally()).map(|prefix| {
-                        let reason = updated
-                            .error_message
-                            .clone()
-                            .unwrap_or_else(|| "SlashIt recorded no reason.".to_string());
-                        format!("{prefix}: {reason}")
-                    });
+                    let failure = not_completed.and_then(|prefix| not_completed_message(prefix, &updated));
                     confirming.try_set(false);
                     apply_task.try_run(updated);
                     match failure {
@@ -122,7 +116,15 @@ pub fn LocalIntegrationPanel(
         run(Box::pin(action), "Task completed.", Some("The task was not completed"));
     };
     let resume = move |_| {
-        run(Box::pin(resume_local_integration(task_id.to_string())), "Integration finished. Nothing was pushed.", None);
+        // A pending record that carries the intent to complete is resumed to
+        // completion, so a task that is still in review is not a success.
+        let completes = preview.with_untracked(|p| p.as_ref().is_some_and(IntegrationPreview::completes_task));
+        let (done, not_completed) = if completes {
+            ("Integrated and completed. Nothing was pushed.", Some("The work is integrated, but the task was not completed"))
+        } else {
+            ("Integration finished. Nothing was pushed.", None)
+        };
+        run(Box::pin(resume_local_integration(task_id.to_string())), done, not_completed);
     };
     let discard = move |_| {
         run(Box::pin(discard_local_integration(task_id.to_string())), "Integration record discarded. Discard touches no file.", None);
@@ -167,7 +169,7 @@ pub fn LocalIntegrationPanel(
                     }
                     PreviewState::Pending => {
                         let note = p.pending_note();
-                        let completes = p.integration.as_ref().is_some_and(|r| r.completes_task);
+                        let completes = p.completes_task();
                         let record = p.integration.clone();
                         let can_discard = p.can_discard();
                         let problems = p.checkout_problems.clone();
@@ -341,7 +343,85 @@ pub fn LocalIntegrationPanel(
     }
 }
 
+/// The explanation for a completing action whose answer is a task that did
+/// not complete, or `None` when it did. `prefix` says what is already true.
+fn not_completed_message(prefix: &str, task: &Task) -> Option<String> {
+    (!task.completed_locally()).then(|| {
+        let reason = task.error_message.as_deref().unwrap_or("SlashIt recorded no reason.");
+        format!("{prefix}: {reason}")
+    })
+}
+
 /// Whether a task has an integration record that says it finished.
 pub fn is_integrated(task: &Task) -> bool {
     task.local_integration.as_ref().is_some_and(|r| r.state == IntegrationState::Integrated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::TaskStatus;
+
+    fn task(status: TaskStatus) -> Task {
+        serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "project_id": Uuid::new_v4(),
+            "title": "t",
+            "description": null,
+            "status": status,
+            "model": "default",
+            "planning_mode": false,
+            "dependencies": [],
+            "workspace_id": null,
+            "jj_change_id": null,
+            "category": "feature",
+            "priority": "medium",
+            "complexity": "moderate",
+            "impact": "medium",
+            "security_severity": "none",
+            "phase": "complete",
+            "phase_progress": 0,
+            "overall_progress": 90,
+            "subtasks": [],
+            "sequence_number": 0,
+            "github_issue_url": null,
+            "gitlab_issue_url": null,
+            "linear_ticket_id": null,
+            "pr_url": null,
+            "qa_signoff": null,
+            "stuck_since": null,
+            "created_at": chrono::Utc::now(),
+            "updated_at": chrono::Utc::now(),
+        }))
+        .expect("a task as the backend sends it")
+    }
+
+    const PREFIX: &str = "The work is integrated, but the task was not completed";
+
+    /// A resumed integration whose checkout the completion could not remove:
+    /// the backend answers `Ok` with the task still in Human Review and the
+    /// reason recorded.
+    #[test]
+    fn a_resumed_integration_whose_checkout_cleanup_was_refused_is_not_reported_as_completed() {
+        let mut kept = task(TaskStatus::HumanReview);
+        kept.error_message = Some("The worktree at /w was kept: locked".into());
+        assert_eq!(
+            not_completed_message(PREFIX, &kept).as_deref(),
+            Some("The work is integrated, but the task was not completed: The worktree at /w was kept: locked")
+        );
+        kept.error_message = None;
+        assert_eq!(
+            not_completed_message(PREFIX, &kept).as_deref(),
+            Some("The work is integrated, but the task was not completed: SlashIt recorded no reason.")
+        );
+    }
+
+    #[test]
+    fn a_task_that_completed_has_nothing_to_explain() {
+        let mut done = task(TaskStatus::Done);
+        let mut entries = Vec::new();
+        slashit_activity::record(&mut entries, chrono::Utc::now(), slashit_activity::Kind::CompletedLocally);
+        done.activity = entries;
+        assert_eq!(not_completed_message(PREFIX, &done), None);
+    }
 }

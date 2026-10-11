@@ -693,6 +693,30 @@ async fn a_crash_after_the_destination_moved_records_it_and_completes_without_mo
     assert_eq!(tip_of(&fx.repo, "main"), plan.result);
 }
 
+/// Resuming to completion can finish the integration and still not complete
+/// the task: the answer is `Ok` with the task in review and the reason, which
+/// the drawer must not report as a completion.
+#[tokio::test]
+async fn resuming_an_integration_whose_checkout_cannot_be_removed_keeps_the_task_in_review() {
+    let fx = fixture().await;
+    let plan = pending_unmoved(&fx).await;
+    run(&fx.repo, &["worktree", "lock", fx.worktree.to_str().unwrap()]);
+
+    let kept = resume(&fx.state, fx.task_id).await.expect("integrated, not completed");
+    assert_eq!(tip_of(&fx.repo, "main"), plan.result, "the destination holds the approved work");
+    assert_eq!(kept.status, TaskStatus::HumanReview, "the task is not reported complete");
+    assert!(!kept.completed_locally());
+    assert!(kept.error_message.as_deref().is_some_and(|m| m.contains("was kept")), "{:?}", kept.error_message);
+    let record = kept.local_integration.clone().expect("the integration is recorded");
+    assert_eq!(record.state, IntegrationState::Integrated);
+    assert_eq!((integrations(&kept), completions(&kept)), (1, 0));
+    assert!(fx.worktree.exists(), "the Task Checkout is kept");
+
+    run(&fx.repo, &["worktree", "unlock", fx.worktree.to_str().unwrap()]);
+    let done = human_review::complete_locally(&fx.state, fx.task_id, true).await.expect("completed");
+    assert_done_and_integrated(&fx, &done, IntegrationStrategy::FastForward);
+}
+
 #[tokio::test]
 async fn a_pending_integration_dropped_before_it_moved_leaves_the_task_in_review() {
     let fx = fixture().await;
