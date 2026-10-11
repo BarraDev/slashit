@@ -159,7 +159,11 @@ async fn refuse_if_local_integration_is_ahead(
     }
     let branch = &base.branch;
     Err(format!(
-        "{repo_path}: the local branch {branch} has work SlashIt integrated into it that          {branch}@origin does not contain, so a task started from {branch}@origin would be          missing that work. SlashIt does not choose between them for you: publish {branch}          (`git push origin {branch}`) or bring {branch}@origin and {branch} together, then start          the task again."
+        "{repo_path}: the local branch {branch} has work SlashIt integrated into it that \
+         {branch}@origin does not contain, so a task started from {branch}@origin would be \
+         missing that work. SlashIt does not choose between them for you: publish {branch} \
+         (`git push origin {branch}`) or bring {branch}@origin and {branch} together, then start \
+         the task again."
     ))
 }
 
@@ -845,6 +849,7 @@ mod tests {
         git(&repo, &["update-ref", &super::super::integration::marker_ref("trunk"), &local]);
         let refused = resolve(&repo).await.unwrap_err();
         assert!(refused.contains("integrated") && refused.contains("git push origin trunk"), "{refused}");
+        assert!(!refused.contains("  "), "no runs of spaces in the message: {refused}");
 
         // The same when the project names `trunk` as its local base: the
         // answer comes from the repository, not from the project record.

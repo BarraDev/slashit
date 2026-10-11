@@ -424,7 +424,11 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
     }
     if plan.strategy != IntegrationStrategy::AlreadyContained {
         if let Some(path) = git::checked_out_at(&p.repo_path, &p.target).await? {
-            out.reason = Some(git::checked_out_message(&p.target, &path, git::short(&approved)));
+            out.reason = Some(git::checked_out_message(
+                &p.target,
+                &path,
+                &git::manual_merge(plan.strategy, &approved),
+            ));
             out.checked_out_at = Some(path);
             return Ok(out);
         }
@@ -526,7 +530,7 @@ pub(crate) async fn integrate(
     }
     if plan.strategy != IntegrationStrategy::AlreadyContained {
         if let Some(path) = git::checked_out_at(&p.repo_path, &p.target).await? {
-            return Err(git::checked_out_message(&p.target, &path, &plan.result));
+            return Err(git::checked_out_message(&p.target, &path, &git::manual_merge(plan.strategy, &plan.result)));
         }
         git::pin(repo, task_id, &plan.result).await?;
     }
@@ -1042,11 +1046,20 @@ mod tests {
     async fn a_checked_out_target_is_refused_with_the_command_to_run_and_nothing_is_changed() {
         let fx = fixture().await;
         git(&fx.repo, &["checkout", "-q", "main"]);
-        let before = tip_of(&fx.repo, "main");
         let p = preview(&fx.state, fx.task_id).await.unwrap();
         assert_eq!(p.state, PreviewState::Refused);
         assert!(p.checked_out_at.is_some());
         assert!(p.reason.as_deref().unwrap().contains("merge --ff-only"));
+
+        // A diverged branch cannot be fast-forwarded, so it is not told to.
+        git(&fx.repo, &["checkout", "-q", "--detach"]);
+        commit_on(&fx.repo, "main", "other.txt", "o\n");
+        git(&fx.repo, &["checkout", "-q", "main"]);
+        let diverged = preview(&fx.state, fx.task_id).await.unwrap();
+        assert_eq!(diverged.strategy, Some(IntegrationStrategy::MergeCommit));
+        let reason = diverged.reason.unwrap();
+        assert!(reason.contains("merge --no-ff") && !reason.contains("--ff-only"), "{reason}");
+        let before = tip_of(&fx.repo, "main");
 
         let err = integrate(
             &fx.state,

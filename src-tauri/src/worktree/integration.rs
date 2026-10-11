@@ -269,7 +269,7 @@ pub async fn advance(repo_path: &str, plan: &Plan) -> Result<(), String> {
         return Ok(());
     }
     if let Some(path) = checked_out_at(repo_path, &plan.target_branch).await? {
-        return Err(checked_out_message(&plan.target_branch, &path, &plan.result));
+        return Err(checked_out_message(&plan.target_branch, &path, &manual_merge(plan.strategy, &plan.result)));
     }
     let message = format!("slashit: integrate {} into {}", short(&plan.approved_tip), plan.target_branch);
     git(
@@ -281,11 +281,23 @@ pub async fn advance(repo_path: &str, plan: &Plan) -> Result<(), String> {
     .map_err(|e| format!("The branch {} was not moved: {e}", plan.target_branch))
 }
 
-pub fn checked_out_message(branch: &str, path: &str, result: &str) -> String {
+/// `command` is the `git merge` invocation, with its arguments, to run in
+/// the checkout that has the branch (see [`manual_merge`]).
+pub fn checked_out_message(branch: &str, path: &str, command: &str) -> String {
     format!(
         "The branch {branch} is checked out in {path}, and SlashIt does not change a checked-out \
-         branch. Nothing was changed. To integrate it yourself, run: git -C {path} merge --ff-only {result}"
+         branch. Nothing was changed. To integrate it yourself, run: git -C {path} {command}"
     )
+}
+
+/// The merge a person can run themselves in the checkout that has the target:
+/// a fast-forward onto `commit` when `strategy` is one (`--ff-only` would
+/// fail for a diverged branch), otherwise a merge of it.
+pub fn manual_merge(strategy: IntegrationStrategy, commit: &str) -> String {
+    match strategy {
+        IntegrationStrategy::MergeCommit => format!("merge --no-ff {commit}"),
+        _ => format!("merge --ff-only {commit}"),
+    }
 }
 
 /// What the target branch says about a plan.
