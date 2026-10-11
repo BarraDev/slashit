@@ -156,6 +156,8 @@ impl Task {
             status: match self.status {
                 TaskStatus::Error => Status::Error,
                 TaskStatus::HumanReview => Status::HumanReview,
+                // Resume and Discard are only offered for work completed locally.
+                TaskStatus::Done if self.completed_locally() => Status::Done,
                 TaskStatus::Backlog
                 | TaskStatus::Queue
                 | TaskStatus::InProgress
@@ -170,6 +172,7 @@ impl Task {
             pr_error_recorded: self.human_review.pr_error.is_some(),
             pr_linked: self.pr_url.is_some() || self.external_refs.iter().any(ExternalRef::is_pr),
             delivery_in_flight,
+            integration_pending: self.local_integration.as_ref().is_some_and(|r| r.state == crate::models::integration::IntegrationState::Pending),
         }
         .needs_you()
     }
@@ -1021,6 +1024,50 @@ mod tests {
         for status in ["backlog", "queue", "in_progress", "ai_review", "pr_created", "done"] {
             assert_eq!(task_json(status, undecided.clone(), None).needs_you(false), None, "{status}");
         }
+    }
+
+    fn with_integration(mut task: Task, state: &str) -> Task {
+        task.local_integration = Some(
+            serde_json::from_value(serde_json::json!({
+                "state": state, "target_branch": "main",
+                "target_old_oid": "a".repeat(40), "approved_tip": "b".repeat(40), "result_oid": "c".repeat(40),
+                "strategy": "fast_forward", "started_at": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap(),
+        );
+        task
+    }
+
+    /// The same table as the backend's `a_pending_integration_needs_the_user_...`.
+    #[test]
+    fn a_pending_integration_needs_the_user_exactly_as_the_backend_says() {
+        let approved = decided("approved", None);
+        let unfinished = AttentionReason::IntegrationUnfinished;
+        let review = |state| with_integration(task_json("human_review", approved.clone(), None), state);
+        assert_eq!(review("pending").needs_you(false), Some(unfinished));
+        assert_eq!(review("pending").needs_you(true), Some(unfinished));
+        assert_eq!(review("integrated").needs_you(false), None);
+        let pr_failed = decided("approved", Some("gh failed"));
+        assert_eq!(
+            with_integration(task_json("human_review", pr_failed, None), "pending").needs_you(false),
+            Some(unfinished)
+        );
+        let undecided = serde_json::json!({ "arrivals": 1, "entries": [] });
+        let other = |status, state| with_integration(task_json(status, undecided.clone(), None), state);
+        assert_eq!(other("done", "pending").needs_you(false), None, "not completed locally: no controls");
+        let completed = |state| {
+            let mut task = other("done", state);
+            task.activity = serde_json::from_value(serde_json::json!([
+                { "seq": 1, "at": "2026-01-01T00:00:00Z", "kind": { "type": "completed_locally" } }
+            ]))
+            .unwrap();
+            task
+        };
+        assert_eq!(completed("pending").needs_you(false), Some(unfinished));
+        assert_eq!(completed("integrated").needs_you(false), None);
+        assert_eq!(other("human_review", "pending").needs_you(false), Some(AttentionReason::Review));
+        assert_eq!(other("error", "pending").needs_you(false), Some(AttentionReason::Failed));
+        assert_eq!(other("queue", "pending").needs_you(false), None);
     }
 
     /// The backend sends `human_review` as a table; a task from before it

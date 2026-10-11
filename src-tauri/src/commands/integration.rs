@@ -1109,6 +1109,7 @@ async fn sweep_orphan_pins(state: &crate::AppState, repo: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::task::AttentionReason;
     use crate::test_helpers::create_test_task_full;
     use std::path::PathBuf;
 
@@ -1660,8 +1661,14 @@ mod tests {
         assert_eq!(tip_of(&fx.repo, "main"), plan.target_old);
         let p = preview(&fx.state, fx.task_id).await.unwrap();
         assert_eq!((p.state, p.observed.as_deref()), (PreviewState::Pending, Some("unmoved")));
+        // What a restart reads: the file alone, with no process that started it.
+        assert_eq!(on_disk(&fx, fx.task_id).needs_you(false), Some(AttentionReason::IntegrationUnfinished));
+        let before = on_disk(&fx, fx.task_id);
 
         let done = resume(&fx.state, fx.task_id).await.unwrap();
+        assert_eq!(done.needs_you(false), None, "resuming resolves the attention");
+        assert_eq!(on_disk(&fx, fx.task_id).needs_you(false), None);
+        assert_eq!(before.status, done.status, "attention is computed, never a status change");
         assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
         assert_eq!(tip_of(&fx.repo, "main"), plan.result);
         assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
@@ -1704,8 +1711,10 @@ mod tests {
     async fn a_pending_integration_can_be_discarded_while_nothing_moved() {
         let fx = fixture().await;
         let plan = pending_unmoved(&fx).await;
+        assert_eq!(on_disk(&fx, fx.task_id).needs_you(false), Some(AttentionReason::IntegrationUnfinished));
         let task = discard(&fx.state, fx.task_id).await.unwrap();
         assert!(task.local_integration.is_none());
+        assert_eq!(task.needs_you(false), None, "discarding resolves the attention");
         assert_eq!(tip_of(&fx.repo, "main"), plan.target_old);
         assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
         assert!(resume(&fx.state, fx.task_id).await.is_err(), "nothing is pending any more");

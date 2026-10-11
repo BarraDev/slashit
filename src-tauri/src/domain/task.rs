@@ -508,6 +508,8 @@ impl Task {
             status: match self.status {
                 TaskStatus::Error => attention::Status::Error,
                 TaskStatus::HumanReview => attention::Status::HumanReview,
+                // Resume and Discard are only offered for work completed locally.
+                TaskStatus::Done if self.completed_locally() => attention::Status::Done,
                 TaskStatus::Backlog
                 | TaskStatus::Queue
                 | TaskStatus::InProgress
@@ -522,6 +524,7 @@ impl Task {
             pr_error_recorded: self.human_review.pr_error.is_some(),
             pr_linked: self.pr_url.is_some() || self.external_refs.iter().any(ExternalRef::is_pr),
             delivery_in_flight,
+            integration_pending: self.local_integration.as_ref().is_some_and(|r| r.is_pending()),
         }
         .needs_you()
     }
@@ -1638,6 +1641,65 @@ mod tests {
         assert_eq!(failed.needs_you(false), Some(AttentionReason::Failed));
     }
 
+    fn integration(state: crate::domain::IntegrationState) -> crate::domain::LocalIntegration {
+        crate::domain::LocalIntegration {
+            state,
+            target_branch: "main".into(),
+            target_old_oid: "a".repeat(40),
+            approved_tip: "b".repeat(40),
+            result_oid: "c".repeat(40),
+            strategy: crate::domain::IntegrationStrategy::FastForward,
+            checkout_path: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            completes_task: false,
+        }
+    }
+
+    /// Both places a pending record can sit: an approved task still in Human
+    /// Review (Complete and Integrate), and a task completed earlier
+    /// (Integrate after completion).
+    #[test]
+    fn a_pending_integration_needs_the_user_until_it_is_integrated_or_discarded() {
+        use crate::domain::IntegrationState::{Integrated, Pending};
+        let mut review = arrived_in_review();
+        review.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        assert_eq!(review.needs_you(false), None);
+        review.local_integration = Some(integration(Pending));
+        assert_eq!(review.needs_you(false), Some(AttentionReason::IntegrationUnfinished));
+        assert_eq!(review.needs_you(true), Some(AttentionReason::IntegrationUnfinished), "a pull request flag does not hide it");
+        review.human_review.pr_error = Some("gh failed".into());
+        assert_eq!(review.needs_you(false), Some(AttentionReason::IntegrationUnfinished), "it outranks PR not created");
+        review.local_integration = Some(integration(Integrated));
+        assert_eq!(review.needs_you(false), Some(AttentionReason::PrNotCreated), "Integrated asks nothing of its own");
+        review.local_integration = None;
+        assert_eq!(review.needs_you(false), Some(AttentionReason::PrNotCreated), "nor does a discarded record");
+
+        let mut done = startable_task();
+        done.status = TaskStatus::Done;
+        done.local_integration = Some(integration(Pending));
+        assert_eq!(done.needs_you(false), None, "a Done task not completed locally offers no Resume or Discard");
+        done.record_activity(ActivityKind::CompletedLocally);
+        assert_eq!(done.needs_you(false), Some(AttentionReason::IntegrationUnfinished));
+        done.local_integration = Some(integration(Integrated));
+        assert_eq!(done.needs_you(false), None);
+
+        // A new arrival that is not decided yet asks for its review.
+        let mut again = arrived_in_review();
+        again.local_integration = Some(integration(Pending));
+        assert_eq!(again.needs_you(false), Some(AttentionReason::Review));
+
+        let mut failed = startable_task();
+        failed.status = TaskStatus::Error;
+        failed.local_integration = Some(integration(Pending));
+        assert_eq!(failed.needs_you(false), Some(AttentionReason::Failed), "a failure is repaired first");
+
+        let mut queued = startable_task();
+        queued.status = TaskStatus::Queue;
+        queued.local_integration = Some(integration(Pending));
+        assert_eq!(queued.needs_you(false), None, "no controls to finish it are offered in this status");
+    }
+
     /// Nothing about attention is stored, so a restart derives the same
     /// answers from the task file alone.
     #[test]
@@ -1653,7 +1715,15 @@ mod tests {
         pr_failed.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
         pr_failed.human_review.pr_error = Some("gh failed".into());
 
-        let tasks = vec![failed, undecided, pr_failed];
+        let mut unfinished = arrived_in_review();
+        unfinished.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        unfinished.local_integration = Some(integration(crate::domain::IntegrationState::Pending));
+        let mut unfinished_done = startable_task();
+        unfinished_done.status = TaskStatus::Done;
+        unfinished_done.record_activity(ActivityKind::CompletedLocally);
+        unfinished_done.local_integration = Some(integration(crate::domain::IntegrationState::Pending));
+
+        let tasks = vec![failed, undecided, pr_failed, unfinished, unfinished_done];
         let toml_text = toml::to_string_pretty(&File { tasks: tasks.clone() }).unwrap();
         assert!(!toml_text.contains("attention") && !toml_text.contains("needs_you"), "{toml_text}");
         let loaded: File = toml::from_str(&toml_text).unwrap();
@@ -1663,7 +1733,9 @@ mod tests {
             vec![
                 Some(AttentionReason::Failed),
                 Some(AttentionReason::Review),
-                Some(AttentionReason::PrNotCreated)
+                Some(AttentionReason::PrNotCreated),
+                Some(AttentionReason::IntegrationUnfinished),
+                Some(AttentionReason::IntegrationUnfinished),
             ]
         );
     }

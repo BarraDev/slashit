@@ -113,6 +113,32 @@ mod tests {
             ]
         );
 
+        // An unfinished integration lists its project like any other reason,
+        // for a task still in review and for one completed earlier.
+        let mut unfinished = task(quiet, TaskStatus::Done, 0);
+        unfinished.record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+        unfinished.local_integration = Some(crate::domain::LocalIntegration {
+            state: crate::domain::IntegrationState::Pending,
+            target_branch: "main".into(),
+            target_old_oid: "a".repeat(40),
+            approved_tip: "b".repeat(40),
+            result_oid: "c".repeat(40),
+            strategy: crate::domain::IntegrationStrategy::FastForward,
+            checkout_path: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            completes_task: false,
+        });
+        let mut with_it = all.clone();
+        with_it.insert(unfinished.id, unfinished.clone());
+        assert_eq!(
+            summarize(&with_it, |_| false).last(),
+            Some(&ProjectAttention {
+                project_id: quiet,
+                tasks: vec![TaskAttention { task_id: unfinished.id, reason: AttentionReason::IntegrationUnfinished }],
+            })
+        );
+
         // While its pull request is being opened again, the task in `b`
         // waits on SlashIt, and `b` drops out.
         let summary = summarize(&all, |id| id == pr_failed.id);

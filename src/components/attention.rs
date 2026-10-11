@@ -145,12 +145,14 @@ pub fn next_after(order: &[Uuid], current: Option<Uuid>) -> Option<Uuid> {
 }
 
 /// Classes for a reason's chip: red for a failure, violet for a review,
-/// amber for a pull request that was not created.
+/// amber for a pull request that was not created, orange for an integration
+/// that was started and not finished.
 pub fn chip_classes(reason: AttentionReason) -> &'static str {
     match reason {
         AttentionReason::Failed => "bg-red-500/15 text-red-200 border-red-500/40",
         AttentionReason::Review => "bg-violet-500/15 text-violet-200 border-violet-400/40",
         AttentionReason::PrNotCreated => "bg-amber-500/15 text-amber-200 border-amber-400/40",
+        AttentionReason::IntegrationUnfinished => "bg-orange-500/15 text-orange-200 border-orange-400/40",
     }
 }
 
@@ -285,5 +287,6 @@ mod tests {
         assert!(chip_classes(AttentionReason::Failed).contains("red"));
         assert!(chip_classes(AttentionReason::Review).contains("violet"));
         assert!(chip_classes(AttentionReason::PrNotCreated).contains("amber"));
+        assert!(chip_classes(AttentionReason::IntegrationUnfinished).contains("orange"));
     }
 }
