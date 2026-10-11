@@ -306,6 +306,7 @@ fn a_rows_kind_name_is_its_stored_type() {
         Kind::PrMerged { number: 1 },
         Kind::PrClosed { number: 1 },
         Kind::CompletedLocally,
+        Kind::IntegratedLocally { target: "main".into(), strategy: "fast_forward".into(), commit: "a".repeat(40) },
     ];
     let entries: Vec<Entry> =
         kinds.iter().enumerate().map(|(i, kind)| Entry { seq: i as u32 + 1, at: t(1), kind: kind.clone() }).collect();
@@ -460,5 +461,25 @@ fn a_local_completion_is_recorded_once_and_read_back() {
     let last = items.last().expect("a row");
     assert_eq!(last.title(), "Completed locally, not merged");
     assert_eq!(last.kind_name(), "completed_locally");
+    assert_eq!(last.tone(), Tone::Good);
+}
+
+#[test]
+fn an_integration_is_recorded_once_per_commit_and_read_back() {
+    let kind = |commit: &str| Kind::IntegratedLocally {
+        target: "main".into(),
+        strategy: "merge_commit".into(),
+        commit: commit.into(),
+    };
+    let mut entries = Vec::new();
+    assert!(record(&mut entries, t(1), kind("aaaa")));
+    assert!(!record(&mut entries, t(2), kind("aaaa")), "the same result is the same milestone");
+    assert!(record(&mut entries, t(3), kind("bbbb")), "a later integration of newer work is its own entry");
+    assert_eq!(entries.len(), 2);
+
+    let items = timeline(t(0), [], &entries);
+    let last = items.last().expect("a row");
+    assert_eq!(last.title(), "Integrated into main");
+    assert_eq!(last.kind_name(), "integrated_locally");
     assert_eq!(last.tone(), Tone::Good);
 }

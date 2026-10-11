@@ -156,6 +156,12 @@ pub enum Kind {
     /// A person completed approved changes locally: the task is Done, its
     /// Task Checkout is gone, and its branch was neither merged nor pushed.
     CompletedLocally,
+    /// A person integrated approved changes into a local branch. The Task's
+    /// branch was kept, and nothing was pushed. `commit` is the commit the
+    /// target branch was advanced to, `strategy` how (`fast_forward`,
+    /// `merge_commit`, or `already_contained` when the target already held
+    /// the work and nothing moved).
+    IntegratedLocally { target: String, strategy: String, commit: String },
 }
 
 fn one() -> u32 {
@@ -187,6 +193,7 @@ impl Kind {
             Self::PrMerged { number } => Identity::PrMerged(*number),
             Self::PrClosed { number } => Identity::PrClosed(*number),
             Self::CompletedLocally => Identity::CompletedLocally,
+            Self::IntegratedLocally { commit, .. } => Identity::IntegratedLocally(commit),
             Self::Moved { .. }
             | Self::ToolUsed { .. }
             | Self::ToolsOmitted { .. }
@@ -215,6 +222,7 @@ enum Identity<'a> {
     PrMerged(u32),
     PrClosed(u32),
     CompletedLocally,
+    IntegratedLocally(&'a str),
 }
 
 /// Append `kind` at `at`, unless it is a once-only milestone already
@@ -492,7 +500,8 @@ impl Item<'_> {
                 | Kind::AiFixApplied { .. }
                 | Kind::PrLinked { .. }
                 | Kind::PrMerged { .. }
-                | Kind::CompletedLocally => Tone::Good,
+                | Kind::CompletedLocally
+                | Kind::IntegratedLocally { .. } => Tone::Good,
                 Kind::ReadyForReview { .. } => Tone::Attention,
                 Kind::Moved { to: Column::Done, .. } => Tone::Good,
                 _ => Tone::Neutral,
@@ -546,6 +555,7 @@ impl Item<'_> {
                 Kind::PrMerged { .. } => "pr_merged",
                 Kind::PrClosed { .. } => "pr_closed",
                 Kind::CompletedLocally => "completed_locally",
+                Kind::IntegratedLocally { .. } => "integrated_locally",
             },
         }
     }
@@ -592,6 +602,7 @@ fn kind_title(kind: &Kind) -> String {
         Kind::PrMerged { .. } => "Pull request merged".to_string(),
         Kind::PrClosed { .. } => "Pull request closed without merge".to_string(),
         Kind::CompletedLocally => "Completed locally, not merged".to_string(),
+        Kind::IntegratedLocally { target, .. } => format!("Integrated into {target}"),
     }
 }
 
@@ -608,6 +619,10 @@ fn kind_detail(kind: &Kind) -> Option<String> {
         }
         Kind::PrLinked { number: Some(number), .. } => Some(format!("#{number}")),
         Kind::PrMerged { number } | Kind::PrClosed { number } => Some(format!("#{number}")),
+        Kind::IntegratedLocally { strategy, commit, .. } => {
+            let short: String = commit.chars().take(12).collect();
+            Some(format!("{} {short}", strategy.replace('_', " ")))
+        }
         _ => None,
     }
 }

@@ -38,6 +38,13 @@
 //! 4. Otherwise the task is refused with a message saying what to do. A
 //!    remote not called `origin` is never read as a remote default branch.
 //!
+//! Step 1 has one exception: a repository where SlashIt has integrated work
+//! into local branch `D` (it records a marker ref, see
+//! `integration::marker_ref`) is not started from `origin/D` while local `D`
+//! has commits `origin/D` lacks. Adding or fetching a remote later therefore
+//! never silently swaps in a line without that work; the task is refused
+//! with what to do.
+//!
 //! A malformed `refs/remotes/origin/HEAD` (pointing outside `origin`, or at a
 //! ref no branch can start from) is refused at step 1 even when the project
 //! has a local base: it is a repository setup that needs fixing, not an
@@ -116,12 +123,44 @@ pub async fn resolve_default_base(
         return Err(refused);
     }
     if let Some(base) = resolve_remote_base(repo, repo_path).await? {
+        refuse_if_local_integration_is_ahead(repo, repo_path, &base).await?;
         return Ok(base);
     }
     match project_base {
         Some(base) => resolve_local_base(repo, repo_path, base.branch()).await,
         None => Err(refusal(repo, repo_path).await),
     }
+}
+
+/// Origin's branch must not replace a local branch SlashIt has integrated
+/// work into while that work is not on origin yet.
+///
+/// Adding a remote later, or fetching one, makes `origin/<D>` readable, and
+/// step 1 would then start new tasks from it: from a line that lacks the
+/// integrated work, and with no sign that it was dropped. So when this
+/// repository carries the marker that SlashIt integrates into `D`
+/// (`integration::marker_ref`), a local `D` that has commits `origin/D` does
+/// not is refused, with what to do. A repository without the marker, and a
+/// local `D` that origin's contains, behave exactly as before. This asks
+/// Git, not any task's record.
+async fn refuse_if_local_integration_is_ahead(
+    repo: &Path,
+    repo_path: &str,
+    base: &ResolvedBase,
+) -> Result<(), String> {
+    if !super::integration::has_marker(repo, &base.branch).await? {
+        return Ok(());
+    }
+    let Some(local) = local_branch_commit(repo, &base.branch).await? else {
+        return Ok(());
+    };
+    if super::restack::is_ancestor(repo, &local, &base.commit).await? {
+        return Ok(());
+    }
+    let branch = &base.branch;
+    Err(format!(
+        "{repo_path}: the local branch {branch} has work SlashIt integrated into it that          {branch}@origin does not contain, so a task started from {branch}@origin would be          missing that work. SlashIt does not choose between them for you: publish {branch}          (`git push origin {branch}`) or bring {branch}@origin and {branch} together, then start          the task again."
+    ))
 }
 
 /// Steps 1 and 2 of the module documentation: origin's default branch, or
@@ -789,5 +828,49 @@ mod tests {
         assert!(resolve(&repo).await.is_err(), "not a JJ repository");
 
         assert_eq!(fake.invocations(), "");
+    }
+    /// Locally integrated work that origin does not have yet must not be
+    /// silently left behind when a remote is added: new tasks are refused,
+    /// not started from the older `origin/<D>`.
+    #[tokio::test]
+    async fn a_local_branch_with_integrated_work_ahead_of_origin_is_not_silently_replaced() {
+        let (_temp, repo, origin_tip) = cloned_repo();
+        // A repository SlashIt has not integrated into behaves as it always
+        // did, however far ahead its local branch is.
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "ahead"]);
+        assert_eq!(resolve(&repo).await.unwrap().commit, origin_tip);
+
+        // Once it has integrated into `trunk`, the same state is refused.
+        let local = git(&repo, &["rev-parse", "refs/heads/trunk"]);
+        git(&repo, &["update-ref", &super::super::integration::marker_ref("trunk"), &local]);
+        let refused = resolve(&repo).await.unwrap_err();
+        assert!(refused.contains("integrated") && refused.contains("git push origin trunk"), "{refused}");
+
+        // The same when the project names `trunk` as its local base: the
+        // answer comes from the repository, not from the project record.
+        let base = ProjectBase::LocalBranch { branch: "trunk".to_string() };
+        assert!(resolve_default_base(repo.to_str().unwrap(), Some(&base)).await.is_err());
+
+        // Publishing it, or origin being ahead of it, ends the refusal.
+        git(&repo, &["push", "-q", "origin", "trunk"]);
+        git(&repo, &["fetch", "-q", "origin"]);
+        assert_eq!(resolve(&repo).await.unwrap().commit, local);
+    }
+
+    #[tokio::test]
+    async fn a_diverged_local_branch_with_integrated_work_is_refused_and_a_behind_one_is_not() {
+        let (_temp, repo, _) = cloned_repo();
+        let first = git(&repo, &["rev-parse", "refs/heads/trunk"]);
+        git(&repo, &["update-ref", &super::super::integration::marker_ref("trunk"), &first]);
+
+        // Origin moves on; the local branch is behind: origin's contains it.
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "origin only"]);
+        git(&repo, &["push", "-q", "origin", "trunk"]);
+        git(&repo, &["reset", "-q", "--hard", &first]);
+        assert!(resolve(&repo).await.is_ok(), "behind origin: starting from origin loses nothing");
+
+        // Local work that origin lacks, on top of the old commit: diverged.
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "local only"]);
+        assert!(resolve(&repo).await.is_err());
     }
 }

@@ -173,6 +173,14 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_republish: Option<PendingRepublish>,
 
+    /// The latest integration of this task's approved work into a local
+    /// branch, finished or still pending. `None` for a task never
+    /// integrated by SlashIt, which is what every earlier record loads as.
+    /// Whether the task's *current* approved work is integrated is never
+    /// answered from this alone; see `commands::integration`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_integration: Option<crate::domain::LocalIntegration>,
+
     /// A destructive worktree cleanup was started for this task and this
     /// process has not yet durably recorded its outcome.
     ///
@@ -367,6 +375,7 @@ impl Task {
             base_commit: None,
             branch_origin: None,
             pending_republish: None,
+            local_integration: None,
             cleanup_in_flight: false,
             pr_review_plan: None,
             activity: Vec::new(),
@@ -1133,6 +1142,16 @@ pub struct HumanReviewEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
     pub decided_at: chrono::DateTime<chrono::Utc>,
+    /// The full object ID of the task branch's tip when this approval was
+    /// recorded: the exact commit that was reviewed and approved. `None` for
+    /// an approval recorded before this existed, or for a task with no
+    /// branch. Only an approval carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_tip: Option<String>,
+    /// The tip was not recorded with the approval but confirmed later by a
+    /// person who was shown that exact commit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tip_reconfirmed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1198,7 +1217,44 @@ impl HumanReviewRecord {
             decision,
             feedback,
             decided_at,
+            approved_tip: None,
+            tip_reconfirmed: false,
         });
+    }
+
+    /// Append an approval made now, of the commit `tip` (when the task has a
+    /// branch).
+    pub fn approve(&mut self, tip: Option<String>, decided_at: chrono::DateTime<chrono::Utc>) {
+        self.push(HumanReviewDecision::Approved, None, decided_at);
+        if let Some(entry) = self.entries.last_mut() {
+            entry.approved_tip = tip;
+        }
+    }
+
+    /// The commit the current approval covers, if the approval recorded one.
+    pub fn approved_tip(&self) -> Option<&str> {
+        self.current_decision()
+            .filter(|e| e.decision == HumanReviewDecision::Approved)
+            .and_then(|e| e.approved_tip.as_deref())
+    }
+
+    /// Record `tip` on the current approval, which has none, because a
+    /// person was shown exactly that commit and confirmed it. Returns
+    /// whether anything was recorded.
+    pub fn reconfirm_tip(&mut self, tip: &str) -> bool {
+        let arrivals = self.arrivals;
+        match self.entries.last_mut() {
+            Some(e)
+                if e.arrival == arrivals
+                    && e.decision == HumanReviewDecision::Approved
+                    && e.approved_tip.is_none() =>
+            {
+                e.approved_tip = Some(tip.to_string());
+                e.tip_reconfirmed = true;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -1731,6 +1787,40 @@ mod tests {
             assert_eq!(loaded.branch_origin.as_ref(), Some(&origin), "{json}");
         }
     }
+
+    #[test]
+    fn an_approval_carries_the_commit_it_approved_and_only_an_unrecorded_one_can_be_reconfirmed() {
+        let mut review = HumanReviewRecord::default();
+        review.record_arrival();
+        review.approve(Some("a".repeat(40)), chrono::Utc::now());
+        assert_eq!(review.approved_tip(), Some("a".repeat(40).as_str()));
+        assert!(!review.reconfirm_tip(&"b".repeat(40)), "a recorded commit is not replaced");
+        assert_eq!(review.approved_tip(), Some("a".repeat(40).as_str()));
+
+        let mut legacy = HumanReviewRecord::default();
+        legacy.record_arrival();
+        legacy.approve(None, chrono::Utc::now());
+        assert_eq!(legacy.approved_tip(), None);
+        assert!(legacy.reconfirm_tip(&"b".repeat(40)));
+        assert!(legacy.entries[0].tip_reconfirmed);
+        assert_eq!(legacy.approved_tip(), Some("b".repeat(40).as_str()));
+
+        // Going back to work retires the approval, and with it the commit.
+        legacy.withdraw_approval();
+        assert_eq!(legacy.approved_tip(), None);
+        assert!(!legacy.reconfirm_tip(&"c".repeat(40)));
+    }
+
+    #[test]
+    fn records_written_before_approved_commits_and_integrations_load_unchanged() {
+        let entry: HumanReviewEntry = serde_json::from_value(serde_json::json!({
+            "sequence": 1, "arrival": 1, "decision": "approved", "decided_at": "2024-01-01T00:00:00Z"
+        }))
+        .expect("an earlier entry");
+        assert_eq!((entry.approved_tip, entry.tip_reconfirmed), (None, false));
+        let task: Task = toml::from_str(LEGACY_TASK_TOML).expect("an earlier task");
+        assert!(task.local_integration.is_none());
+        let written = toml::to_string(&task).unwrap();
+        assert!(!written.contains("local_integration"), "an absent record is not written");
+    }
 }
-
-

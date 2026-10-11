@@ -5,6 +5,7 @@ Domain models shared across backend modules. These types define the core data st
 ## Models
 
 - **agent.rs** - Agent types and status
+- **integration.rs** - The durable record of integrating a Task's approved commit into a local branch
 - **project.rs** - Project definition and metadata
 - **repository.rs** - Repository configuration
 - **session.rs** - Chat session with agents

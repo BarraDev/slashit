@@ -148,6 +148,7 @@ pub async fn import_jira_issues(
             base_commit: None,
             branch_origin: None,
             pending_republish: None,
+            local_integration: None,
             cleanup_in_flight: false,
             pr_review_plan: None,
             activity: Vec::new(),
