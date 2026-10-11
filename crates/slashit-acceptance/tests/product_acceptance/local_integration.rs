@@ -36,6 +36,8 @@ const LI_DISCARD: &str = "[data-testid=\"local-integration-discard\"]";
 const LI_REFUSED: &str = "[data-testid=\"local-integration-refused\"]";
 const LI_REASON: &str = "[data-testid=\"local-integration-reason\"]";
 const LI_CONFLICTS: &str = "[data-testid=\"local-integration-conflicts\"]";
+const LI_ERROR: &str = "[data-testid=\"local-integration-error\"]";
+const LI_ERROR_DISMISS: &str = "[data-testid=\"local-integration-error-dismiss\"]";
 const LI_COMPLETION: &str = "[data-testid=\"local-integration-completion\"]";
 
 const SETTINGS_REPOSITORY_TAB: &str = "[data-testid=\"settings-tab-repository\"]";
@@ -1053,4 +1055,159 @@ async fn complete_and_integrate_from_review(driver: &WebDriver, repository: &Git
     }
     assert_persisted(repository.state_root(), &executed, "done")?;
     Ok(Integrated { task: executed, work_file, tip })
+}
+
+// --- Journey: a destination that moves after the confirmation opened --------------
+
+/// A person opens the confirmation for a fast-forward, and `main` moves on
+/// while it is open. Confirming is refused by Git's own check and changes
+/// nothing; the box closes instead of turning into a confirmation of the new
+/// plan; the reason stays until it is dismissed; and the new plan (a merge
+/// commit onto the moved `main`) is integrated only after it is opened and
+/// confirmed again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_destination_that_moves_while_the_confirmation_is_open_is_refused_and_needs_a_new_confirmation() {
+    let context = TestContext::new("stale_integration_confirmation").expect("harness setup");
+    let outcome = stale_confirmation_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn stale_confirmation_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+    let (_agent, gh) = install_fakes(context, &root)?;
+    context.set_child_env(fake_agent::WRITE_OWN_FILE_VAR, "1");
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("stale-integration-confirmation").await?;
+    let outcome = stale_confirmation(session.driver(), &repository).await;
+    context.close_session(session, "stale-integration-confirmation", &outcome).await?;
+    outcome?;
+    if !gh.invocations()?.is_empty() {
+        bail!("integrating ran gh: {:?}", gh.invocations()?);
+    }
+    Ok(())
+}
+
+async fn stale_confirmation(driver: &WebDriver, repository: &GitFixture) -> Result<()> {
+    let repo = repository.path_buf();
+    let project_id = register_project(driver, repository).await?;
+    let (task_id, title) = create_task(driver, &project_id, "Stale confirmation journey", &[]).await?;
+    let executed = run_to_review(driver, &project_id, &task_id, &title).await?;
+    let branch = branch_name_of(&read_task(driver, &executed).await?)?;
+    let tip = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+    let main_a = repository.branch_tip("main")?.context("main is missing")?;
+    let origin_before = repository.pushed_branches()?;
+    assert_main_checked_out_and_clean(repository)?;
+
+    open_board(driver, &project_id).await?;
+    open_reviewed_drawer(driver, &executed).await?;
+    await_text(driver, HR_APPROVE, |t| t != "Checking…", "the approve action").await?;
+    dismiss_toasts(driver).await?;
+    click(driver, HR_APPROVE, "Approve").await?;
+    ui::visible(driver, HR_APPROVED).await.context("the drawer does not say Approved")?;
+    await_attribute(driver, LI_READY, "data-state", "ready_in_checkout").await?;
+
+    // --- The confirmation is opened for a fast-forward onto A -----------------
+    dismiss_toasts(driver).await?;
+    click(driver, LI_START, "Complete and Integrate").await?;
+    ui::visible(driver, LI_CONFIRM_BOX).await.context("Complete and Integrate did not ask first")?;
+    let facts = await_text(driver, LI_FACTS, |t| !t.is_empty(), "the facts to confirm").await?;
+    for expected in [format!("Current destination commit: {}", short(&main_a)), "Strategy: Fast-forward".to_string()] {
+        if !facts.contains(&expected) {
+            bail!("the first confirmation does not say {expected:?}: {facts:?}");
+        }
+    }
+
+    // --- main moves on while the box is open -----------------------------------
+    std::fs::write(repo.join("moved-meanwhile.txt"), "committed on main while confirming\n")?;
+    git_out(&repo, &["add", "moved-meanwhile.txt"])?;
+    git_out(&repo, &["commit", "--quiet", "-m", "main moved while confirming"])?;
+    let main_b = repository.branch_tip("main")?.context("main is missing")?;
+    if main_b == main_a {
+        bail!("this journey proves nothing: main did not move");
+    }
+
+    // --- One click: Git refuses, nothing changes, the reason is shown ----------
+    dismiss_toasts(driver).await?;
+    click(driver, LI_CONFIRM, "the stale Complete and Integrate confirmation").await?;
+    let reason = await_text(driver, LI_ERROR, |t| t.contains("moved after"), "the refusal of the stale confirmation").await?;
+    await_hidden(driver, LI_CONFIRM_BOX, "the stale confirmation").await?;
+    assert_stale_refusal_changed_nothing(driver, repository, &executed, &main_b, &origin_before).await?;
+
+    // The refusal outlives the refresh that follows it (the panel now holds
+    // the moved destination); the box does not reopen by itself, whatever the
+    // refreshed plan now is.
+    await_attribute(driver, LI_READY, "data-target-tip", &main_b).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    if !text_of_panel(driver, LI_ERROR).await?.contains(&reason) {
+        bail!("the reason did not stay: {:?}", text_of_panel(driver, LI_ERROR).await?);
+    }
+    if count(driver, LI_CONFIRM_BOX).await? != 0 {
+        bail!("the confirmation reopened without being asked");
+    }
+    assert_stale_refusal_changed_nothing(driver, repository, &executed, &main_b, &origin_before).await?;
+
+    // Only the person dismisses it.
+    click(driver, LI_ERROR_DISMISS, "dismiss the refusal").await?;
+    await_hidden(driver, LI_ERROR, "the dismissed refusal").await?;
+
+    // --- A new confirmation shows the new plan, and confirming it works --------
+    dismiss_toasts(driver).await?;
+    click(driver, LI_START, "Complete and Integrate").await?;
+    ui::visible(driver, LI_CONFIRM_BOX).await.context("the new plan was not offered for confirmation")?;
+    let facts = await_text(driver, LI_FACTS, |t| t.contains("Strategy: "), "the facts of the new plan").await?;
+    for expected in [format!("Current destination commit: {}", short(&main_b)), "Strategy: Merge commit".to_string()] {
+        if !facts.contains(&expected) {
+            bail!("the new confirmation does not say {expected:?}: {facts:?}");
+        }
+    }
+    dismiss_toasts(driver).await?;
+    click(driver, LI_CONFIRM, "the new Complete and Integrate confirmation").await?;
+    await_status(driver, &project_id, &executed.id, &["done"]).await?;
+    await_worktree_removal(repository, &executed.worktree_path).await?;
+    let said = await_text(driver, LI_RESULT, |t| t.contains("Integrated into main"), "the integration result").await?;
+    if !said.contains("merge commit") {
+        bail!("the result says {said:?}");
+    }
+    let parents = git_out(&repo, &["rev-list", "--parents", "-n", "1", "main"])?;
+    let parents: Vec<&str> = parents.split_whitespace().skip(1).collect();
+    if parents != [main_b.as_str(), tip.as_str()] {
+        bail!("the merge commit has parents {parents:?}, not [{main_b}, {tip}]");
+    }
+    assert_main_checked_out_and_clean(repository)?;
+    if repository.pushed_branches()? != origin_before {
+        bail!("integrating pushed something to origin");
+    }
+    Ok(())
+}
+
+/// A refused stale confirmation left no trace: `main` is where its owner put
+/// it, the task is in review with no integration record and its checkout, and
+/// no pin ref was left behind.
+async fn assert_stale_refusal_changed_nothing(
+    driver: &WebDriver,
+    repository: &GitFixture,
+    task: &ExecutedTask,
+    main_b: &str,
+    origin_before: &str,
+) -> Result<()> {
+    if repository.branch_tip("main")?.as_deref() != Some(main_b) {
+        bail!("the refused confirmation moved main");
+    }
+    let settled = read_task(driver, task).await?;
+    if settled.get("status").and_then(Value::as_str) != Some("human_review")
+        || integration_of(&settled).is_some()
+        || !task.worktree_path.exists()
+    {
+        bail!("the refused confirmation changed the task: {settled}");
+    }
+    let repo = repository.path_buf();
+    let pins = git_out(&repo, &["for-each-ref", "refs/slashit/integration"])?;
+    if !pins.is_empty() {
+        bail!("the refused confirmation left a pin: {pins}");
+    }
+    if repository.pushed_branches()? != origin_before {
+        bail!("the refused confirmation pushed something to origin");
+    }
+    Ok(())
 }

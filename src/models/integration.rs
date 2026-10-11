@@ -179,6 +179,46 @@ impl IntegrationPreview {
         })
     }
 
+    /// How `current` differs from this preview, which a person confirmed, as
+    /// lines they can read. Empty when it is the same plan; any difference in
+    /// what the confirmation shows means they did not confirm `current`.
+    pub fn plan_changes(&self, current: &IntegrationPreview) -> Vec<String> {
+        if self == current {
+            return Vec::new();
+        }
+        let mut changes = Vec::new();
+        if self.state != current.state {
+            changes.push(match (current.state, current.reason.as_deref()) {
+                (PreviewState::Ready | PreviewState::ReadyInCheckout | PreviewState::AlreadyContained, _) => {
+                    "The kind of integration changed.".to_string()
+                }
+                (_, Some(reason)) => format!("It can no longer be integrated as planned: {reason}"),
+                (_, None) => "It can no longer be integrated as planned.".to_string(),
+            });
+        }
+        let before = self.facts();
+        let after = current.facts();
+        for (label, old) in &before {
+            match after.iter().find(|(l, _)| l == label) {
+                Some((_, new)) if new != old => changes.push(format!("{label}: {old} is now {new}.")),
+                None => changes.push(format!("{label}: {old} no longer applies.")),
+                Some(_) => {}
+            }
+        }
+        for (label, new) in &after {
+            if !before.iter().any(|(l, _)| l == label) {
+                changes.push(format!("{label}: {new} is new."));
+            }
+        }
+        if self.commits != current.commits {
+            changes.push("The commits the branch gains changed.".to_string());
+        }
+        if changes.is_empty() {
+            changes.push("Other details of the plan changed.".to_string());
+        }
+        changes
+    }
+
     /// The facts a person confirms, one line each, label first.
     pub fn facts(&self) -> Vec<(&'static str, String)> {
         let mut facts = Vec::new();
@@ -560,5 +600,51 @@ mod tests {
         let p: IntegrationPreview = serde_json::from_value(serde_json::json!({ "state": "refused", "reason": "no" })).unwrap();
         assert_eq!(p.state, PreviewState::Refused);
         assert!(!p.has_remote && p.checkout_problems.is_empty() && p.commits.is_empty());
+    }
+
+    #[test]
+    fn the_same_plan_asked_again_is_not_a_change() {
+        let shown = preview(PreviewState::Ready);
+        assert!(shown.plan_changes(&shown.clone()).is_empty());
+    }
+
+    #[test]
+    fn a_destination_that_moved_changes_the_plan_and_says_what_changed() {
+        let shown = preview(PreviewState::Ready);
+        let mut moved = shown.clone();
+        moved.target_tip = Some(oid('d'));
+        moved.strategy = Some(IntegrationStrategy::MergeCommit);
+        moved.commits = vec!["ddddddd other".into(), "bbbbbbb add file".into()];
+        let changes = shown.plan_changes(&moved).join("\n");
+        assert!(changes.contains("Current destination commit: aaaaaaaaaaaa is now dddddddddddd."), "{changes}");
+        assert!(changes.contains("Strategy: Fast-forward is now Merge commit."), "{changes}");
+        assert!(changes.contains("commits the branch gains changed"), "{changes}");
+    }
+
+    #[test]
+    fn every_field_the_confirmation_names_changes_the_plan() {
+        let shown = preview(PreviewState::Ready);
+        let edits: [fn(&mut IntegrationPreview); 6] = [
+            |p| p.target_branch = Some("release".into()),
+            |p| p.approved_tip = Some("e".repeat(40)),
+            |p| p.checked_out_at = Some("/work/repo".into()),
+            |p| p.strategy = Some(IntegrationStrategy::AlreadyContained),
+            |p| p.state = PreviewState::ReadyInCheckout,
+            |p| p.unapproved_commits = 2,
+        ];
+        for (i, edit) in edits.iter().enumerate() {
+            let mut other = shown.clone();
+            edit(&mut other);
+            assert!(!shown.plan_changes(&other).is_empty(), "edit {i} went unnoticed");
+        }
+    }
+
+    #[test]
+    fn a_plan_that_became_a_refusal_carries_the_reason() {
+        let shown = preview(PreviewState::Ready);
+        let mut refused = preview(PreviewState::Refused);
+        refused.reason = Some("main has uncommitted changes".into());
+        let changes = shown.plan_changes(&refused).join("\n");
+        assert!(changes.contains("can no longer be integrated as planned: main has uncommitted changes"), "{changes}");
     }
 }

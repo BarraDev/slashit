@@ -6,9 +6,12 @@
 //! The panel asks the backend what integrating would do (nothing is changed
 //! by asking), shows the destination, the exact commits, the strategy and
 //! the checkout it would affect, and integrates only after a deliberate
-//! confirmation of exactly what was shown. Nothing here pushes, and nothing
-//! decides on its own that something succeeded: a command's answer replaces
-//! the task, and its refusal is shown in place.
+//! confirmation of exactly what was shown. That confirmation is a snapshot of
+//! the plan taken when it was opened: it is what the box shows and what a
+//! click sends, and it is closed, never silently replaced, when a later look
+//! finds a different plan or a command refuses it. Nothing here pushes, and
+//! nothing decides on its own that something succeeded: a command's answer
+//! replaces the task, and its refusal stays in place until it is dismissed.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -33,20 +36,52 @@ pub fn LocalIntegrationPanel(
     completing: bool,
 ) -> impl IntoView {
     let preview = RwSignal::new(None::<IntegrationPreview>);
+    // Why the last action was refused. Only a person dismisses it, or starts
+    // the next action: looking again must not make it disappear.
     let error = RwSignal::new(None::<String>);
+    let read_error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
-    let confirming = RwSignal::new(false);
+    // The plan the person is confirming, as it was shown when they opened the
+    // confirmation. Present exactly while the confirmation is open.
+    let confirming = RwSignal::new(None::<IntegrationPreview>);
+    // How the plan changed under an open confirmation, until acknowledged.
+    let plan_changed = RwSignal::new(None::<Vec<String>>);
+    // Only the newest look may answer: an older one can arrive after it.
+    let looks = StoredValue::new(0u64);
 
     // Asked again whenever the task's integration changes, and on demand.
     let refresh = move || {
+        // The panel can be gone when an action resolves and asks again.
+        let Some(previous) = looks.try_get_value() else {
+            return;
+        };
+        let mine = previous + 1;
+        looks.try_set_value(mine);
         spawn_local(async move {
-            match get_integration_preview(task_id.to_string()).await {
+            let answer = get_integration_preview(task_id.to_string()).await;
+            if looks.try_get_value() != Some(mine) {
+                return;
+            }
+            match answer {
                 Ok(answer) => {
-                    error.try_set(None);
+                    read_error.try_set(None);
+                    // While an action runs its confirmation is already spent.
+                    let shown = if busy.try_get_untracked().unwrap_or(true) {
+                        None
+                    } else {
+                        confirming.try_get_untracked().flatten()
+                    };
+                    if let Some(shown) = shown {
+                        let changes = shown.plan_changes(&answer);
+                        if !changes.is_empty() {
+                            confirming.try_set(None);
+                            plan_changed.try_set(Some(changes));
+                        }
+                    }
                     preview.try_set(Some(answer));
                 }
                 Err(e) => {
-                    error.try_set(Some(format!("Could not read the integration: {e}")));
+                    read_error.try_set(Some(format!("Could not read the integration: {e}")));
                 }
             }
         });
@@ -69,11 +104,12 @@ pub fn LocalIntegrationPanel(
         }
         busy.set(true);
         error.set(None);
+        plan_changed.set(None);
         spawn_local(async move {
             match action.await {
                 Ok(updated) => {
                     let failure = not_completed.and_then(|prefix| not_completed_message(prefix, &updated));
-                    confirming.try_set(false);
+                    confirming.try_set(None);
                     apply_task.try_run(updated);
                     match failure {
                         None => crate::components::toast::success(done.to_string()),
@@ -83,6 +119,9 @@ pub fn LocalIntegrationPanel(
                     }
                 }
                 Err(e) => {
+                    // A refused confirmation is spent: the plan it named may
+                    // no longer be the one on offer, so a new one is opened.
+                    confirming.try_set(None);
                     error.try_set(Some(e));
                 }
             }
@@ -92,7 +131,7 @@ pub fn LocalIntegrationPanel(
     };
 
     let integrate = move |_| {
-        let Some(confirmation) = preview.with_untracked(|p| p.as_ref().and_then(IntegrationPreview::confirmation)) else {
+        let Some(confirmation) = confirming.with_untracked(|p| p.as_ref().and_then(IntegrationPreview::confirmation)) else {
             return;
         };
         if completing {
@@ -262,16 +301,7 @@ pub fn LocalIntegrationPanel(
                         }.into_any()
                     }
                     PreviewState::Ready | PreviewState::ReadyInCheckout | PreviewState::AlreadyContained => {
-                        let facts = p.facts();
-                        let strategy_effect = p.strategy.map(|s| s.effect());
-                        let commits = p.commits.clone();
-                        let notes: Vec<String> = [p.checkout_note(), p.unapproved_note()].into_iter().flatten().collect();
-                        let remote = p.remote_note();
-                        let button_label = match (completing, state == PreviewState::AlreadyContained) {
-                            (true, _) => "Complete and Integrate",
-                            (false, true) => "Record as integrated",
-                            (false, false) => "Integrate locally",
-                        };
+                        let button_label = confirm_label(completing, state);
                         let completion_lines = completing.then(|| {
                             task.with_untracked(|t| {
                                 IntegrationPreview::completion_lines(
@@ -281,21 +311,34 @@ pub fn LocalIntegrationPanel(
                             })
                         });
                         let in_checkout = state == PreviewState::ReadyInCheckout;
+                        let snapshot = p.clone();
+                        let target_tip = p.target_tip.clone().unwrap_or_default();
                         view! {
-                            <div data-testid="local-integration-ready" data-state=if in_checkout { "ready_in_checkout" } else { "ready" } class="space-y-2 text-xs text-white/60">
+                            <div data-testid="local-integration-ready" data-state=if in_checkout { "ready_in_checkout" } else { "ready" } data-target-tip=target_tip class="space-y-2 text-xs text-white/60">
                                 <p>{if state == PreviewState::AlreadyContained { "The destination branch already contains the approved commit." } else { "The approved work is on its Task branch and has not reached any other branch." }}</p>
                                 {completing.then(|| view! {
                                     <p data-testid="local-integration-explainer">"One action: integrate the approved commit into the destination, then complete the task. Pushing and pull requests are not part of it."</p>
                                 })}
                                 <button data-testid="local-integration-start"
                                     class="px-3 py-1.5 rounded-lg text-sm bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-50"
-                                    disabled=move || busy.get() || confirming.get()
-                                    on:click=move |_| { error.set(None); confirming.set(true); }>{button_label}</button>
-                                <Show when=move || confirming.get()>
+                                    disabled=move || busy.get() || confirming.with(Option::is_some)
+                                    on:click=move |_| {
+                                        error.set(None);
+                                        plan_changed.set(None);
+                                        confirming.set(Some(snapshot.clone()));
+                                    }>{button_label}</button>
+                                {move || confirming.get().map(|shown| {
+                                    let facts = shown.facts();
+                                    let strategy_effect = shown.strategy.map(|s| s.effect());
+                                    let commits = shown.commits.clone();
+                                    let notes: Vec<String> = [shown.checkout_note(), shown.unapproved_note()].into_iter().flatten().collect();
+                                    let remote = shown.remote_note();
+                                    let button_label = confirm_label(completing, shown.state);
+                                    view! {
                                     <div data-testid="local-integration-confirm" class="rounded-md border border-white/10 bg-black/20 p-2 space-y-2">
                                         <p class="text-xs font-semibold text-white/70">{format!("{button_label}?")}</p>
                                         <ul data-testid="local-integration-facts" class="space-y-0.5">
-                                            {facts.clone().into_iter().map(|(label, value)| view! {
+                                            {facts.into_iter().map(|(label, value)| view! {
                                                 <li class="break-words"><span class="text-white/40">{format!("{label}: ")}</span><span class="font-mono text-white/75">{value}</span></li>
                                             }).collect_view()}
                                         </ul>
@@ -304,17 +347,17 @@ pub fn LocalIntegrationPanel(
                                             <div>
                                                 <p class="text-white/40">"Commits the branch gains"</p>
                                                 <ul data-testid="local-integration-commits" class="list-disc pl-5 font-mono">
-                                                    {commits.clone().into_iter().map(|c| view! { <li class="break-words">{c}</li> }).collect_view()}
+                                                    {commits.into_iter().map(|c| view! { <li class="break-words">{c}</li> }).collect_view()}
                                                 </ul>
                                             </div>
                                         })}
-                                        {notes.clone().into_iter().map(|note| view! { <p data-testid="local-integration-note" class="text-amber-200/80">{note}</p> }).collect_view()}
+                                        {notes.into_iter().map(|note| view! { <p data-testid="local-integration-note" class="text-amber-200/80">{note}</p> }).collect_view()}
                                         {completion_lines.clone().map(|lines| view! {
                                             <ul data-testid="local-integration-completion" class="list-disc pl-5 space-y-0.5">
                                                 {lines.into_iter().map(|line| view! { <li class="break-words">{line}</li> }).collect_view()}
                                             </ul>
                                         })}
-                                        <p data-testid="local-integration-remote">{remote.clone()}</p>
+                                        <p data-testid="local-integration-remote">{remote}</p>
                                         <div class="flex gap-2">
                                             <button data-testid="local-integration-confirm-button"
                                                 class="px-3 py-1.5 rounded-lg text-sm font-medium bg-emerald-500/25 text-emerald-100 hover:bg-emerald-500/35 disabled:opacity-50"
@@ -323,10 +366,11 @@ pub fn LocalIntegrationPanel(
                                             <button data-testid="local-integration-cancel"
                                                 class="px-3 py-1.5 rounded-lg text-sm bg-white/5 text-white/60 hover:bg-white/10"
                                                 disabled=move || busy.get()
-                                                on:click=move |_| confirming.set(false)>"Cancel"</button>
+                                                on:click=move |_| confirming.set(None)>"Cancel"</button>
                                         </div>
                                     </div>
-                                </Show>
+                                    }
+                                })}
                             </div>
                         }.into_any()
                     }
@@ -336,10 +380,39 @@ pub fn LocalIntegrationPanel(
             {move || preview.with(|p| p.is_none()).then(|| view! {
                 <p class="text-xs text-white/40">"Checking what integrating would do…"</p>
             })}
+            {move || read_error.get().map(|e| view! {
+                <p data-testid="local-integration-read-error" class="text-xs text-red-300 whitespace-pre-wrap break-words">{e}</p>
+            })}
+            {move || plan_changed.get().map(|changes| view! {
+                <div data-testid="local-integration-plan-changed" role="alert" class="space-y-1 rounded-md border border-amber-500/30 bg-amber-500/[0.08] p-2 text-xs">
+                    <p class="font-semibold text-amber-200">"The plan changed while you were confirming. Nothing was changed."</p>
+                    <ul class="list-disc pl-5 text-white/70">
+                        {changes.into_iter().map(|line| view! { <li class="break-words">{line}</li> }).collect_view()}
+                    </ul>
+                    <p class="text-white/60">"Review the new plan, then confirm again."</p>
+                    <button data-testid="local-integration-plan-changed-dismiss"
+                        class="px-2 py-1 rounded-md text-xs bg-white/5 text-white/60 hover:bg-white/10"
+                        on:click=move |_| plan_changed.set(None)>"Dismiss"</button>
+                </div>
+            })}
             {move || error.get().map(|e| view! {
-                <p data-testid="local-integration-error" class="text-xs text-red-300 whitespace-pre-wrap break-words">{e}</p>
+                <div data-testid="local-integration-error" role="alert" class="space-y-1 text-xs">
+                    <p class="text-red-300 whitespace-pre-wrap break-words">{e}</p>
+                    <button data-testid="local-integration-error-dismiss"
+                        class="px-2 py-1 rounded-md text-xs bg-white/5 text-white/60 hover:bg-white/10"
+                        on:click=move |_| error.set(None)>"Dismiss"</button>
+                </div>
             })}
         </div>
+    }
+}
+
+/// What the action reads in a preview in `state`.
+fn confirm_label(completing: bool, state: PreviewState) -> &'static str {
+    match (completing, state == PreviewState::AlreadyContained) {
+        (true, _) => "Complete and Integrate",
+        (false, true) => "Record as integrated",
+        (false, false) => "Integrate locally",
     }
 }
 
