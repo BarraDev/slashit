@@ -13,6 +13,15 @@
 //! An approval that recorded no commit has to be reconfirmed against a
 //! commit a person was shown ([`reconfirm`]) before anything is integrated.
 //!
+//! Complete and Integrate does the same from Human Review: the integration is
+//! made while the Task is still in review, and only once the destination
+//! holds the approved work is the Task completed (the same terminalization as
+//! completing locally). The two halves are separate durable facts, never one
+//! transaction: a refused integration leaves the Task in review, and a
+//! completion that cannot finish leaves the integration recorded and the Task
+//! in review with the reason, to be finished by asking again. A successful
+//! integration is never undone to make the Task agree.
+//!
 //! Order of a new integration, so a crash at any point is recoverable from
 //! what is on disk: plan (objects only) -> pin the result -> persist
 //! `Pending` -> mark the repository -> compare-and-swap the target ->
@@ -45,6 +54,10 @@ pub enum PreviewState {
     AlreadyContained,
     /// The Task's current approved work is in the target.
     Integrated,
+    /// The target holds the approved work, recorded, and the Task, which was
+    /// to be completed with it, is still in Human Review. Completing it again
+    /// repeats no integration.
+    CompletionPending,
     /// An integration was started and not finished.
     Pending,
     /// The approval did not record which commit was approved. A person has
@@ -170,6 +183,20 @@ pub async fn integrate_task_locally(
     integrate(&state, task_id, confirmation).await
 }
 
+/// Integrate the approved work of a Task in Human Review into the target the
+/// preview showed, then complete the Task. `Ok` with a Task that is not
+/// completed means the integration is recorded and the completion is still
+/// owed; the Task says why in `error_message`.
+#[tauri::command]
+pub async fn complete_and_integrate_task(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+    confirmation: IntegrationConfirmation,
+) -> Result<Task, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    complete_and_integrate(&state, task_id, confirmation).await
+}
+
 #[tauri::command]
 pub async fn reconfirm_approved_tip(
     state: tauri::State<'_, crate::AppState>,
@@ -243,6 +270,27 @@ fn target_lock_id(project_id: Uuid, branch: &str) -> Uuid {
     Uuid::from_u128((half(1) << 64) | half(2))
 }
 
+/// What a request is for. The planner, the locks and the compare-and-swap of
+/// the target are the same for both; what differs is which Task state may be
+/// integrated and whether the Task is completed by the integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Intent {
+    /// The Task was already completed locally (Done).
+    AfterCompletion,
+    /// The Task is in Human Review and is completed by the integration.
+    WithCompletion,
+}
+
+impl Intent {
+    fn of(task: &Task) -> Self {
+        if task.status == TaskStatus::HumanReview {
+            Self::WithCompletion
+        } else {
+            Self::AfterCompletion
+        }
+    }
+}
+
 /// Everything the checks below share, resolved once.
 struct Prepared {
     task: Task,
@@ -257,13 +305,19 @@ struct Prepared {
 
 /// Why a Task's approved work cannot be integrated at all, before any
 /// question about commits.
-async fn eligible(state: &crate::AppState, task: &Task) -> Result<(), String> {
-    if task.status != TaskStatus::Done || !task.completed_locally() {
-        return Err(
-            "Only a task that was completed locally can be integrated from here. A task moved to \
-             Done in any other way has no approved work on record."
-                .to_string(),
-        );
+async fn eligible(state: &crate::AppState, task: &Task, intent: Intent) -> Result<(), String> {
+    match intent {
+        Intent::AfterCompletion if task.status != TaskStatus::Done || !task.completed_locally() => {
+            return Err(
+                "Only a task that was completed locally can be integrated from here. A task moved to \
+                 Done in any other way has no approved work on record."
+                    .to_string(),
+            );
+        }
+        Intent::WithCompletion if task.status != TaskStatus::HumanReview => {
+            return Err("Only a task in Human Review can be completed and integrated.".to_string());
+        }
+        _ => {}
     }
     if !task.human_review.is_approved() {
         return Err("This task has no approval on record, so there is nothing approved to integrate.".to_string());
@@ -287,13 +341,38 @@ async fn eligible(state: &crate::AppState, task: &Task) -> Result<(), String> {
     Ok(())
 }
 
-async fn prepare(state: &crate::AppState, task_id: Uuid) -> Result<Prepared, String> {
+async fn prepare(state: &crate::AppState, task_id: Uuid, intent: Intent) -> Result<Prepared, String> {
     let task = current(state, task_id).await?;
-    eligible(state, &task).await?;
+    eligible(state, &task, intent).await?;
     let repo_path = repo_path_of(state, task.project_id).await?;
     let repo = Path::new(&repo_path);
     if let Some(refused) = crate::worktree::vcs::detect(repo).await?.refusal(&repo_path) {
         return Err(refused);
+    }
+    // Completing removes the Task Checkout, and Git refuses to remove one
+    // that holds uncommitted work. Refusing here, before anything moves,
+    // spares a person an integration whose completion cannot follow.
+    if intent == Intent::WithCompletion {
+        if let Some(executor) = state.executor.get() {
+            if crate::lifecycle::ExecutionOwnership::is_task_running(executor.as_ref(), task_id).await {
+                return Err(
+                    "An agent is still running for this task, and completing it would remove the \
+                     checkout the agent works in. Stop the run first."
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(checkout) = task.worktree_path.as_deref().filter(|p| Path::new(p).exists()) {
+            let changed = git::uncommitted_paths(checkout).await?;
+            if !changed.is_empty() {
+                return Err(format!(
+                    "The Task Checkout {checkout} has uncommitted changes ({}). They are not part of \
+                     the approved commit, and completing the task would remove that checkout. Commit \
+                     or discard them first; SlashIt will not touch them.",
+                    changed.iter().take(8).cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
     }
     let branch = task
         .branch_name
@@ -405,7 +484,12 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
         }
         return Ok(out);
     }
-    let p = match prepare(state, task_id).await {
+    if task.status == TaskStatus::HumanReview {
+        if let Some(out) = completion_pending(state, &task).await? {
+            return Ok(out);
+        }
+    }
+    let p = match prepare(state, task_id, Intent::of(&task)).await {
         Ok(p) => p,
         Err(reason) if reason == "Task not found" => return Err(reason),
         Err(reason) => return Ok(IntegrationPreview::refused(reason)),
@@ -510,6 +594,41 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
     Ok(out)
 }
 
+/// The preview of a Task in Human Review whose current approved work is
+/// already in the target it was integrated into, which only the completion
+/// is still owed for. `None` when that is not the case.
+///
+/// Answered from the record and Git alone, without the eligibility checks of
+/// a new integration: a completion interrupted mid-removal sets
+/// `cleanup_in_flight`, which refuses a new integration but not finishing
+/// this one.
+async fn completion_pending(state: &crate::AppState, task: &Task) -> Result<Option<IntegrationPreview>, String> {
+    let Some(record) = task.local_integration.as_ref().filter(|r| r.state == IntegrationState::Integrated) else {
+        return Ok(None);
+    };
+    if task.human_review.approved_tip() != Some(record.approved_tip.as_str()) || !task.human_review.is_approved() {
+        return Ok(None);
+    }
+    let repo_path = repo_path_of(state, task.project_id).await?;
+    let repo = Path::new(&repo_path);
+    let Some(target_tip) = git::branch_tip(repo, &record.target_branch).await? else {
+        return Ok(None);
+    };
+    if !is_ancestor(repo, &record.approved_tip, &target_tip).await? {
+        return Ok(None);
+    }
+    Ok(Some(IntegrationPreview {
+        target_branch: Some(record.target_branch.clone()),
+        target_tip: Some(target_tip),
+        approved_tip: Some(record.approved_tip.clone()),
+        strategy: Some(record.strategy),
+        integration: Some(record.clone()),
+        has_remote: git::has_origin(repo).await,
+        reason: task.error_message.clone(),
+        ..IntegrationPreview::new(PreviewState::CompletionPending)
+    }))
+}
+
 /// A refusal naming another Task whose integration into `target` is still
 /// pending, which must be resumed or discarded before another is planned
 /// against the same branch.
@@ -546,7 +665,57 @@ pub(crate) async fn integrate(
     if task.local_integration.as_ref().is_some_and(|r| r.is_pending()) {
         return resume_locked(state, task_id).await;
     }
-    let p = prepare(state, task_id).await?;
+    integrate_locked(state, task_id, confirmed, Intent::AfterCompletion).await
+}
+
+/// Integrate the approved work of a Task in Human Review, then complete it.
+///
+/// Asked again, it never repeats what is done: a pending integration is
+/// resumed, an integration already recorded is not made again and only the
+/// completion is finished, and a Task that is completed answers with itself.
+pub(crate) async fn complete_and_integrate(
+    state: &crate::AppState,
+    task_id: Uuid,
+    confirmed: IntegrationConfirmation,
+) -> Result<Task, String> {
+    let project_id = current(state, task_id).await?.project_id;
+    let _target = state.task_lifecycle_locks.acquire(target_lock_id(project_id, &confirmed.target_branch)).await?;
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+
+    let task = current(state, task_id).await?;
+    if task.completed_locally() {
+        let integrated = task.local_integration.as_ref().is_some_and(|r| {
+            r.state == IntegrationState::Integrated && task.human_review.approved_tip() == Some(r.approved_tip.as_str())
+        });
+        return if integrated {
+            Ok(task)
+        } else {
+            Err("This task was completed locally without its approved work being integrated. Integrate \
+                 it with Integrate locally."
+                .to_string())
+        };
+    }
+    if task.local_integration.as_ref().is_some_and(|r| r.is_pending()) {
+        return resume_locked(state, task_id).await;
+    }
+    if task.status == TaskStatus::HumanReview {
+        if let Some(pending) = completion_pending(state, &task).await? {
+            let target = pending.target_branch.unwrap_or_default();
+            return complete_after_integration(state, task_id, &target).await;
+        }
+    }
+    integrate_locked(state, task_id, confirmed, Intent::WithCompletion).await
+}
+
+/// The body of an integration, with the target-branch lock and the Task's
+/// lease held and nothing pending.
+async fn integrate_locked(
+    state: &crate::AppState,
+    task_id: Uuid,
+    confirmed: IntegrationConfirmation,
+    intent: Intent,
+) -> Result<Task, String> {
+    let p = prepare(state, task_id, intent).await?;
     if p.target != confirmed.target_branch {
         return Err(format!(
             "The integration target is {} now, not {}, so nothing was changed. Review it again.",
@@ -573,7 +742,10 @@ pub(crate) async fn integrate(
             && record.approved_tip == approved
             && is_ancestor(repo, &approved, &p.target_tip).await?
         {
-            return Ok(p.task);
+            return match intent {
+                Intent::AfterCompletion => Ok(p.task),
+                Intent::WithCompletion => complete_after_integration(state, task_id, &p.target).await,
+            };
         }
     }
     if let Some(why) = other_pending_on(state, &p.task, &p.target).await {
@@ -638,19 +810,28 @@ pub(crate) async fn integrate(
         checkout_path: consented_checkout.clone(),
         started_at: chrono::Utc::now(),
         completed_at: None,
+        completes_task: intent == Intent::WithCompletion,
     };
     let stored = record.clone();
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(t) = staged.get_mut(&task_id) {
-            if t.status == TaskStatus::Done && t.local_integration.as_ref().is_none_or(|r| !r.is_pending()) {
+            let in_state = match intent {
+                Intent::AfterCompletion => t.status == TaskStatus::Done,
+                Intent::WithCompletion => t.status == TaskStatus::HumanReview && t.human_review.is_approved(),
+            };
+            if in_state && t.local_integration.as_ref().is_none_or(|r| !r.is_pending()) {
                 t.local_integration = Some(stored.clone());
             }
         }
     };
-    let saved = crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend)
-        .await
-        .map_err(|e| format!("The integration was not started, because recording it failed: {e}"))?
-        .ok_or("Task not found")?;
+    let saved = match crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await {
+        Ok(saved) => saved.ok_or("Task not found")?,
+        Err(e) => {
+            // Nothing recorded the plan, so nothing may keep its result alive.
+            let _ = git::unpin(repo, task_id).await;
+            return Err(format!("The integration was not started, because recording it failed: {e}"));
+        }
+    };
     if saved.local_integration.as_ref() != Some(&record) {
         let _ = git::unpin(repo, task_id).await;
         return Err("The task changed while the integration was being started, so nothing was changed.".to_string());
@@ -723,7 +904,36 @@ async fn finish(state: &crate::AppState, repo: &Path, task_id: Uuid, plan: &Plan
         .ok_or("Task not found")?;
     // A pin that cannot be removed is swept later; it holds no ref anyone reads.
     let _ = git::unpin(repo, task_id).await;
+    let completes = saved.local_integration.as_ref().is_some_and(|r| r.completes_task);
+    if completes && saved.status == TaskStatus::HumanReview {
+        return complete_after_integration(state, task_id, &plan.target_branch).await;
+    }
     Ok(saved)
+}
+
+/// Complete a Task whose approved work `target` now holds. The Task's lease
+/// is held.
+///
+/// The integration is a fact by now and is not touched whatever happens
+/// here. A checkout Git will not remove leaves the Task in Human Review with
+/// the reason, and that Task is returned; any other failure is reported
+/// saying the work is integrated, so that nothing reads as undone.
+async fn complete_after_integration(state: &crate::AppState, task_id: Uuid, target: &str) -> Result<Task, String> {
+    let held = |why: String| {
+        format!(
+            "{target} holds the approved work and that is recorded, but the task was not completed: \
+             {why} Ask to complete it again; the integration is not repeated."
+        )
+    };
+    let task = current(state, task_id).await?;
+    if let Err(why) = crate::commands::human_review::check_completable(state, &task) {
+        return Err(held(why));
+    }
+    match crate::commands::human_review::complete_leased(state, task_id).await {
+        Ok(done) => Ok(done),
+        Err(crate::lifecycle::TerminalizeRefusal::CleanupRefused { .. }) => current(state, task_id).await,
+        Err(other) => Err(held(other.to_string())),
+    }
 }
 
 async fn clear_pending(state: &crate::AppState, repo: &Path, task_id: Uuid, plan: &Plan) -> Result<(), String> {
@@ -778,7 +988,7 @@ async fn resume_locked(state: &crate::AppState, task_id: Uuid) -> Result<Task, S
         Observed::Unmoved => {
             // Re-prove everything that justified the plan before moving
             // anything: the Task, its approval and branch, and the target.
-            let p = prepare(state, task_id).await?;
+            let p = prepare(state, task_id, Intent::of(&task)).await?;
             if p.target != record.target_branch
                 || p.task.human_review.approved_tip() != Some(record.approved_tip.as_str())
                 || !is_ancestor(repo, &record.approved_tip, &p.branch_tip).await?
@@ -843,7 +1053,7 @@ pub(crate) async fn discard(state: &crate::AppState, task_id: Uuid) -> Result<Ta
 pub(crate) async fn reconfirm(state: &crate::AppState, task_id: Uuid, tip: &str) -> Result<Task, String> {
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
     let task = current(state, task_id).await?;
-    eligible(state, &task).await?;
+    eligible(state, &task, Intent::of(&task)).await?;
     if task.human_review.approved_tip().is_some() {
         return Err("This approval already records the commit that was approved.".to_string());
     }
@@ -1435,6 +1645,7 @@ mod tests {
             checkout_path: None,
             started_at: chrono::Utc::now(),
             completed_at: None,
+            completes_task: false,
         };
         let id = fx.task_id;
         let amend = move |s: &mut HashMap<Uuid, Task>| s.get_mut(&id).unwrap().local_integration = Some(record.clone());
@@ -1518,6 +1729,7 @@ mod tests {
                 checkout_path: None,
                 started_at: chrono::Utc::now(),
                 completed_at: None,
+                completes_task: false,
             });
         };
         crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, other, &amend).await.unwrap();
@@ -2079,6 +2291,7 @@ mod tests {
                 checkout_path: c.checkout_path.clone(),
                 started_at: chrono::Utc::now(),
                 completed_at: None,
+                completes_task: false,
             };
             let id = fx.task_id;
             let amend =

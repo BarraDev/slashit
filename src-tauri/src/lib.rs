@@ -395,6 +395,7 @@ pub fn run() {
             complete_task_locally,
             get_integration_preview,
             integrate_task_locally,
+            complete_and_integrate_task,
             reconfirm_approved_tip,
             resume_local_integration,
             discard_local_integration,

@@ -75,10 +75,53 @@ pub struct LocalIntegration {
     pub started_at: chrono::DateTime<chrono::Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The person asked to complete the Task with this integration (Complete
+    /// and Integrate from Human Review), so finishing the integration also
+    /// completes the Task. Every earlier record loads as `false`: an
+    /// integration of a Task that was already completed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub completes_task: bool,
 }
 
 impl LocalIntegration {
     pub fn is_pending(&self) -> bool {
         self.state == IntegrationState::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(completes_task: bool) -> LocalIntegration {
+        LocalIntegration {
+            state: IntegrationState::Integrated,
+            target_branch: "main".into(),
+            target_old_oid: "a".repeat(40),
+            approved_tip: "b".repeat(40),
+            result_oid: "c".repeat(40),
+            strategy: IntegrationStrategy::FastForward,
+            checkout_path: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            completes_task,
+        }
+    }
+
+    #[test]
+    fn a_record_written_before_completion_was_part_of_it_loads_as_not_completing() {
+        let mut value = serde_json::to_value(record(false)).unwrap();
+        assert!(value.get("completes_task").is_none(), "an integration after completion writes no new key");
+        value.as_object_mut().unwrap().remove("completes_task");
+        let loaded: LocalIntegration = serde_json::from_value(value).unwrap();
+        assert!(!loaded.completes_task);
+    }
+
+    #[test]
+    fn the_intent_to_complete_is_written_and_read_back() {
+        let value = serde_json::to_value(record(true)).unwrap();
+        assert_eq!(value.get("completes_task"), Some(&serde_json::json!(true)));
+        let loaded: LocalIntegration = serde_json::from_value(value).unwrap();
+        assert!(loaded.completes_task);
     }
 }

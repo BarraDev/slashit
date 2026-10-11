@@ -292,6 +292,30 @@ interrupted after updating the files and before moving the branch, the next
 attempt recognises exactly that state and finishes by moving the branch; any
 other half-updated checkout is reported with its changes left in place.
 
+**Complete and Integrate** does both from Human Review, as one action a person
+chooses: it is offered next to "Complete locally" for an approved Task that has
+no pull request, and it never replaces the pull request as a Project's default.
+The integration is made while the Task is still in review, with the same
+planner, locks and confirmation as above, and only once the destination holds
+the approved commit is the Task completed (the same completion as Complete
+locally). The two halves are separate durable facts, not one transaction:
+
+- A refused integration (conflict, dirty or changed destination checkout,
+  uncommitted work in the Task Checkout, a running agent, a stale confirmation
+  or approval) changes nothing, and the Task stays in Human Review.
+- The pending integration record carries `completes_task`, so Resume also
+  completes the Task, and Discard drops the plan and leaves the Task in review.
+- A successful integration is never undone to make the Task agree. If the Task
+  Checkout cannot be removed (or the board cannot be written) after it, the
+  integration stays recorded and the Task stays in Human Review with the
+  reason. The drawer says the work is integrated and not completed, offers
+  "Finish completing", and offers no pull request. Finishing repeats no
+  integration.
+- Nothing completes by itself on start: an interrupted integration or
+  completion waits for a person.
+
+The Task branch and its commits are never deleted, and nothing is pushed.
+
 A Task that depends on a locally integrated Task starts from the Project's base
 when the base holds the approved work, and so receives exactly the approved
 commits; otherwise it is stacked on the dependency's branch as before.

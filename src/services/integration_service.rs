@@ -45,6 +45,20 @@ pub async fn integrate_task_locally(task_id: String, confirmation: IntegrationCo
     .await
 }
 
+/// Integrate exactly what the preview showed, and complete the task, which
+/// is in Human Review. An answer that is not completed means the
+/// integration is recorded and the completion is still owed.
+pub async fn complete_and_integrate_task(
+    task_id: String,
+    confirmation: IntegrationConfirmation,
+) -> Result<Task, String> {
+    invoke(
+        "complete_and_integrate_task",
+        serde_json::json!({ "taskId": task_id, "confirmation": confirmation }),
+    )
+    .await
+}
+
 /// Record the commit the person was shown as the approved one, for an
 /// approval that did not record it.
 pub async fn reconfirm_approved_tip(task_id: String, tip: String) -> Result<Task, String> {
