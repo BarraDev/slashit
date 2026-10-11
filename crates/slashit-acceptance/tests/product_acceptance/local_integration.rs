@@ -295,7 +295,7 @@ async fn integrate_into_checked_out_main(driver: &WebDriver, repository: &GitFix
     dismiss_toasts(driver).await?;
     click(driver, LI_CONFIRM, "the Integrate locally confirmation").await?;
     let said = await_text(driver, LI_RESULT, |t| t.contains("Integrated into main"), "the integration result").await?;
-    if !said.contains("fast-forward") || !said.contains(short(&tip)) || !said.contains("Nothing was pushed") {
+    if !said.contains("fast-forward") || !said.contains(short(&tip)) || !said.contains("did not push it") {
         bail!("the result says {said:?}");
     }
 
