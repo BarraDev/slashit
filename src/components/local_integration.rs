@@ -57,8 +57,13 @@ pub fn LocalIntegrationPanel(
         refresh();
     });
 
-    // One action at a time, each applying the task it returns.
-    let run = move |action: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Task, String>>>>, done: &'static str| {
+    // One action at a time, each applying the task it returns. A completing
+    // action (`not_completed` is the start of its message) can answer with a
+    // task that is not completed: that is not an error, the task is applied
+    // and says why it is still in review.
+    let run = move |action: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Task, String>>>>,
+                    done: &'static str,
+                    not_completed: Option<&'static str>| {
         if busy.get_untracked() {
             return;
         }
@@ -67,9 +72,21 @@ pub fn LocalIntegrationPanel(
         spawn_local(async move {
             match action.await {
                 Ok(updated) => {
+                    let failure = not_completed.filter(|_| !updated.completed_locally()).map(|prefix| {
+                        let reason = updated
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "SlashIt recorded no reason.".to_string());
+                        format!("{prefix}: {reason}")
+                    });
                     confirming.try_set(false);
                     apply_task.try_run(updated);
-                    crate::components::toast::success(done.to_string());
+                    match failure {
+                        None => crate::components::toast::success(done.to_string()),
+                        Some(message) => {
+                            error.try_set(Some(message));
+                        }
+                    }
                 }
                 Err(e) => {
                     error.try_set(Some(e));
@@ -85,82 +102,33 @@ pub fn LocalIntegrationPanel(
             return;
         };
         if completing {
-            // An answer that is not completed is not an error: the work is
-            // integrated and the task says why it is still in review.
-            if busy.get_untracked() {
-                return;
-            }
-            busy.set(true);
-            error.set(None);
-            spawn_local(async move {
-                match complete_and_integrate_task(task_id.to_string(), confirmation).await {
-                    Ok(updated) if updated.completed_locally() => {
-                        confirming.try_set(false);
-                        apply_task.try_run(updated);
-                        crate::components::toast::success(
-                            "Integrated and completed. Nothing was pushed.".to_string(),
-                        );
-                    }
-                    Ok(updated) => {
-                        let reason = updated
-                            .error_message
-                            .clone()
-                            .unwrap_or_else(|| "SlashIt recorded no reason.".to_string());
-                        confirming.try_set(false);
-                        apply_task.try_run(updated);
-                        error.try_set(Some(format!(
-                            "The work is integrated, but the task was not completed: {reason}"
-                        )));
-                    }
-                    Err(e) => {
-                        error.try_set(Some(e));
-                    }
-                }
-                busy.try_set(false);
-                refresh();
-            });
+            run(
+                Box::pin(complete_and_integrate_task(task_id.to_string(), confirmation)),
+                "Integrated and completed. Nothing was pushed.",
+                Some("The work is integrated, but the task was not completed"),
+            );
             return;
         }
-        run(Box::pin(integrate_task_locally(task_id.to_string(), confirmation)), "Integrated locally. Nothing was pushed.");
+        run(Box::pin(integrate_task_locally(task_id.to_string(), confirmation)), "Integrated locally. Nothing was pushed.", None);
     };
     // The integration is recorded and only the completion is owed: finishing
     // it is the ordinary completion, which repeats no integration.
     let finish_completing = move |_| {
-        if busy.get_untracked() {
-            return;
-        }
-        busy.set(true);
-        error.set(None);
-        spawn_local(async move {
-            match complete_task_locally(task_id.to_string(), true).await {
-                Ok(updated) if updated.completed_locally() => {
-                    apply_task.try_run(updated);
-                    crate::components::toast::success("Task completed.".to_string());
-                }
-                Ok(updated) => {
-                    let reason = updated
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| "SlashIt recorded no reason.".to_string());
-                    apply_task.try_run(updated);
-                    error.try_set(Some(format!("The task was not completed: {reason}")));
-                }
-                Err(e) => {
-                    error.try_set(Some(format!("The task was not completed: {e}")));
-                }
-            }
-            busy.try_set(false);
-            refresh();
-        });
+        let action = async move {
+            complete_task_locally(task_id.to_string(), true)
+                .await
+                .map_err(|e| format!("The task was not completed: {e}"))
+        };
+        run(Box::pin(action), "Task completed.", Some("The task was not completed"));
     };
     let resume = move |_| {
-        run(Box::pin(resume_local_integration(task_id.to_string())), "Integration finished. Nothing was pushed.");
+        run(Box::pin(resume_local_integration(task_id.to_string())), "Integration finished. Nothing was pushed.", None);
     };
     let discard = move |_| {
-        run(Box::pin(discard_local_integration(task_id.to_string())), "Integration record discarded. Discard touches no file.");
+        run(Box::pin(discard_local_integration(task_id.to_string())), "Integration record discarded. Discard touches no file.", None);
     };
     let reconfirm = move |tip: String| {
-        run(Box::pin(reconfirm_approved_tip(task_id.to_string(), tip)), "Commit confirmed.");
+        run(Box::pin(reconfirm_approved_tip(task_id.to_string(), tip)), "Commit confirmed.", None);
     };
 
     view! {
