@@ -88,6 +88,19 @@ pub struct Reconfirm {
 pub struct RemoteTarget {
     pub name: String,
     pub tip: String,
+    /// Where the local destination branch stands against it.
+    #[serde(default)]
+    pub relation: Option<RemoteRelation>,
+}
+
+/// Mirrors the backend `RemoteRelation`.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteRelation {
+    InSync,
+    LocalAhead,
+    RemoteAhead,
+    Diverged,
 }
 
 /// Mirrors the backend `IntegrationPreview`.
@@ -213,15 +226,26 @@ impl IntegrationPreview {
             return "This repository has no remote named origin. Nothing will be pushed.".to_string();
         }
         match &self.remote_target {
-            Some(remote) => format!(
-                "This repository has a remote named origin ({} was at {} when last seen). \
-                 Nothing will be pushed or fetched: {branch} changes only in this repository. \
-                 Publish it later yourself, when you choose to. Unless you have \
-                 chosen the local branch in Settings > Repository, new tasks keep starting from \
-                 origin's default branch, which does not have this work.",
-                remote.name,
-                short(&remote.tip)
-            ),
+            Some(remote) => {
+                let standing = match remote.relation {
+                    Some(RemoteRelation::RemoteAhead) => {
+                        format!(" {} has commits {branch} does not.", remote.name)
+                    }
+                    Some(RemoteRelation::Diverged) => {
+                        format!(" {} and {branch} have each moved on without the other.", remote.name)
+                    }
+                    _ => String::new(),
+                };
+                format!(
+                    "This repository has a remote named origin ({} was at {} when last seen).{standing} \
+                     Nothing will be pushed or fetched: {branch} changes only in this repository. \
+                     Publish it later yourself, when you choose to. Unless you have \
+                     chosen the local branch in Settings > Repository, new tasks keep starting from \
+                     origin's default branch, which does not have this work.",
+                    remote.name,
+                    short(&remote.tip)
+                )
+            }
             None => format!(
                 "This repository has a remote named origin. Nothing will be pushed or fetched: \
                  {branch} changes only in this repository. Publish it later yourself, when you \
@@ -391,7 +415,7 @@ mod tests {
         p.has_remote = true;
         let without_tip = p.remote_note();
         assert!(without_tip.contains("Nothing will be pushed"), "{without_tip}");
-        p.remote_target = Some(RemoteTarget { name: "origin/main".into(), tip: oid('c') });
+        p.remote_target = Some(RemoteTarget { name: "origin/main".into(), tip: oid('c'), relation: None });
         let with_tip = p.remote_note();
         assert!(with_tip.contains("origin/main") && with_tip.contains("cccccccccccc"), "{with_tip}");
         assert!(with_tip.contains("Nothing will be pushed"), "{with_tip}");

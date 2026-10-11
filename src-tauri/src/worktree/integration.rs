@@ -131,13 +131,14 @@ async fn run_env(dir: &Path, args: &[&str], envs: &[(&str, String)]) -> Result<R
 /// `git`'s standard output exactly as written, for output that is parsed
 /// (`-z` lists), where trimming could change the first or last name.
 async fn git_raw(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = run_git_with(
-        "git".into(),
-        &dir.to_string_lossy(),
-        args,
-        &[("GIT_TERMINAL_PROMPT", "0".to_string())],
-        Input::None,
-    )
+    git_raw_env(dir, args, &[]).await
+}
+
+/// [`git_raw`] with more environment for the one `git`.
+async fn git_raw_env(dir: &Path, args: &[&str], envs: &[(&str, String)]) -> Result<String, String> {
+    let mut all = vec![("GIT_TERMINAL_PROMPT", "0".to_string())];
+    all.extend(envs.iter().map(|(k, v)| (*k, v.clone())));
+    let output = run_git_with("git".into(), &dir.to_string_lossy(), args, &all, Input::None)
     .await
     .map_err(|e| format!("Failed to run git: {e}"))?
     .output;
@@ -475,12 +476,15 @@ pub async fn inspect_checkout(path: &str, plan: &Plan) -> Result<CheckoutReadine
 
     // Every tracked path that differs from `HEAD`, in the index or in the
     // files, including paths with an unresolved conflict.
-    let differing = git_raw(dir, &["diff", "--name-only", "-z", "--ignore-submodules=none", "HEAD"]).await?;
+    let scratch = ScratchIndex::of(dir).await?;
+    let differing =
+        git_raw_env(dir, &["diff", "--name-only", "-z", "--ignore-submodules=none", "HEAD"], &scratch.env()).await?;
     let changed: Vec<String> = differing.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect();
     if !changed.is_empty() {
         let result_tree_in_index =
-            run(dir, &["diff", "--cached", "--quiet", plan.resulting_tree_ish()]).await?.code == Some(0);
-        let files_match_index = run(dir, &["diff", "--quiet"]).await?.code == Some(0);
+            run_env(dir, &["diff", "--cached", "--quiet", plan.resulting_tree_ish()], &scratch.env()).await?.code
+                == Some(0);
+        let files_match_index = run_env(dir, &["diff", "--quiet"], &scratch.env()).await?.code == Some(0);
         if result_tree_in_index && files_match_index && !plan.result.is_empty() && plan.result != plan.target_old {
             return Ok(CheckoutReadiness::FilesAlreadyUpdated);
         }
@@ -506,6 +510,39 @@ pub async fn inspect_checkout(path: &str, plan: &Plan) -> Result<CheckoutReadine
         )]));
     }
     Ok(CheckoutReadiness::Ready)
+}
+
+/// A private copy of a checkout's index, for read-only questions.
+///
+/// `git diff` compares the files with the index and, when it finds an entry
+/// whose timestamp is stale but whose content matches, rewrites the index to
+/// refresh it, taking `index.lock` to do so. `--no-optional-locks` does not
+/// stop that for `diff`. Inspecting a checkout must not write to it, nor
+/// collide with a person's own `git` holding the lock, so the questions are
+/// put to Git against a copy: the comparison is as exact as ever, and the
+/// refresh lands in the copy.
+struct ScratchIndex {
+    _dir: tempfile::TempDir,
+    file: String,
+}
+
+impl ScratchIndex {
+    async fn of(checkout: &Path) -> Result<Self, String> {
+        let original = git(checkout, &["rev-parse", "--path-format=absolute", "--git-path", "index"]).await?;
+        let dir = tempfile::TempDir::new().map_err(|e| format!("Could not make a scratch directory: {e}"))?;
+        let copy = dir.path().join("index");
+        match std::fs::copy(&original, &copy) {
+            Ok(_) => {}
+            // No index yet: Git reads that as empty, and so will the copy.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Could not read the index of {}: {e}", checkout.display())),
+        }
+        Ok(Self { file: copy.to_string_lossy().into_owned(), _dir: dir })
+    }
+
+    fn env(&self) -> [(&'static str, String); 1] {
+        [("GIT_INDEX_FILE", self.file.clone())]
+    }
 }
 
 /// Whether something that is not tracked exists at `relative` in `checkout`,
@@ -635,23 +672,62 @@ pub async fn observe(repo: &Path, plan: &Plan) -> Result<Observed, String> {
     })
 }
 
-/// Local `branch` against `origin/<branch>`: `Some(why)` when integrating
-/// into it would build on a line that is behind or has diverged from
-/// origin's. A repository with no such remote branch has nothing to compare.
-pub async fn not_behind_origin(repo: &Path, branch: &str) -> Result<Option<String>, String> {
+/// Where local `branch` stands against `origin/<branch>` as the repository
+/// last saw it. Nothing is fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteRelation {
+    /// Both name the same commit.
+    InSync,
+    /// Local has commits origin lacks; origin has nothing local lacks.
+    LocalAhead,
+    /// Origin has commits local lacks; local has nothing origin lacks.
+    RemoteAhead,
+    /// Each has commits the other lacks.
+    Diverged,
+}
+
+/// How local `branch` relates to `origin/<branch>`, or `None` when there is
+/// no such pair to compare.
+pub async fn remote_relation(repo: &Path, branch: &str) -> Result<Option<RemoteRelation>, String> {
     let Some(local) = branch_tip(repo, branch).await? else { return Ok(None) };
     let Some(remote) = exact_ref(repo, &format!("refs/remotes/origin/{branch}")).await? else {
         return Ok(None);
     };
-    if is_ancestor(repo, &remote, &local).await? {
+    Ok(Some(if local == remote {
+        RemoteRelation::InSync
+    } else if is_ancestor(repo, &remote, &local).await? {
+        RemoteRelation::LocalAhead
+    } else if is_ancestor(repo, &local, &remote).await? {
+        RemoteRelation::RemoteAhead
+    } else {
+        RemoteRelation::Diverged
+    }))
+}
+
+/// Local `branch` against `origin/<branch>`: `Some(why)` when integrating
+/// into it would build on a line that is behind or has diverged from
+/// origin's. A repository with no such remote branch has nothing to compare.
+///
+/// `local_is_base` is true when the Project explicitly chose this local
+/// branch as the source for new Tasks. Then origin's state is not a reason
+/// to refuse: the local line is the one the person works from, and
+/// integrating into it never touches origin. The divergence is reported by
+/// [`remote_relation`] instead. A Project that uses the remote as its base
+/// keeps the refusal.
+pub async fn not_behind_origin(repo: &Path, branch: &str, local_is_base: bool) -> Result<Option<String>, String> {
+    if local_is_base {
         return Ok(None);
     }
-    Ok(Some(format!(
-        "The branch {branch} does not contain everything origin/{branch} has, so integrating into \
-         it would build on an out-of-date line. Update {branch} first (for example `git fetch` and \
-         `git merge --ff-only origin/{branch}` where it is checked out); SlashIt does not do that \
-         for you."
-    )))
+    Ok(match remote_relation(repo, branch).await? {
+        Some(RemoteRelation::RemoteAhead | RemoteRelation::Diverged) => Some(format!(
+            "The branch {branch} does not contain everything origin/{branch} has, so integrating into \
+             it would build on an out-of-date line. Update {branch} first (for example `git fetch` and \
+             `git merge --ff-only origin/{branch}` where it is checked out); SlashIt does not do that \
+             for you."
+        )),
+        _ => None,
+    })
 }
 
 /// Whether the repository has a remote named origin. Nothing is contacted.

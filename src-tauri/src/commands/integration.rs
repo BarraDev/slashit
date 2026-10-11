@@ -60,6 +60,9 @@ pub enum PreviewState {
 pub struct RemoteTarget {
     pub name: String,
     pub tip: String,
+    /// Where the local target stands against it. Information only when the
+    /// Project starts new Tasks from the local branch.
+    pub relation: Option<git::RemoteRelation>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -248,6 +251,8 @@ struct Prepared {
     branch_tip: String,
     target: String,
     target_tip: String,
+    /// The Project explicitly chose its local branch as where new Tasks start.
+    local_is_base: bool,
 }
 
 /// Why a Task's approved work cannot be integrated at all, before any
@@ -301,15 +306,10 @@ async fn prepare(state: &crate::AppState, task_id: Uuid) -> Result<Prepared, Str
         )
     })?;
 
-    let project_base = state
-        .project
-        .projects
-        .read()
-        .await
-        .get(&task.project_id)
-        .and_then(|p| p.base.as_ref().map(|b| b.branch().to_string()));
+    let project_base = state.project.projects.read().await.get(&task.project_id).and_then(|p| p.base.clone());
+    let local_is_base = project_base.as_ref().is_some_and(|b| b.prefers_local());
     let target = match project_base {
-        Some(branch) => branch,
+        Some(base) => base.branch().to_string(),
         None => git::remote_default_branch(&repo_path).await?.ok_or(
             "This project has no base branch to integrate into. Choose one in Settings > Repository.",
         )?,
@@ -342,7 +342,7 @@ async fn prepare(state: &crate::AppState, task_id: Uuid) -> Result<Prepared, Str
         }
         _ => {}
     }
-    Ok(Prepared { task, repo_path, branch, branch_tip, target, target_tip })
+    Ok(Prepared { task, repo_path, branch, branch_tip, target, target_tip, local_is_base })
 }
 
 fn merge_message(branch: &str, target: &str) -> String {
@@ -470,10 +470,11 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
     out.commits = git::subjects(repo, &p.target_tip, &approved, 50).await.unwrap_or_default();
 
     out.has_remote = git::has_origin(repo).await;
+    let relation = git::remote_relation(repo, &p.target).await?;
     out.remote_target = git::remote_tracking_tip(repo, &p.target)
         .await?
-        .map(|tip| RemoteTarget { name: format!("origin/{}", p.target), tip });
-    if let Some(why) = git::not_behind_origin(repo, &p.target).await? {
+        .map(|tip| RemoteTarget { name: format!("origin/{}", p.target), tip, relation });
+    if let Some(why) = git::not_behind_origin(repo, &p.target, p.local_is_base).await? {
         out.reason = Some(why);
         return Ok(out);
     }
@@ -578,7 +579,7 @@ pub(crate) async fn integrate(
     if let Some(why) = other_pending_on(state, &p.task, &p.target).await {
         return Err(why);
     }
-    if let Some(why) = git::not_behind_origin(repo, &p.target).await? {
+    if let Some(why) = git::not_behind_origin(repo, &p.target, p.local_is_base).await? {
         return Err(why);
     }
     sweep_orphan_pins(state, repo).await;
@@ -796,7 +797,7 @@ async fn resume_locked(state: &crate::AppState, task_id: Uuid) -> Result<Task, S
                 }
                 git::pin(repo, task_id, &plan.result).await?;
             }
-            if let Some(why) = git::not_behind_origin(repo, &p.target).await? {
+            if let Some(why) = git::not_behind_origin(repo, &p.target, p.local_is_base).await? {
                 return Err(why);
             }
             apply(state, &repo_path, task_id, &plan, record.checkout_path.as_deref()).await
@@ -1111,6 +1112,99 @@ mod tests {
         assert_eq!(git(&fx.repo, &["show", &format!("{result}:a.txt")]), "a");
         assert_eq!(git(&fx.repo, &["show", &format!("{result}:other.txt")]), "other");
         assert_eq!(tip_of(&fx.repo, &fx.branch), fx.tip, "the Task branch is not rewritten");
+    }
+
+    /// Where `origin/main` stands against local `main` in the fixture: the
+    /// remote-tracking ref is written directly, so nothing is contacted.
+    #[derive(Clone, Copy, Debug)]
+    enum Origin {
+        /// Origin lacks a commit local `main` has.
+        Behind,
+        /// Origin has a commit local `main` lacks.
+        Ahead,
+        /// Each has a commit the other lacks.
+        Diverged,
+    }
+
+    async fn with_origin(fx: &Fx, origin: Origin, prefer_local: bool) {
+        git(&fx.repo, &["remote", "add", "origin", "/nonexistent/origin.git"]);
+        let init = git(&fx.repo, &["rev-parse", "main"]);
+        let remote_commit = |name: &str| {
+            git(&fx.repo, &["branch", name, "main"]);
+            commit_on(&fx.repo, name, &format!("{name}.txt"), "remote\n")
+        };
+        let remote_tip = match origin {
+            Origin::Behind => {
+                commit_on(&fx.repo, "main", "local.txt", "local\n");
+                init
+            }
+            Origin::Ahead => remote_commit("remote-side"),
+            Origin::Diverged => {
+                let tip = remote_commit("remote-side");
+                commit_on(&fx.repo, "main", "local.txt", "local\n");
+                tip
+            }
+        };
+        git(&fx.repo, &["update-ref", "refs/remotes/origin/main", &remote_tip]);
+        let base = crate::domain::project::ProjectBase::LocalBranch { branch: "main".to_string() };
+        fx.state.project.projects.write().await.get_mut(&fx.project_id).unwrap().base =
+            Some(if prefer_local { base.choosing(true) } else { base });
+    }
+
+    #[tokio::test]
+    async fn a_project_that_chose_its_local_base_integrates_whatever_origin_has_done() {
+        for origin in [Origin::Behind, Origin::Ahead, Origin::Diverged] {
+            let fx = fixture().await;
+            with_origin(&fx, origin, true).await;
+            let p = preview(&fx.state, fx.task_id).await.unwrap();
+            assert!(
+                matches!(p.state, PreviewState::Ready),
+                "{origin:?}: the remote is information, not a reason to refuse: {:?}",
+                p.reason
+            );
+            let remote = p.remote_target.clone().expect("the remote is shown");
+            let expected = match origin {
+                Origin::Behind => git::RemoteRelation::LocalAhead,
+                Origin::Ahead => git::RemoteRelation::RemoteAhead,
+                Origin::Diverged => git::RemoteRelation::Diverged,
+            };
+            assert_eq!(remote.relation, Some(expected), "{origin:?}");
+            let remote_before = git(&fx.repo, &["rev-parse", "refs/remotes/origin/main"]);
+
+            let done = integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
+            assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated, "{origin:?}");
+            assert!(git(&fx.repo, &["merge-base", "--is-ancestor", &fx.tip, "main"]).is_empty(), "{origin:?}");
+            assert_eq!(git(&fx.repo, &["rev-parse", "refs/remotes/origin/main"]), remote_before, "{origin:?}: origin is not touched");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_project_that_uses_the_remote_still_refuses_when_origin_is_ahead_or_diverged() {
+        for origin in [Origin::Ahead, Origin::Diverged] {
+            let fx = fixture().await;
+            with_origin(&fx, origin, false).await;
+            let p = preview(&fx.state, fx.task_id).await.unwrap();
+            assert_eq!(p.state, PreviewState::Refused, "{origin:?}");
+            assert!(p.reason.unwrap().contains("does not contain everything origin/main has"), "{origin:?}");
+            let confirmed = IntegrationConfirmation {
+                target_branch: "main".into(),
+                target_tip: tip_of(&fx.repo, "main"),
+                approved_tip: fx.tip.clone(),
+                checkout_path: None,
+            };
+            let before = tip_of(&fx.repo, "main");
+            assert!(integrate(&fx.state, fx.task_id, confirmed).await.is_err(), "{origin:?}");
+            assert_eq!(tip_of(&fx.repo, "main"), before, "{origin:?}: nothing moved");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_project_that_uses_the_remote_integrates_when_origin_is_behind() {
+        let fx = fixture().await;
+        with_origin(&fx, Origin::Behind, false).await;
+        let p = preview(&fx.state, fx.task_id).await.unwrap();
+        assert_eq!(p.state, PreviewState::Ready, "{:?}", p.reason);
+        integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
     }
 
     #[tokio::test]
@@ -1613,6 +1707,26 @@ mod tests {
             assert!(err.contains("no longer checked out"), "{err}");
             assert_eq!(tip_of(&fx.repo, "main"), before);
             assert!(on_disk(&fx, fx.task_id).local_integration.is_none());
+        }
+
+        /// Looking at a checkout is not changing it. A file whose timestamp
+        /// moved but whose content did not is what makes a plain `git diff`
+        /// refresh the index and take `index.lock`; the inspection must not.
+        #[tokio::test]
+        async fn inspecting_a_checkout_does_not_rewrite_its_index() {
+            let fx = on_main().await;
+            let readme = fx.repo.join("README.md");
+            let file = std::fs::OpenOptions::new().write(true).open(&readme).unwrap();
+            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)).unwrap();
+            drop(file);
+            let index = fx.repo.join(".git/index");
+            let before = std::fs::read(&index).unwrap();
+
+            let p = preview(&fx.state, fx.task_id).await.unwrap();
+
+            assert_eq!(p.state, PreviewState::ReadyInCheckout, "{:?}", p.reason);
+            assert_eq!(std::fs::read(&index).unwrap(), before, "the index is byte for byte what it was");
+            assert!(!fx.repo.join(".git/index.lock").exists());
         }
 
         #[tokio::test]

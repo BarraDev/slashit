@@ -1785,10 +1785,17 @@ impl TaskExecutor {
         // this task starts from the base like any other and receives exactly
         // the commits that were approved, not whatever the dependency's
         // branch holds after them. If the base cannot be read, or does not
-        // hold the approved work, the task is stacked as before.
+        // hold the approved work, the task is stacked as before. A base that
+        // cannot be resolved, or whose resolution is refused, is not a base
+        // that lacks the work: the refusal is the answer, not a reason to
+        // stack around it.
         let dependency = match dependency {
-            Some(_) if self.dependency_work_is_in_the_base(task_id, repo_path).await => None,
-            other => other,
+            Some(_) => match self.dependency_work_is_in_the_base(task_id, repo_path).await {
+                Ok(true) => None,
+                Ok(false) => dependency,
+                Err(refused) => return (existing_branch, Err(refused)),
+            },
+            None => None,
         };
         let base_branch = match dependency {
             None => None,
@@ -1972,7 +1979,13 @@ impl TaskExecutor {
     /// Whether `task_id`'s first dependency was completed locally, has its
     /// currently approved work integrated into a local branch, and the base a
     /// new task would start from holds that work.
-    async fn dependency_work_is_in_the_base(&self, task_id: Uuid, repo_path: &str) -> bool {
+    ///
+    /// `Ok(false)` means the base resolved and does not hold the work (or the
+    /// dependency was not integrated locally): stacking may be appropriate.
+    /// `Err` means the base could not be resolved or compared (invalid,
+    /// ambiguous, unavailable, or refused for safety), and says why. That is
+    /// never turned into a stacked start.
+    async fn dependency_work_is_in_the_base(&self, task_id: Uuid, repo_path: &str) -> Result<bool, String> {
         let approved = {
             let tasks = self.tasks.read().await;
             let Some(dependency) = tasks
@@ -1980,7 +1993,7 @@ impl TaskExecutor {
                 .and_then(|t| t.dependencies.first())
                 .and_then(|id| tasks.get(id))
             else {
-                return false;
+                return Ok(false);
             };
             let integrated = dependency
                 .local_integration
@@ -1988,16 +2001,12 @@ impl TaskExecutor {
                 .filter(|r| r.state == crate::domain::IntegrationState::Integrated);
             match (dependency.completed_locally(), integrated, dependency.human_review.approved_tip()) {
                 (true, Some(record), Some(tip)) if record.approved_tip == tip => record.approved_tip.clone(),
-                _ => return false,
+                _ => return Ok(false),
             }
         };
         let project_base = self.project_base_of(task_id).await;
-        let Ok(base) = crate::worktree::resolve_default_base(repo_path, project_base.as_ref()).await else {
-            return false;
-        };
-        crate::worktree::restack::is_ancestor(std::path::Path::new(repo_path), &approved, &base.commit)
-            .await
-            .unwrap_or(false)
+        let base = crate::worktree::resolve_default_base(repo_path, project_base.as_ref()).await?;
+        crate::worktree::restack::is_ancestor(std::path::Path::new(repo_path), &approved, &base.commit).await
     }
 
     /// The local base (`domain::ProjectBase`) of the project `task_id`
@@ -6792,6 +6801,53 @@ mod tests {
         assert!(!worktree.join("unapproved.txt").exists(), "what was not approved is not");
         assert_eq!(base_commit.as_deref(), Some(approved.as_str()));
         assert_eq!(origin, Some(BranchOrigin::LocalBase { branch: "main".to_string() }));
+    }
+
+    /// A base that cannot be resolved is not a base that lacks the
+    /// dependency's work. The local branch holds work SlashIt integrated that
+    /// origin does not, and the project has not chosen the local branch, so
+    /// resolving the base is refused for safety. That refusal reaches the
+    /// start: the task is not stacked on the dependency's branch around it,
+    /// and nothing is created.
+    #[tokio::test]
+    async fn a_safety_refused_base_refuses_the_start_instead_of_stacking() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-local01").await;
+        publish_default_base(&repo);
+        let approved = complete_dependency_locally(&executor, &repo, dependency_id, "task-local01").await;
+        {
+            let mut tasks = executor.tasks.write().await;
+            let dependency = tasks.get_mut(&dependency_id).unwrap();
+            dependency.human_review.record_arrival();
+            dependency.human_review.approve(Some(approved.clone()), chrono::Utc::now());
+            dependency.local_integration = Some(crate::domain::LocalIntegration {
+                state: crate::domain::IntegrationState::Integrated,
+                target_branch: "main".to_string(),
+                target_old_oid: git_in(&repo, &["rev-parse", "main"]),
+                approved_tip: approved.clone(),
+                result_oid: approved.clone(),
+                strategy: crate::domain::IntegrationStrategy::FastForward,
+                checkout_path: None,
+                started_at: chrono::Utc::now(),
+                completed_at: Some(chrono::Utc::now()),
+            });
+        }
+        // The integrated work is on local main only, and SlashIt marked it.
+        git_in(&repo, &["update-ref", "refs/heads/main", &approved]);
+        git_in(&repo, &["update-ref", &crate::worktree::integration::marker_ref("main"), &approved]);
+        let refs_before = refs_of(&repo);
+
+        let (existing, acquired) = executor.acquire_task_worktree(task_id, repo.to_str().unwrap()).await;
+
+        assert_eq!(existing, None);
+        let refused = acquired.err().expect("the safety refusal reaches the start");
+        assert!(
+            refused.contains("main@origin") && refused.contains("integrated"),
+            "the refusal is the base resolution's own: {refused}"
+        );
+        assert_eq!(refs_of(&repo), refs_before, "no branch is created in its place");
+        assert_eq!(worktree_count(&repo), 1);
     }
 
     /// Without the integration, the same dependency still stacks.
