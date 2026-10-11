@@ -21,6 +21,7 @@ pub mod storage_usage_service;
 pub mod updater_service;
 pub mod task_run_service;
 pub mod human_review_service;
+pub mod integration_service;
 pub mod repository_setup_service;
 pub mod orphans_service;
 pub mod conversation_service;

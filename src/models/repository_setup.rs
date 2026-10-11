@@ -59,6 +59,47 @@ pub struct ResolvedBase {
     pub source: BaseSource,
 }
 
+/// Mirrors the backend `BaseComparison`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BaseComparison {
+    Same,
+    LocalAhead { commits: u32 },
+    RemoteAhead { commits: u32 },
+    Diverged { local_only: u32, remote_only: u32 },
+}
+
+/// Mirrors the backend `BaseStanding`: the local base branch against
+/// origin's, as the repository last saw it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct BaseStanding {
+    pub local_branch: String,
+    pub remote_branch: String,
+    pub comparison: BaseComparison,
+}
+
+impl BaseStanding {
+    /// Where the two stand, in a sentence, without suggesting which to use.
+    pub fn describe(&self) -> String {
+        let (local, remote) = (&self.local_branch, &self.remote_branch);
+        let plural = |n: u32| if n == 1 { "commit" } else { "commits" };
+        match self.comparison {
+            BaseComparison::Same => format!("{local} and {remote} are at the same commit."),
+            BaseComparison::LocalAhead { commits } => {
+                format!("{local} is {commits} {} ahead of {remote}.", plural(commits))
+            }
+            BaseComparison::RemoteAhead { commits } => {
+                format!("{remote} is {commits} {} ahead of {local}.", plural(commits))
+            }
+            BaseComparison::Diverged { local_only, remote_only } => format!(
+                "{local} and {remote} have diverged: {local} has {local_only} {} {remote} lacks, and {remote} has {remote_only} {} {local} lacks.",
+                plural(local_only),
+                plural(remote_only)
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Readiness {
     pub path: String,
@@ -67,6 +108,10 @@ pub struct Readiness {
     pub head: Head,
     pub remote: RemoteState,
     pub project_base: Option<String>,
+    #[serde(default)]
+    pub prefers_local: bool,
+    #[serde(default)]
+    pub standing: Option<BaseStanding>,
     pub base: Option<ResolvedBase>,
     pub blocked: Option<String>,
     pub proposal: Option<String>,

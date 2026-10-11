@@ -48,6 +48,16 @@ pub async fn set_project_base(project_id: String, branch: String) -> Result<Read
     .await
 }
 
+/// Choose where new tasks start when the repository also has a remote
+/// default branch: the project's local base branch, or origin's.
+pub async fn set_project_base_source(project_id: String, prefer_local: bool) -> Result<Readiness, String> {
+    call(
+        "set_project_base_source",
+        serde_json::json!({ "projectId": project_id, "preferLocal": prefer_local }),
+    )
+    .await
+}
+
 pub async fn detect_remote_default_branch(project_id: String) -> Result<Readiness, String> {
     call(
         "detect_remote_default_branch",

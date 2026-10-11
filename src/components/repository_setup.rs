@@ -11,7 +11,7 @@ use crate::models::repository_setup::{
 };
 use crate::services::repository_setup_service::{
     detect_remote_default_branch, get_project_readiness, initialize_project_vcs,
-    preview_vcs_initialization, set_project_base,
+    preview_vcs_initialization, set_project_base, set_project_base_source,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -73,6 +73,21 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
             apply(answer);
         });
     };
+    let choose_source = move |prefer_local: bool| {
+        busy.set(true);
+        let id = pid.get_value();
+        spawn_local(async move {
+            let answer = set_project_base_source(id, prefer_local).await;
+            if answer.is_ok() {
+                toast::success(if prefer_local {
+                    "New tasks will start from your local base branch, whatever origin has.".to_string()
+                } else {
+                    "New tasks will start from origin's default branch where the repository names one.".to_string()
+                });
+            }
+            apply(answer);
+        });
+    };
     let detect = move |_| {
         busy.set(true);
         let id = pid.get_value();
@@ -128,6 +143,7 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                                     <p class="text-sm text-green-400" data-testid="repository-ready">
                                         {match base.source {
                                             BaseSource::Remote => format!("Ready. New tasks start from origin's default branch {} ({}).", base.branch, short(&base.commit)),
+                                            BaseSource::Local if r.prefers_local => format!("Ready. New tasks start from the local branch {} ({}), as you chose. Origin is not consulted.", base.branch, short(&base.commit)),
                                             BaseSource::Local => format!("Ready. New tasks start from the local branch {} ({}).", base.branch, short(&base.commit)),
                                         }}
                                     </p>
@@ -148,7 +164,7 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                             view! {
                                 <div class="p-4 rounded-xl bg-white/5 border border-white/10 space-y-3" data-testid="repository-base">
                                     <p class="font-medium text-white/90">"Base branch"</p>
-                                    <p class="text-xs text-white/40">"Where new tasks start when origin does not name a default branch. Switching the branch you have checked out does not change it."</p>
+                                    <p class="text-xs text-white/40">"The local branch tasks start from: always, if you choose it below, otherwise when origin does not name a default branch. Switching the branch you have checked out does not change it."</p>
                                     <p class="text-sm text-white/70" data-testid="repository-base-current">
                                         {current.clone().map(|b| format!("Base branch: {b}")).unwrap_or_else(|| "No base branch chosen.".to_string())}
                                     </p>
@@ -178,6 +194,46 @@ pub fn RepositorySetup(project_id: String) -> impl IntoView {
                                     })}
                                 </div>
                             }
+                        })}
+
+                        // Where new tasks start when a remote exists: a choice a
+                        // person makes, never one a remote makes for them.
+                        {(r.vcs == Vcs::Git || r.vcs == Vcs::JjColocated).then(|| {
+                            let base_branch = r.project_base.clone();
+                            let has_remote = r.remote != RemoteState::NoOrigin;
+                            let prefers_local = r.prefers_local;
+                            let standing = r.standing.clone();
+                            base_branch.map(|branch| view! {
+                                <div class="p-4 rounded-xl bg-white/5 border border-white/10 space-y-3" data-testid="repository-source" data-prefers-local=prefers_local.to_string()>
+                                    <p class="font-medium text-white/90">"Where new tasks start"</p>
+                                    {if has_remote || prefers_local {
+                                        view! {
+                                            <p class="text-xs text-white/40">"Your choice, saved with the project. Adding, fetching or changing a remote never changes it, and neither choice pushes or fetches anything."</p>
+                                            <div class="space-y-2">
+                                                <button type="button" data-testid="repository-source-remote" data-active=(!prefers_local).to_string()
+                                                    class=if prefers_local { "w-full text-left p-3 rounded-lg border border-white/10 bg-white/[0.03] hover:bg-white/10" } else { "w-full text-left p-3 rounded-lg border border-blue-400/40 bg-blue-500/10" }
+                                                    disabled=move || busy.get() || !prefers_local
+                                                    on:click=move |_| choose_source(false)>
+                                                    <span class="block text-sm text-white/85">{if prefers_local { "Origin's default branch" } else { "Origin's default branch (current)" }}</span>
+                                                    <span class="block text-xs text-white/45">"Where the repository names one, new tasks start from origin's default branch, and from the local base branch otherwise. This is how projects behave unless you choose otherwise."</span>
+                                                </button>
+                                                <button type="button" data-testid="repository-source-local" data-active=prefers_local.to_string()
+                                                    class=if prefers_local { "w-full text-left p-3 rounded-lg border border-blue-400/40 bg-blue-500/10" } else { "w-full text-left p-3 rounded-lg border border-white/10 bg-white/[0.03] hover:bg-white/10" }
+                                                    disabled=move || busy.get() || prefers_local
+                                                    on:click=move |_| choose_source(true)>
+                                                    <span class="block text-sm text-white/85">{if prefers_local { format!("Local branch {branch} (current)") } else { format!("Local branch {branch}") }}</span>
+                                                    <span class="block text-xs text-white/45">"New tasks start from your local branch, including work you integrated locally, whatever origin has. Work integrated into it stays available without publishing."</span>
+                                                </button>
+                                            </div>
+                                            {standing.map(|st| view! { <p class="text-xs text-white/60" data-testid="repository-source-standing">{st.describe()}</p> })}
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <p class="text-sm text-white/60" data-testid="repository-source-local-only">{format!("This repository has no remote, so new tasks start from the local branch {branch}. If you add one later, origin's default branch is used where the repository names one, unless you choose the local branch here.")}</p>
+                                        }.into_any()
+                                    }}
+                                </div>
+                            })
                         })}
 
                         // Remote delivery: optional.

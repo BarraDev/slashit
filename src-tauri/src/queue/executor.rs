@@ -1780,6 +1780,23 @@ impl TaskExecutor {
         } else {
             None
         };
+        // A dependency completed locally whose approved work SlashIt has
+        // integrated into the project's base: that work is in the base, so
+        // this task starts from the base like any other and receives exactly
+        // the commits that were approved, not whatever the dependency's
+        // branch holds after them. If the base cannot be read, or does not
+        // hold the approved work, the task is stacked as before. A base that
+        // cannot be resolved, or whose resolution is refused, is not a base
+        // that lacks the work: the refusal is the answer, not a reason to
+        // stack around it.
+        let dependency = match dependency {
+            Some(_) => match self.dependency_work_is_in_the_base(task_id, repo_path).await {
+                Ok(true) => None,
+                Ok(false) => dependency,
+                Err(refused) => return (existing_branch, Err(refused)),
+            },
+            None => None,
+        };
         let base_branch = match dependency {
             None => None,
             // Done with no pull request: its work reached main without one.
@@ -1957,6 +1974,39 @@ impl TaskExecutor {
             }
         };
         (existing_branch, acquired)
+    }
+
+    /// Whether `task_id`'s first dependency was completed locally, has its
+    /// currently approved work integrated into a local branch, and the base a
+    /// new task would start from holds that work.
+    ///
+    /// `Ok(false)` means the base resolved and does not hold the work (or the
+    /// dependency was not integrated locally): stacking may be appropriate.
+    /// `Err` means the base could not be resolved or compared (invalid,
+    /// ambiguous, unavailable, or refused for safety), and says why. That is
+    /// never turned into a stacked start.
+    async fn dependency_work_is_in_the_base(&self, task_id: Uuid, repo_path: &str) -> Result<bool, String> {
+        let approved = {
+            let tasks = self.tasks.read().await;
+            let Some(dependency) = tasks
+                .get(&task_id)
+                .and_then(|t| t.dependencies.first())
+                .and_then(|id| tasks.get(id))
+            else {
+                return Ok(false);
+            };
+            let integrated = dependency
+                .local_integration
+                .as_ref()
+                .filter(|r| r.state == crate::domain::IntegrationState::Integrated);
+            match (dependency.completed_locally(), integrated, dependency.human_review.approved_tip()) {
+                (true, Some(record), Some(tip)) if record.approved_tip == tip => record.approved_tip.clone(),
+                _ => return Ok(false),
+            }
+        };
+        let project_base = self.project_base_of(task_id).await;
+        let base = crate::worktree::resolve_default_base(repo_path, project_base.as_ref()).await?;
+        crate::worktree::restack::is_ancestor(std::path::Path::new(repo_path), &approved, &base.commit).await
     }
 
     /// The local base (`domain::ProjectBase`) of the project `task_id`
@@ -6702,6 +6752,132 @@ mod tests {
             origin,
             Some(BranchOrigin::Stacked { parent_branch: "task-local01".to_string() })
         );
+    }
+
+    /// A dependency completed locally and then integrated into the project's
+    /// local base: the dependent task starts from that base and receives
+    /// the approved work, and not the commit the dependency added after it.
+    #[tokio::test]
+    async fn a_task_depending_on_one_integrated_locally_starts_from_the_base_with_exactly_the_approved_work() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-local01").await;
+        publish_default_base(&repo);
+        let approved = complete_dependency_locally(&executor, &repo, dependency_id, "task-local01").await;
+        // The dependency's branch gains a commit nobody approved.
+        git_in(&repo, &["checkout", "-q", "task-local01"]);
+        std::fs::write(repo.join("unapproved.txt"), "after the approval\n").unwrap();
+        git_in(&repo, &["add", "unapproved.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "after the approval"]);
+        git_in(&repo, &["checkout", "-q", "main"]);
+
+        // The project's base is its local branch, chosen over origin's.
+        executor.projects.write().await.get_mut(&executor.tasks.read().await[&task_id].project_id).unwrap().base =
+            Some(crate::domain::ProjectBase::PreferredLocalBranch { branch: "main".to_string() });
+        {
+            let mut tasks = executor.tasks.write().await;
+            let dependency = tasks.get_mut(&dependency_id).unwrap();
+            dependency.human_review.record_arrival();
+            dependency.human_review.approve(Some(approved.clone()), chrono::Utc::now());
+            dependency.local_integration = Some(crate::domain::LocalIntegration {
+                state: crate::domain::IntegrationState::Integrated,
+                target_branch: "main".to_string(),
+                target_old_oid: git_in(&repo, &["rev-parse", "main"]),
+                approved_tip: approved.clone(),
+                result_oid: approved.clone(),
+                strategy: crate::domain::IntegrationStrategy::FastForward,
+                checkout_path: None,
+                started_at: chrono::Utc::now(),
+                completed_at: Some(chrono::Utc::now()),
+            });
+        }
+        git_in(&repo, &["update-ref", "refs/heads/main", &approved]);
+
+        let (_, acquired) = executor.acquire_task_worktree(task_id, repo.to_str().unwrap()).await;
+        let Acquired { info, what_happened, base_commit, origin, .. } = acquired.expect("an ordinary worktree");
+        assert_eq!(what_happened, "Created worktree");
+        let worktree = std::path::Path::new(&info.path);
+        assert!(worktree.join("dependency.txt").exists(), "the approved work is there");
+        assert!(!worktree.join("unapproved.txt").exists(), "what was not approved is not");
+        assert_eq!(base_commit.as_deref(), Some(approved.as_str()));
+        assert_eq!(origin, Some(BranchOrigin::LocalBase { branch: "main".to_string() }));
+    }
+
+    /// A base that cannot be resolved is not a base that lacks the
+    /// dependency's work. The local branch holds work SlashIt integrated that
+    /// origin does not, and the project has not chosen the local branch, so
+    /// resolving the base is refused for safety. That refusal reaches the
+    /// start: the task is not stacked on the dependency's branch around it,
+    /// and nothing is created.
+    #[tokio::test]
+    async fn a_safety_refused_base_refuses_the_start_instead_of_stacking() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-local01").await;
+        publish_default_base(&repo);
+        let approved = complete_dependency_locally(&executor, &repo, dependency_id, "task-local01").await;
+        {
+            let mut tasks = executor.tasks.write().await;
+            let dependency = tasks.get_mut(&dependency_id).unwrap();
+            dependency.human_review.record_arrival();
+            dependency.human_review.approve(Some(approved.clone()), chrono::Utc::now());
+            dependency.local_integration = Some(crate::domain::LocalIntegration {
+                state: crate::domain::IntegrationState::Integrated,
+                target_branch: "main".to_string(),
+                target_old_oid: git_in(&repo, &["rev-parse", "main"]),
+                approved_tip: approved.clone(),
+                result_oid: approved.clone(),
+                strategy: crate::domain::IntegrationStrategy::FastForward,
+                checkout_path: None,
+                started_at: chrono::Utc::now(),
+                completed_at: Some(chrono::Utc::now()),
+            });
+        }
+        // The integrated work is on local main only, and SlashIt marked it.
+        git_in(&repo, &["update-ref", "refs/heads/main", &approved]);
+        git_in(&repo, &["update-ref", &crate::worktree::integration::marker_ref("main"), &approved]);
+        let refs_before = refs_of(&repo);
+
+        let (existing, acquired) = executor.acquire_task_worktree(task_id, repo.to_str().unwrap()).await;
+
+        assert_eq!(existing, None);
+        let refused = acquired.err().expect("the safety refusal reaches the start");
+        assert!(
+            refused.contains("main@origin") && refused.contains("integrated"),
+            "the refusal is the base resolution's own: {refused}"
+        );
+        assert_eq!(refs_of(&repo), refs_before, "no branch is created in its place");
+        assert_eq!(worktree_count(&repo), 1);
+    }
+
+    /// Without the integration, the same dependency still stacks.
+    #[tokio::test]
+    async fn an_integration_record_that_is_pending_does_not_count_as_the_work_being_in_the_base() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-local01").await;
+        let approved = complete_dependency_locally(&executor, &repo, dependency_id, "task-local01").await;
+        {
+            let mut tasks = executor.tasks.write().await;
+            let dependency = tasks.get_mut(&dependency_id).unwrap();
+            dependency.human_review.record_arrival();
+            dependency.human_review.approve(Some(approved.clone()), chrono::Utc::now());
+            dependency.local_integration = Some(crate::domain::LocalIntegration {
+                state: crate::domain::IntegrationState::Pending,
+                target_branch: "main".to_string(),
+                target_old_oid: git_in(&repo, &["rev-parse", "main"]),
+                approved_tip: approved.clone(),
+                result_oid: approved.clone(),
+                strategy: crate::domain::IntegrationStrategy::FastForward,
+                checkout_path: None,
+                started_at: chrono::Utc::now(),
+                completed_at: None,
+            });
+        }
+        let (_, acquired) = executor.acquire_task_worktree(task_id, repo.to_str().unwrap()).await;
+        let Acquired { what_happened, origin, .. } = acquired.expect("a stacked worktree");
+        assert_eq!(what_happened, "Created stacked worktree");
+        assert_eq!(origin, Some(BranchOrigin::Stacked { parent_branch: "task-local01".to_string() }));
     }
 
     /// Nothing says the work of a task completed locally is anywhere but its

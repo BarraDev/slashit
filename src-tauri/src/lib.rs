@@ -323,6 +323,7 @@ pub fn run() {
             get_repository,
             get_project_readiness,
             set_project_base,
+            set_project_base_source,
             detect_remote_default_branch,
             preview_vcs_initialization,
             initialize_project_vcs,

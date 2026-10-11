@@ -66,6 +66,12 @@ pub struct LocalIntegration {
     /// The commit `target_branch` is advanced to.
     pub result_oid: String,
     pub strategy: IntegrationStrategy,
+    /// The checkout that had `target_branch` checked out when a person
+    /// confirmed advancing it there, so that resuming moves the branch in
+    /// that checkout and in no other. `None` when the branch was checked out
+    /// nowhere, which is also what every earlier record loads as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_path: Option<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,

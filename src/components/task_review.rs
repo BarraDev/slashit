@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::components::attention::Deliveries;
 use crate::components::close_without_merge_dialog::close_consequences;
+use crate::components::local_integration::{is_integrated, LocalIntegrationPanel};
 use crate::models::{review_findings, HumanReviewDecision, QaSignoff, QaStatus, Task, TaskStatus};
 use crate::services::human_review_service::{
     approve_task, complete_task_locally, create_approved_task_pr, get_pr_availability,
@@ -279,14 +280,16 @@ pub fn HumanReviewPanel(
         });
     };
 
-    let complete_locally = move |_| {
+    // `without_pull_request` is the person's choice to keep the work local in
+    // a project that could open a pull request; it is never implied.
+    let complete_locally = move |without_pull_request: bool| {
         if busy.get_untracked() {
             return;
         }
         busy.set(true);
         error.set(None);
         spawn_local(async move {
-            match complete_task_locally(task_id.to_string()).await {
+            match complete_task_locally(task_id.to_string(), without_pull_request).await {
                 // The task as it now is: Done, or still in Human Review with
                 // the reason Git kept its checkout.
                 Ok(updated) if updated.completed_locally() => {
@@ -343,6 +346,55 @@ pub fn HumanReviewPanel(
         task.with(|t| t.as_ref().and_then(|t| t.human_review.current_decision().map(|e| e.decision)))
     });
     let in_review = Memo::new(move |_| task.with(|t| t.as_ref().is_some_and(|t| t.status == TaskStatus::HumanReview)));
+    // The controls that finish approved changes locally: a button, then the
+    // consequences, then a deliberate confirmation.
+    let local_completion = move |without_pull_request: bool| {
+        view! {
+            <Show when=move || in_review.get()>
+                <button
+                    data-testid="human-review-complete-locally"
+                    class="px-3 py-1.5 rounded-lg text-sm bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-50"
+                    disabled=move || busy.get() || confirming_local.get()
+                    on:click=move |_| {
+                        error.set(None);
+                        confirming_local.set(true);
+                    }
+                >
+                    "Complete locally"
+                </button>
+                <Show when=move || confirming_local.get()>
+                    <div data-testid="human-review-complete-locally-confirm" class="rounded-md border border-white/10 bg-black/20 p-2 space-y-2">
+                        <p class="text-xs font-semibold text-white/70">"Complete locally?"</p>
+                        <ul data-testid="human-review-complete-locally-consequences" class="list-disc pl-5 space-y-0.5 text-xs text-white/60">
+                            {move || task.with(|t| t.as_ref().map(close_consequences).unwrap_or_default())
+                                .into_iter()
+                                .map(|line| view! { <li class="break-words">{line}</li> })
+                                .collect_view()}
+                        </ul>
+                        <div class="flex gap-2">
+                            <button
+                                data-testid="human-review-complete-locally-confirm-button"
+                                class="px-3 py-1.5 rounded-lg text-sm font-medium bg-emerald-500/25 text-emerald-100 hover:bg-emerald-500/35 disabled:opacity-50"
+                                disabled=move || busy.get()
+                                on:click=move |_| complete_locally(without_pull_request)
+                            >
+                                {move || if busy.get() { "Completing…" } else { "Complete locally" }}
+                            </button>
+                            <button
+                                data-testid="human-review-complete-locally-cancel"
+                                class="px-3 py-1.5 rounded-lg text-sm bg-white/5 text-white/60 hover:bg-white/10"
+                                disabled=move || busy.get()
+                                on:click=move |_| confirming_local.set(false)
+                            >
+                                "Cancel"
+                            </button>
+                        </div>
+                    </div>
+                </Show>
+            </Show>
+        }
+    };
+
     let delivery = Memo::new(move |_| {
         task.with(|t| {
             t.as_ref().map(|t| {
@@ -427,6 +479,19 @@ pub fn HumanReviewPanel(
                             </button>
                         }
                     }}
+                    // A project that can open a pull request keeps that as its
+                    // default; approving for local delivery is a separate,
+                    // named choice that opens nothing.
+                    <Show when=move || matches!(availability.get(), Some(PrAvailability::Available))>
+                        <button
+                            data-testid="human-review-approve-local"
+                            class="px-3 py-1.5 rounded-lg text-sm font-medium bg-white/5 text-emerald-200/90 hover:bg-white/10 disabled:opacity-50"
+                            disabled=move || busy.get()
+                            on:click=move |_| approve(false)
+                        >
+                            "Approve for local delivery"
+                        </button>
+                    </Show>
                     <button
                         data-testid="human-review-request-changes"
                         class="px-3 py-1.5 rounded-lg text-sm font-medium bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 disabled:opacity-50"
@@ -545,60 +610,26 @@ pub fn HumanReviewPanel(
                             <p>"SlashIt cannot create a GitHub pull request for this project."</p>
                             <p data-testid="human-review-pr-unavailable" class="text-white/45">{reason}</p>
                             <p class="text-white/45">"Nothing was merged. The task stays in Human Review with its work on its branch until you complete it."</p>
-                            <Show when=move || in_review.get()>
-                                <button
-                                    data-testid="human-review-complete-locally"
-                                    class="px-3 py-1.5 rounded-lg text-sm bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-50"
-                                    disabled=move || busy.get() || confirming_local.get()
-                                    on:click=move |_| {
-                                        error.set(None);
-                                        confirming_local.set(true);
-                                    }
-                                >
-                                    "Complete locally"
-                                </button>
-                                <Show when=move || confirming_local.get()>
-                                    <div data-testid="human-review-complete-locally-confirm" class="rounded-md border border-white/10 bg-black/20 p-2 space-y-2">
-                                        <p class="text-xs font-semibold text-white/70">"Complete locally?"</p>
-                                        <ul data-testid="human-review-complete-locally-consequences" class="list-disc pl-5 space-y-0.5 text-xs text-white/60">
-                                            {move || task.with(|t| t.as_ref().map(close_consequences).unwrap_or_default())
-                                                .into_iter()
-                                                .map(|line| view! { <li class="break-words">{line}</li> })
-                                                .collect_view()}
-                                        </ul>
-                                        <div class="flex gap-2">
-                                            <button
-                                                data-testid="human-review-complete-locally-confirm-button"
-                                                class="px-3 py-1.5 rounded-lg text-sm font-medium bg-emerald-500/25 text-emerald-100 hover:bg-emerald-500/35 disabled:opacity-50"
-                                                disabled=move || busy.get()
-                                                on:click=complete_locally
-                                            >
-                                                {move || if busy.get() { "Completing…" } else { "Complete locally" }}
-                                            </button>
-                                            <button
-                                                data-testid="human-review-complete-locally-cancel"
-                                                class="px-3 py-1.5 rounded-lg text-sm bg-white/5 text-white/60 hover:bg-white/10"
-                                                disabled=move || busy.get()
-                                                on:click=move |_| confirming_local.set(false)
-                                            >
-                                                "Cancel"
-                                            </button>
-                                        </div>
-                                    </div>
-                                </Show>
-                            </Show>
+                            {local_completion(false)}
                         </div>
                     }.into_any(),
                     Delivery::CompletedLocally { branch } => view! {
                         <div data-testid="human-review-delivery" data-delivery="completed_locally" class="text-xs text-white/60 space-y-1">
                             <p data-testid="human-review-completed-locally" class="font-medium text-emerald-200/90">"Completed locally."</p>
-                            <p>"Nothing was merged or pushed, and no pull request exists."</p>
+                            <p>
+                                {move || if task.with(|t| t.as_ref().is_some_and(is_integrated)) {
+                                    "Nothing was pushed, and no pull request exists."
+                                } else {
+                                    "Nothing was merged or pushed, and no pull request exists."
+                                }}
+                            </p>
                             <p data-testid="human-review-completed-branch">
                                 {match branch {
                                     Some(branch) => format!("The work is on the branch {branch} in your local repository. Its Task Checkout was removed."),
                                     None => "This task has no branch recorded. Its Task Checkout was removed.".to_string(),
                                 }}
                             </p>
+                            <LocalIntegrationPanel task_id=task_id task=task apply_task=apply_task />
                         </div>
                     }.into_any(),
                     Delivery::NotAttempted => view! {
@@ -612,6 +643,10 @@ pub fn HumanReviewPanel(
                             >
                                 {move || if busy.get() || in_flight() { "Creating…" } else { "Create PR" }}
                             </button>
+                            <p data-testid="human-review-local-choice" class="text-white/45">
+                                "Or keep this work local: finish it without a pull request. Nothing is pushed, and you can publish later."
+                            </p>
+                            {local_completion(true)}
                         </div>
                     }.into_any(),
                 })}

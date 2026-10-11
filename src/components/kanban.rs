@@ -2992,6 +2992,7 @@ mod tests {
             arrival: 1,
             decision: HumanReviewDecision::Approved,
             feedback: None,
+            approved_tip: None,
             decided_at: chrono::Utc::now(),
         });
         task
