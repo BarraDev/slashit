@@ -352,9 +352,11 @@ fn not_completed_message(prefix: &str, task: &Task) -> Option<String> {
     })
 }
 
-/// Whether a task has an integration record that says it finished.
+/// Whether the work approved now was integrated. A finished integration of
+/// earlier approved work (the task went back to work since) does not say so.
 pub fn is_integrated(task: &Task) -> bool {
-    task.local_integration.as_ref().is_some_and(|r| r.state == IntegrationState::Integrated)
+    task.integrating_current_approval()
+        && task.local_integration.as_ref().is_some_and(|r| r.state == IntegrationState::Integrated)
 }
 
 #[cfg(test)]
@@ -414,6 +416,47 @@ mod tests {
             not_completed_message(PREFIX, &kept).as_deref(),
             Some("The work is integrated, but the task was not completed: SlashIt recorded no reason.")
         );
+    }
+
+    /// Approval A was integrated, the task went back to work, and approval B
+    /// was completed locally without integrating: the drawer must not say
+    /// that the work was integrated, and must say so again once B is.
+    #[test]
+    fn an_earlier_approvals_integration_is_not_the_current_approvals() {
+        use crate::models::integration::{IntegrationStrategy, LocalIntegration};
+        let record = |tip: &str| LocalIntegration {
+            state: IntegrationState::Integrated,
+            target_branch: "main".into(),
+            target_old_oid: "a".repeat(40),
+            approved_tip: tip.into(),
+            result_oid: "c".repeat(40),
+            strategy: IntegrationStrategy::FastForward,
+            checkout_path: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            completes_task: false,
+        };
+        let approve = |t: &mut Task, sequence: u32, tip: &str| {
+            t.human_review.entries.push(crate::models::HumanReviewEntry {
+                sequence,
+                arrival: t.human_review.arrivals,
+                decision: crate::models::HumanReviewDecision::Approved,
+                feedback: None,
+                approved_tip: Some(tip.into()),
+                decided_at: chrono::Utc::now(),
+            });
+        };
+        let (a, b) = ("a1".repeat(20), "b2".repeat(20));
+        let mut t = task(TaskStatus::Done);
+        approve(&mut t, 1, &a);
+        t.local_integration = Some(record(&a));
+        assert!(is_integrated(&t), "approval A is the integrated one");
+
+        approve(&mut t, 2, &b);
+        assert!(!is_integrated(&t), "approval B was completed without integrating");
+
+        t.local_integration = Some(record(&b));
+        assert!(is_integrated(&t), "B integrated after completing locally");
     }
 
     #[test]
