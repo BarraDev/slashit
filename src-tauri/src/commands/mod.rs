@@ -11,6 +11,8 @@ pub mod queue;
 pub mod qa;
 pub mod human_review;
 pub mod integration;
+#[cfg(test)]
+mod complete_and_integrate_tests;
 pub mod attention;
 pub mod storage_usage;
 pub mod orphans;

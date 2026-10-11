@@ -36,6 +36,7 @@ const LI_DISCARD: &str = "[data-testid=\"local-integration-discard\"]";
 const LI_REFUSED: &str = "[data-testid=\"local-integration-refused\"]";
 const LI_REASON: &str = "[data-testid=\"local-integration-reason\"]";
 const LI_CONFLICTS: &str = "[data-testid=\"local-integration-conflicts\"]";
+const LI_COMPLETION: &str = "[data-testid=\"local-integration-completion\"]";
 
 const SETTINGS_REPOSITORY_TAB: &str = "[data-testid=\"settings-tab-repository\"]";
 const REPOSITORY_SOURCE: &str = "[data-testid=\"repository-source\"]";
@@ -465,6 +466,15 @@ async fn deliver_locally_in_a_github_project(
     await_attribute(driver, HR_DELIVERY, "data-delivery", "not_attempted").await?;
     ui::visible(driver, HR_LOCAL_CHOICE).await.context("the drawer does not offer to keep the work local")?;
     ui::visible(driver, HR_RETRY_PR).await.context("Create PR is no longer offered")?;
+    // Local delivery in one step is offered beside it as a named choice,
+    // never instead of it, and asking to see it opens nothing.
+    let one_step = await_text(driver, LI_START, |t| !t.is_empty(), "the Complete and Integrate action").await?;
+    if one_step != "Complete and Integrate" {
+        bail!("the one-step local delivery reads {one_step:?}");
+    }
+    if gh.create_attempts()? != 0 {
+        bail!("offering Complete and Integrate created a pull request");
+    }
 
     dismiss_toasts(driver).await?;
     click(driver, HR_COMPLETE_LOCALLY, "Complete locally").await?;
@@ -859,4 +869,188 @@ async fn refuse_resume_and_discard(
         bail!("recovering integrations pushed something to origin");
     }
     Ok(())
+}
+
+// --- Journey D ----------------------------------------------------------------
+
+/// Complete and Integrate, from Human Review: one action integrates the
+/// approved commit into the `main` that is checked out and completes the
+/// task. Cancelling changes nothing; nothing is pushed and no pull request
+/// is opened; the Task Checkout goes and the Task branch stays; the outcome
+/// survives a restart; and a task that depends on this one starts from the
+/// local base that holds the approved work.
+#[tokio::test(flavor = "multi_thread")]
+async fn approved_work_is_completed_and_integrated_in_one_action_and_a_dependent_task_starts_from_it() {
+    let context = TestContext::new("complete_and_integrate").expect("harness setup");
+    let outcome = complete_and_integrate_journey(&context).await;
+    context.finish(outcome);
+}
+
+async fn complete_and_integrate_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+    let (_agent, gh) = install_fakes(context, &root)?;
+    context.set_child_env(fake_agent::WRITE_OWN_FILE_VAR, "1");
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("complete-and-integrate").await?;
+    let outcome = complete_and_integrate_from_review(session.driver(), &repository).await;
+    context.close_session(session, "complete-and-integrate", &outcome).await?;
+    let integrated = outcome?;
+    if !gh.invocations()?.is_empty() {
+        bail!("completing and integrating ran gh: {:?}", gh.invocations()?);
+    }
+
+    let session = context.start_session("complete-and-integrate-restart").await?;
+    let outcome = integration_survives_and_feeds_a_dependent(session.driver(), &repository, &integrated).await;
+    context.close_session(session, "complete-and-integrate-restart", &outcome).await?;
+    outcome?;
+    if !gh.invocations()?.is_empty() {
+        bail!("starting the dependent task ran gh: {:?}", gh.invocations()?);
+    }
+    Ok(())
+}
+
+async fn complete_and_integrate_from_review(driver: &WebDriver, repository: &GitFixture) -> Result<Integrated> {
+    let repo = repository.path_buf();
+    let project_id = register_project(driver, repository).await?;
+    let (task_id, title) = create_task(driver, &project_id, "Complete and integrate journey", &[]).await?;
+    let executed = run_to_review(driver, &project_id, &task_id, &title).await?;
+    let branch = branch_name_of(&read_task(driver, &executed).await?)?;
+    let work_file = own_file_of(&executed)?;
+    let tip = repository.branch_tip(&branch)?.context("the task branch is missing")?;
+    let main_before = repository.branch_tip("main")?.context("main is missing")?;
+    let origin_before = repository.pushed_branches()?;
+    if tip == main_before {
+        bail!("the task produced no commit of its own");
+    }
+    assert_main_checked_out_and_clean(repository)?;
+
+    // --- Approve; both local alternatives are offered side by side ------------
+    open_board(driver, &project_id).await?;
+    open_reviewed_drawer(driver, &executed).await?;
+    await_text(driver, HR_APPROVE, |t| t != "Checking…", "the approve action").await?;
+    dismiss_toasts(driver).await?;
+    click(driver, HR_APPROVE, "Approve").await?;
+    ui::visible(driver, HR_APPROVED).await.context("the drawer does not say Approved")?;
+    ui::visible(driver, HR_COMPLETE_LOCALLY).await.context("Complete locally is no longer offered")?;
+    let label = await_text(driver, LI_START, |t| !t.is_empty(), "the Complete and Integrate action").await?;
+    if label != "Complete and Integrate" {
+        bail!("the one-step action reads {label:?}");
+    }
+    await_attribute(driver, LI_READY, "data-state", "ready_in_checkout").await?;
+
+    // --- What it would do, read before anything is confirmed ------------------
+    dismiss_toasts(driver).await?;
+    click(driver, LI_START, "Complete and Integrate").await?;
+    ui::visible(driver, LI_CONFIRM_BOX).await.context("Complete and Integrate did not ask first")?;
+    let facts = await_text(driver, LI_FACTS, |t| !t.is_empty(), "the facts to confirm").await?;
+    for expected in [
+        "Destination branch: main".to_string(),
+        format!("Approved commit: {}", short(&tip)),
+        format!("Current destination commit: {}", short(&main_before)),
+        "Strategy: Fast-forward".to_string(),
+        "Checkout affected: ".to_string(),
+    ] {
+        if !facts.contains(&expected) {
+            bail!("the confirmation does not say {expected:?}: {facts:?}");
+        }
+    }
+    let completion = text_of_panel(driver, LI_COMPLETION).await?;
+    for expected in ["marked Done", "No pull request is created.", "Task Checkout at", "is removed", &branch, "are kept"] {
+        if !completion.contains(expected) {
+            bail!("the confirmation does not say {expected:?}: {completion:?}");
+        }
+    }
+    let remote = text_of_panel(driver, LI_REMOTE).await?;
+    if !remote.contains("Nothing will be pushed") {
+        bail!("the confirmation does not say nothing is pushed: {remote:?}");
+    }
+
+    // --- Cancel changes nothing ------------------------------------------------
+    dismiss_toasts(driver).await?;
+    click(driver, LI_CANCEL, "Cancel").await?;
+    await_hidden(driver, LI_CONFIRM_BOX, "the confirmation, after Cancel").await?;
+    let still = read_task(driver, &executed).await?;
+    if still.get("status").and_then(Value::as_str) != Some("human_review")
+        || integration_of(&still).is_some()
+        || !executed.worktree_path.exists()
+        || repository.branch_tip("main")?.as_deref() != Some(main_before.as_str())
+    {
+        bail!("cancelling changed something: {still}");
+    }
+
+    // --- Confirm: one action ---------------------------------------------------
+    dismiss_toasts(driver).await?;
+    click(driver, LI_START, "Complete and Integrate").await?;
+    dismiss_toasts(driver).await?;
+    click(driver, LI_CONFIRM, "the Complete and Integrate confirmation").await?;
+    let done = await_status(driver, &project_id, &executed.id, &["done"]).await?;
+    await_worktree_removal(repository, &executed.worktree_path).await?;
+    let said = await_text(driver, LI_RESULT, |t| t.contains("Integrated into main"), "the integration result").await?;
+    if !said.contains("fast-forward") || !said.contains(short(&tip)) || !said.contains("did not push it") {
+        bail!("the result says {said:?}");
+    }
+    await_attribute(driver, HR_DELIVERY, "data-delivery", "completed_locally").await?;
+
+    // Git: the branch, the index and the files moved together; the Task
+    // branch is untouched; nothing reached origin.
+    if repository.branch_tip("main")?.as_deref() != Some(tip.as_str()) {
+        bail!("main is not at the approved commit {tip}");
+    }
+    assert_main_checked_out_and_clean(repository)?;
+    match std::fs::read_to_string(repo.join(&work_file)) {
+        Ok(content) if content == fake_agent::WORK_CONTENT => {}
+        other => bail!("the checkout that has main holds {other:?} as {work_file}, not the agent's work"),
+    }
+    if git_out(&repo, &["rev-parse", &format!("refs/heads/{branch}")])? != tip {
+        bail!("the Task branch was moved");
+    }
+    if repository.pushed_branches()? != origin_before {
+        bail!("completing and integrating pushed something to origin");
+    }
+
+    // The product's record: Done, complete, 100%, the approval kept, the
+    // integration naming the approved commit and its result.
+    let settled = read_task(driver, &executed).await?;
+    if done.get("status").and_then(Value::as_str) != Some("done")
+        || settled.get("phase").and_then(Value::as_str) != Some("complete")
+        || settled.get("overall_progress").and_then(Value::as_u64) != Some(100)
+        || settled.get("worktree_path").is_some_and(|v| !v.is_null())
+        || settled.get("pr_url").is_some_and(|v| !v.is_null())
+    {
+        bail!("the completed task reads {settled}");
+    }
+    let approvals = settled
+        .pointer("/human_review/entries")
+        .and_then(Value::as_array)
+        .context("the task has no review history")?;
+    if approvals.len() != 1
+        || approvals[0].get("decision").and_then(Value::as_str) != Some("approved")
+        || approvals[0].get("approved_tip").and_then(Value::as_str) != Some(tip.as_str())
+    {
+        bail!("the approval history is {approvals:?}");
+    }
+    let record = integration_of(&settled).context("the task records no integration")?;
+    if record.get("state").and_then(Value::as_str) != Some("integrated")
+        || record.get("strategy").and_then(Value::as_str) != Some("fast_forward")
+        || record.get("target_branch").and_then(Value::as_str) != Some("main")
+        || record.get("approved_tip").and_then(Value::as_str) != Some(tip.as_str())
+        || record.get("result_oid").and_then(Value::as_str) != Some(tip.as_str())
+        || record.get("completes_task").and_then(Value::as_bool) != Some(true)
+    {
+        bail!("the integration is recorded as {record}");
+    }
+
+    // The timeline records each once, integration first.
+    let rows = await_timeline_reaching(driver, "completed_locally").await?;
+    let kinds: Vec<&str> = rows
+        .iter()
+        .map(|(kind, _, _)| kind.as_str())
+        .filter(|kind| matches!(*kind, "integrated_locally" | "completed_locally"))
+        .collect();
+    if kinds != ["integrated_locally", "completed_locally"] {
+        bail!("the timeline shows {kinds:?} in {rows:?}");
+    }
+    assert_persisted(repository.state_root(), &executed, "done")?;
+    Ok(Integrated { task: executed, work_file, tip })
 }

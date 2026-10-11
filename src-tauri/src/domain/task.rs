@@ -477,6 +477,16 @@ impl Task {
         self.status == TaskStatus::Done && slashit_activity::completed_locally(&self.activity)
     }
 
+    /// Whether the current approval's work is being integrated into a local
+    /// branch, or already is: an integration that is pending, or one that
+    /// recorded exactly the commit approved now. An integration of earlier
+    /// approved work (the task went back to work since) does not count.
+    pub fn integrating_current_approval(&self) -> bool {
+        self.local_integration.as_ref().is_some_and(|r| {
+            r.is_pending() || self.human_review.approved_tip() == Some(r.approved_tip.as_str())
+        })
+    }
+
     /// The number the task's next coding run gets.
     pub fn next_run(&self) -> u32 {
         slashit_activity::next_run(&self.activity)

@@ -346,6 +346,14 @@ pub fn HumanReviewPanel(
         task.with(|t| t.as_ref().and_then(|t| t.human_review.current_decision().map(|e| e.decision)))
     });
     let in_review = Memo::new(move |_| task.with(|t| t.as_ref().is_some_and(|t| t.status == TaskStatus::HumanReview)));
+    // The approved work is being integrated into a local branch, or already
+    // is, and the task is still in review: that is the one delivery, and no
+    // second one (a pull request, a plain completion) is offered next to it.
+    let integrating = Memo::new(move |_| {
+        task.with(|t| {
+            t.as_ref().is_some_and(|t| t.status == TaskStatus::HumanReview && t.integrating_current_approval())
+        })
+    });
     // The controls that finish approved changes locally: a button, then the
     // consequences, then a deliberate confirmation.
     let local_completion = move |without_pull_request: bool| {
@@ -554,7 +562,14 @@ pub fn HumanReviewPanel(
                     </svg>
                     "Approved"
                 </p>
-                {move || delivery.get().map(|d| match d {
+                {move || delivery.get().map(|d| if integrating.get() {
+                    view! {
+                        <div data-testid="human-review-delivery" data-delivery="integrating_locally" class="text-xs text-white/60 space-y-2">
+                            <p>"This task's approved work is being delivered to a local branch. No pull request is created."</p>
+                            <LocalIntegrationPanel task_id=task_id task=task apply_task=apply_task completing=true />
+                        </div>
+                    }.into_any()
+                } else { match d {
                     Delivery::Checking => view! {
                         <p data-testid="human-review-delivery" data-delivery="checking" class="text-xs text-white/40">"Checking whether a pull request can be created…"</p>
                     }.into_any(),
@@ -611,6 +626,7 @@ pub fn HumanReviewPanel(
                             <p data-testid="human-review-pr-unavailable" class="text-white/45">{reason}</p>
                             <p class="text-white/45">"Nothing was merged. The task stays in Human Review with its work on its branch until you complete it."</p>
                             {local_completion(false)}
+                            <LocalIntegrationPanel task_id=task_id task=task apply_task=apply_task completing=true />
                         </div>
                     }.into_any(),
                     Delivery::CompletedLocally { branch } => view! {
@@ -647,9 +663,10 @@ pub fn HumanReviewPanel(
                                 "Or keep this work local: finish it without a pull request. Nothing is pushed, and you can publish later."
                             </p>
                             {local_completion(true)}
+                            <LocalIntegrationPanel task_id=task_id task=task apply_task=apply_task completing=true />
                         </div>
                     }.into_any(),
-                })}
+                } })}
             </Show>
 
             {move || error.get().map(|e| view! {
@@ -809,6 +826,43 @@ mod tests {
         assert!(tried_a_pull_request(Some(&PrDelivery::Created { url: "u".into() })));
         assert!(!tried_a_pull_request(Some(&PrDelivery::Unavailable { reason: "x".into() })));
         assert!(!tried_a_pull_request(None));
+    }
+
+    #[test]
+    fn work_being_integrated_locally_is_the_one_delivery_of_the_current_approval() {
+        use crate::models::integration::{IntegrationState, IntegrationStrategy, LocalIntegration};
+        let record = |state, tip: &str| LocalIntegration {
+            state,
+            target_branch: "main".into(),
+            target_old_oid: "a".repeat(40),
+            approved_tip: tip.into(),
+            result_oid: "c".repeat(40),
+            strategy: IntegrationStrategy::FastForward,
+            checkout_path: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            completes_task: true,
+        };
+        let tip = "b".repeat(40);
+        let mut t = task(TaskStatus::HumanReview);
+        assert!(!t.integrating_current_approval(), "nothing started");
+
+        t.local_integration = Some(record(IntegrationState::Pending, &"9".repeat(40)));
+        assert!(t.integrating_current_approval(), "a pending integration always counts");
+
+        t.human_review.entries.push(crate::models::HumanReviewEntry {
+            sequence: 1,
+            arrival: t.human_review.arrivals,
+            decision: HumanReviewDecision::Approved,
+            feedback: None,
+            approved_tip: Some(tip.clone()),
+            decided_at: chrono::Utc::now(),
+        });
+        t.local_integration = Some(record(IntegrationState::Integrated, &tip));
+        assert!(t.integrating_current_approval(), "the approved commit is the integrated one");
+
+        t.local_integration = Some(record(IntegrationState::Integrated, &"9".repeat(40)));
+        assert!(!t.integrating_current_approval(), "an earlier approval's integration is not this delivery");
     }
 
     #[test]

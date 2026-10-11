@@ -124,6 +124,15 @@ impl Task {
         self.status == TaskStatus::Done && slashit_activity::completed_locally(&self.activity)
     }
 
+    /// Whether the current approval's work is being integrated into a local
+    /// branch, or already is. Same rule as the backend.
+    pub fn integrating_current_approval(&self) -> bool {
+        self.local_integration.as_ref().is_some_and(|r| {
+            r.state == crate::models::integration::IntegrationState::Pending
+                || self.human_review.approved_tip() == Some(r.approved_tip.as_str())
+        })
+    }
+
     /// What happened to the task, oldest first.
     pub fn timeline(&self) -> Vec<slashit_activity::Item<'_>> {
         let decisions = self.human_review.entries.iter().map(|e| slashit_activity::Decision {
@@ -548,6 +557,13 @@ impl HumanReviewRecord {
     pub fn is_approved(&self) -> bool {
         self.current_decision()
             .is_some_and(|e| e.decision == HumanReviewDecision::Approved)
+    }
+
+    /// The commit the current approval covers, if it recorded one.
+    pub fn approved_tip(&self) -> Option<&str> {
+        self.current_decision()
+            .filter(|e| e.decision == HumanReviewDecision::Approved)
+            .and_then(|e| e.approved_tip.as_deref())
     }
 
     /// Changes requested in earlier reviews, oldest first: the feedback the

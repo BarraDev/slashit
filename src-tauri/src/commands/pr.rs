@@ -458,6 +458,16 @@ pub(crate) async fn create_pr_for_approved_task(
             );
         }
         refuse_while_republish_pending(state, task_id).await?;
+        // One delivery per task: work being integrated into a local branch,
+        // or already integrated there, is not also opened as a pull request.
+        let integrating = state.task.tasks.read().await.get(&task_id).is_some_and(|t| t.integrating_current_approval());
+        if integrating {
+            return Err(
+                "This task's approved work is being integrated into a local branch, or already \
+                 is, so no pull request was opened."
+                    .to_string(),
+            );
+        }
         match state.executor.get() {
             Some(executor) => Some(executor.begin_pr_side_effect_under_lease(task_id).await?),
             None => None,

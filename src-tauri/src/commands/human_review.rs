@@ -38,7 +38,7 @@ impl DeliveriesInFlight {
 
     /// Mark `task_id` as being delivered until the returned guard is dropped.
     /// Counted, so two overlapping attempts do not end each other's mark.
-    fn start(&self, task_id: Uuid) -> DeliveryMark {
+    pub(crate) fn start(&self, task_id: Uuid) -> DeliveryMark {
         *self.lock().entry(task_id).or_default() += 1;
         DeliveryMark { deliveries: self.clone(), task_id }
     }
@@ -50,7 +50,7 @@ impl DeliveriesInFlight {
     }
 }
 
-struct DeliveryMark {
+pub(crate) struct DeliveryMark {
     deliveries: DeliveriesInFlight,
     task_id: Uuid,
 }
@@ -209,21 +209,7 @@ pub(crate) async fn complete_locally(
     if task.completed_locally() {
         return Ok(task);
     }
-    check_reviewable(&task, "completed locally")?;
-    if !task.human_review.is_approved() {
-        return Err(
-            "Approve the changes before completing them locally; this task has no approval."
-                .to_string(),
-        );
-    }
-    let has_pr = task.pr_url.is_some() || task.external_refs.iter().any(|r| r.is_pr());
-    if has_pr || state.task.deliveries.contains(task_id) {
-        return Err(
-            "This task has a pull request, or one is being opened, so it is delivered through \
-             that pull request, not completed locally."
-                .to_string(),
-        );
-    }
+    check_completable(state, &task)?;
     // Asked for by name, finishing locally does not depend on whether a pull
     // request could be opened.
     if !without_pull_request {
@@ -245,7 +231,46 @@ pub(crate) async fn complete_locally(
             }
         }
     }
+    complete_leased(state, task_id).await.map_err(|refusal| refusal.to_string())
+}
 
+/// What has to hold for approved changes to be completed locally, whoever
+/// asks: the task is in Human Review with its changes approved, it has no
+/// pull request and none is being opened, and no integration of it is half
+/// done (whichever way that one ends decides what completing means).
+pub(crate) fn check_completable(state: &crate::AppState, task: &Task) -> Result<(), String> {
+    check_reviewable(task, "completed locally")?;
+    if !task.human_review.is_approved() {
+        return Err(
+            "Approve the changes before completing them locally; this task has no approval."
+                .to_string(),
+        );
+    }
+    let has_pr = task.pr_url.is_some() || task.external_refs.iter().any(|r| r.is_pr());
+    if has_pr || state.task.deliveries.contains(task.id) {
+        return Err(
+            "This task has a pull request, or one is being opened, so it is delivered through \
+             that pull request, not completed locally."
+                .to_string(),
+        );
+    }
+    if task.local_integration.as_ref().is_some_and(|r| r.is_pending()) {
+        return Err(
+            "An integration of this task into a local branch was started and not finished. \
+             Resume or discard it first."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The terminalization of [`complete_locally`], for a caller that holds the
+/// task's lease and has checked [`check_completable`]: the checkout is
+/// removed, then `Done` is committed with the activity entry in one write.
+pub(crate) async fn complete_leased(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<Task, crate::lifecycle::TerminalizeRefusal> {
     let record = |staged: &mut HashMap<Uuid, Task>| {
         if let Some(t) = staged.get_mut(&task_id) {
             t.overall_progress = 100;
@@ -262,7 +287,6 @@ pub(crate) async fn complete_locally(
         request,
     )
     .await
-    .map_err(|refusal| refusal.to_string())
 }
 
 async fn record_approval(state: &crate::AppState, task_id: Uuid) -> Result<Task, String> {

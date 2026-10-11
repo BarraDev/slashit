@@ -6789,6 +6789,7 @@ mod tests {
                 checkout_path: None,
                 started_at: chrono::Utc::now(),
                 completed_at: Some(chrono::Utc::now()),
+                completes_task: false,
             });
         }
         git_in(&repo, &["update-ref", "refs/heads/main", &approved]);
@@ -6831,6 +6832,7 @@ mod tests {
                 checkout_path: None,
                 started_at: chrono::Utc::now(),
                 completed_at: Some(chrono::Utc::now()),
+                completes_task: false,
             });
         }
         // The integrated work is on local main only, and SlashIt marked it.
@@ -6872,6 +6874,7 @@ mod tests {
                 checkout_path: None,
                 started_at: chrono::Utc::now(),
                 completed_at: None,
+                completes_task: false,
             });
         }
         let (_, acquired) = executor.acquire_task_worktree(task_id, repo.to_str().unwrap()).await;

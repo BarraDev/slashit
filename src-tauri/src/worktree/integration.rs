@@ -512,6 +512,31 @@ pub async fn inspect_checkout(path: &str, plan: &Plan) -> Result<CheckoutReadine
     Ok(CheckoutReadiness::Ready)
 }
 
+/// The paths in the checkout at `path` that Git would refuse to discard when
+/// removing it: tracked files that differ from `HEAD` and untracked files
+/// that are not ignored. Empty when the checkout can be removed cleanly.
+/// Changes nothing, and takes no optional lock.
+pub async fn uncommitted_paths(path: &str) -> Result<Vec<String>, String> {
+    let out = git_raw_env(
+        Path::new(path),
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal", "--ignore-submodules=none"],
+        &[("GIT_OPTIONAL_LOCKS", "0".to_string())],
+    )
+    .await?;
+    // Entries are `XY <path>`; a rename carries its source as a further
+    // NUL-separated field, which is not an entry of its own.
+    let mut paths = Vec::new();
+    let mut fields = out.split('\0').filter(|f| !f.is_empty());
+    while let Some(field) = fields.next() {
+        let Some(name) = field.get(3..) else { continue };
+        paths.push(name.to_string());
+        if field.starts_with('R') || field.starts_with('C') {
+            fields.next();
+        }
+    }
+    Ok(paths)
+}
+
 /// A private copy of a checkout's index, for read-only questions.
 ///
 /// `git diff` compares the files with the index and, when it finds an entry
@@ -800,6 +825,32 @@ mod tests {
         "new\nline",
         "",
     ];
+
+    #[tokio::test]
+    async fn uncommitted_paths_names_what_git_would_refuse_to_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        git_in(repo, &["init", "-q", "-b", "main"]);
+        git_in(repo, &["config", "user.email", "t@example.com"]);
+        git_in(repo, &["config", "user.name", "T"]);
+        std::fs::write(repo.join(".gitignore"), "ignored.log\n").unwrap();
+        std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+        std::fs::write(repo.join("moved.txt"), "move me\n").unwrap();
+        git_in(repo, &["add", "."]);
+        git_in(repo, &["commit", "-q", "-m", "init"]);
+        let path = repo.to_str().unwrap();
+        assert!(uncommitted_paths(path).await.unwrap().is_empty(), "a clean checkout");
+
+        std::fs::write(repo.join("ignored.log"), "noise\n").unwrap();
+        assert!(uncommitted_paths(path).await.unwrap().is_empty(), "ignored files do not block removal");
+
+        std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "new\n").unwrap();
+        git_in(repo, &["mv", "moved.txt", "renamed.txt"]);
+        let mut found = uncommitted_paths(path).await.unwrap();
+        found.sort();
+        assert_eq!(found, ["renamed.txt", "tracked.txt", "untracked.txt"], "a rename is one entry, named by its new path");
+    }
 
     #[test]
     fn quoted_text_reaches_a_shell_as_exactly_one_word() {

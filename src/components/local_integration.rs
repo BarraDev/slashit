@@ -1,5 +1,7 @@
-//! Integrating a locally completed task's approved work into a local branch,
-//! from the task drawer.
+//! Integrating a task's approved work into a local branch, from the task
+//! drawer: after the task was completed locally ("Integrate locally"), or
+//! from Human Review as one action that also completes it ("Complete and
+//! Integrate").
 //!
 //! The panel asks the backend what integrating would do (nothing is changed
 //! by asking), shows the destination, the exact commits, the strategy and
@@ -15,9 +17,10 @@ use uuid::Uuid;
 use crate::models::integration::{short, IntegrationPreview, IntegrationState, PreviewState};
 use crate::models::Task;
 use crate::services::integration_service::{
-    discard_local_integration, get_integration_preview, integrate_task_locally, reconfirm_approved_tip,
-    resume_local_integration,
+    complete_and_integrate_task, discard_local_integration, get_integration_preview, integrate_task_locally,
+    reconfirm_approved_tip, resume_local_integration,
 };
+use crate::services::human_review_service::complete_task_locally;
 
 #[component]
 pub fn LocalIntegrationPanel(
@@ -25,6 +28,9 @@ pub fn LocalIntegrationPanel(
     #[prop(into)] task: Signal<Option<Task>>,
     /// Apply a task record a command returned.
     apply_task: Callback<Task>,
+    /// The task is in Human Review and the action completes it too.
+    #[prop(optional)]
+    completing: bool,
 ) -> impl IntoView {
     let preview = RwSignal::new(None::<IntegrationPreview>);
     let error = RwSignal::new(None::<String>);
@@ -78,7 +84,74 @@ pub fn LocalIntegrationPanel(
         let Some(confirmation) = preview.with_untracked(|p| p.as_ref().and_then(IntegrationPreview::confirmation)) else {
             return;
         };
+        if completing {
+            // An answer that is not completed is not an error: the work is
+            // integrated and the task says why it is still in review.
+            if busy.get_untracked() {
+                return;
+            }
+            busy.set(true);
+            error.set(None);
+            spawn_local(async move {
+                match complete_and_integrate_task(task_id.to_string(), confirmation).await {
+                    Ok(updated) if updated.completed_locally() => {
+                        confirming.try_set(false);
+                        apply_task.try_run(updated);
+                        crate::components::toast::success(
+                            "Integrated and completed. Nothing was pushed.".to_string(),
+                        );
+                    }
+                    Ok(updated) => {
+                        let reason = updated
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "SlashIt recorded no reason.".to_string());
+                        confirming.try_set(false);
+                        apply_task.try_run(updated);
+                        error.try_set(Some(format!(
+                            "The work is integrated, but the task was not completed: {reason}"
+                        )));
+                    }
+                    Err(e) => {
+                        error.try_set(Some(e));
+                    }
+                }
+                busy.try_set(false);
+                refresh();
+            });
+            return;
+        }
         run(Box::pin(integrate_task_locally(task_id.to_string(), confirmation)), "Integrated locally. Nothing was pushed.");
+    };
+    // The integration is recorded and only the completion is owed: finishing
+    // it is the ordinary completion, which repeats no integration.
+    let finish_completing = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match complete_task_locally(task_id.to_string(), true).await {
+                Ok(updated) if updated.completed_locally() => {
+                    apply_task.try_run(updated);
+                    crate::components::toast::success("Task completed.".to_string());
+                }
+                Ok(updated) => {
+                    let reason = updated
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "SlashIt recorded no reason.".to_string());
+                    apply_task.try_run(updated);
+                    error.try_set(Some(format!("The task was not completed: {reason}")));
+                }
+                Err(e) => {
+                    error.try_set(Some(format!("The task was not completed: {e}")));
+                }
+            }
+            busy.try_set(false);
+            refresh();
+        });
     };
     let resume = move |_| {
         run(Box::pin(resume_local_integration(task_id.to_string())), "Integration finished. Nothing was pushed.");
@@ -92,7 +165,9 @@ pub fn LocalIntegrationPanel(
 
     view! {
         <div data-testid="local-integration" class="space-y-2 border-t border-white/10 pt-2">
-            <p class="text-[11px] font-semibold uppercase tracking-wide text-white/50">"Integrate locally"</p>
+            <p class="text-[11px] font-semibold uppercase tracking-wide text-white/50">
+                {if completing { "Complete and integrate locally" } else { "Integrate locally" }}
+            </p>
 
             {move || preview.get().map(|p| {
                 let state = p.state;
@@ -106,8 +181,25 @@ pub fn LocalIntegrationPanel(
                             </div>
                         }.into_any()
                     }
+                    PreviewState::CompletionPending => {
+                        let note = p.completion_pending_note();
+                        let line = p.integration.as_ref().map(|r| r.result_line());
+                        view! {
+                            <div data-testid="local-integration-completion-pending" data-state="completion_pending" class="space-y-2 rounded-md border border-amber-500/20 bg-amber-500/[0.06] p-2 text-xs">
+                                <p class="font-semibold text-amber-200">"Integrated, not completed yet"</p>
+                                {line.map(|l| view! { <p data-testid="local-integration-result" class="text-emerald-200/90">{l}</p> })}
+                                <p data-testid="local-integration-completion-note" class="text-white/70 whitespace-pre-wrap break-words">{note}</p>
+                                <p class="text-white/50">"SlashIt did not push it, and no pull request exists."</p>
+                                <button data-testid="local-integration-finish"
+                                    class="px-3 py-1.5 rounded-lg text-sm bg-emerald-500/20 text-emerald-100 hover:bg-emerald-500/30 disabled:opacity-50"
+                                    disabled=move || busy.get()
+                                    on:click=finish_completing>{move || if busy.get() { "Completing…" } else { "Finish completing" }}</button>
+                            </div>
+                        }.into_any()
+                    }
                     PreviewState::Pending => {
                         let note = p.pending_note();
+                        let completes = p.integration.as_ref().is_some_and(|r| r.completes_task);
                         let record = p.integration.clone();
                         let can_discard = p.can_discard();
                         let problems = p.checkout_problems.clone();
@@ -135,7 +227,7 @@ pub fn LocalIntegrationPanel(
                                     <button data-testid="local-integration-resume"
                                         class="px-3 py-1.5 rounded-lg text-sm bg-emerald-500/20 text-emerald-100 hover:bg-emerald-500/30 disabled:opacity-50"
                                         disabled=move || busy.get()
-                                        on:click=resume>"Resume"</button>
+                                        on:click=resume>{if completes { "Resume and complete" } else { "Resume" }}</button>
                                     {can_discard.then(|| view! {
                                         <button data-testid="local-integration-discard"
                                             class="px-3 py-1.5 rounded-lg text-sm bg-white/5 text-white/70 hover:bg-white/10 disabled:opacity-50"
@@ -205,11 +297,26 @@ pub fn LocalIntegrationPanel(
                         let commits = p.commits.clone();
                         let notes: Vec<String> = [p.checkout_note(), p.unapproved_note()].into_iter().flatten().collect();
                         let remote = p.remote_note();
-                        let button_label = if state == PreviewState::AlreadyContained { "Record as integrated" } else { "Integrate locally" };
+                        let button_label = match (completing, state == PreviewState::AlreadyContained) {
+                            (true, _) => "Complete and Integrate",
+                            (false, true) => "Record as integrated",
+                            (false, false) => "Integrate locally",
+                        };
+                        let completion_lines = completing.then(|| {
+                            task.with_untracked(|t| {
+                                IntegrationPreview::completion_lines(
+                                    t.as_ref().and_then(|t| t.worktree_path.as_deref()),
+                                    t.as_ref().and_then(|t| t.branch_name.as_deref()),
+                                )
+                            })
+                        });
                         let in_checkout = state == PreviewState::ReadyInCheckout;
                         view! {
                             <div data-testid="local-integration-ready" data-state=if in_checkout { "ready_in_checkout" } else { "ready" } class="space-y-2 text-xs text-white/60">
                                 <p>{if state == PreviewState::AlreadyContained { "The destination branch already contains the approved commit." } else { "The approved work is on its Task branch and has not reached any other branch." }}</p>
+                                {completing.then(|| view! {
+                                    <p data-testid="local-integration-explainer">"One action: integrate the approved commit into the destination, then complete the task. Pushing and pull requests are not part of it."</p>
+                                })}
                                 <button data-testid="local-integration-start"
                                     class="px-3 py-1.5 rounded-lg text-sm bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-50"
                                     disabled=move || busy.get() || confirming.get()
@@ -232,6 +339,11 @@ pub fn LocalIntegrationPanel(
                                             </div>
                                         })}
                                         {notes.clone().into_iter().map(|note| view! { <p data-testid="local-integration-note" class="text-amber-200/80">{note}</p> }).collect_view()}
+                                        {completion_lines.clone().map(|lines| view! {
+                                            <ul data-testid="local-integration-completion" class="list-disc pl-5 space-y-0.5">
+                                                {lines.into_iter().map(|line| view! { <li class="break-words">{line}</li> }).collect_view()}
+                                            </ul>
+                                        })}
                                         <p data-testid="local-integration-remote">{remote.clone()}</p>
                                         <div class="flex gap-2">
                                             <button data-testid="local-integration-confirm-button"

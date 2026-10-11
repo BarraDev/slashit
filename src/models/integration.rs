@@ -61,6 +61,9 @@ pub struct LocalIntegration {
     pub started_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The integration was asked for as part of completing the Task.
+    #[serde(default)]
+    pub completes_task: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -70,6 +73,9 @@ pub enum PreviewState {
     ReadyInCheckout,
     AlreadyContained,
     Integrated,
+    /// The destination holds the approved work and the Task is not
+    /// completed yet.
+    CompletionPending,
     Pending,
     NeedsReconfirmation,
     Refused,
@@ -256,6 +262,45 @@ impl IntegrationPreview {
         }
     }
 
+    /// What completing the task does besides moving the destination, one
+    /// statement per line, for the confirmation of Complete and Integrate.
+    pub fn completion_lines(task_checkout: Option<&str>, branch: Option<&str>) -> Vec<String> {
+        let mut lines = vec![
+            "The task is marked Done once the destination holds the approved commit. If it cannot be \
+             completed, the integration stays recorded and the task stays in Human Review."
+                .to_string(),
+            "No pull request is created.".to_string(),
+        ];
+        if let Some(path) = task_checkout {
+            lines.push(format!(
+                "Its Task Checkout at {path} is removed. If Git refuses because it holds uncommitted \
+                 changes, the checkout is kept."
+            ));
+        }
+        match branch {
+            Some(branch) => lines.push(format!(
+                "The Task branch {branch} and all its commits are kept. SlashIt does not delete or push it."
+            )),
+            None => lines.push("This task has no branch recorded.".to_string()),
+        }
+        lines
+    }
+
+    /// What is true when the destination holds the work and the task is
+    /// still in review.
+    pub fn completion_pending_note(&self) -> String {
+        let branch = self.target_branch.as_deref().unwrap_or("The destination branch");
+        let mut note = format!(
+            "{branch} already holds the approved work, and that is recorded. The task is not \
+             completed yet. Finishing it repeats no integration."
+        );
+        if let Some(reason) = &self.reason {
+            note.push(' ');
+            note.push_str(reason);
+        }
+        note
+    }
+
     /// What a pending integration needs, in a sentence, from what the
     /// destination branch shows.
     pub fn pending_note(&self) -> Option<String> {
@@ -341,6 +386,7 @@ mod tests {
             PreviewState::ReadyInCheckout => "ready_in_checkout",
             PreviewState::AlreadyContained => "already_contained",
             PreviewState::Integrated => "integrated",
+            PreviewState::CompletionPending => "completion_pending",
             PreviewState::Pending => "pending",
             PreviewState::NeedsReconfirmation => "needs_reconfirmation",
             PreviewState::Refused => "refused",
@@ -363,9 +409,49 @@ mod tests {
     }
 
     #[test]
+    fn completing_says_what_happens_to_the_checkout_the_branch_and_the_pull_request() {
+        let lines = IntegrationPreview::completion_lines(Some("/data/worktrees/p/task-a"), Some("task-a")).join("\n");
+        assert!(lines.contains("/data/worktrees/p/task-a is removed") || lines.contains("Task Checkout at /data/worktrees/p/task-a is removed"));
+        assert!(lines.contains("uncommitted"), "{lines}");
+        assert!(lines.contains("task-a and all its commits are kept"), "{lines}");
+        assert!(lines.contains("No pull request is created."));
+        assert!(lines.contains("stays in Human Review"), "a refused completion is described");
+
+        let bare = IntegrationPreview::completion_lines(None, None).join("\n");
+        assert!(!bare.contains("removed"), "no checkout, nothing removed: {bare}");
+        assert!(bare.contains("no branch recorded"));
+    }
+
+    #[test]
+    fn an_integration_waiting_for_its_completion_says_so_and_why() {
+        let mut p = preview(PreviewState::CompletionPending);
+        let plain = p.completion_pending_note();
+        assert!(plain.contains("main already holds the approved work"), "{plain}");
+        assert!(plain.contains("not completed yet") && plain.contains("repeats no integration"));
+        p.reason = Some("The worktree at /w was kept: locked".into());
+        assert!(p.completion_pending_note().ends_with("was kept: locked"));
+    }
+
+    #[test]
+    fn a_record_written_before_completion_was_part_of_it_loads_as_not_completing() {
+        let record: LocalIntegration = serde_json::from_value(serde_json::json!({
+            "state": "integrated",
+            "target_branch": "main",
+            "target_old_oid": oid('a'),
+            "approved_tip": oid('b'),
+            "result_oid": oid('c'),
+            "strategy": "fast_forward",
+            "started_at": chrono::Utc::now(),
+        }))
+        .unwrap();
+        assert!(!record.completes_task);
+    }
+
+    #[test]
     fn only_a_ready_preview_can_be_confirmed() {
         for state in [
             PreviewState::Integrated,
+            PreviewState::CompletionPending,
             PreviewState::Pending,
             PreviewState::NeedsReconfirmation,
             PreviewState::Refused,
@@ -432,6 +518,7 @@ mod tests {
             checkout_path: None,
             started_at: chrono::Utc::now(),
             completed_at: None,
+            completes_task: false,
         }
     }
 
