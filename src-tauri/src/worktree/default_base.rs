@@ -12,7 +12,13 @@
 //!
 //! The folder must first be a Git repository root, or a Jujutsu repository
 //! colocated with Git (see [`super::vcs`]); anything else is refused saying
-//! what to do. Then, in order:
+//! what to do.
+//!
+//! A project whose person chose its local base branch over any remote
+//! (`ProjectBase::PreferredLocalBranch`) resolves to step 3 below and
+//! nothing else: origin is not consulted, so adding, fetching or changing a
+//! remote cannot move where its tasks start, and the guard in step 1 has
+//! nothing to guard. Every other project goes through the steps in order:
 //!
 //! 1. `refs/remotes/origin/HEAD`, read as the exact ref, when it is a
 //!    symbolic ref that resolves to `refs/remotes/origin/<D>` and that ref
@@ -122,6 +128,9 @@ pub async fn resolve_default_base(
     if let Some(refused) = vcs::detect(repo).await?.refusal(repo_path) {
         return Err(refused);
     }
+    if let Some(base) = project_base.filter(|b| b.prefers_local()) {
+        return resolve_local_base(repo, repo_path, base.branch()).await;
+    }
     if let Some(base) = resolve_remote_base(repo, repo_path).await? {
         refuse_if_local_integration_is_ahead(repo, repo_path, &base).await?;
         return Ok(base);
@@ -161,9 +170,10 @@ async fn refuse_if_local_integration_is_ahead(
     Err(format!(
         "{repo_path}: the local branch {branch} has work SlashIt integrated into it that \
          {branch}@origin does not contain, so a task started from {branch}@origin would be \
-         missing that work. SlashIt does not choose between them for you: publish {branch} \
-         (`git push origin {branch}`) or bring {branch}@origin and {branch} together, then start \
-         the task again."
+         missing that work. SlashIt does not choose between them for you: choose the local \
+         branch {branch} as where tasks start in Settings > Repository, or publish {branch} \
+         (`git push origin {branch}`), or bring {branch}@origin and {branch} together, then \
+         start the task again."
     ))
 }
 
@@ -877,5 +887,91 @@ mod tests {
         // Local work that origin lacks, on top of the old commit: diverged.
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "local only"]);
         assert!(resolve(&repo).await.is_err());
+    }
+
+    fn preferring(branch: &str) -> ProjectBase {
+        ProjectBase::PreferredLocalBranch { branch: branch.to_string() }
+    }
+
+    /// A project that chose its local branch starts there when the local
+    /// branch is ahead of origin's, behind it, or has diverged from it, and
+    /// records the exact local commit. The project that did not choose
+    /// starts from origin's, as it always did.
+    #[tokio::test]
+    async fn a_chosen_local_base_is_used_ahead_behind_and_diverged_and_an_unchosen_one_is_not() {
+        let (_temp, repo, origin_tip) = cloned_repo();
+        let path = repo.to_str().unwrap();
+        let chosen = preferring("trunk");
+        let legacy = local("trunk");
+
+        // Same commit: either way the same answer, from different sources.
+        let base = resolve_default_base(path, Some(&chosen)).await.unwrap();
+        assert_eq!((base.commit.as_str(), base.source), (origin_tip.as_str(), BaseSource::Local));
+
+        // Local ahead (with work SlashIt integrated: the guard would refuse
+        // an unchosen project, and does not apply to a chosen one).
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "local ahead"]);
+        let local_tip = git(&repo, &["rev-parse", "refs/heads/trunk"]);
+        git(&repo, &["update-ref", &super::super::integration::marker_ref("trunk"), &origin_tip]);
+        let base = resolve_default_base(path, Some(&chosen)).await.unwrap();
+        assert_eq!((base.commit.as_str(), base.source), (local_tip.as_str(), BaseSource::Local));
+        assert_eq!(base.branch_origin(), BranchOrigin::LocalBase { branch: "trunk".into() });
+        assert!(resolve_default_base(path, Some(&legacy)).await.is_err(), "the guard still protects an unchosen project");
+
+        // Remote ahead: origin gained commits that were fetched; the chosen
+        // local branch is still where tasks start.
+        let clone = _temp.path().join("other");
+        git(_temp.path(), &["clone", "-q", "-b", "trunk", _temp.path().join("origin.git").to_str().unwrap(), clone.to_str().unwrap()]);
+        git(&clone, &["commit", "-q", "--allow-empty", "-m", "remote only"]);
+        git(&clone, &["push", "-q", "origin", "HEAD:trunk"]);
+        git(&repo, &["fetch", "-q", "origin"]);
+        let remote_tip = git(&repo, &["rev-parse", "refs/remotes/origin/trunk"]);
+        assert_ne!(remote_tip, local_tip);
+        let base = resolve_default_base(path, Some(&chosen)).await.unwrap();
+        assert_eq!(base.commit, local_tip, "diverged: the chosen local branch, exactly");
+        git(&repo, &["reset", "-q", "--hard", &origin_tip]);
+        let behind = resolve_default_base(path, Some(&chosen)).await.unwrap();
+        assert_eq!(behind.commit, origin_tip, "behind origin: still the local branch, not origin's newer commit");
+        assert_ne!(behind.commit, remote_tip);
+        assert_eq!(resolve_default_base(path, Some(&legacy)).await.unwrap().commit, remote_tip);
+    }
+
+    /// Choosing the local branch makes origin irrelevant: a remote added
+    /// later, one with a malformed `origin/HEAD`, or none at all changes
+    /// nothing. A missing or unusable branch is refused, never replaced.
+    #[tokio::test]
+    async fn a_chosen_local_base_ignores_origin_and_is_refused_when_unusable() {
+        let (_temp, repo, _) = cloned_repo();
+        let path = repo.to_str().unwrap();
+        let chosen = preferring("trunk");
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "local"]);
+        let local_tip = git(&repo, &["rev-parse", "refs/heads/trunk"]);
+
+        git(&repo, &["update-ref", "refs/remotes/upstream/elsewhere", &local_tip]);
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/upstream/elsewhere"]);
+        assert_eq!(resolve_default_base(path, Some(&chosen)).await.unwrap().commit, local_tip, "a malformed origin/HEAD is not read");
+        assert!(resolve_default_base(path, Some(&local("trunk"))).await.is_err(), "an unchosen project still reads it");
+
+        let refused = resolve_default_base(path, Some(&preferring("gone"))).await.unwrap_err();
+        assert!(refused.contains("does not exist"), "{refused}");
+        let refused = resolve_default_base(path, Some(&preferring("-evil"))).await.unwrap_err();
+        assert!(refused.contains("will not use it"), "{refused}");
+    }
+
+    /// The choice is part of the stored project, and projects stored before
+    /// it existed load as an unchosen one, byte for byte.
+    #[test]
+    fn the_choice_is_stored_with_the_base_and_earlier_records_are_unchanged() {
+        let legacy = r#"{"kind":"local_branch","branch":"main"}"#;
+        let loaded: ProjectBase = serde_json::from_str(legacy).unwrap();
+        assert_eq!(loaded, local("main"));
+        assert!(!loaded.prefers_local());
+        assert_eq!(serde_json::to_string(&loaded).unwrap(), legacy, "writing it back changes nothing");
+
+        let chosen = loaded.choosing(true);
+        let stored = serde_json::to_string(&chosen).unwrap();
+        assert_eq!(stored, r#"{"kind":"preferred_local_branch","branch":"main"}"#);
+        assert_eq!(serde_json::from_str::<ProjectBase>(&stored).unwrap(), chosen);
+        assert_eq!(chosen.choosing(false), loaded, "the branch is kept when the choice is withdrawn");
     }
 }

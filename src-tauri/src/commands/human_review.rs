@@ -116,18 +116,21 @@ pub async fn create_approved_task_pr(
     retry_delivery(&state, task_id).await
 }
 
-/// Finish approved changes without a pull request, for a project SlashIt
-/// cannot open one for.
+/// Finish approved changes without a pull request: for a project SlashIt
+/// cannot open one for, or, with `without_pull_request`, for one it can when
+/// a person chooses to keep the work local.
 ///
 /// Nothing is merged, pushed or opened: the Task Checkout is removed and the
-/// task becomes Done, and its branch keeps the work.
+/// task becomes Done, and its branch keeps the work. Publishing is a later,
+/// separate decision.
 #[tauri::command]
 pub async fn complete_task_locally(
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
+    without_pull_request: Option<bool>,
 ) -> Result<Task, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    complete_locally(&state, task_id).await
+    complete_locally(&state, task_id, without_pull_request.unwrap_or(false)).await
 }
 
 /// Record a change request for a task in Human Review and queue it to run
@@ -190,10 +193,15 @@ pub(crate) async fn retry_delivery(
 /// and commits once.
 ///
 /// The branch is never touched, and nothing here pushes or opens a pull
-/// request. A project that can take one is refused: that work is delivered.
+/// request. A project that can take one is refused unless a person said, in
+/// this very call, that they want the work to stay local
+/// (`without_pull_request`): the default delivery of such a project is still
+/// its pull request, and nothing here changes it. A task that has a pull
+/// request, or is getting one, is refused whatever was said.
 pub(crate) async fn complete_locally(
     state: &crate::AppState,
     task_id: Uuid,
+    without_pull_request: bool,
 ) -> Result<Task, String> {
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
@@ -216,20 +224,25 @@ pub(crate) async fn complete_locally(
                 .to_string(),
         );
     }
-    match pr_availability(state, task_id).await {
-        Ok(PrAvailability::Unavailable { .. }) => {}
-        Ok(PrAvailability::Available) => {
-            return Err(
-                "SlashIt can open a pull request for this project, so these changes are \
-                 delivered with Create PR, not completed locally."
-                    .to_string(),
-            )
-        }
-        Err(reason) => {
-            return Err(format!(
-                "SlashIt could not tell whether this project can take a pull request, so the \
-                 task was not completed: {reason}"
-            ))
+    // Asked for by name, finishing locally does not depend on whether a pull
+    // request could be opened.
+    if !without_pull_request {
+        match pr_availability(state, task_id).await {
+            Ok(PrAvailability::Unavailable { .. }) => {}
+            Ok(PrAvailability::Available) => {
+                return Err(
+                    "SlashIt can open a pull request for this project, so these changes are \
+                     delivered with Create PR. To keep them local instead, choose to finish \
+                     them locally without a pull request."
+                        .to_string(),
+                )
+            }
+            Err(reason) => {
+                return Err(format!(
+                    "SlashIt could not tell whether this project can take a pull request, so the \
+                     task was not completed: {reason}"
+                ))
+            }
         }
     }
 
@@ -834,7 +847,7 @@ mod tests {
             approve(&self.state, self.task_id, false).await.expect("approved");
         }
         async fn complete(&self) -> Result<Task, String> {
-            complete_locally(&self.state, self.task_id).await
+            complete_locally(&self.state, self.task_id, false).await
         }
         fn branch_exists(&self) -> bool {
             std::process::Command::new("git")
@@ -1071,6 +1084,55 @@ mod tests {
 
         // Delivery still sees the project as it did.
         assert_eq!(pr_availability(&local.state, local.task_id).await, Ok(PrAvailability::Available));
+    }
+
+    /// Asked for by name, a project with a GitHub remote finishes locally:
+    /// no pull request, no push, nothing merged, the branch kept, and the
+    /// project's default delivery unchanged afterwards.
+    #[tokio::test]
+    async fn a_project_with_a_github_remote_finishes_locally_when_that_is_chosen() {
+        let local = local_project().await;
+        git(&local.repo, &["remote", "add", "origin", "https://github.com/BarraDev/example.git"]);
+        local.approve().await;
+        let main_before = git(&local.repo, &["rev-parse", "main"]);
+
+        let done = complete_locally(&local.state, local.task_id, true).await.expect("chosen explicitly");
+        assert!(done.completed_locally());
+        assert_eq!(done.status, TaskStatus::Done);
+        assert!(done.pr_url.is_none());
+        assert!(local.branch_exists(), "the branch keeps the work");
+        assert!(done.worktree_path.is_none());
+        assert_eq!(git(&local.repo, &["rev-parse", "main"]), main_before, "nothing was merged");
+        assert!(!local.state.task.deliveries.contains(local.task_id), "no pull request was started");
+        assert_eq!(completions(&done), 1);
+
+        // Asked again, it answers and records nothing more.
+        let again = complete_locally(&local.state, local.task_id, true).await.unwrap();
+        assert_eq!(completions(&again), 1);
+        // The project's default delivery is still the pull request.
+        assert_eq!(pr_availability(&local.state, local.task_id).await, Ok(PrAvailability::Available));
+    }
+
+    /// The explicit choice never reaches a task that has, or is getting, a
+    /// pull request, and never skips the approval.
+    #[tokio::test]
+    async fn choosing_to_finish_locally_does_not_override_a_pull_request_or_the_approval() {
+        let local = local_project().await;
+        git(&local.repo, &["remote", "add", "origin", "https://github.com/BarraDev/example.git"]);
+
+        let refused = complete_locally(&local.state, local.task_id, true).await.expect_err("not approved");
+        assert!(refused.contains("Approve the changes"), "{refused}");
+        local.approve().await;
+
+        let guard = local.state.task.deliveries.start(local.task_id);
+        let refused = complete_locally(&local.state, local.task_id, true).await.expect_err("being opened");
+        assert!(refused.contains("pull request"), "{refused}");
+        drop(guard);
+        local.state.task.tasks.write().await.get_mut(&local.task_id).unwrap().pr_url =
+            Some("https://github.com/BarraDev/example/pull/1".to_string());
+        let refused = complete_locally(&local.state, local.task_id, true).await.expect_err("has one");
+        assert!(refused.contains("pull request"), "{refused}");
+        assert!(local.worktree.join("work.txt").exists(), "the checkout was left alone");
     }
 
     #[tokio::test]

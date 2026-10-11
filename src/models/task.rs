@@ -98,6 +98,11 @@ pub struct Task {
     #[serde(default)]
     pub branch_name: Option<String>,
 
+    /// The latest integration of this task's approved work into a local
+    /// branch, if one was started. See `models::integration`.
+    #[serde(default)]
+    pub local_integration: Option<crate::models::integration::LocalIntegration>,
+
     #[serde(default)]
     pub pr_review_plan: Option<PrReviewPlan>,
 
@@ -520,6 +525,9 @@ pub struct HumanReviewEntry {
     pub decision: HumanReviewDecision,
     #[serde(default)]
     pub feedback: Option<String>,
+    /// The commit an approval was made on, when it recorded one.
+    #[serde(default)]
+    pub approved_tip: Option<String>,
     pub decided_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -933,6 +941,7 @@ mod tests {
             arrival,
             decision,
             feedback: feedback.map(str::to_string),
+            approved_tip: None,
             decided_at: chrono::Utc::now(),
         }
     }

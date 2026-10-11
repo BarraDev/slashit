@@ -25,20 +25,49 @@ impl ProjectScope {
     }
 }
 
-/// Where a project's new task branches start when no remote says so.
+/// Where a project's new task branches start, and whether a remote may
+/// override it.
+///
+/// Both variants name a local branch, `refs/heads/<branch>`, read afresh
+/// when each task branch is created. In a Jujutsu repository colocated with
+/// Git this is the bookmark of that name, which JJ exports to that ref. They
+/// differ only in what happens when the repository also names a remote
+/// default branch (`worktree::default_base::resolve_default_base`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProjectBase {
-    /// The local branch `refs/heads/<branch>`, read afresh when each task
-    /// branch is created. In a Jujutsu repository colocated with Git this
-    /// is the bookmark of that name, which JJ exports to that ref.
+    /// The branch to start from when no remote says so. When the repository
+    /// names origin's default branch, that wins. This is what every project
+    /// stored before the choice existed has, and what a project gets
+    /// unless a person chooses otherwise.
     LocalBranch { branch: String },
+    /// A person chose this local branch as where tasks start, whatever a
+    /// remote says. Adding, fetching or changing a remote never replaces it;
+    /// only choosing origin's default branch in the project's repository
+    /// settings does.
+    PreferredLocalBranch { branch: String },
 }
 
 impl ProjectBase {
     pub fn branch(&self) -> &str {
         match self {
-            Self::LocalBranch { branch } => branch,
+            Self::LocalBranch { branch } | Self::PreferredLocalBranch { branch } => branch,
+        }
+    }
+
+    /// Whether a person chose the local branch over any remote default.
+    pub fn prefers_local(&self) -> bool {
+        matches!(self, Self::PreferredLocalBranch { .. })
+    }
+
+    /// The same branch, with the choice between it and a remote default
+    /// made as `prefer_local` says.
+    pub fn choosing(&self, prefer_local: bool) -> Self {
+        let branch = self.branch().to_string();
+        if prefer_local {
+            Self::PreferredLocalBranch { branch }
+        } else {
+            Self::LocalBranch { branch }
         }
     }
 }

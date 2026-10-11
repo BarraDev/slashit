@@ -83,11 +83,17 @@ pub async fn create_approved_task_pr(task_id: String) -> Result<ApprovalOutcome,
     invoke("create_approved_task_pr", serde_json::json!({ "taskId": task_id })).await
 }
 
-/// Finish approved changes in a project that cannot take a pull request:
-/// the task becomes Done, its Task Checkout is removed and its branch is kept,
-/// unmerged. `Err` means the task was not completed and is where it was.
-pub async fn complete_task_locally(task_id: String) -> Result<Task, String> {
-    invoke("complete_task_locally", serde_json::json!({ "taskId": task_id })).await
+/// Finish approved changes without a pull request: the task becomes Done,
+/// its Task Checkout is removed and its branch is kept, unmerged.
+/// `without_pull_request` is a person's choice to do that in a project that
+/// could open one; without it, only a project that cannot is accepted.
+/// `Err` means the task was not completed and is where it was.
+pub async fn complete_task_locally(task_id: String, without_pull_request: bool) -> Result<Task, String> {
+    invoke(
+        "complete_task_locally",
+        serde_json::json!({ "taskId": task_id, "withoutPullRequest": without_pull_request }),
+    )
+    .await
 }
 
 /// `Err` means neither the feedback nor the requeue was recorded.

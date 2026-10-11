@@ -59,6 +59,7 @@ pub use jj_status::*;
 pub mod storage_settings;
 pub mod disk_usage;
 pub mod repository_setup;
+pub mod local_integration;
 pub mod orphan_reclaim;
 
 pub use badge::*;

@@ -181,6 +181,23 @@ the branch is created, and never re-derived afterwards:
 3. Otherwise the Task is refused with what to do. The primary checkout's
    `HEAD` is never used.
 
+Steps 1 and 2 are the default, and what every Project stored before there was
+a choice gets. A person can instead **choose the Project's local base branch
+over any remote default** in Settings > Repository
+(`domain::ProjectBase::PreferredLocalBranch`). That Project's Tasks start at
+the exact commit its local branch names and origin is not consulted, so
+adding, fetching or changing a remote never moves where its Tasks start; only
+choosing origin's default branch in Settings does. A choice that would leave
+no usable base is refused when it is made. Settings shows where the local
+branch stands against origin's (the same commit, ahead, behind or diverged)
+without suggesting which to use. Neither choice fetches or pushes.
+
+The guard remains for a Project that has not made the choice: once SlashIt
+has integrated work into a local branch (see Local delivery below), a Task is
+not started from `origin/<branch>` while the local branch has commits origin's
+lacks, since it would silently lack that work. The refusal names the ways out,
+and choosing the local branch is one of them.
+
 A malformed `refs/remotes/origin/HEAD` (pointing outside `origin`) is
 refused rather than skipped. "Detect default branch" in Settings >
 Repository runs the equivalent of `git remote set-head origin --auto` on
@@ -238,6 +255,47 @@ a failed fix), without making them again. A fix already committed is
 never committed again, and an apply that made no new fix and has no such
 uncommitted fix commits nothing.
 
+### Local delivery
+
+A Task whose changes a person approved can be finished without a pull request:
+**Complete locally** removes its Task Checkout, marks it Done and keeps its
+branch, unmerged. A Project that cannot open a pull request (no GitHub
+`origin`) offers it as the way to finish. A Project that can keeps the pull
+request as its default and offers "Approve for local delivery" beside "Approve &
+Create PR", so keeping work local is always a named choice and never implied.
+A Task that has, or is getting, a pull request is not completed locally.
+
+**Integrate locally** then advances a local branch to the exact commit that
+was approved (not whatever the Task branch holds later) and nothing else. It
+is a delivery fact about the Task (`Task.local_integration`), not a lifecycle
+status, and it never pushes. The drawer shows the destination branch, the
+approved and current destination commits, the strategy (fast-forward or a
+merge commit made without touching any working tree), the Task branch's
+unapproved extra commits, whether a remote exists, and the checkout affected,
+and integrates only after a deliberate confirmation of exactly that. A
+conflict is found beforehand and nothing changes. An integration that was
+started and not finished is recorded durably and offers Resume or Discard; the
+destination branch itself says which. An approval that recorded no commit
+shows the actual commit and what it changes, and is reconfirmed by a person
+before anything is integrated.
+
+When the destination branch is checked out somewhere, moving only the branch
+would leave that checkout's index and files at the old commit, so a plain
+`update-ref` is never used. With the person's confirmation of that exact
+checkout, SlashIt has Git itself fast-forward it (`merge --ff-only`), after
+verifying that `HEAD` is attached to the branch and at the commit the plan was
+made against, that no merge, rebase, cherry-pick, revert or bisect is under
+way, that no tracked file has uncommitted changes, and that no untracked or
+ignored file stands where the integration would create one. Anything else is
+refused, naming it, and nothing is forced, reset or discarded. If Git is
+interrupted after updating the files and before moving the branch, the next
+attempt recognises exactly that state and finishes by moving the branch; any
+other half-updated checkout is reported with its changes left in place.
+
+A Task that depends on a locally integrated Task starts from the Project's base
+when the base holds the approved work, and so receives exactly the approved
+commits; otherwise it is stacked on the dependency's branch as before.
+
 Workspace and Task Checkout are distinct concepts at different levels:
 
 | | Workspace | Task Checkout |
@@ -275,6 +333,7 @@ The procedure is in [development-workflow.md](../development-workflow.md).
 | Task Checkout | `Task.worktree_path`, `branch_name`, `base_commit`, `branch_origin` (`domain::BranchOrigin`); `worktree::WorktreeManager` |
 | Base of a Task's branch | `worktree::default_base`, `Project.base` (`domain::ProjectBase`), `worktree::project_base` |
 | Repository readiness and setup | `worktree::readiness`, `worktree::remote_head`, `worktree::vcs_init`; `commands/repository_setup.rs` |
+| Local delivery and integration | `commands/human_review.rs`, `commands/integration.rs`, `worktree::integration`, `domain::LocalIntegration` (`Task.local_integration`) |
 | Workspace root as agent context | `TaskExecutor::resolve_workspace_launch` in `queue/executor.rs` |
 | Task Checkout lifecycle | `lifecycle.rs` |
 | Jujutsu integration | `jj/`, `commands/jj.rs` |

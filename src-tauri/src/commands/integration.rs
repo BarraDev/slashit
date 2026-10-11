@@ -37,6 +37,9 @@ use crate::worktree::restack::is_ancestor;
 pub enum PreviewState {
     /// Integrating would advance the target as described.
     Ready,
+    /// The target is checked out in `checked_out_at` and Git can fast-forward
+    /// it there. Confirming has to name that checkout.
+    ReadyInCheckout,
     /// The target already holds the approved work; confirming records that
     /// and moves nothing.
     AlreadyContained,
@@ -51,12 +54,23 @@ pub enum PreviewState {
     Refused,
 }
 
+/// `origin/<target>` as the repository last saw it. Nothing is fetched to
+/// learn it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RemoteTarget {
+    pub name: String,
+    pub tip: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Reconfirm {
     /// The Task branch's tip: the commit that confirming would approve.
     pub branch_tip: String,
     /// The commits on it the target does not have, oldest first.
     pub commits: Vec<String>,
+    /// What those commits change in the target's files, as `<status> <path>`
+    /// (`A` added, `M` modified, `D` deleted), a bounded list.
+    pub changed_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,9 +88,17 @@ pub struct IntegrationPreview {
     /// approved and are not integrated.
     pub unapproved_commits: u32,
     pub conflicts: Vec<String>,
-    /// The checkout that has the target branch checked out, when that is
-    /// what refused it.
+    /// The checkout that has the target branch checked out, if one does.
     pub checked_out_at: Option<String>,
+    /// Why Git cannot fast-forward that checkout, when it cannot: uncommitted
+    /// changes, an operation under way, a file in the way.
+    pub checkout_problems: Vec<String>,
+    /// Whether the repository has a remote named origin. Integrating never
+    /// pushes to it.
+    pub has_remote: bool,
+    /// The remote-tracking branch of the target, `origin/<target>`, when the
+    /// repository has one and where it is relative to the target.
+    pub remote_target: Option<RemoteTarget>,
     pub integration: Option<LocalIntegration>,
     /// For a pending integration: `applied`, `unmoved`, `moved` or
     /// `missing`, as the target branch shows it.
@@ -97,6 +119,9 @@ impl IntegrationPreview {
             unapproved_commits: 0,
             conflicts: Vec::new(),
             checked_out_at: None,
+            checkout_problems: Vec::new(),
+            has_remote: false,
+            remote_target: None,
             integration: None,
             observed: None,
             reconfirm: None,
@@ -116,6 +141,11 @@ pub struct IntegrationConfirmation {
     pub target_branch: String,
     pub target_tip: String,
     pub approved_tip: String,
+    /// The checkout the preview said has the target branch checked out, when
+    /// one does. Required exactly then: a branch checked out somewhere is
+    /// advanced there only with the person's confirmation of that checkout.
+    #[serde(default)]
+    pub checkout_path: Option<String>,
 }
 
 #[tauri::command]
@@ -327,6 +357,7 @@ fn plan_of(record: &LocalIntegration) -> Plan {
         approved_tip: record.approved_tip.clone(),
         result: record.result_oid.clone(),
         strategy: record.strategy,
+        merge_tree: None,
     }
 }
 
@@ -345,15 +376,34 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
     let task = current(state, task_id).await?;
     if let Some(record) = task.local_integration.as_ref().filter(|r| r.is_pending()) {
         let repo_path = repo_path_of(state, task.project_id).await?;
-        let observed = git::observe(Path::new(&repo_path), &plan_of(record)).await?;
-        return Ok(IntegrationPreview {
+        let plan = plan_of(record);
+        let observed = git::observe(Path::new(&repo_path), &plan).await?;
+        let mut out = IntegrationPreview {
             target_branch: Some(record.target_branch.clone()),
             approved_tip: Some(record.approved_tip.clone()),
             strategy: Some(record.strategy),
             integration: Some(record.clone()),
             observed: Some(observed_name(observed).to_string()),
             ..IntegrationPreview::new(PreviewState::Pending)
-        });
+        };
+        // Where the branch is checked out now, and whether Git can still
+        // move it there, so that Resume says what it will do.
+        if observed == Observed::Unmoved {
+            if let Some(path) = git::checked_out_at(&repo_path, &record.target_branch).await? {
+                if record.checkout_path.as_deref() != Some(path.as_str()) {
+                    out.checkout_problems = vec![format!(
+                        "{} is checked out in {path}, which was not confirmed for this integration, \
+                         so it cannot be resumed. Discard it and integrate again to confirm that \
+                         checkout.",
+                        record.target_branch
+                    )];
+                } else if let git::CheckoutReadiness::Blocked(problems) = git::inspect_checkout(&path, &plan).await? {
+                    out.checkout_problems = problems;
+                }
+                out.checked_out_at = Some(path);
+            }
+        }
+        return Ok(out);
     }
     let p = match prepare(state, task_id).await {
         Ok(p) => p,
@@ -373,6 +423,7 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
         out.reconfirm = Some(Reconfirm {
             branch_tip: p.branch_tip.clone(),
             commits: git::subjects(repo, &p.target_tip, &p.branch_tip, 50).await.unwrap_or_default(),
+            changed_files: git::changed_files(repo, &p.target_tip, &p.branch_tip, 100).await.unwrap_or_default(),
         });
         out.reason = Some(
             "This approval did not record which commit was approved. Confirm the commit shown \
@@ -418,19 +469,30 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
     out.strategy = Some(plan.strategy);
     out.commits = git::subjects(repo, &p.target_tip, &approved, 50).await.unwrap_or_default();
 
+    out.has_remote = git::has_origin(repo).await;
+    out.remote_target = git::remote_tracking_tip(repo, &p.target)
+        .await?
+        .map(|tip| RemoteTarget { name: format!("origin/{}", p.target), tip });
     if let Some(why) = git::not_behind_origin(repo, &p.target).await? {
         out.reason = Some(why);
         return Ok(out);
     }
+    let mut in_checkout = false;
     if plan.strategy != IntegrationStrategy::AlreadyContained {
         if let Some(path) = git::checked_out_at(&p.repo_path, &p.target).await? {
-            out.reason = Some(git::checked_out_message(
-                &p.target,
-                &path,
-                &git::manual_merge(plan.strategy, &approved),
-            ));
-            out.checked_out_at = Some(path);
-            return Ok(out);
+            out.checked_out_at = Some(path.clone());
+            match git::inspect_checkout(&path, &plan).await? {
+                git::CheckoutReadiness::Ready | git::CheckoutReadiness::FilesAlreadyUpdated => in_checkout = true,
+                git::CheckoutReadiness::Blocked(problems) => {
+                    out.reason = Some(format!(
+                        "{} To integrate it yourself once that is resolved, run: {}",
+                        problems.join(" "),
+                        git::manual_command(&path, &git::manual_merge(plan.strategy, &approved))
+                    ));
+                    out.checkout_problems = problems;
+                    return Ok(out);
+                }
+            }
         }
     }
     if let Some(other) = other_pending_on(state, &p.task, &p.target).await {
@@ -439,6 +501,8 @@ pub(crate) async fn preview(state: &crate::AppState, task_id: Uuid) -> Result<In
     }
     out.state = if plan.strategy == IntegrationStrategy::AlreadyContained {
         PreviewState::AlreadyContained
+    } else if in_checkout {
+        PreviewState::ReadyInCheckout
     } else {
         PreviewState::Ready
     };
@@ -528,9 +592,37 @@ pub(crate) async fn integrate(
             p.target
         ));
     }
+    let mut consented_checkout = None;
     if plan.strategy != IntegrationStrategy::AlreadyContained {
-        if let Some(path) = git::checked_out_at(&p.repo_path, &p.target).await? {
-            return Err(git::checked_out_message(&p.target, &path, &git::manual_merge(plan.strategy, &plan.result)));
+        let checkout = git::checked_out_at(&p.repo_path, &p.target).await?;
+        match (&checkout, &confirmed.checkout_path) {
+            (Some(path), Some(confirmed_path)) if path == confirmed_path => {
+                if let git::CheckoutReadiness::Blocked(problems) = git::inspect_checkout(path, &plan).await? {
+                    return Err(format!("{} Nothing was changed. Review it again.", problems.join(" ")));
+                }
+                consented_checkout = checkout.clone();
+            }
+            (Some(path), Some(_)) => {
+                return Err(format!(
+                    "{} is checked out in {path} now, not in the checkout that was shown, so \
+                     nothing was changed. Review it again.",
+                    p.target
+                ));
+            }
+            (Some(path), None) => {
+                return Err(git::checked_out_message(
+                    &p.target,
+                    path,
+                    &git::manual_merge(plan.strategy, &plan.approved_tip),
+                ));
+            }
+            (None, Some(shown)) => {
+                return Err(format!(
+                    "{} is no longer checked out in {shown}, so nothing was changed. Review it again.",
+                    p.target
+                ));
+            }
+            (None, None) => {}
         }
         git::pin(repo, task_id, &plan.result).await?;
     }
@@ -542,6 +634,7 @@ pub(crate) async fn integrate(
         approved_tip: plan.approved_tip.clone(),
         result_oid: plan.result.clone(),
         strategy: plan.strategy,
+        checkout_path: consented_checkout.clone(),
         started_at: chrono::Utc::now(),
         completed_at: None,
     };
@@ -561,16 +654,23 @@ pub(crate) async fn integrate(
         let _ = git::unpin(repo, task_id).await;
         return Err("The task changed while the integration was being started, so nothing was changed.".to_string());
     }
-    apply(state, &p.repo_path, task_id, &plan).await
+    apply(state, &p.repo_path, task_id, &plan, consented_checkout.as_deref()).await
 }
 
-/// Move the target (if it has to move), then record the result.
-async fn apply(state: &crate::AppState, repo_path: &str, task_id: Uuid, plan: &Plan) -> Result<Task, String> {
+/// Move the target (if it has to move), then record the result. `checkout`
+/// is the checkout a person confirmed moving the target in, if it has one.
+async fn apply(
+    state: &crate::AppState,
+    repo_path: &str,
+    task_id: Uuid,
+    plan: &Plan,
+    checkout: Option<&str>,
+) -> Result<Task, String> {
     let repo = Path::new(repo_path);
     if plan.strategy != IntegrationStrategy::AlreadyContained {
         git::mark_base(repo, &plan.target_branch, &plan.target_old).await?;
     }
-    if let Err(why) = git::advance(repo_path, plan).await {
+    if let Err(why) = git::advance(repo_path, plan, checkout).await {
         return match git::observe(repo, plan).await? {
             // It moved anyway (another process, or a retry of this one that
             // got further than it reported): record what is true.
@@ -699,7 +799,7 @@ async fn resume_locked(state: &crate::AppState, task_id: Uuid) -> Result<Task, S
             if let Some(why) = git::not_behind_origin(repo, &p.target).await? {
                 return Err(why);
             }
-            apply(state, &repo_path, task_id, &plan).await
+            apply(state, &repo_path, task_id, &plan, record.checkout_path.as_deref()).await
         }
     }
 }
@@ -941,6 +1041,7 @@ mod tests {
             target_branch: preview.target_branch.clone().expect("a target"),
             target_tip: preview.target_tip.clone().expect("a target tip"),
             approved_tip: preview.approved_tip.clone().expect("an approved tip"),
+            checkout_path: preview.checked_out_at.clone(),
         }
     }
 
@@ -1032,6 +1133,7 @@ mod tests {
                 target_branch: "main".into(),
                 target_tip: main_after_a.clone(),
                 approved_tip: b_tip.clone(),
+                checkout_path: None,
             },
         )
         .await
@@ -1040,43 +1142,6 @@ mod tests {
         assert_eq!(tip_of(&fx.repo, "main"), main_after_a);
         assert!(on_disk(&fx, b).local_integration.is_none());
         assert!(!ref_exists(&fx.repo, &git::pin_ref(b)));
-    }
-
-    #[tokio::test]
-    async fn a_checked_out_target_is_refused_with_the_command_to_run_and_nothing_is_changed() {
-        let fx = fixture().await;
-        git(&fx.repo, &["checkout", "-q", "main"]);
-        let p = preview(&fx.state, fx.task_id).await.unwrap();
-        assert_eq!(p.state, PreviewState::Refused);
-        assert!(p.checked_out_at.is_some());
-        assert!(p.reason.as_deref().unwrap().contains("merge --ff-only"));
-
-        // A diverged branch cannot be fast-forwarded, so it is not told to.
-        git(&fx.repo, &["checkout", "-q", "--detach"]);
-        commit_on(&fx.repo, "main", "other.txt", "o\n");
-        git(&fx.repo, &["checkout", "-q", "main"]);
-        let diverged = preview(&fx.state, fx.task_id).await.unwrap();
-        assert_eq!(diverged.strategy, Some(IntegrationStrategy::MergeCommit));
-        let reason = diverged.reason.unwrap();
-        assert!(reason.contains("merge --no-ff") && !reason.contains("--ff-only"), "{reason}");
-        let before = tip_of(&fx.repo, "main");
-
-        let err = integrate(
-            &fx.state,
-            fx.task_id,
-            IntegrationConfirmation {
-                target_branch: "main".into(),
-                target_tip: before.clone(),
-                approved_tip: fx.tip.clone(),
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(err.contains("checked out"), "{err}");
-        assert_eq!(tip_of(&fx.repo, "main"), before);
-        assert_eq!(git(&fx.repo, &["status", "--porcelain"]), "", "the checkout is untouched");
-        assert!(on_disk(&fx, fx.task_id).local_integration.is_none());
-        assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
     }
 
     #[tokio::test]
@@ -1113,7 +1178,7 @@ mod tests {
         assert!(integrate(
             &fx.state,
             fx.task_id,
-            IntegrationConfirmation { target_branch: "main".into(), target_tip: before.clone(), approved_tip: fx.tip.clone() }
+            IntegrationConfirmation { target_branch: "main".into(), target_tip: before.clone(), approved_tip: fx.tip.clone(), checkout_path: None }
         )
         .await
         .is_err());
@@ -1129,12 +1194,13 @@ mod tests {
         let shown = p.reconfirm.expect("what to confirm");
         assert_eq!(shown.branch_tip, fx.tip);
         assert_eq!(shown.commits.len(), 1);
+        assert_eq!(shown.changed_files, vec!["A a.txt".to_string()], "the changes themselves are shown");
 
         let before = tip_of(&fx.repo, "main");
         assert!(integrate(
             &fx.state,
             legacy,
-            IntegrationConfirmation { target_branch: "main".into(), target_tip: before.clone(), approved_tip: fx.tip.clone() }
+            IntegrationConfirmation { target_branch: "main".into(), target_tip: before.clone(), approved_tip: fx.tip.clone(), checkout_path: None }
         )
         .await
         .is_err());
@@ -1199,6 +1265,7 @@ mod tests {
             target_branch: "main".into(),
             target_tip: before.clone(),
             approved_tip: fx.tip.clone(),
+            checkout_path: None,
         };
 
         // Moved to Done some other way: no completion milestone.
@@ -1271,6 +1338,7 @@ mod tests {
             approved_tip: plan.approved_tip.clone(),
             result_oid: plan.result.clone(),
             strategy: plan.strategy,
+            checkout_path: None,
             started_at: chrono::Utc::now(),
             completed_at: None,
         };
@@ -1298,7 +1366,7 @@ mod tests {
     async fn a_crash_after_the_branch_moved_is_recorded_without_moving_it_again() {
         let fx = fixture().await;
         let plan = pending_unmoved(&fx).await;
-        git::advance(fx.repo.to_str().unwrap(), &plan).await.unwrap();
+        git::advance(fx.repo.to_str().unwrap(), &plan, None).await.unwrap();
         let moved_at = tip_of(&fx.repo, "main");
         // The target has since advanced past the result: still applied.
         let later = commit_on(&fx.repo, "main", "later.txt", "l\n");
@@ -1353,6 +1421,7 @@ mod tests {
                 approved_tip: "1".repeat(40),
                 result_oid: "2".repeat(40),
                 strategy: IntegrationStrategy::FastForward,
+                checkout_path: None,
                 started_at: chrono::Utc::now(),
                 completed_at: None,
             });
@@ -1416,5 +1485,492 @@ mod tests {
         assert_eq!(changed.len(), 1, "only main moved: {changed:?}");
         assert!(changed[0].starts_with("refs/heads/main "));
         assert_eq!(refs_before.lines().count(), refs_after.lines().count(), "no branch was deleted or added");
+    }
+
+    /// A target branch that is checked out: the person is shown the
+    /// checkout, confirms it, and Git moves the branch, the index and the
+    /// files together.
+    mod checked_out {
+        use super::*;
+
+        /// `main` checked out, attached and clean, in the primary checkout.
+        async fn on_main() -> Fx {
+            let fx = fixture().await;
+            git(&fx.repo, &["checkout", "-q", "main"]);
+            fx
+        }
+
+        fn path_of(fx: &Fx) -> String {
+            // The path Git reports, which is what a confirmation must name.
+            git(&fx.repo, &["rev-parse", "--show-toplevel"])
+        }
+
+        async fn confirm_checkout(fx: &Fx, id: Uuid) -> IntegrationConfirmation {
+            let p = preview(&fx.state, id).await.unwrap();
+            assert_eq!(p.state, PreviewState::ReadyInCheckout, "{:?}", p.reason);
+            assert!(p.checkout_problems.is_empty());
+            let c = confirmation(&p);
+            assert_eq!(c.checkout_path, Some(path_of(fx)));
+            c
+        }
+
+        fn clean(repo: &Path) {
+            assert_eq!(git(repo, &["status", "--porcelain"]), "", "index and files are clean");
+        }
+
+        #[tokio::test]
+        async fn a_clean_checked_out_target_is_fast_forwarded_with_its_index_and_files() {
+            let fx = on_main().await;
+            let before = tip_of(&fx.repo, "main");
+            let p = preview(&fx.state, fx.task_id).await.unwrap();
+            assert_eq!(p.state, PreviewState::ReadyInCheckout);
+            assert_eq!(p.strategy, Some(IntegrationStrategy::FastForward));
+            assert_eq!(p.checked_out_at, Some(path_of(&fx)));
+            assert_eq!(p.target_tip.as_deref(), Some(before.as_str()));
+            assert!(!p.has_remote, "a local-only repository");
+            assert_eq!(tip_of(&fx.repo, "main"), before, "a preview moves nothing");
+            assert!(!fx.repo.join("a.txt").exists());
+
+            let done = integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
+            let record = done.local_integration.unwrap();
+            assert_eq!(record.state, IntegrationState::Integrated);
+            assert_eq!(record.checkout_path, Some(path_of(&fx)));
+            assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
+            assert_eq!(git(&fx.repo, &["symbolic-ref", "HEAD"]), "refs/heads/main", "still on main");
+            assert_eq!(std::fs::read_to_string(fx.repo.join("a.txt")).unwrap(), "a\n", "the files moved too");
+            clean(&fx.repo);
+            assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
+
+            // The next commit in the checkout builds on the integration.
+            std::fs::write(fx.repo.join("next.txt"), "n\n").unwrap();
+            git(&fx.repo, &["add", "."]);
+            git(&fx.repo, &["commit", "-q", "-m", "next"]);
+            git(&fx.repo, &["merge-base", "--is-ancestor", &fx.tip, "main"]);
+        }
+
+        #[tokio::test]
+        async fn a_diverged_checked_out_target_gets_the_merge_commit_in_its_files() {
+            let fx = on_main().await;
+            git(&fx.repo, &["checkout", "-q", "--detach"]);
+            let other = commit_on(&fx.repo, "main", "other.txt", "other\n");
+            git(&fx.repo, &["checkout", "-q", "main"]);
+            let c = confirm_checkout(&fx, fx.task_id).await;
+            let p = preview(&fx.state, fx.task_id).await.unwrap();
+            assert_eq!(p.strategy, Some(IntegrationStrategy::MergeCommit));
+
+            let done = integrate(&fx.state, fx.task_id, c).await.unwrap();
+            let result = tip_of(&fx.repo, "main");
+            assert_eq!(done.local_integration.unwrap().result_oid, result);
+            let parents = git(&fx.repo, &["rev-list", "--parents", "-n1", &result]);
+            assert_eq!(parents.split_whitespace().skip(1).collect::<Vec<_>>(), vec![other.as_str(), fx.tip.as_str()]);
+            assert!(fx.repo.join("a.txt").is_file() && fx.repo.join("other.txt").is_file());
+            clean(&fx.repo);
+        }
+
+        #[tokio::test]
+        async fn a_linked_worktree_that_has_the_target_is_the_checkout_that_moves() {
+            let fx = fixture().await;
+            let linked = fx._tmp.path().join("linked main");
+            git(&fx.repo, &["worktree", "add", "-q", linked.to_str().unwrap(), "main"]);
+            let shown = git(&linked, &["rev-parse", "--show-toplevel"]);
+            let p = preview(&fx.state, fx.task_id).await.unwrap();
+            assert_eq!(p.state, PreviewState::ReadyInCheckout);
+            assert_eq!(p.checked_out_at, Some(shown.clone()));
+
+            integrate(&fx.state, fx.task_id, confirmation(&p)).await.unwrap();
+            assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
+            assert!(linked.join("a.txt").is_file(), "the linked checkout's files moved");
+            clean(&linked);
+        }
+
+        #[tokio::test]
+        async fn without_the_checkout_confirmed_nothing_moves_and_the_command_is_quoted() {
+            let fx = on_main().await;
+            let before = tip_of(&fx.repo, "main");
+            let mut c = confirm_checkout(&fx, fx.task_id).await;
+            c.checkout_path = None;
+            let err = integrate(&fx.state, fx.task_id, c.clone()).await.unwrap_err();
+            assert!(err.contains("checked out") && err.contains("git -C "), "{err}");
+            assert_eq!(tip_of(&fx.repo, "main"), before);
+            assert!(on_disk(&fx, fx.task_id).local_integration.is_none());
+            assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
+            clean(&fx.repo);
+
+            // A different checkout than the one shown is not the one confirmed.
+            c.checkout_path = Some("/somewhere/else".into());
+            let err = integrate(&fx.state, fx.task_id, c).await.unwrap_err();
+            assert!(err.contains("not in the checkout that was shown"), "{err}");
+            assert_eq!(tip_of(&fx.repo, "main"), before);
+        }
+
+        #[tokio::test]
+        async fn a_checkout_that_was_not_checked_out_when_shown_cannot_be_confirmed() {
+            let fx = fixture().await;
+            let before = tip_of(&fx.repo, "main");
+            let mut c = ready(&fx, fx.task_id).await;
+            c.checkout_path = Some(path_of(&fx));
+            let err = integrate(&fx.state, fx.task_id, c).await.unwrap_err();
+            assert!(err.contains("no longer checked out"), "{err}");
+            assert_eq!(tip_of(&fx.repo, "main"), before);
+            assert!(on_disk(&fx, fx.task_id).local_integration.is_none());
+        }
+
+        #[tokio::test]
+        async fn uncommitted_changes_are_refused_and_every_byte_is_kept() {
+            for (setup, label) in [
+                ("modify", "an unstaged edit"),
+                ("stage", "a staged edit"),
+                ("delete", "a deleted tracked file"),
+            ] {
+                let fx = on_main().await;
+                let readme = fx.repo.join("README.md");
+                match setup {
+                    "modify" => std::fs::write(&readme, "mine\n").unwrap(),
+                    "stage" => {
+                        std::fs::write(&readme, "mine\n").unwrap();
+                        git(&fx.repo, &["add", "README.md"]);
+                    }
+                    _ => std::fs::remove_file(&readme).unwrap(),
+                }
+                let status_before = git(&fx.repo, &["status", "--porcelain"]);
+                let before = tip_of(&fx.repo, "main");
+
+                let p = preview(&fx.state, fx.task_id).await.unwrap();
+                assert_eq!(p.state, PreviewState::Refused, "{label}");
+                assert!(p.checkout_problems.iter().any(|m| m.contains("README.md")), "{label}: {:?}", p.checkout_problems);
+                assert!(p.reason.unwrap().contains("git -C "), "{label}");
+
+                let c = IntegrationConfirmation {
+                    target_branch: "main".into(),
+                    target_tip: before.clone(),
+                    approved_tip: fx.tip.clone(),
+                    checkout_path: Some(path_of(&fx)),
+                };
+                let err = integrate(&fx.state, fx.task_id, c).await.unwrap_err();
+                assert!(err.contains("uncommitted changes") && err.contains("Nothing was changed"), "{label}: {err}");
+                assert_eq!(tip_of(&fx.repo, "main"), before, "{label}");
+                assert_eq!(git(&fx.repo, &["status", "--porcelain"]), status_before, "{label}: untouched");
+                if setup != "delete" {
+                    assert_eq!(std::fs::read_to_string(&readme).unwrap(), "mine\n", "{label}");
+                }
+                assert!(on_disk(&fx, fx.task_id).local_integration.is_none(), "{label}");
+                assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)), "{label}");
+            }
+        }
+
+        #[tokio::test]
+        async fn unrelated_untracked_files_are_kept_and_do_not_block() {
+            let fx = on_main().await;
+            std::fs::write(fx.repo.join("notes.txt"), "keep me\n").unwrap();
+            std::fs::write(fx.repo.join(".gitignore.local"), "x\n").unwrap();
+            let c = confirm_checkout(&fx, fx.task_id).await;
+            integrate(&fx.state, fx.task_id, c).await.unwrap();
+            assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
+            assert_eq!(std::fs::read_to_string(fx.repo.join("notes.txt")).unwrap(), "keep me\n");
+        }
+
+        #[tokio::test]
+        async fn a_file_in_the_way_of_a_new_one_is_refused_even_when_ignored() {
+            for ignored in [false, true] {
+                let fx = on_main().await;
+                if ignored {
+                    std::fs::write(fx.repo.join(".git").join("info").join("exclude"), "a.txt\n").unwrap();
+                }
+                std::fs::write(fx.repo.join("a.txt"), "precious\n").unwrap();
+                let before = tip_of(&fx.repo, "main");
+                let p = preview(&fx.state, fx.task_id).await.unwrap();
+                assert_eq!(p.state, PreviewState::Refused, "ignored: {ignored}");
+                assert!(p.checkout_problems.iter().any(|m| m.contains("a.txt")), "{:?}", p.checkout_problems);
+                let c = IntegrationConfirmation {
+                    target_branch: "main".into(),
+                    target_tip: before.clone(),
+                    approved_tip: fx.tip.clone(),
+                    checkout_path: Some(path_of(&fx)),
+                };
+                assert!(integrate(&fx.state, fx.task_id, c).await.is_err());
+                assert_eq!(std::fs::read_to_string(fx.repo.join("a.txt")).unwrap(), "precious\n", "ignored: {ignored}");
+                assert_eq!(tip_of(&fx.repo, "main"), before);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_git_operation_under_way_blocks_the_integration() {
+            for marker in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "BISECT_LOG", "index.lock"] {
+                let fx = on_main().await;
+                let path = fx.repo.join(".git").join(marker);
+                if marker == "rebase-merge" {
+                    std::fs::create_dir(&path).unwrap();
+                } else {
+                    std::fs::write(&path, format!("{}\n", "0".repeat(40))).unwrap();
+                }
+                let before = tip_of(&fx.repo, "main");
+                let p = preview(&fx.state, fx.task_id).await.unwrap();
+                assert_eq!(p.state, PreviewState::Refused, "{marker}");
+                assert!(!p.checkout_problems.is_empty(), "{marker}");
+                let c = IntegrationConfirmation {
+                    target_branch: "main".into(),
+                    target_tip: before.clone(),
+                    approved_tip: fx.tip.clone(),
+                    checkout_path: Some(path_of(&fx)),
+                };
+                let err = integrate(&fx.state, fx.task_id, c).await.unwrap_err();
+                assert!(err.contains("in progress") || err.contains("index.lock"), "{marker}: {err}");
+                assert_eq!(tip_of(&fx.repo, "main"), before, "{marker}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_checkout_that_moved_or_detached_after_the_preview_is_refused() {
+            // A commit in the checkout after the preview: the target moved.
+            let fx = on_main().await;
+            let c = confirm_checkout(&fx, fx.task_id).await;
+            std::fs::write(fx.repo.join("late.txt"), "l\n").unwrap();
+            git(&fx.repo, &["add", "."]);
+            git(&fx.repo, &["commit", "-q", "-m", "late"]);
+            let moved = tip_of(&fx.repo, "main");
+            let err = integrate(&fx.state, fx.task_id, c).await.unwrap_err();
+            assert!(err.contains("moved after the integration was shown"), "{err}");
+            assert_eq!(tip_of(&fx.repo, "main"), moved);
+
+            // The checkout left main: nothing has it checked out any more.
+            let fx = on_main().await;
+            let c = confirm_checkout(&fx, fx.task_id).await;
+            git(&fx.repo, &["checkout", "-q", "--detach"]);
+            let err = integrate(&fx.state, fx.task_id, c).await.unwrap_err();
+            assert!(err.contains("no longer checked out"), "{err}");
+            assert!(on_disk(&fx, fx.task_id).local_integration.is_none());
+        }
+
+        /// Git updated the index and the files to the result and stopped
+        /// before it moved the branch: exactly what `git merge --ff-only`
+        /// leaves if it dies between its two steps.
+        #[tokio::test]
+        async fn a_crash_after_the_files_changed_and_before_the_branch_moved_is_finished_by_resuming() {
+            let fx = on_main().await;
+            let c = confirm_checkout(&fx, fx.task_id).await;
+            let plan = pending_unmoved_in_checkout(&fx, &c).await;
+            git(&fx.repo, &["read-tree", "-m", "-u", &plan.target_old, &plan.result]);
+            assert_eq!(tip_of(&fx.repo, "main"), plan.target_old, "the branch has not moved");
+            assert!(fx.repo.join("a.txt").is_file(), "the files already have the work");
+
+            let p = preview(&fx.state, fx.task_id).await.unwrap();
+            assert_eq!(p.state, PreviewState::Pending);
+            assert_eq!(p.observed.as_deref(), Some("unmoved"));
+            assert!(p.checkout_problems.is_empty(), "resume can finish: {:?}", p.checkout_problems);
+
+            let done = resume(&fx.state, fx.task_id).await.unwrap();
+            assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
+            assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
+            clean(&fx.repo);
+            assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
+        }
+
+        /// A checkout Git could only partly update: the integration stays
+        /// pending, nothing the person had is discarded, resuming never
+        /// forces it, and discarding drops the record and touches no file.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_partly_updated_checkout_keeps_everything_and_is_never_forced() {
+            use std::os::unix::fs::PermissionsExt;
+            let fx = on_main().await;
+            // `main` has a directory the task adds a file to; the task also
+            // adds a file Git writes first.
+            std::fs::create_dir(fx.repo.join("sealed")).unwrap();
+            std::fs::write(fx.repo.join("sealed").join("keep.txt"), "mine\n").unwrap();
+            git(&fx.repo, &["add", "."]);
+            git(&fx.repo, &["commit", "-q", "-m", "sealed"]);
+            git(&fx.repo, &["branch", "task-p", "main"]);
+            git(&fx.repo, &["checkout", "-q", "task-p"]);
+            std::fs::write(fx.repo.join("aaa.txt"), "task\n").unwrap();
+            std::fs::write(fx.repo.join("sealed").join("in.txt"), "task\n").unwrap();
+            git(&fx.repo, &["add", "."]);
+            git(&fx.repo, &["commit", "-q", "-m", "task-p"]);
+            let tip = git(&fx.repo, &["rev-parse", "HEAD"]);
+            git(&fx.repo, &["checkout", "-q", "main"]);
+            let id = seed(&fx.state, fx.project_id, "task-p", Some(&tip)).await;
+            let main_before = tip_of(&fx.repo, "main");
+
+            let sealed = fx.repo.join("sealed");
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o555)).unwrap();
+            if std::fs::write(sealed.join("probe"), "x").is_ok() {
+                // Privileges that ignore permissions cannot make Git fail this way.
+                std::fs::remove_file(sealed.join("probe")).unwrap();
+                std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+                return;
+            }
+
+            let p = preview(&fx.state, id).await.unwrap();
+            assert_eq!(p.state, PreviewState::ReadyInCheckout, "{:?}", p.reason);
+            let err = integrate(&fx.state, id, confirmation(&p)).await.unwrap_err();
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(err.contains("pending") || err.contains("did not fast-forward"), "{err}");
+
+            // Still pending, the branch where it was, the person's file intact.
+            assert!(on_disk(&fx, id).local_integration.expect("still recorded").is_pending());
+            assert_eq!(tip_of(&fx.repo, "main"), main_before);
+            assert_eq!(std::fs::read_to_string(sealed.join("keep.txt")).unwrap(), "mine\n");
+
+            let partial = fx.repo.join("aaa.txt").exists();
+            let resumed = resume(&fx.state, id).await;
+            if partial {
+                // Git wrote one of the files before it failed. That is not a
+                // state SlashIt overwrites or resets its way out of.
+                let why = resumed.expect_err("a half-updated checkout is not finished by force");
+                assert!(why.contains("aaa.txt"), "{why}");
+                assert_eq!(std::fs::read_to_string(fx.repo.join("aaa.txt")).unwrap(), "task\n");
+                assert_eq!(tip_of(&fx.repo, "main"), main_before);
+                discard(&fx.state, id).await.unwrap();
+                assert!(on_disk(&fx, id).local_integration.is_none());
+                assert!(fx.repo.join("aaa.txt").exists(), "discarding the record keeps the files");
+            } else {
+                assert_eq!(resumed.unwrap().local_integration.unwrap().state, IntegrationState::Integrated);
+            }
+            assert_eq!(std::fs::read_to_string(sealed.join("keep.txt")).unwrap(), "mine\n");
+        }
+
+        /// Resuming moves a checked-out branch only in the checkout that was
+        /// confirmed. A plan made when nothing had the branch checked out
+        /// carries no such confirmation, and the pending integration says so.
+        #[tokio::test]
+        async fn a_pending_integration_never_moves_a_checkout_that_was_not_confirmed() {
+            let fx = fixture().await;
+            let c = ready(&fx, fx.task_id).await;
+            let plan = pending_unmoved(&fx).await;
+            assert_eq!(plan.target_old, c.target_tip);
+            git(&fx.repo, &["checkout", "-q", "main"]);
+
+            let p = preview(&fx.state, fx.task_id).await.unwrap();
+            assert_eq!(p.state, PreviewState::Pending);
+            assert!(p.checkout_problems.iter().any(|m| m.contains("not confirmed")), "{:?}", p.checkout_problems);
+            let err = resume(&fx.state, fx.task_id).await.unwrap_err();
+            assert!(err.contains("checked out") && err.contains("Nothing was changed"), "{err}");
+            assert_eq!(tip_of(&fx.repo, "main"), plan.target_old);
+            clean(&fx.repo);
+
+            // Discarding changes no file, and integrating again can confirm it.
+            discard(&fx.state, fx.task_id).await.unwrap();
+            let confirm = confirm_checkout(&fx, fx.task_id).await;
+            integrate(&fx.state, fx.task_id, confirm).await.unwrap();
+            assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
+            clean(&fx.repo);
+        }
+
+        /// Git lists a checkout in the middle of a rebase or bisect as
+        /// detached, but the branch is still its own: it counts as checked
+        /// out, so the branch is never moved from under the operation.
+        #[tokio::test]
+        async fn a_branch_being_rebased_or_bisected_counts_as_checked_out() {
+            for (file, contents) in [
+                ("rebase-merge/head-name", "refs/heads/main\n"),
+                ("rebase-apply/head-name", "refs/heads/main\n"),
+                ("BISECT_START", "main\n"),
+            ] {
+                let fx = on_main().await;
+                git(&fx.repo, &["checkout", "-q", "--detach"]);
+                let marker = fx.repo.join(".git").join(file);
+                std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+                std::fs::write(&marker, contents).unwrap();
+                let before = tip_of(&fx.repo, "main");
+
+                let p = preview(&fx.state, fx.task_id).await.unwrap();
+                assert_eq!(p.state, PreviewState::Refused, "{file}");
+                assert_eq!(p.checked_out_at, Some(path_of(&fx)), "{file}");
+                let c = IntegrationConfirmation {
+                    target_branch: "main".into(),
+                    target_tip: before.clone(),
+                    approved_tip: fx.tip.clone(),
+                    checkout_path: None,
+                };
+                assert!(integrate(&fx.state, fx.task_id, c).await.is_err(), "{file}");
+                assert_eq!(tip_of(&fx.repo, "main"), before, "{file}: the branch did not move");
+            }
+        }
+
+        /// A name that starts with a space is still that name: an ignored
+        /// file by it is in the way, and is not overwritten.
+        #[tokio::test]
+        async fn an_ignored_file_whose_name_starts_with_a_space_is_not_overwritten() {
+            let fx = on_main().await;
+            git(&fx.repo, &["branch", "task-sp", "main"]);
+            git(&fx.repo, &["checkout", "-q", "task-sp"]);
+            std::fs::write(fx.repo.join(" secret"), "from task\n").unwrap();
+            git(&fx.repo, &["add", "-f", "--", " secret"]);
+            git(&fx.repo, &["commit", "-q", "-m", "space"]);
+            let tip = git(&fx.repo, &["rev-parse", "HEAD"]);
+            git(&fx.repo, &["checkout", "-q", "main"]);
+            std::fs::write(fx.repo.join(".git").join("info").join("exclude"), "\\ secret\n").unwrap();
+            std::fs::write(fx.repo.join(" secret"), "USER DATA\n").unwrap();
+            let id = seed(&fx.state, fx.project_id, "task-sp", Some(&tip)).await;
+
+            let p = preview(&fx.state, id).await.unwrap();
+            assert_eq!(p.state, PreviewState::Refused, "{:?}", p.reason);
+            assert!(p.checkout_problems.iter().any(|m| m.contains(" secret")));
+            assert_eq!(std::fs::read_to_string(fx.repo.join(" secret")).unwrap(), "USER DATA\n");
+        }
+
+        /// Replacing a tracked file by a directory is the task's own change,
+        /// not something in the way.
+        #[tokio::test]
+        async fn a_task_replacing_a_tracked_file_with_a_directory_is_not_refused() {
+            let fx = on_main().await;
+            std::fs::write(fx.repo.join("thing"), "file\n").unwrap();
+            git(&fx.repo, &["add", "."]);
+            git(&fx.repo, &["commit", "-q", "-m", "thing"]);
+            git(&fx.repo, &["branch", "task-d", "main"]);
+            git(&fx.repo, &["checkout", "-q", "task-d"]);
+            git(&fx.repo, &["rm", "-q", "thing"]);
+            std::fs::create_dir(fx.repo.join("thing")).unwrap();
+            std::fs::write(fx.repo.join("thing").join("inner"), "x\n").unwrap();
+            git(&fx.repo, &["add", "."]);
+            git(&fx.repo, &["commit", "-q", "-m", "dir"]);
+            let tip = git(&fx.repo, &["rev-parse", "HEAD"]);
+            git(&fx.repo, &["checkout", "-q", "main"]);
+            let id = seed(&fx.state, fx.project_id, "task-d", Some(&tip)).await;
+
+            let c = confirm_checkout(&fx, id).await;
+            integrate(&fx.state, id, c).await.unwrap();
+            assert_eq!(std::fs::read_to_string(fx.repo.join("thing").join("inner")).unwrap(), "x\n");
+            clean(&fx.repo);
+        }
+
+        /// A detached worktree whose directory is gone, but which Git still
+        /// lists, does not stop an integration.
+        #[tokio::test]
+        async fn a_detached_worktree_whose_directory_is_gone_does_not_block_integrating() {
+            let fx = fixture().await;
+            let gone = fx._tmp.path().join("gone worktree");
+            git(&fx.repo, &["worktree", "add", "-q", "--detach", gone.to_str().unwrap()]);
+            std::fs::remove_dir_all(&gone).unwrap();
+            assert!(git(&fx.repo, &["worktree", "list", "--porcelain"]).contains("gone worktree"));
+
+            let c = ready(&fx, fx.task_id).await;
+            integrate(&fx.state, fx.task_id, c).await.unwrap();
+            assert_eq!(tip_of(&fx.repo, "main"), fx.tip);
+        }
+
+        /// Record the plan as pending, pinned, without moving anything.
+        async fn pending_unmoved_in_checkout(fx: &Fx, c: &IntegrationConfirmation) -> Plan {
+            let repo = fx.repo.as_path();
+            let plan = git::plan(repo, "main", &fx.tip, &merge_message(&fx.branch, "main"), true).await.unwrap();
+            assert_eq!(plan.target_old, c.target_tip);
+            git::pin(repo, fx.task_id, &plan.result).await.unwrap();
+            git::mark_base(repo, "main", &plan.target_old).await.unwrap();
+            let record = LocalIntegration {
+                state: IntegrationState::Pending,
+                target_branch: plan.target_branch.clone(),
+                target_old_oid: plan.target_old.clone(),
+                approved_tip: plan.approved_tip.clone(),
+                result_oid: plan.result.clone(),
+                strategy: plan.strategy,
+                checkout_path: c.checkout_path.clone(),
+                started_at: chrono::Utc::now(),
+                completed_at: None,
+            };
+            let id = fx.task_id;
+            let amend =
+                move |s: &mut HashMap<Uuid, Task>| s.get_mut(&id).unwrap().local_integration = Some(record.clone());
+            crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend).await.unwrap();
+            plan
+        }
     }
 }
