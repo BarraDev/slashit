@@ -249,10 +249,24 @@ async fn handle_move_task(ctx: &IpcContext, task_id: String, status: String) -> 
         Err(e) => return IpcResponse::error(e),
     };
 
-    let old_status = match ctx.tasks.read().await.get(&task_uuid).map(|t| t.status.clone()) {
-        Some(s) => s,
+    let (old_status, unfinished_integration) = match ctx
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .map(|t| (t.status.clone(), t.integration_unfinished_refusal()))
+    {
+        Some(found) => found,
         None => return IpcResponse::error(format!("Task {task_id} not found")),
     };
+
+    // Same as the desktop `update_task_status`: a pending local integration
+    // keeps the task in the column it is recovered from.
+    if old_status != new_status {
+        if let Some(refusal) = unfinished_integration {
+            return IpcResponse::error(refusal);
+        }
+    }
 
     // Same as the desktop `update_task_status`: a move into In Progress is
     // refused while new work is paused for disk space, before anything else.
@@ -419,7 +433,24 @@ async fn handle_enqueue_task(ctx: &IpcContext, task_id: String) -> IpcResponse {
         Err(e) => return IpcResponse::error(e),
     };
 
-    let old_status = ctx.tasks.read().await.get(&task_uuid).map(|t| t.status.clone());
+    let (old_status, unfinished_integration) = match ctx
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .map(|t| (t.status.clone(), t.integration_unfinished_refusal()))
+    {
+        Some((status, refusal)) => (Some(status), refusal),
+        None => (None, None),
+    };
+
+    // Same as the desktop `update_task_status`: a task whose local integration
+    // is unfinished is not queued from the column it is recovered from.
+    if old_status != Some(TaskStatus::Queue) {
+        if let Some(refusal) = unfinished_integration {
+            return IpcResponse::error(refusal);
+        }
+    }
 
     if !matches!(&old_status, None | Some(TaskStatus::Queue)) {
         let running = ctx
@@ -847,6 +878,64 @@ mod tests {
         assert_eq!(persisted_task.status, TaskStatus::InProgress);
         assert_eq!(persisted_task.phase, crate::domain::TaskPhase::Idle);
         assert!(persisted_task.error_message.is_none());
+    }
+
+    /// The command-line client reaches the same lifecycle as the desktop: a
+    /// task whose local integration was started and not finished stays in the
+    /// column its Resume and Discard are offered in, whatever is asked.
+    #[tokio::test]
+    async fn ipc_moves_and_enqueues_leave_a_task_with_an_unfinished_integration_alone() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let ctx = ipc_test_context(paths);
+
+        let project_id = Uuid::new_v4();
+        let mut task = create_test_task_full("integrating", project_id, TaskStatus::Done, 0);
+        task.local_integration = Some(crate::domain::LocalIntegration {
+            state: crate::domain::IntegrationState::Pending,
+            target_branch: "main".to_string(),
+            target_old_oid: "a".repeat(40),
+            approved_tip: "b".repeat(40),
+            result_oid: "b".repeat(40),
+            strategy: crate::domain::IntegrationStrategy::FastForward,
+            checkout_path: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            completes_task: false,
+        });
+        task.record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+        let task_id = task.id;
+        ctx.tasks.write().await.insert(task_id, task.clone());
+        ctx.storage.save_project_tasks(project_id, &[task.clone()]).expect("seed the board");
+
+        let mut requests = vec![IpcRequest::EnqueueTask { task_id: task_id.to_string() }];
+        for status in ["backlog", "queue", "in_progress", "done"] {
+            requests.push(IpcRequest::MoveTask { task_id: task_id.to_string(), status: status.to_string() });
+        }
+        for request in requests {
+            let label = format!("{request:?}");
+            let answer = dispatch(request, &ctx, &peer()).await.response;
+            assert!(!answer.ok, "{label}: must be refused: {answer:?}");
+            assert!(
+                format!("{answer:?}").contains(crate::domain::task::INTEGRATION_UNFINISHED_REFUSAL),
+                "{label}: {answer:?}"
+            );
+            let board = ctx.tasks.read().await[&task_id].clone();
+            assert_eq!(
+                (board.status, board.updated_at, board.activity.len()),
+                (TaskStatus::Done, task.updated_at, 1),
+                "{label}: the board is unchanged"
+            );
+            assert_eq!(board.local_integration, task.local_integration, "{label}");
+            let persisted = ctx.storage.load_project_tasks(project_id).expect("read back");
+            assert_eq!(persisted[0].status, TaskStatus::Done, "{label}: the file is unchanged");
+            assert!(persisted[0].local_integration.as_ref().is_some_and(|r| r.is_pending()), "{label}");
+        }
     }
 
     /// Front-door parity: `CreateTask` used to hardcode `position: 0` for

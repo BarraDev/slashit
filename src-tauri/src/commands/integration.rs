@@ -2309,4 +2309,265 @@ mod tests {
             plan
         }
     }
+
+    /// A normal Task lifecycle transition must never strand an integration
+    /// that was started and not finished: the record may already have moved
+    /// the target, and Resume and Discard are the only ways out.
+    mod unfinished_integration_blocks_lifecycle {
+        use super::*;
+        use tauri::Manager;
+
+        const REFUSAL: &str = "An integration is unfinished. Resume or Discard it before moving this Task.";
+
+        struct Board {
+            _tmp: tempfile::TempDir,
+            app: tauri::App<tauri::test::MockRuntime>,
+            repo: PathBuf,
+            project_id: Uuid,
+            task_id: Uuid,
+            plan: Plan,
+        }
+
+        impl Board {
+            fn state(&self) -> tauri::State<'_, crate::AppState> {
+                self.app.state()
+            }
+
+            fn on_disk(&self) -> Task {
+                self.state()
+                    .storage
+                    .load_project_tasks(self.project_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|t| t.id == self.task_id)
+                    .expect("on disk")
+            }
+
+            async fn in_memory(&self) -> Task {
+                self.state().task.tasks.read().await[&self.task_id].clone()
+            }
+
+            async fn status(&self, to: TaskStatus) -> Result<Option<Task>, String> {
+                crate::commands::task::update_task_status(
+                    self.app.state(),
+                    self.task_id.to_string(),
+                    to,
+                    Some(true),
+                )
+                .await
+            }
+
+            async fn drag(&self, to: Option<TaskStatus>, position: i32) -> Result<Option<Task>, String> {
+                crate::commands::task::reorder_task(
+                    self.app.state(),
+                    self.task_id.to_string(),
+                    to,
+                    position,
+                    Some(true),
+                    None,
+                )
+                .await
+            }
+        }
+
+        /// Everything recovery depends on, as the board and the file hold it.
+        #[derive(Debug, PartialEq)]
+        struct Recovery {
+            status: TaskStatus,
+            record: Option<LocalIntegration>,
+            approved_tip: Option<String>,
+            worktree_path: Option<String>,
+            branch_name: Option<String>,
+            activity: usize,
+            needs_you: Option<AttentionReason>,
+        }
+
+        fn recovery(task: &Task) -> Recovery {
+            Recovery {
+                status: task.status.clone(),
+                record: task.local_integration.clone(),
+                approved_tip: task.human_review.approved_tip().map(str::to_string),
+                worktree_path: task.worktree_path.clone(),
+                branch_name: task.branch_name.clone(),
+                activity: task.activity.len(),
+                needs_you: task.needs_you(false),
+            }
+        }
+
+        /// A pending integration recorded and pinned, with the target either
+        /// still where it was planned from or already holding the result.
+        /// `in_review` makes the Task an approved Human Review Task whose
+        /// integration also completes it, instead of a Done one.
+        async fn board(target_moved: bool, in_review: bool) -> Board {
+            let fx = fixture().await;
+            let plan = pending_unmoved(&fx).await;
+            if target_moved {
+                git::advance(fx.repo.to_str().unwrap(), &plan, None).await.unwrap();
+            }
+            if in_review {
+                let id = fx.task_id;
+                let amend = move |s: &mut HashMap<Uuid, Task>| {
+                    let t = s.get_mut(&id).unwrap();
+                    t.status = TaskStatus::HumanReview;
+                    t.activity.retain(|e| !matches!(e.kind, ActivityKind::CompletedLocally));
+                    t.local_integration.as_mut().unwrap().completes_task = true;
+                };
+                crate::lifecycle::record(&fx.state.task.tasks, &fx.state.storage, id, &amend).await.unwrap();
+            }
+            let Fx { _tmp, state, repo, project_id, task_id, .. } = fx;
+            let app = tauri::test::mock_app();
+            app.manage(state);
+            Board { _tmp, app, repo, project_id, task_id, plan }
+        }
+
+        async fn refused_everywhere(b: &Board) {
+            let before = recovery(&b.in_memory().await);
+            assert_eq!(before.needs_you, Some(AttentionReason::IntegrationUnfinished));
+            for to in [TaskStatus::Backlog, TaskStatus::Queue, TaskStatus::InProgress, TaskStatus::Done] {
+                let label = format!("{to:?}");
+                let refusal = b.status(to.clone()).await.expect_err(&label);
+                assert_eq!(refusal, REFUSAL, "{label}");
+                if to == before.status {
+                    // Dropped back onto its own column: a reorder, not a move.
+                    b.drag(Some(to), 0).await.unwrap().expect("exists");
+                } else {
+                    let refusal = b.drag(Some(to), 0).await.expect_err(&label);
+                    assert_eq!(refusal, REFUSAL, "{label} by drag");
+                }
+                assert_eq!(recovery(&b.in_memory().await), before, "{label}: the board is unchanged");
+                assert_eq!(recovery(&b.on_disk()), before, "{label}: the file is unchanged");
+                assert!(ref_exists(&b.repo, &git::pin_ref(b.task_id)), "{label}: the pin is kept");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_done_task_stays_put_while_its_integration_has_not_moved_the_target() {
+            let b = board(false, false).await;
+            refused_everywhere(&b).await;
+            assert_eq!(git(&b.repo, &["rev-parse", "refs/heads/main"]), b.plan.target_old);
+
+            let done = resume(&b.state(), b.task_id).await.unwrap();
+            assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
+            assert_eq!(git(&b.repo, &["rev-parse", "refs/heads/main"]), b.plan.result);
+        }
+
+        #[tokio::test]
+        async fn a_done_task_stays_put_while_the_target_already_holds_the_result() {
+            let b = board(true, false).await;
+            refused_everywhere(&b).await;
+
+            let done = resume(&b.state(), b.task_id).await.unwrap();
+            assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
+            assert_eq!(git(&b.repo, &["rev-parse", "refs/heads/main"]), b.plan.result);
+        }
+
+        #[tokio::test]
+        async fn an_approved_human_review_task_stays_put_with_its_approval() {
+            for target_moved in [false, true] {
+                let b = board(target_moved, true).await;
+                assert_eq!(b.in_memory().await.status, TaskStatus::HumanReview);
+                refused_everywhere(&b).await;
+                assert!(b.in_memory().await.human_review.is_approved(), "the approval is kept");
+
+                let finished = resume(&b.state(), b.task_id).await.unwrap();
+                assert_eq!(finished.status, TaskStatus::Done, "moved={target_moved}: resuming completes it");
+                assert_eq!(finished.local_integration.unwrap().state, IntegrationState::Integrated);
+            }
+        }
+
+        #[tokio::test]
+        async fn queueing_and_deleting_are_refused_and_nothing_is_lost() {
+            let b = board(false, false).await;
+            let before = recovery(&b.in_memory().await);
+
+            let verdict = crate::lifecycle::enqueue_leased(
+                &b.state().task.tasks,
+                &b.state().storage,
+                b.project_id,
+                b.task_id,
+                &TaskStatus::Done,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(verdict, crate::lifecycle::EnqueueVerdict::Blocked(_)), "{verdict:?}");
+
+            let refusal = crate::commands::task::delete_task(b.app.state(), b.task_id.to_string())
+                .await
+                .expect_err("a delete would drop the only record of the integration");
+            assert_eq!(refusal, REFUSAL);
+
+            assert_eq!(recovery(&b.in_memory().await), before);
+            assert_eq!(recovery(&b.on_disk()), before);
+            assert!(ref_exists(&b.repo, &git::pin_ref(b.task_id)));
+            assert_eq!(resume(&b.state(), b.task_id).await.unwrap().status, TaskStatus::Done);
+        }
+
+        #[tokio::test]
+        async fn queue_commands_and_create_pr_are_refused_and_nothing_is_lost() {
+            for review in [false, true] {
+                let b = board(false, review).await;
+                let before = recovery(&b.in_memory().await);
+
+                let id = b.task_id.to_string();
+                let refusal = crate::commands::queue::add_to_queue(b.app.state(), id.clone()).await.unwrap_err();
+                assert_eq!(refusal, REFUSAL);
+                let results = crate::commands::queue::bulk_add_to_queue(b.app.state(), vec![id.clone()])
+                    .await
+                    .unwrap();
+                assert!(results[0].contains(REFUSAL), "{results:?}");
+                let refusal = crate::commands::pr::create_pr(b.app.state(), id).await.unwrap_err();
+                assert_eq!(refusal, REFUSAL);
+
+                assert_eq!(recovery(&b.in_memory().await), before);
+                assert_eq!(recovery(&b.on_disk()), before);
+                assert!(ref_exists(&b.repo, &git::pin_ref(b.task_id)));
+            }
+        }
+
+        /// A record saved where no control can finish it (before this check
+        /// existed) must not also pin the task there.
+        #[tokio::test]
+        async fn a_record_where_no_control_can_finish_it_does_not_pin_the_task() {
+            let b = board(false, false).await;
+            let id = b.task_id;
+            let amend = move |s: &mut HashMap<Uuid, Task>| s.get_mut(&id).unwrap().status = TaskStatus::Backlog;
+            crate::lifecycle::record(&b.state().task.tasks, &b.state().storage, id, &amend).await.unwrap();
+            let moved = b.status(TaskStatus::Queue).await.unwrap().expect("exists");
+            assert_eq!(moved.status, TaskStatus::Queue);
+            assert!(moved.local_integration.is_some_and(|r| r.is_pending()), "the record itself is kept");
+        }
+
+        #[tokio::test]
+        async fn discarding_releases_the_task_to_move_again() {
+            let b = board(false, false).await;
+            assert_eq!(b.status(TaskStatus::Backlog).await.unwrap_err(), REFUSAL);
+
+            let discarded = discard(&b.state(), b.task_id).await.unwrap();
+            assert!(discarded.local_integration.is_none());
+            let moved = b.status(TaskStatus::Backlog).await.unwrap().expect("exists");
+            assert_eq!(moved.status, TaskStatus::Backlog);
+        }
+
+        #[tokio::test]
+        async fn an_integrated_task_is_not_held_by_its_finished_record() {
+            let b = board(false, false).await;
+            resume(&b.state(), b.task_id).await.unwrap();
+            let moved = b.status(TaskStatus::Backlog).await.unwrap().expect("exists");
+            assert_eq!(moved.status, TaskStatus::Backlog);
+        }
+
+        #[tokio::test]
+        async fn reordering_inside_the_same_column_is_still_allowed() {
+            let b = board(false, false).await;
+            let before = recovery(&b.in_memory().await);
+
+            let kept = b.drag(Some(TaskStatus::Done), 0).await.unwrap().expect("exists");
+            assert_eq!(recovery(&kept), before);
+            let kept = b.drag(None, 0).await.unwrap().expect("exists");
+            assert_eq!(recovery(&kept), before);
+
+            let done = resume(&b.state(), b.task_id).await.unwrap();
+            assert_eq!(done.local_integration.unwrap().state, IntegrationState::Integrated);
+        }
+    }
 }

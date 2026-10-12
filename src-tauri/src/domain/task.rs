@@ -290,7 +290,36 @@ pub struct NewTask {
     pub linear_ticket_id: Option<String>,
 }
 
+/// What a person is told when a Task cannot leave its column because an
+/// integration of its approved work into a local branch was started and not
+/// finished.
+pub const INTEGRATION_UNFINISHED_REFUSAL: &str =
+    "An integration is unfinished. Resume or Discard it before moving this Task.";
+
 impl Task {
+    /// Why this task may not change status right now, or `None`.
+    ///
+    /// A pending [`Self::local_integration`] is a persisted Git operation
+    /// that may already have moved its target branch. Resume re-proves the
+    /// approval it was planned for, and is offered only where the person can
+    /// reach it: an approved Human Review task, or a Done task completed
+    /// locally (the same states [`Self::needs_you`] reports it in). A move
+    /// out of there withdraws the approval or the column, so it is refused
+    /// rather than the record being cleared or left unreachable. A record
+    /// found anywhere else offers no control to finish it, so it must not
+    /// also pin the task; reordering inside a column is not asked about.
+    pub fn integration_unfinished_refusal(&self) -> Option<String> {
+        let recoverable_here = match self.status {
+            TaskStatus::HumanReview => self.human_review.is_approved(),
+            TaskStatus::Done => self.completed_locally(),
+            _ => false,
+        };
+        self.local_integration
+            .as_ref()
+            .filter(|r| r.is_pending() && recoverable_here)
+            .map(|_| INTEGRATION_UNFINISHED_REFUSAL.to_string())
+    }
+
     /// Why nothing but the restack's own recovery may change this task's
     /// branch or checkout right now, or `None`.
     ///
@@ -1698,6 +1727,30 @@ mod tests {
         queued.status = TaskStatus::Queue;
         queued.local_integration = Some(integration(Pending));
         assert_eq!(queued.needs_you(false), None, "no controls to finish it are offered in this status");
+    }
+
+    #[test]
+    fn only_a_pending_integration_keeps_a_task_from_changing_status() {
+        use crate::domain::IntegrationState::{Integrated, Pending};
+        let mut task = arrived_in_review();
+        task.human_review.approve(None, chrono::Utc::now());
+        assert_eq!(task.integration_unfinished_refusal(), None, "no record");
+        task.local_integration = Some(integration(Integrated));
+        assert_eq!(task.integration_unfinished_refusal(), None, "a finished record holds nothing");
+        task.local_integration = Some(integration(Pending));
+        assert_eq!(task.integration_unfinished_refusal().as_deref(), Some(INTEGRATION_UNFINISHED_REFUSAL));
+
+        let mut done = startable_task();
+        done.status = TaskStatus::Done;
+        done.local_integration = Some(integration(Pending));
+        assert_eq!(done.integration_unfinished_refusal(), None, "not completed locally: no control to finish it");
+        done.record_activity(ActivityKind::CompletedLocally);
+        assert!(done.integration_unfinished_refusal().is_some());
+
+        let mut stranded = startable_task();
+        stranded.status = TaskStatus::Backlog;
+        stranded.local_integration = Some(integration(Pending));
+        assert_eq!(stranded.integration_unfinished_refusal(), None, "no control exists there, so it must not pin the task");
     }
 
     /// Nothing about attention is stored, so a restart derives the same

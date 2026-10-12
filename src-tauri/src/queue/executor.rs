@@ -1717,7 +1717,11 @@ impl TaskExecutor {
             // itself. Cleanup is never forced under a running agent, and a
             // quarantine is never touched automatically; both simply become
             // eligible again once the condition that is holding them clears.
+            // An unfinished local integration is the same kind of condition: a
+            // task with a pull request is never integrated locally, so this
+            // only waits for a person's Resume or Discard.
             Err(crate::lifecycle::TerminalizeRefusal::ExecutionActive)
+            | Err(crate::lifecycle::TerminalizeRefusal::IntegrationUnfinished)
             | Err(crate::lifecycle::TerminalizeRefusal::Quarantined(_))
             | Err(crate::lifecycle::TerminalizeRefusal::Busy(_))
             | Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => {}
