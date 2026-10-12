@@ -30,7 +30,7 @@ user is needed.
 
 Two separate questions, never merged. Attention asks "does the person need
 to act?" and is already answered by `slashit-attention` (`AttentionReason`:
-Failed, Review, PrNotCreated), derived from persisted facts. Run state asks
+Failed, Review, PrNotCreated, IntegrationUnfinished), derived from persisted facts. Run state asks
 "what is the execution SlashIt owns doing right now?" and is a different
 model. Needs review is already Attention. Working is not an Attention reason.
 

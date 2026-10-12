@@ -29,10 +29,10 @@ const SLOW_UNSELECTED_SECONDS: u32 = 10;
 
 /// What one card shows, read in one pass so the parts agree with each other.
 #[derive(Debug, Clone, Default)]
-struct Card {
+pub(super) struct Card {
     /// `data-reason` of the "Needs you" chip, if there is one.
-    reason: Option<String>,
-    chip_text: Option<String>,
+    pub(super) reason: Option<String>,
+    pub(super) chip_text: Option<String>,
     chip_classes: Option<String>,
     delivering: bool,
     /// The text of the card's human decision badge, if shown.
@@ -119,7 +119,7 @@ async fn await_card(
     }
 }
 
-async fn await_reason(driver: &WebDriver, task_id: &str, reason: Option<&str>) -> Result<Card> {
+pub(super) async fn await_reason(driver: &WebDriver, task_id: &str, reason: Option<&str>) -> Result<Card> {
     await_card(driver, task_id, &format!("attention {reason:?}"), |c| {
         c.reason.as_deref() == reason && !c.delivering
     })
@@ -132,7 +132,7 @@ async fn header_count(driver: &WebDriver) -> Result<Option<u64>> {
         .and_then(|c| c.parse().ok()))
 }
 
-async fn await_header(driver: &WebDriver, expected: u64) -> Result<()> {
+pub(super) async fn await_header(driver: &WebDriver, expected: u64) -> Result<()> {
     let started = Instant::now();
     loop {
         let shown = header_count(driver).await?;
@@ -157,7 +157,7 @@ async fn rail_count(driver: &WebDriver, project_id: &str) -> Result<Option<u64>>
     Ok(found.as_str().and_then(|c| c.parse().ok()))
 }
 
-async fn await_rail(driver: &WebDriver, project_id: &str, expected: Option<u64>) -> Result<()> {
+pub(super) async fn await_rail(driver: &WebDriver, project_id: &str, expected: Option<u64>) -> Result<()> {
     let started = Instant::now();
     loop {
         let shown = rail_count(driver, project_id).await?;

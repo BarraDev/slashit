@@ -11,6 +11,7 @@ use super::human_review::{
     attribute, await_task, click, install_fakes, open_reviewed_drawer, read_task, HR_APPROVE, HR_APPROVED, HR_DELIVERY,
     HR_RETRY_PR,
 };
+use super::needs_you::{await_header, await_rail, await_reason};
 use super::task_runs::{branch_name_of, create_task, git_is_ancestor, git_out, register_project, run_to_review};
 use super::*;
 use slashit_acceptance::fake_gh::FakeGh;
@@ -794,6 +795,21 @@ async fn refuse_resume_and_discard(
     let repo = repository.path_buf();
     let origin_before = repository.pushed_branches()?;
 
+    // --- After the restart, the unfinished integrations ask for the user ----------
+    // No process remains that started them, and no drawer is open: the board
+    // and the rail say so from the task file alone.
+    let project = completed.resumable.project_id.as_str();
+    open_board(driver, project).await?;
+    await_header(driver, 2).await?;
+    await_rail(driver, project, Some(2)).await?;
+    for task in [&completed.resumable, &completed.discardable] {
+        let chip = await_reason(driver, &task.id, Some("integration_unfinished")).await?;
+        if chip.chip_text.as_deref().is_none_or(|t| !t.contains("Integration unfinished")) {
+            bail!("the card says {:?}", chip.chip_text);
+        }
+    }
+    await_reason(driver, &completed.conflicting.id, None).await?;
+
     // --- Discard: the branch has not moved, so the plan is simply dropped --------
     reopen_completed_drawer(driver, &completed.discardable).await?;
     await_attribute(driver, LI_PENDING, "data-observed", "unmoved").await?;
@@ -804,6 +820,8 @@ async fn refuse_resume_and_discard(
     dismiss_toasts(driver).await?;
     click(driver, LI_DISCARD, "Discard").await?;
     await_task(driver, &completed.discardable, "no pending integration", |t| integration_of(t).is_none()).await?;
+    await_reason(driver, &completed.discardable.id, None).await?;
+    await_header(driver, 1).await?;
     if repository.branch_tip("main")?.as_deref() != Some(main_tip) {
         bail!("discarding moved main");
     }
@@ -831,6 +849,9 @@ async fn refuse_resume_and_discard(
     if repository.branch_tip("main")?.as_deref() != Some(resumable_tip) {
         bail!("resuming did not move main to {resumable_tip}");
     }
+    await_reason(driver, &completed.resumable.id, None).await?;
+    await_header(driver, 0).await?;
+    await_rail(driver, project, None).await?;
     assert_main_checked_out_and_clean(repository)?;
     let work_file = own_file_of(&completed.resumable)?;
     if std::fs::read_to_string(repo.join(&work_file))? != fake_agent::WORK_CONTENT {

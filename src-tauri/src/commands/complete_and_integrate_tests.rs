@@ -721,8 +721,12 @@ async fn resuming_an_integration_whose_checkout_cannot_be_removed_keeps_the_task
 async fn a_pending_integration_dropped_before_it_moved_leaves_the_task_in_review() {
     let fx = fixture().await;
     let plan = pending_unmoved(&fx).await;
+    let waiting = current(&fx).await;
+    assert_eq!(waiting.status, TaskStatus::HumanReview);
+    assert_eq!(waiting.needs_you(false), Some(crate::domain::task::AttentionReason::IntegrationUnfinished));
     let task = discard(&fx.state, fx.task_id).await.unwrap();
     assert!(task.local_integration.is_none());
+    assert_eq!(task.needs_you(false), None);
     assert_eq!(task.status, TaskStatus::HumanReview);
     assert_eq!(tip_of(&fx.repo, "main"), plan.target_old);
     assert!(!ref_exists(&fx.repo, &git::pin_ref(fx.task_id)));
