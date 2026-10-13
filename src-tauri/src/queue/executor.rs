@@ -164,6 +164,14 @@ fn in_pr_lifecycle(task: &Task) -> bool {
     matches!(task.status, TaskStatus::PrCreated | TaskStatus::HumanReview | TaskStatus::Done)
 }
 
+/// Whether `task` still links exactly the pull request `key`: repository and
+/// number both.
+fn links_pull_request(task: &Task, key: &crate::pr_status::PrKey) -> bool {
+    task.external_refs
+        .iter()
+        .any(|r| matches!(r, ExternalRef::GithubPr { number, repo, .. } if *number == key.number && *repo == key.repo))
+}
+
 /// The pull requests the background poll asks about, each with the tasks
 /// linked to it, in a stable order.
 ///
@@ -1593,7 +1601,21 @@ impl TaskExecutor {
         // The poll chose to finish this task from its column before the lease
         // was held; a move out of the delivery columns since then is the
         // user taking it back, and wins. The next poll decides again.
-        if !self.tasks.read().await.get(&task_id).is_some_and(in_pr_lifecycle) {
+        //
+        // Likewise the reference: the poll chose `key` before it waited on
+        // GitHub, and the user may have removed it since. Removing a pull
+        // request reference takes this same lease
+        // (`commands::task::remove_external_ref_serialized`), so what is
+        // true here stays true until this function returns. A merge heard
+        // for a reference the task no longer has completes nothing, records
+        // nothing and says nothing.
+        if !self
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .is_some_and(|t| in_pr_lifecycle(t) && links_pull_request(t, key))
+        {
             return;
         }
 
@@ -5592,6 +5614,203 @@ mod tests {
             polled_pull_requests(&tasks, &crate::pr_status::PrStatuses::github()),
             vec![(crate::pr_status::PrKey::new("other/repo", 7), vec![id])],
         );
+    }
+
+    /// Remove reference `index` the way the command does.
+    async fn remove_ref(executor: &TaskExecutor, id: Uuid, index: usize) -> Result<Option<Task>, String> {
+        crate::commands::task::remove_external_ref_serialized(&executor.tasks, &executor.storage, &executor.lifecycle, id, index).await
+    }
+
+    fn merges_recorded(task: &Task) -> usize {
+        task.activity.iter().filter(|e| matches!(e.kind, ActivityKind::PrMerged { .. } | ActivityKind::PrClosed { .. })).count()
+    }
+
+    /// Poll selects `owner/repo#7`, the user removes the reference while the
+    /// lookup is out, and the stale MERGED answer is applied afterwards.
+    /// Nothing is completed, latched, announced or cleaned up.
+    #[tokio::test]
+    async fn a_stale_merge_for_a_removed_reference_completes_nothing() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
+        let checkout = tempfile::tempdir().expect("a checkout directory");
+        let path = checkout.path().to_str().unwrap().to_string();
+        let (id, project_id) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("owner/repo", 7, Some("OPEN"))).await;
+        let set_checkout = {
+            let path = path.clone();
+            move |staged: &mut HashMap<Uuid, Task>| {
+                if let Some(t) = staged.get_mut(&id) {
+                    t.worktree_path = Some(path.clone());
+                }
+            }
+        };
+        crate::lifecycle::record(&executor.tasks, &executor.storage, id, &set_checkout).await.expect("fixture");
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+        // The selection the poll made before it started waiting on GitHub.
+        let selected = polled_pull_requests(&executor.tasks.read().await.clone(), &executor.pr_statuses);
+        assert_eq!(selected, vec![(key.clone(), vec![id])]);
+
+        remove_ref(&executor, id, 0).await.expect("removal succeeds");
+        let before = executor.tasks.read().await[&id].clone();
+
+        for answer in [crate::pr_status::PrState::Merged, crate::pr_status::PrState::Closed, crate::pr_status::PrState::Open] {
+            executor.apply_polled_pr_state(id, &key, answer).await;
+        }
+
+        for (seen, task) in [
+            ("in memory", executor.tasks.read().await[&id].clone()),
+            ("on disk", on_disk_task(&executor, project_id, id)),
+        ] {
+            assert!(task.external_refs.is_empty(), "{seen}: the reference stays removed");
+            assert_eq!(task.status, TaskStatus::PrCreated, "{seen}: not completed");
+            assert_eq!(task.worktree_path.as_deref(), Some(path.as_str()), "{seen}: checkout still referenced");
+            assert!(!task.cleanup_in_flight, "{seen}: no cleanup was announced");
+            assert_eq!(task.error_message, None, "{seen}: nothing was latched");
+            assert_eq!(merges_recorded(&task), 0, "{seen}: no false PR activity");
+        }
+        assert_eq!(executor.tasks.read().await[&id].updated_at, before.updated_at, "nothing was written");
+        assert!(checkout.path().exists(), "the checkout is untouched");
+        assert!(recording.recorded().is_empty(), "and nothing was said: {:?}", recording.recorded());
+    }
+
+    /// A merge heard for another repository's pull request 7 does not
+    /// authorize completing a task that links only `other/repo#7`.
+    #[tokio::test]
+    async fn a_merge_for_another_repositorys_pull_request_does_not_complete_the_task() {
+        let (executor, _temps) = test_executor();
+        let (id, _) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("other/repo", 7, Some("OPEN"))).await;
+
+        executor
+            .apply_polled_pr_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), crate::pr_status::PrState::Merged)
+            .await;
+
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(after.status, TaskStatus::PrCreated);
+        assert_eq!(recorded_pr_state(&after).as_deref(), Some("OPEN"));
+        assert_eq!(merges_recorded(&after), 0);
+        assert_eq!(after.error_message, None);
+    }
+
+    /// A pending local integration stays recoverable when the removal wins.
+    #[tokio::test]
+    async fn a_stale_merge_leaves_a_pending_integration_recoverable() {
+        use crate::domain::{IntegrationState, IntegrationStrategy, LocalIntegration};
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_with_pr(&executor, TaskStatus::HumanReview, pr_ref("owner/repo", 7, Some("OPEN"))).await;
+        let pin = move |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&id) {
+                t.human_review.approve(Some("1111111111111111111111111111111111111111".to_string()), chrono::Utc::now());
+                t.local_integration = Some(LocalIntegration {
+                    state: IntegrationState::Pending,
+                    target_branch: "main".to_string(),
+                    target_old_oid: "0000000000000000000000000000000000000000".to_string(),
+                    approved_tip: "1111111111111111111111111111111111111111".to_string(),
+                    result_oid: "2222222222222222222222222222222222222222".to_string(),
+                    strategy: IntegrationStrategy::FastForward,
+                    checkout_path: None,
+                    started_at: chrono::Utc::now(),
+                    completed_at: None,
+                    completes_task: false,
+                });
+            }
+        };
+        crate::lifecycle::record(&executor.tasks, &executor.storage, id, &pin).await.expect("fixture");
+        remove_ref(&executor, id, 0).await.expect("removal succeeds");
+        let before = executor.tasks.read().await[&id].clone();
+
+        executor
+            .apply_polled_pr_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), crate::pr_status::PrState::Merged)
+            .await;
+
+        for (seen, task) in [
+            ("in memory", executor.tasks.read().await[&id].clone()),
+            ("on disk", on_disk_task(&executor, project_id, id)),
+        ] {
+            assert_eq!(task.status, TaskStatus::HumanReview, "{seen}");
+            assert_eq!(task.local_integration, before.local_integration, "{seen}: still recoverable");
+            assert_eq!(task.error_message, None, "{seen}: no not-finished note for a reference it does not have");
+            assert!(task.integration_unfinished_refusal().is_some(), "{seen}: Resume and Discard still apply");
+        }
+    }
+
+    /// Completion wins: while the poll's completion owns the lease, the
+    /// removal of the pull request reference waits, and it lands only after.
+    #[tokio::test]
+    async fn removing_a_pull_request_reference_waits_for_the_lifecycle_lease() {
+        use futures::FutureExt;
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("owner/repo", 7, Some("OPEN"))).await;
+        let lease = executor.lifecycle.try_acquire(id).await.expect("the lease is free");
+
+        let mut removal = Box::pin(remove_ref(&executor, id, 0));
+        assert!(removal.as_mut().now_or_never().is_none(), "the removal is blocked by the lease holder");
+        assert_eq!(executor.tasks.read().await[&id].external_refs.len(), 1, "and has changed nothing in memory");
+        assert_eq!(on_disk_task(&executor, project_id, id).external_refs.len(), 1, "or on disk");
+
+        drop(lease);
+        let removed = removal.await.expect("removal succeeds").expect("task");
+        assert!(removed.external_refs.is_empty());
+        assert!(on_disk_task(&executor, project_id, id).external_refs.is_empty());
+    }
+
+    /// Completion wins, run to the end: the merge is latched under the lease,
+    /// then the removal proceeds and the result matches that order.
+    #[tokio::test]
+    async fn a_removal_after_the_completion_sees_the_completed_task() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) =
+            task_with_open_pr(&executor, Some("/nonexistent/checkout")).await;
+        let key = crate::pr_status::PrKey::new("owner/repo", 7);
+
+        executor.complete_merged_task(id, &key, "MERGED").await;
+        assert_eq!(recorded_pr_state(&executor.tasks.read().await[&id]).as_deref(), Some("MERGED"));
+
+        let after = remove_ref(&executor, id, 0).await.expect("removal succeeds").expect("task");
+        assert!(after.external_refs.is_empty());
+        assert_eq!(merges_recorded(&after), 1, "the merge that happened is still on the record");
+        assert_eq!(on_disk_task(&executor, project_id, id).external_refs.len(), 0);
+    }
+
+    /// Removing a reference with no lifecycle meaning does not wait for the
+    /// lease; removal without any poll is otherwise as before.
+    #[tokio::test]
+    async fn removing_other_references_does_not_wait_and_removes_the_right_one() {
+        use futures::FutureExt;
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("owner/repo", 7, Some("OPEN"))).await;
+        let add = move |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&id) {
+                t.external_refs.insert(0, ExternalRef::JiraTicket { key: "P-1".to_string(), project: "P".to_string() });
+                t.external_refs.push(ExternalRef::LinearTicket { id: "L-1".to_string() });
+            }
+        };
+        crate::lifecycle::record(&executor.tasks, &executor.storage, id, &add).await.expect("fixture");
+
+        let lease = executor.lifecycle.try_acquire(id).await.expect("the lease is free");
+        let removed = remove_ref(&executor, id, 2).now_or_never();
+        assert!(removed.is_some(), "a ticket reference does not wait behind a lifecycle transition");
+        let removed = removed.unwrap().expect("removal succeeds").expect("task");
+        assert_eq!(removed.external_refs.len(), 2);
+        drop(lease);
+
+        let after = remove_ref(&executor, id, 1).await.expect("removal succeeds").expect("task");
+        assert_eq!(after.external_refs.len(), 1);
+        assert!(matches!(after.external_refs[0], ExternalRef::JiraTicket { .. }));
+        assert_eq!(on_disk_task(&executor, project_id, id).external_refs.len(), 1);
+
+        let unchanged = remove_ref(&executor, id, 9).await.expect("out of range is not an error").expect("task");
+        assert_eq!(unchanged.external_refs.len(), 1);
+        assert!(remove_ref(&executor, Uuid::new_v4(), 0).await.expect("unknown id").is_none());
+    }
+
+    /// A failed write leaves the reference where it was, in memory too.
+    #[tokio::test]
+    async fn a_failed_removal_write_leaves_the_reference_in_memory() {
+        let (executor, temps) = test_executor();
+        let (id, _) = seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("owner/repo", 7, Some("OPEN"))).await;
+        block_persistence(&temps[0]);
+
+        assert!(remove_ref(&executor, id, 0).await.is_err());
+        assert_eq!(executor.tasks.read().await[&id].external_refs.len(), 1);
     }
 
     /// A merged pull request heard by the poll for a task a pending local

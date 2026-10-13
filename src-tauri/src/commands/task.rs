@@ -730,14 +730,80 @@ pub async fn remove_external_ref(
     ref_index: usize,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
-    let amend = move |staged: &mut HashMap<Uuid, Task>| {
-        if let Some(task) = staged.get_mut(&task_id) {
-            if ref_index < task.external_refs.len() {
-                task.external_refs.remove(ref_index);
+    remove_external_ref_serialized(
+        &state.task.tasks,
+        &state.storage,
+        &state.task_lifecycle_locks,
+        task_id,
+        ref_index,
+    )
+    .await
+}
+
+/// Remove the external reference at `ref_index`, serialized against the
+/// task's lifecycle transitions when the reference is a GitHub pull request.
+///
+/// A merged pull request completes the task that links it (see
+/// `TaskExecutor::complete_merged_task`), and it decides that under the
+/// task's lifecycle lease from a reading taken before the lease was held.
+/// Removing the reference is the one way to take that justification away, so
+/// it takes the same lease for the whole read-modify-persist-publish: either
+/// the completion finished first and the removal then sees the finished task,
+/// or the removal did and the completion finds no reference and does nothing.
+/// Any other reference (an issue, a ticket) has no lifecycle consequence and
+/// does not wait behind a transition that may be running `git`.
+///
+/// The index is only meaningful against the list it was chosen from, so the
+/// kind of reference at `ref_index` is read before the lease is awaited
+/// (never holding the task map across the wait) and checked again under the
+/// write; if another removal shifted a different kind of reference into that
+/// position meanwhile, the choice is made again.
+pub(crate) async fn remove_external_ref_serialized(
+    tasks: &crate::lifecycle::Tasks,
+    storage: &crate::config::Storage,
+    locks: &crate::lifecycle::TaskLifecycleLocks,
+    task_id: Uuid,
+    ref_index: usize,
+) -> Result<Option<Task>, String> {
+    let is_pr = |r: &ExternalRef| matches!(r, ExternalRef::GithubPr { .. });
+    for _ in 0..3 {
+        let guards_lifecycle = {
+            let tasks = tasks.read().await;
+            let Some(task) = tasks.get(&task_id) else {
+                return Ok(None);
+            };
+            task.external_refs.get(ref_index).is_some_and(is_pr)
+        };
+        let _lease = if guards_lifecycle { Some(locks.acquire(task_id).await?) } else { None };
+
+        let shifted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let revise = {
+            let shifted = shifted.clone();
+            move |staged: &mut HashMap<Uuid, Task>| {
+                let Some(task) = staged.get_mut(&task_id) else {
+                    return false;
+                };
+                match task.external_refs.get(ref_index) {
+                    Some(r) if is_pr(r) != guards_lifecycle => {
+                        shifted.store(true, std::sync::atomic::Ordering::SeqCst);
+                        false
+                    }
+                    Some(_) => {
+                        task.external_refs.remove(ref_index);
+                        true
+                    }
+                    None => false,
+                }
             }
+        };
+        match crate::lifecycle::record_if_changed(tasks, storage, task_id, &revise).await {
+            Ok(_) if shifted.load(std::sync::atomic::Ordering::SeqCst) => continue,
+            Ok(_) => return Ok(tasks.read().await.get(&task_id).cloned()),
+            Err(_) if !tasks.read().await.contains_key(&task_id) => return Ok(None),
+            Err(e) => return Err(e),
         }
-    };
-    crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend).await
+    }
+    Err("the task's references kept changing; nothing was removed, so this can be asked for again".to_string())
 }
 
 /// Core update_task_status logic extracted for testability.
