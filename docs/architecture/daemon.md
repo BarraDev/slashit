@@ -48,6 +48,26 @@ Everything else — `AppState`, hydration, migrations, the queue executor, the
 IPC command handlers, worktree management, agent execution — is one
 implementation used by both.
 
+## One process per data directory
+
+The synchronization the backend performs is in-process: the per-task
+lifecycle leases, the per-Project deletion gate
+(`lifecycle::ProjectLifecycleGate`) and the board's shared write guard are
+tokio locks inside one `AppState`, and `Storage`'s file writes are atomic per
+file (temp file, rename) while holding no OS-level lock. A second process
+mutating the same user data concurrently is therefore unsupported, and the
+single-instance rule is what enforces that in practice: both entry points
+claim the IPC endpoints *before* they read or write a byte of shared state,
+and a second desktop app or `slashitd` that loses the claim exits untouched
+("another SlashIt instance ... is already running"). The CLI never opens the
+data directory itself — it talks to the one live instance through the control
+channel.
+
+With no live instance, crash recovery may find leftover cleanup records; that
+is designed reconciliation, not a concurrency agreement. Tooling that
+bypasses the endpoint (tests, a debugging harness) and touches the same user
+data while an instance runs carries no such guarantee and is not supported.
+
 ### The event sink
 
 `queue/executor.rs` used to hold a `tauri::AppHandle` purely to call `.emit()`

@@ -360,6 +360,7 @@ pub fn ipc_test_context(paths: std::sync::Arc<crate::config::paths::AppPaths>) -
     };
 
     IpcContext {
+        project_gate: Default::default(),
         tasks: tasks.clone(),
         projects: Arc::new(RwLock::new(HashMap::new())),
         executions: Arc::new(RwLock::new(HashMap::new())),

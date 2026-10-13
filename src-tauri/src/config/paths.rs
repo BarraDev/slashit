@@ -378,6 +378,17 @@ impl AppPaths {
         self.conversations_dir().join(format!("{project_id}.delete-pending"))
     }
 
+    /// Durable recovery records for Project deletions whose Task-record
+    /// cleanup may not have completed before process exit.
+    ///
+    /// The records live beside `config.toml` rather than beside the Task
+    /// files: a cleanup that failed because the Task directory refused a
+    /// deletion must still have been able to record the retry, and the fixed
+    /// listing here finds every record however the file it names was routed.
+    pub fn pending_project_tasks_deletion_file(&self, project_id: Uuid) -> PathBuf {
+        self.config_dir.join(format!("{project_id}.tasks-delete-pending"))
+    }
+
     pub fn conversation_file(&self, conversation_id: Uuid) -> PathBuf {
         self.conversations_dir().join(format!("{conversation_id}.json"))
     }

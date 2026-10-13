@@ -54,7 +54,9 @@ use crate::domain::conversation::{
     ProjectActionStatus, Role, TaskMutation, coordinator_may_move,
 };
 use crate::domain::{NewTask, Project, Task, TaskStatus};
-use crate::lifecycle::{self, EnqueueVerdict, StatusTransitionEffect, TaskLifecycleLocks, Tasks};
+use crate::lifecycle::{
+    self, EnqueueVerdict, ProjectLifecycleGate, StatusTransitionEffect, TaskLifecycleLocks, Tasks,
+};
 
 /// Everything an approved operation touches. `project_id` is the scope the
 /// Conversation belongs to; every Task target is validated against it here
@@ -66,6 +68,9 @@ pub struct Scope<'a> {
     pub projects: &'a RwLock<HashMap<Uuid, Project>>,
     /// The Task lifecycle's own serialization, taken by every status move.
     pub locks: &'a TaskLifecycleLocks,
+    /// The Project lifecycle gate; creation takes it shared so a Project
+    /// deletion cannot be deciding mid-birth.
+    pub gate: &'a ProjectLifecycleGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,7 +303,13 @@ async fn execute(scope: &Scope<'_>, mutation: &TaskMutation) -> Result<Execution
                 gitlab_issue_url: None,
                 linear_ticket_id: None,
             };
-            let task = lifecycle::create(scope.tasks, scope.storage, scope.project_id, move |existing| {
+            let task = lifecycle::create(
+                scope.gate,
+                scope.tasks,
+                scope.projects,
+                scope.storage,
+                scope.project_id,
+                move |existing| {
                 Task::new_backlog(existing, new)
             })
             .await?;
@@ -525,6 +536,7 @@ mod tests {
         projects: RwLock<HashMap<Uuid, Project>>,
         storage: Storage,
         locks: TaskLifecycleLocks,
+        gate: crate::lifecycle::ProjectLifecycleGate,
         project_id: Uuid,
     }
 
@@ -565,6 +577,7 @@ mod tests {
                 tasks: Arc::new(RwLock::new(HashMap::new())),
                 projects: RwLock::new(HashMap::from([(project_id, project)])),
                 locks: TaskLifecycleLocks::new(),
+                gate: crate::lifecycle::ProjectLifecycleGate::new(),
                 project_id,
                 _tmp: tmp,
             }
@@ -577,6 +590,7 @@ mod tests {
                 storage: &self.storage,
                 projects: &self.projects,
                 locks: &self.locks,
+                gate: &self.gate,
             }
         }
 
@@ -585,7 +599,35 @@ mod tests {
         }
 
         async fn seed_task(&self, project_id: Uuid, title: &str) -> Task {
-            lifecycle::create(&self.tasks, &self.storage, project_id, |existing| {
+            // Some tests seed a Task belonging to another Project on
+            // purpose. A Task exists only for a Project that exists, so give
+            // any unregistered id the Project it needs; the tests still
+            // answer for the project's own Scope.
+            if !self.projects.read().await.contains_key(&project_id) {
+                self.projects.write().await.insert(
+                    project_id,
+                    Project {
+                        id: project_id,
+                        name: "foreign".into(),
+                        repository_id: None,
+                        scope: ProjectScope::Standalone,
+                        state_location: StateLocation::External,
+                        base: None,
+                        agent_type: AgentType::ClaudeCode,
+                        agent_config: AgentConfig {
+                            agent_type: AgentType::ClaudeCode,
+                            command: "claude".into(),
+                            args: Vec::new(),
+                            env: HashMap::new(),
+                            model: None,
+                            api_key: None,
+                        },
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                    },
+                );
+            }
+            lifecycle::create(&self.gate, &self.tasks, &self.projects, &self.storage, project_id, |existing| {
                 Task::new_backlog(
                     existing,
                     NewTask {

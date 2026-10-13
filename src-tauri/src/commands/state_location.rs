@@ -236,12 +236,17 @@ fn record_migrated_location(
 /// [`set_state_location_committed`] need, so passing them through stays under
 /// clippy's argument-count lint without smuggling anything through global
 /// state — the same shape [`crate::lifecycle::TerminalizeCtx`] uses.
-struct StateLocationCtx<'a> {
-    locks: &'a StateLocationLocks,
-    projects: &'a RwLock<HashMap<Uuid, Project>>,
-    repositories: &'a RwLock<HashMap<Uuid, Repository>>,
-    paths: &'a AppPaths,
-    storage: &'a Storage,
+pub(crate) struct StateLocationCtx<'a> {
+    pub(crate) locks: &'a StateLocationLocks,
+    /// The Project lifecycle gate. A deletion captures the Project's board
+    /// files from its current routes and holds the gate in write for its
+    /// whole transaction; a move or a route change taking the same gate in
+    /// write is what keeps those captured paths the real ones.
+    pub(crate) gate: &'a crate::lifecycle::ProjectLifecycleGate,
+    pub(crate) projects: &'a RwLock<HashMap<Uuid, Project>>,
+    pub(crate) repositories: &'a RwLock<HashMap<Uuid, Repository>>,
+    pub(crate) paths: &'a AppPaths,
+    pub(crate) storage: &'a Storage,
 }
 
 /// Core of [`apply_state_migration`], taking raw locks/paths/storage so tests
@@ -254,13 +259,18 @@ struct StateLocationCtx<'a> {
 /// longer current. The proposed map is persisted before it replaces the
 /// shared one, so a persistence failure never leaves memory believing a
 /// setting was saved that disk does not have.
-async fn apply_state_migration_committed(
+pub(crate) async fn apply_state_migration_committed(
     ctx: StateLocationCtx<'_>,
     id: Uuid,
     target: StateLocation,
     policy: Option<ConflictPolicy>,
 ) -> Result<MigrationReport, String> {
     let _guard = ctx.locks.acquire(id).await;
+    // Lock order: state-location lock, then the lifecycle gate. Nothing that
+    // holds the gate waits on a state-location lock, so the order is acyclic.
+    // Taken in write: files are about to move under a Project whose Tasks a
+    // creation or a deletion may be reading or capturing by route.
+    let _gate = ctx.gate.write(id).await;
 
     let (project, root) = resolve_project_root(ctx.projects, ctx.repositories, id).await?;
 
@@ -314,6 +324,7 @@ pub async fn apply_state_migration(
     apply_state_migration_committed(
         StateLocationCtx {
             locks: &state.state_location_locks,
+            gate: &state.task.project_gate,
             projects: &state.project.projects,
             repositories: &state.repository.repositories,
             paths: &state.paths,
@@ -356,6 +367,7 @@ fn parse_known_updated_at(raw: &str) -> Result<chrono::DateTime<chrono::Utc>, St
 /// protection by omitting the timestamp.
 async fn set_state_location_committed(
     locks: &StateLocationLocks,
+    gate: &crate::lifecycle::ProjectLifecycleGate,
     projects: &RwLock<HashMap<Uuid, Project>>,
     storage: &Storage,
     id: Uuid,
@@ -363,6 +375,9 @@ async fn set_state_location_committed(
     known_updated_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     let _guard = locks.acquire(id).await;
+    // A route change moves where a deletion would look for the Project's
+    // board file, so it waits for the gate like a move does.
+    let _gate = gate.write(id).await;
 
     let mut projects_w = projects.write().await;
     let mut proposed = projects_w.clone();
@@ -411,6 +426,7 @@ pub async fn set_state_location(
 
     set_state_location_committed(
         &state.state_location_locks,
+        &state.task.project_gate,
         &state.project.projects,
         &state.storage,
         id,
@@ -594,6 +610,7 @@ mod tests {
             test_repository(repository_id, &repo_root),
         )]));
         let locks = StateLocationLocks::new();
+        let gate = crate::lifecycle::ProjectLifecycleGate::new();
         let paths = storage.paths();
 
         // Seed the external state dir with a file, so the migration actually
@@ -608,6 +625,7 @@ mod tests {
         apply_state_migration_committed(
             StateLocationCtx {
                 locks: &locks,
+                gate: &gate,
                 projects: &projects,
                 repositories: &repositories,
                 paths,
@@ -630,6 +648,7 @@ mod tests {
         // *before* A ran.
         let result = set_state_location_committed(
             &locks,
+            &gate,
             &projects,
             &storage,
             project_id,
@@ -671,9 +690,11 @@ mod tests {
         let current = project.updated_at;
         let projects = RwLock::new(HashMap::from([(project_id, project)]));
         let locks = StateLocationLocks::new();
+        let gate = crate::lifecycle::ProjectLifecycleGate::new();
 
         set_state_location_committed(
             &locks,
+            &gate,
             &projects,
             &storage,
             project_id,
