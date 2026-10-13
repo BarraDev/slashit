@@ -1291,12 +1291,13 @@ mod tests {
         let pointer = storage.paths().primary_conversation_file(id);
         let document = storage.paths().conversation_file(conversation.id);
         std::fs::write(&document, "malformed Conversation").unwrap();
-        let tasks_file = storage
-            .paths()
-            .pending_project_tasks_deletion_file(id)
-            .with_file_name(format!("{id}.toml"));
+        let tasks_file = board_tasks_file(id, &storage);
         let done = board_task(id);
         storage.save_project_tasks(id, std::slice::from_ref(&done)).unwrap();
+        assert!(
+            tasks_file.exists(),
+            "the Task file must exist before deletion, or its later absence proves nothing"
+        );
         let tasks = board(vec![done]);
         let projects = RwLock::new(HashMap::from([(id, project)]));
 
@@ -2787,6 +2788,115 @@ mod tests {
                 .exists(),
             "no Task file may reappear for a deleted Project"
         );
+    }
+
+    /// A state migration racing a Project deletion.
+    ///
+    /// The deletion captures the Project's board files from its routes, then
+    /// holds at the junction. A migration that did not wait for the lifecycle
+    /// gate would move the Task file to the new location and record the new
+    /// route meanwhile, and the deletion would then clean the stale captured
+    /// path and leave an orphan Task file behind. The migration shares the
+    /// deletion's gate, so it waits, then finds the Project gone.
+    #[tokio::test]
+    async fn a_state_migration_waits_for_a_deletion_and_leaves_no_orphan() {
+        use crate::commands::state_location::{
+            apply_state_migration_committed, StateLocationCtx, StateLocationLocks,
+        };
+        use crate::config::paths::ProjectKey;
+
+        let _serial = super::delete_junction_test_support::serial().await;
+        let (storage, _temp) = create_test_storage();
+        let repo_temp = TempDir::new().unwrap();
+        let repo_root = repo_temp.path().to_path_buf();
+        let id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let repository = crate::domain::Repository {
+            id: repository_id,
+            local_path: repo_root.display().to_string(),
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        let mut project = make_test_project(id);
+        project.repository_id = Some(repository_id);
+        let mut config = AppConfig::default();
+        config.repositories.insert(repository_id.to_string(), repository.clone());
+        config.projects.insert(id.to_string(), project.clone());
+        storage.save_config(&config).unwrap();
+
+        let task = board_task(id);
+        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        let tasks = board(vec![task]);
+        let routed_file = storage
+            .tasks_board_files(id)
+            .into_iter()
+            .find(|path| path.exists())
+            .expect("the Task file exists at its routed location before deletion");
+        let key = ProjectKey::for_path(&repo_root).key;
+        let destination_file = storage
+            .paths()
+            .project_state_dir(&key, id, &repo_root, StateLocation::InProject)
+            .join("tasks.toml");
+        assert_ne!(routed_file, destination_file, "the migration must change the route");
+
+        let projects = Arc::new(RwLock::new(HashMap::from([(id, project)])));
+        let repositories = RwLock::new(HashMap::from([(repository_id, repository)]));
+        let (mut arrived, release_tx) = super::delete_junction_test_support::arm(id);
+        let gate = crate::lifecycle::ProjectLifecycleGate::new();
+        let lease_locks = crate::lifecycle::TaskLifecycleLocks::new();
+        let del_task = tokio::spawn({
+            let (projects, tasks, storage, gate) =
+                (projects.clone(), tasks.clone(), storage.clone(), gate.clone());
+            async move {
+                let _gate = gate.write(id).await;
+                let _leases = crate::lifecycle::hold_project_task_leases(&lease_locks, &tasks, id)
+                    .await
+                    .expect("no lifecycle operation owns these tasks in this test");
+                delete_project_committed(&projects, &tasks, &storage, None, None, id).await
+            }
+        });
+        arrived.recv().await.expect("a junction cannot close early");
+
+        let state_locks = StateLocationLocks::new();
+        let migration = async {
+            apply_state_migration_committed(
+                StateLocationCtx {
+                    locks: &state_locks,
+                    gate: &gate,
+                    projects: &projects,
+                    repositories: &repositories,
+                    paths: storage.paths(),
+                    storage: &storage,
+                },
+                id,
+                StateLocation::InProject,
+                None,
+            )
+            .await
+        };
+        // The migration is polled while the deletion sits at the junction;
+        // releasing the deletion once the migration has had its chance makes
+        // the interleaving deterministic either way.
+        let release = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = release_tx.send(());
+        };
+        let (migrated, _) = tokio::join!(migration, release);
+        let deleted = del_task.await.expect("the deletion must not panic");
+
+        assert!(matches!(deleted, Ok(true)), "{deleted:?}");
+        assert!(
+            migrated.is_err(),
+            "a migration of a Project that was deleted meanwhile must be refused: {migrated:?}"
+        );
+        assert!(!routed_file.exists(), "the captured Task file is removed");
+        assert!(
+            !destination_file.exists(),
+            "no orphan Task file may appear at the migration's destination"
+        );
+        assert!(!projects.read().await.contains_key(&id));
+        assert!(!storage.paths().pending_project_tasks_deletion_file(id).exists());
     }
 
     #[cfg(unix)]
