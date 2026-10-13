@@ -2240,11 +2240,8 @@ pub async fn sync_pr_review_replies_inner(
 }
 
 fn pr_url_for_task(task: &Task) -> Result<String, String> {
-    task.pr_url.clone()
-        .or_else(|| task.external_refs.iter().find_map(|r| match r {
-            ExternalRef::GithubPr { url, .. } => Some(url.clone()),
-            _ => None,
-        }))
+    task.authoritative_pr_url()
+        .map(str::to_string)
         .ok_or_else(|| "Task does not have a GitHub PR".to_string())
 }
 
@@ -5178,12 +5175,7 @@ pub async fn refresh_task_pr_state(
     let pr_url = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_uuid).ok_or("Task not found")?;
-        task.pr_url.clone()
-            .or_else(|| task.external_refs.iter().find_map(|r| match r {
-                ExternalRef::GithubPr { url, .. } => Some(url.clone()),
-                _ => None,
-            }))
-            .ok_or("Task has no PR linked")?
+        task.authoritative_pr_url().map(str::to_string).ok_or("Task has no PR linked")?
     };
 
     let status = refresh_pr_url(&state.pr_statuses, &pr_url)
@@ -5218,6 +5210,34 @@ pub async fn refresh_task_pr_state(
         .acquire(task_uuid)
         .await
         .map_err(|e| format!("recording the pull request state failed: {e}"))?;
+
+    // The answer is about the pull request chosen before the lease was held.
+    // If the task has been unlinked from it, or delivered through another
+    // pull request, since, the answer authorizes nothing: no write, no owner
+    // stopped, no terminalization. Unlinking and relinking take this same
+    // lease (`remove_external_ref_serialized`, `link_pr`,
+    // `link_pr_to_task_reserved`), so what is true here stays true until this
+    // function returns. The writers that take no lease only append
+    // (`add_external_ref`, `link_github_issue`) or remove a reference that
+    // is not a pull request, and neither can change an established
+    // `authoritative_pr_url`.
+    let still_linked = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .map(|t| t.authoritative_pr_url() == Some(pr_url.as_str()));
+    match still_linked {
+        None => return Ok(None),
+        Some(false) => {
+            return Err(format!(
+                "The pull request link changed while GitHub was being asked about {pr_url}, so \
+                 nothing was changed. Refresh again."
+            ))
+        }
+        Some(true) => {}
+    }
 
     // Same live hole `link_pr_to_task` had before this unit, and the same
     // fix: this is a second, independent place that can write
@@ -13272,6 +13292,416 @@ mod tests {
                     "the card says why the merge did not finish the task: {:?}",
                     after.error_message
                 );
+            }
+
+            // ──────────────────────────────────────────────
+            // A refresh decided before the lease is held (issue #192 follow-up)
+            // ──────────────────────────────────────────────
+
+            /// A `gh` whose `pr view` announces that it was asked, then holds
+            /// its answer until the test releases it: the controlled GitHub
+            /// response that lets a test change the task while the lookup is
+            /// in flight, in a fixed order and without sleeping on a guess.
+            #[cfg(unix)]
+            struct GatedGh {
+                _tmp: tempfile::TempDir,
+                entered: PathBuf,
+                gate: PathBuf,
+                saved_path: Option<String>,
+            }
+
+            #[cfg(unix)]
+            impl GatedGh {
+                fn install(state_json: &str) -> Self {
+                    let tmp = tempfile::tempdir().expect("tempdir");
+                    let bin_dir = tmp.path().join("bin");
+                    std::fs::create_dir_all(&bin_dir).unwrap();
+                    let entered = tmp.path().join("entered");
+                    let gate = tmp.path().join("gate");
+                    let script = format!(
+                        "#!/bin/sh\ncase \"$*\" in\n  *'pr view'*) : > {entered:?}; while [ ! -e {gate:?} ]; do sleep 0.01; done; printf '%s' {state_json:?} ;;\n  *) printf '{{}}' ;;\nesac\n"
+                    );
+                    // Created by `cp`, never by this process: a descriptor this
+                    // process holds open for writing can be inherited by a child
+                    // another test thread forks, and `execve` of the file then
+                    // fails with ETXTBSY (see `pr_status::tests::process::script`).
+                    let source = tmp.path().join("gh.source");
+                    write_executable(&source, &script);
+                    let copied = std::process::Command::new("/bin/cp")
+                        .arg(&source)
+                        .arg(bin_dir.join("gh"))
+                        .status()
+                        .unwrap();
+                    assert!(copied.success(), "could not create the fake gh: {copied}");
+                    std::fs::remove_file(&source).unwrap();
+                    let saved_path = std::env::var("PATH").ok();
+                    let new_path = match &saved_path {
+                        Some(p) => format!("{}:{}", bin_dir.display(), p),
+                        None => bin_dir.display().to_string(),
+                    };
+                    // Safety: serialized via PATH_LOCK; restored on Drop.
+                    unsafe {
+                        std::env::set_var("PATH", new_path);
+                    }
+                    GatedGh { _tmp: tmp, entered, gate, saved_path }
+                }
+
+                /// Bounded, so a refresh that never reaches `gh` fails the
+                /// test instead of hanging it.
+                async fn asked(&self) {
+                    let waiting = async {
+                        while !self.entered.exists() {
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                    };
+                    tokio::time::timeout(std::time::Duration::from_secs(30), waiting)
+                        .await
+                        .expect("the refresh never asked GitHub");
+                }
+
+                fn answer(&self) {
+                    std::fs::write(&self.gate, b"").unwrap();
+                }
+            }
+
+            #[cfg(unix)]
+            impl Drop for GatedGh {
+                fn drop(&mut self) {
+                    unsafe {
+                        match &self.saved_path {
+                            Some(p) => std::env::set_var("PATH", p),
+                            None => std::env::remove_var("PATH"),
+                        }
+                    }
+                }
+            }
+
+            const PR_A: &str = "https://github.com/owner/repo/pull/7";
+            const PR_B: &str = "https://github.com/owner/repo/pull/8";
+            const PR_OTHER: &str = "https://github.com/other/repo/pull/7";
+
+            fn pr_link(url: &str, state: &str) -> crate::domain::task::ExternalRef {
+                parse_pr_url_to_ref_with_state(url, state)
+            }
+
+            fn parse_pr_url_to_ref_with_state(url: &str, state: &str) -> crate::domain::task::ExternalRef {
+                match parse_pr_url_to_ref(url).expect("a pull request URL") {
+                    crate::domain::task::ExternalRef::GithubPr { url, number, repo, .. } => {
+                        crate::domain::task::ExternalRef::GithubPr { url, number, repo, state: Some(state.to_string()) }
+                    }
+                    other => other,
+                }
+            }
+
+            /// What changes the task while the lookup is out.
+            enum WhileAsking {
+                Nothing,
+                /// The user removes the first reference.
+                Unlink,
+                /// The delivery is relinked to another pull request.
+                Relink(&'static str),
+                /// The task's file stops accepting writes.
+                BlockStorage,
+            }
+
+            struct Refreshed {
+                result: Result<Option<Task>, String>,
+                /// The task once the change made while asking had landed, and
+                /// before GitHub answered.
+                during: Task,
+                after: Task,
+                _tmp: tempfile::TempDir,
+            }
+
+            /// Seed a task in `status` shaped by `fixture`, start a manual
+            /// refresh, apply `change` once GitHub has been asked and before
+            /// it answers `answer`, then let it answer.
+            #[cfg(unix)]
+            async fn refresh_while(
+                answer: &str,
+                status: TaskStatus,
+                fixture: impl FnOnce(&mut Task),
+                change: WhileAsking,
+            ) -> Refreshed {
+                use tauri::Manager;
+                let gh = GatedGh::install(&format!(r#"{{"state":"{answer}"}}"#));
+                let (state, tmp) = build_test_state().await;
+                let task_id = seed_task(&state, "/tmp", Some("task-branch"), status).await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    fixture(tasks.get_mut(&task_id).unwrap());
+                }
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let refresh = refresh_task_pr_state(app.state(), task_id.to_string());
+                let driver = async {
+                    gh.asked().await;
+                    let st = app.state::<crate::AppState>();
+                    match change {
+                        WhileAsking::Nothing => {}
+                        WhileAsking::Unlink => {
+                            crate::commands::task::remove_external_ref_serialized(
+                                &st.task.tasks,
+                                &st.storage,
+                                &st.task_lifecycle_locks,
+                                task_id,
+                                0,
+                            )
+                            .await
+                            .expect("unlinking succeeds");
+                        }
+                        WhileAsking::Relink(url) => {
+                            crate::commands::task::link_pr(app.state(), task_id.to_string(), url.to_string())
+                                .await
+                                .expect("relinking succeeds");
+                        }
+                        WhileAsking::BlockStorage => {
+                            std::fs::create_dir_all(st.storage.paths().config_dir()).unwrap();
+                            block_task_persistence(&st.storage);
+                        }
+                    }
+                    let during = st.task.tasks.read().await[&task_id].clone();
+                    gh.answer();
+                    during
+                };
+                let (result, during) = tokio::join!(refresh, driver);
+                let after = app.state::<crate::AppState>().task.tasks.read().await[&task_id].clone();
+                Refreshed { result, during, after, _tmp: tmp }
+            }
+
+            fn pr_events(task: &Task) -> usize {
+                task.activity
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e.kind,
+                            crate::domain::task::ActivityKind::PrMerged { .. }
+                                | crate::domain::task::ActivityKind::PrClosed { .. }
+                        )
+                    })
+                    .count()
+            }
+
+            fn delivered_through(task: &mut Task, url: &str) {
+                task.pr_url = Some(url.to_string());
+                task.external_refs.push(pr_link(url, "OPEN"));
+            }
+
+            /// Unlink wins: whatever GitHub says afterwards, a task that no
+            /// longer links the pull request is not completed, moved,
+            /// stopped, written or given activity for it.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_refresh_for_an_unlinked_pull_request_changes_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                for answer in ["MERGED", "CLOSED", "OPEN"] {
+                    let r = refresh_while(answer, TaskStatus::HumanReview, |t| delivered_through(t, PR_A), WhileAsking::Unlink).await;
+                    let message = r.result.expect_err(&format!("{answer}: a stale answer is refused"));
+                    assert!(message.contains("link changed"), "{answer}: {message}");
+                    assert_eq!(r.during.pr_url, None, "{answer}: unlinking cleared the delivery that named it");
+                    assert!(r.during.external_refs.is_empty());
+                    assert_eq!(r.after.status, TaskStatus::HumanReview, "{answer}");
+                    assert_eq!(r.after.updated_at, r.during.updated_at, "{answer}: nothing was written");
+                    assert_eq!(r.after.error_message, None, "{answer}");
+                    assert_eq!(r.after.worktree_path, r.during.worktree_path, "{answer}: checkout untouched");
+                    assert!(!r.after.cleanup_in_flight, "{answer}");
+                    assert_eq!(pr_events(&r.after), 0, "{answer}: no false PR activity");
+                }
+            }
+
+            /// The delivery is relinked from A to B while A is being asked
+            /// about: A's answer applies to neither the task's state nor B.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_refresh_for_a_replaced_pull_request_changes_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let r = refresh_while("MERGED", TaskStatus::PrCreated, |t| delivered_through(t, PR_A), WhileAsking::Relink(PR_B)).await;
+                assert!(r.result.is_err(), "the stale answer is refused");
+                assert_eq!(r.during.pr_url.as_deref(), Some(PR_B));
+                assert_eq!(r.after.status, TaskStatus::PrCreated);
+                assert_eq!(r.after.updated_at, r.during.updated_at, "nothing was written");
+                assert_eq!(pr_events(&r.after), 0);
+                for ref_ in &r.after.external_refs {
+                    assert!(
+                        matches!(ref_, crate::domain::task::ExternalRef::GithubPr { state, .. } if state.as_deref() == Some("OPEN")),
+                        "neither A nor B was marked: {ref_:?}"
+                    );
+                }
+            }
+
+            /// Same pull request number in two repositories: unlinking the
+            /// first leaves `other/repo#7`, which is not the pull request that
+            /// was asked about and authorizes nothing.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn another_repositorys_pull_request_does_not_authorize_a_refresh() {
+                let _guard = PATH_LOCK.lock().await;
+                let r = refresh_while(
+                    "MERGED",
+                    TaskStatus::PrCreated,
+                    |t| {
+                        delivered_through(t, PR_A);
+                        t.external_refs.push(pr_link(PR_OTHER, "OPEN"));
+                    },
+                    WhileAsking::Unlink,
+                )
+                .await;
+                assert!(r.result.is_err());
+                assert_eq!(r.after.status, TaskStatus::PrCreated);
+                assert_eq!(r.after.updated_at, r.during.updated_at);
+                assert_eq!(pr_events(&r.after), 0);
+                assert_eq!(r.after.external_refs.len(), 1);
+            }
+
+            /// A pending local integration stays recoverable when the unlink
+            /// wins, with its approval and record exactly as they were.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_stale_refresh_leaves_a_pending_integration_recoverable() {
+                let _guard = PATH_LOCK.lock().await;
+                let pin = crate::domain::LocalIntegration {
+                    state: crate::domain::IntegrationState::Pending,
+                    target_branch: "target".to_string(),
+                    target_old_oid: "0".repeat(40),
+                    approved_tip: "1".repeat(40),
+                    result_oid: "2".repeat(40),
+                    strategy: crate::domain::IntegrationStrategy::FastForward,
+                    checkout_path: None,
+                    started_at: chrono::Utc::now(),
+                    completed_at: None,
+                    completes_task: false,
+                };
+                let r = refresh_while(
+                    "MERGED",
+                    TaskStatus::HumanReview,
+                    |t| {
+                        delivered_through(t, PR_A);
+                        t.human_review.approve(Some(pin.approved_tip.clone()), chrono::Utc::now());
+                        t.local_integration = Some(pin.clone());
+                    },
+                    WhileAsking::Unlink,
+                )
+                .await;
+                assert!(r.result.is_err());
+                assert_eq!(r.after.status, TaskStatus::HumanReview);
+                assert_eq!(r.after.local_integration, r.during.local_integration);
+                assert_eq!(r.after.human_review, r.during.human_review);
+                assert_eq!(r.after.error_message, None);
+                assert!(r.after.integration_unfinished_refusal().is_some(), "Resume and Discard still apply");
+                assert_eq!(r.after.updated_at, r.during.updated_at);
+            }
+
+            /// Link still present: the refresh records what GitHub says, for a
+            /// task with a reference and for a legacy task that only has
+            /// `pr_url`.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_refresh_for_the_linked_pull_request_still_records_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let linked = refresh_while("CLOSED", TaskStatus::HumanReview, |t| delivered_through(t, PR_A), WhileAsking::Nothing).await;
+                let after = linked.result.expect("refresh succeeds").expect("task");
+                assert_eq!(after.status, TaskStatus::PrCreated);
+                assert!(after.external_refs.iter().any(
+                    |r| matches!(r, crate::domain::task::ExternalRef::GithubPr { state, .. } if state.as_deref() == Some("CLOSED"))
+                ));
+                assert_eq!(pr_events(&after), 1);
+
+                let legacy = refresh_while(
+                    "CLOSED",
+                    TaskStatus::HumanReview,
+                    |t| t.pr_url = Some(PR_A.to_string()),
+                    WhileAsking::Nothing,
+                )
+                .await;
+                let after = legacy.result.expect("a pr_url-only task is still linked").expect("task");
+                assert_eq!(after.status, TaskStatus::PrCreated);
+                assert_eq!(after.pr_url.as_deref(), Some(PR_A));
+            }
+
+            /// A write that fails during a valid refresh is reported and
+            /// leaves the board as it was: no in-memory-only change.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_failed_write_during_a_refresh_is_reported_and_changes_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let r = refresh_while("CLOSED", TaskStatus::HumanReview, |t| delivered_through(t, PR_A), WhileAsking::BlockStorage).await;
+                assert!(r.result.is_err(), "the failed write is reported");
+                assert_eq!(r.after.status, TaskStatus::HumanReview, "no in-memory-only change");
+                assert!(r.after.external_refs.iter().all(
+                    |r| matches!(r, crate::domain::task::ExternalRef::GithubPr { state, .. } if state.as_deref() == Some("OPEN"))
+                ));
+            }
+
+            /// Unlinking removes the `pr_url` that names the pull request, and
+            /// only that one, durably; a legacy task keeps its `pr_url`.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn unlinking_clears_only_the_delivery_that_names_the_pull_request() {
+                let (state, _tmp) = build_test_state().await;
+                let id = seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::PrCreated).await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let t = tasks.get_mut(&id).unwrap();
+                    delivered_through(t, PR_B);
+                    t.external_refs.insert(0, pr_link(PR_A, "OPEN"));
+                }
+                let remove = |index| {
+                    crate::commands::task::remove_external_ref_serialized(
+                        &state.task.tasks,
+                        &state.storage,
+                        &state.task_lifecycle_locks,
+                        id,
+                        index,
+                    )
+                };
+                let kept = remove(0).await.unwrap().unwrap();
+                assert_eq!(kept.pr_url.as_deref(), Some(PR_B), "A was not the delivery");
+                let cleared = remove(0).await.unwrap().unwrap();
+                assert_eq!(cleared.pr_url, None, "B was, and is cleared with it");
+                assert!(cleared.external_refs.is_empty());
+                let on_disk = state
+                    .storage
+                    .load_project_tasks(cleared.project_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .unwrap();
+                assert_eq!(on_disk.pr_url, None);
+
+                let legacy = seed_task(&state, "/tmp", Some("task-legacy"), TaskStatus::PrCreated).await;
+                state.task.tasks.write().await.get_mut(&legacy).unwrap().pr_url = Some(PR_A.to_string());
+                let task = crate::commands::task::remove_external_ref_serialized(
+                    &state.task.tasks,
+                    &state.storage,
+                    &state.task_lifecycle_locks,
+                    legacy,
+                    0,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(task.pr_url.as_deref(), Some(PR_A), "nothing to unlink on a pr_url-only task");
+            }
+
+            /// Replacing the delivery waits for the lifecycle lease, as
+            /// unlinking does.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn relinking_waits_for_the_lifecycle_lease() {
+                use futures::FutureExt;
+                use tauri::Manager;
+                let (state, _tmp) = build_test_state().await;
+                let id = seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::PrCreated).await;
+                let lease = state.task_lifecycle_locks.acquire(id).await.unwrap();
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let mut relink = Box::pin(crate::commands::task::link_pr(app.state(), id.to_string(), PR_B.to_string()));
+                assert!(relink.as_mut().now_or_never().is_none(), "blocked by the lease holder");
+                assert_eq!(app.state::<crate::AppState>().task.tasks.read().await[&id].pr_url, None);
+                drop(lease);
+                let task = relink.await.unwrap().unwrap();
+                assert_eq!(task.pr_url.as_deref(), Some(PR_B));
             }
 
             // ──────────────────────────────────────────────

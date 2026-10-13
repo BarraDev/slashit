@@ -410,6 +410,10 @@ pub async fn link_pr(
     pr_url: String,
 ) -> Result<Option<Task>, String> {
     let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    // Replacing `pr_url` changes which pull request the task is delivered
+    // through, which a refresh decided before it held this lease (see
+    // `refresh_task_pr_state`), so it is written under the same lease.
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
     let amend = move |staged: &mut HashMap<Uuid, Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
             task.pr_url = Some(pr_url.clone());
@@ -753,6 +757,11 @@ pub async fn remove_external_ref(
 /// Any other reference (an issue, a ticket) has no lifecycle consequence and
 /// does not wait behind a transition that may be running `git`.
 ///
+/// Removing a pull request reference also clears the `pr_url` that names it,
+/// in the same write, so a delivery link left behind cannot keep authorizing
+/// a refresh of a pull request the task no longer links (see
+/// `Task::authoritative_pr_url`).
+///
 /// The index is only meaningful against the list it was chosen from, so the
 /// kind of reference at `ref_index` is read before the lease is awaited
 /// (never holding the task map across the wait) and checked again under the
@@ -789,7 +798,18 @@ pub(crate) async fn remove_external_ref_serialized(
                         false
                     }
                     Some(_) => {
-                        task.external_refs.remove(ref_index);
+                        let removed = task.external_refs.remove(ref_index);
+                        // Unlinking the pull request unlinks the delivery
+                        // that names it, in the same write: a `pr_url` left
+                        // behind would keep naming a pull request the task
+                        // no longer links, and a refresh would go on acting
+                        // on it. A different `pr_url` is another link and
+                        // stays.
+                        if let ExternalRef::GithubPr { url, .. } = &removed {
+                            if task.pr_url.as_deref() == Some(url.as_str()) {
+                                task.pr_url = None;
+                            }
+                        }
                         true
                     }
                     None => false,
