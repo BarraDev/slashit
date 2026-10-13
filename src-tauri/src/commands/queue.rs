@@ -137,7 +137,19 @@ async fn enqueue_durably(
         .read()
         .await
         .get(&task_id)
-        .map(|t| t.status.clone());
+        .map(|t| (t.status.clone(), t.integration_unfinished_refusal()));
+    let (old_status, unfinished_integration) = match old_status {
+        Some((status, refusal)) => (Some(status), refusal),
+        None => (None, None),
+    };
+
+    // Queueing withdraws the approval a pending local integration is
+    // resumed from; refused before an owner is ended or anything is written.
+    if old_status != Some(TaskStatus::Queue) {
+        if let Some(refusal) = unfinished_integration {
+            return Err(refusal);
+        }
+    }
 
     if !matches!(&old_status, None | Some(TaskStatus::Queue)) {
         let running = state

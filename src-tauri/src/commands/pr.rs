@@ -3246,6 +3246,14 @@ async fn reserve_task_for_pr_side_effect(
 ) -> Result<Option<crate::queue::PrHelperLease>, String> {
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
     refuse_while_republish_pending(state, task_id).await?;
+    // A pull request moves the task to PR Created, out of the column its
+    // unfinished local integration is resumed from. Refused before any
+    // push or pull request exists.
+    if let Some(refusal) =
+        state.task.tasks.read().await.get(&task_id).and_then(Task::integration_unfinished_refusal)
+    {
+        return Err(refusal);
+    }
     match state.executor.get() {
         Some(executor) => executor.begin_pr_side_effect_under_lease(task_id).await.map(Some),
         None => Ok(None),

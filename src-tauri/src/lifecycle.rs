@@ -274,6 +274,10 @@ pub enum TerminalizeRefusal {
     /// or discarding that restack depends on, and nothing here can tell
     /// whether the restack succeeded.
     RepublishPending,
+    /// An integration of the task's approved work into a local branch was
+    /// started and not finished. It may already have moved its target, and
+    /// only the person's Resume or Discard decides how it ends.
+    IntegrationUnfinished,
 }
 
 impl std::fmt::Display for TerminalizeRefusal {
@@ -300,6 +304,7 @@ impl std::fmt::Display for TerminalizeRefusal {
             ),
             Self::NotRecorded(m) => write!(f, "{m}"),
             Self::RepublishPending => f.write_str(REPUBLISH_PENDING_REASON),
+            Self::IntegrationUnfinished => f.write_str(crate::domain::task::INTEGRATION_UNFINISHED_REFUSAL),
         }
     }
 }
@@ -576,6 +581,12 @@ pub async fn enqueue_leased(
                 ),
                 false,
             ),
+            Some(task) if task.integration_unfinished_refusal().is_some() => (
+                EnqueueVerdict::Blocked(
+                    "An integration of this Task into a local branch is unfinished, so it cannot run yet".into(),
+                ),
+                false,
+            ),
             Some(task) => {
                 let from = task.status.clone();
                 task.status = TaskStatus::Queue;
@@ -823,6 +834,13 @@ pub async fn terminalize_leased(
         // and its backup are exactly as found.
         if task.republish_pending_refusal().is_some() {
             return Err(TerminalizeRefusal::RepublishPending);
+        }
+        // Likewise for an unfinished local integration: finishing the task
+        // here would remove the checkout and withdraw the state its Resume
+        // re-proves. An integration that completes the task does so only
+        // after recording itself as integrated, so it is never asked this.
+        if task.integration_unfinished_refusal().is_some() {
+            return Err(TerminalizeRefusal::IntegrationUnfinished);
         }
         (
             task.project_id,

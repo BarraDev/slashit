@@ -173,12 +173,21 @@ pub async fn update_task_status(
 
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
-    let Some(old_status) = ({
+    let Some((old_status, unfinished_integration)) = ({
         let tasks = state.task.tasks.read().await;
-        tasks.get(&task_id).map(|t| t.status.clone())
+        tasks.get(&task_id).map(|t| (t.status.clone(), t.integration_unfinished_refusal()))
     }) else {
         return Ok(None);
     };
+
+    // A pending local integration is recovered from the column it was made
+    // in, so no move out of it is made until a person resumes or discards it.
+    // Refused before an owner is ended or anything is written.
+    if old_status != status {
+        if let Some(refusal) = unfinished_integration {
+            return Err(refusal);
+        }
+    }
 
     // A move into In Progress asks for a new execution; while new work is
     // paused for disk space it is refused here, before a current owner is
@@ -602,9 +611,9 @@ pub async fn reorder_task(
 
     let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
 
-    let Some((project_id, old_status)) = ({
+    let Some((project_id, old_status, unfinished_integration)) = ({
         let tasks = state.task.tasks.read().await;
-        tasks.get(&task_id).map(|t| (t.project_id, t.status.clone()))
+        tasks.get(&task_id).map(|t| (t.project_id, t.status.clone(), t.integration_unfinished_refusal()))
     }) else {
         return Ok(None);
     };
@@ -618,6 +627,15 @@ pub async fn reorder_task(
     }
 
     let target_status = new_status.unwrap_or_else(|| old_status.clone());
+
+    // Same as `update_task_status`: a card leaves its column only once a
+    // pending local integration is resolved. Moving it inside its own column
+    // changes no status and stays allowed.
+    if old_status != target_status {
+        if let Some(refusal) = unfinished_integration {
+            return Err(refusal);
+        }
+    }
 
     // Same as `update_task_status`: refused before anything is ended or
     // written while new work is paused for disk space.
