@@ -326,24 +326,10 @@ async fn delete_project_committed(
         .iter()
         .chain(tasks_w.values().filter(|t| t.project_id == id))
     {
-        if let Some(running) = running {
-            if running.is_task_running(task.id).await {
-                return Err(format!(
-                    "an agent is running for task {:?} ({}); stop it before deleting the \
-                     Project, because its working directory is one of this Project's \
-                     checkouts",
-                    task.title, task.id
-                ));
-            }
-        }
-        if let Some(deliveries) = deliveries {
-            if deliveries.contains(task.id) {
-                return Err(format!(
-                    "a pull request is being opened for task {:?} ({}); wait for it to finish \
-                     before deleting the Project",
-                    task.title, task.id
-                ));
-            }
+        if let Some(message) =
+            live_work_refusal(task, running, deliveries).await
+        {
+            return Err(message);
         }
         if let Some(message) = project_task_refusal(task) {
             return Err(message);
@@ -357,7 +343,7 @@ async fn delete_project_committed(
     // is exactly the await window the production code already has at the lock
     // acquisitions in between.
     #[cfg(test)]
-    delete_junction().await;
+    delete_junction(id).await;
 
     // One more look at the facts no belt-and-braces free: a delivery marker
     // is a process-internal flag an `approve` can raise without holding this
@@ -369,24 +355,10 @@ async fn delete_project_committed(
             .iter()
             .chain(tasks_w.values().filter(|t| t.project_id == id))
         {
-            if let Some(running) = running {
-                if running.is_task_running(task.id).await {
-                    return Some(format!(
-                        "an agent is running for task {:?} ({}); stop it before deleting the \
-                         Project, because its working directory is one of this Project's \
-                         checkouts",
-                        task.title, task.id
-                    ));
-                }
-            }
-            if let Some(deliveries) = deliveries {
-                if deliveries.contains(task.id) {
-                    return Some(format!(
-                        "a pull request is being opened for task {:?} ({}); wait for it to \
-                         finish before deleting the Project",
-                        task.title, task.id
-                    ));
-                }
+            if let Some(message) =
+                live_work_refusal(task, running, deliveries).await
+            {
+                return Some(message);
             }
         }
         None
@@ -566,8 +538,13 @@ mod delete_junction_test_support {
     //! itself when taken, so a leftover arming cannot stale the next test.
 
     use tokio::sync::mpsc;
+    use uuid::Uuid;
 
+    // The junction holds the Project id it was armed for, so a deletion of any
+    // other Project (a parallel non-junction test) passes straight through a
+    // foreign arming instead of eating it.
     struct ArmedJunction {
+        project_id: Uuid,
         arrived: mpsc::UnboundedSender<()>,
         release: std::sync::Mutex<mpsc::UnboundedReceiver<()>>,
     }
@@ -589,25 +566,32 @@ mod delete_junction_test_support {
     /// Arm the junction. The two channels are used in the deletion's own task:
     /// `arrived` from the arm point, and the `deletion proceeds` release from
     /// the test's task.
-    pub fn arm() -> (
+    pub fn arm(
+        project_id: Uuid,
+    ) -> (
         mpsc::UnboundedReceiver<()>,
         mpsc::UnboundedSender<()>,
     ) {
         let (arrived_tx, arrived_rx) = mpsc::unbounded_channel();
         let (release_tx, release_rx) = mpsc::unbounded_channel();
         *JUNCTION.lock().unwrap() = Some(ArmedJunction {
+            project_id,
             arrived: arrived_tx,
             release: std::sync::Mutex::new(release_rx),
         });
         (arrived_rx, release_tx)
     }
 
-    /// The site inside the deletion, a no-op when no junction is armed. Taking
+    /// The site inside the deletion, a no-op when no junction is armed *for
+    /// this Project* — a deletion of any other Project passes through, so a
+    /// concurrent non-junction test can never eat an armed junction. Taking
     /// it un-arms, so a second armed test will not wait here forever.
-    pub async fn wait() {
+    pub async fn wait(project_id: Uuid) {
         const JUNCTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
-        let junction = JUNCTION.lock().unwrap().take();
-        let ArmedJunction { arrived, release } = match junction {
+        let junction = JUNCTION.lock().unwrap().take_if(|junction| {
+            junction.project_id == project_id
+        });
+        let ArmedJunction { arrived, release, .. } = match junction {
             Some(junction) => junction,
             None => return,
         };
@@ -627,8 +611,38 @@ mod delete_junction_test_support {
 }
 
 #[cfg(test)]
-async fn delete_junction() {
-    delete_junction_test_support::wait().await;
+async fn delete_junction(project_id: Uuid) {
+    delete_junction_test_support::wait(project_id).await;
+}
+
+/// The live ownership a deletion refuses to outrun: an agent running for the
+/// Task, or a pull request being opened for it. Shared by the durable refusal
+/// pass and the commit-window re-check, so the two can never disagree.
+async fn live_work_refusal(
+    task: &Task,
+    running: Option<&dyn crate::lifecycle::ExecutionOwnership>,
+    deliveries: Option<&crate::commands::human_review::DeliveriesInFlight>,
+) -> Option<String> {
+    if let Some(running) = running {
+        if running.is_task_running(task.id).await {
+            return Some(format!(
+                "an agent is running for task {:?} ({}); stop it before deleting the \
+                 Project, because its working directory is one of this Project's \
+                 checkouts",
+                task.title, task.id
+            ));
+        }
+    }
+    if let Some(deliveries) = deliveries {
+        if deliveries.contains(task.id) {
+            return Some(format!(
+                "a pull request is being opened for task {:?} ({}); wait for it to finish \
+                 before deleting the Project",
+                task.title, task.id
+            ));
+        }
+    }
+    None
 }
 
 /// The refusal a Project deletion answers with when one Task's durable work
@@ -1718,7 +1732,7 @@ mod tests {
         let tasks = board(Vec::new());
         let projects = Arc::new(RwLock::new(HashMap::from([(id, make_test_project(id))])));
 
-        let (mut arrived, release_tx) = super::delete_junction_test_support::arm();
+        let (mut arrived, release_tx) = super::delete_junction_test_support::arm(id);
 
         // The deletion as `delete_project` drives it: the gate in write (the
         // Conversation lock would come first in the command, but that lock
@@ -1948,7 +1962,7 @@ mod tests {
         let deliveries = crate::commands::human_review::DeliveriesInFlight::default();
 
         let _serial = super::delete_junction_test_support::serial().await;
-        let (mut arrived, release_tx) = super::delete_junction_test_support::arm();
+        let (mut arrived, release_tx) = super::delete_junction_test_support::arm(id);
         let gate = crate::lifecycle::ProjectLifecycleGate::new();
         let locks = crate::lifecycle::TaskLifecycleLocks::new();
         let deletion = {
@@ -2061,7 +2075,7 @@ mod tests {
         let projects = Arc::new(RwLock::new(HashMap::from([(id, make_test_project(id))])));
 
         let _serial = super::delete_junction_test_support::serial().await;
-        let (mut arrived, release_tx) = super::delete_junction_test_support::arm();
+        let (mut arrived, release_tx) = super::delete_junction_test_support::arm(id);
         let gate = crate::lifecycle::ProjectLifecycleGate::new();
         let locks = crate::lifecycle::TaskLifecycleLocks::new();
         let deletion = {
@@ -2151,7 +2165,7 @@ mod tests {
             .expect("the orphan file exists");
 
         let _serial = super::delete_junction_test_support::serial().await;
-        let (mut arrived, release_tx) = super::delete_junction_test_support::arm();
+        let (mut arrived, release_tx) = super::delete_junction_test_support::arm(id);
         let gate = crate::lifecycle::ProjectLifecycleGate::new();
         let locks = crate::lifecycle::TaskLifecycleLocks::new();
         let projects = Arc::new(RwLock::new(HashMap::new()));
@@ -2242,7 +2256,7 @@ mod tests {
             .unwrap();
 
         let _serial = super::delete_junction_test_support::serial().await;
-        let (mut arrived, release_tx) = super::delete_junction_test_support::arm();
+        let (mut arrived, release_tx) = super::delete_junction_test_support::arm(id);
         let gate = crate::lifecycle::ProjectLifecycleGate::new();
         let locks = crate::lifecycle::TaskLifecycleLocks::new();
         let projects = Arc::new(RwLock::new(HashMap::new()));

@@ -627,34 +627,6 @@ mod tests {
                     },
                 );
             }
-            // Some tests seed a Task belonging to another Project on
-            // purpose. A Task exists only for a Project that exists, so give
-            // any unregistered id the Project it needs; the tests still
-            // answer for the project's own Scope.
-            if !self.projects.read().await.contains_key(&project_id) {
-                self.projects.write().await.insert(
-                    project_id,
-                    Project {
-                        id: project_id,
-                        name: "foreign".into(),
-                        repository_id: None,
-                        scope: ProjectScope::Standalone,
-                        state_location: StateLocation::External,
-                        base: None,
-                        agent_type: AgentType::ClaudeCode,
-                        agent_config: AgentConfig {
-                            agent_type: AgentType::ClaudeCode,
-                            command: "claude".into(),
-                            args: Vec::new(),
-                            env: HashMap::new(),
-                            model: None,
-                            api_key: None,
-                        },
-                        created_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
-                    },
-                );
-            }
             lifecycle::create(&self.gate, &self.tasks, &self.projects, &self.storage, project_id, |existing| {
                 Task::new_backlog(
                     existing,
