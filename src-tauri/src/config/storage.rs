@@ -988,18 +988,24 @@ impl Storage {
     /// but was bad when memory was built.
     fn ensure_board_replaceable(&self, path: &Path, legacy: &Path) -> Result<()> {
         let (source, state) = Self::board_at(path.to_path_buf(), legacy);
-        match state {
-            TasksFileState::Unreadable(e) => Err(e.into()),
-            TasksFileState::Board(_) if self.was_unloaded(&source) => {
-                Err(UnreadableTasksFile {
-                    path: source,
-                    reason: "it could not be read when SlashIt started, so the board in \
-                             memory does not include it"
-                        .to_string(),
-                }
-                .into())
+        if let TasksFileState::Unreadable(e) = state {
+            return Err(e.into());
+        }
+        // Either location may be the one startup skipped: a route that changed
+        // since then can leave a readable routed file beside a legacy board
+        // memory never saw.
+        let skipped = [source.as_path(), path, legacy]
+            .into_iter()
+            .find(|candidate| self.was_unloaded(candidate));
+        match skipped {
+            Some(skipped) => Err(UnreadableTasksFile {
+                path: skipped.to_path_buf(),
+                reason: "it could not be read when SlashIt started, so the board in memory \
+                         does not include it"
+                    .to_string(),
             }
-            TasksFileState::Absent | TasksFileState::Board(_) => Ok(()),
+            .into()),
+            None => Ok(()),
         }
     }
 
@@ -1566,6 +1572,32 @@ mod tests {
         fs::write(&path, b"tasks = [ not toml").unwrap();
         storage.delete_project_tasks(project_id).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_legacy_board_skipped_at_startup_still_guards_after_the_project_is_routed() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let project_id = Uuid::new_v4();
+
+        // Unrouted at startup: the legacy file is the board, and it is bad.
+        let legacy = storage.legacy_tasks_path(project_id);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"tasks = [ not toml").unwrap();
+        assert!(storage.load_all_tasks().unwrap().is_empty());
+
+        // The project is routed later and a readable routed board appears.
+        route_project_to(&storage, project_id, &repo);
+        let routed = storage.tasks_path(project_id);
+        assert_ne!(routed, legacy);
+        fs::create_dir_all(routed.parent().unwrap()).unwrap();
+        let routed_text = valid_board_text(project_id);
+        fs::write(&routed, &routed_text).unwrap();
+
+        assert!(storage.save_project_tasks(project_id, &[]).is_err());
+        assert_eq!(fs::read_to_string(&routed).unwrap(), routed_text);
+        assert_eq!(fs::read(&legacy).unwrap(), b"tasks = [ not toml");
     }
 
     // ==================== AppConfig Serde Default Tests ====================
