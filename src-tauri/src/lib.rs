@@ -393,6 +393,8 @@ pub fn run() {
             check_recurring_issues,
             approve_task,
             complete_task_locally,
+            approve_task_again,
+            get_approval_status,
             get_integration_preview,
             integrate_task_locally,
             complete_and_integrate_task,

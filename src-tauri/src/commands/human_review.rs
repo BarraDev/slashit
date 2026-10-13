@@ -149,6 +149,169 @@ pub async fn request_task_changes(
     request_changes(&state, task_id, &feedback).await
 }
 
+/// Whether a task's approval still covers its branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalCoverage {
+    /// The task is not approved, or has no branch to bind it to.
+    NotApplicable,
+    /// The branch is at the approved commit.
+    Current,
+    /// The branch moved on from the approved commit (it is still on the
+    /// branch) or replaced it (`rewritten`).
+    Moved,
+    /// The approval did not record the commit.
+    Unrecorded,
+    /// The branch cannot be found.
+    BranchMissing,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ApprovalStatus {
+    pub coverage: ApprovalCoverage,
+    pub approved_tip: Option<String>,
+    /// The branch's tip now: the commit approving again would cover.
+    pub branch_tip: Option<String>,
+    /// For `Moved`: the approved commit is no longer on the branch.
+    pub rewritten: bool,
+    /// What a person can act on, when the approval does not cover the branch.
+    pub reason: Option<String>,
+}
+
+/// Whether the approval of a task still covers the branch as it is. Reads
+/// only.
+#[tauri::command]
+pub async fn get_approval_status(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<ApprovalStatus, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    approval_status(&state, task_id).await
+}
+
+pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> Result<ApprovalStatus, String> {
+    let task = current(state, task_id).await.ok_or("Task not found")?;
+    let approved_tip = task.human_review.approved_tip().map(str::to_string);
+    let none = |coverage| ApprovalStatus {
+        coverage,
+        approved_tip: approved_tip.clone(),
+        branch_tip: None,
+        rewritten: false,
+        reason: None,
+    };
+    if task.branch_name.is_none() || !task.human_review.is_approved() {
+        return Ok(none(ApprovalCoverage::NotApplicable));
+    }
+    let branch_tip = crate::commands::pr::task_branch_tip(state, task_id).await?;
+    let refusal = match task.human_review.binds(true, branch_tip.as_deref()) {
+        Ok(()) => return Ok(ApprovalStatus { branch_tip, ..none(ApprovalCoverage::Current) }),
+        Err(refusal) => refusal,
+    };
+    let coverage = match refusal {
+        crate::domain::task::ApprovalBindingRefusal::Unrecorded => ApprovalCoverage::Unrecorded,
+        crate::domain::task::ApprovalBindingRefusal::Moved { .. } => ApprovalCoverage::Moved,
+        crate::domain::task::ApprovalBindingRefusal::BranchMissing { .. } => ApprovalCoverage::BranchMissing,
+    };
+    let mut rewritten = false;
+    if let (ApprovalCoverage::Moved, Some(approved), Some(tip), Ok(repo)) = (
+        coverage,
+        approved_tip.as_deref(),
+        branch_tip.as_deref(),
+        crate::commands::integration::repo_path_of(state, task.project_id).await,
+    ) {
+        rewritten = !crate::worktree::restack::is_ancestor(std::path::Path::new(&repo), approved, tip)
+            .await
+            .unwrap_or(false);
+    }
+    Ok(ApprovalStatus { branch_tip, rewritten, reason: Some(refusal.to_string()), ..none(coverage) })
+}
+
+/// Approve the Task branch as it is now, after it moved past the commit that
+/// was approved. `tip` is the commit the person was shown.
+///
+/// The earlier approval stays in the history; this adds a new one for `tip`,
+/// which is the current decision because it is the last. Nothing is delivered
+/// or completed by it.
+#[tauri::command]
+pub async fn approve_task_again(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+    tip: String,
+) -> Result<Task, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    approve_again(&state, task_id, &tip).await
+}
+
+pub(crate) async fn approve_again(
+    state: &crate::AppState,
+    task_id: Uuid,
+    tip: &str,
+) -> Result<Task, String> {
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+
+    let task = current(state, task_id).await.ok_or("Task not found")?;
+    check_reviewable(&task, "approved again")?;
+    if !task.human_review.is_approved() {
+        return Err("Approve the changes first; this task has no approval to renew.".to_string());
+    }
+    if task.pr_url.is_some()
+        || task.external_refs.iter().any(|r| r.is_pr())
+        || state.task.deliveries.contains(task.id)
+    {
+        return Err("This task has a pull request, or one is being opened, so its approval is not renewed.".to_string());
+    }
+    if task.integrating_current_approval() {
+        return Err(
+            "An integration of this task into a local branch was started, and it uses the commit \
+             that was approved. Resume or discard it first."
+                .to_string(),
+        );
+    }
+    if let Some(executor) = state.executor.get() {
+        if crate::lifecycle::ExecutionOwnership::is_task_running(executor.as_ref(), task_id).await {
+            return Err("An agent is still running for this task. Stop the run first.".to_string());
+        }
+    }
+    let now_tip = crate::commands::pr::task_branch_tip(state, task_id).await?;
+    match task.human_review.binds(true, now_tip.as_deref()) {
+        Ok(()) => return Ok(task),
+        // An approval that never recorded its commit is renewed the same way:
+        // the person was shown this commit and approves it.
+        Err(
+            crate::domain::task::ApprovalBindingRefusal::Moved { .. }
+            | crate::domain::task::ApprovalBindingRefusal::Unrecorded,
+        ) => {}
+        Err(other) => return Err(other.to_string()),
+    }
+    if now_tip.as_deref() != Some(tip) {
+        return Err(
+            "The branch moved after it was shown to you, so nothing was approved. Review it again."
+                .to_string(),
+        );
+    }
+    let now = chrono::Utc::now();
+    let wanted = tip.to_string();
+    let amend = move |staged: &mut HashMap<Uuid, Task>| {
+        if let Some(t) = staged.get_mut(&task_id) {
+            if t.status == TaskStatus::HumanReview
+                && t.human_review.is_approved()
+                && t.human_review.approved_tip() != Some(wanted.as_str())
+            {
+                t.human_review.approve_again(wanted.clone(), now);
+                t.human_review.pr_error = None;
+            }
+        }
+    };
+    let task = crate::lifecycle::commit_task(&state.task.tasks, &state.storage, task_id, &amend)
+        .await
+        .map_err(|e| format!("The approval was not saved: {e}"))?
+        .ok_or("Task not found")?;
+    if task.human_review.approved_tip() != Some(tip) {
+        return Err("The task changed while it was being approved, so nothing was recorded.".to_string());
+    }
+    Ok(task)
+}
+
 pub(crate) async fn approve(
     state: &crate::AppState,
     task_id: Uuid,
@@ -210,6 +373,9 @@ pub(crate) async fn complete_locally(
         return Ok(task);
     }
     check_completable(state, &task)?;
+    // The approval covers one commit. Done is committed only for a branch
+    // that is still at it, before the checkout is touched.
+    crate::commands::pr::approved_commit_for_delivery(state, task_id).await?;
     // Asked for by name, finishing locally does not depend on whether a pull
     // request could be opened.
     if !without_pull_request {
@@ -1019,6 +1185,10 @@ mod tests {
         // Dealt with, asked again.
         git(&local.worktree, &["add", "."]);
         git(&local.worktree, &["commit", "-q", "-m", "keep it"]);
+        // Committing it changed the branch, which the approval did not cover.
+        let refused = local.complete().await.expect_err("a commit nobody approved");
+        assert!(refused.contains("changed since"), "{refused}");
+        approve_again(&local.state, local.task_id, &local.tip()).await.expect("approved as it is now");
         let done = local.complete().await.expect("completed on the second request");
         assert_eq!(done.status, TaskStatus::Done);
         assert_eq!(completions(&done), 1);
@@ -1218,5 +1388,175 @@ mod tests {
         let task = on_disk(&state, project_id, task_id);
         assert!(task.human_review.is_approved());
         assert_eq!(task.human_review.approved_tip(), None);
+    }
+
+    // ---- Approval is bound to the commit that was approved ----
+
+    impl Local {
+        fn tip(&self) -> String {
+            git(&self.repo, &["rev-parse", &format!("refs/heads/{}", self.branch)])
+        }
+        /// A later commit on the Task branch, made in its checkout.
+        fn advance(&self) -> String {
+            std::fs::write(self.worktree.join("later.txt"), "later\n").unwrap();
+            git(&self.worktree, &["add", "."]);
+            git(&self.worktree, &["commit", "-q", "-m", "after the approval"]);
+            self.tip()
+        }
+        /// The approved commit replaced by another, so it is no longer on the branch.
+        fn rewrite(&self) -> String {
+            git(&self.worktree, &["commit", "-q", "--amend", "-m", "rewritten after the approval"]);
+            self.tip()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_branch_that_advanced_after_approval_is_not_completed_locally() {
+        let local = local_project().await;
+        local.approve().await;
+        let approved = local.tip();
+        let later = local.advance();
+
+        let refused = local.complete().await.expect_err("the branch moved");
+        assert!(refused.contains("changed since"), "{refused}");
+        local.untouched().await;
+        assert_eq!(local.tip(), later, "no commit is discarded");
+        let task = local.on_disk();
+        assert_eq!(task.human_review.approved_tip(), Some(approved.as_str()), "the approval stays as it was");
+        assert_eq!(task.human_review.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_branch_rewritten_after_approval_is_not_completed_locally() {
+        let local = local_project().await;
+        local.approve().await;
+        let approved = local.tip();
+        let rewritten = local.rewrite();
+        assert_ne!(approved, rewritten);
+
+        let refused = local.complete().await.expect_err("the approved commit is gone");
+        assert!(refused.contains("changed since"), "{refused}");
+        local.untouched().await;
+        assert_eq!(local.tip(), rewritten);
+        assert_eq!(local.on_disk().human_review.approved_tip(), Some(approved.as_str()));
+    }
+
+    #[tokio::test]
+    async fn an_approval_without_a_recorded_commit_is_not_completed_locally_for_a_task_with_a_branch() {
+        let local = local_project().await;
+        local.approve().await;
+        {
+            let mut tasks = local.state.task.tasks.write().await;
+            let entry = &mut tasks.get_mut(&local.task_id).unwrap().human_review.entries[0];
+            entry.approved_tip = None;
+        }
+        let refused = local.complete().await.expect_err("legacy approval");
+        assert!(refused.contains("which commit"), "{refused}");
+        local.untouched().await;
+    }
+
+    #[tokio::test]
+    async fn approving_again_needs_the_commit_that_was_shown_and_changes_nothing_else() {
+        let local = local_project().await;
+        local.approve().await;
+        let approved = local.tip();
+
+        // Still at the approved commit: nothing to renew.
+        let same = approve_again(&local.state, local.task_id, &approved).await.expect("no-op");
+        assert_eq!(same.human_review.entries.len(), 1);
+
+        let later = local.advance();
+        let status = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::Moved);
+        assert!(!status.rewritten);
+        assert_eq!(status.branch_tip.as_deref(), Some(later.as_str()));
+        assert_eq!(status.approved_tip.as_deref(), Some(approved.as_str()));
+
+        // A commit other than the one on the branch now is refused.
+        let stale = approve_again(&local.state, local.task_id, &approved).await.expect_err("not the tip");
+        assert!(stale.contains("moved after it was shown"), "{stale}");
+        assert_eq!(local.on_disk().human_review.entries.len(), 1);
+
+        let renewed = approve_again(&local.state, local.task_id, &later).await.expect("approved");
+        assert_eq!(renewed.human_review.approved_tip(), Some(later.as_str()));
+        assert_eq!(local.on_disk().human_review.entries.len(), 2);
+        assert_eq!(approval_status(&local.state, local.task_id).await.unwrap().coverage, ApprovalCoverage::Current);
+        let done = local.complete().await.expect("the renewed approval completes it");
+        assert_eq!(done.status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_branch_is_reported_and_can_be_approved_as_it_is() {
+        let local = local_project().await;
+        local.approve().await;
+        let rewritten = local.rewrite();
+        let status = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!((status.coverage, status.rewritten), (ApprovalCoverage::Moved, true));
+        approve_again(&local.state, local.task_id, &rewritten).await.expect("approved");
+    }
+
+    #[tokio::test]
+    async fn approving_again_is_refused_while_an_integration_uses_the_earlier_approval() {
+        let local = local_project().await;
+        local.approve().await;
+        local.advance();
+        {
+            let mut tasks = local.state.task.tasks.write().await;
+            let t = tasks.get_mut(&local.task_id).unwrap();
+            t.local_integration = Some(crate::domain::integration::LocalIntegration {
+                state: crate::domain::integration::IntegrationState::Pending,
+                target_branch: "main".into(),
+                target_old_oid: "a".repeat(40),
+                approved_tip: "b".repeat(40),
+                result_oid: "c".repeat(40),
+                strategy: crate::domain::integration::IntegrationStrategy::FastForward,
+                checkout_path: None,
+                started_at: chrono::Utc::now(),
+                completed_at: None,
+                completes_task: true,
+            });
+        }
+        let refused = approve_again(&local.state, local.task_id, &local.tip()).await.expect_err("integrating");
+        assert!(refused.contains("integration"), "{refused}");
+        assert_eq!(local.on_disk().human_review.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_approval_that_never_recorded_its_commit_is_renewed_by_approving_what_was_shown() {
+        let local = local_project().await;
+        local.approve().await;
+        local.state.task.tasks.write().await.get_mut(&local.task_id).unwrap().human_review.entries[0].approved_tip = None;
+        let status = approval_status(&local.state, local.task_id).await.unwrap();
+        assert_eq!(status.coverage, ApprovalCoverage::Unrecorded);
+        assert_eq!(status.branch_tip.as_deref(), Some(local.tip().as_str()));
+
+        let renewed = approve_again(&local.state, local.task_id, &local.tip()).await.expect("approved");
+        assert_eq!(renewed.human_review.approved_tip(), Some(local.tip().as_str()));
+        local.complete().await.expect("completes");
+    }
+
+    #[tokio::test]
+    async fn an_integration_record_of_an_earlier_approval_does_not_stop_approving_again() {
+        let local = local_project().await;
+        local.approve().await;
+        local.advance();
+        {
+            let mut tasks = local.state.task.tasks.write().await;
+            let t = tasks.get_mut(&local.task_id).unwrap();
+            // Integrated work from an earlier approval of some other commit.
+            t.local_integration = Some(crate::domain::integration::LocalIntegration {
+                state: crate::domain::integration::IntegrationState::Integrated,
+                target_branch: "main".into(),
+                target_old_oid: "a".repeat(40),
+                approved_tip: "d".repeat(40),
+                result_oid: "c".repeat(40),
+                strategy: crate::domain::integration::IntegrationStrategy::FastForward,
+                checkout_path: None,
+                started_at: chrono::Utc::now(),
+                completed_at: None,
+                completes_task: false,
+            });
+        }
+        approve_again(&local.state, local.task_id, &local.tip()).await.expect("approved");
     }
 }

@@ -96,6 +96,38 @@ pub async fn complete_task_locally(task_id: String, without_pull_request: bool) 
     .await
 }
 
+/// Mirrors the backend `ApprovalCoverage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalCoverage {
+    NotApplicable,
+    Current,
+    Moved,
+    Unrecorded,
+    BranchMissing,
+}
+
+/// Mirrors the backend `ApprovalStatus`: whether the approval still covers
+/// the task's branch as it is now.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ApprovalStatus {
+    pub coverage: ApprovalCoverage,
+    pub approved_tip: Option<String>,
+    pub branch_tip: Option<String>,
+    pub rewritten: bool,
+    pub reason: Option<String>,
+}
+
+pub async fn get_approval_status(task_id: String) -> Result<ApprovalStatus, String> {
+    invoke("get_approval_status", serde_json::json!({ "taskId": task_id })).await
+}
+
+/// Approve the branch as it is now, after it moved past the approved commit.
+/// `tip` is the commit the person was shown; `Err` means nothing was approved.
+pub async fn approve_task_again(task_id: String, tip: String) -> Result<Task, String> {
+    invoke("approve_task_again", serde_json::json!({ "taskId": task_id, "tip": tip })).await
+}
+
 /// `Err` means neither the feedback nor the requeue was recorded.
 pub async fn request_task_changes(task_id: String, feedback: String) -> Result<Task, String> {
     invoke(
