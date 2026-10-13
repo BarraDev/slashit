@@ -12,6 +12,45 @@ use uuid::Uuid;
 /// Task file name inside a project's own state directory.
 const TASKS_FILE: &str = "tasks.toml";
 
+/// Newest board layout this build can read and write back without losing
+/// anything. A file declaring a later version was written by a newer SlashIt,
+/// and saving over it would drop whatever that version added.
+const TASKS_FILE_VERSION: u32 = 1;
+
+/// A Task file that exists but cannot be used as a board.
+///
+/// Reading it as an empty board and saving that is how history gets lost, so
+/// every save that would replace such a file refuses with this instead. The
+/// file is never touched: its bytes are the only copy of the board.
+#[derive(Debug)]
+pub struct UnreadableTasksFile {
+    pub path: PathBuf,
+    reason: String,
+}
+
+impl std::fmt::Display for UnreadableTasksFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the task file {} cannot be used as a board ({}). SlashIt will not overwrite it, \
+             so nothing was saved. Keep a copy of the file, then repair or restore it and \
+             restart SlashIt.",
+            self.path.display(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for UnreadableTasksFile {}
+
+/// What one Task file path holds. An absent file and an empty board are
+/// different answers, and neither is the same as a file that cannot be read.
+enum TasksFileState {
+    Absent,
+    Board(Vec<Task>),
+    Unreadable(UnreadableTasksFile),
+}
+
 /// Structure for storing tasks per project in TOML files
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectTasksFile {
@@ -165,6 +204,12 @@ pub struct Storage {
     /// from the table (no repository attached, or config not loaded yet) falls
     /// back to the legacy global location rather than guessing.
     routes: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
+    /// Task files [`Self::load_all_tasks`] could not read. The board in memory
+    /// for such a project was built without them, so it is empty or partial
+    /// however the file looks later: a repair made while the app runs does not
+    /// reach memory, and a save of that board would replace the repaired file
+    /// with it. Saves over these refuse until a load reads the file again.
+    unloaded_boards: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
     /// Serializes every read-modify-write transaction over `config_file`.
     ///
     /// `config.toml` is one shared persistence unit: each writer replaces a
@@ -384,6 +429,7 @@ impl Storage {
             paths: Arc::new(paths),
             config_file,
             routes: Arc::new(RwLock::new(HashMap::new())),
+            unloaded_boards: Arc::new(Mutex::new(std::collections::HashSet::new())),
             config_tx: Arc::new(Mutex::new(())),
         }
     }
@@ -720,6 +766,10 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Write a file atomically, leaving permissions at the platform default.
+///
+/// Only the temp-name uniqueness test uses it; the Task file write does its own
+/// temp-and-rename so it can re-check its target before replacing it.
+#[cfg(test)]
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -761,34 +811,46 @@ impl Default for Storage {
 }
 
 impl Storage {
-    /// Read and parse one tasks file, applying reference migration.
+    /// Read one tasks file, applying reference migration.
     ///
-    /// A parse failure is reported and skipped rather than propagated: one
-    /// corrupt project file must not stop the other projects from loading.
-    fn read_tasks_file(path: &Path) -> Option<Vec<Task>> {
+    /// Only a missing file is `Absent`. Any other failure (permissions, bytes
+    /// that are not UTF-8, TOML that does not parse into the current types, a
+    /// layout version this build does not know) is `Unreadable`, because the
+    /// file is there and holds something this run cannot account for.
+    fn inspect_tasks_file(path: &Path) -> TasksFileState {
+        let unreadable = |reason: String| {
+            TasksFileState::Unreadable(UnreadableTasksFile {
+                path: path.to_path_buf(),
+                reason,
+            })
+        };
         let contents = match fs::read_to_string(path) {
             Ok(contents) => contents,
-            Err(e) => {
-                eprintln!("Warning: Failed to read tasks file {path:?}: {e}");
-                return None;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TasksFileState::Absent,
+            Err(e) => return unreadable(format!("read failed: {e}")),
         };
         match toml::from_str::<ProjectTasksFile>(&contents) {
+            Ok(file) if file.version > TASKS_FILE_VERSION => unreadable(format!(
+                "layout version {} is newer than this SlashIt understands ({TASKS_FILE_VERSION})",
+                file.version
+            )),
             Ok(file) => {
                 let mut tasks = file.tasks;
                 for task in &mut tasks {
                     migrate_task_refs(task);
                 }
-                Some(tasks)
+                TasksFileState::Board(tasks)
             }
-            Err(e) => {
-                eprintln!("Warning: Failed to parse tasks file {path:?}: {e}");
-                None
-            }
+            Err(e) => unreadable(format!("parse failed: {e}")),
         }
     }
 
     /// Load every task across every project.
+    ///
+    /// A board that cannot be read is reported and skipped rather than
+    /// propagated: one corrupt project file must not stop the other projects
+    /// from loading. It is remembered, so a save never replaces it from a
+    /// board built without it.
     ///
     /// Reads each routed project's own state directory, then sweeps the legacy
     /// global directory for projects that have not been routed or not yet
@@ -796,9 +858,21 @@ impl Storage {
     /// tasks stay visible until the project that owns them is saved once.
     pub fn load_all_tasks(&self) -> Result<Vec<Task>> {
         let mut all_tasks = Vec::new();
+        let mut unloaded = match self.unloaded_boards.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         for source in self.task_files()? {
-            if let Some(tasks) = Self::read_tasks_file(&source) {
-                all_tasks.extend(tasks);
+            match Self::inspect_tasks_file(&source) {
+                TasksFileState::Board(tasks) => {
+                    unloaded.remove(&source);
+                    all_tasks.extend(tasks);
+                }
+                TasksFileState::Absent => {}
+                TasksFileState::Unreadable(e) => {
+                    eprintln!("Warning: {e}");
+                    unloaded.insert(source);
+                }
             }
         }
         Ok(all_tasks)
@@ -811,10 +885,10 @@ impl Storage {
     pub fn unreadable_task_files(&self) -> Result<Vec<PathBuf>> {
         let mut unreadable = Vec::new();
         for source in self.task_files()? {
-            let readable = fs::read_to_string(&source)
-                .ok()
-                .is_some_and(|contents| toml::from_str::<ProjectTasksFile>(&contents).is_ok());
-            if !readable {
+            if matches!(
+                Self::inspect_tasks_file(&source),
+                TasksFileState::Unreadable(_)
+            ) {
                 unreadable.push(source);
             }
         }
@@ -873,19 +947,68 @@ impl Storage {
         Ok(files)
     }
 
-    /// Load tasks for a specific project, falling back to the legacy location.
-    pub fn load_project_tasks(&self, project_id: Uuid) -> Result<Vec<Task>> {
+    /// The file that holds this project's board right now: its own
+    /// `tasks.toml`, else the legacy file it has not been migrated out of.
+    /// Absent carries the routed path, where a first save would write.
+    fn project_board(&self, project_id: Uuid) -> (PathBuf, TasksFileState) {
         let path = self.tasks_path(project_id);
-        if path.is_file() {
-            return Ok(Self::read_tasks_file(&path).unwrap_or_default());
-        }
-
         let legacy = self.legacy_tasks_path(project_id);
-        if legacy != path && legacy.is_file() {
-            return Ok(Self::read_tasks_file(&legacy).unwrap_or_default());
-        }
+        Self::board_at(path, &legacy)
+    }
 
-        Ok(Vec::new())
+    fn board_at(path: PathBuf, legacy: &Path) -> (PathBuf, TasksFileState) {
+        match Self::inspect_tasks_file(&path) {
+            TasksFileState::Absent if legacy != path => {
+                match Self::inspect_tasks_file(legacy) {
+                    TasksFileState::Absent => (path, TasksFileState::Absent),
+                    state => (legacy.to_path_buf(), state),
+                }
+            }
+            state => (path, state),
+        }
+    }
+
+    /// Load tasks for a specific project, falling back to the legacy location.
+    ///
+    /// A project with no file has no tasks. A project whose file exists but
+    /// cannot be read is an error, not an empty board: callers that went on to
+    /// save would otherwise replace the file with nothing.
+    pub fn load_project_tasks(&self, project_id: Uuid) -> Result<Vec<Task>> {
+        match self.project_board(project_id).1 {
+            TasksFileState::Absent => Ok(Vec::new()),
+            TasksFileState::Board(tasks) => Ok(tasks),
+            TasksFileState::Unreadable(e) => Err(e.into()),
+        }
+    }
+
+    /// Refuse when the file this save would replace cannot be read, or could
+    /// not be when the board in memory was loaded. The check looks at the
+    /// disk, so a stale or empty in-memory board cannot get past a file that
+    /// is bad now; [`Self::unloaded_boards`] covers the one that is good now
+    /// but was bad when memory was built.
+    fn ensure_board_replaceable(&self, path: &Path, legacy: &Path) -> Result<()> {
+        let (source, state) = Self::board_at(path.to_path_buf(), legacy);
+        match state {
+            TasksFileState::Unreadable(e) => Err(e.into()),
+            TasksFileState::Board(_) if self.was_unloaded(&source) => {
+                Err(UnreadableTasksFile {
+                    path: source,
+                    reason: "it could not be read when SlashIt started, so the board in \
+                             memory does not include it"
+                        .to_string(),
+                }
+                .into())
+            }
+            TasksFileState::Absent | TasksFileState::Board(_) => Ok(()),
+        }
+    }
+
+    fn was_unloaded(&self, path: &Path) -> bool {
+        let unloaded = match self.unloaded_boards.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        unloaded.contains(path)
     }
 
     /// Save tasks for a specific project.
@@ -893,19 +1016,50 @@ impl Storage {
     /// Writes to the project's current state directory and then retires the
     /// legacy file, so the move happens exactly once and only after the new
     /// copy is safely on disk.
+    ///
+    /// Refuses with [`UnreadableTasksFile`] when the file being replaced (or,
+    /// for an unmigrated project, the legacy file it would shadow) exists but
+    /// cannot be read. The check runs before anything is written and again
+    /// just before the rename. That narrows, but does not close, the window in
+    /// which another process could swap in an unreadable file: it runs from the
+    /// end of the second read, parse included, to the rename. SlashIt's own
+    /// writers always replace the file atomically with a readable one, so they
+    /// cannot open it; an outside process (an editor, a second instance, a
+    /// restore) can, and only a cross-process lock would close it.
     pub fn save_project_tasks(&self, project_id: Uuid, tasks: &[Task]) -> Result<()> {
         let path = self.tasks_path(project_id);
+        let legacy = self.legacy_tasks_path(project_id);
+        self.ensure_board_replaceable(&path, &legacy)?;
 
         let tasks_file = ProjectTasksFile {
-            version: 1,
+            version: TASKS_FILE_VERSION,
             tasks: tasks.to_vec(),
         };
         let contents = toml::to_string_pretty(&tasks_file).context("Failed to serialize tasks")?;
-        write_atomic(&path, contents.as_bytes()).context("Failed to write tasks file")?;
 
-        let legacy = self.legacy_tasks_path(project_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).context("Failed to write tasks file")?;
+        }
+        let tmp = unique_temp_path(&path);
+        fs::write(&tmp, contents.as_bytes()).context("Failed to write tasks file")?;
+        let published = self
+            .ensure_board_replaceable(&path, &legacy)
+            .and_then(|()| fs::rename(&tmp, &path).context("Failed to write tasks file"));
+        if let Err(e) = published {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+
         if legacy != path && legacy.is_file() {
-            if let Err(e) = fs::remove_file(&legacy) {
+            // A legacy copy that cannot be read is the only record of
+            // whatever it holds. The routed file already shadows it, so
+            // leaving it costs nothing and deleting it could not be undone.
+            if matches!(
+                Self::inspect_tasks_file(&legacy),
+                TasksFileState::Unreadable(_)
+            ) {
+                eprintln!("Warning: Keeping unreadable legacy tasks file {legacy:?}");
+            } else if let Err(e) = fs::remove_file(&legacy) {
                 eprintln!("Warning: Failed to remove legacy tasks file {legacy:?}: {e}");
             }
         }
@@ -1146,6 +1300,272 @@ mod tests {
         fs::write(legacy.join(format!("{}.toml", Uuid::new_v4())), "version = 1\ntasks = []\n").unwrap();
         assert_eq!(storage.unreadable_task_files().unwrap().len(), 1);
         assert!(storage.load_all_tasks().unwrap().is_empty());
+    }
+
+    // ==================== Unreadable Task file tests ====================
+
+    /// A board with one Pending local integration, as written by `save`.
+    fn board_with_pending_integration(project_id: Uuid) -> Vec<Task> {
+        let mut task = crate::test_helpers::create_test_task("Has a pending integration");
+        task.project_id = project_id;
+        task.local_integration = Some(crate::domain::LocalIntegration {
+            state: crate::domain::IntegrationState::Pending,
+            target_branch: "main".into(),
+            target_old_oid: "a".repeat(40),
+            approved_tip: "b".repeat(40),
+            result_oid: "c".repeat(40),
+            strategy: crate::domain::IntegrationStrategy::FastForward,
+            checkout_path: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            completes_task: false,
+        });
+        vec![task]
+    }
+
+    /// Ways a Task file can exist and still not be a board, each as the bytes
+    /// to leave on disk.
+    fn unreadable_variants(valid: &str) -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("malformed TOML", b"tasks = [ not toml".to_vec()),
+            (
+                "unknown status",
+                valid.replacen("status = \"backlog\"", "status = \"from_the_future\"", 1).into_bytes(),
+            ),
+            ("not UTF-8", vec![0xff, 0xfe, 0x00, 0x80]),
+            (
+                "newer layout version",
+                valid.replacen("version = 1", "version = 2", 1).into_bytes(),
+            ),
+        ]
+    }
+
+    fn valid_board_text(project_id: Uuid) -> String {
+        toml::to_string_pretty(&ProjectTasksFile {
+            version: 1,
+            tasks: board_with_pending_integration(project_id),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_missing_file_and_an_empty_board_are_both_loadable_but_different() {
+        let (storage, _dir) = create_test_storage();
+        let missing = Uuid::new_v4();
+        assert!(matches!(storage.project_board(missing).1, TasksFileState::Absent));
+        assert!(storage.load_project_tasks(missing).unwrap().is_empty());
+
+        let empty = Uuid::new_v4();
+        storage.save_project_tasks(empty, &[]).unwrap();
+        assert!(matches!(
+            storage.project_board(empty).1,
+            TasksFileState::Board(ref tasks) if tasks.is_empty()
+        ));
+        assert!(storage.load_project_tasks(empty).unwrap().is_empty());
+        // Both stay writable.
+        storage.save_project_tasks(missing, &board_with_pending_integration(missing)).unwrap();
+        storage.save_project_tasks(empty, &board_with_pending_integration(empty)).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_board_is_refused_and_left_byte_for_byte() {
+        for (what, bytes) in unreadable_variants(&valid_board_text(Uuid::new_v4())) {
+            let (storage, _dir) = create_test_storage();
+            let project_id = Uuid::new_v4();
+            let path = storage.tasks_path(project_id);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, &bytes).unwrap();
+
+            let loaded = storage.load_project_tasks(project_id);
+            let error = loaded.expect_err(what);
+            assert!(error.downcast_ref::<UnreadableTasksFile>().is_some(), "{what}");
+
+            // The ordinary create/update path: an empty in-memory board plus
+            // one new Task, then a later update of it.
+            let mut fresh = crate::test_helpers::create_test_task("Created after a failed load");
+            fresh.project_id = project_id;
+            for attempt in [vec![fresh.clone()], vec![]] {
+                let error = storage
+                    .save_project_tasks(project_id, &attempt)
+                    .expect_err(what);
+                let refusal = error.downcast_ref::<UnreadableTasksFile>().expect(what);
+                assert_eq!(refusal.path, path, "{what}");
+                assert!(error.to_string().contains("will not overwrite"), "{what}");
+                assert_eq!(fs::read(&path).unwrap(), bytes, "{what}: bytes must not change");
+            }
+
+            // Nothing was left behind next to it, and a restart sees the same.
+            let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(leftovers.len(), 1, "{what}: no temp file may remain: {leftovers:?}");
+            let restarted = Storage::with_paths(storage.paths().clone());
+            assert!(restarted.save_project_tasks(project_id, &[fresh]).is_err(), "{what}");
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{what}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_board_does_not_stop_healthy_projects() {
+        let (storage, _dir) = create_test_storage();
+        let broken = Uuid::new_v4();
+        let healthy = Uuid::new_v4();
+        storage.save_project_tasks(healthy, &board_with_pending_integration(healthy)).unwrap();
+        let broken_path = storage.tasks_path(broken);
+        fs::create_dir_all(broken_path.parent().unwrap()).unwrap();
+        fs::write(&broken_path, b"tasks = [ not toml").unwrap();
+
+        let loaded = storage.load_all_tasks().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(storage.unreadable_task_files().unwrap(), vec![broken_path.clone()]);
+
+        let mut more = board_with_pending_integration(healthy);
+        more.push(crate::test_helpers::create_test_task("Second"));
+        storage.save_project_tasks(healthy, &more).unwrap();
+        assert_eq!(storage.load_project_tasks(healthy).unwrap().len(), 2);
+        assert_eq!(fs::read(&broken_path).unwrap(), b"tasks = [ not toml");
+    }
+
+    #[test]
+    fn a_pending_integration_survives_an_unreadable_board_and_returns_once_repaired() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let valid = valid_board_text(project_id);
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let damaged = valid.replacen("status = \"backlog\"", "status = \"from_the_future\"", 1);
+        fs::write(&path, &damaged).unwrap();
+
+        assert!(storage.save_project_tasks(project_id, &[]).is_err());
+        let kept = fs::read_to_string(&path).unwrap();
+        assert!(kept.contains("[tasks.local_integration]"), "{kept}");
+        assert!(kept.contains("state = \"pending\""), "{kept}");
+
+        // The owner repairs it by hand; the same storage picks it straight up.
+        fs::write(&path, &valid).unwrap();
+        let tasks = storage.load_project_tasks(project_id).unwrap();
+        assert!(tasks[0].local_integration.is_some());
+        storage.save_project_tasks(project_id, &tasks).unwrap();
+    }
+
+    #[test]
+    fn a_stale_board_cannot_overwrite_a_file_that_went_bad_after_it_was_loaded() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        storage.save_project_tasks(project_id, &board_with_pending_integration(project_id)).unwrap();
+        let in_memory = storage.load_project_tasks(project_id).unwrap();
+
+        let path = storage.tasks_path(project_id);
+        fs::write(&path, b"tasks = [ not toml").unwrap();
+        assert!(storage.save_project_tasks(project_id, &in_memory).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"tasks = [ not toml");
+    }
+
+    #[test]
+    fn a_routed_project_refuses_over_its_own_file_and_leaves_others_alone() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let project_id = Uuid::new_v4();
+        route_project_to(&storage, project_id, &repo);
+
+        storage.save_project_tasks(project_id, &board_with_pending_integration(project_id)).unwrap();
+        let routed = storage.tasks_path(project_id);
+        assert_ne!(routed, storage.legacy_tasks_path(project_id));
+        fs::write(&routed, b"tasks = [ not toml").unwrap();
+
+        assert!(storage.save_project_tasks(project_id, &[]).is_err());
+        assert_eq!(fs::read(&routed).unwrap(), b"tasks = [ not toml");
+        // A project with no routing is unaffected.
+        let other = Uuid::new_v4();
+        storage.save_project_tasks(other, &[]).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_legacy_file_is_not_shadowed_or_deleted_by_a_migrating_save() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let project_id = Uuid::new_v4();
+        route_project_to(&storage, project_id, &repo);
+
+        // Unmigrated: nothing routed yet, the only board is the unreadable
+        // legacy one, so writing a routed file would hide it for good.
+        let legacy = storage.legacy_tasks_path(project_id);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"tasks = [ not toml").unwrap();
+        assert!(storage.load_project_tasks(project_id).is_err());
+        assert!(storage.save_project_tasks(project_id, &[]).is_err());
+        assert!(!storage.tasks_path(project_id).exists());
+        assert_eq!(fs::read(&legacy).unwrap(), b"tasks = [ not toml");
+
+        // Migrated, then a stale unreadable legacy copy: the routed save
+        // proceeds but never deletes the unreadable bytes.
+        let routed = storage.tasks_path(project_id);
+        fs::create_dir_all(routed.parent().unwrap()).unwrap();
+        fs::write(&routed, valid_board_text(project_id)).unwrap();
+        storage.save_project_tasks(project_id, &board_with_pending_integration(project_id)).unwrap();
+        assert_eq!(fs::read(&legacy).unwrap(), b"tasks = [ not toml");
+    }
+
+    #[test]
+    fn a_readable_legacy_file_is_still_migrated_and_retired() {
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let project_id = Uuid::new_v4();
+        route_project_to(&storage, project_id, &repo);
+
+        let legacy = storage.legacy_tasks_path(project_id);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, valid_board_text(project_id)).unwrap();
+        let tasks = storage.load_project_tasks(project_id).unwrap();
+        assert_eq!(tasks.len(), 1);
+        storage.save_project_tasks(project_id, &tasks).unwrap();
+        assert!(storage.tasks_path(project_id).is_file());
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn a_board_repaired_while_running_is_not_overwritten_by_the_memory_built_without_it() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let valid = valid_board_text(project_id);
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"tasks = [ not toml").unwrap();
+
+        // Startup: the board is skipped, so memory holds nothing for it.
+        assert!(storage.load_all_tasks().unwrap().is_empty());
+
+        // The owner repairs the file while the app is running.
+        fs::write(&path, &valid).unwrap();
+        let error = storage
+            .save_project_tasks(project_id, &[crate::test_helpers::create_test_task("New")])
+            .expect_err("memory never saw the repaired board");
+        assert!(error.downcast_ref::<UnreadableTasksFile>().is_some());
+        assert_eq!(fs::read_to_string(&path).unwrap(), valid);
+
+        // A restart loads it, after which saving is ordinary again.
+        let restarted = Storage::with_paths(storage.paths().clone());
+        let tasks = restarted.load_all_tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        restarted.save_project_tasks(project_id, &tasks).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_project_still_removes_its_board_file_even_when_unreadable() {
+        // Deliberate: deleting a project is an explicit instruction to discard
+        // its tasks, and the orphan scan refuses to run while any unreadable
+        // board exists. Recorded here so a change to it is a decision.
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"tasks = [ not toml").unwrap();
+        storage.delete_project_tasks(project_id).unwrap();
+        assert!(!path.exists());
     }
 
     // ==================== AppConfig Serde Default Tests ====================
