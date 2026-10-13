@@ -499,6 +499,22 @@ impl Task {
         }
     }
 
+    /// The pull request this task is delivered through: `pr_url` when it is
+    /// set, otherwise the first GitHub pull request reference.
+    ///
+    /// The one place that decides which link a refresh asks GitHub about, so
+    /// the same question can be asked again under the task's lifecycle lease:
+    /// an answer about a URL that is no longer this one is stale. A legacy
+    /// task that only has `pr_url` (no reference) is linked by it alone.
+    pub fn authoritative_pr_url(&self) -> Option<&str> {
+        self.pr_url.as_deref().or_else(|| {
+            self.external_refs.iter().find_map(|r| match r {
+                ExternalRef::GithubPr { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+        })
+    }
+
     /// Whether a person completed this task locally: approved changes finished
     /// without a pull request. Done says the task is finished; this says the
     /// branch was never merged by SlashIt.

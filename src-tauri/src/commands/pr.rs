@@ -2240,11 +2240,8 @@ pub async fn sync_pr_review_replies_inner(
 }
 
 fn pr_url_for_task(task: &Task) -> Result<String, String> {
-    task.pr_url.clone()
-        .or_else(|| task.external_refs.iter().find_map(|r| match r {
-            ExternalRef::GithubPr { url, .. } => Some(url.clone()),
-            _ => None,
-        }))
+    task.authoritative_pr_url()
+        .map(str::to_string)
         .ok_or_else(|| "Task does not have a GitHub PR".to_string())
 }
 
@@ -4921,13 +4918,32 @@ async fn link_pr_to_task_reserved(
     // something is still attached, but ending it here first gives that
     // terminalization a clean shot at succeeding instead of needlessly
     // refusing a merge that arrived while an owner was still winding down.
-    let running = state
-        .executor
-        .get()
-        .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
-    crate::lifecycle::end_active_ownership(running, task_uuid)
+    //
+    // Not asked of a task a pending local integration pins
+    // (`integration_unfinished_refusal`): the status a PR implies would move
+    // it out of the column where Resume and Discard exist (issue #192). That
+    // write is withheld below, so what remains here is metadata, and ending
+    // an owner for a metadata write is the needless stop the pin exists to
+    // avoid. A pinned task's pin only clears under resume/discard/plan, every
+    // one of which needs the lifecycle lease this function holds, so this
+    // read cannot go stale before the write it guards.
+    let pinned = state
+        .task
+        .tasks
+        .read()
         .await
-        .map_err(PrLinkFailure::NotRecorded)?;
+        .get(&task_uuid)
+        .map(|t| t.integration_unfinished_refusal().is_some())
+        .unwrap_or(false);
+    if !pinned {
+        let running = state
+            .executor
+            .get()
+            .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+        crate::lifecycle::end_active_ownership(running, task_uuid)
+            .await
+            .map_err(PrLinkFailure::NotRecorded)?;
+    }
 
     let remote = remote_state.clone();
     let apply = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
@@ -4935,8 +4951,17 @@ async fn link_pr_to_task_reserved(
             apply_pr_link(task, pr_url, remote.as_deref());
             // Withheld when merged: the status a merged PR implies is `Done`,
             // and that is the terminalization's to write, after the cleanup it
-            // depends on has succeeded.
-            if !merged {
+            // depends on has succeeded. Also withheld when a pending local
+            // integration pins this task -- judged on the snapshot being
+            // written, corroborated by the pre-write read above: the two
+            // agree under this codebase's invariant that every mutator of
+            // `local_integration` holds this lease, and a disagreement (say, a
+            // future lease-less mutator) refuses the move instead of writing
+            // it, the always-safe direction.
+            if !merged
+                && !pinned
+                && task.integration_unfinished_refusal().is_none()
+            {
                 task.status = TaskStatus::PrCreated;
             }
         }
@@ -5127,7 +5152,13 @@ pub async fn refresh_pr_status(
 /// Whether recording `remote` for `pr_url` would change `task`: a reference
 /// to that pull request records another state, or the task would move.
 fn pr_refresh_changes(task: &Task, pr_url: &str, remote: &str) -> bool {
-    let moves = matches!(remote, "CLOSED" | "OPEN") && task.status != TaskStatus::PrCreated;
+    // A task a pending local integration pins is never moved by the refresh
+    // below either (the `apply` closure withholds the status), so a move to
+    // `PrCreated` it would imply is not a change to make: asking again is
+    // metadata only, and the pinned task is not disturbed for it (issue #192).
+    let movable = task.integration_unfinished_refusal().is_none();
+    let moves =
+        matches!(remote, "CLOSED" | "OPEN") && movable && task.status != TaskStatus::PrCreated;
     let restates = task.external_refs.iter().any(|r| {
         matches!(r, ExternalRef::GithubPr { url, state, .. } if url == pr_url && state.as_deref() != Some(remote))
     });
@@ -5144,12 +5175,7 @@ pub async fn refresh_task_pr_state(
     let pr_url = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_uuid).ok_or("Task not found")?;
-        task.pr_url.clone()
-            .or_else(|| task.external_refs.iter().find_map(|r| match r {
-                ExternalRef::GithubPr { url, .. } => Some(url.clone()),
-                _ => None,
-            }))
-            .ok_or("Task has no PR linked")?
+        task.authoritative_pr_url().map(str::to_string).ok_or("Task has no PR linked")?
     };
 
     let status = refresh_pr_url(&state.pr_statuses, &pr_url)
@@ -5185,20 +5211,64 @@ pub async fn refresh_task_pr_state(
         .await
         .map_err(|e| format!("recording the pull request state failed: {e}"))?;
 
+    // The answer is about the pull request chosen before the lease was held.
+    // If the task has been unlinked from it, or delivered through another
+    // pull request, since, the answer authorizes nothing: no write, no owner
+    // stopped, no terminalization. Unlinking and relinking take this same
+    // lease (`remove_external_ref_serialized`, `link_pr`,
+    // `link_pr_to_task_reserved`), so what is true here stays true until this
+    // function returns. The writers that take no lease only append
+    // (`add_external_ref`, `link_github_issue`) or remove a reference that
+    // is not a pull request, and neither can change an established
+    // `authoritative_pr_url`.
+    let still_linked = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_uuid)
+        .map(|t| t.authoritative_pr_url() == Some(pr_url.as_str()));
+    match still_linked {
+        None => return Ok(None),
+        Some(false) => {
+            return Err(format!(
+                "The pull request link changed while GitHub was being asked about {pr_url}, so \
+                 nothing was changed. Refresh again."
+            ))
+        }
+        Some(true) => {}
+    }
+
     // Same live hole `link_pr_to_task` had before this unit, and the same
     // fix: this is a second, independent place that can write
     // `TaskStatus::PrCreated` (see the `apply` closure below), reachable from
     // the frontend (`kanban.rs`'s PR-review apply and reply-sync) for any task that
     // already has a `pr_url` -- including one still `InProgress`/`AiReview`
     // with a live owner, since nothing above checks that. Ended under the
-    // lease already held, before the write, not a second acquire.
-    let running = state
-        .executor
-        .get()
-        .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
-    crate::lifecycle::end_active_ownership(running, task_uuid)
+    // lease already held, before the write, not a second acquire. Not asked
+    // of a task a pending local integration pins
+    // (`integration_unfinished_refusal`): the status write below is withheld
+    // for it (issue #192), and what remains is metadata recording -- exactly
+    // the needless owner stop the pin exists to avoid. The pin only clears
+    // under resume/discard/plan, all of which need the lease held here, so
+    // this read cannot go stale before the write it guards.
+    let pinned = state
+        .task
+        .tasks
+        .read()
         .await
-        .map_err(|e| format!("recording the pull request state failed: {e}"))?;
+        .get(&task_uuid)
+        .map(|t| t.integration_unfinished_refusal().is_some())
+        .unwrap_or(false);
+    if !pinned {
+        let running = state
+            .executor
+            .get()
+            .map(|e| e.as_ref() as &dyn crate::lifecycle::ExecutionOwnership);
+        crate::lifecycle::end_active_ownership(running, task_uuid)
+            .await
+            .map_err(|e| format!("recording the pull request state failed: {e}"))?;
+    }
 
     let refreshed = remote_state.clone();
     let target = pr_url.clone();
@@ -5217,8 +5287,18 @@ pub async fn refresh_task_pr_state(
                 task.record_pr_state(number, &refreshed);
             }
             // `MERGED` implies `Done`, which the terminalization below writes
-            // only after the cleanup it depends on has succeeded.
-            if matches!(refreshed.as_str(), "CLOSED" | "OPEN") {
+            // only after the cleanup it depends on has succeeded. Also
+            // withheld when a pending local integration pins this task --
+            // judged on the snapshot being written, corroborated by the
+            // pre-write read above: the two agree under this codebase's
+            // invariant that every mutator of `local_integration` holds this
+            // lease, and a disagreement (say, a future lease-less mutator)
+            // refuses the move instead of writing it, the always-safe
+            // direction.
+            if matches!(refreshed.as_str(), "CLOSED" | "OPEN")
+                && !pinned
+                && task.integration_unfinished_refusal().is_none()
+            {
                 task.status = TaskStatus::PrCreated;
             }
         }
@@ -5262,6 +5342,36 @@ pub async fn refresh_task_pr_state(
             // successful.
             Err(refusal) => match pr_link_error(&classify_terminalization(&refusal), &pr_url) {
                 Some(message) => Err(message),
+                // A task whose local integration is unfinished is not finished
+                // either, and nothing is silent about it: the card gets the
+                // same not-finished explanation `link_pr_to_task_reserved`
+                // records when it discovers the merge, best effort by the
+                // same construction (issue #192). Every other refusal
+                // this command answers quietly is a passing condition the task
+                // already reports for itself, and stayed untouched.
+                None
+                    if matches!(
+                        refusal,
+                        crate::lifecycle::TerminalizeRefusal::IntegrationUnfinished
+                    ) =>
+                {
+                    let note = refusal.to_string();
+                    let explain = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
+                        if let Some(task) = staged.get_mut(&task_uuid) {
+                            task.error_message = Some(format!(
+                                "The pull request is merged, but the task was not finished: {note}"
+                            ));
+                        }
+                    };
+                    let _ = crate::lifecycle::record(
+                        &state.task.tasks,
+                        &state.storage,
+                        task_uuid,
+                        &explain,
+                    )
+                    .await;
+                    Ok(state.task.tasks.read().await.get(&task_uuid).cloned())
+                }
                 None => Ok(state.task.tasks.read().await.get(&task_uuid).cloned()),
             },
         };
@@ -6155,6 +6265,35 @@ mod tests {
         assert!(pr_refresh_changes(&with_pr(TaskStatus::PrCreated, Some("OPEN")), url, "CLOSED"));
         assert!(pr_refresh_changes(&with_pr(TaskStatus::HumanReview, Some("OPEN")), url, "OPEN"));
         assert!(!pr_refresh_changes(&with_pr(TaskStatus::PrCreated, Some("OPEN")), "https://github.com/o/r/pull/6", "OPEN"));
+    }
+
+    #[test]
+    fn a_refresh_of_a_pinned_task_only_counts_its_metadata_changes() {
+        use crate::domain::{IntegrationState, IntegrationStrategy, LocalIntegration};
+        let url = "https://github.com/o/r/pull/5";
+        let mut pinned = with_pr(TaskStatus::HumanReview, Some("OPEN"));
+        pinned.human_review.approve(None, chrono::Utc::now());
+        pinned.local_integration = Some(LocalIntegration {
+            state: IntegrationState::Pending,
+            target_branch: "main".to_string(),
+            target_old_oid: "0000000000000000000000000000000000000000".to_string(),
+            approved_tip: "1111111111111111111111111111111111111111".to_string(),
+            result_oid: "2222222222222222222222222222222222222222".to_string(),
+            strategy: IntegrationStrategy::FastForward,
+            checkout_path: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            completes_task: false,
+        });
+        assert!(pinned.integration_unfinished_refusal().is_some(), "fixture: the record pins the task");
+
+        // The move to PR Created the refresh would otherwise imply is
+        // refused, so it is not a change: a repeating refresh of a pinned
+        // task answers from the record without a lease and without a write.
+        assert!(!pr_refresh_changes(&pinned, url, "OPEN"));
+        // A stale reference is still restated, and that is metadata only: no
+        // move is implicated by a `MERGED` answer at all.
+        assert!(pr_refresh_changes(&pinned, url, "MERGED"));
     }
 
     #[tokio::test]
@@ -12578,6 +12717,1032 @@ mod tests {
 
                 assert!(cleaned_up.load(std::sync::atomic::Ordering::SeqCst));
                 assert_eq!(updated.unwrap().status, TaskStatus::PrCreated);
+            }
+
+            // ──────────────────────────────────────────────
+            // A pending local integration pins a task to the column where its
+            // recovery panel lives (issue #192). Both `PrCreated` writers keep
+            // the pin: they record the pull request as the remote fact it is
+            // and leave the lifecycle status -- and so Needs You, Resume and
+            // Discard -- exactly where they were.
+            // ──────────────────────────────────────────────
+
+            /// Stamp a pending local integration, and approve the seeded
+            /// review for exactly the commit it names, through the same
+            /// staged write a real integration uses.
+            #[cfg(unix)]
+            async fn pin_pending_integration(
+                state: &crate::AppState,
+                task_id: Uuid,
+                completes_task: bool,
+            ) {
+                use crate::domain::{IntegrationState, IntegrationStrategy, LocalIntegration};
+                let record = LocalIntegration {
+                    state: IntegrationState::Pending,
+                    target_branch: "target".to_string(),
+                    target_old_oid: "0000000000000000000000000000000000000000".to_string(),
+                    approved_tip: "1111111111111111111111111111111111111111".to_string(),
+                    result_oid: "2222222222222222222222222222222222222222".to_string(),
+                    strategy: IntegrationStrategy::FastForward,
+                    checkout_path: None,
+                    started_at: chrono::Utc::now(),
+                    completed_at: None,
+                    completes_task,
+                };
+                let amend = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
+                    if let Some(task) = staged.get_mut(&task_id) {
+                        task.human_review
+                            .approve(Some(record.approved_tip.clone()), chrono::Utc::now());
+                        task.local_integration = Some(record.clone());
+                    }
+                };
+                crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &amend)
+                    .await
+                    .expect("the pinned fixture must persist");
+            }
+
+            /// `link_pr_to_task` on an approved Human Review task a pending
+            /// local integration pins: the pull request is recorded as the
+            /// remote fact it is, and every lifecycle fact the recovery panel
+            /// runs on is left untouched -- the column, the record, the
+            /// approval history, and Needs You's report of the integration.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn link_pr_to_task_records_metadata_on_a_pinned_review_without_moving_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
+                pin_pending_integration(&state, task_id, true).await;
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+
+                link_pr_to_task(&state, task_id, "https://github.com/testorg/testrepo/pull/12")
+                    .await
+                    .expect("a pull request that exists is a fact to record, whatever the pin");
+
+                let after = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+                assert_eq!(
+                    after.status, before.status,
+                    "the recoverable column is not PR link's to leave"
+                );
+                assert_eq!(
+                    after.local_integration, before.local_integration,
+                    "the recovery record must survive unchanged"
+                );
+                assert_eq!(
+                    after.human_review, before.human_review,
+                    "approval and its history are not link's to touch either"
+                );
+                assert_eq!(
+                    after.needs_you(false),
+                    Some(crate::domain::task::AttentionReason::IntegrationUnfinished),
+                    "Needs You must go on reporting what Resume and Discard answer to"
+                );
+                assert_eq!(
+                    after.pr_url.as_deref(),
+                    Some("https://github.com/testorg/testrepo/pull/12"),
+                    "the remote fact is recorded"
+                );
+                assert!(
+                    after.external_refs.iter().any(|r| matches!(r, crate::domain::task::ExternalRef::GithubPr { url, state, .. }
+                        if url == "https://github.com/testorg/testrepo/pull/12" && state.as_deref() == Some("OPEN"))),
+                    "with the remote state"
+                );
+            }
+
+            /// The same pin on a Done task completed locally: the other
+            /// column Resume and Discard are offered in. Same contract.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn link_pr_to_task_records_metadata_on_a_pinned_done_without_moving_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::Done).await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    tasks
+                        .get_mut(&task_id)
+                        .unwrap()
+                        .record_activity(crate::domain::task::ActivityKind::CompletedLocally);
+                }
+                pin_pending_integration(&state, task_id, false).await;
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+                assert!(before.completed_locally(), "fixture: completed locally");
+
+                link_pr_to_task(&state, task_id, "https://github.com/testorg/testrepo/pull/13")
+                    .await
+                    .expect("a pull request that exists is a fact to record, whatever the pin");
+
+                let after = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+                assert_eq!(after.status, TaskStatus::Done, "the recoverable column holds");
+                assert_eq!(after.local_integration, before.local_integration);
+                assert_eq!(
+                    after.needs_you(false),
+                    Some(crate::domain::task::AttentionReason::IntegrationUnfinished)
+                );
+            }
+
+            /// The whole Sync Existing PR front door on a pinned task, with
+            /// only the existing pull request on GitHub to find: discovery
+            /// answers one `pr list`, the link records the pull request, and
+            /// no second pull request is opened for it.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_existing_pr_records_a_pinned_task_without_creating_anything() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let url = "https://github.com/testorg/testrepo/pull/21";
+                let mock = MockGh::setup_answering(
+                    url,
+                    r#"{"state":"OPEN"}"#,
+                    &[(
+                        "pr list --head task-branch --state all --limit 30 --json url,isCrossRepository"
+                            .to_string(),
+                        format!(r#"printf '%s' '[{{"url":{url:?},"isCrossRepository":false}}]'"#),
+                    ),
+                    ],
+                );
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
+                pin_pending_integration(&state, task_id, false).await;
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let synced = sync_existing_pr(app.state(), task_id.to_string())
+                    .await
+                    .expect("an existing pull request is a fact to sync, whatever the pin")
+                    .expect("the pull request for the branch is found");
+
+                assert_eq!(synced.status, before.status, "the recovery column never moved");
+                assert_eq!(synced.local_integration, before.local_integration);
+                assert_eq!(
+                    synced.needs_you(false),
+                    Some(crate::domain::task::AttentionReason::IntegrationUnfinished)
+                );
+                assert_eq!(synced.pr_url.as_deref(), Some(url));
+                let log = mock.read_log();
+                assert!(
+                    !log.lines().any(|l| l == "create"),
+                    "discovery must never open another pull request: {log}"
+                );
+                assert!(
+                    log.lines().any(|l| l == "--head"),
+                    "discovery asked for the branch's pull requests: {log}"
+                );
+            }
+
+            /// A branch with no pull request behind it: the pinned task is
+            /// answered as found-nothing, unchanged.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn sync_existing_pr_answers_none_for_a_pinned_task_without_a_pr() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
+                pin_pending_integration(&state, task_id, false).await;
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let synced = sync_existing_pr(app.state(), task_id.to_string())
+                    .await
+                    .expect("asking succeeds");
+                assert!(synced.is_none(), "no pull request exists for the branch");
+
+                // Nothing anywhere was written: no pull request, no metadata,
+                // and no lifecycle fact moved while nobody was asking.
+                let after = app
+                    .state::<crate::AppState>()
+                    .task
+                    .tasks
+                    .read()
+                    .await
+                    .get(&task_id)
+                    .unwrap()
+                    .clone();
+                assert_eq!(after.status, before.status);
+                assert_eq!(after.pr_url, before.pr_url);
+                assert_eq!(after.local_integration, before.local_integration);
+                assert_eq!(after.external_refs, before.external_refs);
+                assert_eq!(after.error_message, before.error_message);
+                assert_eq!(after.updated_at, before.updated_at);
+                drop(_tmp);
+            }
+
+            /// The pin never holds a task whose record is integrated or
+            /// absent: a PR link moves those to PR Created as before.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn link_pr_to_task_still_moves_a_review_without_a_pending_record() {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+
+                let pinned_but_done = {
+                    let task_id = seed_task(
+                        &state,
+                        "/tmp",
+                        Some("task-branch2"),
+                        TaskStatus::HumanReview,
+                    )
+                    .await;
+                    pin_pending_integration(&state, task_id, false).await;
+                    let amend = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
+                        if let Some(task) = staged.get_mut(&task_id) {
+                            task.local_integration
+                                .as_mut()
+                                .expect("fixture record")
+                                .state = crate::domain::IntegrationState::Integrated;
+                        }
+                    };
+                    crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &amend)
+                        .await
+                        .expect("fixture must persist");
+                    task_id
+                };
+                let still_moved = {
+                    let task_id =
+                        seed_task(&state, "/tmp", Some("task-branch3"), TaskStatus::HumanReview)
+                            .await;
+                    let amend = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
+                        if let Some(task) = staged.get_mut(&task_id) {
+                            task.human_review.approve(None, chrono::Utc::now());
+                        }
+                    };
+                    crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &amend)
+                        .await
+                        .expect("fixture must persist");
+                    task_id
+                };
+
+                for task_id in [pinned_but_done, still_moved] {
+                    link_pr_to_task(&state, task_id, "https://github.com/testorg/testrepo/pull/14")
+                        .await
+                        .expect("no pending record holds this task");
+                    let after = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+                    assert_eq!(after.status, TaskStatus::PrCreated, "an ordinary PR link still moves the task, either way");
+                }
+            }
+
+            /// A merged pull request on a pinned task: the merge is recorded,
+            /// the terminalization it implies refuses on the record
+            /// (`terminalize_leased` asks the same guard before anything
+            /// destructive), and what the user gets is the not-finished
+            /// explanation -- not a Done, not a status move, not a lost PR.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn link_pr_to_task_records_a_merged_pr_without_finishing_a_pinned_task() {
+                let _guard = PATH_LOCK.lock().await;
+                let url = "https://github.com/testorg/testrepo/pull/15";
+                let mock = MockGh::setup("unused", r#"{"state":"MERGED"}"#);
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
+                pin_pending_integration(&state, task_id, true).await;
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+
+                let failure = link_pr_to_task(&state, task_id, url)
+                    .await
+                    .expect_err("the merge's terminalization refuses on the pending record");
+                assert!(
+                    matches!(failure, PrLinkFailure::NotTerminalized(ref m) if m.contains(crate::domain::task::INTEGRATION_UNFINISHED_REFUSAL)),
+                    "the refusal is the guard's own answer: {failure:?}"
+                );
+
+                let after = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+                assert_eq!(after.status, before.status, "not a status change to answer a refusal with");
+                assert_eq!(after.local_integration, before.local_integration);
+                assert_eq!(
+                    after.needs_you(false),
+                    Some(crate::domain::task::AttentionReason::IntegrationUnfinished),
+                    "the recovery action is still on offer"
+                );
+                assert_eq!(after.pr_url.as_deref(), Some(url), "the remote fact stands");
+                assert!(
+                    after
+                        .external_refs
+                        .iter()
+                        .any(|r| matches!(r, crate::domain::task::ExternalRef::GithubPr { url, state, .. }
+                            if url.as_str() == "https://github.com/testorg/testrepo/pull/15" && state.as_deref() == Some("MERGED"))),
+                    "and so does the merged state, whatever git holds"
+                );
+                assert!(
+                    after
+                        .error_message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("merged, but the task was not finished")),
+                    "the card says why the merge did not finish the task: {:?}",
+                    after.error_message
+                );
+            }
+
+            /// Repeated sync on a pinned task is metadata-idempotent: the
+            /// second link changes nothing the first did not already record,
+            /// and the first moved none of the lifecycle facts either.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn link_pr_to_task_is_idempotent_on_a_pinned_task() {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
+                pin_pending_integration(&state, task_id, false).await;
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+
+                link_pr_to_task(&state, task_id, "https://github.com/testorg/testrepo/pull/16")
+                    .await
+                    .expect("first sync records the pull request");
+                let once = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+
+                assert_eq!(once.status, before.status, "the first link did not move the pinned task");
+                assert_eq!(once.local_integration, before.local_integration);
+
+                link_pr_to_task(&state, task_id, "https://github.com/testorg/testrepo/pull/16")
+                    .await
+                    .expect("asking again is not a change");
+                let twice = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+
+                assert_eq!(twice.status, once.status, "the status the recovery panel runs on never moved");
+                assert_eq!(twice.local_integration, once.local_integration);
+                assert_eq!(twice.human_review, once.human_review);
+                assert_eq!(twice.activity, once.activity, "the linked activity repeats identically or not at all");
+                assert_eq!(twice.external_refs, once.external_refs);
+            }
+
+            /// A metadata write the file refuses leaves the pinned task
+            /// exactly as found: persist-before-publish holds, so neither the
+            /// pull request nor any lifecycle fact is half-known.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn link_pr_to_task_persists_the_pr_or_changes_nothing_on_a_pinned_task() {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
+                let _ = &mock;
+
+                let (state, tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
+                pin_pending_integration(&state, task_id, false).await;
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+
+                // Persistence blocker, the executor tests' way: the tasks
+                // directory replaced by a file.
+                let blocker = tmp.path().join("config").join("tasks");
+                let _ = std::fs::remove_dir_all(&blocker);
+                std::fs::write(&blocker, b"not a directory").expect("place persistence blocker");
+
+                let failure = link_pr_to_task(&state, task_id, "https://github.com/testorg/testrepo/pull/17")
+                    .await
+                    .expect_err("a PR the file refused is not a record");
+                assert!(
+                    matches!(failure, PrLinkFailure::NotRecorded(_)),
+                    "metadata refusal is NotRecorded: {failure:?}"
+                );
+
+                let after = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+                assert_eq!(after.pr_url, before.pr_url, "nothing was published that the file refused");
+                assert_eq!(after.status, before.status);
+                assert_eq!(after.local_integration, before.local_integration, "the record is exactly as found");
+                assert_eq!(
+                    after.needs_you(false),
+                    Some(crate::domain::task::AttentionReason::IntegrationUnfinished),
+                    "recovery is exactly as available as it was"
+                );
+            }
+
+            /// The metadata-only path proves it does not stop what it used to
+            /// stop: with a fake live owner attached and the task pinned, the
+            /// link records the pull request and the owner is left running,
+            /// because nothing is moved and the merged path's terminalization
+            /// would refuse on the pin before it ever needed the task free.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn link_pr_to_task_on_a_pinned_task_does_not_end_a_live_owner() {
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"OPEN"}"#);
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+                let executor = attach_test_executor(&state);
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
+                pin_pending_integration(&state, task_id, false).await;
+                let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+
+                link_pr_to_task(&state, task_id, "https://github.com/testorg/testrepo/pull/22")
+                    .await
+                    .expect("the pull request is metadata on a pinned task");
+
+                assert!(
+                    !cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+                    "metadata-only sync must not stop the owner that the pin's recovery depends on"
+                );
+                let after = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+                assert_eq!(after.status, TaskStatus::HumanReview);
+                assert_eq!(
+                    after.needs_you(false),
+                    Some(crate::domain::task::AttentionReason::IntegrationUnfinished)
+                );
+            }
+
+            /// `refresh_task_pr_state` on a pinned task: an OPEN and a CLOSED
+            /// answer record their state on the reference and never move the
+            /// task, asked again and again.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refresh_task_pr_state_records_remote_state_without_moving_a_pinned_task() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                for (attempt, remote_answer) in ["OPEN", "CLOSED", "OPEN"].into_iter().enumerate() {
+                    let mock = MockGh::setup("unused", &format!(r#"{{"state":{remote_answer:?}}}"#));
+                    let _ = &mock;
+
+                    let (state, _tmp) = build_test_state().await;
+                    let task_id = seed_task(
+                        &state,
+                        "/tmp",
+                        Some(&format!("task-branch-{attempt}")),
+                        TaskStatus::HumanReview,
+                    )
+                    .await;
+                    {
+                        let mut tasks = state.task.tasks.write().await;
+                        let task = tasks.get_mut(&task_id).unwrap();
+                        task.pr_url =
+                            Some("https://github.com/testorg/testrepo/pull/18".to_string());
+                        // The ref the refresh updates; see the merged-answer test
+                        // below.
+                        task.external_refs.push(crate::domain::task::ExternalRef::GithubPr {
+                            url: "https://github.com/testorg/testrepo/pull/18".to_string(),
+                            number: 18,
+                            repo: "testorg/testrepo".to_string(),
+                            state: None,
+                        });
+                    }
+                    pin_pending_integration(&state, task_id, false).await;
+                    let pinned = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+
+                    let app = tauri::test::mock_app();
+                    app.manage(state);
+                    let after = refresh_task_pr_state(app.state(), task_id.to_string())
+                        .await
+                        .expect("a refreshed remote state is a fact to record, whatever the pin")
+                        .expect("the task is there");
+
+                    assert_eq!(after.status, pinned.status, "the recovery column never moved");
+                    assert_eq!(after.local_integration, pinned.local_integration);
+                    assert_eq!(
+                        after.needs_you(false),
+                        Some(crate::domain::task::AttentionReason::IntegrationUnfinished)
+                    );
+                    assert!(
+                        after.external_refs.iter().any(|r| matches!(r, crate::domain::task::ExternalRef::GithubPr { state, .. }
+                            if state.as_deref() == Some(remote_answer))),
+                        "the remote state {remote_answer} was recorded"
+                    );
+                    drop(mock);
+                }
+            }
+
+            /// And a MERGED answer: recorded, then refused by the same guard
+            /// `link_pr_to_task` runs into, the command answering with the
+            /// task -- which never moved.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn refresh_task_pr_state_records_a_merged_pr_without_finishing_a_pinned_task() {
+                use tauri::Manager;
+
+                let _guard = PATH_LOCK.lock().await;
+                let mock = MockGh::setup("unused", r#"{"state":"MERGED"}"#);
+                let _ = &mock;
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id =
+                    seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let task = tasks.get_mut(&task_id).unwrap();
+                    task.pr_url = Some("https://github.com/testorg/testrepo/pull/19".to_string());
+                    // The ref the frontend's apply/reply-sync refresh runs
+                    // against: every task on this path got it when the pull
+                    // request was linked.
+                    task.external_refs.push(crate::domain::task::ExternalRef::GithubPr {
+                        url: "https://github.com/testorg/testrepo/pull/19".to_string(),
+                        number: 19,
+                        repo: "testorg/testrepo".to_string(),
+                        state: Some("OPEN".to_string()),
+                    });
+                }
+                pin_pending_integration(&state, task_id, false).await;
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let after = refresh_task_pr_state(app.state(), task_id.to_string())
+                    .await
+                    .expect("the merge is a fact; the pin refuses only the finishing")
+                    .expect("the task is there");
+
+                assert_eq!(after.status, before.status, "not a status change");
+                assert_eq!(after.local_integration, before.local_integration);
+                assert_eq!(after.human_review, before.human_review);
+                assert_eq!(
+                    after.needs_you(false),
+                    Some(crate::domain::task::AttentionReason::IntegrationUnfinished),
+                    "the recovery action is still on offer"
+                );
+                assert!(
+                    after
+                        .external_refs
+                        .iter()
+                        .any(|r| matches!(r, crate::domain::task::ExternalRef::GithubPr { state, .. }
+                            if state.as_deref() == Some("MERGED"))),
+                    "the merged state was recorded, whatever git holds"
+                );
+                assert!(
+                    after
+                        .error_message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("merged, but the task was not finished")),
+                    "the card says why the merge did not finish the task: {:?}",
+                    after.error_message
+                );
+            }
+
+            // ──────────────────────────────────────────────
+            // A refresh decided before the lease is held (issue #192 follow-up)
+            // ──────────────────────────────────────────────
+
+            /// A `gh` whose `pr view` announces that it was asked, then holds
+            /// its answer until the test releases it: the controlled GitHub
+            /// response that lets a test change the task while the lookup is
+            /// in flight, in a fixed order and without sleeping on a guess.
+            #[cfg(unix)]
+            struct GatedGh {
+                _tmp: tempfile::TempDir,
+                entered: PathBuf,
+                gate: PathBuf,
+                saved_path: Option<String>,
+            }
+
+            #[cfg(unix)]
+            impl GatedGh {
+                fn install(state_json: &str) -> Self {
+                    let tmp = tempfile::tempdir().expect("tempdir");
+                    let bin_dir = tmp.path().join("bin");
+                    std::fs::create_dir_all(&bin_dir).unwrap();
+                    let entered = tmp.path().join("entered");
+                    let gate = tmp.path().join("gate");
+                    let script = format!(
+                        "#!/bin/sh\ncase \"$*\" in\n  *'pr view'*) : > {entered:?}; while [ ! -e {gate:?} ]; do sleep 0.01; done; printf '%s' {state_json:?} ;;\n  *) printf '{{}}' ;;\nesac\n"
+                    );
+                    // Created by `cp`, never by this process: a descriptor this
+                    // process holds open for writing can be inherited by a child
+                    // another test thread forks, and `execve` of the file then
+                    // fails with ETXTBSY (see `pr_status::tests::process::script`).
+                    let source = tmp.path().join("gh.source");
+                    write_executable(&source, &script);
+                    let copied = std::process::Command::new("/bin/cp")
+                        .arg(&source)
+                        .arg(bin_dir.join("gh"))
+                        .status()
+                        .unwrap();
+                    assert!(copied.success(), "could not create the fake gh: {copied}");
+                    std::fs::remove_file(&source).unwrap();
+                    let saved_path = std::env::var("PATH").ok();
+                    let new_path = match &saved_path {
+                        Some(p) => format!("{}:{}", bin_dir.display(), p),
+                        None => bin_dir.display().to_string(),
+                    };
+                    // Safety: serialized via PATH_LOCK; restored on Drop.
+                    unsafe {
+                        std::env::set_var("PATH", new_path);
+                    }
+                    GatedGh { _tmp: tmp, entered, gate, saved_path }
+                }
+
+                /// Bounded, so a refresh that never reaches `gh` fails the
+                /// test instead of hanging it.
+                async fn asked(&self) {
+                    let waiting = async {
+                        while !self.entered.exists() {
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                    };
+                    tokio::time::timeout(std::time::Duration::from_secs(30), waiting)
+                        .await
+                        .expect("the refresh never asked GitHub");
+                }
+
+                fn answer(&self) {
+                    std::fs::write(&self.gate, b"").unwrap();
+                }
+            }
+
+            #[cfg(unix)]
+            impl Drop for GatedGh {
+                fn drop(&mut self) {
+                    unsafe {
+                        match &self.saved_path {
+                            Some(p) => std::env::set_var("PATH", p),
+                            None => std::env::remove_var("PATH"),
+                        }
+                    }
+                }
+            }
+
+            const PR_A: &str = "https://github.com/owner/repo/pull/7";
+            const PR_B: &str = "https://github.com/owner/repo/pull/8";
+            const PR_OTHER: &str = "https://github.com/other/repo/pull/7";
+
+            fn pr_link(url: &str, state: &str) -> crate::domain::task::ExternalRef {
+                parse_pr_url_to_ref_with_state(url, state)
+            }
+
+            fn parse_pr_url_to_ref_with_state(url: &str, state: &str) -> crate::domain::task::ExternalRef {
+                match parse_pr_url_to_ref(url).expect("a pull request URL") {
+                    crate::domain::task::ExternalRef::GithubPr { url, number, repo, .. } => {
+                        crate::domain::task::ExternalRef::GithubPr { url, number, repo, state: Some(state.to_string()) }
+                    }
+                    other => other,
+                }
+            }
+
+            /// What changes the task while the lookup is out.
+            enum WhileAsking {
+                Nothing,
+                /// The user removes the first reference.
+                Unlink,
+                /// The delivery is relinked to another pull request.
+                Relink(&'static str),
+                /// The task's file stops accepting writes.
+                BlockStorage,
+            }
+
+            struct Refreshed {
+                result: Result<Option<Task>, String>,
+                /// The task once the change made while asking had landed, and
+                /// before GitHub answered.
+                during: Task,
+                after: Task,
+                _tmp: tempfile::TempDir,
+            }
+
+            /// Seed a task in `status` shaped by `fixture`, start a manual
+            /// refresh, apply `change` once GitHub has been asked and before
+            /// it answers `answer`, then let it answer.
+            #[cfg(unix)]
+            async fn refresh_while(
+                answer: &str,
+                status: TaskStatus,
+                fixture: impl FnOnce(&mut Task),
+                change: WhileAsking,
+            ) -> Refreshed {
+                use tauri::Manager;
+                let gh = GatedGh::install(&format!(r#"{{"state":"{answer}"}}"#));
+                let (state, tmp) = build_test_state().await;
+                let task_id = seed_task(&state, "/tmp", Some("task-branch"), status).await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    fixture(tasks.get_mut(&task_id).unwrap());
+                }
+                let app = tauri::test::mock_app();
+                app.manage(state);
+
+                let refresh = refresh_task_pr_state(app.state(), task_id.to_string());
+                let driver = async {
+                    gh.asked().await;
+                    let st = app.state::<crate::AppState>();
+                    match change {
+                        WhileAsking::Nothing => {}
+                        WhileAsking::Unlink => {
+                            crate::commands::task::remove_external_ref_serialized(
+                                &st.task.tasks,
+                                &st.storage,
+                                &st.task_lifecycle_locks,
+                                task_id,
+                                0,
+                            )
+                            .await
+                            .expect("unlinking succeeds");
+                        }
+                        WhileAsking::Relink(url) => {
+                            crate::commands::task::link_pr(app.state(), task_id.to_string(), url.to_string())
+                                .await
+                                .expect("relinking succeeds");
+                        }
+                        WhileAsking::BlockStorage => {
+                            std::fs::create_dir_all(st.storage.paths().config_dir()).unwrap();
+                            block_task_persistence(&st.storage);
+                        }
+                    }
+                    let during = st.task.tasks.read().await[&task_id].clone();
+                    gh.answer();
+                    during
+                };
+                let (result, during) = tokio::join!(refresh, driver);
+                let after = app.state::<crate::AppState>().task.tasks.read().await[&task_id].clone();
+                Refreshed { result, during, after, _tmp: tmp }
+            }
+
+            fn pr_events(task: &Task) -> usize {
+                task.activity
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e.kind,
+                            crate::domain::task::ActivityKind::PrMerged { .. }
+                                | crate::domain::task::ActivityKind::PrClosed { .. }
+                        )
+                    })
+                    .count()
+            }
+
+            fn delivered_through(task: &mut Task, url: &str) {
+                task.pr_url = Some(url.to_string());
+                task.external_refs.push(pr_link(url, "OPEN"));
+            }
+
+            /// Unlink wins: whatever GitHub says afterwards, a task that no
+            /// longer links the pull request is not completed, moved,
+            /// stopped, written or given activity for it.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_refresh_for_an_unlinked_pull_request_changes_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                for answer in ["MERGED", "CLOSED", "OPEN"] {
+                    let r = refresh_while(answer, TaskStatus::HumanReview, |t| delivered_through(t, PR_A), WhileAsking::Unlink).await;
+                    let message = r.result.expect_err(&format!("{answer}: a stale answer is refused"));
+                    assert!(message.contains("link changed"), "{answer}: {message}");
+                    assert_eq!(r.during.pr_url, None, "{answer}: unlinking cleared the delivery that named it");
+                    assert!(r.during.external_refs.is_empty());
+                    assert_eq!(r.after.status, TaskStatus::HumanReview, "{answer}");
+                    assert_eq!(r.after.updated_at, r.during.updated_at, "{answer}: nothing was written");
+                    assert_eq!(r.after.error_message, None, "{answer}");
+                    assert_eq!(r.after.worktree_path, r.during.worktree_path, "{answer}: checkout untouched");
+                    assert!(!r.after.cleanup_in_flight, "{answer}");
+                    assert_eq!(pr_events(&r.after), 0, "{answer}: no false PR activity");
+                }
+            }
+
+            /// The delivery is relinked from A to B while A is being asked
+            /// about: A's answer applies to neither the task's state nor B.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_refresh_for_a_replaced_pull_request_changes_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let r = refresh_while("MERGED", TaskStatus::PrCreated, |t| delivered_through(t, PR_A), WhileAsking::Relink(PR_B)).await;
+                assert!(r.result.is_err(), "the stale answer is refused");
+                assert_eq!(r.during.pr_url.as_deref(), Some(PR_B));
+                assert_eq!(r.after.status, TaskStatus::PrCreated);
+                assert_eq!(r.after.updated_at, r.during.updated_at, "nothing was written");
+                assert_eq!(pr_events(&r.after), 0);
+                for ref_ in &r.after.external_refs {
+                    assert!(
+                        matches!(ref_, crate::domain::task::ExternalRef::GithubPr { state, .. } if state.as_deref() == Some("OPEN")),
+                        "neither A nor B was marked: {ref_:?}"
+                    );
+                }
+            }
+
+            /// Same pull request number in two repositories: unlinking the
+            /// first leaves `other/repo#7`, which is not the pull request that
+            /// was asked about and authorizes nothing.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn another_repositorys_pull_request_does_not_authorize_a_refresh() {
+                let _guard = PATH_LOCK.lock().await;
+                let r = refresh_while(
+                    "MERGED",
+                    TaskStatus::PrCreated,
+                    |t| {
+                        delivered_through(t, PR_A);
+                        t.external_refs.push(pr_link(PR_OTHER, "OPEN"));
+                    },
+                    WhileAsking::Unlink,
+                )
+                .await;
+                assert!(r.result.is_err());
+                assert_eq!(r.after.status, TaskStatus::PrCreated);
+                assert_eq!(r.after.updated_at, r.during.updated_at);
+                assert_eq!(pr_events(&r.after), 0);
+                assert_eq!(r.after.external_refs.len(), 1);
+            }
+
+            /// A pending local integration stays recoverable when the unlink
+            /// wins, with its approval and record exactly as they were.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_stale_refresh_leaves_a_pending_integration_recoverable() {
+                let _guard = PATH_LOCK.lock().await;
+                let pin = crate::domain::LocalIntegration {
+                    state: crate::domain::IntegrationState::Pending,
+                    target_branch: "target".to_string(),
+                    target_old_oid: "0".repeat(40),
+                    approved_tip: "1".repeat(40),
+                    result_oid: "2".repeat(40),
+                    strategy: crate::domain::IntegrationStrategy::FastForward,
+                    checkout_path: None,
+                    started_at: chrono::Utc::now(),
+                    completed_at: None,
+                    completes_task: false,
+                };
+                let r = refresh_while(
+                    "MERGED",
+                    TaskStatus::HumanReview,
+                    |t| {
+                        delivered_through(t, PR_A);
+                        t.human_review.approve(Some(pin.approved_tip.clone()), chrono::Utc::now());
+                        t.local_integration = Some(pin.clone());
+                    },
+                    WhileAsking::Unlink,
+                )
+                .await;
+                assert!(r.result.is_err());
+                assert_eq!(r.after.status, TaskStatus::HumanReview);
+                assert_eq!(r.after.local_integration, r.during.local_integration);
+                assert_eq!(r.after.human_review, r.during.human_review);
+                assert_eq!(r.after.error_message, None);
+                assert!(r.after.integration_unfinished_refusal().is_some(), "Resume and Discard still apply");
+                assert_eq!(r.after.updated_at, r.during.updated_at);
+            }
+
+            /// Link still present: the refresh records what GitHub says, for a
+            /// task with a reference and for a legacy task that only has
+            /// `pr_url`.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_refresh_for_the_linked_pull_request_still_records_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let linked = refresh_while("CLOSED", TaskStatus::HumanReview, |t| delivered_through(t, PR_A), WhileAsking::Nothing).await;
+                let after = linked.result.expect("refresh succeeds").expect("task");
+                assert_eq!(after.status, TaskStatus::PrCreated);
+                assert!(after.external_refs.iter().any(
+                    |r| matches!(r, crate::domain::task::ExternalRef::GithubPr { state, .. } if state.as_deref() == Some("CLOSED"))
+                ));
+                assert_eq!(pr_events(&after), 1);
+
+                let legacy = refresh_while(
+                    "CLOSED",
+                    TaskStatus::HumanReview,
+                    |t| t.pr_url = Some(PR_A.to_string()),
+                    WhileAsking::Nothing,
+                )
+                .await;
+                let after = legacy.result.expect("a pr_url-only task is still linked").expect("task");
+                assert_eq!(after.status, TaskStatus::PrCreated);
+                assert_eq!(after.pr_url.as_deref(), Some(PR_A));
+            }
+
+            /// A write that fails during a valid refresh is reported and
+            /// leaves the board as it was: no in-memory-only change.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_failed_write_during_a_refresh_is_reported_and_changes_nothing() {
+                let _guard = PATH_LOCK.lock().await;
+                let r = refresh_while("CLOSED", TaskStatus::HumanReview, |t| delivered_through(t, PR_A), WhileAsking::BlockStorage).await;
+                assert!(r.result.is_err(), "the failed write is reported");
+                assert_eq!(r.after.status, TaskStatus::HumanReview, "no in-memory-only change");
+                assert!(r.after.external_refs.iter().all(
+                    |r| matches!(r, crate::domain::task::ExternalRef::GithubPr { state, .. } if state.as_deref() == Some("OPEN"))
+                ));
+            }
+
+            /// Unlinking removes the `pr_url` that names the pull request, and
+            /// only that one, durably; a legacy task keeps its `pr_url`.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn unlinking_clears_only_the_delivery_that_names_the_pull_request() {
+                let (state, _tmp) = build_test_state().await;
+                let id = seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::PrCreated).await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let t = tasks.get_mut(&id).unwrap();
+                    delivered_through(t, PR_B);
+                    t.external_refs.insert(0, pr_link(PR_A, "OPEN"));
+                }
+                let remove = |index| {
+                    crate::commands::task::remove_external_ref_serialized(
+                        &state.task.tasks,
+                        &state.storage,
+                        &state.task_lifecycle_locks,
+                        id,
+                        index,
+                    )
+                };
+                let kept = remove(0).await.unwrap().unwrap();
+                assert_eq!(kept.pr_url.as_deref(), Some(PR_B), "A was not the delivery");
+                let cleared = remove(0).await.unwrap().unwrap();
+                assert_eq!(cleared.pr_url, None, "B was, and is cleared with it");
+                assert!(cleared.external_refs.is_empty());
+                let on_disk = state
+                    .storage
+                    .load_project_tasks(cleared.project_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .unwrap();
+                assert_eq!(on_disk.pr_url, None);
+
+                let legacy = seed_task(&state, "/tmp", Some("task-legacy"), TaskStatus::PrCreated).await;
+                state.task.tasks.write().await.get_mut(&legacy).unwrap().pr_url = Some(PR_A.to_string());
+                let task = crate::commands::task::remove_external_ref_serialized(
+                    &state.task.tasks,
+                    &state.storage,
+                    &state.task_lifecycle_locks,
+                    legacy,
+                    0,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(task.pr_url.as_deref(), Some(PR_A), "nothing to unlink on a pr_url-only task");
+            }
+
+            /// Another removal shifts a different pull request into the chosen
+            /// position while the removal waits for the lease: nothing is
+            /// removed and no `pr_url` is cleared for a link nobody chose.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_removal_never_removes_a_reference_that_moved_into_its_position() {
+                use futures::FutureExt;
+                let (state, _tmp) = build_test_state().await;
+                let id = seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::PrCreated).await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let t = tasks.get_mut(&id).unwrap();
+                    t.external_refs.push(crate::domain::task::ExternalRef::LinearTicket { id: "L-1".to_string() });
+                    t.external_refs.push(pr_link(PR_A, "OPEN"));
+                    delivered_through(t, PR_B);
+                }
+                let remove = |index| {
+                    crate::commands::task::remove_external_ref_serialized(
+                        &state.task.tasks,
+                        &state.storage,
+                        &state.task_lifecycle_locks,
+                        id,
+                        index,
+                    )
+                };
+                let lease = state.task_lifecycle_locks.acquire(id).await.unwrap();
+                // Chosen: pull request A at index 1. It waits for the lease.
+                let mut waiting = Box::pin(remove(1));
+                assert!(waiting.as_mut().now_or_never().is_none());
+                // The ticket before it is removed meanwhile, with no lease, so
+                // pull request B now sits at index 1.
+                remove(0).await.unwrap().unwrap();
+                drop(lease);
+
+                let refused = waiting.await.expect_err("the chosen reference is no longer there");
+                assert!(refused.contains("changed"), "{refused}");
+                let task = state.task.tasks.read().await[&id].clone();
+                assert_eq!(task.external_refs.len(), 2, "nothing was removed");
+                assert_eq!(task.pr_url.as_deref(), Some(PR_B), "and the delivery was not cleared");
+            }
+
+            /// Replacing the delivery waits for the lifecycle lease, as
+            /// unlinking does.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn relinking_waits_for_the_lifecycle_lease() {
+                use futures::FutureExt;
+                use tauri::Manager;
+                let (state, _tmp) = build_test_state().await;
+                let id = seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::PrCreated).await;
+                let lease = state.task_lifecycle_locks.acquire(id).await.unwrap();
+                let app = tauri::test::mock_app();
+                app.manage(state);
+                let mut relink = Box::pin(crate::commands::task::link_pr(app.state(), id.to_string(), PR_B.to_string()));
+                assert!(relink.as_mut().now_or_never().is_none(), "blocked by the lease holder");
+                assert_eq!(app.state::<crate::AppState>().task.tasks.read().await[&id].pr_url, None);
+                drop(lease);
+                let task = relink.await.unwrap().unwrap();
+                assert_eq!(task.pr_url.as_deref(), Some(PR_B));
             }
 
             // ──────────────────────────────────────────────
