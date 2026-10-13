@@ -204,12 +204,14 @@ pub struct Storage {
     /// from the table (no repository attached, or config not loaded yet) falls
     /// back to the legacy global location rather than guessing.
     routes: Arc<RwLock<HashMap<Uuid, PathBuf>>>,
-    /// Task files [`Self::load_all_tasks`] could not read. The board in memory
-    /// for such a project was built without them, so it is empty or partial
-    /// however the file looks later: a repair made while the app runs does not
-    /// reach memory, and a save of that board would replace the repaired file
-    /// with it. Saves over these refuse until a load reads the file again.
-    unloaded_boards: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+    /// Projects whose Task file [`Self::load_all_tasks`] could not read, with
+    /// that file. The board in memory for such a project was built without it,
+    /// so it is empty or partial however the file looks later: a repair made
+    /// while the app runs does not reach memory, and a save of that board would
+    /// replace the repaired file with it. Keyed by project, not path, so a
+    /// route change that moves the board does not lift the guard. Saves refuse
+    /// until a load reads the project's file again.
+    unloaded_boards: Arc<Mutex<HashMap<Uuid, PathBuf>>>,
     /// Serializes every read-modify-write transaction over `config_file`.
     ///
     /// `config.toml` is one shared persistence unit: each writer replaces a
@@ -429,7 +431,7 @@ impl Storage {
             paths: Arc::new(paths),
             config_file,
             routes: Arc::new(RwLock::new(HashMap::new())),
-            unloaded_boards: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            unloaded_boards: Arc::new(Mutex::new(HashMap::new())),
             config_tx: Arc::new(Mutex::new(())),
         }
     }
@@ -862,16 +864,20 @@ impl Storage {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        for source in self.task_files()? {
+        for (owner, source) in self.task_files()? {
             match Self::inspect_tasks_file(&source) {
                 TasksFileState::Board(tasks) => {
-                    unloaded.remove(&source);
+                    if let Some(owner) = owner {
+                        unloaded.remove(&owner);
+                    }
                     all_tasks.extend(tasks);
                 }
                 TasksFileState::Absent => {}
                 TasksFileState::Unreadable(e) => {
                     eprintln!("Warning: {e}");
-                    unloaded.insert(source);
+                    if let Some(owner) = owner {
+                        unloaded.insert(owner, source);
+                    }
                 }
             }
         }
@@ -884,7 +890,7 @@ impl Storage {
     /// something must ask first.
     pub fn unreadable_task_files(&self) -> Result<Vec<PathBuf>> {
         let mut unreadable = Vec::new();
-        for source in self.task_files()? {
+        for (_, source) in self.task_files()? {
             if matches!(
                 Self::inspect_tasks_file(&source),
                 TasksFileState::Unreadable(_)
@@ -896,8 +902,9 @@ impl Storage {
     }
 
     /// Every file a task can be loaded from, each project's own first and
-    /// the legacy ones no project has claimed after.
-    fn task_files(&self) -> Result<Vec<PathBuf>> {
+    /// the legacy ones no project has claimed after, with the project each
+    /// belongs to when that is known (a legacy file is named for its project).
+    fn task_files(&self) -> Result<Vec<(Option<Uuid>, PathBuf)>> {
         let mut files = Vec::new();
         let mut seen_files = std::collections::HashSet::new();
 
@@ -924,11 +931,11 @@ impl Storage {
             seen_files.insert(legacy.clone());
 
             if path.is_file() {
-                files.push(path);
+                files.push((Some(*project_id), path));
             } else if legacy.is_file() {
                 // Not migrated yet: read from where the tasks still are, so
                 // nothing disappears on upgrade.
-                files.push(legacy);
+                files.push((Some(*project_id), legacy));
             }
         }
 
@@ -939,7 +946,11 @@ impl Storage {
                 if path.extension().is_some_and(|ext| ext == "toml")
                     && !seen_files.contains(&path)
                 {
-                    files.push(path);
+                    let owner = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .and_then(|stem| Uuid::parse_str(stem).ok());
+                    files.push((owner, path));
                 }
             }
         }
@@ -986,20 +997,23 @@ impl Storage {
     /// disk, so a stale or empty in-memory board cannot get past a file that
     /// is bad now; [`Self::unloaded_boards`] covers the one that is good now
     /// but was bad when memory was built.
-    fn ensure_board_replaceable(&self, path: &Path, legacy: &Path) -> Result<()> {
-        let (source, state) = Self::board_at(path.to_path_buf(), legacy);
+    fn ensure_board_replaceable(
+        &self,
+        project_id: Uuid,
+        path: &Path,
+        legacy: &Path,
+    ) -> Result<()> {
+        let (_, state) = Self::board_at(path.to_path_buf(), legacy);
         if let TasksFileState::Unreadable(e) = state {
             return Err(e.into());
         }
-        // Either location may be the one startup skipped: a route that changed
-        // since then can leave a readable routed file beside a legacy board
-        // memory never saw.
-        let skipped = [source.as_path(), path, legacy]
-            .into_iter()
-            .find(|candidate| self.was_unloaded(candidate));
+        let skipped = match self.unloaded_boards.lock() {
+            Ok(guard) => guard.get(&project_id).cloned(),
+            Err(poisoned) => poisoned.into_inner().get(&project_id).cloned(),
+        };
         match skipped {
             Some(skipped) => Err(UnreadableTasksFile {
-                path: skipped.to_path_buf(),
+                path: skipped,
                 reason: "it could not be read when SlashIt started, so the board in memory \
                          does not include it"
                     .to_string(),
@@ -1007,14 +1021,6 @@ impl Storage {
             .into()),
             None => Ok(()),
         }
-    }
-
-    fn was_unloaded(&self, path: &Path) -> bool {
-        let unloaded = match self.unloaded_boards.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        unloaded.contains(path)
     }
 
     /// Save tasks for a specific project.
@@ -1035,7 +1041,7 @@ impl Storage {
     pub fn save_project_tasks(&self, project_id: Uuid, tasks: &[Task]) -> Result<()> {
         let path = self.tasks_path(project_id);
         let legacy = self.legacy_tasks_path(project_id);
-        self.ensure_board_replaceable(&path, &legacy)?;
+        self.ensure_board_replaceable(project_id, &path, &legacy)?;
 
         let tasks_file = ProjectTasksFile {
             version: TASKS_FILE_VERSION,
@@ -1049,7 +1055,7 @@ impl Storage {
         let tmp = unique_temp_path(&path);
         fs::write(&tmp, contents.as_bytes()).context("Failed to write tasks file")?;
         let published = self
-            .ensure_board_replaceable(&path, &legacy)
+            .ensure_board_replaceable(project_id, &path, &legacy)
             .and_then(|()| fs::rename(&tmp, &path).context("Failed to write tasks file"));
         if let Err(e) = published {
             let _ = fs::remove_file(&tmp);
@@ -1581,10 +1587,15 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         let project_id = Uuid::new_v4();
 
-        // Unrouted at startup: the legacy file is the board, and it is bad.
+        // Unrouted at startup: the legacy file is the board, and it is bad. It
+        // holds a Pending integration record under a status this build does
+        // not know.
         let legacy = storage.legacy_tasks_path(project_id);
         fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, b"tasks = [ not toml").unwrap();
+        let legacy_bytes = valid_board_text(project_id)
+            .replacen("status = \"backlog\"", "status = \"from_the_future\"", 1)
+            .into_bytes();
+        fs::write(&legacy, &legacy_bytes).unwrap();
         assert!(storage.load_all_tasks().unwrap().is_empty());
 
         // The project is routed later and a readable routed board appears.
@@ -1597,7 +1608,43 @@ mod tests {
 
         assert!(storage.save_project_tasks(project_id, &[]).is_err());
         assert_eq!(fs::read_to_string(&routed).unwrap(), routed_text);
-        assert_eq!(fs::read(&legacy).unwrap(), b"tasks = [ not toml");
+        assert_eq!(fs::read(&legacy).unwrap(), legacy_bytes);
+        assert!(String::from_utf8(legacy_bytes).unwrap().contains("[tasks.local_integration]"));
+        // Neither a second attempt nor a restart-less retry changes anything.
+        assert!(storage.save_project_tasks(project_id, &[]).is_err());
+        assert_eq!(fs::read_to_string(&routed).unwrap(), routed_text);
+    }
+
+    #[test]
+    fn a_board_skipped_at_startup_stays_guarded_when_the_route_moves_it() {
+        let (storage, temp) = create_test_storage();
+        let repo_a = temp.path().join("repo-a");
+        let repo_b = temp.path().join("repo-b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        let project_id = Uuid::new_v4();
+
+        // Routed at startup, board unreadable.
+        route_project_to(&storage, project_id, &repo_a);
+        let first = storage.tasks_path(project_id);
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(&first, b"tasks = [ not toml").unwrap();
+        assert!(storage.load_all_tasks().unwrap().is_empty());
+
+        // The project is re-pointed; the bytes land at the new route, are
+        // repaired there by hand, and a save must still not replace them.
+        route_project_to(&storage, project_id, &repo_b);
+        let second = storage.tasks_path(project_id);
+        assert_ne!(first, second);
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        let repaired = valid_board_text(project_id);
+        fs::write(&second, &repaired).unwrap();
+
+        assert!(storage.save_project_tasks(project_id, &[]).is_err());
+        assert_eq!(fs::read_to_string(&second).unwrap(), repaired);
+        assert_eq!(fs::read(&first).unwrap(), b"tasks = [ not toml");
+        // Other projects are unaffected.
+        storage.save_project_tasks(Uuid::new_v4(), &[]).unwrap();
     }
 
     // ==================== AppConfig Serde Default Tests ====================
