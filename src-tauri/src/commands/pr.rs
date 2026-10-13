@@ -13684,6 +13684,47 @@ mod tests {
                 assert_eq!(task.pr_url.as_deref(), Some(PR_A), "nothing to unlink on a pr_url-only task");
             }
 
+            /// Another removal shifts a different pull request into the chosen
+            /// position while the removal waits for the lease: nothing is
+            /// removed and no `pr_url` is cleared for a link nobody chose.
+            #[cfg(unix)]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_removal_never_removes_a_reference_that_moved_into_its_position() {
+                use futures::FutureExt;
+                let (state, _tmp) = build_test_state().await;
+                let id = seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::PrCreated).await;
+                {
+                    let mut tasks = state.task.tasks.write().await;
+                    let t = tasks.get_mut(&id).unwrap();
+                    t.external_refs.push(crate::domain::task::ExternalRef::LinearTicket { id: "L-1".to_string() });
+                    t.external_refs.push(pr_link(PR_A, "OPEN"));
+                    delivered_through(t, PR_B);
+                }
+                let remove = |index| {
+                    crate::commands::task::remove_external_ref_serialized(
+                        &state.task.tasks,
+                        &state.storage,
+                        &state.task_lifecycle_locks,
+                        id,
+                        index,
+                    )
+                };
+                let lease = state.task_lifecycle_locks.acquire(id).await.unwrap();
+                // Chosen: pull request A at index 1. It waits for the lease.
+                let mut waiting = Box::pin(remove(1));
+                assert!(waiting.as_mut().now_or_never().is_none());
+                // The ticket before it is removed meanwhile, with no lease, so
+                // pull request B now sits at index 1.
+                remove(0).await.unwrap().unwrap();
+                drop(lease);
+
+                let refused = waiting.await.expect_err("the chosen reference is no longer there");
+                assert!(refused.contains("changed"), "{refused}");
+                let task = state.task.tasks.read().await[&id].clone();
+                assert_eq!(task.external_refs.len(), 2, "nothing was removed");
+                assert_eq!(task.pr_url.as_deref(), Some(PR_B), "and the delivery was not cleared");
+            }
+
             /// Replacing the delivery waits for the lifecycle lease, as
             /// unlinking does.
             #[cfg(unix)]

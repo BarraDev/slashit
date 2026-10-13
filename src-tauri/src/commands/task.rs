@@ -763,10 +763,13 @@ pub async fn remove_external_ref(
 /// `Task::authoritative_pr_url`).
 ///
 /// The index is only meaningful against the list it was chosen from, so the
-/// kind of reference at `ref_index` is read before the lease is awaited
-/// (never holding the task map across the wait) and checked again under the
-/// write; if another removal shifted a different kind of reference into that
-/// position meanwhile, the choice is made again.
+/// reference at `ref_index` is read before the lease is awaited (never holding
+/// the task map across the wait) and compared again under the write. If
+/// another removal moved a different reference into that position meanwhile,
+/// nothing is removed and the caller is told to ask again, rather than
+/// removing, or clearing the `pr_url` of, a reference nobody chose. Two pull
+/// request references are the same link when their URLs are; their recorded
+/// state changes under a poll and is not identity.
 pub(crate) async fn remove_external_ref_serialized(
     tasks: &crate::lifecycle::Tasks,
     storage: &crate::config::Storage,
@@ -774,56 +777,58 @@ pub(crate) async fn remove_external_ref_serialized(
     task_id: Uuid,
     ref_index: usize,
 ) -> Result<Option<Task>, String> {
-    let is_pr = |r: &ExternalRef| matches!(r, ExternalRef::GithubPr { .. });
-    for _ in 0..3 {
-        let guards_lifecycle = {
-            let tasks = tasks.read().await;
-            let Some(task) = tasks.get(&task_id) else {
-                return Ok(None);
-            };
-            task.external_refs.get(ref_index).is_some_and(is_pr)
+    let same_link = |a: &ExternalRef, b: &ExternalRef| match (a, b) {
+        (ExternalRef::GithubPr { url: a, .. }, ExternalRef::GithubPr { url: b, .. }) => a == b,
+        _ => a == b,
+    };
+    let chosen = {
+        let tasks = tasks.read().await;
+        let Some(task) = tasks.get(&task_id) else {
+            return Ok(None);
         };
-        let _lease = if guards_lifecycle { Some(locks.acquire(task_id).await?) } else { None };
+        task.external_refs.get(ref_index).cloned()
+    };
+    let guards_lifecycle = matches!(chosen, Some(ExternalRef::GithubPr { .. }));
+    let _lease = if guards_lifecycle { Some(locks.acquire(task_id).await?) } else { None };
 
-        let shifted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let revise = {
-            let shifted = shifted.clone();
-            move |staged: &mut HashMap<Uuid, Task>| {
-                let Some(task) = staged.get_mut(&task_id) else {
-                    return false;
-                };
-                match task.external_refs.get(ref_index) {
-                    Some(r) if is_pr(r) != guards_lifecycle => {
-                        shifted.store(true, std::sync::atomic::Ordering::SeqCst);
-                        false
-                    }
-                    Some(_) => {
-                        let removed = task.external_refs.remove(ref_index);
-                        // Unlinking the pull request unlinks the delivery
-                        // that names it, in the same write: a `pr_url` left
-                        // behind would keep naming a pull request the task
-                        // no longer links, and a refresh would go on acting
-                        // on it. A different `pr_url` is another link and
-                        // stays.
-                        if let ExternalRef::GithubPr { url, .. } = &removed {
-                            if task.pr_url.as_deref() == Some(url.as_str()) {
-                                task.pr_url = None;
-                            }
-                        }
-                        true
-                    }
-                    None => false,
+    let moved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let revise = {
+        let moved = moved.clone();
+        move |staged: &mut HashMap<Uuid, Task>| {
+            let Some(task) = staged.get_mut(&task_id) else {
+                return false;
+            };
+            // Nothing was there to choose.
+            let Some(chosen) = chosen.as_ref() else {
+                return false;
+            };
+            if !task.external_refs.get(ref_index).is_some_and(|now| same_link(chosen, now)) {
+                moved.store(true, std::sync::atomic::Ordering::SeqCst);
+                return false;
+            }
+            let removed = task.external_refs.remove(ref_index);
+            // Unlinking the pull request unlinks the delivery that names it,
+            // in the same write: a `pr_url` left behind would keep naming a
+            // pull request the task no longer links, and a refresh would go
+            // on acting on it. A different `pr_url` is another link and
+            // stays.
+            if let ExternalRef::GithubPr { url, .. } = &removed {
+                if task.pr_url.as_deref() == Some(url.as_str()) {
+                    task.pr_url = None;
                 }
             }
-        };
-        match crate::lifecycle::record_if_changed(tasks, storage, task_id, &revise).await {
-            Ok(_) if shifted.load(std::sync::atomic::Ordering::SeqCst) => continue,
-            Ok(_) => return Ok(tasks.read().await.get(&task_id).cloned()),
-            Err(_) if !tasks.read().await.contains_key(&task_id) => return Ok(None),
-            Err(e) => return Err(e),
+            true
         }
+    };
+    match crate::lifecycle::record_if_changed(tasks, storage, task_id, &revise).await {
+        Ok(_) if moved.load(std::sync::atomic::Ordering::SeqCst) => Err(
+            "the task's references changed while this was waiting; nothing was removed, so this can be asked for again"
+                .to_string(),
+        ),
+        Ok(_) => Ok(tasks.read().await.get(&task_id).cloned()),
+        Err(_) if !tasks.read().await.contains_key(&task_id) => Ok(None),
+        Err(e) => Err(e),
     }
-    Err("the task's references kept changing; nothing was removed, so this can be asked for again".to_string())
 }
 
 /// Core update_task_status logic extracted for testability.
