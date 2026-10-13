@@ -251,6 +251,7 @@ pub fn run() {
                     pty: state.pty.clone(),
                     queue_manager: state.queue.manager.clone(),
                     storage: state.storage.clone(),
+                    project_gate: state.task.project_gate.clone(),
                     events: events.clone(),
                     control: control.clone(),
                     features: state.features.clone(),

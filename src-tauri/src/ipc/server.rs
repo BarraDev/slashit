@@ -82,6 +82,11 @@ pub struct IpcContext {
     pub queue_manager: Arc<RwLock<crate::queue::QueueManager>>,
     pub storage: crate::config::Storage,
 
+    /// The Project lifecycle gate, shared with `AppState.task.project_gate`:
+    /// Task creation from the CLI takes it shared, exactly as the desktop's
+    /// own creation paths do.
+    pub project_gate: crate::lifecycle::ProjectLifecycleGate,
+
     /// Where a handler reports to when it has something to say.
     ///
     /// Held rather than reached for: a handler that needed to notify the UI

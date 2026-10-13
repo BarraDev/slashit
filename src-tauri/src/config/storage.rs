@@ -440,14 +440,55 @@ impl Storage {
         project_id: Uuid,
         board_files: &[PathBuf],
     ) -> Result<()> {
+        self::Storage::check_cleanup_paths_losslessly_recordable(board_files)?;
         let path = self.paths.pending_project_tasks_deletion_file(project_id);
         let mut contents = project_id.to_string();
         for board_file in board_files {
+            // Checked by `check_cleanup_paths_losslessly_recordable` above;
+            // this stays `.to_str()` so a record line can never be a lossy
+            // rendering of a path.
             contents.push('\n');
-            contents.push_str(&board_file.to_string_lossy());
+            contents.push_str(board_file.to_str().expect("checked above"));
         }
         write_private_atomic(&path, contents.as_bytes())
             .context("Failed to persist pending Project Task cleanup")
+    }
+
+    /// Whether the pending-cleanup record format can name these paths without
+    /// loss.
+    ///
+    /// The record is one path per line, so a newline inside a path would
+    /// corrupt it, and the file is read as text, so a non-UTF-8 path cannot be
+    /// carried. Refusing is the removal decision this Process cannot carry
+    /// out safely; the caller treats it as a refusal that deleted nothing.
+    pub fn check_cleanup_paths_losslessly_recordable(board_files: &[PathBuf]) -> Result<()> {
+        for board_file in board_files {
+            let Some(text) = board_file.to_str() else {
+                anyhow::bail!(
+                    "the path {board_file:?} is not valid UTF-8, and a pending task cleanup \
+                     record cannot carry it faithfully"
+                );
+            };
+            if text.contains('\n') || text.contains('\r') {
+                anyhow::bail!(
+                    "the path {board_file:?} contains a line break, and a pending task cleanup \
+                     record is one path per line"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether an unfinished earlier attempt left a Task cleanup record for
+    /// this Project.
+    pub fn has_pending_tasks_deletion_record(&self, project_id: Uuid) -> Result<bool> {
+        match fs::metadata(self.paths.pending_project_tasks_deletion_file(project_id)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(anyhow::Error::new(error).context(
+                "Failed to read pending Task cleanup record",
+            )),
+        }
     }
 
     /// Drop the retry reference. Call only once Task cleanup has finished, or
@@ -2536,6 +2577,73 @@ user_name = "Test"
         let loaded = storage.load_all_tasks().expect("Should load");
         assert_eq!(loaded.len(), 1, "stale legacy copy must be ignored");
         assert_eq!(loaded[0].title, "Current");
+    }
+
+    /// The cleanup record is one path per line read back as text, so a line
+    /// break inside a path would silently corrupt it. Fail closed.
+    #[test]
+    fn a_board_path_with_a_line_break_is_refused_rather_than_encoded_lossily() {
+        let (storage, _temp) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let broken = storage.legacy_tasks_path(project_id).with_file_name("line\nbreak.toml");
+
+        let error = storage
+            .mark_project_tasks_deletion_pending(project_id, std::slice::from_ref(&broken))
+            .expect_err("a line break cannot survive the record format");
+        assert!(
+            error.to_string().contains("line break") || error.to_string().contains("one path per line"),
+            "{error:?}"
+        );
+        assert!(
+            !storage
+                .paths()
+                .pending_project_tasks_deletion_file(project_id)
+                .exists(),
+            "a refused record must not have been written"
+        );
+        assert!(!pending_list_contains(&storage, project_id));
+    }
+
+    /// A non-UTF-8 path byte cannot round-trip through the text record at
+    /// all, so the record is not written and the caller refuses.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_board_path_is_refused_rather_than_encoded_lossily() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (storage, _temp) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let lossy_to_be = PathBuf::from(std::ffi::OsString::from_vec(
+            b"state/\xff/repo".to_vec(),
+        ));
+
+        assert!(lossy_to_be.to_str().is_none(), "fixture must be non-UTF-8");
+        let error = storage
+            .mark_project_tasks_deletion_pending(
+                project_id,
+                std::slice::from_ref(&lossy_to_be),
+            )
+            .expect_err("a non-UTF-8 path cannot survive the record format");
+        assert!(
+            error.to_string().contains("UTF-8") || error.to_string().contains("faithfully"),
+            "{error:?}"
+        );
+        assert!(
+            !storage
+                .paths()
+                .pending_project_tasks_deletion_file(project_id)
+                .exists()
+        );
+        assert!(!pending_list_contains(&storage, project_id));
+    }
+
+    /// `true` when the Project shows up in `pending_project_tasks_deletions`.
+    fn pending_list_contains(storage: &Storage, project_id: Uuid) -> bool {
+        storage
+            .pending_project_tasks_deletions()
+            .unwrap()
+            .iter()
+            .any(|record| record.project_id == project_id)
     }
 
     #[test]

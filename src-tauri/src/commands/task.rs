@@ -39,6 +39,10 @@ pub struct TaskState {
     pub tasks: Tasks,
     /// Tasks whose pull request is being opened right now.
     pub deliveries: crate::commands::human_review::DeliveriesInFlight,
+    /// The Project lifecycle gate: Project deletions hold it exclusively for
+    /// their whole transaction; Task creation takes it shared from its first
+    /// board read.
+    pub project_gate: crate::lifecycle::ProjectLifecycleGate,
 }
 
 impl TaskState {
@@ -46,6 +50,7 @@ impl TaskState {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
             deliveries: Default::default(),
+            project_gate: crate::lifecycle::ProjectLifecycleGate::new(),
         }
     }
 }
@@ -104,6 +109,7 @@ pub async fn create_task(
         linear_ticket_id: params.linear_ticket_id,
     };
     crate::lifecycle::create(
+        &state.task.project_gate,
         &state.task.tasks,
         &state.project.projects,
         &state.storage,

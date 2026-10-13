@@ -472,12 +472,19 @@ pub async fn commit_task(
 /// it was, so a caller told creation failed never goes on to see the task
 /// anyway.
 pub async fn create(
+    gate: &ProjectLifecycleGate,
     tasks: &Tasks,
     projects: &RwLock<HashMap<Uuid, Project>>,
     storage: &Storage,
     project_id: Uuid,
     build: impl FnOnce(&HashMap<Uuid, Task>) -> Task,
 ) -> Result<Task, String> {
+    // The deletion barrier is held before anything is read: if a deletion is
+    // underway, this creation waits for it to settle and is then refused by
+    // the existence check below -- the Project went away while this creation
+    // was waiting. Sharing one per-Project gate with the deletion is what
+    // keeps a deletion's Task-decision frozen against a birth.
+    let _gate = gate.read(project_id).await;
     let mut tasks_w = tasks.write().await;
 
     // Asking whether the Project exists before waiting on this lock would
@@ -508,12 +515,15 @@ pub async fn create(
 /// whole batch, so a refused save leaves neither the board nor the disk with
 /// a part of it.
 pub async fn create_batch(
+    gate: &ProjectLifecycleGate,
     tasks: &Tasks,
     projects: &RwLock<HashMap<Uuid, Project>>,
     storage: &Storage,
     project_id: Uuid,
     new_tasks: &[Task],
 ) -> Result<(), String> {
+    // The deletion barrier; see [`create`].
+    let _gate = gate.read(project_id).await;
     let mut tasks_w = tasks.write().await;
 
     // The same under-lock existence check [`create`] does, for the same
@@ -857,6 +867,63 @@ pub async fn delete(ctx: TerminalizeCtx<'_>, task_id: Uuid) -> Result<bool, Term
     Ok(true)
 }
 
+
+/// Per-Project barrier serializing Project deletion against Task creation.
+///
+/// Project deletion takes this gate **exclusively** before its lease snapshot
+/// and holds it for the whole transaction; every Task creation takes it
+/// **shared** from before its board insert until its project-existence check
+/// has answered. The two checks of a deletion (the durable Task records and
+/// the board) therefore look at a Task set no concurrent creation can extend,
+/// and a creation that arrives mid-transaction waits for the deletion to
+/// settle and is then refused by the existence check those functions already
+/// run -- a refusal before anything was written, exactly the guarantee a
+/// deletion refusal itself promises.
+///
+/// The gate is deliberately *inside* [`create`] and [`create_batch`]: they
+/// are the authoritative Task-creation boundary, so no later front door
+/// (desktop, CLI, import) can bypass it by forgetting its own call.
+///
+/// One-process guarantee: a separate SlashIt process (desktop and daemon can
+/// both run against the same storage) is not excluded by an in-process
+/// barrier; the pre-existing, unsupported cross-process contract of the
+/// storage layer applies unchanged. See `docs/architecture/daemon.md`.
+#[derive(Clone, Default)]
+pub struct ProjectLifecycleGate {
+    inner: std::sync::Arc<PerProjectGate>,
+}
+
+#[derive(Default)]
+struct PerProjectGate {
+    per_project: tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::RwLock<()>>>>,
+}
+
+pub type ProjectLifecycleRead = tokio::sync::OwnedRwLockReadGuard<()>;
+pub type ProjectLifecycleWrite = tokio::sync::OwnedRwLockWriteGuard<()>;
+
+impl ProjectLifecycleGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    async fn per_project(&self, project_id: Uuid) -> Arc<tokio::sync::RwLock<()>> {
+        let mut per_project = self.inner.per_project.lock().await;
+        per_project
+            .entry(project_id)
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+    }
+
+    /// A Task creation's shared hold, from its first board read to its insert.
+    pub async fn read(&self, project_id: Uuid) -> ProjectLifecycleRead {
+        self.per_project(project_id).await.read_owned().await
+    }
+
+    /// A Project deletion's exclusive hold, for its whole transaction.
+    pub async fn write(&self, project_id: Uuid) -> ProjectLifecycleWrite {
+        self.per_project(project_id).await.write_owned().await
+    }
+}
 
 /// Why a Task blocks the deletion of the Project it belongs to, or `None`.
 ///
@@ -1259,6 +1326,7 @@ mod tests {
         worktree_manager: WorktreeManager,
         storage: Storage,
         authority: TaskLifecycleLocks,
+        gate: ProjectLifecycleGate,
         project_id: Uuid,
         storage_paths: AppPaths,
     }
@@ -1393,6 +1461,7 @@ mod tests {
             worktree_manager: WorktreeManager::new(Arc::new(app_paths.clone())),
             storage: Storage::with_paths(app_paths.clone()),
             authority: TaskLifecycleLocks::new(),
+            gate: ProjectLifecycleGate::new(),
             project_id,
             storage_paths: app_paths,
             _tmp: tmp,
@@ -2656,7 +2725,7 @@ mod tests {
         let damaged = b"tasks = [ not toml".to_vec();
         std::fs::write(&file, &damaged).unwrap();
 
-        let created = create(&world.tasks, &world.projects, &world.storage, world.project_id, |_| {
+        let created = create(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, |_| {
             let mut t = crate::test_helpers::create_test_task("New");
             t.project_id = world.project_id;
             t
@@ -2675,7 +2744,7 @@ mod tests {
 
         let mut imported = crate::test_helpers::create_test_task("Imported");
         imported.project_id = world.project_id;
-        assert!(create_batch(&world.tasks, &world.projects, &world.storage, world.project_id, &[imported]).await.is_err());
+        assert!(create_batch(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, &[imported]).await.is_err());
 
         let board = world.tasks.read().await;
         assert_eq!(board.len(), 1, "no refused change may appear on the board");
@@ -2708,7 +2777,7 @@ mod tests {
                 updated_at: chrono::Utc::now(),
             },
         );
-        let ok = create(&world.tasks, &world.projects, &world.storage, other, |_| {
+        let ok = create(&world.gate, &world.tasks, &world.projects, &world.storage, other, |_| {
             let mut t = crate::test_helpers::create_test_task("Elsewhere");
             t.project_id = other;
             t
@@ -2726,7 +2795,7 @@ mod tests {
         let mut existing = crate::test_helpers::create_test_task("Existing");
         existing.project_id = world.project_id;
         let existing_id = existing.id;
-        create_batch(&world.tasks, &world.projects, &world.storage, world.project_id, &[existing]).await.unwrap();
+        create_batch(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, &[existing]).await.unwrap();
 
         let batch: Vec<Task> = ["One", "Two", "Three"]
             .iter()
@@ -2738,7 +2807,7 @@ mod tests {
                 t
             })
             .collect();
-        create_batch(&world.tasks, &world.projects, &world.storage, world.project_id, &batch).await.unwrap();
+        create_batch(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, &batch).await.unwrap();
 
         assert_eq!(world.tasks.read().await.len(), 4);
         let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();

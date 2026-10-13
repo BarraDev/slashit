@@ -183,6 +183,7 @@ async fn handle_create_task(
         linear_ticket_id: None,
     };
     let result = crate::lifecycle::create(
+        &ctx.project_gate,
         &ctx.tasks,
         &ctx.projects,
         &ctx.storage,

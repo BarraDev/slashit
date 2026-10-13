@@ -610,6 +610,7 @@ pub async fn act_on_project_conversation(
                 storage: &state.storage,
                 projects: &state.project.projects,
                 locks: &state.task_lifecycle_locks,
+                gate: &state.task.project_gate,
             };
             conversation_actions::decide(&scope, &mut conversation, action_id, decision).await?;
             return Ok(snapshot(&state, conversation, None).await);

@@ -54,7 +54,9 @@ use crate::domain::conversation::{
     ProjectActionStatus, Role, TaskMutation, coordinator_may_move,
 };
 use crate::domain::{NewTask, Project, Task, TaskStatus};
-use crate::lifecycle::{self, EnqueueVerdict, StatusTransitionEffect, TaskLifecycleLocks, Tasks};
+use crate::lifecycle::{
+    self, EnqueueVerdict, ProjectLifecycleGate, StatusTransitionEffect, TaskLifecycleLocks, Tasks,
+};
 
 /// Everything an approved operation touches. `project_id` is the scope the
 /// Conversation belongs to; every Task target is validated against it here
@@ -66,6 +68,9 @@ pub struct Scope<'a> {
     pub projects: &'a RwLock<HashMap<Uuid, Project>>,
     /// The Task lifecycle's own serialization, taken by every status move.
     pub locks: &'a TaskLifecycleLocks,
+    /// The Project lifecycle gate; creation takes it shared so a Project
+    /// deletion cannot be deciding mid-birth.
+    pub gate: &'a ProjectLifecycleGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +304,7 @@ async fn execute(scope: &Scope<'_>, mutation: &TaskMutation) -> Result<Execution
                 linear_ticket_id: None,
             };
             let task = lifecycle::create(
+                scope.gate,
                 scope.tasks,
                 scope.projects,
                 scope.storage,
@@ -530,6 +536,7 @@ mod tests {
         projects: RwLock<HashMap<Uuid, Project>>,
         storage: Storage,
         locks: TaskLifecycleLocks,
+        gate: crate::lifecycle::ProjectLifecycleGate,
         project_id: Uuid,
     }
 
@@ -570,6 +577,7 @@ mod tests {
                 tasks: Arc::new(RwLock::new(HashMap::new())),
                 projects: RwLock::new(HashMap::from([(project_id, project)])),
                 locks: TaskLifecycleLocks::new(),
+                gate: crate::lifecycle::ProjectLifecycleGate::new(),
                 project_id,
                 _tmp: tmp,
             }
@@ -582,6 +590,7 @@ mod tests {
                 storage: &self.storage,
                 projects: &self.projects,
                 locks: &self.locks,
+                gate: &self.gate,
             }
         }
 
@@ -646,7 +655,7 @@ mod tests {
                     },
                 );
             }
-            lifecycle::create(&self.tasks, &self.projects, &self.storage, project_id, |existing| {
+            lifecycle::create(&self.gate, &self.tasks, &self.projects, &self.storage, project_id, |existing| {
                 Task::new_backlog(
                     existing,
                     NewTask {
