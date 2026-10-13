@@ -1684,9 +1684,20 @@ impl TaskExecutor {
             // user's resume or discard can end it, and the checkout it keeps is
             // its recovery evidence. The merge is latched for the same reasons;
             // the restack record, its backup and the checkout are not touched.
+            //
+            // An unfinished local integration refuses the same way, and the
+            // same reasons latch its merge too (issue #192): the lifecycle
+            // guard answers before anything is durable, only a person's
+            // Resume or Discard can end it, and the recovery record must stay
+            // exactly as it is. The ref becomes `MERGED` -- the remote fact,
+            // which also takes the task out of the poll's selection -- the
+            // record and its target branch are not touched, and the card
+            // carries the guard's own Resume/Discard wording instead of one
+            // silent retry every thirty seconds that can only refuse again.
             Err(
                 refusal @ (crate::lifecycle::TerminalizeRefusal::RepositoryUnresolved(_)
-                | crate::lifecycle::TerminalizeRefusal::RepublishPending),
+                | crate::lifecycle::TerminalizeRefusal::RepublishPending
+                | crate::lifecycle::TerminalizeRefusal::IntegrationUnfinished),
             ) => {
                 let reason = refusal.to_string();
                 let republish_pending =
@@ -1735,11 +1746,7 @@ impl TaskExecutor {
             // itself. Cleanup is never forced under a running agent, and a
             // quarantine is never touched automatically; both simply become
             // eligible again once the condition that is holding them clears.
-            // An unfinished local integration is the same kind of condition: a
-            // task with a pull request is never integrated locally, so this
-            // only waits for a person's Resume or Discard.
             Err(crate::lifecycle::TerminalizeRefusal::ExecutionActive)
-            | Err(crate::lifecycle::TerminalizeRefusal::IntegrationUnfinished)
             | Err(crate::lifecycle::TerminalizeRefusal::Quarantined(_))
             | Err(crate::lifecycle::TerminalizeRefusal::Busy(_))
             | Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => {}
@@ -5451,6 +5458,74 @@ mod tests {
         let after = executor.tasks.read().await[&id].clone();
         assert_eq!(after.status, TaskStatus::InProgress);
         assert_eq!(recorded_pr_state(&after).as_deref(), Some("OPEN"));
+    }
+
+    /// A merged pull request heard by the poll for a task a pending local
+    /// integration pins: the terminalization it implies refuses on the guard
+    /// before anything durable, so the poll latches the merge the same way it
+    /// latches its other stable blockers -- the remote fact on the reference,
+    /// the not-finished reason on the card, the record and the status that
+    /// Resume and Discard run on untouched -- and never asks again (issue
+    /// #192).
+    #[tokio::test]
+    async fn a_poll_heard_merge_is_latched_without_finishing_a_pinned_task() {
+        use crate::domain::{IntegrationState, IntegrationStrategy, LocalIntegration};
+        let (executor, _temps) = test_executor();
+        let (id, project_id) =
+            seed_with_pr(&executor, TaskStatus::HumanReview, pr_ref("owner/repo", 7, Some("OPEN"))).await;
+        {
+            let amend = move |staged: &mut HashMap<Uuid, Task>| {
+                if let Some(t) = staged.get_mut(&id) {
+                    t.human_review.approve(Some("1111111111111111111111111111111111111111".to_string()), chrono::Utc::now());
+                    t.local_integration = Some(LocalIntegration {
+                        state: IntegrationState::Pending,
+                        target_branch: "main".to_string(),
+                        target_old_oid: "0000000000000000000000000000000000000000".to_string(),
+                        approved_tip: "1111111111111111111111111111111111111111".to_string(),
+                        result_oid: "2222222222222222222222222222222222222222".to_string(),
+                        strategy: IntegrationStrategy::FastForward,
+                        checkout_path: None,
+                        started_at: chrono::Utc::now(),
+                        completed_at: None,
+                        completes_task: false,
+                    });
+                }
+            };
+            crate::lifecycle::record(&executor.tasks, &executor.storage, id, &amend)
+                .await
+                .expect("fixture record persists");
+        }
+        let before = executor.tasks.read().await.get(&id).unwrap().clone();
+        assert!(before.integration_unfinished_refusal().is_some(), "fixture: the record pins the task");
+
+        executor.apply_polled_pr_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), crate::pr_status::PrState::Merged).await;
+
+        for (seen, task) in [
+            ("in memory", executor.tasks.read().await[&id].clone()),
+            ("on disk", on_disk_task(&executor, project_id, id)),
+        ] {
+            assert_eq!(task.status, TaskStatus::HumanReview, "{seen}: the merge did not move the task");
+            assert_eq!(task.local_integration, before.local_integration, "{seen}: the recovery record is untouched");
+            assert_eq!(task.human_review, before.human_review, "{seen}: the approval stands");
+            assert!(task.overall_progress < 100 && !matches!(task.phase, TaskPhase::Complete), "{seen}: nothing was reported complete");
+            assert_eq!(recorded_pr_state(&task).as_deref(), Some("MERGED"), "{seen}: the merge is latched");
+            assert!(
+                task.error_message.as_deref().is_some_and(|m| m.contains("merged, but the task was not finished")),
+                "{seen}: the card says why: {:?}",
+                task.error_message
+            );
+            assert_eq!(
+                task.needs_you(false),
+                Some(crate::domain::task::AttentionReason::IntegrationUnfinished),
+                "{seen}: the recovery action is still on offer"
+            );
+        }
+
+        let tasks = executor.tasks.read().await;
+        assert!(
+            polled_pull_requests(&tasks, &executor.pr_statuses).is_empty(),
+            "latched: the poll is not asked about this pull request again"
+        );
     }
 
     #[tokio::test]
