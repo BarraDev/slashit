@@ -235,7 +235,7 @@ pub(crate) async fn tip_to_approve(state: &crate::AppState, task: &Task) -> Opti
     git::branch_tip(Path::new(&repo), branch).await.ok().flatten()
 }
 
-async fn repo_path_of(state: &crate::AppState, project_id: Uuid) -> Result<String, String> {
+pub(crate) async fn repo_path_of(state: &crate::AppState, project_id: Uuid) -> Result<String, String> {
     let repository_id = {
         let projects = state.project.projects.read().await;
         projects

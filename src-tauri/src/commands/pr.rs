@@ -458,6 +458,9 @@ pub(crate) async fn create_pr_for_approved_task(
             );
         }
         refuse_while_republish_pending(state, task_id).await?;
+        // The approval covers one commit. Refused here, before reserving ends
+        // whatever owns the task, when the branch is no longer at it.
+        approved_commit_for_delivery(state, task_id).await?;
         // One delivery per task: work being integrated into a local branch,
         // or already integrated there, is not also opened as a pull request.
         let integrating = state.task.tasks.read().await.get(&task_id).is_some_and(|t| t.integrating_current_approval());
@@ -473,7 +476,7 @@ pub(crate) async fn create_pr_for_approved_task(
             None => None,
         }
     };
-    create_pr_reserved(state, task_id, reservation).await
+    create_pr_reserved(state, task_id, reservation, None).await
 }
 
 /// Whether SlashIt can open a pull request for a task's project at all.
@@ -784,12 +787,57 @@ pub async fn recover_private_email_and_create_pr(
         return Err("The task commit already uses that author email".to_string());
     }
 
+    // The rewrite changes the commit a person approved, so it may only be
+    // done to that commit, and what it leaves must be that commit with a new
+    // author and nothing else.
+    let approved = approved_commit_for_delivery(&state, task_uuid).await?;
+    if approved.as_deref().is_some_and(|approved| approved != plan.commit_sha) {
+        return Err(
+            "The task's branch changed since you approved it, so its author was not rewritten and \
+             nothing was pushed. Review the branch as it is and approve it again to continue."
+                .to_string(),
+        );
+    }
+
     refuse_if_pr_operation_cancelled(&reservation, "rewriting the branch tip author")?;
     run_cmd("git", &["config", "user.email", email], &working_dir).await
         .map_err(|e| format!("Failed to set repo-local Git email: {}", e))?;
     rewrite_branch_tip_author(&working_dir, &branch, &plan, email).await?;
 
-    create_pr_reserved(&state, task_uuid, reservation).await
+    let reauthored = match approved {
+        Some(approved) => Some(reauthored_tip(&working_dir, &branch, &approved).await?),
+        None => None,
+    };
+    create_pr_reserved(&state, task_uuid, reservation, reauthored).await
+}
+
+/// The branch tip after an author rewrite, once it is shown to be the
+/// approved commit `approved` with only its author changed: the same tree on
+/// the same parents.
+async fn reauthored_tip(working_dir: &str, branch: &str, approved: &str) -> Result<String, String> {
+    let refused = || {
+        "The task's branch is not the approved commit with a new author, so nothing was pushed. \
+         Review the branch as it is and approve it again to continue."
+            .to_string()
+    };
+    let Some(tip) = git_branch_tip(working_dir, branch).await? else {
+        return Err(refused());
+    };
+    let mut shapes = Vec::new();
+    for commit in [tip.as_str(), approved] {
+        let mut args: Vec<String> = Vec::new();
+        if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
+            args.push(git_dir);
+        }
+        args.extend(["show", "-s", "--format=%T %P", commit].map(String::from));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        shapes.push(run_cmd("git", &args, working_dir).await.map_err(|_| refused())?);
+    }
+    if shapes[0] == shapes[1] {
+        Ok(tip)
+    } else {
+        Err(refused())
+    }
 }
 
 #[tauri::command]
@@ -3423,7 +3471,7 @@ async fn create_pr_inner(
     // `PrCreated`, and none of that may race an owner that can still mutate
     // the same checkout/branch. See `reserve_task_for_pr_side_effect`.
     let reservation = reserve_task_for_pr_side_effect(state, task_uuid).await?;
-    create_pr_reserved(state, task_uuid, reservation).await
+    create_pr_reserved(state, task_uuid, reservation, None).await
 }
 
 /// [`create_pr_inner`]'s body, for a caller that already holds the task's PR
@@ -3435,6 +3483,7 @@ async fn create_pr_reserved(
     state: &crate::AppState,
     task_uuid: Uuid,
     reservation: Option<crate::queue::PrHelperLease>,
+    reauthored_tip: Option<String>,
 ) -> Result<String, String> {
     // Repository-level, not task-workspace: every command below names its
     // branch explicitly (the task's recorded `branch_name`, never the
@@ -3473,6 +3522,16 @@ async fn create_pr_reserved(
             .to_string()
     })?;
 
+    // What a person approved is one commit. If the task has a current
+    // approval, only that commit may be published (or, after a recovery that
+    // re-authored it, the commit the recovery proved is that one), and the
+    // push below names it by object ID so the branch moving from here on
+    // cannot change what is sent.
+    let mut publish_tip = match reauthored_tip {
+        Some(tip) => Some(tip),
+        None => approved_commit_for_delivery(state, task_uuid).await?,
+    };
+
     if let Some(existing_pr_url) = find_existing_pr_for_branch(&working_dir, &task_branch_name).await? {
         // Classified rather than flattened. A cleanup this refused is a task that
         // is simply not finished, and the refusal is already persisted onto its
@@ -3507,8 +3566,17 @@ async fn create_pr_reserved(
         &task_branch_name,
         base.landed_parent.as_ref(),
         &reservation,
+        publish_tip.as_deref(),
     )
     .await?;
+    if matches!(restacked, RestackOutcome::Restacked) && publish_tip.is_some() {
+        // The restack replayed the approved commits onto the default branch;
+        // what it left is what is published.
+        publish_tip = git_branch_tip(&working_dir, &task_branch_name).await?;
+        if publish_tip.is_none() {
+            return Err("The task's branch is missing after it was restacked, so nothing was pushed.".to_string());
+        }
+    }
     if let (RestackOutcome::Unchanged(why), Some(landed)) = (&restacked, &base.landed_parent) {
         eprintln!(
             "[pr] {task_branch_name} was not restacked onto {}: {why}",
@@ -3517,7 +3585,7 @@ async fn create_pr_reserved(
     }
 
     refuse_if_pr_operation_cancelled(&reservation, "pushing the branch")?;
-    let branch = push_branch(&working_dir, &task_branch_name)
+    let branch = push_branch_pinned(&working_dir, &task_branch_name, publish_tip.as_deref())
         .await
         .map_err(friendly_pr_error)?;
 
@@ -3953,6 +4021,7 @@ async fn restack_onto_landed_parent(
     branch: &str,
     landed: Option<&LandedParent>,
     reservation: &Option<crate::queue::PrHelperLease>,
+    required_tip: Option<&str>,
 ) -> Result<RestackOutcome, String> {
     use crate::worktree::restack;
     let unchanged = |why: &str| Ok(RestackOutcome::Unchanged(why.to_string()));
@@ -3982,6 +4051,15 @@ async fn restack_onto_landed_parent(
     let Some(tip) = restack::exact_ref(repo, &branch_ref).await? else {
         return unchanged("the task's branch does not exist locally");
     };
+    // Only the approved commit is replayed: a branch that moved on since is
+    // refused rather than restacked and published.
+    if required_tip.is_some_and(|required| required != tip) {
+        return Err(
+            "The task's branch changed since you approved it, so it was not restacked or pushed. \
+             Review the branch as it is and approve it again to continue."
+                .to_string(),
+        );
+    }
     let backup = restack::backup_ref(task_uuid);
     recover_unfinished_restack(repo, worktree.as_deref(), branch, &tip, &backup, default).await?;
 
@@ -5307,6 +5385,21 @@ fn build_pr_body(task: &Task) -> String {
 /// reaches `git` as a bare argument: it gets `--` and a fully qualified
 /// `refs/heads/<b>:refs/heads/<b>` refspec.
 async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> {
+    push_branch_pinned(working_dir, branch, None).await
+}
+
+/// [`push_branch`], publishing exactly the commit `pinned` when there is one.
+///
+/// A push by branch name publishes whatever the branch is at the moment git
+/// reads it, so a check made earlier proves nothing about it. With a pinned
+/// commit the source of the refspec is that object ID: the branch moving
+/// after the check cannot change what reaches the remote, and a later commit
+/// or a rewrite stays local. The branch is read again here, after any `jj
+/// git export`, and a branch that is no longer at the pinned commit refuses
+/// before anything is sent. The push is still an ordinary one: a remote
+/// branch that is not an ancestor of the pinned commit is refused, never
+/// forced.
+async fn push_branch_pinned(working_dir: &str, branch: &str, pinned: Option<&str>) -> Result<String, String> {
     let branch = checked_task_branch(branch)?;
     let mut git_args: Vec<String> = Vec::new();
     if is_jj_repo(working_dir).await {
@@ -5317,12 +5410,120 @@ async fn push_branch(working_dir: &str, branch: &str) -> Result<String, String> 
         git_args.push(git_dir);
     }
 
-    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    let source = match pinned {
+        Some(commit) => {
+            let now = git_branch_tip(working_dir, branch).await?;
+            if now.as_deref() != Some(commit) {
+                return Err("The task's branch changed since you approved it, so nothing was pushed. \
+                     Review the branch as it is and approve it again to continue."
+                    .to_string());
+            }
+            commit.to_string()
+        }
+        None => format!("refs/heads/{branch}"),
+    };
+    let refspec = format!("{source}:refs/heads/{branch}");
     git_args.extend(["push", "-u", "--", "origin", &refspec].map(String::from));
     let git_args: Vec<&str> = git_args.iter().map(String::as_str).collect();
     run_cmd("git", &git_args, working_dir).await
         .map_err(|e| format!("git push failed: {}", e))?;
+    if pinned.is_some() {
+        // A push whose source is an object ID cannot record the upstream.
+        track_pushed_branch(working_dir, branch).await?;
+    }
     Ok(branch.to_string())
+}
+
+/// The commit local branch `branch` names, by exact ref, or `None` when there
+/// is no such branch. In a jj repository the bookmark is exported first, so
+/// this is the branch a push would see.
+async fn git_branch_tip(working_dir: &str, branch: &str) -> Result<Option<String>, String> {
+    let branch = checked_task_branch(branch)?;
+    let mut args: Vec<String> = Vec::new();
+    if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
+        args.push(git_dir);
+    }
+    let name = format!("refs/heads/{branch}");
+    args.extend(["for-each-ref", "--format=%(refname) %(objectname)", &name].map(String::from));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let listed = run_cmd("git", &args, working_dir).await?;
+    Ok(listed.lines().find_map(|line| {
+        let (refname, oid) = line.split_once(' ')?;
+        (refname == name).then(|| oid.to_string())
+    }))
+}
+
+/// Make local `branch` track `origin/<branch>`, which a push by object ID
+/// does not do. Written as configuration, as `git push -u` does, so it holds
+/// even when the remote's fetch refspec never creates `origin/<branch>`.
+async fn track_pushed_branch(working_dir: &str, branch: &str) -> Result<(), String> {
+    let mut prefix: Vec<String> = Vec::new();
+    if let Some(git_dir) = jj_git_dir_arg(working_dir).await? {
+        prefix.push(git_dir);
+    }
+    for (key, value) in [
+        (format!("branch.{branch}.remote"), "origin".to_string()),
+        (format!("branch.{branch}.merge"), format!("refs/heads/{branch}")),
+    ] {
+        let mut args = prefix.clone();
+        args.extend(["config".to_string(), key, value]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_cmd("git", &args, working_dir).await.map_err(|e| format!("git config failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The commit a delivery of `task` may publish: the one its current approval
+/// covers, once the branch is shown to still be there.
+///
+/// `Ok(None)` means there is no approval to bind (the task was never
+/// approved at Human Review, is not approved now, or has no branch) and the
+/// branch is delivered as it always was. A branch that moved, was rewritten,
+/// is missing, or whose approval recorded no commit is refused with the
+/// explanation a person can act on. The ref is read as a push would read it
+/// (a jj bookmark is exported first), and a delivery must still publish by
+/// this object ID rather than by name: the branch can move after this reads it.
+pub(crate) async fn approved_commit_for_delivery(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<Option<String>, String> {
+    let task = state.task.tasks.read().await.get(&task_id).cloned().ok_or("Task not found")?;
+    if task.branch_name.is_none() || !task.human_review.is_approved() {
+        return Ok(None);
+    }
+    let tip = task_branch_tip(state, task_id).await?;
+    task.human_review.binds(true, tip.as_deref()).map_err(|refusal| {
+        let mut message = refusal.to_string();
+        if task.status != TaskStatus::HumanReview {
+            // Approving again is a Human Review decision.
+            message.push_str(
+                " This task is no longer in Human Review: send it back to work and review it again, \
+                 or publish the branch yourself.",
+            );
+        }
+        message
+    })?;
+    Ok(task.human_review.approved_tip().map(str::to_string))
+}
+
+/// The tip of the task's branch as a push would see it: in a jj repository
+/// the bookmark is exported to Git first. `None` when the branch does not
+/// exist.
+pub(crate) async fn task_branch_tip(state: &crate::AppState, task_id: Uuid) -> Result<Option<String>, String> {
+    let branch = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .and_then(|t| t.branch_name.clone())
+        .ok_or("This task has no branch recorded.")?;
+    let working_dir = resolve_repository_dir(state, task_id).await?;
+    if is_jj_repo(&working_dir).await {
+        run_cmd("jj", &["--ignore-working-copy", "git", "export"], &working_dir).await
+            .map_err(|e| format!("jj git export failed: {}", e))?;
+    }
+    git_branch_tip(&working_dir, &branch).await
 }
 
 /// The `--git-dir` argument `git` needs in `working_dir`: the Git repository
@@ -8017,7 +8218,7 @@ mod tests {
         #[cfg(unix)]
         mod human_review_delivery {
             use super::*;
-            use crate::commands::human_review::{approve, retry_delivery, PrDelivery};
+            use crate::commands::human_review::{approve, approve_again, retry_delivery, PrDelivery};
 
             const PR_URL: &str = "https://github.com/testorg/testrepo/pull/7";
 
@@ -8080,6 +8281,291 @@ mod tests {
                 assert!(persisted.human_review.is_approved());
             }
 
+            /// A commit on `branch` after the one that was approved, made without
+            /// touching any checkout.
+            fn advance_branch(repo: &RepoFixture, branch: &str) -> String {
+                let tip = git(&repo.checkout, &["rev-parse", branch]);
+                let tree = format!("{tip}^{{tree}}");
+                let later = git(&repo.checkout, &["commit-tree", "-m", "after the approval", "-p", &tip, &tree]);
+                git(&repo.checkout, &["update-ref", &format!("refs/heads/{branch}"), &later]);
+                later
+            }
+
+            /// A `git` ahead of the real one on `PATH` that moves `branch` to
+            /// `to` just before any `push`: another process advancing the
+            /// branch after SlashIt checked it and before it published.
+            struct MoveBranchBeforePush {
+                _tmp: tempfile::TempDir,
+                saved_path: Option<String>,
+            }
+
+            impl MoveBranchBeforePush {
+                fn install(branch: &str, to: &str) -> Self {
+                    let real = StdCommand::new("sh").args(["-c", "command -v git"]).output().expect("which git");
+                    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+                    let tmp = tempfile::tempdir().expect("tempdir");
+                    let bin = tmp.path().join("bin");
+                    std::fs::create_dir_all(&bin).unwrap();
+                    let script = format!(
+                        "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = push ]; then {real} update-ref refs/heads/{branch} {to}; break; fi\ndone\nexec {real} \"$@\"\n"
+                    );
+                    write_executable(&bin.join("git"), &script);
+                    let saved_path = std::env::var("PATH").ok();
+                    let new_path = match &saved_path {
+                        Some(p) => format!("{}:{}", bin.display(), p),
+                        None => bin.display().to_string(),
+                    };
+                    // Safety: serialized via PATH_LOCK; restored on Drop.
+                    unsafe { std::env::set_var("PATH", new_path) };
+                    Self { _tmp: tmp, saved_path }
+                }
+            }
+
+            impl Drop for MoveBranchBeforePush {
+                fn drop(&mut self) {
+                    unsafe {
+                        match &self.saved_path {
+                            Some(p) => std::env::set_var("PATH", p),
+                            None => std::env::remove_var("PATH"),
+                        }
+                    }
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_branch_that_advanced_after_approval_is_not_published_and_a_new_approval_publishes_it() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let approved = create_branch(&repo, "task-moved");
+                let mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-moved"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                let project_id = project_of(&state, task_id).await;
+                approve(&state, task_id, false).await.expect("approved");
+                let later = advance_branch(&repo, "task-moved");
+
+                let outcome = retry_delivery(&state, task_id).await.expect("asked");
+                let Some(PrDelivery::Failed { reason }) = outcome.pr else {
+                    panic!("the branch moved, so the pull request must not open: {:?}", outcome.pr);
+                };
+                assert!(reason.contains("changed since you approved"), "{reason}");
+                assert_eq!(repo.remote_has_branch("task-moved"), None, "nothing was pushed");
+                assert!(!mock.read_log().contains("pr\ncreate"), "no pull request was asked for");
+                assert_eq!(git(&repo.checkout, &["rev-parse", "task-moved"]), later, "no commit was discarded");
+                for task in [state.task.tasks.read().await.get(&task_id).cloned().unwrap(), on_disk(&state, project_id, task_id)] {
+                    assert_eq!(task.status, TaskStatus::HumanReview);
+                    assert_eq!(task.human_review.approved_tip(), Some(approved.as_str()));
+                    assert_eq!(task.human_review.entries.len(), 1);
+                }
+
+                // A person who was shown the new commit can approve it.
+                let task = approve_again(&state, task_id, &later).await.expect("approved again");
+                assert_eq!(task.human_review.approved_tip(), Some(later.as_str()));
+                assert_eq!(task.human_review.entries.len(), 2, "the first decision stays on the record");
+                assert_eq!(task.human_review.entries[0].approved_tip.as_deref(), Some(approved.as_str()));
+
+                let outcome = retry_delivery(&state, task_id).await.expect("asked");
+                assert_eq!(outcome.pr, Some(PrDelivery::Created { url: PR_URL.to_string() }));
+                assert_eq!(repo.remote_has_branch("task-moved").as_deref(), Some(later.as_str()));
+                assert_eq!(
+                    git(&repo.checkout, &["rev-parse", "--abbrev-ref", "task-moved@{upstream}"]),
+                    "origin/task-moved",
+                    "the branch still tracks what was pushed"
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_branch_rewritten_after_approval_is_not_published() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-rewritten");
+                let _mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-rewritten"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                approve(&state, task_id, false).await.expect("approved");
+                // Replaced by a commit that does not contain the approved one.
+                let tree = "main^{tree}";
+                let other = git(&repo.checkout, &["commit-tree", "-m", "replacement", tree]);
+                git(&repo.checkout, &["update-ref", "refs/heads/task-rewritten", &other]);
+
+                for refusal in [
+                    create_pr_for_approved_task(&state, task_id).await.expect_err("replaced"),
+                    create_pr_inner(&state, &task_id.to_string()).await.expect_err("replaced"),
+                ] {
+                    assert!(refusal.contains("changed since you approved"), "{refusal}");
+                }
+                assert_eq!(repo.remote_has_branch("task-rewritten"), None);
+                assert_eq!(git(&repo.checkout, &["rev-parse", "task-rewritten"]), other);
+            }
+
+            /// The branch moving after the check cannot change what is published:
+            /// the push names the approved object ID.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_branch_that_moves_during_delivery_still_publishes_only_the_approved_commit() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                let approved = create_branch(&repo, "task-race");
+                let later = {
+                    let tree = format!("{approved}^{{tree}}");
+                    git(&repo.checkout, &["commit-tree", "-m", "late", "-p", &approved, &tree])
+                };
+                let _mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-race"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                approve(&state, task_id, false).await.expect("approved");
+                let _shim = MoveBranchBeforePush::install("task-race", &later);
+
+                let outcome = retry_delivery(&state, task_id).await.expect("asked");
+
+                assert_eq!(outcome.pr, Some(PrDelivery::Created { url: PR_URL.to_string() }));
+                assert_eq!(git(&repo.checkout, &["rev-parse", "task-race"]), later, "the branch did move");
+                assert_eq!(
+                    repo.remote_has_branch("task-race").as_deref(),
+                    Some(approved.as_str()),
+                    "and only the approved commit reached the remote"
+                );
+            }
+
+            /// In a colocated jj repository the branch is a bookmark, and a jj
+            /// rewrite moves it with no SlashIt involvement. Delivery sees the
+            /// bookmark as a push would, and refuses it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_bookmark_rewritten_by_jj_after_approval_is_not_published() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                repo.colocate_jj();
+                git(&repo.checkout, &["checkout", "-q", "-b", "task-jj"]);
+                std::fs::write(repo.checkout.join("taskfile.txt"), "task work").unwrap();
+                git(&repo.checkout, &["add", "taskfile.txt"]);
+                git(&repo.checkout, &["commit", "-q", "-m", "task commit"]);
+                let approved = git(&repo.checkout, &["rev-parse", "task-jj"]);
+                git(&repo.checkout, &["checkout", "-q", "main"]);
+                jj(&repo.checkout, &["--ignore-working-copy", "git", "import"]);
+                let _mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-jj"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                approve(&state, task_id, false).await.expect("approved");
+
+                jj_as_test_user(&repo.checkout, &["describe", "--ignore-working-copy", "-r", "task-jj", "-m", "reworded"]);
+                let rewritten = git(&repo.checkout, &["rev-parse", "task-jj"]);
+                assert_ne!(rewritten, approved, "jj moved the branch");
+
+                let refusal = create_pr_for_approved_task(&state, task_id).await.expect_err("rewritten");
+                assert!(refusal.contains("changed since you approved"), "{refusal}");
+                assert_eq!(repo.remote_has_branch("task-jj"), None);
+                let task = state.task.tasks.read().await.get(&task_id).cloned().unwrap();
+                assert_eq!(task.human_review.approved_tip(), Some(approved.as_str()));
+                assert_eq!(task.status, TaskStatus::HumanReview);
+            }
+
+            /// A repository whose remote only fetches `main` never has
+            /// `origin/<task branch>`; the push must still record what the
+            /// branch tracks, and the pull request must still open.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_pinned_push_works_when_the_remote_does_not_fetch_the_task_branch() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                git(&repo.checkout, &["config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"]);
+                let sha = create_branch(&repo, "task-narrow");
+                let _mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-narrow"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                approve(&state, task_id, false).await.expect("approved");
+
+                let outcome = retry_delivery(&state, task_id).await.expect("asked");
+
+                assert_eq!(outcome.pr, Some(PrDelivery::Created { url: PR_URL.to_string() }));
+                assert_eq!(repo.remote_has_branch("task-narrow").as_deref(), Some(sha.as_str()));
+                assert_eq!(git(&repo.checkout, &["config", "branch.task-narrow.remote"]), "origin");
+                assert_eq!(git(&repo.checkout, &["config", "branch.task-narrow.merge"]), "refs/heads/task-narrow");
+            }
+
+            /// Once the task is out of Human Review the refusal says how to
+            /// get a decision again, since approving again is a review step.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_moved_branch_of_a_task_outside_human_review_says_how_to_continue() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-done");
+                let _mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-done"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                approve(&state, task_id, false).await.expect("approved");
+                state.task.tasks.write().await.get_mut(&task_id).unwrap().status = TaskStatus::Done;
+                advance_branch(&repo, "task-done");
+
+                let refusal = create_pr_inner(&state, &task_id.to_string()).await.expect_err("moved");
+                assert!(refusal.contains("changed since you approved"), "{refusal}");
+                assert!(refusal.contains("send it back to work"), "{refusal}");
+                assert_eq!(repo.remote_has_branch("task-done"), None);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn an_approval_without_a_recorded_commit_is_not_published_for_a_task_with_a_branch() {
+                let _guard = PATH_LOCK.lock().await;
+                let repo = RepoFixture::new();
+                point_origin_at_github(&repo);
+                create_branch(&repo, "task-legacy");
+                let _mock = MockGh::setup(PR_URL, r#"{"state":"OPEN"}"#);
+                let (state, _tmp) = build_test_state().await;
+                let task_id = seed_task(
+                    &state,
+                    repo.checkout.to_str().unwrap(),
+                    Some("task-legacy"),
+                    TaskStatus::HumanReview,
+                )
+                .await;
+                approve(&state, task_id, false).await.expect("approved");
+                state.task.tasks.write().await.get_mut(&task_id).unwrap().human_review.entries[0].approved_tip = None;
+
+                let refusal = create_pr_for_approved_task(&state, task_id).await.expect_err("unrecorded");
+                assert!(refusal.contains("did not record which commit"), "{refusal}");
+                assert_eq!(repo.remote_has_branch("task-legacy"), None);
+            }
+
             /// A forge failure never erases the decision, and retrying the
             /// pull request does not ask for, or record, a second approval.
             #[tokio::test(flavor = "multi_thread")]
@@ -8115,7 +8601,16 @@ mod tests {
                 let again = approve(&state, task_id, false).await.expect("already approved");
                 assert_eq!(again.task.human_review.entries.len(), 1);
 
-                create_branch(&repo, "task-late");
+                let sha = create_branch(&repo, "task-late");
+                // The approval was made before there was a commit to approve,
+                // so a person confirms the commit that exists now.
+                let unconfirmed = retry_delivery(&state, task_id).await.expect("a retry is allowed");
+                assert!(
+                    matches!(&unconfirmed.pr, Some(PrDelivery::Failed { reason }) if reason.contains("did not record which commit")),
+                    "{:?}",
+                    unconfirmed.pr
+                );
+                crate::commands::integration::reconfirm(&state, task_id, &sha).await.expect("confirmed");
                 let retried = retry_delivery(&state, task_id).await.expect("a retry is allowed");
                 assert_eq!(retried.pr, Some(PrDelivery::Created { url: PR_URL.to_string() }));
                 assert_eq!(retried.task.status, TaskStatus::PrCreated);

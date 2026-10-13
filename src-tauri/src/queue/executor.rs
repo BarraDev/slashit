@@ -507,6 +507,14 @@ pub enum PrHelperRefusal {
     /// An unfinished restack of the task's published branch owns it; see
     /// `Task::republish_pending_refusal`.
     RepublishPending,
+    /// The task's changes are approved at Human Review, or an integration of
+    /// them is unfinished. A helper that can edit the branch would change
+    /// what the approval covers; sending the task back to work is the
+    /// explicit way to do that, and withdraws the approval.
+    ApprovedWork,
+    /// An integration of the task into a local branch was started and not
+    /// finished; resuming or discarding it comes first.
+    IntegrationUnfinished,
 }
 
 impl std::fmt::Display for PrHelperRefusal {
@@ -529,6 +537,16 @@ impl std::fmt::Display for PrHelperRefusal {
                 f,
                 "a restack of this task's published branch is unfinished; resume or discard it \
                  in the task's pull request section first"
+            ),
+            Self::ApprovedWork => write!(
+                f,
+                "this task's changes are approved, so an agent cannot work in its checkout. Send \
+                 the task back to work to change it; that withdraws the approval"
+            ),
+            Self::IntegrationUnfinished => write!(
+                f,
+                "an integration of this task into a local branch was started and not finished, so \
+                 an agent cannot work in its checkout. Resume or discard the integration first"
             ),
         }
     }
@@ -2960,6 +2978,19 @@ impl TaskExecutor {
         }
         if self.tasks.read().await.get(&task_id).is_some_and(|t| t.republish_pending_refusal().is_some()) {
             return Err(PrHelperRefusal::RepublishPending);
+        }
+        let refusal = self.tasks.read().await.get(&task_id).and_then(|t| {
+            if t.integration_unfinished_refusal().is_some() {
+                return Some(PrHelperRefusal::IntegrationUnfinished);
+            }
+            // A task with a pull request is worked on through it: its approval
+            // was delivered, and review fixes are what it is for.
+            let has_pr = t.pr_url.is_some() || t.external_refs.iter().any(|r| r.is_pr());
+            (t.status == TaskStatus::HumanReview && t.human_review.is_approved() && !has_pr)
+                .then_some(PrHelperRefusal::ApprovedWork)
+        });
+        if let Some(refusal) = refusal {
+            return Err(refusal);
         }
 
         // A direct/manual admission draw, same as `execute_task`'s own: no
@@ -9283,6 +9314,60 @@ VERDICT: APPROVED")), ReviewVerdict::Approved);
 
             executor.stop_task(task_id).await.expect("stop the review");
             assert!(!pid_is_alive(pid));
+        }
+
+        /// An agent that can edit the branch is not admitted to a task whose
+        /// changes are approved (and not yet delivered), or whose integration
+        /// is unfinished; a task with a pull request keeps its review helpers.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn no_helper_starts_in_the_checkout_of_approved_or_integrating_work() {
+            let (executor, _temps) = test_executor();
+            let mut approved = create_test_task_full("approved", Uuid::new_v4(), TaskStatus::HumanReview, 0);
+            approved.human_review.record_arrival();
+            approved.human_review.approve(Some("a".repeat(40)), chrono::Utc::now());
+            let approved_id = approved.id;
+            executor.tasks.write().await.insert(approved_id, approved.clone());
+            assert_eq!(
+                executor.try_begin_pr_helper(approved_id).await.err(),
+                Some(crate::queue::PrHelperRefusal::ApprovedWork)
+            );
+
+            // The same task with a pull request is worked on through it.
+            let mut delivered = approved.clone();
+            delivered.id = Uuid::new_v4();
+            delivered.pr_url = Some("https://github.com/o/r/pull/1".to_string());
+            let delivered_id = delivered.id;
+            executor.tasks.write().await.insert(delivered_id, delivered);
+            assert!(executor.try_begin_pr_helper(delivered_id).await.is_ok());
+
+            // An unfinished integration has its own remedy.
+            let mut integrating = approved.clone();
+            integrating.id = Uuid::new_v4();
+            integrating.local_integration = Some(crate::domain::integration::LocalIntegration {
+                state: crate::domain::integration::IntegrationState::Pending,
+                target_branch: "main".into(),
+                target_old_oid: "a".repeat(40),
+                approved_tip: "a".repeat(40),
+                result_oid: "c".repeat(40),
+                strategy: crate::domain::integration::IntegrationStrategy::FastForward,
+                checkout_path: None,
+                started_at: chrono::Utc::now(),
+                completed_at: None,
+                completes_task: true,
+            });
+            let integrating_id = integrating.id;
+            executor.tasks.write().await.insert(integrating_id, integrating);
+            assert_eq!(
+                executor.try_begin_pr_helper(integrating_id).await.err(),
+                Some(crate::queue::PrHelperRefusal::IntegrationUnfinished)
+            );
+
+            // Not approved: the helper is admitted.
+            let mut undecided = create_test_task_full("undecided", Uuid::new_v4(), TaskStatus::HumanReview, 0);
+            undecided.human_review.record_arrival();
+            let undecided_id = undecided.id;
+            executor.tasks.write().await.insert(undecided_id, undecided);
+            assert!(executor.try_begin_pr_helper(undecided_id).await.is_ok());
         }
 
         /// An unfinished restack of a published branch owns the task: no

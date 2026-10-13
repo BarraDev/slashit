@@ -1196,6 +1196,47 @@ pub struct HumanReviewEntry {
     pub tip_reconfirmed: bool,
 }
 
+/// Why an approval does not cover the Task branch as it is now. See
+/// [`HumanReviewRecord::binds`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalBindingRefusal {
+    /// The approval did not record which commit was approved (it predates
+    /// that), so it cannot be shown to cover this one.
+    Unrecorded,
+    /// The branch is somewhere other than the approved commit: later commits
+    /// were added, or the approved commit was replaced.
+    Moved { approved: String, current: String },
+    /// The branch the approval was about cannot be found.
+    BranchMissing { approved: String },
+}
+
+impl std::fmt::Display for ApprovalBindingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let short = |s: &str| s.chars().take(12).collect::<String>();
+        match self {
+            Self::Unrecorded => f.write_str(
+                "This approval did not record which commit was approved, so SlashIt cannot tell \
+                 that it covers the branch as it is now. Confirm the commit shown for this task \
+                 first.",
+            ),
+            Self::Moved { approved, current } => write!(
+                f,
+                "The task's branch changed since you approved it: you approved {}, and the branch \
+                 is now at {}. Nothing was delivered or completed. Review the branch as it is and \
+                 approve it again to continue.",
+                short(approved),
+                short(current)
+            ),
+            Self::BranchMissing { approved } => write!(
+                f,
+                "The task's branch no longer exists, so the commit you approved ({}) cannot be \
+                 shown to belong to it. Restore the branch to continue.",
+                short(approved)
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanReviewDecision {
@@ -1280,6 +1321,37 @@ impl HumanReviewRecord {
             .and_then(|e| e.approved_tip.as_deref())
     }
 
+    /// Whether the current approval still covers `branch_tip`, the tip of the
+    /// Task branch now (`None` when the branch cannot be found). An approval
+    /// authorizes the one commit it recorded and nothing built on or in place
+    /// of it, so a descendant, a rewrite and a missing branch all refuse.
+    /// A task with no branch has nothing to bind, and a task without a
+    /// current approval is for the caller's own approval check.
+    pub fn binds(&self, has_branch: bool, branch_tip: Option<&str>) -> Result<(), ApprovalBindingRefusal> {
+        let Some(entry) = self.current_decision().filter(|e| e.decision == HumanReviewDecision::Approved) else {
+            return Ok(());
+        };
+        if !has_branch {
+            return Ok(());
+        }
+        let Some(approved) = entry.approved_tip.as_deref() else {
+            return Err(ApprovalBindingRefusal::Unrecorded);
+        };
+        match branch_tip {
+            Some(tip) if tip == approved => Ok(()),
+            Some(tip) => Err(ApprovalBindingRefusal::Moved { approved: approved.to_string(), current: tip.to_string() }),
+            None => Err(ApprovalBindingRefusal::BranchMissing { approved: approved.to_string() }),
+        }
+    }
+
+    /// A new approval of `tip` in the current arrival, made by a person who
+    /// was shown that commit after the branch moved past the one they first
+    /// approved. The earlier entry stays in the history; this one is the
+    /// current decision because it is the last.
+    pub fn approve_again(&mut self, tip: String, decided_at: chrono::DateTime<chrono::Utc>) {
+        self.approve(Some(tip), decided_at);
+    }
+
     /// Record `tip` on the current approval, which has none, because a
     /// person was shown exactly that commit and confirmed it. Returns
     /// whether anything was recorded.
@@ -1330,6 +1402,43 @@ mod tests {
         created_at = "2024-01-01T00:00:00Z"
         updated_at = "2024-01-01T00:00:00Z"
     "#;
+
+    #[test]
+    fn an_approval_binds_only_the_commit_it_recorded() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let mut review = HumanReviewRecord::default();
+        review.record_arrival();
+        // Nothing approved: not this check's business.
+        assert_eq!(review.binds(true, Some(&a)), Ok(()));
+        review.approve(Some(a.clone()), chrono::Utc::now());
+        assert_eq!(review.binds(true, Some(&a)), Ok(()));
+        assert_eq!(
+            review.binds(true, Some(&b)),
+            Err(ApprovalBindingRefusal::Moved { approved: a.clone(), current: b })
+        );
+        assert_eq!(review.binds(true, None), Err(ApprovalBindingRefusal::BranchMissing { approved: a }));
+        // A task with no branch has nothing to bind.
+        assert_eq!(review.binds(false, None), Ok(()));
+
+        let mut legacy = HumanReviewRecord::default();
+        legacy.record_arrival();
+        legacy.approve(None, chrono::Utc::now());
+        assert_eq!(legacy.binds(true, Some(&"c".repeat(40))), Err(ApprovalBindingRefusal::Unrecorded));
+        assert_eq!(legacy.binds(false, None), Ok(()));
+    }
+
+    #[test]
+    fn approving_again_keeps_the_earlier_decision_and_does_not_rewrite_it() {
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let mut review = HumanReviewRecord::default();
+        review.record_arrival();
+        review.approve(Some(a.clone()), chrono::Utc::now());
+        review.approve_again(b.clone(), chrono::Utc::now());
+        assert_eq!(review.entries.len(), 2);
+        assert_eq!(review.entries[0].approved_tip.as_deref(), Some(a.as_str()));
+        assert_eq!(review.approved_tip(), Some(b.as_str()));
+        assert!(review.is_approved());
+    }
 
     /// A task the poller may start: `InProgress`, idle phase, no cleanup
     /// pending.
