@@ -793,7 +793,7 @@ mod tests {
         // this happens until the owning project is saved once). The load
         // reads the real file at the legacy path; the migration's save
         // targets the *routed* path, which this test pre-occupies with a
-        // directory so the final `fs::rename` fails deterministically -- no
+        // directory so the save is refused deterministically -- no
         // chmod, no disk-full simulation, nothing timing-dependent.
         let tmp = TempDir::new().unwrap();
         let paths = test_paths(&tmp);
@@ -869,7 +869,7 @@ mod tests {
         // Occupy the routed path -- where the migration's save must write --
         // with a directory, so the load (which falls back to the legacy file
         // above, since nothing routed exists yet) succeeds but the later save
-        // cannot rename its temp file onto it.
+        // finds something it cannot use as a board there and refuses.
         let key = config::paths::ProjectKey::for_path(&repo_root).key;
         let routed_dir = paths.project_state_dir(
             &key,

@@ -485,6 +485,25 @@ pub async fn create(
     Ok(task)
 }
 
+/// [`create`], for several Tasks that arrive together (an import).
+///
+/// All of them reach the board in one write, after the file accepted the
+/// whole batch, so a refused save leaves neither the board nor the disk with
+/// a part of it.
+pub async fn create_batch(
+    tasks: &Tasks,
+    storage: &Storage,
+    project_id: Uuid,
+    new_tasks: &[Task],
+) -> Result<(), String> {
+    let mut tasks_w = tasks.write().await;
+    let mut staged = stage_project(&tasks_w, project_id);
+    for task in new_tasks {
+        staged.insert(task.id, task.clone());
+    }
+    publish(&mut tasks_w, storage, project_id, staged)
+}
+
 /// Renumber `target_status`'s column so `task_id` sits at `new_position` and
 /// every card in that column has a distinct, gapless position.
 ///
@@ -2494,6 +2513,97 @@ mod tests {
                 "a timeout must say plainly that nothing was attempted: {message}"
             ),
             other => panic!("the acquisition should have given up, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // A board file that cannot be read
+    // -----------------------------------------------------------------------
+
+    /// With the project's file damaged, the ordinary front doors (create,
+    /// update, import) report failure, leave the board as it was, and leave the
+    /// damaged bytes alone; a project with a healthy file is unaffected.
+    #[tokio::test]
+    async fn an_unreadable_board_file_refuses_create_update_and_import_without_touching_it() {
+        let world = world(false);
+        let existing = crate::test_helpers::create_test_task("Existing");
+        let existing_id = existing.id;
+        let mut existing = existing;
+        existing.project_id = world.project_id;
+        world.storage.save_project_tasks(world.project_id, &[existing.clone()]).unwrap();
+        world.tasks.write().await.insert(existing_id, existing);
+
+        let file = world.storage_paths.legacy_tasks_dir().join(format!("{}.toml", world.project_id));
+        let damaged = b"tasks = [ not toml".to_vec();
+        std::fs::write(&file, &damaged).unwrap();
+
+        let created = create(&world.tasks, &world.storage, world.project_id, |_| {
+            let mut t = crate::test_helpers::create_test_task("New");
+            t.project_id = world.project_id;
+            t
+        })
+        .await;
+        let message = created.expect_err("create must not report success");
+        assert!(message.contains("will not overwrite"), "{message}");
+
+        let amended = record(&world.tasks, &world.storage, existing_id, &|staged| {
+            if let Some(t) = staged.get_mut(&existing_id) {
+                t.title = "Renamed".into();
+            }
+        })
+        .await;
+        assert!(amended.is_err());
+
+        let mut imported = crate::test_helpers::create_test_task("Imported");
+        imported.project_id = world.project_id;
+        assert!(create_batch(&world.tasks, &world.storage, world.project_id, &[imported]).await.is_err());
+
+        let board = world.tasks.read().await;
+        assert_eq!(board.len(), 1, "no refused change may appear on the board");
+        assert_eq!(board[&existing_id].title, "Existing");
+        assert_eq!(std::fs::read(&file).unwrap(), damaged);
+        drop(board);
+
+        // Another project keeps working.
+        let other = Uuid::new_v4();
+        let ok = create(&world.tasks, &world.storage, other, |_| {
+            let mut t = crate::test_helpers::create_test_task("Elsewhere");
+            t.project_id = other;
+            t
+        })
+        .await;
+        assert!(ok.is_ok());
+    }
+
+    /// An import lands as one write: every Task is on disk and on the board
+    /// together, the project's existing Tasks are kept, and the result reads
+    /// back after a restart.
+    #[tokio::test]
+    async fn a_batch_reaches_the_board_and_the_file_together() {
+        let world = world(false);
+        let mut existing = crate::test_helpers::create_test_task("Existing");
+        existing.project_id = world.project_id;
+        let existing_id = existing.id;
+        create_batch(&world.tasks, &world.storage, world.project_id, &[existing]).await.unwrap();
+
+        let batch: Vec<Task> = ["One", "Two", "Three"]
+            .iter()
+            .enumerate()
+            .map(|(i, title)| {
+                let mut t = crate::test_helpers::create_test_task(title);
+                t.project_id = world.project_id;
+                t.position = i as i32;
+                t
+            })
+            .collect();
+        create_batch(&world.tasks, &world.storage, world.project_id, &batch).await.unwrap();
+
+        assert_eq!(world.tasks.read().await.len(), 4);
+        let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();
+        assert_eq!(on_disk.len(), 4);
+        assert!(on_disk.iter().any(|t| t.id == existing_id));
+        for task in &batch {
+            assert_eq!(world.persisted(task.id).position, task.position);
         }
     }
 }

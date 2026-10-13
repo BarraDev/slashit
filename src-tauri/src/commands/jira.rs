@@ -156,17 +156,12 @@ pub async fn import_jira_issues(
             updated_at: now,
         };
 
-        state.task.tasks.write().await.insert(task.id, task.clone());
         imported.push(task);
     }
 
-    // Persist
-    let tasks_r = state.task.tasks.read().await;
-    let project_tasks: Vec<Task> = tasks_r.values()
-        .filter(|t| t.project_id == project_id)
-        .cloned()
-        .collect();
-    let _ = state.storage.save_project_tasks(project_id, &project_tasks);
+    // The board shows the import only once the file has accepted it.
+    crate::lifecycle::create_batch(&state.task.tasks, &state.storage, project_id, &imported)
+        .await?;
 
     Ok(imported)
 }
