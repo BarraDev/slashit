@@ -1494,7 +1494,7 @@ impl TaskExecutor {
             }
         };
         match state {
-            PrState::Merged if lifecycle => self.complete_merged_task(task_id, key.number, recorded).await,
+            PrState::Merged if lifecycle => self.complete_merged_task(task_id, key, recorded).await,
             PrState::Merged => {}
             _ => self.record_pr_poll_state(task_id, key, recorded).await,
         }
@@ -1546,12 +1546,14 @@ impl TaskExecutor {
         }
     }
 
-    /// Write a PR's remote state onto the task's matching external ref.
-    fn record_pr_state(task: &mut Task, number: u32, state: &str) {
-        task.record_pr_state(number, state);
+    /// Write a PR's remote state onto the task's external ref to that exact
+    /// pull request: the repository counts as much as the number, because
+    /// two repositories each have a pull request 7.
+    fn record_pr_state(task: &mut Task, key: &crate::pr_status::PrKey, state: &str) {
+        task.record_pr_state(key.number, state);
         for r in &mut task.external_refs {
-            if let crate::domain::task::ExternalRef::GithubPr { number: n, state: ref mut s, .. } = r {
-                if *n == number {
+            if let crate::domain::task::ExternalRef::GithubPr { number, repo, state: ref mut s, .. } = r {
+                if *number == key.number && *repo == key.repo {
                     *s = Some(state.to_string());
                 }
             }
@@ -1582,7 +1584,7 @@ impl TaskExecutor {
     /// thirty seconds forever cannot change a repository that does not resolve.
     /// Neither kind ever re-runs a destructive step on a timer: once the merge
     /// is durable, only an explicit lifecycle action finishes the task.
-    async fn complete_merged_task(&self, task_id: Uuid, number: u32, state: &str) {
+    async fn complete_merged_task(&self, task_id: Uuid, key: &crate::pr_status::PrKey, state: &str) {
         // Declined, not failed. Nothing was asked and nothing is owed, so the
         // next pass finds the task exactly as eligible as this one did.
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
@@ -1597,7 +1599,7 @@ impl TaskExecutor {
 
         let record_merge = move |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
-                Self::record_pr_state(t, number, state);
+                Self::record_pr_state(t, key, state);
             }
         };
         // Only true of a task that is actually finished, so it is withheld from
@@ -1704,7 +1706,7 @@ impl TaskExecutor {
                     matches!(refusal, crate::lifecycle::TerminalizeRefusal::RepublishPending);
                 let latch = move |staged: &mut HashMap<Uuid, Task>| {
                     if let Some(t) = staged.get_mut(&task_id) {
-                        Self::record_pr_state(t, number, state);
+                        Self::record_pr_state(t, key, state);
                         t.error_message = Some(if republish_pending {
                             crate::lifecycle::merged_while_republish_pending_message()
                         } else {
@@ -4844,7 +4846,7 @@ mod tests {
         let (executor, _temps) = test_executor();
         let (id, project_id) = task_with_open_pr(&executor, Some("/nonexistent/checkout")).await;
 
-        executor.complete_merged_task(id, 7, "MERGED").await;
+        executor.complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED").await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
         assert_eq!(
@@ -4910,7 +4912,7 @@ mod tests {
             executor.storage.save_project_tasks(project_id, std::slice::from_ref(task)).unwrap();
         }
 
-        executor.complete_merged_task(id, 7, "MERGED").await;
+        executor.complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED").await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
         assert_eq!(after.pending_republish, Some(pending), "the record is preserved");
@@ -4950,7 +4952,7 @@ mod tests {
             .await
             .expect("the lease must be free to take");
 
-        executor.complete_merged_task(id, 7, "MERGED").await;
+        executor.complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED").await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
         assert_eq!(
@@ -5453,11 +5455,143 @@ mod tests {
         let (executor, _temps) = test_executor();
         let (id, _) = seed_with_pr(&executor, TaskStatus::InProgress, pr_ref("owner/repo", 7, Some("OPEN"))).await;
 
-        executor.complete_merged_task(id, 7, "MERGED").await;
+        executor.complete_merged_task(id, &crate::pr_status::PrKey::new("owner/repo", 7), "MERGED").await;
 
         let after = executor.tasks.read().await[&id].clone();
         assert_eq!(after.status, TaskStatus::InProgress);
         assert_eq!(recorded_pr_state(&after).as_deref(), Some("OPEN"));
+    }
+
+    /// Two repositories each have a pull request 7, and a task links both.
+    /// GitHub says only `owner/repo`'s is merged: only that reference may be
+    /// recorded merged, the other stays open and eligible for the poll, and
+    /// the activity says one merge.
+    #[tokio::test]
+    async fn a_merge_is_recorded_on_the_repository_it_was_heard_for() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) =
+            seed_with_pr(&executor, TaskStatus::PrCreated, pr_ref("owner/repo", 7, Some("OPEN"))).await;
+        let other = pr_ref("other/repo", 7, Some("OPEN"));
+        let add_other = {
+            let other = other.clone();
+            move |staged: &mut HashMap<Uuid, Task>| {
+                if let Some(t) = staged.get_mut(&id) {
+                    t.external_refs.push(other.clone());
+                }
+            }
+        };
+        crate::lifecycle::record(&executor.tasks, &executor.storage, id, &add_other)
+            .await
+            .expect("fixture record persists");
+
+        executor
+            .apply_polled_pr_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), crate::pr_status::PrState::Merged)
+            .await;
+
+        let states = |task: &Task| -> Vec<(String, Option<String>)> {
+            task.external_refs
+                .iter()
+                .filter_map(|r| match r {
+                    ExternalRef::GithubPr { repo, state, .. } => Some((repo.clone(), state.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (seen, task) in [
+            ("in memory", executor.tasks.read().await[&id].clone()),
+            ("on disk", on_disk_task(&executor, project_id, id)),
+        ] {
+            assert_eq!(
+                states(&task),
+                vec![
+                    ("owner/repo".to_string(), Some("MERGED".to_string())),
+                    ("other/repo".to_string(), Some("OPEN".to_string())),
+                ],
+                "{seen}: only the merged repository's reference is merged"
+            );
+        }
+
+        let task = executor.tasks.read().await[&id].clone();
+        let merges = task
+            .activity
+            .iter()
+            .filter(|e| matches!(e.kind, ActivityKind::PrMerged { .. }))
+            .count();
+        assert_eq!(merges, 1, "one merge happened");
+
+        let tasks = executor.tasks.read().await.clone();
+        let polled = polled_pull_requests(&tasks, &crate::pr_status::PrStatuses::github());
+        assert_eq!(
+            polled,
+            vec![(crate::pr_status::PrKey::new("other/repo", 7), vec![id])],
+            "the unrelated open pull request is still asked about"
+        );
+    }
+
+    /// The stable-blocker latch keeps the repository too: a pinned task that
+    /// links same-numbered pull requests in two repositories latches only the
+    /// merged one, and its recovery record stays recoverable.
+    #[tokio::test]
+    async fn a_latched_merge_does_not_mark_a_same_numbered_pull_request_elsewhere() {
+        use crate::domain::{IntegrationState, IntegrationStrategy, LocalIntegration};
+        let (executor, _temps) = test_executor();
+        let (id, project_id) =
+            seed_with_pr(&executor, TaskStatus::HumanReview, pr_ref("owner/repo", 7, Some("OPEN"))).await;
+        let amend = move |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&id) {
+                t.external_refs.push(pr_ref("other/repo", 7, Some("OPEN")));
+                t.human_review.approve(Some("1111111111111111111111111111111111111111".to_string()), chrono::Utc::now());
+                t.local_integration = Some(LocalIntegration {
+                    state: IntegrationState::Pending,
+                    target_branch: "main".to_string(),
+                    target_old_oid: "0000000000000000000000000000000000000000".to_string(),
+                    approved_tip: "1111111111111111111111111111111111111111".to_string(),
+                    result_oid: "2222222222222222222222222222222222222222".to_string(),
+                    strategy: IntegrationStrategy::FastForward,
+                    checkout_path: None,
+                    started_at: chrono::Utc::now(),
+                    completed_at: None,
+                    completes_task: false,
+                });
+            }
+        };
+        crate::lifecycle::record(&executor.tasks, &executor.storage, id, &amend)
+            .await
+            .expect("fixture record persists");
+        let before = executor.tasks.read().await[&id].clone();
+
+        executor
+            .apply_polled_pr_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), crate::pr_status::PrState::Merged)
+            .await;
+
+        for (seen, task) in [
+            ("in memory", executor.tasks.read().await[&id].clone()),
+            ("on disk", on_disk_task(&executor, project_id, id)),
+        ] {
+            let states: Vec<_> = task
+                .external_refs
+                .iter()
+                .filter_map(|r| match r {
+                    ExternalRef::GithubPr { repo, state, .. } => Some((repo.as_str().to_string(), state.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                states,
+                vec![
+                    ("owner/repo".to_string(), Some("MERGED".to_string())),
+                    ("other/repo".to_string(), Some("OPEN".to_string())),
+                ],
+                "{seen}"
+            );
+            assert_eq!(task.status, TaskStatus::HumanReview, "{seen}");
+            assert_eq!(task.local_integration, before.local_integration, "{seen}: still recoverable");
+        }
+        let tasks = executor.tasks.read().await.clone();
+        assert_eq!(
+            polled_pull_requests(&tasks, &crate::pr_status::PrStatuses::github()),
+            vec![(crate::pr_status::PrKey::new("other/repo", 7), vec![id])],
+        );
     }
 
     /// A merged pull request heard by the poll for a task a pending local

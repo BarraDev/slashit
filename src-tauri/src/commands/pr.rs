@@ -5335,7 +5335,7 @@ pub async fn refresh_task_pr_state(
                         crate::lifecycle::TerminalizeRefusal::IntegrationUnfinished
                     ) =>
                 {
-                    let note = crate::domain::task::INTEGRATION_UNFINISHED_REFUSAL;
+                    let note = refusal.to_string();
                     let explain = move |staged: &mut std::collections::HashMap<Uuid, Task>| {
                         if let Some(task) = staged.get_mut(&task_uuid) {
                             task.error_message = Some(format!(
@@ -12897,7 +12897,7 @@ mod tests {
                 let task_id =
                     seed_task(&state, "/tmp", Some("task-branch"), TaskStatus::HumanReview).await;
                 pin_pending_integration(&state, task_id, false).await;
-                let _before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
+                let before = state.task.tasks.read().await.get(&task_id).unwrap().clone();
 
                 let app = tauri::test::mock_app();
                 app.manage(state);
@@ -12908,6 +12908,21 @@ mod tests {
 
                 // Nothing anywhere was written: no pull request, no metadata,
                 // and no lifecycle fact moved while nobody was asking.
+                let after = app
+                    .state::<crate::AppState>()
+                    .task
+                    .tasks
+                    .read()
+                    .await
+                    .get(&task_id)
+                    .unwrap()
+                    .clone();
+                assert_eq!(after.status, before.status);
+                assert_eq!(after.pr_url, before.pr_url);
+                assert_eq!(after.local_integration, before.local_integration);
+                assert_eq!(after.external_refs, before.external_refs);
+                assert_eq!(after.error_message, before.error_message);
+                assert_eq!(after.updated_at, before.updated_at);
                 drop(_tmp);
             }
 
