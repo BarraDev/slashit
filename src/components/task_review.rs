@@ -164,6 +164,28 @@ pub fn AiReviewSection(signoff: QaSignoff) -> impl IntoView {
     }
 }
 
+/// Why an approval that no longer covers the branch cannot be renewed from
+/// here, from what the task record shows; `None` when it may be offered.
+///
+/// This only hides a button that would be refused. The backend decides, and
+/// also refuses while a delivery is in flight, which the record does not show.
+fn renewal_blocker(task: &Task) -> Option<&'static str> {
+    if task.status != TaskStatus::HumanReview {
+        return Some("This task is no longer in review, so its approval cannot be renewed here.");
+    }
+    if task.pr_url.is_some() || task.external_refs.iter().any(|r| r.is_pr()) {
+        return Some(
+            "This task has a pull request, so its approval is not renewed. The pull request holds the branch that was delivered.",
+        );
+    }
+    if task.integrating_current_approval() {
+        return Some(
+            "A local integration of this task was started with the approved commit. Resume or discard it first.",
+        );
+    }
+    None
+}
+
 /// Whether a delivery answer means a pull request was actually tried, so the
 /// drawer numbers it as an attempt.
 fn tried_a_pull_request(answer: Option<&PrDelivery>) -> bool {
@@ -600,12 +622,18 @@ pub fn HumanReviewPanel(
                     "Approved"
                 </p>
                 {move || coverage.get().filter(|c| !matches!(c.coverage, ApprovalCoverage::Current | ApprovalCoverage::NotApplicable)).map(|c| {
-                    let tip = c.branch_tip.clone().filter(|_| matches!(c.coverage, ApprovalCoverage::Moved | ApprovalCoverage::Unrecorded));
+                    let blocker = task.with(|t| t.as_ref().and_then(renewal_blocker));
+                    let tip = c.branch_tip.clone()
+                        .filter(|_| matches!(c.coverage, ApprovalCoverage::Moved | ApprovalCoverage::Unrecorded))
+                        .filter(|_| blocker.is_none());
                     let reason = c.reason.clone().unwrap_or_default();
                     view! {
                         <div data-testid="human-review-approval-stale" data-coverage=format!("{:?}", c.coverage) class="rounded-md border border-amber-500/20 bg-amber-500/[0.06] p-2 space-y-2">
                             <p class="text-xs font-semibold text-amber-200">"The branch is not what you approved"</p>
                             <p class="text-xs text-white/70 whitespace-pre-wrap break-words">{reason}</p>
+                            {blocker.map(|why| view! {
+                                <p data-testid="human-review-approve-again-unavailable" class="text-xs text-white/50">{why}</p>
+                            })}
                             {tip.map(|tip| view! {
                                 <button
                                     data-testid="human-review-approve-again"
@@ -920,6 +948,34 @@ mod tests {
 
         t.local_integration = Some(record(IntegrationState::Integrated, &"9".repeat(40)));
         assert!(!t.integrating_current_approval(), "an earlier approval's integration is not this delivery");
+    }
+
+    #[test]
+    fn an_approval_is_not_offered_for_renewal_where_the_backend_would_refuse_it() {
+        use crate::models::integration::{IntegrationState, IntegrationStrategy, LocalIntegration};
+        let mut t = task(TaskStatus::HumanReview);
+        assert_eq!(renewal_blocker(&t), None, "an ordinary reviewed task may renew");
+
+        t.pr_url = Some("https://github.com/o/r/pull/1".into());
+        assert!(renewal_blocker(&t).is_some_and(|w| w.contains("pull request")));
+        t.pr_url = None;
+
+        t.local_integration = Some(LocalIntegration {
+            state: IntegrationState::Pending,
+            target_branch: "main".into(),
+            target_old_oid: "a".repeat(40),
+            approved_tip: "b".repeat(40),
+            result_oid: "c".repeat(40),
+            strategy: IntegrationStrategy::FastForward,
+            checkout_path: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            completes_task: true,
+        });
+        assert!(renewal_blocker(&t).is_some_and(|w| w.contains("Resume or discard")));
+        t.local_integration = None;
+
+        assert!(renewal_blocker(&task(TaskStatus::Done)).is_some_and(|w| w.contains("no longer in review")));
     }
 
     #[test]
