@@ -219,9 +219,11 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
         branch_tip.as_deref(),
         crate::commands::integration::repo_path_of(state, task.project_id).await,
     ) {
-        rewritten = !crate::worktree::restack::is_ancestor(std::path::Path::new(&repo), approved, tip)
-            .await
-            .unwrap_or(false);
+        // Only a definite answer from Git says the approved commit is gone.
+        rewritten = matches!(
+            crate::worktree::restack::is_ancestor(std::path::Path::new(&repo), approved, tip).await,
+            Ok(false)
+        );
     }
     Ok(ApprovalStatus { branch_tip, rewritten, reason: Some(refusal.to_string()), ..none(coverage) })
 }
