@@ -231,6 +231,15 @@ pub struct Storage {
     config_tx: Arc<Mutex<()>>,
 }
 
+/// One durable Task cleanup retry record: the Project whose board file
+/// cleanup remains owed, and the board files captured for it while the
+/// Project could still be routed to its state directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectTaskCleanupRecord {
+    pub project_id: Uuid,
+    pub board_files: Vec<PathBuf>,
+}
+
 impl Storage {
     /// Load a Project's primary Conversation, if one has been created.
     pub fn load_primary_conversation(&self, project_id: Uuid) -> Result<Option<Conversation>> {
@@ -415,6 +424,95 @@ impl Storage {
                 anyhow::bail!("Project id does not match cleanup record {:?}", entry.path());
             }
             pending.push(project_id);
+        }
+        Ok(pending)
+    }
+
+    /// Persist the retry reference before removing a Project from config.
+    ///
+    /// While the record exists, the Project's Task cleanup is owed: it names
+    /// the Project whose Task records are still on disk even after the
+    /// Project itself is gone, and carries the board files captured while the
+    /// Project could still be routed to them (see [`Self::tasks_board_files`]),
+    /// because once the removal has persisted no routing recomputes them.
+    pub fn mark_project_tasks_deletion_pending(
+        &self,
+        project_id: Uuid,
+        board_files: &[PathBuf],
+    ) -> Result<()> {
+        let path = self.paths.pending_project_tasks_deletion_file(project_id);
+        let mut contents = project_id.to_string();
+        for board_file in board_files {
+            contents.push('\n');
+            contents.push_str(&board_file.to_string_lossy());
+        }
+        write_private_atomic(&path, contents.as_bytes())
+            .context("Failed to persist pending Project Task cleanup")
+    }
+
+    /// Drop the retry reference. Call only once Task cleanup has finished, or
+    /// once the Project is known to still exist in config because its removal
+    /// never committed. Clearing an absent record is a no-op so recovery can
+    /// be repeated.
+    pub fn clear_project_tasks_deletion_pending(&self, project_id: Uuid) -> Result<()> {
+        let path = self.paths.pending_project_tasks_deletion_file(project_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("Failed to clear cleanup record {path:?}")),
+        }
+    }
+
+    /// List valid durable Task cleanup records without discarding malformed
+    /// ones. The first line of a record is the Project id; the remaining
+    /// lines are the board files captured at deletion time.
+    pub fn pending_project_tasks_deletions(&self) -> Result<Vec<ProjectTaskCleanupRecord>> {
+        let entries = match fs::read_dir(self.paths.config_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("Failed to list Task cleanup records"),
+        };
+        let mut pending = Vec::new();
+        for entry in entries {
+            let entry = entry.context("Failed to read Task cleanup directory entry")?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".tasks-delete-pending") else {
+                continue;
+            };
+            let project_id = id.parse::<Uuid>().with_context(|| {
+                format!(
+                    "Invalid Project id in Task cleanup record {:?}",
+                    entry.path()
+                )
+            })?;
+            let raw = fs::read_to_string(entry.path())
+                .with_context(|| format!("Failed to read Task cleanup record {:?}", entry.path()))?;
+            let mut lines = raw.lines();
+            let recorded_id: Uuid = lines
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .parse()
+                .with_context(|| {
+                    format!(
+                        "Invalid Project id in Task cleanup record {:?}",
+                        entry.path()
+                    )
+                })?;
+            if recorded_id != project_id {
+                anyhow::bail!("Project id does not match Task cleanup record {:?}", entry.path());
+            }
+            let board_files = lines
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect();
+            pending.push(ProjectTaskCleanupRecord {
+                project_id,
+                board_files,
+            });
         }
         Ok(pending)
     }
@@ -1079,19 +1177,35 @@ impl Storage {
         Ok(())
     }
 
-    /// Delete a project's tasks from wherever they live.
-    pub fn delete_project_tasks(&self, project_id: Uuid) -> Result<()> {
-        let path = self.tasks_path(project_id);
-        if path.exists() {
-            fs::remove_file(&path).context("Failed to delete project tasks file")?;
+    pub fn delete_task_files(&self, board_files: &[PathBuf]) -> Result<()> {
+        for path in board_files {
+            if path.exists() {
+                fs::remove_file(path)
+                    .with_context(|| format!("Failed to delete project tasks file {path:?}"))?;
+            }
         }
-
-        let legacy = self.legacy_tasks_path(project_id);
-        if legacy != path && legacy.exists() {
-            fs::remove_file(&legacy).context("Failed to delete legacy project tasks file")?;
-        }
-
         Ok(())
+    }
+
+    /// The files that may hold this project's board: its routed `tasks.toml`
+    /// and the legacy one. Both are candidates, whichever exists.
+    ///
+    /// Capture the list *before* the Project leaves the config: the routing
+    /// table is rebuilt from the config, so once the Project is gone this
+    /// listing can only produce the legacy path and a routed project's board
+    /// would be stranded forever. A Task cleanup record therefore carries the
+    /// captured list, which is how a restart finishes the cleanup without the
+    /// Project to route from.
+    pub fn tasks_board_files(&self, project_id: Uuid) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        if let Some(dir) = self.routed_state_dir(project_id) {
+            files.push(dir.join(TASKS_FILE));
+        }
+        let legacy = self.legacy_tasks_path(project_id);
+        if !files.contains(&legacy) {
+            files.push(legacy);
+        }
+        files
     }
 }
 
@@ -1576,7 +1690,7 @@ mod tests {
         let path = storage.tasks_path(project_id);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"tasks = [ not toml").unwrap();
-        storage.delete_project_tasks(project_id).unwrap();
+        storage.delete_task_files(&storage.tasks_board_files(project_id)).unwrap();
         assert!(!path.exists());
     }
 
@@ -2187,7 +2301,7 @@ user_name = "Test"
         assert!(path.exists());
         
         // Delete tasks
-        storage.delete_project_tasks(project_id).expect("Should delete");
+        storage.delete_task_files(&storage.tasks_board_files(project_id)).expect("Should delete");
         
         // Verify file is gone
         assert!(!path.exists());
@@ -2360,7 +2474,7 @@ user_name = "Test"
             "B task"
         );
 
-        storage.delete_project_tasks(project_b).unwrap();
+        storage.delete_task_files(&storage.tasks_board_files(project_b)).unwrap();
         assert_eq!(
             storage.load_project_tasks(project_a).unwrap()[0].title,
             "A task"

@@ -160,8 +160,14 @@ pub async fn import_jira_issues(
     }
 
     // The board shows the import only once the file has accepted it.
-    crate::lifecycle::create_batch(&state.task.tasks, &state.storage, project_id, &imported)
-        .await?;
+    crate::lifecycle::create_batch(
+        &state.task.tasks,
+        &state.project.projects,
+        &state.storage,
+        project_id,
+        &imported,
+    )
+    .await?;
 
     Ok(imported)
 }

@@ -103,9 +103,15 @@ pub async fn create_task(
         gitlab_issue_url: params.gitlab_issue_url,
         linear_ticket_id: params.linear_ticket_id,
     };
-    crate::lifecycle::create(&state.task.tasks, &state.storage, project_id, move |existing| {
-        Task::new_backlog(existing, new)
-    })
+    crate::lifecycle::create(
+        &state.task.tasks,
+        &state.project.projects,
+        &state.storage,
+        project_id,
+        move |existing| {
+            Task::new_backlog(existing, new)
+        },
+    )
     .await
 }
 

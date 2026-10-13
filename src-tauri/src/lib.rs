@@ -147,21 +147,32 @@ pub fn run() {
     let (app_state, report) = tauri::async_runtime::block_on(app_core::build_state())
         .expect("Failed to build application state");
 
-    if report.project_conversation_cleanup_failures.is_empty() {
+    let cleanup_failures = report
+        .project_conversation_cleanup_failures
+        .iter()
+        .map(|failure| format!("Project Conversation cleanup: {failure}"))
+        .chain(
+            report
+                .project_tasks_cleanup_failures
+                .iter()
+                .map(|failure| format!("Project Task cleanup: {failure}")),
+        )
+        .collect::<Vec<_>>();
+    if cleanup_failures.is_empty() {
         println!(
             "SlashIt: Loaded {} repositories, {} projects, {} tasks from disk",
             report.repositories, report.projects, report.tasks
         );
     } else {
         eprintln!(
-            "SlashIt: Startup incomplete: loaded {} repositories, {} projects, {} tasks; {} Project Conversation cleanup recovery issue(s) need attention",
+            "SlashIt: Startup incomplete: loaded {} repositories, {} projects, {} tasks; {} cleanup recovery issue(s) need attention",
             report.repositories,
             report.projects,
             report.tasks,
-            report.project_conversation_cleanup_failures.len()
+            cleanup_failures.len()
         );
-        for failure in &report.project_conversation_cleanup_failures {
-            eprintln!("SlashIt: Pending Project Conversation cleanup: {failure}");
+        for failure in &cleanup_failures {
+            eprintln!("SlashIt: Pending cleanup: {failure}");
         }
     }
     if report.migrated_projects > 0 {

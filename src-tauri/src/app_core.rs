@@ -64,6 +64,9 @@ pub struct StartupReport {
     /// Durable Project Conversation cleanup records that could not be
     /// completed during startup. Each record remains on disk for a later retry.
     pub project_conversation_cleanup_failures: Vec<String>,
+    /// Durable Project Task cleanup records that could not be completed
+    /// during startup. Each record remains on disk for a later retry.
+    pub project_tasks_cleanup_failures: Vec<String>,
 }
 
 /// Resolve the OS directories and build state from what is on disk.
@@ -234,6 +237,52 @@ pub async fn build_state_with_paths(
             Err(error) => {
                 eprintln!("Warning: Failed to discover pending Project Conversation cleanup: {error}");
                 report.project_conversation_cleanup_failures.push(format!(
+                    "could not discover pending cleanup records: {error}"
+                ));
+            }
+        }
+    }
+
+    // The same reconciliation, for the Project's Task records. Deleting a
+    // Project persists the removal first and leaves a record before it, so a
+    // failed Task cleanup names the Project it owes a finish to and carries
+    // the board files the cleanup needs (the Project that would route to
+    // them is gone from config by now). The board files are deleted as the
+    // committed deletion already authorized: the obligation check happened
+    // before that commit, under the lifecycle leases, and nothing that a
+    // later start could learn about those files would make honoring it less
+    // safe.
+    if projects_are_authoritative {
+        match app_state.storage.pending_project_tasks_deletions() {
+            Ok(pending) => {
+                let projects = app_state.project.projects.read().await;
+                for record in pending {
+                    let project_id = record.project_id;
+                    if projects.contains_key(&project_id) {
+                        if let Err(error) = app_state.storage
+                            .clear_project_tasks_deletion_pending(project_id)
+                        {
+                            eprintln!("Warning: Failed to clear uncommitted Project Task deletion record for {project_id}: {error}");
+                            report.project_tasks_cleanup_failures.push(format!(
+                                "{project_id}: could not clear uncommitted deletion marker: {error}"
+                            ));
+                        }
+                    } else {
+                        let result = app_state.storage
+                            .delete_task_files(&record.board_files)
+                            .and_then(|()| app_state.storage.clear_project_tasks_deletion_pending(project_id));
+                        if let Err(error) = result {
+                            eprintln!("Warning: Project Task cleanup remains pending for {project_id}: {error}");
+                            report.project_tasks_cleanup_failures.push(format!(
+                                "{project_id}: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("Warning: Failed to discover pending Project Task cleanup: {error}");
+                report.project_tasks_cleanup_failures.push(format!(
                     "could not discover pending cleanup records: {error}"
                 ));
             }
@@ -726,6 +775,88 @@ mod tests {
         assert!(!pointer.exists());
         assert!(!document.exists());
         assert!(!paths.pending_project_conversation_deletion_file(project_id).exists());
+    }
+
+
+    #[tokio::test]
+    async fn startup_retries_a_committed_project_task_cleanup_with_recorded_board_files() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let seed = Storage::with_paths((*paths).clone());
+        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        // A routed board file recorded by the committed deletion.
+        let routed = tmp.path().join("state").join("routed").join("tasks.toml");
+        std::fs::create_dir_all(routed.parent().unwrap()).unwrap();
+        std::fs::write(&routed, "tasks = []").unwrap();
+        seed.mark_project_tasks_deletion_pending(
+            project_id,
+            &[routed.clone(), seed.tasks_board_files(project_id).pop().unwrap()],
+        )
+        .unwrap();
+
+        // A restart finishes what the committed deletion owed, by the recorded
+        // paths, and clears the record even though the Project cannot be
+        // routed to anymore.
+        let (state, report) = build_state_with_paths(paths.clone()).await.unwrap();
+        assert_eq!(report.projects, 0);
+        assert!(report.project_tasks_cleanup_failures.is_empty(), "{:?}", report.project_tasks_cleanup_failures);
+        assert!(!routed.exists());
+        assert!(!state.project.projects.read().await.contains_key(&project_id));
+        assert!(!paths.pending_project_tasks_deletion_file(project_id).exists());
+        // The legacy candidate that never existed was a no-op.
+        let (second, report) = build_state_with_paths(paths.clone()).await.unwrap();
+        assert!(report.project_tasks_cleanup_failures.is_empty());
+        assert!(!second.storage.paths().pending_project_tasks_deletion_file(project_id).exists());
+    }
+
+    #[tokio::test]
+    async fn startup_clears_an_uncommitted_project_task_cleanup_record() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let seed = Storage::with_paths((*paths).clone());
+        let project_id = uuid::Uuid::new_v4();
+        // The Project's removal never committed, so config still holds it; the
+        // leftover record must be dropped, not acted on.
+        seed.save_config(&config_with_project(project_id)).unwrap();
+        let board = seed.tasks_board_files(project_id);
+        std::fs::create_dir_all(board[0].parent().unwrap()).unwrap();
+        std::fs::write(&board[0], "tasks = []").unwrap();
+        seed.mark_project_tasks_deletion_pending(project_id, &board).unwrap();
+
+        let (state, report) = build_state_with_paths(paths.clone()).await.unwrap();
+        assert_eq!(report.projects, 1);
+        assert!(report.project_tasks_cleanup_failures.is_empty(), "{:?}", report.project_tasks_cleanup_failures);
+        assert!(board[0].exists(), "an uncommitted deletion must not delete Task records");
+        assert!(!paths.pending_project_tasks_deletion_file(project_id).exists());
+        assert!(!state.project.projects.read().await.is_empty());
+    }
+
+    fn config_with_project(project_id: uuid::Uuid) -> config::storage::AppConfig {
+        let mut config = config::storage::AppConfig::default();
+        config.projects.insert(
+            project_id.to_string(),
+            domain::Project {
+                id: project_id,
+                name: "P".into(),
+                repository_id: None,
+                scope: domain::ProjectScope::Standalone,
+                state_location: config::paths::StateLocation::External,
+                base: None,
+                agent_type: domain::AgentType::ClaudeCode,
+                agent_config: domain::AgentConfig {
+                    agent_type: domain::AgentType::ClaudeCode,
+                    command: "claude".into(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    model: None,
+                    api_key: None,
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        config
     }
 
     #[tokio::test]

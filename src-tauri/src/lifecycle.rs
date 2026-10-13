@@ -473,11 +473,28 @@ pub async fn commit_task(
 /// anyway.
 pub async fn create(
     tasks: &Tasks,
+    projects: &RwLock<HashMap<Uuid, Project>>,
     storage: &Storage,
     project_id: Uuid,
     build: impl FnOnce(&HashMap<Uuid, Task>) -> Task,
 ) -> Result<Task, String> {
     let mut tasks_w = tasks.write().await;
+
+    // Asking whether the Project exists before waiting on this lock would
+    // reopen the window Project deletion closed for one of its own Tasks: a
+    // create that decided a Project still exists and then waited could land
+    // its insert after a deletion released it here, and the Task file of a
+    // Project that no longer exists would be back on disk. Checked under the
+    // lock instead, either the create lands beside the Project it names or it
+    // does not happen. The small read under this write guard is the ordered
+    // side of the pair -- no code knowingly holds a Project lock and then
+    // waits on the Task map, which the review contract this file relies on.
+    if !projects.read().await.contains_key(&project_id) {
+        return Err(format!(
+            "Project {project_id} does not exist or was deleted, so no Task can be created for it"
+        ));
+    }
+
     let mut staged = stage_project(&tasks_w, project_id);
     let task = build(&staged);
     staged.insert(task.id, task.clone());
@@ -492,11 +509,23 @@ pub async fn create(
 /// a part of it.
 pub async fn create_batch(
     tasks: &Tasks,
+    projects: &RwLock<HashMap<Uuid, Project>>,
     storage: &Storage,
     project_id: Uuid,
     new_tasks: &[Task],
 ) -> Result<(), String> {
     let mut tasks_w = tasks.write().await;
+
+    // The same under-lock existence check [`create`] does, for the same
+    // reason: a Project removed while the batch was waiting must not get its
+    // Task file back.
+    if !projects.read().await.contains_key(&project_id) {
+        return Err(format!(
+            "Project {project_id} does not exist or was deleted, so no Task can be imported \
+             into it"
+        ));
+    }
+
     let mut staged = stage_project(&tasks_w, project_id);
     for task in new_tasks {
         staged.insert(task.id, task.clone());
@@ -826,6 +855,96 @@ pub async fn delete(ctx: TerminalizeCtx<'_>, task_id: Uuid) -> Result<bool, Term
 
     tasks_w.remove(&task_id);
     Ok(true)
+}
+
+
+/// Why a Task blocks the deletion of the Project it belongs to, or `None`.
+///
+/// [`Task::integration_unfinished_refusal`] deliberately answers only where a
+/// Resume exists, because a status move should not pin a record the person has
+/// no way to finish. Deleting a whole Project is different: the record is
+/// durable evidence of a Git operation that may already have moved a branch,
+/// and removing the Tasks file deletes the only copy of it — with no control
+/// and no target branch, whatever it proves would be stranded. Deletion is
+/// therefore refused while the record is pending, wherever the Task's status
+/// put it, which fulfills both sides: a status move asks
+/// [`Self::integration_unfinished_refusal`], and a Project deletion asks this.
+pub fn project_deletion_refusal(task: &Task) -> Option<String> {
+    let title = task.title.as_str();
+    let id = task.id;
+    if task
+        .local_integration
+        .as_ref()
+        .is_some_and(|r| r.is_pending())
+    {
+        return Some(format!(
+            "task {title:?} ({id}) records an unfinished integration of its approved work; \
+             resume or discard that integration before deleting the Project"
+        ));
+    }
+    if task.republish_pending_refusal().is_some() {
+        return Some(format!(
+            "task {title:?} ({id}) has an unfinished restack of its published branch; \
+             resume or discard that restack before deleting the Project"
+        ));
+    }
+    if task.cleanup_in_flight {
+        return Some(format!(
+            "the cleanup of task {title:?}'s ({id}) checkout is unfinished, because an earlier \
+             removal was interrupted; delete the Task again before deleting the Project"
+        ));
+    }
+    if let Some(worktree_path) = task.worktree_path.as_deref() {
+        return Some(format!(
+            "task {title:?} ({id}) still has a checkout at {worktree_path}; delete the Task \
+             (its deletion removes the checkout safely and keeps its Git recovery refs) \
+             before deleting the Project"
+        ));
+    }
+    None
+}
+
+/// Acquire every Project-task lifecycle lease at once, releasing again if any
+/// of them cannot be taken.
+///
+/// Project deletion must not open a Task's checkout, start a run against it or
+/// ask a Task mutation to persist while one of the Project's Tasks is mid
+/// transition. Every transition that matters -- starting a run, crafting a
+/// worktree, terminalizing, deleting -- takes this same lease first, so
+/// holding all of a Project's leases across the deletion makes its remaining
+/// Tasks momentarily inaccessible to exactly those transitions and nothing
+/// else. A read of the board, and an ordinary edit of a Task's text or of its
+/// dependencies, do not take the lease and are unaffected.
+///
+/// The leases are dropped (`Err` et al. unwind them) when any acquisition
+/// times out, so a refusal leaves every Task as found -- the same contract as
+/// [`TaskLifecycleLocks::acquire`], extended to the set.
+pub async fn hold_project_task_leases(
+    authority: &TaskLifecycleLocks,
+    tasks: &Tasks,
+    project_id: Uuid,
+) -> Result<Vec<LifecycleLease>, String> {
+    let ids = {
+        let tasks_r = tasks.read().await;
+        project_task_ids(&tasks_r, project_id)
+    };
+    let mut leases = Vec::with_capacity(ids.len());
+    for id in &ids {
+        match authority.acquire(*id).await {
+            Ok(lease) => leases.push(lease),
+            Err(message) => return Err(message),
+        }
+    }
+    Ok(leases)
+}
+
+/// The ids of a Project's Tasks currently on the board.
+pub fn project_task_ids(tasks: &HashMap<Uuid, Task>, project_id: Uuid) -> Vec<Uuid> {
+    tasks
+        .values()
+        .filter(|t| t.project_id == project_id)
+        .map(|t| t.id)
+        .collect()
 }
 
 /// [`terminalize`] for a caller that already holds the task's lease.
@@ -2537,7 +2656,7 @@ mod tests {
         let damaged = b"tasks = [ not toml".to_vec();
         std::fs::write(&file, &damaged).unwrap();
 
-        let created = create(&world.tasks, &world.storage, world.project_id, |_| {
+        let created = create(&world.tasks, &world.projects, &world.storage, world.project_id, |_| {
             let mut t = crate::test_helpers::create_test_task("New");
             t.project_id = world.project_id;
             t
@@ -2556,7 +2675,7 @@ mod tests {
 
         let mut imported = crate::test_helpers::create_test_task("Imported");
         imported.project_id = world.project_id;
-        assert!(create_batch(&world.tasks, &world.storage, world.project_id, &[imported]).await.is_err());
+        assert!(create_batch(&world.tasks, &world.projects, &world.storage, world.project_id, &[imported]).await.is_err());
 
         let board = world.tasks.read().await;
         assert_eq!(board.len(), 1, "no refused change may appear on the board");
@@ -2564,9 +2683,32 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), damaged);
         drop(board);
 
-        // Another project keeps working.
+        // Another project keeps working — the project exists, so creation
+        // for it is still allowed.
         let other = Uuid::new_v4();
-        let ok = create(&world.tasks, &world.storage, other, |_| {
+        world.projects.write().await.insert(
+            other,
+            Project {
+                id: other,
+                name: "Other".into(),
+                repository_id: None,
+                scope: ProjectScope::Standalone,
+                state_location: StateLocation::External,
+                base: None,
+                agent_type: crate::domain::AgentType::ClaudeCode,
+                agent_config: AgentConfig {
+                    agent_type: crate::domain::AgentType::ClaudeCode,
+                    command: "claude".into(),
+                    args: vec!["--stdio".into()],
+                    env: HashMap::new(),
+                    model: None,
+                    api_key: None,
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        );
+        let ok = create(&world.tasks, &world.projects, &world.storage, other, |_| {
             let mut t = crate::test_helpers::create_test_task("Elsewhere");
             t.project_id = other;
             t
@@ -2584,7 +2726,7 @@ mod tests {
         let mut existing = crate::test_helpers::create_test_task("Existing");
         existing.project_id = world.project_id;
         let existing_id = existing.id;
-        create_batch(&world.tasks, &world.storage, world.project_id, &[existing]).await.unwrap();
+        create_batch(&world.tasks, &world.projects, &world.storage, world.project_id, &[existing]).await.unwrap();
 
         let batch: Vec<Task> = ["One", "Two", "Three"]
             .iter()
@@ -2596,7 +2738,7 @@ mod tests {
                 t
             })
             .collect();
-        create_batch(&world.tasks, &world.storage, world.project_id, &batch).await.unwrap();
+        create_batch(&world.tasks, &world.projects, &world.storage, world.project_id, &batch).await.unwrap();
 
         assert_eq!(world.tasks.read().await.len(), 4);
         let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();

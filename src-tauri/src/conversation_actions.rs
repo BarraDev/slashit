@@ -298,7 +298,12 @@ async fn execute(scope: &Scope<'_>, mutation: &TaskMutation) -> Result<Execution
                 gitlab_issue_url: None,
                 linear_ticket_id: None,
             };
-            let task = lifecycle::create(scope.tasks, scope.storage, scope.project_id, move |existing| {
+            let task = lifecycle::create(
+                scope.tasks,
+                scope.projects,
+                scope.storage,
+                scope.project_id,
+                move |existing| {
                 Task::new_backlog(existing, new)
             })
             .await?;
@@ -585,7 +590,63 @@ mod tests {
         }
 
         async fn seed_task(&self, project_id: Uuid, title: &str) -> Task {
-            lifecycle::create(&self.tasks, &self.storage, project_id, |existing| {
+            // Some tests seed a Task belonging to another Project on
+            // purpose. A Task exists only for a Project that exists, so give
+            // any unregistered id the Project it needs; the tests still
+            // answer for the project's own Scope.
+            if !self.projects.read().await.contains_key(&project_id) {
+                self.projects.write().await.insert(
+                    project_id,
+                    Project {
+                        id: project_id,
+                        name: "foreign".into(),
+                        repository_id: None,
+                        scope: ProjectScope::Standalone,
+                        state_location: StateLocation::External,
+                        base: None,
+                        agent_type: AgentType::ClaudeCode,
+                        agent_config: AgentConfig {
+                            agent_type: AgentType::ClaudeCode,
+                            command: "claude".into(),
+                            args: Vec::new(),
+                            env: HashMap::new(),
+                            model: None,
+                            api_key: None,
+                        },
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                    },
+                );
+            }
+            // Some tests seed a Task belonging to another Project on
+            // purpose. A Task exists only for a Project that exists, so give
+            // any unregistered id the Project it needs; the tests still
+            // answer for the project's own Scope.
+            if !self.projects.read().await.contains_key(&project_id) {
+                self.projects.write().await.insert(
+                    project_id,
+                    Project {
+                        id: project_id,
+                        name: "foreign".into(),
+                        repository_id: None,
+                        scope: ProjectScope::Standalone,
+                        state_location: StateLocation::External,
+                        base: None,
+                        agent_type: AgentType::ClaudeCode,
+                        agent_config: AgentConfig {
+                            agent_type: AgentType::ClaudeCode,
+                            command: "claude".into(),
+                            args: Vec::new(),
+                            env: HashMap::new(),
+                            model: None,
+                            api_key: None,
+                        },
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                    },
+                );
+            }
+            lifecycle::create(&self.tasks, &self.projects, &self.storage, project_id, |existing| {
                 Task::new_backlog(
                     existing,
                     NewTask {

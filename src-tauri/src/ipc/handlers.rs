@@ -182,9 +182,15 @@ async fn handle_create_task(
         gitlab_issue_url: None,
         linear_ticket_id: None,
     };
-    let result = crate::lifecycle::create(&ctx.tasks, &ctx.storage, project_uuid, move |existing| {
-        crate::domain::Task::new_backlog(existing, new)
-    })
+    let result = crate::lifecycle::create(
+        &ctx.tasks,
+        &ctx.projects,
+        &ctx.storage,
+        project_uuid,
+        move |existing| {
+            crate::domain::Task::new_backlog(existing, new)
+        },
+    )
     .await;
 
     match result {

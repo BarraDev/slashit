@@ -319,6 +319,14 @@ pub(crate) async fn approve(
     task_id: Uuid,
     create_pr: bool,
 ) -> Result<ApprovalOutcome, String> {
+    // The delivery marker is taken before the approval is recorded, not
+    // inside `deliver`: approving runs outside the task's lifecycle lease
+    // after `record_approval` returns, so a Project deletion could otherwise
+    // answer "nothing is owed for this Task" in the gap between the
+    // approval's durable write and the delivery's registration, and delete
+    // the Project out from under a delivery that is about to own the Task.
+    // Counted marks nest, so `deliver` keeps starting its own.
+    let _in_flight = state.task.deliveries.start(task_id);
     let task = record_approval(state, task_id).await?;
     if !create_pr {
         return Ok(ApprovalOutcome { task, pr: None });
@@ -331,6 +339,10 @@ pub(crate) async fn retry_delivery(
     state: &crate::AppState,
     task_id: Uuid,
 ) -> Result<ApprovalOutcome, String> {
+    // Same reason as in [`approve`]: the marker must be visible before the
+    // checks below read the task, so a concurrent Project deletion cannot
+    // slip between this decision and the delivery that follows it.
+    let _in_flight = state.task.deliveries.start(task_id);
     let task = current(state, task_id).await.ok_or("Task not found")?;
     if task.status != TaskStatus::HumanReview || !task.human_review.is_approved() {
         return Err(
