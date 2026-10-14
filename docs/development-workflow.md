@@ -142,6 +142,42 @@ Rules:
 
 ## 5. JJ workspace lifecycle
 
+### Preflight
+
+Run this before the first mutation of a session or of a unit, and again after
+anything that could have changed the answers (a fetch, another agent's
+activity, a failed command). It is read-only; use `--ignore-working-copy` in
+the canonical root.
+
+```bash
+# 1. Which kind of checkout is this? A JJ developer workspace has no .git; the
+#    canonical root and a Git-only clone do.
+pwd; test -e .git && echo "has .git" || echo "no .git"
+mise exec -- jj workspace list
+
+# 2. Ownership: is anyone else mutating this workspace? Recent operations
+#    that are not yours mean it is not yours to edit.
+mise exec -- jj op log --limit 5
+
+# 3. Active revision and parent: what is @, is it empty, what is @-?
+mise exec -- jj log -r '@ | @-'
+
+# 4. Publication bookmark against the remote it will be pushed to. The local
+#    bookmark must exist once, not be conflicted, and agree with <bookmark>@origin.
+mise exec -- jj --ignore-working-copy bookmark list -a <bookmark>
+
+# 5. The remote head as GitHub reports it, not as the last push printed it.
+gh api repos/BarraDev/slashit/git/ref/heads/<bookmark> --jq .object.sha
+```
+
+Then confirm the authorization the next operation needs (section 13) and read
+the `AGENTS.md` of every directory you are about to touch.
+
+Stop under section 15 when the answers disagree with what you were told: you
+are in the canonical root and about to edit product files, `@` holds edits you
+did not make, the bookmark is conflicted or its change is divergent, or the
+remote head is not the commit you expected.
+
 ### Work
 
 Inside the workspace, use ordinary `jj` commands (`jj status`, `jj diff`,
@@ -269,6 +305,35 @@ ancestor after the published commit was rewritten. `jj bookmark move`
 refuses backward or sideways moves unless given `--allow-backwards`; do not
 pass it here. The dry run must report `move forward` for that bookmark and
 nothing else.
+
+Step 4 is where a mistake becomes public, so before running it prove the
+correction is what you believe it is:
+
+- It changes something. For a source correction `mise exec -- jj diff -r
+  <correction-change-id> --stat` must list the intended files. A correction
+  with an empty diff is not a fix, whatever its description says, and a
+  successful `jj describe`, commit or push proves nothing about content.
+- Its parent is the published checkpoint:
+  `mise exec -- jj log -r '<correction-change-id>- | <bookmark>@origin'` shows
+  one commit.
+- The tests ran against exactly this commit. Record
+  `jj log --no-graph -r <correction-change-id> -T commit_id` before the run
+  and again after it, and make sure `jj status` showed no edits on top.
+- Edit the change where it lives. Editing the same change from a Git
+  checkout or with Git porcelain makes it divergent (two commits, one change
+  ID), and a push from the Git side can then publish a copy that lacks the
+  content. Check for it with `mise exec -- jj log -r 'divergent()'`.
+
+After the push, read GitHub back instead of trusting the push output:
+
+```bash
+scripts/verify-published-commit.sh BarraDev/slashit <bookmark> <full-commit-id> --path <changed-dir>/
+```
+
+It fails unless the remote head is exactly that commit, the commit changes
+files, and it touches the given path. Equal commit IDs imply equal trees, so
+the published tree is the tree that was tested. The script does not say the
+hosted checks passed.
 
 ### Published-history policy
 
@@ -398,6 +463,36 @@ against the canonical `.git`. Use a `<slug>-git` clone as the project instead.
 
 JJ developer workspaces have no `.git` directory. This is expected.
 
+`jj` imports the refs and `HEAD` of every Git worktree registered in the
+canonical `.git`, so a worktree made there shows up as a stray bookmark in
+the shared store, and its `HEAD` moves under `jj`'s feet. Making one
+"temporarily" is not harmless. `git worktree list` run in the canonical root
+shows what is registered; report a worktree you did not create instead of
+removing it.
+
+`jj git init --colocate` inside a Git worktree is refused ("Cannot create a
+colocated jj repo inside a Git worktree", checked with the pinned `jj`), so a
+worktree cannot be converted into a JJ workspace. For a real `.git` use the
+independent clone above, which is its own repository.
+
+### When the preferred JJ operation fails
+
+A failing `jj` command is information, not an obstacle to route around.
+Switching to Git porcelain or to another kind of checkout leaves a state `jj`
+did not make and a later import has to reconcile, which is how a correction
+ends up published as an empty commit. Recover inside the workflow:
+
+| Symptom | Do |
+|---|---|
+| `jj workspace add` fails | Read the error. Usually the path exists or the working directory is wrong. Fix that; do not fall back to `git worktree add`. |
+| "working copy is stale" | `mise exec -- jj workspace update-stale`, then repeat the preflight. |
+| Conflicted bookmark (`??`) or divergent change | Do not push. The workspace that owns the change decides which side is kept. Report it; resolve with `jj bookmark set` or `jj abandon` only if you own it. |
+| A push dry run shows anything but `add` or `move forward` | Stop (section 15). Never retry with a force option. |
+| A tool needs a real `.git` | The Git-only exception above: an independent clone, not a worktree and not a colocation. |
+| `jj` itself misbehaves | Check `mise exec -- jj --version` against the pin, and reproduce in a disposable repository (section 9). Report the failure; do not improvise another VCS flow. |
+
+If a Git-only step really is the only way forward, record why in the report.
+
 ## 8. Mise and toolchain policy
 
 Project tools come from the project `mise.toml`. Today it pins one tool:
@@ -512,6 +607,31 @@ Operational rules:
   compiler cache, belong in a disposable workspace, not in project config.
 - Cargo's registry and Git download caches under `~/.cargo` remain shared
   globally. Only build output is per workspace.
+
+### Resource safety
+
+Diagnose capacity before a large build, not after it fails:
+
+```bash
+df -h . "${TMPDIR:-/tmp}"; free -g
+```
+
+A `/tmp` mounted as tmpfs consumes memory, so leftovers there can starve a
+build as surely as a full disk. Cap build parallelism (`cargo ... -j <n>`)
+when memory is short.
+
+Cleanup is limited to what the agent owns:
+
+- Allowed without asking: the `target/` of your own workspace, and temporary
+  files you created.
+- Needs explicit authorization: anything else, including other workspaces and
+  their `target/`, shared Cargo caches, `~/.cargo`, `~/.rustup` and installed
+  Rust toolchains, Git worktrees you did not create, and any directory whose
+  owner you cannot name. Removing a toolchain or cache to make room is not a
+  routine diagnosis step; it breaks other workspaces' builds and may be slow
+  or impossible to restore.
+- Report leftovers you find (stale worktrees, large temporary trees) with
+  their paths and sizes instead of removing them.
 
 ## 11. Agent and subagent model
 
@@ -635,4 +755,28 @@ Stop and report instead of guessing when:
   for the intended bookmark, or lists any other bookmark;
 - a bookmark operation could schedule a remote deletion;
 - it cannot be proven that removing a workspace loses nothing;
-- a sandbox remote or push URL resolves outside the sandbox.
+- a sandbox remote or push URL resolves outside the sandbox;
+- the preflight (section 5) disagrees with what you were told;
+- the next step would use a different VCS or checkout kind because a `jj`
+  operation failed (section 7);
+- reading the published branch back shows a head or content other than the
+  one you tested.
+
+## 16. Verification discipline
+
+A claim of success needs evidence that is about the thing being claimed.
+These substitutes are common and wrong:
+
+| Substitute | Why it fails | Check instead |
+|---|---|---|
+| The last line of `cargo test ... \| tail` | The pipeline's status is `tail`'s. A failing run looks successful. | Run without the pipe and read `$?`, or use `set -o pipefail`, or write to a file and check the status first. |
+| A passing run | It may have run another revision, or with uncommitted edits. | Record the commit ID before and after the run and keep `jj status` clean (section 5, Review corrections). |
+| A successful push or commit | It proves a ref moved, not that the content is there. | `scripts/verify-published-commit.sh`. |
+| A passing local merge of two branches | It validates that union only. Two unmerged pull requests are not integrated by it, and the merge that eventually lands may resolve differently. | Say "validated on a local union"; re-validate after the first PR merges, on the exact tree to be published. |
+| An old CodeRabbit review | A review of an earlier commit says nothing about the head, and a rate-limited run is not a review. | Compare the review's `commit_id` with the PR head: `gh api repos/BarraDev/slashit/pulls/<n>/reviews --jq '.[] \| {user: .user.login, commit_id}'`. |
+| "CI is green" while jobs run | A check with no conclusion is pending. | `gh pr view <n> -R BarraDev/slashit --json statusCheckRollup`; report pending checks as pending. |
+
+Local tests show how the code behaves in the tests. They do not demonstrate
+power-loss durability, behavior on an operating system other than the one they
+ran on, or anything the hosted `ignore`d tests cover. State those limits in
+the report instead of implying them.
