@@ -4300,6 +4300,18 @@ impl TaskExecutor {
     /// irreversible work, but a lost write would still silently strand the
     /// task off every automatic path with nothing on disk explaining why.
     ///
+    /// A failed record answers truthfully about what it did, the way
+    /// [`Self::settle_stopped_static`] does: a failure that replaced the file
+    /// and then could not confirm it durable left the errored board published
+    /// (on disk and, through `publish`'s adoption, in memory too), so the task
+    /// shows as errored and only the durability of that record is unconfirmed.
+    /// A failure that published nothing left the task exactly as it was, so
+    /// whether anything picks it up again is a fact about that state: only a
+    /// task that is ready to execute is selected again while this process
+    /// runs. Either way the answer is delivered both as an error event and as
+    /// a warn log, because the log line alone is not an event a surface keys
+    /// on, and the error event alone would not reach the task's log timeline.
+    ///
     /// `ended` is the coding run the failure ended, with its tool calls;
     /// `None` when the task failed before a run could start.
     async fn set_task_error_static(
@@ -4328,14 +4340,57 @@ impl TaskExecutor {
             }
         };
         if let Err(e) = crate::lifecycle::record(tasks, storage, task_id, &amend).await {
+            let message = if crate::config::says_in_place_but_unconfirmed(&e) {
+                format!(
+                    "Task {task_id} failed ({msg}). The failure was recorded on the board and \
+                     in the file, so the task shows as errored, but SlashIt could not confirm \
+                     that this reached stable storage, so a restart may still find the task as \
+                     it was before this failure: {e}"
+                )
+            } else {
+                // `record` writes and publishes nothing on a failure that did
+                // not reach the file, so the task is exactly as it was.
+                // Whether anything will pick it up again is a fact about that
+                // state, not about this call: only a task that is ready to
+                // execute is selected again while this process runs, and a task
+                // whose run has just ended is not (its phase says a run is in
+                // progress that no longer exists). A restart returns it to
+                // Queue.
+                let current = tasks.read().await.get(&task_id).cloned();
+                let outlook = match &current {
+                    Some(task) if task.is_ready_to_execute() => "it is still ready to execute, \
+                         so the \
+                         next pass will pick it up and try again"
+                        .to_string(),
+                    Some(task) => format!(
+                        "it is still {:?} in phase {:?}, which nothing picks up again while \
+                         SlashIt keeps running, so it stays there with no run attached until \
+                         you act: move it to Queue to run it again (it starts when the queue \
+                         promotes it, automatically only while auto-promote is on), to \
+                         Backlog to park it (it does not start until you queue or start it), \
+                         or to Error to record that it failed{}",
+                        task.status,
+                        task.phase,
+                        // `migrate_task` returns exactly these two to Queue at start-up.
+                        if matches!(task.status, TaskStatus::InProgress | TaskStatus::AiReview) {
+                            ". Restarting SlashIt returns it to Queue, where it runs again \
+                             once the queue promotes it"
+                        } else {
+                            ""
+                        }
+                    ),
+                    None => "it is no longer on the board".to_string(),
+                };
+                format!(
+                    "Task {task_id} failed ({msg}), and recording that failure durably also \
+                     failed, so the task was not published as errored: {outlook}. Cause: {e}"
+                )
+            };
+            events.agent_event(AgentEvent::Error { task_id: task_id.to_string(), message: message.clone() });
             events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Warn,
-                message: format!(
-                    "Task {task_id} failed ({msg}), and recording that failure durably also \
-                     failed, so the task was not published as errored and remains eligible to \
-                     be picked up again: {e}"
-                ),
+                message,
             });
         }
     }
@@ -6184,6 +6239,9 @@ mod tests {
         let recording = Arc::new(crate::events::RecordingEventSink::new());
         let (executor, temps) = test_executor_with_events(recording.clone());
         let (id, _project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        // Promoted out of the queue and failing before any run: the one shape
+        // the executor selects again. (The seed's phase is a working one.)
+        executor.tasks.write().await.get_mut(&id).unwrap().phase = TaskPhase::Idle;
         block_persistence(&temps[0]);
 
         TaskExecutor::set_task_error_static(
@@ -6197,6 +6255,10 @@ mod tests {
         .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert!(
+            after.is_ready_to_execute(),
+            "the premise of the promise below"
+        );
         assert_eq!(
             after.status,
             TaskStatus::InProgress,
@@ -6206,8 +6268,232 @@ mod tests {
         assert!(after.error_message.is_none());
 
         assert!(
-            warn_message_containing(&recording, "remains eligible to be picked up again"),
+            warn_message_containing(&recording, "next pass will pick it up and try again"),
             "the failure must be surfaced, not silently swallowed; recorded events: {:?}",
+            recording.recorded()
+        );
+    }
+
+    fn recorded_error_messages(recording: &crate::events::RecordingEventSink) -> Vec<String> {
+        recording
+            .recorded()
+            .iter()
+            .filter(|(name, payload)| {
+                name == "agent-event" && payload.get("type").and_then(|v| v.as_str()) == Some("error")
+            })
+            .filter_map(|(_, payload)| payload.get("message").and_then(|v| v.as_str()).map(str::to_string))
+            .collect()
+    }
+
+    /// A run that has just ended leaves its task in a working phase. Nothing
+    /// selects that task again, so a failed error write must not say it will
+    /// be retried; it must say where the task is stuck and how to move it.
+    #[tokio::test]
+    async fn an_error_that_cannot_be_recorded_after_a_run_does_not_promise_a_retry() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, temps) = test_executor_with_events(recording.clone());
+        let (id, _project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        executor.tasks.write().await.get_mut(&id).unwrap().phase = TaskPhase::Coding;
+        block_persistence(&temps[0]);
+
+        TaskExecutor::set_task_error_static(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            "agent exited with status 1",
+            Some(RunEnd { run: 1, tools: None, timeline_reason: None }),
+        )
+        .await;
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(after.status, TaskStatus::InProgress, "nothing was published");
+        assert_eq!(after.phase, TaskPhase::Coding);
+        assert!(!after.is_ready_to_execute(), "the premise: nothing will pick this task up");
+
+        assert!(
+            !warn_message_containing(&recording, "try again"),
+            "a task nothing selects must not be promised a retry: {:?}",
+            recording.recorded()
+        );
+        assert!(!warn_message_containing(&recording, "eligible"), "{:?}", recording.recorded());
+        for needle in ["InProgress", "Coding", "while SlashIt keeps running", "Restarting SlashIt", "automatically only while auto-promote is on", "does not start until you queue or start it", "or to Error"] {
+            assert!(
+                warn_message_containing(&recording, needle),
+                "the warning must say {needle:?}: {:?}",
+                recording.recorded()
+            );
+        }
+        // Also sent as an error event (the log line alone is not an event a surface keys on).
+        let errors = recorded_error_messages(&recording);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("not published as errored"), "{errors:?}");
+    }
+
+    /// A restart only returns an in-flight task to Queue. Telling the person a
+    /// restart will run a task in any other status again would be false.
+    #[tokio::test]
+    async fn the_stranded_error_promises_a_restart_only_where_a_restart_requeues() {
+        for (status, promised) in [
+            (TaskStatus::InProgress, true),
+            (TaskStatus::AiReview, true),
+            (TaskStatus::HumanReview, false),
+            (TaskStatus::Done, false),
+        ] {
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let (executor, temps) = test_executor_with_events(recording.clone());
+            let (id, _project_id) = seed_task(&executor, status.clone()).await;
+            {
+                let mut tasks = executor.tasks.write().await;
+                let task = tasks.get_mut(&id).unwrap();
+                task.phase = TaskPhase::Coding;
+            }
+            block_persistence(&temps[0]);
+
+            TaskExecutor::set_task_error_static(&executor.tasks, &executor.storage, &executor.events, id, "x", None)
+                .await;
+
+            assert_eq!(
+                warn_message_containing(&recording, "Restarting SlashIt returns it to Queue"),
+                promised,
+                "{status:?}: {:?}",
+                recording.recorded()
+            );
+            assert!(warn_message_containing(&recording, &format!("{status:?}")), "{status:?}");
+        }
+    }
+
+    /// The path the message names is real: moving the stranded task to Queue or
+    /// Backlog resets its phase, and moving it to Error needs nothing else.
+    #[test]
+    fn the_recovery_the_error_names_does_work_for_a_task_a_run_left_behind() {
+        let mut stranded = crate::test_helpers::create_test_task_full("t", Uuid::new_v4(), TaskStatus::InProgress, 0);
+        stranded.phase = TaskPhase::Coding;
+        assert!(!stranded.is_ready_to_execute());
+        for target in [TaskStatus::Backlog, TaskStatus::Queue] {
+            assert_eq!(
+                crate::lifecycle::classify_status_transition(&stranded.status, &target),
+                crate::lifecycle::StatusTransitionEffect::ResetExecutionState
+            );
+            let mut moved = stranded.clone();
+            moved.reset_execution_state();
+            moved.status = TaskStatus::InProgress;
+            assert!(moved.is_ready_to_execute(), "{target:?}: reset makes it runnable again");
+        }
+        assert_eq!(
+            crate::lifecycle::classify_status_transition(&stranded.status, &TaskStatus::Error),
+            crate::lifecycle::StatusTransitionEffect::None
+        );
+    }
+
+    /// A directory-sync failure after the file was replaced means `publish`
+    /// adopted the errored board into memory and the file already holds it: the
+    /// failure WAS published, and only its durability is unconfirmed. The
+    /// message must say that -- not that the task was not published and remains
+    /// eligible, because nothing at all picks up an errored task while SlashIt
+    /// keeps running, and a caller that believes the error never happened would
+    /// have nowhere to see the failure again once the Error event is gone.
+    #[tokio::test]
+    async fn an_error_the_board_adopted_but_could_not_confirm_is_reported_as_recorded() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, temps) = test_executor_with_events(recording.clone());
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        // A run that has just ended: the task sits in a working phase nothing
+        // selects again while SlashIt keeps running.
+        executor.tasks.write().await.get_mut(&id).unwrap().phase = TaskPhase::Coding;
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        TaskExecutor::set_task_error_static(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            "agent exited with status 1",
+            Some(RunEnd { run: 1, tools: None, timeline_reason: None }),
+        )
+        .await;
+        drop(fault);
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            after.status,
+            TaskStatus::Error,
+            "`record` adopted the errored board it published, so memory shows it"
+        );
+        assert_eq!(after.phase, TaskPhase::Failed);
+        assert_eq!(after.error_message.as_deref(), Some("agent exited with status 1"));
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(on_disk.status, TaskStatus::Error, "the file holds the errored board");
+
+        let errors = recorded_error_messages(&recording);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("was recorded on the board and in the file"),
+            "{errors:?}"
+        );
+        assert!(
+            errors[0].contains("could not confirm"),
+            "the message must keep the durability caveat: {errors:?}"
+        );
+        assert!(!errors[0].contains("not published as errored"), "{errors:?}");
+        assert!(!errors[0].contains("remains eligible"), "{errors:?}");
+        assert!(
+            !warn_message_containing(&recording, "next pass will pick it up and try again"),
+            "an errored task matches no selector, so no retry promise is true: {:?}",
+            recording.recorded()
+        );
+    }
+
+    /// Same published-but-unconfirmed outcome for the eager shape: the executor
+    /// would select a ready task again, but once the errored record is adopted
+    /// the task is errored and matches no selector, so the ready promise must
+    /// not be made either.
+    #[tokio::test]
+    async fn a_spawn_failure_the_board_adopted_but_could_not_confirm_is_not_promised_the_next_pass() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, temps) = test_executor_with_events(recording.clone());
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        // The eager premise: promoted out of the queue and failing before any
+        // run, the one state the executor would select again.
+        executor.tasks.write().await.get_mut(&id).unwrap().phase = TaskPhase::Idle;
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        TaskExecutor::set_task_error_static(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            "agent could not start",
+            None,
+        )
+        .await;
+        drop(fault);
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            after.status,
+            TaskStatus::Error,
+            "`record` adopted the errored board, so the task is no longer ready to execute"
+        );
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(on_disk.status, TaskStatus::Error, "the file holds the errored board");
+
+        let errors = recorded_error_messages(&recording);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("was recorded on the board and in the file"),
+            "{errors:?}"
+        );
+        assert!(!errors[0].contains("still ready to execute"), "{errors:?}");
+        assert!(
+            !warn_message_containing(&recording, "next pass will pick it up and try again"),
+            "the adopted board errored the task, so nothing picks it up: {:?}",
             recording.recorded()
         );
     }

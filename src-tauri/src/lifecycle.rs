@@ -379,8 +379,12 @@ pub async fn terminalize(
 /// destructive and nothing here moves a task between columns.
 ///
 /// The order is the same contract the rest of the backend holds: the file
-/// accepts the change before the board shows it, so a failure leaves both the
-/// shared map and the disk exactly as they were and the caller is told so.
+/// accepts the change before the board shows it. A save that was refused
+/// before the replacement leaves both the shared map and the disk exactly as
+/// they were; one that replaced the file and then could not confirm it durable
+/// has already put the new board on disk -- [`publish`] adopts it into memory,
+/// and the error it returns says the change is in place, so the caller never
+/// reports a failure that published as one that published nothing.
 pub async fn record(
     tasks: &Tasks,
     storage: &Storage,
