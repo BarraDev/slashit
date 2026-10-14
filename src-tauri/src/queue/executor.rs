@@ -1543,13 +1543,23 @@ impl TaskExecutor {
         if let Err(e) =
             crate::lifecycle::record_if_changed(&self.tasks, &self.storage, task_id, &revise).await
         {
+            let message = if crate::config::says_in_place_but_unconfirmed(&e) {
+                format!(
+                    "Observed pull request state {state:?} for task {task_id}; the observation \
+                     is on the board and in the file, so the task already shows it, and only \
+                     its durability is unconfirmed (a restart that finds the record lost \
+                     observes the same pull request state again): {e}"
+                )
+            } else {
+                format!(
+                    "Observed pull request state {state:?} for task {task_id}, but recording \
+                     it failed, so it was not applied and will be retried: {e}"
+                )
+            };
             self.events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Warn,
-                message: format!(
-                    "Observed pull request state {state:?} for task {task_id}, but recording \
-                     it failed, so it was not applied and will be retried: {e}"
-                ),
+                message,
             });
         }
     }
@@ -1774,6 +1784,9 @@ impl TaskExecutor {
             | Err(crate::lifecycle::TerminalizeRefusal::Quarantined(_))
             | Err(crate::lifecycle::TerminalizeRefusal::Busy(_))
             | Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => {}
+
+            // Only a delete answers this; a terminalization never does.
+            Err(crate::lifecycle::TerminalizeRefusal::DeleteBlockedByIntegration) => {}
         }
     }
 
@@ -2603,16 +2616,33 @@ impl TaskExecutor {
                                         }
                                     }
                                     Err(e) => {
-                                        // Nothing was published: memory and
-                                        // disk both still have the run in
-                                        // progress. A finish that cannot be
-                                        // recorded ends the run as a failure,
-                                        // the durable transition every other
-                                        // unfinished run takes.
-                                        let message = format!(
-                                            "The agent finished and its work was committed, but moving the \
-                                             task to AI review could not be saved, so it was not reviewed: {e}"
-                                        );
+                                        // `record_run_completed` either published the
+                                        // AI-review board and could not confirm it
+                                        // durable, or published nothing. In the second
+                                        // case a finish that cannot be recorded ends the
+                                        // run as a failure, the durable transition every
+                                        // other unfinished run takes. In the first the
+                                        // completed run is already on the board and in
+                                        // the file; the failure record that follows says
+                                        // so on its own, and a restart that loses the
+                                        // whole write re-derives the same ended run
+                                        // either way.
+                                        let message =
+                                            if crate::config::says_in_place_but_unconfirmed(&e) {
+                                                format!(
+                                                    "The agent finished and its work was committed. \
+                                                     The move to AI review was recorded on the board \
+                                                     and in the file, but SlashIt could not confirm \
+                                                     that this reached stable storage, so a restart \
+                                                     may still find the run in progress: {e}"
+                                                )
+                                            } else {
+                                                format!(
+                                                    "The agent finished and its work was committed, but \
+                                                     moving the task to AI review could not be saved, \
+                                                     so it was not reviewed: {e}"
+                                                )
+                                            };
                                         record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
                                         let ended = RunEnd { run, tools, timeline_reason: None };
                                         Self::set_task_error_static(&tasks, &storage, &events, task_id, &message, Some(ended)).await;
@@ -3958,14 +3988,22 @@ impl TaskExecutor {
             }
         };
         if let Err(e) = crate::lifecycle::record(tasks, storage, task_id, &amend).await {
+            // Either the hand-off was published and only its durability is
+            // unconfirmed (`record` adopts what reached the file), or nothing
+            // was published, in which case the AI-review selector still finds
+            // the task and a later attempt re-runs the review.
+            let outcome = if crate::config::says_in_place_but_unconfirmed(&e) {
+                "the hand-off was recorded on the board and in the file, so the task shows as \
+                 ready for human review, but SlashIt could not confirm that this reached \
+                 stable storage, so a restart may still find it as it was before the hand-off"
+            } else {
+                "recording it as ready for human review failed, so it was not published and \
+                 will be re-reviewed rather than silently skipped"
+            };
             events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Warn,
-                message: format!(
-                    "Task {task_id} finished review, but recording it as ready for human \
-                     review failed, so it was not published and will be re-reviewed rather \
-                     than silently skipped: {e}"
-                ),
+                message: format!("Task {task_id} finished review, but {outcome}: {e}"),
             });
         }
     }
@@ -4268,8 +4306,9 @@ impl TaskExecutor {
     /// Move a task whose run finished and whose work is committed on to AI
     /// review, durably before the board can show it: the status, the review
     /// phase, the run's tool calls and its [`ActivityKind::RunCompleted`] are
-    /// one write. `Err` means nothing was written or published, and `tools`
-    /// is still the caller's to record elsewhere.
+    /// one write. `Err` means the write either published the new board and
+    /// could not confirm it durable, or published nothing; `tools` is still
+    /// the caller's to record on the task either way.
     async fn record_run_completed(
         tasks: &Tasks,
         storage: &crate::config::Storage,
@@ -5353,6 +5392,52 @@ mod tests {
         );
     }
 
+    /// A closure observation whose directory sync failed has still been
+    /// recorded: `record_if_changed` adopted the board the published file
+    /// holds, so the poll's own selection already treats this PR as closed and
+    /// does not ask the spin-off question again. The log must say the
+    /// observation is in place, not that it will be re-applied -- there is
+    /// nothing to re-apply, and a restart that finds the record lost simply
+    /// observes the same pull request again.
+    #[tokio::test]
+    async fn a_closed_pr_observation_the_board_adopted_but_could_not_confirm_is_reported_as_recorded() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
+        let (id, project_id) = task_with_open_pr(&executor, None).await;
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        executor.record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED").await;
+        drop(fault);
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            recorded_pr_state(&after).as_deref(),
+            Some("CLOSED"),
+            "`record_if_changed` adopted the published observation, so memory shows it"
+        );
+        assert_eq!(
+            after.error_message.as_deref(),
+            Some("PR was closed without merge"),
+            "a PrCreated task is in the PR lifecycle, so the explanation was recorded by \
+             the same write"
+        );
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(recorded_pr_state(&on_disk).as_deref(), Some("CLOSED"));
+        assert!(
+            warn_message_containing(&recording, "the task already shows it"),
+            "{:?}",
+            recording.recorded()
+        );
+        assert!(
+            !warn_message_containing(&recording, "was not applied"),
+            "a published observation is not one that will be retried: {:?}",
+            recording.recorded()
+        );
+    }
+
     #[tokio::test]
     async fn a_closed_pr_that_is_recorded_is_durable_before_it_is_published() {
         let (executor, _temps) = test_executor();
@@ -6232,6 +6317,60 @@ mod tests {
         );
     }
 
+    /// A hand-off whose directory sync failed has still put the task in
+    /// `HumanReview`: `record` adopted the board the published file holds. The
+    /// log must say where the hand-off stands, not that it never happened and
+    /// will be re-run -- nothing re-runs it, and claiming it did would invite
+    /// re-triggering the fix agent over a tree that already moved.
+    #[tokio::test]
+    async fn a_handoff_the_board_adopted_but_could_not_confirm_is_reported_as_recorded() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
+        let (id, project_id) = seed_task(&executor, TaskStatus::AiReview).await;
+
+        let signoff = QaSignoff {
+            status: QaStatus::Approved,
+            issues_found: Vec::new(),
+            timestamp: chrono::Utc::now(),
+            session_id: Uuid::new_v4(),
+        };
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        TaskExecutor::transition_to_human_review(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            Some(signoff),
+            Vec::new(),
+        )
+        .await;
+        drop(fault);
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            after.status,
+            TaskStatus::HumanReview,
+            "`record` adopted the published board, so memory shows the hand-off"
+        );
+        assert_eq!(after.phase, TaskPhase::Complete);
+        assert!(after.qa_signoff.is_some());
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(on_disk.status, TaskStatus::HumanReview, "the file holds the hand-off");
+        assert!(
+            warn_message_containing(&recording, "was recorded on the board and in the file"),
+            "{:?}",
+            recording.recorded()
+        );
+        assert!(
+            !warn_message_containing(&recording, "will be re-reviewed"),
+            "a published hand-off is not one that will run again: {:?}",
+            recording.recorded()
+        );
+    }
+
     // --- set_task_error_static ---
 
     #[tokio::test]
@@ -6255,10 +6394,7 @@ mod tests {
         .await;
 
         let after = executor.tasks.read().await.get(&id).cloned().expect("task");
-        assert!(
-            after.is_ready_to_execute(),
-            "the premise of the promise below"
-        );
+        assert!(after.is_ready_to_execute(), "the premise of the promise below");
         assert_eq!(
             after.status,
             TaskStatus::InProgress,
@@ -6396,7 +6532,7 @@ mod tests {
     #[tokio::test]
     async fn an_error_the_board_adopted_but_could_not_confirm_is_reported_as_recorded() {
         let recording = Arc::new(crate::events::RecordingEventSink::new());
-        let (executor, temps) = test_executor_with_events(recording.clone());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
         let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
         // A run that has just ended: the task sits in a working phase nothing
         // selects again while SlashIt keeps running.
@@ -6454,7 +6590,7 @@ mod tests {
     #[tokio::test]
     async fn a_spawn_failure_the_board_adopted_but_could_not_confirm_is_not_promised_the_next_pass() {
         let recording = Arc::new(crate::events::RecordingEventSink::new());
-        let (executor, temps) = test_executor_with_events(recording.clone());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
         let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
         // The eager premise: promoted out of the queue and failing before any
         // run, the one state the executor would select again.
@@ -6496,6 +6632,37 @@ mod tests {
             "the adopted board errored the task, so nothing picks it up: {:?}",
             recording.recorded()
         );
+    }
+
+    /// A run completion whose directory sync failed has still moved the task
+    /// to `AiReview`: `record` adopted the board the published file holds, so
+    /// the caller's "nothing was saved" reading would be false exactly where
+    /// its follow-up (the error record) needs to know the AI-review move
+    /// already happened.
+    #[tokio::test]
+    async fn a_run_completion_the_board_adopted_but_could_not_confirm_reports_the_write_in_place() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        let error = TaskExecutor::record_run_completed(&executor.tasks, &executor.storage, id, 1, None)
+            .await
+            .expect_err("the caller is told the durability is unconfirmed");
+        drop(fault);
+
+        assert!(error.contains("in place but not confirmed durable"), "{error}");
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(
+            after.status,
+            TaskStatus::AiReview,
+            "`record` adopted the published board, so memory shows the completion"
+        );
+        assert_eq!(after.phase, TaskPhase::QaReview);
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(on_disk.status, TaskStatus::AiReview, "the file holds the completion");
     }
 
     #[tokio::test]
