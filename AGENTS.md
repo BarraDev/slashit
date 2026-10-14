@@ -120,9 +120,8 @@ private state.
 - One mutating owner per workspace. Read-only reviewers may share a workspace
   but must not write to it or run builds that conflict with the owner's.
 - Never run `git worktree add` against the canonical `.git`: `jj` would
-  import its refs. A task that genuinely needs a real `.git` (SlashIt's own
-  Git worktree backend, `git bisect`) uses a disposable independent clone at
-  `../workspaces/<slug>-git`.
+  import its refs. A task that needs a real `.git` (e.g. `git bisect`) uses
+  a disposable independent clone at `../workspaces/<slug>-git`.
 - Each workspace keeps its own `target/`; do not share a Cargo target
   directory between workspaces or set `CARGO_TARGET_DIR` globally.
 - JJ workspaces have no `.git`; run `gh` with `-R BarraDev/slashit` or from
