@@ -75,15 +75,18 @@ pub struct ProjectTasksFile {
 ///   [`Storage::confirm_config_durable`] succeeds, and the caller must say so
 ///   instead of reporting either success or "nothing was saved".
 ///
-/// A fully durable success is the `Ok` of the call that returned this. On a
-/// filesystem that cannot synchronize a directory at all
-/// (`slashit_durable_fs::DirectorySync::Unsupported`) the write is accepted as
-/// confirmed, because nothing more can be asked of it; that is the one place
-/// "durable" means "as durable as that filesystem gets".
+/// * [`Self::Unconfirmable`] -- only ever returned by
+///   [`Storage::confirm_config_durable`]. The write itself succeeded, but the
+///   filesystem cannot synchronize a directory
+///   (`slashit_durable_fs::DirectorySync::Unsupported`), so nothing can prove
+///   the replacement survives a power loss. An ordinary save is not refused on
+///   such a filesystem; a destructive step that depends on the change sticking
+///   is, and it keeps its retry records.
 #[derive(Debug)]
 pub enum ConfigWriteError {
     NotPublished(anyhow::Error),
     PublishedNotDurable(anyhow::Error),
+    Unconfirmable(anyhow::Error),
 }
 
 impl ConfigWriteError {
@@ -94,7 +97,7 @@ impl ConfigWriteError {
 
     fn inner(&self) -> &anyhow::Error {
         match self {
-            Self::NotPublished(e) | Self::PublishedNotDurable(e) => e,
+            Self::NotPublished(e) | Self::PublishedNotDurable(e) | Self::Unconfirmable(e) => e,
         }
     }
 
@@ -107,6 +110,11 @@ impl ConfigWriteError {
                 "The change was applied, but SlashIt could not confirm that it reached stable \
                  storage (while trying to {action}), so it may be lost if the computer stops \
                  before the next successful save. Do not repeat the action: {e:#}"
+            ),
+            Self::Unconfirmable(e) => format!(
+                "Could not {action}: the change is saved, but this storage location cannot \
+                 confirm that it survives a power loss, so SlashIt will not delete anything \
+                 that depends on it: {e:#}"
             ),
         }
     }
@@ -124,6 +132,7 @@ impl std::fmt::Display for ConfigWriteError {
                 "the change is in place but not confirmed durable (it may be lost if the \
                  computer stops before the next successful save): {e:#}"
             ),
+            Self::Unconfirmable(e) => write!(f, "the change cannot be confirmed durable on this storage location: {e:#}"),
         }
     }
 }
@@ -338,8 +347,9 @@ pub struct Storage {
     /// it protects is entirely synchronous file I/O with no `await` inside.
     config_tx: Arc<Mutex<()>>,
     /// Set while the last configuration write replaced the file but could not
-    /// confirm it durable, cleared by the next write that completes. See
-    /// [`Self::confirm_config_durable`].
+    /// confirm it durable (its directory sync failed, or the filesystem cannot
+    /// do one at all), cleared by the next write whose directory sync
+    /// succeeded. See [`Self::confirm_config_durable`].
     config_unconfirmed: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -912,11 +922,25 @@ impl Storage {
     /// The rewrite is the full protocol over the file as it is now, so it is
     /// also the retry that can clear the uncertainty. A no-op when the last
     /// write was confirmed.
+    ///
+    /// A filesystem that cannot synchronize a directory never confirms: the
+    /// rewrite succeeds, yet the result is [`ConfigWriteError::Unconfirmable`],
+    /// because "the filesystem would not say" is not "the filesystem said yes".
     pub fn confirm_config_durable(&self) -> std::result::Result<(), ConfigWriteError> {
         if !self.config_unconfirmed.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
-        self.update_config(|_| {})
+        self.update_config(|_| {})?;
+        self.require_config_confirmed()
+    }
+
+    fn require_config_confirmed(&self) -> std::result::Result<(), ConfigWriteError> {
+        if self.config_unconfirmed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ConfigWriteError::Unconfirmable(anyhow::anyhow!(
+                "the filesystem holding the configuration does not support synchronizing a directory"
+            )));
+        }
+        Ok(())
     }
 
     /// [`Self::confirm_config_durable`] without trusting this process's memory
@@ -928,7 +952,8 @@ impl Storage {
         // Unconfirmed until a write completes, so a failure here (including one
         // before publication) keeps every later barrier in this process closed.
         self.config_unconfirmed.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.update_config(|_| {})
+        self.update_config(|_| {})?;
+        self.require_config_confirmed()
     }
 
     /// Take the config transaction guard.
@@ -952,8 +977,12 @@ impl Storage {
             .context("Failed to serialize config")
             .map_err(ConfigWriteError::NotPublished)?;
         match write_private_atomic(&self.config_file, contents.as_bytes()) {
-            Ok(_) => {
-                self.config_unconfirmed.store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(committed) => {
+                // `Unsupported` is a write that succeeded without anyone being
+                // able to confirm the replacement itself: the barrier stays
+                // closed, but an ordinary save is not refused for it.
+                self.config_unconfirmed
+                    .store(!committed.is_fully_durable(), std::sync::atomic::Ordering::SeqCst);
                 self.refresh_routes(config);
                 Ok(())
             }
@@ -1038,6 +1067,16 @@ impl Storage {
     }
 }
 
+/// The phrase every board-write error uses when the new content is already in
+/// place. Callers that only have the rendered message (see `lifecycle::publish`)
+/// use [`says_in_place_but_unconfirmed`] to tell this from a write that changed
+/// nothing.
+const NOT_CONFIRMED_DURABLE: &str = "in place but not confirmed durable";
+
+pub fn says_in_place_but_unconfirmed(message: &str) -> bool {
+    message.contains(NOT_CONFIRMED_DURABLE)
+}
+
 /// A durable-write failure as an `anyhow` error whose outermost message is
 /// true. Callers render with `{e}`, which shows only that layer, so it must
 /// itself say when the new content is already in place: "failed to write X"
@@ -1047,12 +1086,27 @@ fn write_failure(error: slashit_durable_fs::WriteError, what: &str) -> anyhow::E
     let error = anyhow::Error::new(error);
     if published {
         error.context(format!(
-            "{what}: the new content is in place but not confirmed durable (it may be lost if \
+            "{what}: the new content is {NOT_CONFIRMED_DURABLE} (it may be lost if \
              the computer stops before the next successful save)"
         ))
     } else {
         error.context(format!("Failed to {what}"))
     }
+}
+
+/// Whether a failed [`Storage::save_project_tasks`] had already replaced the
+/// board file: the new board is what every reader sees, but its durability is
+/// unconfirmed ([`slashit_durable_fs::WriteError::PublishedNotDurable`]).
+///
+/// A caller that keeps the board in memory must then adopt what it tried to
+/// save, the way [`adopt_published`] does for configuration. Leaving memory on
+/// the previous board would let the next save, of any Task in that Project,
+/// write the whole previous board back over a change the file already holds,
+/// which undoes the operation silently.
+pub fn board_write_published(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<slashit_durable_fs::WriteError>()
+        .is_some_and(slashit_durable_fs::WriteError::is_published)
 }
 
 /// Write a file durably and atomically with owner-only permissions.
@@ -1318,13 +1372,14 @@ impl Storage {
         self.ensure_board_replaceable(project_id, &path, &legacy)?;
         // A `PublishedNotDurable` error leaves the new board in place, so the
         // legacy copy below must not be retired on that path: it is retired
-        // only after the new file's write completed. (On a filesystem that
-        // cannot synchronize a directory the write completes without that
-        // confirmation; the legacy copy is then retired on the same terms as
-        // any other file there.)
-        staged.publish().map_err(|e| write_failure(e, "write tasks file"))?;
+        // only after the new file's write completed and was confirmed. On a
+        // filesystem that cannot synchronize a directory it is not retired at
+        // all: removing the only other copy while the new file's entry is
+        // unproven could lose the board. The routed file shadows the legacy
+        // one, so keeping it costs nothing.
+        let committed = staged.publish().map_err(|e| write_failure(e, "write tasks file"))?;
 
-        if legacy != path && legacy.is_file() {
+        if legacy != path && legacy.is_file() && committed.is_fully_durable() {
             // A legacy copy that cannot be read is the only record of
             // whatever it holds. The routed file already shadows it, so
             // leaving it costs nothing and deleting it could not be undone.
@@ -1935,6 +1990,102 @@ mod tests {
         let trace = fault::trace();
         storage.confirm_config_durable().unwrap();
         assert!(trace.stages().is_empty(), "a confirmed config is not rewritten again");
+    }
+
+    /// A Conversation is read from disk at the start of every request, never held
+    /// across requests, so a save that published without confirming is simply
+    /// what the next request loads; there is no stale copy to write back.
+    #[test]
+    fn a_conversation_published_but_not_durable_is_what_the_next_request_loads_and_extends() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let mut conversation = storage.create_primary_conversation(project_id).unwrap();
+        conversation.push(
+            crate::domain::Role::Human,
+            crate::domain::EntryKind::HumanMessage { text: "first".into() },
+        );
+
+        let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = storage.save_conversation(&conversation).unwrap_err();
+        drop(fault);
+        assert!(board_write_published(&error), "{error:#}");
+        assert!(format!("{error}").contains("not confirmed durable"), "{error:#}");
+
+        // The next request: load, extend, save. The earlier entry is still there.
+        let mut reloaded = storage.load_primary_conversation(project_id).unwrap().unwrap();
+        assert_eq!(reloaded.entries.len(), 1);
+        reloaded.push(
+            crate::domain::Role::Human,
+            crate::domain::EntryKind::HumanMessage { text: "second".into() },
+        );
+        storage.save_conversation(&reloaded).expect("the next save completes");
+        assert_eq!(storage.load_primary_conversation(project_id).unwrap().unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn the_rendered_board_error_says_whether_the_new_board_is_in_place() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let published = {
+            let _f = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+            storage.save_project_tasks(project_id, &[]).unwrap_err()
+        };
+        let unpublished = {
+            let _f = fault::fail_at(Stage::Replace, std::io::ErrorKind::Other);
+            storage.save_project_tasks(project_id, &[]).unwrap_err()
+        };
+        assert!(says_in_place_but_unconfirmed(&published.to_string()));
+        assert!(!says_in_place_but_unconfirmed(&unpublished.to_string()));
+    }
+
+    #[test]
+    fn a_filesystem_that_cannot_sync_directories_never_confirms_the_config() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, _dir) = create_test_storage();
+        storage.confirm_config_durable().unwrap();
+
+        let fault = fault::fail_every(Stage::SyncDirectory, std::io::ErrorKind::Unsupported);
+        // An ordinary save is not refused for it ...
+        storage
+            .update_config(|config| config.ui_preferences.theme = "light".to_string())
+            .expect("the write itself succeeds");
+        assert_eq!(storage.load_config().unwrap().ui_preferences.theme, "light");
+        // ... but nothing destructive may lean on it, however often it is asked.
+        for _ in 0..2 {
+            let error = storage.confirm_config_durable().unwrap_err();
+            assert!(matches!(error, ConfigWriteError::Unconfirmable(_)), "{error:?}");
+            assert!(!error.is_published());
+        }
+        assert!(matches!(storage.reconfirm_config_durable().unwrap_err(), ConfigWriteError::Unconfirmable(_)));
+
+        // The same storage on a filesystem that can answer clears it.
+        drop(fault);
+        storage.confirm_config_durable().expect("a synced rewrite confirms");
+        storage.confirm_config_durable().unwrap();
+    }
+
+    #[test]
+    fn a_legacy_board_is_kept_when_the_new_boards_directory_entry_is_unproven() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let legacy = storage.legacy_tasks_path(project_id);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        storage.save_project_tasks(project_id, &[]).unwrap();
+        assert!(legacy.is_file());
+        let (donor, _donor_dir) = create_test_storage();
+        let routed = route_project_to(&donor, project_id, &repo);
+        storage.update_config(|config| *config = routed.clone()).unwrap();
+        assert_ne!(storage.tasks_path(project_id), legacy);
+
+        let _fault = fault::fail_every(Stage::SyncDirectory, std::io::ErrorKind::Unsupported);
+        storage.save_project_tasks(project_id, &[]).unwrap();
+        assert!(storage.tasks_path(project_id).is_file());
+        assert!(legacy.is_file(), "the only other copy stays while the new entry is unproven");
     }
 
     #[test]

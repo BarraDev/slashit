@@ -65,6 +65,10 @@
 //! FUSE filesystems), the write still succeeds, but [`Committed::directory`]
 //! says [`DirectorySync::Unsupported`], [`Committed::is_fully_durable`] is
 //! false, and the entry's durability is whatever that filesystem provides.
+//! This crate does not decide what a caller does with that: a caller must not
+//! treat `Unsupported` as confirmation before a step that deletes the only
+//! other copy of the data (SlashIt's configuration barrier and its state
+//! migration both refuse to), and may accept it for an ordinary save.
 //!
 //! Replacing a file gives the destination a new inode. Its owner becomes the
 //! user running SlashIt, and a symbolic link at the destination is replaced by
@@ -101,6 +105,10 @@ pub enum Stage {
     Replace,
     /// Synchronizing the containing directory after the replacement.
     SyncDirectory,
+    /// Synchronizing one regular file of a tree (see [`sync_tree`]).
+    SyncTreeFile,
+    /// Synchronizing one directory of a tree (see [`sync_tree`]).
+    SyncTreeDirectory,
 }
 
 impl fmt::Display for Stage {
@@ -114,6 +122,8 @@ impl fmt::Display for Stage {
             Stage::SyncTemp => "synchronizing the temporary file",
             Stage::Replace => "replacing the destination",
             Stage::SyncDirectory => "synchronizing the containing directory",
+            Stage::SyncTreeFile => "synchronizing a file of a copied tree",
+            Stage::SyncTreeDirectory => "synchronizing a directory of a copied tree",
         })
     }
 }
@@ -183,6 +193,13 @@ impl WriteError {
         }
     }
 
+    /// The underlying I/O error, for a caller that only needs to report it.
+    pub fn into_io(self) -> io::Error {
+        match self {
+            WriteError::NotPublished { source, .. } | WriteError::PublishedNotDurable { source, .. } => source,
+        }
+    }
+
     pub fn io_error(&self) -> &io::Error {
         match self {
             WriteError::NotPublished { source, .. } | WriteError::PublishedNotDurable { source, .. } => source,
@@ -249,6 +266,52 @@ fn tolerate_unsupported(error: io::Error) -> io::Result<DirectorySync> {
     } else {
         Err(error)
     }
+}
+
+fn merge_sync(total: &mut DirectorySync, next: DirectorySync) {
+    if next == DirectorySync::Unsupported {
+        *total = DirectorySync::Unsupported;
+    }
+}
+
+/// Synchronize one directory so the entries created, renamed or removed in it
+/// survive a power loss. [`DirectorySync::Unsupported`] says the filesystem
+/// cannot be asked; any other failure is an error.
+pub fn sync_directory(dir: &Path) -> io::Result<DirectorySync> {
+    step(Stage::SyncDirectory, dir, || platform::sync_directory(dir)).or_else(tolerate_unsupported)
+}
+
+/// Synchronize everything under `root`: the contents of every regular file and
+/// every directory's entries, deepest first. The entry of `root` itself in its
+/// parent is not covered; follow a rename of `root` with [`sync_directory`] on
+/// its parent. Symbolic links are not followed; their own entries are covered
+/// by the directory that holds them.
+///
+/// This is how a caller that *copies* a tree (rather than replacing one file)
+/// learns that the copy can survive a power loss before it removes the
+/// original. [`DirectorySync::Unsupported`] means at least one directory could
+/// not be asked, so the copy is not proven durable: a caller that is about to
+/// delete the only other copy must treat that like a failure.
+pub fn sync_tree(root: &Path) -> io::Result<DirectorySync> {
+    let mut total = DirectorySync::Synced;
+    sync_tree_into(root, &mut total)?;
+    Ok(total)
+}
+
+fn sync_tree_into(dir: &Path, total: &mut DirectorySync) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let path = entry.path();
+        if kind.is_dir() {
+            sync_tree_into(&path, total)?;
+        } else if kind.is_file() {
+            step(Stage::SyncTreeFile, &path, || platform::sync_file(&path))?;
+        }
+    }
+    let synced = step(Stage::SyncTreeDirectory, dir, || platform::sync_directory(dir)).or_else(tolerate_unsupported)?;
+    merge_sync(total, synced);
+    Ok(())
 }
 
 /// A fully written and synchronized temporary file that has not replaced its
@@ -358,7 +421,7 @@ fn parent_of(path: &Path) -> &Path {
 /// `create_dir_all`, then synchronize the entry of every directory this
 /// process created and has not yet confirmed, plus (once) the destination
 /// directory's own entry. See the crate documentation for what that covers.
-fn create_dir_all_durable(dir: &Path) -> Result<(), WriteError> {
+pub fn create_dir_all_durable(dir: &Path) -> Result<(), WriteError> {
     let mut guard = DIRECTORY_STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let state = guard.get_or_insert_with(DirectoryState::default);
 

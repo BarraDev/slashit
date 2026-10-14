@@ -800,6 +800,37 @@ mod tests {
         assert!(!paths.pending_project_conversation_deletion_file(project_id).exists());
     }
 
+    /// On a filesystem that cannot synchronize a directory the configuration is
+    /// never confirmable, so a start never deletes on the strength of a
+    /// Project's absence; the records wait, and the failure says why.
+    #[tokio::test]
+    async fn startup_never_finishes_pending_cleanup_on_a_filesystem_that_cannot_sync_directories() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let seed = Storage::with_paths((*paths).clone());
+        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let conversation = seed.create_primary_conversation(project_id).unwrap();
+        let pointer = paths.primary_conversation_file(project_id);
+        let document = paths.conversation_file(conversation.id);
+        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+
+        let _fault = slashit_durable_fs::fault::fail_every(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Unsupported,
+        );
+        for _ in 0..2 {
+            let (_state, report) = build_state_with_paths(paths.clone()).await.unwrap();
+            assert!(pointer.exists() && document.exists(), "nothing is deleted on an unprovable absence");
+            assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
+            assert!(
+                report.project_conversation_cleanup_failures.iter().any(|f| f.contains("not confirmed durable")),
+                "{:?}",
+                report.project_conversation_cleanup_failures
+            );
+        }
+    }
+
     #[tokio::test]
     async fn startup_retries_committed_project_conversation_cleanup() {
         let tmp = TempDir::new().unwrap();

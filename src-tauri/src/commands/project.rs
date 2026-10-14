@@ -1408,6 +1408,44 @@ mod tests {
         assert!(!reopened(&storage).load_config().unwrap().projects.contains_key(&project.id.to_string()));
     }
 
+    /// A filesystem that cannot synchronize a directory cannot prove the
+    /// Project's removal sticks, so the Task and Conversation records, the only
+    /// other copy of the Project's data, are not deleted -- however often the
+    /// deletion is retried -- and the cleanup records stay.
+    #[tokio::test]
+    async fn a_project_deletion_on_a_filesystem_that_cannot_sync_directories_deletes_nothing() {
+        let (storage, _temp) = create_test_storage();
+        let project = make_test_project(Uuid::new_v4());
+        let id = project.id;
+        storage
+            .save_config(&AppConfig { projects: HashMap::from([(id.to_string(), project.clone())]), ..AppConfig::default() })
+            .unwrap();
+        let conversation = storage.create_primary_conversation(id).unwrap();
+        let pointer = storage.paths().primary_conversation_file(id);
+        let document = storage.paths().conversation_file(conversation.id);
+        let task = board_task(id);
+        let tasks_file = board_tasks_file(id, &storage);
+        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        let tasks = board(vec![task]);
+        let projects = RwLock::new(HashMap::from([(id, project)]));
+
+        let _fault = slashit_durable_fs::fault::fail_every(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Unsupported,
+        );
+        for attempt in 0..2 {
+            let message = delete_project_committed(&projects, &tasks, &storage, None, None, id)
+                .await
+                .expect_err("a deletion nothing can confirm is not a completed deletion");
+            assert!(message.contains("not run") && message.contains("cannot"), "attempt {attempt}: {message}");
+            assert!(tasks_file.exists(), "attempt {attempt}: Task records must not be deleted");
+            assert!(pointer.exists() && document.exists(), "attempt {attempt}: the Conversation must not be deleted");
+            assert!(tasks.read().await.values().any(|t| t.project_id == id));
+        }
+        assert!(!storage.pending_project_tasks_deletions().unwrap().is_empty(), "the cleanup record is kept");
+        assert!(storage.pending_project_conversation_deletions().unwrap().contains(&id));
+    }
+
     #[tokio::test]
     async fn a_project_update_that_could_not_confirm_durability_is_adopted_not_reverted_by_the_next_save() {
         let (storage, _temp) = create_test_storage();

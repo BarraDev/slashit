@@ -44,6 +44,17 @@ pub(crate) fn replace(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+/// Synchronize one regular file's contents to stable storage. On Windows this
+/// needs write access, so a read-only file fails closed instead of being
+/// reported as synchronized.
+pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    let file = OpenOptions::new().write(true).open(path)?;
+    #[cfg(not(windows))]
+    let file = File::open(path)?;
+    file.sync_all()
+}
+
 /// Synchronize a directory so the entries created or replaced in it survive a
 /// power loss.
 #[cfg(unix)]

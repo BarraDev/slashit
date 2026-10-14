@@ -326,6 +326,73 @@ mod unix {
     }
 }
 
+mod sync_tree {
+    use super::*;
+
+    fn tree(root: &Path) {
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("top.toml"), b"1").unwrap();
+        fs::write(root.join("a/mid.toml"), b"2").unwrap();
+        fs::write(root.join("a/b/leaf.toml"), b"3").unwrap();
+    }
+
+    #[test]
+    fn synchronizes_every_file_and_every_directory_deepest_first() {
+        let dir = TempDir::new().unwrap();
+        tree(dir.path());
+        let t = trace();
+        let outcome = sync_tree(dir.path()).unwrap();
+        // Linux must be able to; elsewhere the answer is evidence, as for a single file.
+        #[cfg(target_os = "linux")]
+        assert_eq!(outcome, DirectorySync::Synced);
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(outcome, DirectorySync::Synced | DirectorySync::Unsupported), "{outcome:?}");
+        eprintln!("directory sync of a tree on this platform: {outcome:?}");
+        let stages = t.stages();
+        assert_eq!(stages.iter().filter(|s| **s == Stage::SyncTreeFile).count(), 3);
+        // root, a, a/b
+        assert_eq!(stages.iter().filter(|s| **s == Stage::SyncTreeDirectory).count(), 3);
+        assert_eq!(stages.last(), Some(&Stage::SyncTreeDirectory), "the root's own entries are last: {stages:?}");
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_synchronized_fails_the_whole_tree() {
+        let dir = TempDir::new().unwrap();
+        tree(dir.path());
+        let _fault = fail_at(Stage::SyncTreeFile, io::ErrorKind::Other);
+        assert!(sync_tree(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_synchronized_fails_the_whole_tree() {
+        let dir = TempDir::new().unwrap();
+        tree(dir.path());
+        let _fault = fail_at(Stage::SyncTreeDirectory, io::ErrorKind::Other);
+        assert!(sync_tree(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_filesystem_that_cannot_sync_directories_makes_the_tree_unproven_not_failed() {
+        let dir = TempDir::new().unwrap();
+        tree(dir.path());
+        let _fault = fail_at(Stage::SyncTreeDirectory, io::ErrorKind::Unsupported);
+        assert_eq!(sync_tree(dir.path()).unwrap(), DirectorySync::Unsupported);
+    }
+
+    #[test]
+    fn sync_directory_reports_unsupported_instead_of_failing() {
+        let dir = TempDir::new().unwrap();
+        let _fault = fail_at(Stage::SyncDirectory, io::ErrorKind::Unsupported);
+        assert_eq!(sync_directory(dir.path()).unwrap(), DirectorySync::Unsupported);
+    }
+
+    #[test]
+    fn a_missing_tree_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        assert!(sync_tree(&dir.path().join("absent")).is_err());
+    }
+}
+
 #[cfg(windows)]
 mod windows {
     use super::*;

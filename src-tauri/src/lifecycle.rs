@@ -851,17 +851,28 @@ pub async fn delete(ctx: TerminalizeCtx<'_>, task_id: Uuid) -> Result<bool, Term
     }
 
     let list: Vec<Task> = staged.values().cloned().collect();
-    storage.save_project_tasks(project_id, &list).map_err(|e| {
+    if let Err(e) = storage.save_project_tasks(project_id, &list) {
         // The record stays, and it stays truthful: the terminalization above
         // already committed `worktree_path = None` and `cleanup_in_flight =
         // false`, so what survives says the cleanup succeeded, which it did.
         // Asking again is then an ordinary delete with nothing left to clean
         // up.
-        TerminalizeRefusal::NotRecorded(format!(
-            "the worktree for task {task_id} was cleaned up, but removing the task from the \
-             board failed, so the task is still there and can simply be deleted again: {e}"
-        ))
-    })?;
+        if !crate::config::board_write_published(&e) {
+            return Err(TerminalizeRefusal::NotRecorded(format!(
+                "the worktree for task {task_id} was cleaned up, but removing the task from the \
+                 board failed, so the task is still there and can simply be deleted again: {e}"
+            )));
+        }
+        // The file already lacks the task; only its durability is unconfirmed.
+        // Keeping it in memory would let the next save of any sibling put it
+        // back, undoing a delete the user was told about.
+        tasks_w.remove(&task_id);
+        return Err(TerminalizeRefusal::NotRecorded(format!(
+            "the worktree for task {task_id} was cleaned up and the task was removed from the \
+             board, but SlashIt could not confirm that this reached stable storage, so the task \
+             may reappear if the computer stops before the next successful save: {e}"
+        )));
+    }
 
     tasks_w.remove(&task_id);
     Ok(true)
@@ -1179,10 +1190,21 @@ async fn stamp_cleanup_in_flight(
     task.updated_at = chrono::Utc::now();
 
     publish(&mut tasks_w, storage, project_id, staged).map_err(|e| {
-        format!(
-            "the worktree cleanup for task {task_id} was not started, because recording that \
-             it had begun failed and an interrupted removal would then be invisible: {e}"
-        )
+        if crate::config::says_in_place_but_unconfirmed(&e) {
+            // The record is in the file and on the board: the task is flagged
+            // as having a cleanup in flight, which holds it out of automatic
+            // terminalization until that is resolved.
+            format!(
+                "the worktree cleanup for task {task_id} was not started, but the record that it \
+                 had begun is already saved and the task is flagged as having a cleanup in \
+                 flight; SlashIt could not confirm that reached stable storage: {e}"
+            )
+        } else {
+            format!(
+                "the worktree cleanup for task {task_id} was not started, because recording that \
+                 it had begun failed and an interrupted removal would then be invisible: {e}"
+            )
+        }
     })
 }
 
@@ -1255,14 +1277,23 @@ async fn commit(
         .ok_or(TerminalizeRefusal::TaskNotFound)?;
 
     publish(&mut tasks_w, storage, project_id, staged).map_err(|e| {
-        TerminalizeRefusal::NotRecorded(match &kept {
-            None => format!(
+        let in_place = crate::config::says_in_place_but_unconfirmed(&e);
+        TerminalizeRefusal::NotRecorded(match (&kept, in_place) {
+            (None, false) => format!(
                 "the worktree was removed, but recording task {task_id} as finished failed, so \
                  the board still shows its previous state and still names a checkout that is \
                  gone; the next start reconciles it: {e}"
             ),
-            Some(_) => format!(
-                "the worktree was kept, and recording why failed: {e}"
+            (None, true) => format!(
+                "the worktree was removed and task {task_id} is recorded as finished, but \
+                 SlashIt could not confirm that reached stable storage, so after a power loss \
+                 the board may still name a checkout that is gone; the next start reconciles \
+                 it: {e}"
+            ),
+            (Some(_), false) => format!("the worktree was kept, and recording why failed: {e}"),
+            (Some(_), true) => format!(
+                "the worktree was kept, and the record of why is saved but not confirmed on \
+                 stable storage: {e}"
             ),
         })
     })?;
@@ -1300,13 +1331,17 @@ fn publish(
     staged: HashMap<Uuid, Task>,
 ) -> Result<(), String> {
     let list: Vec<Task> = staged.values().cloned().collect();
-    storage
-        .save_project_tasks(project_id, &list)
-        .map_err(|e| e.to_string())?;
-    for (id, task) in staged {
-        tasks_w.insert(id, task);
+    let saved = storage.save_project_tasks(project_id, &list);
+    // A board the file already holds but could not confirm durable is still
+    // the file's board: memory follows it, or the next save of any sibling
+    // would write the previous board back over it. The error is still
+    // returned, and says the change is in place.
+    if saved.as_ref().err().is_none_or(crate::config::board_write_published) {
+        for (id, task) in staged {
+            tasks_w.insert(id, task);
+        }
     }
-    Ok(())
+    saved.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -2623,6 +2658,103 @@ mod tests {
             world.tasks.read().await.contains_key(&id2),
             "the record has to survive, because a task the user is still shown is a task they \
              can delete again"
+        );
+    }
+
+    /// The board file already holds a change whose directory sync failed. Memory
+    /// must follow the file: the next save, of any Task in the Project, writes
+    /// the whole board from memory and would otherwise undo the change.
+    #[tokio::test]
+    async fn a_board_published_but_not_durable_is_adopted_so_the_next_save_cannot_undo_it() {
+        use slashit_durable_fs::{fault, Stage};
+        let world = world(false);
+        let (id, sibling_id) = seed(&world, TaskStatus::Backlog, None).await;
+
+        let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = record(&world.tasks, &world.storage, id, &|staged| {
+            staged.get_mut(&id).unwrap().title = "renamed".into();
+        })
+        .await
+        .expect_err("the caller is told the durability is unconfirmed");
+        drop(fault);
+        assert!(error.contains("not confirmed durable"), "{error}");
+        assert_eq!(world.tasks.read().await[&id].title, "renamed", "memory follows the visible file");
+        let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();
+        assert_eq!(on_disk.iter().find(|t| t.id == id).unwrap().title, "renamed");
+
+        // An unrelated save rewrites the whole board from memory.
+        record(&world.tasks, &world.storage, sibling_id, &|staged| {
+            staged.get_mut(&sibling_id).unwrap().title = "sibling renamed".into();
+        })
+        .await
+        .expect("the next save completes");
+        let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();
+        assert_eq!(on_disk.iter().find(|t| t.id == id).unwrap().title, "renamed", "the earlier change survives");
+        assert_eq!(on_disk.iter().find(|t| t.id == sibling_id).unwrap().title, "sibling renamed");
+    }
+
+    /// The message names what actually happened to the task's cleanup flag.
+    #[tokio::test]
+    async fn an_unconfirmed_cleanup_flag_is_reported_as_saved_not_as_not_started() {
+        use slashit_durable_fs::{fault, Stage};
+        let world = world(false);
+        let (id, _) = seed(&world, TaskStatus::Backlog, None).await;
+        let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let request = TerminalizeRequest::new(TaskStatus::Backlog);
+        let error = stamp_cleanup_in_flight(&world.tasks, &world.storage, id, world.project_id, &request)
+            .await
+            .unwrap_err();
+        assert!(error.contains("flagged as having a cleanup in flight"), "{error}");
+        assert!(world.tasks.read().await[&id].cleanup_in_flight, "memory follows the file");
+    }
+
+    /// A write that did not replace the file leaves memory and file as they were.
+    #[tokio::test]
+    async fn a_board_write_that_never_published_changes_nothing_in_memory() {
+        use slashit_durable_fs::{fault, Stage};
+        let world = world(false);
+        let (id, _) = seed(&world, TaskStatus::Backlog, None).await;
+        let before = world.tasks.read().await[&id].title.clone();
+
+        let _fault = fault::fail_at(Stage::Replace, std::io::ErrorKind::Other);
+        record(&world.tasks, &world.storage, id, &|staged| {
+            staged.get_mut(&id).unwrap().title = "renamed".into();
+        })
+        .await
+        .expect_err("nothing was written");
+        assert_eq!(world.tasks.read().await[&id].title, before);
+        let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();
+        assert_eq!(on_disk.iter().find(|t| t.id == id).unwrap().title, before);
+    }
+
+    /// The delete reached the file; only the sync failed. The Task must not come
+    /// back from memory on the next save, and the message must not claim the
+    /// Task is "still there".
+    #[tokio::test]
+    async fn a_delete_the_file_accepted_but_could_not_confirm_is_not_undone_by_the_next_save() {
+        use slashit_durable_fs::{fault, Stage};
+        let world = world(false);
+        let (id, sibling_id) = seed(&world, TaskStatus::Backlog, None).await;
+
+        // A delete makes two board writes: the terminalization record, then the
+        // removal. Let the first through and fail the second one's sync.
+        let fault = fault::fail_after(Stage::SyncDirectory, std::io::ErrorKind::Other, 1);
+        let refusal = delete(world.ctx(), id).await.expect_err("an unconfirmed delete is reported");
+        drop(fault);
+        let TerminalizeRefusal::NotRecorded(message) = refusal else { panic!("{refusal:?}") };
+        assert!(message.contains("may reappear"), "{message}");
+        assert!(!message.contains("still there"), "{message}");
+        assert!(!world.tasks.read().await.contains_key(&id), "memory follows the file");
+        assert!(!world.storage.load_project_tasks(world.project_id).unwrap().iter().any(|t| t.id == id));
+
+        record(&world.tasks, &world.storage, sibling_id, &|staged| {
+            staged.get_mut(&sibling_id).unwrap().title = "sibling renamed".into();
+        })
+        .await
+        .expect("the next save completes");
+        assert!(
+            !world.storage.load_project_tasks(world.project_id).unwrap().iter().any(|t| t.id == id),
+            "the deleted Task is not written back"
         );
     }
 

@@ -3263,15 +3263,24 @@ impl TaskExecutor {
             })
             .collect();
 
-        storage
-            .save_project_tasks(project_id, &staged)
-            .map_err(|e| {
-                format!(
+        if let Err(e) = storage.save_project_tasks(project_id, &staged) {
+            if !crate::config::board_write_published(&e) {
+                return Err(format!(
                     "the agent was stopped, but recording task {task_id} as stopped \
                      failed, so it is still saved as running and a restart would start \
                      it again: {e}"
-                )
-            })?;
+                ));
+            }
+            // The file already records the stop; only its durability is
+            // unconfirmed. Memory follows the file, or the next save of any
+            // sibling would put the running record back.
+            tasks_w.insert(task_id, stopped);
+            return Err(format!(
+                "the agent was stopped and task {task_id} was recorded as stopped, but \
+                 SlashIt could not confirm that this reached stable storage, so a restart \
+                 may still find it saved as running: {e}"
+            ));
+        }
 
         // Published only now, and as exactly the record that reached the
         // disk, so the board cannot show a stop the file does not have.
@@ -5233,6 +5242,28 @@ mod tests {
             ]
         ), "{:?}", stopped.activity);
         assert!(!executor.run_tools.lock().unwrap().contains_key(&id));
+    }
+
+    /// The stop reached the file; only the directory sync failed. Memory must
+    /// follow the file, or the next save of a sibling writes the running
+    /// record back and a restart starts the agent again.
+    #[tokio::test]
+    async fn a_stop_the_file_accepted_but_could_not_confirm_is_not_undone_by_memory() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        executor.register_fake_running_execution_for_test(id).await;
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        let message = executor.stop_task(id).await.expect_err("the unconfirmed record is reported");
+        drop(fault);
+
+        assert!(message.contains("could not confirm"), "{message}");
+        assert!(!message.contains("still saved as running"), "{message}");
+        assert_eq!(executor.tasks.read().await[&id].status, TaskStatus::Backlog, "memory follows the file");
+        assert_eq!(on_disk_task(&executor, project_id, id).status, TaskStatus::Backlog);
     }
 
     // --- record_pr_poll_state("CLOSED") ---

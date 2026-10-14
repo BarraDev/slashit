@@ -459,4 +459,4 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Durable write crate tests
-        run: cargo test -p slashit-durable-fs
+        run: cargo test -p slashit-durable-fs -- --nocapture
