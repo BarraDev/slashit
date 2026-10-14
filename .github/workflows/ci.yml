@@ -90,7 +90,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Clippy (backend + CLI)
-        run: cargo clippy -p slashit-ui -p slashit -p slashit-ipc -p slashit-attention -p slashit-activity -p slashit-review-content -- -D warnings
+        run: cargo clippy -p slashit-ui -p slashit -p slashit-ipc -p slashit-durable-fs -p slashit-attention -p slashit-activity -p slashit-review-content -- -D warnings
 
       # `--all-targets --features run-acceptance` so the acceptance journeys
       # themselves are linted, not just the harness library. They are behind a
@@ -148,7 +148,7 @@ jobs:
           install_args: jj
 
       - name: Tests (backend + harness units)
-        run: cargo test -p slashit-ui -p slashit-ipc -p slashit-attention -p slashit-activity -p slashit-review-content -p slashit-acceptance
+        run: cargo test -p slashit-ui -p slashit-ipc -p slashit-durable-fs -p slashit-attention -p slashit-activity -p slashit-review-content -p slashit-acceptance
 
   # `slashit-frontend` is the root package (Leptos/WASM), not `slashit-ui`
   # -- see that crate's own Cargo.toml comment. It does not depend on the
@@ -401,7 +401,7 @@ jobs:
       # only Linux tests use) is gated `#[cfg(target_os = "linux")]` instead,
       # so the macOS leg compiles it out rather than failing on it.
       - name: Check (backend + CLI + IPC + attention rule + acceptance harness, including test code)
-        run: cargo check --tests -p slashit-ui -p slashit -p slashit-ipc -p slashit-attention -p slashit-activity -p slashit-review-content -p slashit-acceptance
+        run: cargo check --tests -p slashit-ui -p slashit -p slashit-ipc -p slashit-durable-fs -p slashit-attention -p slashit-activity -p slashit-review-content -p slashit-acceptance
 
   # The compile check above cannot say whether the named-pipe transport works,
   # only that it builds. This job runs it: the IPC crate's own tests (the
@@ -433,3 +433,30 @@ jobs:
 
       - name: IPC integration suite (assembled server over a named pipe)
         run: cargo test -p slashit-ui --test ipc_integration
+
+  # Durable replacement has a different implementation on each platform
+  # (fsync, F_FULLFSYNC, a directory flush on Windows), so the crate that
+  # owns it runs its tests on all three. The crate is dependency-light on
+  # purpose, which keeps this job to a minute or two. It proves the call
+  # sequence, the permission and failure semantics on each platform's real
+  # filesystem; it cannot prove behavior across a power loss.
+  durable-fs:
+    name: Durable write tests (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-22.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Durable write crate tests
+        run: cargo test -p slashit-durable-fs -- --nocapture

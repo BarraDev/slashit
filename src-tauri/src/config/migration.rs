@@ -30,8 +30,15 @@
 //!    fail-closed error handling, not from a checksum;
 //! 7. retire the destination (rename aside) and atomically rename staging
 //!    into its place;
-//! 8. only after that swap has succeeded, delete the source and the retired
-//!    destination.
+//! 8. only after the destination is proven to survive a power loss, delete the
+//!    source and the retired destination. A successful swap and a byte-for-byte
+//!    comparison are not that proof: both can be true of data that is still only
+//!    in the operating system's cache. So staging is synchronized (every file,
+//!    every directory) *before* it is published, and the parent directory is
+//!    synchronized *after* the renames; if either cannot be confirmed, including
+//!    because the filesystem cannot synchronize a directory, the source and the
+//!    retired destination are kept and a warning says so. A kept source is
+//!    harmless; a deleted one is not recoverable.
 //!
 //! Steps 4–6 build a scratch copy in staging while leaving both the source
 //! and the destination fully intact, so an interruption before step 7 leaves
@@ -383,8 +390,8 @@ impl StateMigrator {
                 io::Error::from(io::ErrorKind::InvalidInput),
             )
         })?;
-        fs::create_dir_all(parent)
-            .map_err(|e| MigrationError::io(format!("creating {}", parent.display()), e))?;
+        let parent_entries = slashit_durable_fs::create_dir_all_durable(parent)
+            .map_err(|e| MigrationError::io(format!("creating {}", parent.display()), e.into_io()))?;
 
         // Scoped to this exact destination and this exact call, so a second
         // migration running concurrently for a sibling destination under the
@@ -427,13 +434,44 @@ impl StateMigrator {
                 let _ = fs::remove_dir_all(&staging);
                 return Err(e);
             }
+        }
+
+        // The marker belongs in the copy that gets synchronized, not in a
+        // later write nothing synchronizes.
+        write_marker(&staging, &mut warnings);
+
+        // Everything staged is synchronized before it is published: after a
+        // power loss `to` must never be a directory whose entries survived
+        // while their contents did not. A failure aborts with the source
+        // untouched. A filesystem that cannot synchronize a directory is not an
+        // abort, but nothing may be deleted on the strength of this copy.
+        let mut proven = match slashit_durable_fs::sync_tree(&staging) {
+            Ok(slashit_durable_fs::DirectorySync::Synced) => true,
+            Ok(slashit_durable_fs::DirectorySync::Unsupported) => false,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(MigrationError::io(
+                    format!("making the copy at {} durable", staging.display()),
+                    e,
+                ));
+            }
+        };
+
+        // The destination's parent must itself survive a power loss, or the
+        // whole migrated tree can vanish with it.
+        if parent_entries == slashit_durable_fs::DirectorySync::Unsupported {
+            proven = false;
+        }
+
+        let mut retired_copy = None;
+        if to.exists() {
             let retired = parent.join(format!("{STAGING_PREFIX}old-{dest_tag}-{txn}"));
             let _ = fs::remove_dir_all(&retired);
             fs::rename(to, &retired)
                 .map_err(|e| MigrationError::io(format!("retiring {}", to.display()), e))?;
             match fs::rename(&staging, to) {
                 Ok(()) => {
-                    let _ = fs::remove_dir_all(&retired);
+                    retired_copy = Some(retired);
                 }
                 Err(e) => {
                     // Put the original destination back before surfacing the error.
@@ -452,16 +490,42 @@ impl StateMigrator {
             })?;
         }
 
-        write_marker(to, &mut warnings);
+        // The renames above are directory entries of `parent`; until it is
+        // synchronized the swap itself can be undone by a power loss.
+        match slashit_durable_fs::sync_directory(parent) {
+            Ok(slashit_durable_fs::DirectorySync::Synced) => {}
+            Ok(slashit_durable_fs::DirectorySync::Unsupported) => proven = false,
+            Err(e) => {
+                proven = false;
+                warnings.push(format!("could not synchronize {}: {e}", parent.display()));
+            }
+        }
 
-        // The destination is now complete: the source portion was checked
-        // file-by-file above, and any destination-only carry-over is present
-        // because `merge_into` returned `Ok` rather than a fail-closed error.
-        // Only now is the source expendable.
-        if let Err(e) = fs::remove_dir_all(from) {
+        // The destination is now complete and, if `proven`, on stable storage:
+        // the source portion was checked file-by-file above, any
+        // destination-only carry-over is present because `merge_into` returned
+        // `Ok`, and every byte and entry was synchronized. Only now is the
+        // source expendable. Otherwise it stays: it is the only copy a power
+        // loss cannot take, and leaving it costs one stale directory.
+        if proven {
+            if let Some(retired) = &retired_copy {
+                let _ = fs::remove_dir_all(retired);
+            }
+            if let Err(e) = fs::remove_dir_all(from) {
+                warnings.push(format!(
+                    "state was migrated successfully, but the old directory {} could not be removed: {e}",
+                    from.display()
+                ));
+            }
+        } else {
             warnings.push(format!(
-                "state was migrated successfully, but the old directory {} could not be removed: {e}",
-                from.display()
+                "state was migrated, but SlashIt could not confirm that it reached stable storage, \
+                 so the old directory {} was kept{}. Remove it once you have checked the new location.",
+                from.display(),
+                retired_copy
+                    .as_ref()
+                    .map(|r| format!(" together with the previous destination at {}", r.display()))
+                    .unwrap_or_default()
             ));
         }
 
@@ -684,6 +748,15 @@ fn archive(dir: &Path, warnings: &mut Vec<String>) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
+/// Whether `to`, and the directory entry that names it, are confirmed on stable
+/// storage. Anything less than a confirmed yes is a no: this gates deleting the
+/// only other copy.
+fn destination_is_durable(to: &Path) -> bool {
+    let parent = to.parent().unwrap_or(Path::new("."));
+    matches!(slashit_durable_fs::sync_tree(to), Ok(slashit_durable_fs::DirectorySync::Synced))
+        && matches!(slashit_durable_fs::sync_directory(parent), Ok(slashit_durable_fs::DirectorySync::Synced))
+}
+
 /// Decide and act on the fate of one transaction's leftovers, per
 /// [`StateMigrator::recover`]'s documented cases.
 fn resolve_one(to: &Path, scratch: Option<&PathBuf>, retired: Option<&PathBuf>) -> RecoveryOutcome {
@@ -694,6 +767,12 @@ fn resolve_one(to: &Path, scratch: Option<&PathBuf>, retired: Option<&PathBuf>) 
         }
         (None, Some(retired)) => {
             if to.exists() {
+                // `to` is only known to be the swapped-in copy, not that it
+                // would survive a power loss; the retired one is the only
+                // other copy of what `to` replaced.
+                if !destination_is_durable(to) {
+                    return RecoveryOutcome::LeftForManualReview;
+                }
                 let _ = fs::remove_dir_all(retired);
                 RecoveryOutcome::RemovedStaleRetired
             } else if fs::rename(retired, to).is_ok() {
@@ -706,6 +785,9 @@ fn resolve_one(to: &Path, scratch: Option<&PathBuf>, retired: Option<&PathBuf>) 
             if to.exists() {
                 RecoveryOutcome::LeftForManualReview
             } else if fs::rename(scratch, to).is_ok() {
+                if !destination_is_durable(to) {
+                    return RecoveryOutcome::LeftForManualReview;
+                }
                 let _ = fs::remove_dir_all(retired);
                 RecoveryOutcome::CompletedSwap
             } else {
@@ -967,6 +1049,155 @@ mod tests {
         assert!(!from.exists(), "source must be gone after success");
         assert_eq!(fs::read_to_string(to.join("tasks/a.toml")).unwrap(), "id = 1\n");
         assert!(to.join(STATE_MARKER).is_file(), "marker identifies our dir");
+    }
+
+    // --- Durability: nothing is deleted until the copy is proven ------------
+
+    use slashit_durable_fs::{fault, Stage};
+
+    /// The migrated state, complete and byte-identical, at `to`.
+    fn assert_seeded_at(to: &Path) {
+        assert_eq!(fs::read_to_string(to.join("tasks/a.toml")).unwrap(), "id = 1\n");
+        assert_eq!(fs::read_to_string(to.join("tasks/b.toml")).unwrap(), "id = 2\n");
+        assert_eq!(fs::read_to_string(to.join("roadmap.toml")).unwrap(), "features = []\n");
+    }
+
+    fn leftovers(parent: &Path) -> Vec<String> {
+        fs::read_dir(parent)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(STAGING_PREFIX))
+            .collect()
+    }
+
+    #[test]
+    fn every_copied_file_and_directory_is_synchronized_before_the_source_is_removed() {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("external/proj");
+        let to = tmp.path().join("repo/.slashit");
+        seed(&from);
+
+        let trace = fault::trace();
+        StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
+        let stages = trace.stages();
+
+        // 3 seeded files plus the marker; the root and `tasks/` are the directories.
+        assert_eq!(stages.iter().filter(|s| **s == Stage::SyncTreeFile).count(), 4, "{stages:?}");
+        assert_eq!(stages.iter().filter(|s| **s == Stage::SyncTreeDirectory).count(), 2, "{stages:?}");
+        // Contents first, the parent's entries (the renames) after.
+        let last_tree = stages.iter().rposition(|s| matches!(s, Stage::SyncTreeFile | Stage::SyncTreeDirectory)).unwrap();
+        let parent_sync = stages.iter().rposition(|s| *s == Stage::SyncDirectory).expect("the swap is synchronized");
+        assert!(last_tree < parent_sync, "{stages:?}");
+        assert!(!from.exists());
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_synchronized_aborts_and_the_source_and_destination_survive() {
+        for stage in [Stage::SyncTreeFile, Stage::SyncTreeDirectory] {
+            let tmp = TempDir::new().unwrap();
+            let from = tmp.path().join("external/proj");
+            let to = tmp.path().join("repo/.slashit");
+            seed(&from);
+            write(&to.join("destination_only.toml"), "keep\n");
+
+            let _fault = fault::fail_at(stage, io::ErrorKind::Other);
+            let error = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap_err();
+
+            assert!(error.to_string().contains("durable"), "{stage:?}: {error}");
+            assert_seeded_at(&from);
+            assert_eq!(fs::read_to_string(to.join("destination_only.toml")).unwrap(), "keep\n");
+            assert!(!to.join("tasks").exists(), "nothing was installed at the destination");
+            assert!(leftovers(to.parent().unwrap()).is_empty(), "staging is removed: {stage:?}");
+        }
+    }
+
+    #[test]
+    fn a_swap_that_cannot_be_confirmed_keeps_the_source_and_the_retired_destination() {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("external/proj");
+        let to = tmp.path().join("repo/.slashit");
+        seed(&from);
+        write(&to.join("destination_only.toml"), "keep\n");
+
+        let _fault = fault::fail_at(Stage::SyncDirectory, io::ErrorKind::Other);
+        let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
+
+        assert!(matches!(report.outcome, MigrationOutcome::Migrated { files: 3, .. }));
+        assert!(report.warnings.iter().any(|w| w.contains("could not confirm") && w.contains("was kept")), "{:?}", report.warnings);
+        assert_seeded_at(&from);
+        assert_seeded_at(&to);
+        assert_eq!(fs::read_to_string(to.join("destination_only.toml")).unwrap(), "keep\n");
+        let kept = leftovers(to.parent().unwrap());
+        assert_eq!(kept.len(), 1, "the retired destination is kept: {kept:?}");
+        assert!(kept[0].contains("-old-"), "{kept:?}");
+    }
+
+    #[test]
+    fn a_filesystem_that_cannot_sync_directories_never_loses_the_source() {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("external/proj");
+        let to = tmp.path().join("repo/.slashit");
+        seed(&from);
+
+        let _fault = fault::fail_every(Stage::SyncTreeDirectory, io::ErrorKind::Unsupported);
+        let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
+
+        assert!(matches!(report.outcome, MigrationOutcome::Migrated { files: 3, .. }));
+        assert!(report.warnings.iter().any(|w| w.contains("was kept")), "{:?}", report.warnings);
+        assert_seeded_at(&from);
+        assert_seeded_at(&to);
+    }
+
+    #[test]
+    fn a_destination_parent_whose_entry_cannot_be_synced_never_loses_the_source() {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("external/proj");
+        let to = tmp.path().join("repo/.slashit");
+        seed(&from);
+
+        // `repo` is created by the migration; its entry in the temporary
+        // directory cannot be synchronized, whatever the later syncs say.
+        let _fault = fault::fail_at(Stage::SyncCreatedDirectory, io::ErrorKind::Unsupported);
+        let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
+
+        assert!(matches!(report.outcome, MigrationOutcome::Migrated { files: 3, .. }));
+        assert!(report.warnings.iter().any(|w| w.contains("was kept")), "{:?}", report.warnings);
+        assert_seeded_at(&from);
+        assert_seeded_at(&to);
+    }
+
+    #[test]
+    fn recovery_does_not_delete_the_retired_copy_while_the_destination_is_unproven() {
+        let tmp = TempDir::new().unwrap();
+        let to = tmp.path().join("dest/state");
+        write(&to.join("roadmap.toml"), "installed\n");
+        let retired = retired_dir_for(&to, "777");
+        write(&retired.join("roadmap.toml"), "previous\n");
+
+        let unproven = fault::fail_every(Stage::SyncTreeDirectory, io::ErrorKind::Unsupported);
+        assert_eq!(StateMigrator::recover(&to), vec![RecoveryOutcome::LeftForManualReview]);
+        assert!(retired.exists(), "the only other copy stays");
+        drop(unproven);
+
+        // Once the destination can be confirmed, the stale copy goes as before.
+        assert_eq!(StateMigrator::recover(&to), vec![RecoveryOutcome::RemovedStaleRetired]);
+        assert!(!retired.exists());
+    }
+
+    #[test]
+    fn a_completed_swap_is_not_finalized_while_the_destination_is_unproven() {
+        let tmp = TempDir::new().unwrap();
+        let to = tmp.path().join("dest/state");
+        let scratch = scratch_dir_for(&to, "888");
+        let retired = retired_dir_for(&to, "888");
+        write(&scratch.join("roadmap.toml"), "new\n");
+        write(&retired.join("roadmap.toml"), "previous\n");
+
+        let _fault = fault::fail_every(Stage::SyncTreeDirectory, io::ErrorKind::Unsupported);
+        assert_eq!(StateMigrator::recover(&to), vec![RecoveryOutcome::LeftForManualReview]);
+        assert!(retired.exists());
+        assert_eq!(fs::read_to_string(to.join("roadmap.toml")).unwrap(), "new\n");
     }
 
     #[test]

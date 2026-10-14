@@ -43,7 +43,8 @@ async fn project_and_path(
 }
 
 /// Record `base` as the project's local base, durably before memory: a
-/// failed write leaves both as they were.
+/// failed write leaves both as they were, and a write that replaced the file
+/// without confirming it durable moves memory with the file.
 pub(crate) async fn record_project_base(
     state: &crate::AppState,
     project_id: Uuid,
@@ -56,9 +57,9 @@ pub(crate) async fn record_project_base(
         .ok_or_else(|| format!("Project {project_id} not found"))?;
     project.base = base;
     project.updated_at = chrono::Utc::now();
-    crate::commands::project::try_persist_projects(&state.storage, &proposed)
-        .map_err(|e| format!("Failed to save the project's base branch: {e}"))?;
-    *projects = proposed;
+    let outcome = crate::commands::project::try_persist_projects(&state.storage, &proposed);
+    crate::config::adopt_published(&mut *projects, proposed, outcome)
+        .map_err(|e| e.describe("save the project's base branch"))?;
     Ok(())
 }
 

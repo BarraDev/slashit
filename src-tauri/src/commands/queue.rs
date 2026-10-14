@@ -106,11 +106,20 @@ pub(crate) async fn apply_queue_config_patch(
     next.validate()?;
 
     let persisted = next.clone();
-    storage
-        .update_config(move |config| config.queue = persisted)
-        .map_err(|e| format!("Queue settings were not saved: {e}"))?;
-
-    manager.set_config(next.clone()).await;
+    let written = storage.update_config(move |config| config.queue = persisted);
+    // The file now holds the new settings whenever it was replaced, durable or
+    // not, so the running manager follows it either way.
+    let published = written.as_ref().err().is_none_or(|e| e.is_published());
+    if published {
+        manager.set_config(next.clone()).await;
+    }
+    written.map_err(|e| {
+        if e.is_published() {
+            e.describe("save the queue settings")
+        } else {
+            format!("Queue settings were not saved: {e}")
+        }
+    })?;
     Ok(next)
 }
 
@@ -652,6 +661,31 @@ mod queue_settings {
             &QueueConfig::default(),
             "a settings change that was not saved must not be applied either"
         );
+    }
+
+    #[tokio::test]
+    async fn settings_the_file_holds_but_could_not_confirm_are_applied_and_reported() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let queue = QueueState::default();
+        let storage = Storage::with_paths((*paths).clone());
+        storage.save_config(&Default::default()).unwrap();
+
+        let _fault = slashit_durable_fs::fault::fail_at_file(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+            "config.toml",
+        );
+        let error = apply_queue_config_patch(&queue, &storage, every_field_changed())
+            .await
+            .expect_err("the durability is unconfirmed");
+
+        assert!(error.contains("could not confirm"), "{error}");
+        let expected = queue.manager.read().await.config().clone();
+        assert_ne!(expected, QueueConfig::default(), "memory follows the file the change is in");
+        // A restart reads the same settings the running queue uses.
+        assert_eq!(Storage::with_paths((*paths).clone()).load_config().unwrap().queue, expected);
     }
 
     #[tokio::test]

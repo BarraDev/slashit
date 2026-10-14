@@ -42,7 +42,7 @@ pub async fn create_workspace(
             root.as_path().display()
         ));
     }
-    registry.upsert(workspace.clone()).map_err(|e| e.to_string())?;
+    registry.upsert(workspace.clone()).map_err(|e| e.describe("save the workspace"))?;
     Ok(workspace)
 }
 
@@ -107,8 +107,15 @@ pub async fn delete_workspace(
         ));
     }
 
+    // The "no project references it" check above read memory, which may follow
+    // a detach that is published but unconfirmed. Removing the workspace is a
+    // durable fact in another file, so it waits for that to be confirmed.
+    state
+        .storage
+        .confirm_config_durable()
+        .map_err(|e| e.describe("confirm the project configuration before removing the workspace"))?;
     let mut registry = state.workspace.registry.write().await;
-    registry.remove(&workspace_id).map_err(|e| e.to_string())
+    registry.remove(&workspace_id).map_err(|e| e.describe("remove the workspace"))
 }
 
 #[cfg(test)]

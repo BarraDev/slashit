@@ -136,6 +136,12 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
                 report.unsaved_migrated_projects
             );
         }
+        if report.unconfirmed_migrated_projects > 0 {
+            println!(
+                "slashitd: {} project(s) were saved but SlashIt could not confirm that reached stable storage (a restart repeats the same reconciliation either way)",
+                report.unconfirmed_migrated_projects
+            );
+        }
     }
 
     // CLI overrides sit above the environment and the config file, so the full

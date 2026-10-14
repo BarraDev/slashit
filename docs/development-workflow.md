@@ -598,6 +598,7 @@ owner policy, applied by whoever merges.
 - Frontend tests and build
 - Compile check (windows-latest)
 - Compile check (macos-latest)
+- Durable write tests (ubuntu-22.04, macos-latest, windows-latest)
 - Desktop acceptance / harness
 - Desktop acceptance / product shard 1, 2 and 3
 

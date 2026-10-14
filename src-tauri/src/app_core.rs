@@ -47,6 +47,18 @@ pub struct StartupReport {
     /// is lost, only possibly redone. This field exists so a caller's success
     /// message cannot claim disk durability that did not happen.
     pub unsaved_migrated_projects: usize,
+    /// Of `migrated_projects`, how many were saved to disk, yet whose save
+    /// could not be confirmed durable (the file accepted the change and only
+    /// the directory sync failed).
+    ///
+    /// The board was written: this is saved, not failed, and the reconciled
+    /// state on disk is what a restart reads. What is unknown is whether the
+    /// write survives a power loss before the next successful save, when a
+    /// restart would simply re-run the same reconciliation against the same
+    /// stale file and reach the same result. This field exists so a caller's
+    /// log line can say both together instead of reporting a save that
+    /// happened as one that did not.
+    pub unconfirmed_migrated_projects: usize,
     /// Worktrees found at a new location and re-linked rather than dropped.
     pub adopted_worktrees: usize,
     /// Worktrees that could not be found anywhere, whose reference was cleared.
@@ -208,6 +220,30 @@ pub async fn build_state_with_paths(
     // proof every record is left for a later start. With it, a present
     // Project means its removal never committed (drop the record); an absent
     // one means the record authorizes finishing Conversation cleanup.
+    //
+    // "Absent" is only as trustworthy as the file it was read from. A previous
+    // process may have removed the Project and been unable to confirm that
+    // write; this process cannot know, and the file it read may still lose the
+    // removal in a later crash. So before anything is deleted on that basis the
+    // configuration is rewritten through the full durable protocol; if that
+    // fails the records are kept and the cleanup waits for a later start.
+    let mut projects_are_authoritative = projects_are_authoritative;
+    if projects_are_authoritative {
+        let owed = app_state.storage.pending_project_conversation_deletions().map(|p| !p.is_empty()).unwrap_or(true)
+            || app_state.storage.pending_project_tasks_deletions().map(|p| !p.is_empty()).unwrap_or(true);
+        if owed {
+            if let Err(error) = app_state.storage.reconfirm_config_durable() {
+                eprintln!(
+                    "Warning: the configuration could not be confirmed durable, so pending Project \
+                     cleanup is left for a later start: {error}"
+                );
+                report.project_conversation_cleanup_failures.push(format!(
+                    "pending cleanup deferred: configuration not confirmed durable: {error}"
+                ));
+                projects_are_authoritative = false;
+            }
+        }
+    }
     if projects_are_authoritative {
         match app_state.storage.pending_project_conversation_deletions() {
             Ok(pending) => {
@@ -567,14 +603,29 @@ pub async fn build_state_with_paths(
                 .filter(|t| &t.project_id == project_id)
                 .cloned()
                 .collect();
-            if let Err(e) = app_state
+            match app_state
                 .storage
                 .save_project_tasks(*project_id, &project_tasks)
             {
-                eprintln!(
-                    "Warning: Failed to persist migrated tasks for project {project_id}: {e}"
-                );
-                report.unsaved_migrated_projects += 1;
+                Ok(()) => {}
+                // The migration was saved; only its durability is unconfirmed.
+                // The board on disk is what a restart reads, so this replay of
+                // the reconciliation cost it nothing: the plain "could not be
+                // saved" reading would tell an operator to retry what already
+                // happened.
+                Err(e) if crate::config::board_write_published(&e) => {
+                    eprintln!(
+                        "Warning: Saved migrated tasks for project {project_id}, but could \
+                         not confirm that reached stable storage: {e}"
+                    );
+                    report.unconfirmed_migrated_projects += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to persist migrated tasks for project {project_id}: {e}"
+                    );
+                    report.unsaved_migrated_projects += 1;
+                }
             }
         }
     }
@@ -738,6 +789,73 @@ mod tests {
         assert!(state.task.tasks.read().await.is_empty());
         assert!(state.project.projects.read().await.is_empty());
         assert!(state.repository.repositories.read().await.is_empty());
+    }
+
+    /// A previous process may have removed a Project and been unable to
+    /// confirm that write. Startup must not delete on the strength of that
+    /// absence until it has confirmed the configuration itself.
+    #[tokio::test]
+    async fn startup_defers_pending_cleanup_while_the_configuration_cannot_be_confirmed() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let seed = Storage::with_paths((*paths).clone());
+        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let conversation = seed.create_primary_conversation(project_id).unwrap();
+        let pointer = paths.primary_conversation_file(project_id);
+        let document = paths.conversation_file(conversation.id);
+        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+
+        let fault = slashit_durable_fs::fault::fail_at_file(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+            "config.toml",
+        );
+        let (_state, report) = build_state_with_paths(paths.clone()).await.unwrap();
+        drop(fault);
+        assert!(pointer.exists() && document.exists(), "nothing is deleted on an unconfirmed absence");
+        assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
+        assert!(
+            report.project_conversation_cleanup_failures.iter().any(|f| f.contains("not confirmed durable")),
+            "{:?}",
+            report.project_conversation_cleanup_failures
+        );
+
+        // The next start confirms the configuration, then finishes.
+        let (_state, _report) = build_state_with_paths(paths.clone()).await.unwrap();
+        assert!(!pointer.exists() && !document.exists());
+        assert!(!paths.pending_project_conversation_deletion_file(project_id).exists());
+    }
+
+    /// On a filesystem that cannot synchronize a directory the configuration is
+    /// never confirmable, so a start never deletes on the strength of a
+    /// Project's absence; the records wait, and the failure says why.
+    #[tokio::test]
+    async fn startup_never_finishes_pending_cleanup_on_a_filesystem_that_cannot_sync_directories() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let seed = Storage::with_paths((*paths).clone());
+        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let conversation = seed.create_primary_conversation(project_id).unwrap();
+        let pointer = paths.primary_conversation_file(project_id);
+        let document = paths.conversation_file(conversation.id);
+        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+
+        let _fault = slashit_durable_fs::fault::fail_every(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Unsupported,
+        );
+        for _ in 0..2 {
+            let (_state, report) = build_state_with_paths(paths.clone()).await.unwrap();
+            assert!(pointer.exists() && document.exists(), "nothing is deleted on an unprovable absence");
+            assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
+            assert!(
+                report.project_conversation_cleanup_failures.iter().any(|f| f.contains("not confirmed durable")),
+                "{:?}",
+                report.project_conversation_cleanup_failures
+            );
+        }
     }
 
     #[tokio::test]
@@ -1052,6 +1170,138 @@ mod tests {
             "already-reconciled data must not migrate again"
         );
         assert_eq!(second_report.unsaved_migrated_projects, 0);
+    }
+
+    /// Same migration-save seam as the test above, but with the routed path
+    /// writable and a fault armed at `Stage::SyncDirectory`: the file is
+    /// written and only its durability is unconfirmed. Counting that as an
+    /// unsaved migration would tell an operator the recovered state is still
+    /// missing -- and on the very signal where being wrong costs most (before
+    /// the operator can look at anything, a restart already re-derives the
+    /// same state from disk).
+    #[tokio::test]
+    async fn a_migrated_project_saved_but_cannot_confirm_durability_says_so() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repository = domain::Repository {
+            id: uuid::Uuid::new_v4(),
+            local_path: repo_root.to_string_lossy().to_string(),
+            remote_url: None,
+            remote_type: None,
+            created_at: chrono::Utc::now(),
+        };
+        let project = domain::Project {
+            id: uuid::Uuid::new_v4(),
+            name: "test-project".to_string(),
+            repository_id: Some(repository.id),
+            scope: domain::ProjectScope::Standalone,
+            state_location: config::paths::StateLocation::External,
+            base: None,
+            agent_type: domain::AgentType::ClaudeCode,
+            agent_config: domain::AgentConfig {
+                agent_type: domain::AgentType::ClaudeCode,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                model: None,
+                api_key: None,
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let project_id = project.id;
+
+        let task = task_with(
+            domain::TaskStatus::InProgress,
+            domain::TaskPhase::Coding,
+            "default",
+        );
+        let task = Task {
+            project_id,
+            ..task
+        };
+        let task_id = task.id;
+
+        let seed_storage = Storage::with_paths((*paths).clone());
+        let mut cfg = config::storage::AppConfig {
+            projects: HashMap::new(),
+            repositories: HashMap::new(),
+            agent_configs: HashMap::new(),
+            jj_config: Default::default(),
+            worktree: Default::default(),
+            ui_preferences: Default::default(),
+            queue: Default::default(),
+        };
+        cfg.repositories
+            .insert(repository.id.to_string(), repository);
+        cfg.projects.insert(project_id.to_string(), project);
+        seed_storage.save_config(&cfg).expect("save config");
+
+        // Seed the task at the *legacy* path so the load reads it there and
+        // the migration's save targets the routed path -- unlike the test
+        // above, nothing occupies that path: the save must reach its replace
+        // and fail only at the directory sync. The fault is narrowed to the
+        // board file so every other durable write of the start-up runs.
+        let legacy_file = paths.config_dir().join("tasks").join(format!("{project_id}.toml"));
+        std::fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
+        let legacy_contents = toml::to_string_pretty(&config::storage::ProjectTasksFile {
+            version: 1,
+            tasks: vec![task.clone()],
+        })
+        .unwrap();
+        std::fs::write(&legacy_file, legacy_contents).unwrap();
+
+        let key = config::paths::ProjectKey::for_path(&repo_root).key;
+        let routed_dir = paths.project_state_dir(
+            &key,
+            project_id,
+            &repo_root,
+            config::paths::StateLocation::External,
+        );
+        let routed_file = routed_dir.join("tasks.toml");
+
+        let fault = slashit_durable_fs::fault::fail_at_file(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+            "tasks.toml",
+        );
+        let (state, report) = build_state_with_paths(paths.clone())
+            .await
+            .expect("the durability is unconfirmed, not failed: the build still succeeds");
+        drop(fault);
+
+        assert_eq!(report.migrated_projects, 1);
+        assert_eq!(
+            report.unconfirmed_migrated_projects, 1,
+            "the saved-but-unconfirmed migration must be counted on its own, not as an \
+             unsaved one"
+        );
+        assert_eq!(
+            report.unsaved_migrated_projects, 0,
+            "the migration was saved: a not-saved report would be false"
+        );
+
+        let on_disk: config::storage::ProjectTasksFile = {
+            let bytes = std::fs::read_to_string(&routed_file).expect("the routed board was written");
+            toml::from_str(&bytes).expect("the written board parses")
+        };
+        assert_eq!(on_disk.tasks.len(), 1);
+        assert_eq!(on_disk.tasks[0].id, task_id);
+        assert_eq!(
+            on_disk.tasks[0].status,
+            domain::TaskStatus::Queue,
+            "the file holds the reconciled board, so a restart reads the recovery even \
+             though the save's durability was never confirmed"
+        );
+
+        let recovered = {
+            let tasks = state.task.tasks.read().await;
+            tasks.get(&task_id).expect("task is still published").clone()
+        };
+        assert_eq!(recovered.status, domain::TaskStatus::Queue);
     }
 
     #[tokio::test]

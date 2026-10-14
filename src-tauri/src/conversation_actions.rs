@@ -1378,7 +1378,7 @@ mod tests {
             Ok(CoordinatorOutput::EnqueueTask { target_task_id, .. }) if target_task_id == id
         ));
         for bad in [
-            format!(r#"{{"type":"enqueue_task","text":"x"}}"#),
+            r#"{"type":"enqueue_task","text":"x"}"#.to_string(),
             format!(r#"{{"type":"enqueue_task","text":"x","target_task_id":"{id}","status":"in_progress"}}"#),
             format!(r#"{{"type":"enqueue_task","text":"x","target_task_id":"{id}","position":0}}"#),
             format!(r#"{{"type":"enqueue_task","text":"  ","target_task_id":"{id}"}}"#),

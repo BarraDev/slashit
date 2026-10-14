@@ -31,7 +31,7 @@ type Projects = Arc<RwLock<HashMap<Uuid, Project>>>;
 pub(crate) fn try_persist_projects(
     storage: &Storage,
     projects: &HashMap<Uuid, Project>,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::config::ConfigWriteError> {
     // No extra `context` here on purpose: every caller formats this error
     // with `{e}`, which renders only the outermost context, so wrapping it
     // would replace the stage that actually failed ("Failed to load config
@@ -127,9 +127,12 @@ pub async fn create_project(
 /// Core of [`create_project`], taking the raw map and storage so tests can
 /// call it without a `tauri::State`.
 ///
-/// Inserts into a cloned map, persists the clone, and only replaces the
-/// shared map on success — a failed persist never leaves memory holding a
-/// project the caller was told did not get created.
+/// Inserts into a cloned map, persists the clone, and replaces the shared map
+/// once the file holds it — a failed persist never leaves memory holding a
+/// project the caller was told did not get created, and a write that replaced
+/// the file without confirming it durable never leaves memory behind the file
+/// (see [`crate::config::adopt_published`]). The caller is still told the
+/// truth: an error that says the change is in place and unconfirmed.
 async fn create_project_committed(
     projects: &RwLock<HashMap<Uuid, Project>>,
     storage: &Storage,
@@ -139,10 +142,9 @@ async fn create_project_committed(
     let mut proposed = projects_w.clone();
     proposed.insert(project.id, project.clone());
 
-    try_persist_projects(storage, &proposed)
-        .map_err(|e| format!("Failed to persist project: {e}"))?;
-
-    *projects_w = proposed;
+    let outcome = try_persist_projects(storage, &proposed);
+    crate::config::adopt_published(&mut *projects_w, proposed, outcome)
+        .map_err(|e| e.describe("persist project"))?;
     Ok(project)
 }
 
@@ -400,31 +402,64 @@ async fn delete_project_committed(
                     "Failed to record Project Conversation cleanup: {error}"
                 ));
             }
-            if let Err(error) = try_persist_projects(storage, &proposed) {
-                // Config still holds the Project on disk, so memory must not
-                // lose it either. Clear both retry records and say so.
-                storage
-                    .clear_project_tasks_deletion_pending(id)
-                    .map_err(|clear_error| {
-                        format!(
-                            "Failed to persist project deletion: {error}; also failed to clear \
-                         its pending Task cleanup record: {clear_error}"
-                        )
-                    })?;
-                storage
-                    .clear_project_conversation_deletion_pending(id)
-                    .map_err(|clear_error| {
-                        format!(
-                            "Failed to persist project deletion: {error}; also failed to clear \
-                         its pending Conversation cleanup record: {clear_error}"
-                        )
-                    })?;
-                return Err(format!("Failed to persist project deletion: {error}"));
+            let outcome = try_persist_projects(storage, &proposed);
+            match crate::config::adopt_published(&mut *projects_w, proposed, outcome) {
+                Ok(()) => {}
+                Err(error) if error.is_published() => {
+                    // The config without the Project is what the file holds,
+                    // and memory now agrees. Whether it survives a crash is
+                    // unknown, so nothing that depends on it may run: both
+                    // retry records stay as the evidence the next start (or a
+                    // retried deletion, after `confirm_config_durable`) needs
+                    // to finish or to discard the cleanup.
+                    return Err(format!(
+                        "The Project was removed from the configuration, but SlashIt could not \
+                         confirm that this reached stable storage ({error:#}). Its Task and \
+                         Conversation cleanup has not run and stays recorded. The next start \
+                         confirms the configuration first and then finishes the cleanup; if it \
+                         cannot, the records are kept."
+                    ));
+                }
+                Err(error) => {
+                    // Config still holds the Project on disk, so memory must not
+                    // lose it either. Clear both retry records and say so.
+                    storage
+                        .clear_project_tasks_deletion_pending(id)
+                        .map_err(|clear_error| {
+                            format!(
+                                "Failed to persist project deletion: {error}; also failed to clear \
+                             its pending Task cleanup record: {clear_error}"
+                            )
+                        })?;
+                    storage
+                        .clear_project_conversation_deletion_pending(id)
+                        .map_err(|clear_error| {
+                            format!(
+                                "Failed to persist project deletion: {error}; also failed to clear \
+                             its pending Conversation cleanup record: {clear_error}"
+                            )
+                        })?;
+                    return Err(format!("Failed to persist project deletion: {error}"));
+                }
             }
-            *projects_w = proposed;
         }
         removed
     };
+
+    // The cleanup below deletes the only other copies of the Project's data.
+    // It runs only once the configuration that no longer names the Project is
+    // confirmed durable: a retried deletion reaches here with the removal
+    // already published but unconfirmed, and this is the retry that settles it.
+    if removed || had_tasks {
+        storage.confirm_config_durable().map_err(|error| {
+            format!(
+                "The Project's Task and Conversation cleanup was not run, because the \
+                 configuration that removes the Project is not confirmed durable yet; its \
+                 cleanup records are kept. {}",
+                error.describe("save the configuration")
+            )
+        })?;
+    }
 
     // --- Task-record cleanup, already inside this write guard -------------
     //
@@ -699,10 +734,9 @@ async fn update_project_committed(
         project.updated_at = chrono::Utc::now();
         let result = project.clone();
 
-        try_persist_projects(storage, &proposed)
-            .map_err(|e| format!("Failed to persist project update: {e}"))?;
-
-        *projects_w = proposed;
+        let outcome = try_persist_projects(storage, &proposed);
+        crate::config::adopt_published(&mut *projects_w, proposed, outcome)
+            .map_err(|e| e.describe("persist project update"))?;
         Ok(Some(result))
     } else {
         Ok(None)
@@ -764,10 +798,9 @@ async fn attach_project_to_workspace_committed(
     project.updated_at = chrono::Utc::now();
     let result = project.clone();
 
-    try_persist_projects(storage, &proposed)
-        .map_err(|e| format!("Failed to persist workspace attachment: {e}"))?;
-
-    *projects_w = proposed;
+    let outcome = try_persist_projects(storage, &proposed);
+    crate::config::adopt_published(&mut *projects_w, proposed, outcome)
+        .map_err(|e| e.describe("persist workspace attachment"))?;
     Ok(result)
 }
 
@@ -801,10 +834,9 @@ async fn detach_project_from_workspace_committed(
     project.updated_at = chrono::Utc::now();
     let result = project.clone();
 
-    try_persist_projects(storage, &proposed)
-        .map_err(|e| format!("Failed to persist workspace detachment: {e}"))?;
-
-    *projects_w = proposed;
+    let outcome = try_persist_projects(storage, &proposed);
+    crate::config::adopt_published(&mut *projects_w, proposed, outcome)
+        .map_err(|e| e.describe("persist workspace detachment"))?;
     Ok(result)
 }
 
@@ -1326,6 +1358,230 @@ mod tests {
             .paths()
             .pending_project_tasks_deletion_file(id)
             .exists());
+    }
+
+    // ===== durable-write contract for the Projects section of config.toml =====
+
+    fn reopened(storage: &Storage) -> Storage {
+        // What a restart sees: a fresh Storage over the same directories.
+        let paths = storage.paths().clone();
+        Storage::with_paths(paths)
+    }
+
+    fn fail_config(stage: slashit_durable_fs::Stage) -> slashit_durable_fs::fault::FaultGuard {
+        slashit_durable_fs::fault::fail_at_file(stage, std::io::ErrorKind::Other, "config.toml")
+    }
+
+    #[tokio::test]
+    async fn a_project_created_by_a_write_that_could_not_confirm_durability_is_in_memory_and_on_disk() {
+        let (storage, _temp) = create_test_storage();
+        storage.save_config(&AppConfig::default()).unwrap();
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
+        let project = make_test_project(Uuid::new_v4());
+
+        let _fault = fail_config(slashit_durable_fs::Stage::SyncDirectory);
+        let message = create_project_committed(&projects, &storage, project.clone())
+            .await
+            .expect_err("the caller must be told the durability is unconfirmed");
+
+        assert!(message.contains("could not confirm"), "{message}");
+        assert!(message.contains("Do not repeat"), "{message}");
+        assert!(!message.starts_with("Failed to"), "this is not a failed save: {message}");
+        assert!(projects.read().await.contains_key(&project.id), "memory follows the visible file");
+        // The file and a restart agree with memory.
+        assert!(reopened(&storage).load_config().unwrap().projects.contains_key(&project.id.to_string()));
+        assert!(storage.load_config().unwrap().projects.contains_key(&project.id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_project_whose_write_failed_before_publication_is_nowhere() {
+        let (storage, _temp) = create_test_storage();
+        storage.save_config(&AppConfig::default()).unwrap();
+        let projects: RwLock<HashMap<Uuid, Project>> = RwLock::new(HashMap::new());
+        let project = make_test_project(Uuid::new_v4());
+
+        let _fault = fail_config(slashit_durable_fs::Stage::Replace);
+        let message = create_project_committed(&projects, &storage, project.clone()).await.unwrap_err();
+
+        assert!(message.starts_with("Failed to persist project"), "{message}");
+        assert!(projects.read().await.is_empty());
+        assert!(!reopened(&storage).load_config().unwrap().projects.contains_key(&project.id.to_string()));
+    }
+
+    /// A filesystem that cannot synchronize a directory cannot prove the
+    /// Project's removal sticks, so the Task and Conversation records, the only
+    /// other copy of the Project's data, are not deleted -- however often the
+    /// deletion is retried -- and the cleanup records stay.
+    #[tokio::test]
+    async fn a_project_deletion_on_a_filesystem_that_cannot_sync_directories_deletes_nothing() {
+        let (storage, _temp) = create_test_storage();
+        let project = make_test_project(Uuid::new_v4());
+        let id = project.id;
+        storage
+            .save_config(&AppConfig { projects: HashMap::from([(id.to_string(), project.clone())]), ..AppConfig::default() })
+            .unwrap();
+        let conversation = storage.create_primary_conversation(id).unwrap();
+        let pointer = storage.paths().primary_conversation_file(id);
+        let document = storage.paths().conversation_file(conversation.id);
+        let task = board_task(id);
+        let tasks_file = board_tasks_file(id, &storage);
+        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        let tasks = board(vec![task]);
+        let projects = RwLock::new(HashMap::from([(id, project)]));
+
+        let _fault = slashit_durable_fs::fault::fail_every(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Unsupported,
+        );
+        for attempt in 0..2 {
+            let message = delete_project_committed(&projects, &tasks, &storage, None, None, id)
+                .await
+                .expect_err("a deletion nothing can confirm is not a completed deletion");
+            assert!(message.contains("not run") && message.contains("cannot"), "attempt {attempt}: {message}");
+            assert!(tasks_file.exists(), "attempt {attempt}: Task records must not be deleted");
+            assert!(pointer.exists() && document.exists(), "attempt {attempt}: the Conversation must not be deleted");
+            assert!(tasks.read().await.values().any(|t| t.project_id == id));
+        }
+        assert!(!storage.pending_project_tasks_deletions().unwrap().is_empty(), "the cleanup record is kept");
+        assert!(storage.pending_project_conversation_deletions().unwrap().contains(&id));
+    }
+
+    #[tokio::test]
+    async fn a_project_update_that_could_not_confirm_durability_is_adopted_not_reverted_by_the_next_save() {
+        let (storage, _temp) = create_test_storage();
+        let project = make_test_project(Uuid::new_v4());
+        let id = project.id;
+        storage
+            .save_config(&AppConfig { projects: HashMap::from([(id.to_string(), project.clone())]), ..AppConfig::default() })
+            .unwrap();
+        let projects = RwLock::new(HashMap::from([(id, project)]));
+
+        let fault = fail_config(slashit_durable_fs::Stage::SyncDirectory);
+        let message = update_project_committed(&projects, &storage, id, Some("Renamed".into()), None, None)
+            .await
+            .unwrap_err();
+        drop(fault);
+        assert!(message.contains("could not confirm"), "{message}");
+        assert_eq!(projects.read().await[&id].name, "Renamed");
+
+        // The next, unrelated save writes memory; the rename must survive it.
+        let other = make_test_project(Uuid::new_v4());
+        create_project_committed(&projects, &storage, other.clone()).await.unwrap();
+        let on_disk = reopened(&storage).load_config().unwrap();
+        assert_eq!(on_disk.projects[&id.to_string()].name, "Renamed");
+        assert!(on_disk.projects.contains_key(&other.id.to_string()));
+    }
+
+    /// Project deletion whose config write replaced the file without
+    /// confirming it: nothing destructive may run, the evidence is kept, and
+    /// the retried deletion is what finishes it once the file is confirmed.
+    #[tokio::test]
+    async fn a_project_deletion_the_config_could_not_confirm_keeps_every_record_and_deletes_nothing() {
+        let (storage, _temp) = create_test_storage();
+        let project = make_test_project(Uuid::new_v4());
+        let id = project.id;
+        storage
+            .save_config(&AppConfig { projects: HashMap::from([(id.to_string(), project.clone())]), ..AppConfig::default() })
+            .unwrap();
+        let conversation = storage.create_primary_conversation(id).unwrap();
+        let pointer = storage.paths().primary_conversation_file(id);
+        let document = storage.paths().conversation_file(conversation.id);
+        let task = board_task(id);
+        let tasks_file = board_tasks_file(id, &storage);
+        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        let tasks = board(vec![task]);
+        let projects = RwLock::new(HashMap::from([(id, project)]));
+
+        let fault = fail_config(slashit_durable_fs::Stage::SyncDirectory);
+        let message = delete_project_committed(&projects, &tasks, &storage, None, None, id)
+            .await
+            .expect_err("a deletion whose commit is unconfirmed is not a completed deletion");
+        drop(fault);
+
+        assert!(message.contains("could not") && message.contains("confirm"), "{message}");
+        // Memory and the visible file agree that the Project is gone...
+        assert!(!projects.read().await.contains_key(&id));
+        assert!(!storage.load_config().unwrap().projects.contains_key(&id.to_string()));
+        // ...but nothing that depended on it ran, and the evidence is intact.
+        assert!(tasks_file.exists(), "Task records must not be deleted on an unconfirmed commit");
+        assert!(tasks.read().await.values().any(|t| t.project_id == id));
+        assert!(pointer.exists() && document.exists(), "the Conversation must not be deleted");
+        assert!(storage.paths().pending_project_tasks_deletion_file(id).exists());
+        assert!(storage.paths().pending_project_conversation_deletion_file(id).exists());
+
+        // A restart in this state sees the Project gone and both records. They
+        // are the reconciliation evidence: startup confirms the configuration
+        // before it acts on them (see `app_core`), or drops them if the removal
+        // did not survive.
+        let restarted = reopened(&storage);
+        assert!(!restarted.load_config().unwrap().projects.contains_key(&id.to_string()));
+        assert!(restarted.has_pending_tasks_deletion_record(id).unwrap());
+        assert_eq!(restarted.pending_project_conversation_deletions().unwrap(), vec![id]);
+
+        // The retry confirms the config first, then finishes.
+        assert!(delete_project_committed(&projects, &tasks, &storage, None, None, id).await.unwrap());
+        assert!(!tasks_file.exists());
+        // A retried deletion leaves its Conversation leg, and the record that
+        // owns it, to the next start's reconciliation (existing contract).
+        assert!(storage.paths().pending_project_conversation_deletion_file(id).exists());
+        assert!(!storage.paths().pending_project_tasks_deletion_file(id).exists());
+    }
+
+    #[tokio::test]
+    async fn a_retried_deletion_does_not_clean_up_while_the_config_still_cannot_be_confirmed() {
+        let (storage, _temp) = create_test_storage();
+        let project = make_test_project(Uuid::new_v4());
+        let id = project.id;
+        storage
+            .save_config(&AppConfig { projects: HashMap::from([(id.to_string(), project.clone())]), ..AppConfig::default() })
+            .unwrap();
+        let task = board_task(id);
+        let tasks_file = board_tasks_file(id, &storage);
+        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        let tasks = board(vec![task]);
+        let projects = RwLock::new(HashMap::from([(id, project)]));
+
+        let first = fail_config(slashit_durable_fs::Stage::SyncDirectory);
+        delete_project_committed(&projects, &tasks, &storage, None, None, id).await.unwrap_err();
+        drop(first);
+
+        // The confirmation rewrite fails too (here after the rename again).
+        let second = fail_config(slashit_durable_fs::Stage::SyncDirectory);
+        let message = delete_project_committed(&projects, &tasks, &storage, None, None, id)
+            .await
+            .expect_err("still unconfirmed");
+        drop(second);
+
+        assert!(message.contains("not run"), "{message}");
+        assert!(tasks_file.exists(), "no cleanup without a confirmed config");
+        assert!(storage.paths().pending_project_tasks_deletion_file(id).exists());
+        assert!(delete_project_committed(&projects, &tasks, &storage, None, None, id).await.unwrap());
+        assert!(!tasks_file.exists());
+    }
+
+    #[tokio::test]
+    async fn a_project_deletion_that_failed_before_publication_clears_its_records_and_changes_nothing() {
+        let (storage, _temp) = create_test_storage();
+        let project = make_test_project(Uuid::new_v4());
+        let id = project.id;
+        storage
+            .save_config(&AppConfig { projects: HashMap::from([(id.to_string(), project.clone())]), ..AppConfig::default() })
+            .unwrap();
+        let task = board_task(id);
+        let tasks_file = board_tasks_file(id, &storage);
+        storage.save_project_tasks(id, std::slice::from_ref(&task)).unwrap();
+        let tasks = board(vec![task]);
+        let projects = RwLock::new(HashMap::from([(id, project)]));
+
+        let _fault = fail_config(slashit_durable_fs::Stage::Replace);
+        let message = delete_project_committed(&projects, &tasks, &storage, None, None, id).await.unwrap_err();
+
+        assert!(message.starts_with("Failed to persist project deletion"), "{message}");
+        assert!(projects.read().await.contains_key(&id));
+        assert!(storage.load_config().unwrap().projects.contains_key(&id.to_string()));
+        assert!(tasks_file.exists());
+        assert!(!storage.paths().pending_project_tasks_deletion_file(id).exists());
+        assert!(!storage.paths().pending_project_conversation_deletion_file(id).exists());
     }
 
     #[tokio::test]

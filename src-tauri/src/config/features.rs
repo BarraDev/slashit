@@ -350,16 +350,22 @@ impl FeatureFlags {
         }
     }
 
-    pub fn save(&self, paths: &AppPaths) -> std::io::Result<()> {
+    pub fn save(&self, paths: &AppPaths) -> Result<(), crate::config::ConfigWriteError> {
+        use crate::config::ConfigWriteError;
         let path = paths.feature_flags_file();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let text = toml::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, &path)
+            .map_err(|e| ConfigWriteError::NotPublished(anyhow::Error::new(e)))?;
+        slashit_durable_fs::write_atomic(&path, text.as_bytes(), slashit_durable_fs::Permissions::Preserve)
+            .map(|_| ())
+            .map_err(|e| {
+                let published = e.is_published();
+                let error = anyhow::Error::new(e).context("Failed to write the feature flags");
+                if published {
+                    ConfigWriteError::PublishedNotDurable(error)
+                } else {
+                    ConfigWriteError::NotPublished(error)
+                }
+            })
     }
 
     /// Look a flag up by name, for the frontend toggle.

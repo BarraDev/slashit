@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// A coding run whose start is on disk.
+#[derive(Debug)]
 struct RunStart {
     working_dir: String,
     /// The run's number, as its recorded [`ActivityKind::RunStarted`] has it.
@@ -1543,13 +1544,23 @@ impl TaskExecutor {
         if let Err(e) =
             crate::lifecycle::record_if_changed(&self.tasks, &self.storage, task_id, &revise).await
         {
+            let message = if crate::config::says_in_place_but_unconfirmed(&e) {
+                format!(
+                    "Observed pull request state {state:?} for task {task_id}; the observation \
+                     is on the board and in the file, so the task already shows it, and only \
+                     its durability is unconfirmed (a restart that finds the record lost \
+                     observes the same pull request state again): {e}"
+                )
+            } else {
+                format!(
+                    "Observed pull request state {state:?} for task {task_id}, but recording \
+                     it failed, so it was not applied and will be retried: {e}"
+                )
+            };
             self.events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Warn,
-                message: format!(
-                    "Observed pull request state {state:?} for task {task_id}, but recording \
-                     it failed, so it was not applied and will be retried: {e}"
-                ),
+                message,
             });
         }
     }
@@ -2086,12 +2097,13 @@ impl TaskExecutor {
     /// recorded by the start that created it, so a retry or a restart keeps
     /// the stack parent the branch was actually built on.
     ///
-    /// `Err` means nothing was recorded and the agent must not start. A
-    /// checkout this start created is taken back first (see
-    /// [`WorktreeManager::undo_created_checkout`]): left behind unrecorded,
-    /// the next start would adopt it, and an adopted checkout records no
-    /// starting commit and no origin. The message says what was kept, if
-    /// anything.
+    /// `Err` means the agent must not start. A checkout this start created is
+    /// taken back, but only when the record published nothing (see
+    /// [`WorktreeManager::undo_created_checkout`]): a record the file
+    /// accepted without confirming its durability has already replaced the
+    /// board, its checkout is one the published board references, and taking
+    /// it back would delete recorded state. The message says what was kept,
+    /// if anything.
     async fn record_run_start(
         &self,
         task_id: Uuid,
@@ -2125,10 +2137,29 @@ impl TaskExecutor {
                 run: run.load(std::sync::atomic::Ordering::Relaxed),
             }),
             Err(e) => {
-                let outcome = self
-                    .worktree_manager
-                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
-                    .await;
+                let published = crate::config::says_in_place_but_unconfirmed(&e);
+                let outcome = if published {
+                    // The record reached the board file, which now names
+                    // this checkout, its branch and its starting commit.
+                    // Taking the checkout back would undo a published
+                    // record: it would delete a checkout the persisted
+                    // board references, and the branch itself while it
+                    // still stands exactly at its creation commit -- the
+                    // direction `commit` and the delete path refuse for
+                    // the same outcome. Nothing can undo a write the file
+                    // already accepted, so the checkout stays and the
+                    // refusal says where things stand.
+                    format!(
+                        "the checkout at {path} stands on branch {branch} as the board \
+                         already records, so it was not undone",
+                        path = acquired.info.path,
+                        branch = acquired.info.branch,
+                    )
+                } else {
+                    self.worktree_manager
+                        .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                        .await
+                };
                 Err(format!(
                     "The task's worktree could not be recorded ({e}), so the task was not \
                      started; {outcome}"
@@ -2178,9 +2209,6 @@ impl TaskExecutor {
             .await
     }
 
-    /// [`Self::spawn_task_execution`] for a caller that already holds
-    /// `task_id`'s lifecycle lease, which `lease` stands for.
-    ///
     /// The one place a task execution is decided, under the lease, so no
     /// other lifecycle transition can land between the answer and the start
     /// it allowed. A live owner, the task's own state, the unrecorded-worktree
@@ -2353,7 +2381,10 @@ impl TaskExecutor {
                     .to_string(),
             });
         }
-        let RunStart { working_dir, run } = match self.record_run_start(task_id, &repo_path, acquired).await {
+        let RunStart { working_dir, run } = match self
+            .record_run_start(task_id, &repo_path, acquired)
+            .await
+        {
             Ok(start) => {
                 self.unrecorded_backoff_lock().remove(&task_id);
                 start
@@ -2606,16 +2637,33 @@ impl TaskExecutor {
                                         }
                                     }
                                     Err(e) => {
-                                        // Nothing was published: memory and
-                                        // disk both still have the run in
-                                        // progress. A finish that cannot be
-                                        // recorded ends the run as a failure,
-                                        // the durable transition every other
-                                        // unfinished run takes.
-                                        let message = format!(
-                                            "The agent finished and its work was committed, but moving the \
-                                             task to AI review could not be saved, so it was not reviewed: {e}"
-                                        );
+                                        // `record_run_completed` either published the
+                                        // AI-review board and could not confirm it
+                                        // durable, or published nothing. In the second
+                                        // case a finish that cannot be recorded ends the
+                                        // run as a failure, the durable transition every
+                                        // other unfinished run takes. In the first the
+                                        // completed run is already on the board and in
+                                        // the file; the failure record that follows says
+                                        // so on its own, and a restart that loses the
+                                        // whole write re-derives the same ended run
+                                        // either way.
+                                        let message =
+                                            if crate::config::says_in_place_but_unconfirmed(&e) {
+                                                format!(
+                                                    "The agent finished and its work was committed. \
+                                                     The move to AI review was recorded on the board \
+                                                     and in the file, but SlashIt could not confirm \
+                                                     that this reached stable storage, so a restart \
+                                                     may still find the run in progress: {e}"
+                                                )
+                                            } else {
+                                                format!(
+                                                    "The agent finished and its work was committed, but \
+                                                     moving the task to AI review could not be saved, \
+                                                     so it was not reviewed: {e}"
+                                                )
+                                            };
                                         record_output(&logs, execution_id, LogLevel::Error, message.clone()).await;
                                         let ended = RunEnd { run, tools, timeline_reason: None };
                                         Self::set_task_error_static(&tasks, &storage, &events, task_id, &message, Some(ended)).await;
@@ -3266,15 +3314,24 @@ impl TaskExecutor {
             })
             .collect();
 
-        storage
-            .save_project_tasks(project_id, &staged)
-            .map_err(|e| {
-                format!(
+        if let Err(e) = storage.save_project_tasks(project_id, &staged) {
+            if !crate::config::board_write_published(&e) {
+                return Err(format!(
                     "the agent was stopped, but recording task {task_id} as stopped \
                      failed, so it is still saved as running and a restart would start \
                      it again: {e}"
-                )
-            })?;
+                ));
+            }
+            // The file already records the stop; only its durability is
+            // unconfirmed. Memory follows the file, or the next save of any
+            // sibling would put the running record back.
+            tasks_w.insert(task_id, stopped);
+            return Err(format!(
+                "the agent was stopped and task {task_id} was recorded as stopped, but \
+                 SlashIt could not confirm that this reached stable storage, so a restart \
+                 may still find it saved as running: {e}"
+            ));
+        }
 
         // Published only now, and as exactly the record that reached the
         // disk, so the board cannot show a stop the file does not have.
@@ -3952,14 +4009,22 @@ impl TaskExecutor {
             }
         };
         if let Err(e) = crate::lifecycle::record(tasks, storage, task_id, &amend).await {
+            // Either the hand-off was published and only its durability is
+            // unconfirmed (`record` adopts what reached the file), or nothing
+            // was published, in which case the AI-review selector still finds
+            // the task and a later attempt re-runs the review.
+            let outcome = if crate::config::says_in_place_but_unconfirmed(&e) {
+                "the hand-off was recorded on the board and in the file, so the task shows as \
+                 ready for human review, but SlashIt could not confirm that this reached \
+                 stable storage, so a restart may still find it as it was before the hand-off"
+            } else {
+                "recording it as ready for human review failed, so it was not published and \
+                 will be re-reviewed rather than silently skipped"
+            };
             events.agent_event(AgentEvent::Log {
                 task_id: task_id.to_string(),
                 level: LogLevel::Warn,
-                message: format!(
-                    "Task {task_id} finished review, but recording it as ready for human \
-                     review failed, so it was not published and will be re-reviewed rather \
-                     than silently skipped: {e}"
-                ),
+                message: format!("Task {task_id} finished review, but {outcome}: {e}"),
             });
         }
     }
@@ -4262,8 +4327,9 @@ impl TaskExecutor {
     /// Move a task whose run finished and whose work is committed on to AI
     /// review, durably before the board can show it: the status, the review
     /// phase, the run's tool calls and its [`ActivityKind::RunCompleted`] are
-    /// one write. `Err` means nothing was written or published, and `tools`
-    /// is still the caller's to record elsewhere.
+    /// one write. `Err` means the write either published the new board and
+    /// could not confirm it durable, or published nothing; `tools` is still
+    /// the caller's to record on the task either way.
     async fn record_run_completed(
         tasks: &Tasks,
         storage: &crate::config::Storage,
@@ -4294,6 +4360,18 @@ impl TaskExecutor {
     /// irreversible work, but a lost write would still silently strand the
     /// task off every automatic path with nothing on disk explaining why.
     ///
+    /// A failed record answers truthfully about what it did, the way
+    /// [`Self::settle_stopped_static`] does: a failure that replaced the file
+    /// and then could not confirm it durable left the errored board published
+    /// (on disk and, through `publish`'s adoption, in memory too), so the task
+    /// shows as errored and only the durability of that record is unconfirmed.
+    /// A failure that published nothing left the task exactly as it was, so
+    /// whether anything picks it up again is a fact about that state: only a
+    /// task that is ready to execute is selected again while this process
+    /// runs. Either way the answer is delivered both as an error event and as
+    /// a warn log, because the log line alone is not an event a surface keys
+    /// on, and the error event alone would not reach the task's log timeline.
+    ///
     /// `ended` is the coding run the failure ended, with its tool calls;
     /// `None` when the task failed before a run could start.
     async fn set_task_error_static(
@@ -4322,42 +4400,58 @@ impl TaskExecutor {
             }
         };
         if let Err(e) = crate::lifecycle::record(tasks, storage, task_id, &amend).await {
-            // `record` writes and publishes nothing on failure, so the task is
-            // exactly as it was. Whether anything will pick it up again is a
-            // fact about that state, not about this call: only a task that is
-            // ready to execute is selected again while this process runs, and a
-            // task whose run has just ended is not (its phase says a run is in
-            // progress that no longer exists). A restart returns it to Queue.
-            let current = tasks.read().await.get(&task_id).cloned();
-            let outlook = match &current {
-                Some(task) if task.is_ready_to_execute() => "it is still ready to execute, so the \
-                     next pass will pick it up and try again"
-                    .to_string(),
-                Some(task) => format!(
-                    "it is still {:?} in phase {:?}, which nothing picks up again while SlashIt \
-                     keeps running, so it stays there with no run attached until you act: move \
-                     it to Queue to run it again (it starts when the queue promotes it, \
-                     automatically only while auto-promote is on), to Backlog to park it (it \
-                     does not start until you queue or start it), or to Error to record that it \
-                     failed{}",
-                    task.status,
-                    task.phase,
-                    // `migrate_task` returns exactly these two to Queue at start-up.
-                    if matches!(task.status, TaskStatus::InProgress | TaskStatus::AiReview) {
-                        ". Restarting SlashIt returns it to Queue, where it runs again once the \
-                         queue promotes it"
-                    } else {
-                        ""
-                    }
-                ),
-                None => "it is no longer on the board".to_string(),
+            let message = if crate::config::says_in_place_but_unconfirmed(&e) {
+                format!(
+                    "Task {task_id} failed ({msg}). The failure was recorded on the board and \
+                     in the file, so the task shows as errored, but SlashIt could not confirm \
+                     that this reached stable storage, so a restart may still find the task as \
+                     it was before this failure: {e}"
+                )
+            } else {
+                // `record` writes and publishes nothing on a failure that did
+                // not reach the file, so the task is exactly as it was.
+                // Whether anything will pick it up again is a fact about that
+                // state, not about this call: only a task that is ready to
+                // execute is selected again while this process runs, and a task
+                // whose run has just ended is not (its phase says a run is in
+                // progress that no longer exists). A restart returns it to
+                // Queue.
+                let current = tasks.read().await.get(&task_id).cloned();
+                let outlook = match &current {
+                    Some(task) if task.is_ready_to_execute() => "it is still ready to execute, \
+                         so the \
+                         next pass will pick it up and try again"
+                        .to_string(),
+                    Some(task) => format!(
+                        "it is still {:?} in phase {:?}, which nothing picks up again while \
+                         SlashIt keeps running, so it stays there with no run attached until \
+                         you act: move it to Queue to run it again (it starts when the queue \
+                         promotes it, automatically only while auto-promote is on), to \
+                         Backlog to park it (it does not start until you queue or start it), \
+                         or to Error to record that it failed{}",
+                        task.status,
+                        task.phase,
+                        // `migrate_task` returns exactly these two to Queue at start-up.
+                        if matches!(task.status, TaskStatus::InProgress | TaskStatus::AiReview) {
+                            ". Restarting SlashIt returns it to Queue, where it runs again \
+                             once the queue promotes it"
+                        } else {
+                            ""
+                        }
+                    ),
+                    None => "it is no longer on the board".to_string(),
+                };
+                format!(
+                    "Task {task_id} failed ({msg}), and recording that failure durably also \
+                     failed, so the task was not published as errored: {outlook}. Cause: {e}"
+                )
             };
-            let message = format!(
-                "Task {task_id} failed ({msg}), and recording that failure durably also failed, \
-                 so the task was not published as errored: {outlook}. Cause: {e}"
-            );
             events.agent_event(AgentEvent::Error { task_id: task_id.to_string(), message: message.clone() });
-            events.agent_event(AgentEvent::Log { task_id: task_id.to_string(), level: LogLevel::Warn, message });
+            events.agent_event(AgentEvent::Log {
+                task_id: task_id.to_string(),
+                level: LogLevel::Warn,
+                message,
+            });
         }
     }
 
@@ -5265,6 +5359,28 @@ mod tests {
         assert!(!executor.run_tools.lock().unwrap().contains_key(&id));
     }
 
+    /// The stop reached the file; only the directory sync failed. Memory must
+    /// follow the file, or the next save of a sibling writes the running
+    /// record back and a restart starts the agent again.
+    #[tokio::test]
+    async fn a_stop_the_file_accepted_but_could_not_confirm_is_not_undone_by_memory() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        executor.register_fake_running_execution_for_test(id).await;
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        let message = executor.stop_task(id).await.expect_err("the unconfirmed record is reported");
+        drop(fault);
+
+        assert!(message.contains("could not confirm"), "{message}");
+        assert!(!message.contains("still saved as running"), "{message}");
+        assert_eq!(executor.tasks.read().await[&id].status, TaskStatus::Backlog, "memory follows the file");
+        assert_eq!(on_disk_task(&executor, project_id, id).status, TaskStatus::Backlog);
+    }
+
     // --- record_pr_poll_state("CLOSED") ---
 
     #[tokio::test]
@@ -5293,6 +5409,52 @@ mod tests {
         assert!(
             warn_message_containing(&recording, "was not applied and will be retried"),
             "the failure must be surfaced, not silently swallowed; recorded events: {:?}",
+            recording.recorded()
+        );
+    }
+
+    /// A closure observation whose directory sync failed has still been
+    /// recorded: `record_if_changed` adopted the board the published file
+    /// holds, so the poll's own selection already treats this PR as closed and
+    /// does not ask the spin-off question again. The log must say the
+    /// observation is in place, not that it will be re-applied -- there is
+    /// nothing to re-apply, and a restart that finds the record lost simply
+    /// observes the same pull request again.
+    #[tokio::test]
+    async fn a_closed_pr_observation_the_board_adopted_but_could_not_confirm_is_reported_as_recorded() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
+        let (id, project_id) = task_with_open_pr(&executor, None).await;
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        executor.record_pr_poll_state(id, &crate::pr_status::PrKey::new("owner/repo", 7), "CLOSED").await;
+        drop(fault);
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            recorded_pr_state(&after).as_deref(),
+            Some("CLOSED"),
+            "`record_if_changed` adopted the published observation, so memory shows it"
+        );
+        assert_eq!(
+            after.error_message.as_deref(),
+            Some("PR was closed without merge"),
+            "a PrCreated task is in the PR lifecycle, so the explanation was recorded by \
+             the same write"
+        );
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(recorded_pr_state(&on_disk).as_deref(), Some("CLOSED"));
+        assert!(
+            warn_message_containing(&recording, "the task already shows it"),
+            "{:?}",
+            recording.recorded()
+        );
+        assert!(
+            !warn_message_containing(&recording, "was not applied"),
+            "a published observation is not one that will be retried: {:?}",
             recording.recorded()
         );
     }
@@ -6176,6 +6338,60 @@ mod tests {
         );
     }
 
+    /// A hand-off whose directory sync failed has still put the task in
+    /// `HumanReview`: `record` adopted the board the published file holds. The
+    /// log must say where the hand-off stands, not that it never happened and
+    /// will be re-run -- nothing re-runs it, and claiming it did would invite
+    /// re-triggering the fix agent over a tree that already moved.
+    #[tokio::test]
+    async fn a_handoff_the_board_adopted_but_could_not_confirm_is_reported_as_recorded() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
+        let (id, project_id) = seed_task(&executor, TaskStatus::AiReview).await;
+
+        let signoff = QaSignoff {
+            status: QaStatus::Approved,
+            issues_found: Vec::new(),
+            timestamp: chrono::Utc::now(),
+            session_id: Uuid::new_v4(),
+        };
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        TaskExecutor::transition_to_human_review(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            Some(signoff),
+            Vec::new(),
+        )
+        .await;
+        drop(fault);
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            after.status,
+            TaskStatus::HumanReview,
+            "`record` adopted the published board, so memory shows the hand-off"
+        );
+        assert_eq!(after.phase, TaskPhase::Complete);
+        assert!(after.qa_signoff.is_some());
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(on_disk.status, TaskStatus::HumanReview, "the file holds the hand-off");
+        assert!(
+            warn_message_containing(&recording, "was recorded on the board and in the file"),
+            "{:?}",
+            recording.recorded()
+        );
+        assert!(
+            !warn_message_containing(&recording, "will be re-reviewed"),
+            "a published hand-off is not one that will run again: {:?}",
+            recording.recorded()
+        );
+    }
+
     // --- set_task_error_static ---
 
     #[tokio::test]
@@ -6325,6 +6541,149 @@ mod tests {
             crate::lifecycle::classify_status_transition(&stranded.status, &TaskStatus::Error),
             crate::lifecycle::StatusTransitionEffect::None
         );
+    }
+
+    /// A directory-sync failure after the file was replaced means `publish`
+    /// adopted the errored board into memory and the file already holds it: the
+    /// failure WAS published, and only its durability is unconfirmed. The
+    /// message must say that -- not that the task was not published and remains
+    /// eligible, because nothing at all picks up an errored task while SlashIt
+    /// keeps running, and a caller that believes the error never happened would
+    /// have nowhere to see the failure again once the Error event is gone.
+    #[tokio::test]
+    async fn an_error_the_board_adopted_but_could_not_confirm_is_reported_as_recorded() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        // A run that has just ended: the task sits in a working phase nothing
+        // selects again while SlashIt keeps running.
+        executor.tasks.write().await.get_mut(&id).unwrap().phase = TaskPhase::Coding;
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        TaskExecutor::set_task_error_static(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            "agent exited with status 1",
+            Some(RunEnd { run: 1, tools: None, timeline_reason: None }),
+        )
+        .await;
+        drop(fault);
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            after.status,
+            TaskStatus::Error,
+            "`record` adopted the errored board it published, so memory shows it"
+        );
+        assert_eq!(after.phase, TaskPhase::Failed);
+        assert_eq!(after.error_message.as_deref(), Some("agent exited with status 1"));
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(on_disk.status, TaskStatus::Error, "the file holds the errored board");
+
+        let errors = recorded_error_messages(&recording);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("was recorded on the board and in the file"),
+            "{errors:?}"
+        );
+        assert!(
+            errors[0].contains("could not confirm"),
+            "the message must keep the durability caveat: {errors:?}"
+        );
+        assert!(!errors[0].contains("not published as errored"), "{errors:?}");
+        assert!(!errors[0].contains("remains eligible"), "{errors:?}");
+        assert!(
+            !warn_message_containing(&recording, "next pass will pick it up and try again"),
+            "an errored task matches no selector, so no retry promise is true: {:?}",
+            recording.recorded()
+        );
+    }
+
+    /// Same published-but-unconfirmed outcome for the eager shape: the executor
+    /// would select a ready task again, but once the errored record is adopted
+    /// the task is errored and matches no selector, so the ready promise must
+    /// not be made either.
+    #[tokio::test]
+    async fn a_spawn_failure_the_board_adopted_but_could_not_confirm_is_not_promised_the_next_pass() {
+        let recording = Arc::new(crate::events::RecordingEventSink::new());
+        let (executor, _temps) = test_executor_with_events(recording.clone());
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+        // The eager premise: promoted out of the queue and failing before any
+        // run, the one state the executor would select again.
+        executor.tasks.write().await.get_mut(&id).unwrap().phase = TaskPhase::Idle;
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        TaskExecutor::set_task_error_static(
+            &executor.tasks,
+            &executor.storage,
+            &executor.events,
+            id,
+            "agent could not start",
+            None,
+        )
+        .await;
+        drop(fault);
+
+        let after = executor.tasks.read().await.get(&id).cloned().expect("task");
+        assert_eq!(
+            after.status,
+            TaskStatus::Error,
+            "`record` adopted the errored board, so the task is no longer ready to execute"
+        );
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(on_disk.status, TaskStatus::Error, "the file holds the errored board");
+
+        let errors = recorded_error_messages(&recording);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("was recorded on the board and in the file"),
+            "{errors:?}"
+        );
+        assert!(!errors[0].contains("still ready to execute"), "{errors:?}");
+        assert!(
+            !warn_message_containing(&recording, "next pass will pick it up and try again"),
+            "the adopted board errored the task, so nothing picks it up: {:?}",
+            recording.recorded()
+        );
+    }
+
+    /// A run completion whose directory sync failed has still moved the task
+    /// to `AiReview`: `record` adopted the board the published file holds, so
+    /// the caller's "nothing was saved" reading would be false exactly where
+    /// its follow-up (the error record) needs to know the AI-review move
+    /// already happened.
+    #[tokio::test]
+    async fn a_run_completion_the_board_adopted_but_could_not_confirm_reports_the_write_in_place() {
+        let (executor, _temps) = test_executor();
+        let (id, project_id) = seed_task(&executor, TaskStatus::InProgress).await;
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        let error = TaskExecutor::record_run_completed(&executor.tasks, &executor.storage, id, 1, None)
+            .await
+            .expect_err("the caller is told the durability is unconfirmed");
+        drop(fault);
+
+        assert!(error.contains("in place but not confirmed durable"), "{error}");
+        let after = executor.tasks.read().await[&id].clone();
+        assert_eq!(
+            after.status,
+            TaskStatus::AiReview,
+            "`record` adopted the published board, so memory shows the completion"
+        );
+        assert_eq!(after.phase, TaskPhase::QaReview);
+        let on_disk = on_disk_task(&executor, project_id, id);
+        assert_eq!(on_disk.status, TaskStatus::AiReview, "the file holds the completion");
     }
 
     #[tokio::test]
@@ -7972,6 +8331,296 @@ mod tests {
             persisted_task(&executor, project_id, task_id).branch_origin,
             Some(BranchOrigin::Stacked { parent_branch: "task-deadbeef".to_string() })
         );
+    }
+
+    /// What a run start's record changes: the task's name, path, branch,
+    /// phase and activity, in memory and on disk. `Task` deliberately has no
+    /// `PartialEq`, so tests compare this instead.
+    fn run_start_fingerprint(task: &Task) -> String {
+        format!(
+            "path={:?} branch={:?} phase={:?} progress={} activity={}",
+            task.worktree_path,
+            task.branch_name,
+            task.phase,
+            task.phase_progress,
+            task.activity.len(),
+        )
+    }
+
+    /// A run start whose record already reached the board file but could not
+    /// be confirmed durable must not take the checkout it created back.
+    ///
+    /// `lifecycle::publish` adopts a board the file holds but could not
+    /// confirm durable: on this outcome the file on disk already names the
+    /// checkout, its branch and its starting commit, so a rollback would
+    /// delete a checkout the published board references (and, while the
+    /// branch still stands at `created_at`, the branch as a whole) -- the
+    /// opposite of the fail-closed direction every other board write keeps.
+    /// Releasing the checkout stays reserved for a record that published
+    /// nothing (`NotPublished`), where the next attempt really does start
+    /// over.
+    #[tokio::test]
+    async fn a_published_but_unconfirmed_run_start_record_keeps_its_created_checkout() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        seed_stacked_fixture_board(&executor).await;
+        publish_default_base(&repo);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("a created checkout");
+        let path = acquired.info.path.clone();
+        let branch = acquired.info.branch.clone();
+        let created_at = acquired
+            .created_at
+            .clone()
+            .expect("a created checkout knows its starting commit");
+        assert!(std::path::Path::new(&path).is_dir());
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        assert_eq!(
+            on_disk_task(&executor, project_id, task_id).worktree_path,
+            None,
+            "precondition: the board has never named the checkout"
+        );
+
+        // Failing the directory sync after the replacement is the real
+        // production shape of "published, durability unconfirmed".
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        let error = executor
+            .record_run_start(task_id, repo.to_str().unwrap(), acquired)
+            .await
+            .expect_err("the unconfirmed record is reported");
+        drop(fault);
+
+        // The refusal says where the already-published record stands, and
+        // never claims to be safe to retry from the top.
+        assert!(error.contains("in place but not confirmed durable"), "{error}");
+        assert!(
+            !error.contains("was removed again"),
+            "the checkout must not be taken back on this outcome: {error}"
+        );
+
+        // The persisted board already names the checkout the record wrote.
+        let persisted = on_disk_task(&executor, project_id, task_id);
+        assert_eq!(persisted.worktree_path.as_deref(), Some(path.as_str()));
+        assert_eq!(persisted.branch_name.as_deref(), Some(branch.as_str()));
+        assert_eq!(persisted.phase, TaskPhase::Coding, "the run's phase reached the file");
+        assert_eq!(persisted.activity.len(), 1, "the RunStarted record reached the file");
+
+        // The checkout survives, still registered with git, and the branch
+        // still stands at the commit the record captured.
+        assert!(std::path::Path::new(&path).is_dir(), "the checkout file tree must be kept");
+        let list = git_in(&repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            list.contains(&format!("worktree {path}")),
+            "the worktree must stay registered: {list}"
+        );
+        assert_eq!(
+            git_in(std::path::Path::new(&path), &["rev-parse", "HEAD"]),
+            created_at,
+            "the branch keeps the starting commit it was created at"
+        );
+
+        // A restart can still start from here: the reloadable task names a
+        // checkout that really is there, on the branch the record captured.
+        let reloaded = on_disk_task(&executor, project_id, task_id);
+        assert_eq!(reloaded.worktree_path.as_deref(), Some(path.as_str()));
+        assert_eq!(reloaded.branch_name.as_deref(), Some(branch.as_str()));
+    }
+
+    /// A record that published nothing still releases the checkout it
+    /// created, so a retry starts over instead of adopting one whose origin
+    /// and starting commit were never recorded.
+    #[tokio::test]
+    async fn a_run_start_record_that_published_nothing_still_releases_its_created_checkout() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        seed_stacked_fixture_board(&executor).await;
+        publish_default_base(&repo);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("a created checkout");
+        let path = acquired.info.path.clone();
+        let created_at = acquired
+            .created_at
+            .clone()
+            .expect("a created checkout knows its starting commit");
+        assert!(std::path::Path::new(&path).is_dir());
+
+        // Failing the replacement leaves the board file exactly as it was:
+        // nothing about this start is on disk.
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+        );
+        let error = executor
+            .record_run_start(task_id, repo.to_str().unwrap(), acquired)
+            .await
+            .expect_err("the unpublished record is reported");
+        drop(fault);
+
+        assert!(
+            !error.contains("in place but not confirmed durable"),
+            "the record published nothing, so the refusal must not say it did: {error}"
+        );
+        assert!(error.contains("was removed again"), "{error}");
+        assert!(!std::path::Path::new(&path).is_dir(), "the unrecorded checkout is taken back");
+        assert_eq!(worktree_count(&repo), 1, "only the main checkout remains");
+        let created = git_in(&repo, &["cat-file", "-t", &created_at]);
+        assert_eq!(created, "commit", "the commit the branch rose from must survive");
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let persisted = on_disk_task(&executor, project_id, task_id);
+        assert!(persisted.worktree_path.is_none(), "the board never named the checkout");
+    }
+
+    /// A run start that only reattached to a checkout of a branch a previous
+    /// process recorded fails closed on an unconfirmable record: the record
+    /// is on the file already, memory adopts it, and nothing is removed.
+    #[tokio::test]
+    async fn a_reattached_run_start_with_an_unconfirmable_record_removes_nothing() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        let task_branch = WorktreeManager::branch_for_task(task_id);
+        git_in(&repo, &["branch", &task_branch]);
+        seed_recorded_branch_without_checkout(&executor, task_id, &task_branch).await;
+        publish_default_base(&repo);
+
+        let (existing, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        assert_eq!(existing, Some(task_branch.clone()), "the recorded branch is reattached");
+        let acquired = acquired.expect("reattached");
+        assert_eq!(acquired.what_happened, "Reattached worktree");
+        assert!(acquired.created_at.is_none(), "a reattached checkout was not created here");
+        let repo_path = repo.to_str().unwrap();
+        let path = acquired.info.path.clone();
+        assert!(std::path::Path::new(&path).is_dir());
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let fingerprint_before = run_start_fingerprint(&executor.tasks.read().await[&task_id]);
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        let error = executor
+            .record_run_start(task_id, repo_path, acquired)
+            .await
+            .expect_err("the unconfirmed record is reported");
+        drop(fault);
+
+        assert!(error.contains("in place but not confirmed durable"), "{error}");
+        let after = &executor.tasks.read().await[&task_id];
+        assert_ne!(
+            run_start_fingerprint(after),
+            fingerprint_before,
+            "memory publishes what the file already holds, or the next save of a sibling              restores the previous board and the record of the run's start is lost: {after:?}"
+        );
+        assert_eq!(
+            after.worktree_path.as_deref(),
+            on_disk_task(&executor, project_id, task_id).worktree_path.as_deref(),
+            "memory and the file agree on the checkout"
+        );
+        assert!(
+            !error.contains("was removed again"),
+            "a reattached checkout is never this start's to remove: {error}"
+        );
+        assert!(std::path::Path::new(&path).is_dir(), "a reattached checkout is not removed");
+        assert_eq!(worktree_count(&repo), 2);
+    }
+
+    /// Write every task currently in memory to its project's board file, so a
+    /// failing record has a real file to fail against.
+    async fn seed_stacked_fixture_board(executor: &TaskExecutor) {
+        let snapshot = executor.tasks.read().await.clone();
+        let mut by_project: HashMap<Uuid, Vec<Task>> = HashMap::new();
+        for task in snapshot.into_values() {
+            by_project.entry(task.project_id).or_default().push(task);
+        }
+        for (project_id, list) in by_project {
+            executor
+                .storage
+                .save_project_tasks(project_id, &list)
+                .expect("seed the board");
+        }
+    }
+
+    /// Record `task_id`'s branch without a checkout, in memory and on disk:
+    /// the state a restart after a removed checkout reads.
+    async fn seed_recorded_branch_without_checkout(executor: &TaskExecutor, task_id: Uuid, branch: &str) {
+        {
+            let mut tasks_w = executor.tasks.write().await;
+            if let Some(task) = tasks_w.get_mut(&task_id) {
+                task.branch_name = Some(branch.to_string());
+                task.worktree_path = None;
+            }
+        }
+        seed_stacked_fixture_board(executor).await;
+    }
+
+    /// A record that published nothing still leaves memory where it was:
+    /// the save refused before the replacement, so the board in memory goes
+    /// on describing exactly what the file holds.
+    #[tokio::test]
+    async fn a_run_start_record_that_published_nothing_leaves_memory_unpublished() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        let task_branch = WorktreeManager::branch_for_task(task_id);
+        git_in(&repo, &["branch", &task_branch]);
+        seed_recorded_branch_without_checkout(&executor, task_id, &task_branch).await;
+        publish_default_base(&repo);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("reattached");
+        assert_eq!(acquired.what_happened, "Reattached worktree");
+        let repo_path = repo.to_str().unwrap();
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let fingerprint_before = run_start_fingerprint(&executor.tasks.read().await[&task_id]);
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+        );
+        let error = executor
+            .record_run_start(task_id, repo_path, acquired)
+            .await
+            .expect_err("the unpublished record is reported");
+        drop(fault);
+
+        assert!(!error.contains("in place but not confirmed durable"), "{error}");
+        let after = &executor.tasks.read().await[&task_id];
+        assert_eq!(
+            run_start_fingerprint(after),
+            fingerprint_before,
+            "memory follows a file that was never replaced: {after:?}"
+        );
+        let persisted = on_disk_task(&executor, project_id, task_id);
+        assert!(persisted.worktree_path.is_none(), "the file was never replaced");
+        assert_eq!(persisted.phase, TaskPhase::Idle, "no run phase reached the file");
+        assert!(persisted.activity.is_empty(), "no run was recorded on disk");
     }
 
     /// A done dependency whose recorded branch is not a branch name is

@@ -811,6 +811,22 @@ mod tests {
         );
     }
 
+    /// Pins what lets a migrated directory be found again when writing its
+    /// marker failed: validity needs the marker or any entry, not the marker.
+    #[test]
+    fn auto_honours_a_populated_dir_without_a_marker() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("adopted");
+        let state = project.join(IN_PROJECT_DIR);
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("roadmap.toml"), "x = 1\n").unwrap();
+        assert!(!state.join(STATE_MARKER).exists());
+        assert_eq!(
+            StateLocation::Auto.resolve(&project),
+            ResolvedLocation::InProject
+        );
+    }
+
     #[test]
     fn explicit_locations_ignore_the_filesystem() {
         let tmp = TempDir::new().unwrap();

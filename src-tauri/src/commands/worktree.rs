@@ -86,8 +86,11 @@ async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result
     .await?;
 
     // Recorded before it is reported, and taken back if it cannot be: see
-    // `WorktreeManager::undo_created_checkout` for why a checkout left behind
-    // unrecorded costs the task its starting commit and origin.
+    // `WorktreeManager::undo_created_checkout` for why a checkout left
+    // behind unrecorded costs the task its starting commit and origin. The
+    // take-back runs only when the record published nothing: a record the
+    // file accepted without confirming its durability has already replaced
+    // the board, and its checkout is one the published board references.
     let amend = |staged: &mut std::collections::HashMap<Uuid, crate::domain::Task>| {
         if let Some(task) = staged.get_mut(&task_id) {
             task.worktree_path = Some(acquired.info.path.clone());
@@ -103,10 +106,23 @@ async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result
     if let Err(e) =
         crate::lifecycle::record(&state.task.tasks, &state.storage, task_id, &amend).await
     {
-        let outcome = state
-            .worktree_manager
-            .release_unrecorded(&repo_path, &acquired.info, acquired.created_at.as_deref())
-            .await;
+        let outcome = if crate::config::says_in_place_but_unconfirmed(&e) {
+            // The board file now names this checkout, its branch and its
+            // starting commit; undoing it would delete a checkout the
+            // published board references. The same rule `record_run_start`
+            // and the terminalization refusals hold.
+            format!(
+                "the checkout at {path} stands on branch {branch} as the board already \
+                 records, so it was not undone",
+                path = acquired.info.path,
+                branch = acquired.info.branch,
+            )
+        } else {
+            state
+                .worktree_manager
+                .release_unrecorded(&repo_path, &acquired.info, acquired.created_at.as_deref())
+                .await
+        };
         return Err(format!("The task's checkout could not be recorded ({e}); {outcome}"));
     }
 
@@ -528,6 +544,66 @@ mod tests {
                 assert_eq!(tasks[&id].branch_name, Some(WorktreeManager::branch_for_task(id)));
             }
             assert_eq!(git(&repo, &["worktree", "list", "--porcelain"]).matches("worktree ").count(), 3);
+        }
+
+        /// A checkout the panel created stays on the board when its record
+        /// reached the file but could not be confirmed durable: the file
+        /// already names it, so taking it back would delete a checkout the
+        /// published board references (see `record_run_start`, which holds
+        /// the same rule for an automatic start).
+        #[tokio::test]
+        async fn a_created_checkout_is_kept_when_its_record_is_saved_but_unconfirmable() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let (state, repo) = state_with_two_tasks(&temp, None, None).await;
+
+            let fault = slashit_durable_fs::fault::fail_at(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            let error = create_worktree_inner(&state, A)
+                .await
+                .expect_err("the unconfirmed record is reported");
+            drop(fault);
+
+            let branch = WorktreeManager::branch_for_task(A);
+            assert!(
+                error.contains("in place but not confirmed durable"),
+                "the report must carry the storage layer's published marker: {error}"
+            );
+            assert!(
+                !error.contains("was removed again"),
+                "the checkout must not be taken back on this outcome: {error}"
+            );
+
+            // The failed record has still replaced the board with the
+            // amended one, in memory and on the file: the checkout is
+            // recorded, and both sides agree.
+            let recorded = state.task.tasks.read().await[&A].clone();
+            let path = recorded.worktree_path.expect("the record is adopted in memory");
+            let project_id = recorded.project_id;
+            let persisted = state
+                .storage
+                .load_project_tasks(project_id)
+                .expect("the board file is readable after the replacement")
+                .into_iter()
+                .find(|t| t.id == A)
+                .expect("the task is on disk");
+            assert_eq!(persisted.worktree_path.as_deref(), Some(path.as_str()));
+            assert_eq!(persisted.branch_name.as_deref(), Some(branch.as_str()));
+
+            // The checkout itself survives, registered with git, on the
+            // branch the record named.
+            assert!(Path::new(&path).is_dir(), "the checkout file tree must be kept");
+            let listing = git(&repo, &["worktree", "list", "--porcelain"]);
+            assert!(
+                listing.contains(&format!("worktree {path}\n")),
+                "the worktree must stay registered: {listing}"
+            );
+            assert_eq!(
+                git(Path::new(&path), &["rev-parse", "HEAD"]),
+                git(&repo, &["rev-parse", &format!("refs/heads/{branch}")]),
+                "the branch stands where the created checkout left it"
+            );
         }
 
         /// Two tasks recording one branch are both refused its checkout, and

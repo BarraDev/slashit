@@ -4762,8 +4762,9 @@ enum PrLinkFailure {
     NotTerminalized(String),
     /// The pull request is recorded and on disk, and the terminalization that
     /// followed could not write its own result. This is a durability failure,
-    /// not a refusal: the operation the user asked for did not finish, and what
-    /// the board shows is the state from before it ran. Distinct from
+    /// not a refusal: the operation the user asked for did not finish, and the
+    /// message says whether the board still shows the state from before it ran
+    /// or already holds the new one without confirmation that it is durable. Distinct from
     /// [`Self::NotTerminalized`] because a refusal is an answer and this is the
     /// absence of one.
     TerminalStateNotRecorded(String),

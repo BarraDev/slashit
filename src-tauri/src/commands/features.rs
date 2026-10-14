@@ -56,12 +56,20 @@ async fn set_feature_flag_on(
     if !persisted.set(name, enabled) {
         return Err(format!("Unknown feature flag '{name}'"));
     }
-    persisted.save(paths).map_err(|e| e.to_string())?;
+    let saved = persisted.save(paths);
+    if let Err(error) = &saved {
+        if !error.is_published() {
+            return Err(error.describe("save the feature flags"));
+        }
+    }
 
     // Rebuilt from what is now on disk, not assigned `persisted` directly, so
     // a flag the environment is pinning stays pinned rather than appearing to
-    // accept the toggle.
+    // accept the toggle. Also when the write replaced the file without
+    // confirming it durable: memory follows the file, and the error below
+    // still says what could not be confirmed.
     *flags = crate::config::features::resolve_startup_flags(paths);
+    saved.map_err(|e| e.describe("save the feature flags"))?;
     Ok(flags.clone())
 }
 
@@ -102,6 +110,30 @@ mod tests {
             !features.read().await.daemon_mode,
             "a failed save must not leave the in-memory flag diverged from disk"
         );
+    }
+
+    #[tokio::test]
+    async fn a_toggle_the_file_holds_but_could_not_confirm_is_reflected_and_reported() {
+        let temp = TempDir::new().unwrap();
+        let paths = AppPaths::with_roots(
+            temp.path().join("config"),
+            temp.path().join("data"),
+            temp.path().join("cache"),
+            temp.path().join("runtime"),
+        );
+        let features = RwLock::new(FeatureFlags::default());
+
+        let _fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        let error = set_feature_flag_on(&features, &paths, "daemon_mode", true)
+            .await
+            .expect_err("the durability is unconfirmed");
+
+        assert!(error.contains("could not confirm"), "{error}");
+        assert!(features.read().await.daemon_mode, "memory follows the file");
+        assert!(FeatureFlags::load(&paths).daemon_mode, "the file holds the toggle");
     }
 
     #[tokio::test]
