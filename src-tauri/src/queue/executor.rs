@@ -4336,13 +4336,16 @@ impl TaskExecutor {
                 Some(task) => format!(
                     "it is still {:?} in phase {:?}, which nothing picks up again while SlashIt \
                      keeps running, so it stays there with no run attached until you act: move \
-                     it to Backlog or Queue to run it again, or to Error to record that it \
+                     it to Queue to run it again (it starts when the queue promotes it, \
+                     automatically only while auto-promote is on), to Backlog to park it (it \
+                     does not start until you queue or start it), or to Error to record that it \
                      failed{}",
                     task.status,
                     task.phase,
                     // `migrate_task` returns exactly these two to Queue at start-up.
                     if matches!(task.status, TaskStatus::InProgress | TaskStatus::AiReview) {
-                        ". Restarting SlashIt returns it to Queue, and it will run again"
+                        ". Restarting SlashIt returns it to Queue, where it runs again once the \
+                         queue promotes it"
                     } else {
                         ""
                     }
@@ -6255,7 +6258,7 @@ mod tests {
             recording.recorded()
         );
         assert!(!warn_message_containing(&recording, "eligible"), "{:?}", recording.recorded());
-        for needle in ["InProgress", "Coding", "while SlashIt keeps running", "Restarting SlashIt", "move it to Backlog or Queue", "or to Error"] {
+        for needle in ["InProgress", "Coding", "while SlashIt keeps running", "Restarting SlashIt", "automatically only while auto-promote is on", "does not start until you queue or start it", "or to Error"] {
             assert!(
                 warn_message_containing(&recording, needle),
                 "the warning must say {needle:?}: {:?}",
