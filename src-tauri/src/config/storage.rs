@@ -925,6 +925,9 @@ impl Storage {
     /// unconfirmed by the previous one, so startup uses this before it deletes
     /// anything on the strength of what the configuration says is absent.
     pub fn reconfirm_config_durable(&self) -> std::result::Result<(), ConfigWriteError> {
+        // Unconfirmed until a write completes, so a failure here (including one
+        // before publication) keeps every later barrier in this process closed.
+        self.config_unconfirmed.store(true, std::sync::atomic::Ordering::SeqCst);
         self.update_config(|_| {})
     }
 
@@ -1932,6 +1935,22 @@ mod tests {
         let trace = fault::trace();
         storage.confirm_config_durable().unwrap();
         assert!(trace.stages().is_empty(), "a confirmed config is not rewritten again");
+    }
+
+    #[test]
+    fn a_failed_reconfirmation_keeps_this_processs_barrier_closed() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, _dir) = create_test_storage();
+        storage.save_config(&AppConfig::default()).unwrap();
+        storage.confirm_config_durable().unwrap();
+        {
+            let _fault = fault::fail_at(Stage::Replace, std::io::ErrorKind::Other);
+            assert!(storage.reconfirm_config_durable().is_err());
+        }
+        // Not published, yet the barrier is closed until a write completes.
+        let _trace = fault::trace();
+        storage.confirm_config_durable().expect("the retry completes");
+        assert!(_trace.stages().contains(&Stage::Replace), "the barrier rewrote the config");
     }
 
     #[test]

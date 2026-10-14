@@ -217,8 +217,8 @@ pub async fn build_state_with_paths(
     // fails the records are kept and the cleanup waits for a later start.
     let mut projects_are_authoritative = projects_are_authoritative;
     if projects_are_authoritative {
-        let owed = app_state.storage.pending_project_conversation_deletions().map(|p| !p.is_empty()).unwrap_or(false)
-            || app_state.storage.pending_project_tasks_deletions().map(|p| !p.is_empty()).unwrap_or(false);
+        let owed = app_state.storage.pending_project_conversation_deletions().map(|p| !p.is_empty()).unwrap_or(true)
+            || app_state.storage.pending_project_tasks_deletions().map(|p| !p.is_empty()).unwrap_or(true);
         if owed {
             if let Err(error) = app_state.storage.reconfirm_config_durable() {
                 eprintln!(
