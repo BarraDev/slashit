@@ -120,10 +120,9 @@ private state.
   project-pinned `jj`; substantial work gets a dedicated one.
 - One mutating owner per workspace. Read-only reviewers may share a workspace
   but must not write to it or run builds that conflict with the owner's.
-- Never run `git worktree add` against the canonical `.git`. A task that
-  genuinely needs a real `.git` (for example exercising SlashIt's own Git
-  worktree backend, or `git bisect`) uses a disposable independent clone at
-  `../workspaces/<slug>-git`.
+- Never run `git worktree add` against the canonical `.git`: `jj` would
+  import its refs. A task that needs a real `.git` (e.g. `git bisect`) uses
+  a disposable independent clone at `../workspaces/<slug>-git`.
 - Each workspace keeps its own `target/`; do not share a Cargo target
   directory between workspaces or set `CARGO_TARGET_DIR` globally.
 - JJ workspaces have no `.git`; run `gh` with `-R BarraDev/slashit` or from
@@ -148,6 +147,20 @@ private state.
   SlashIt checkout.
 - Retire a merged publication bookmark with `jj bookmark forget`, not
   `jj bookmark delete`.
+
+### Preflight and verification
+
+- Before the first mutation, run the preflight in
+  [docs/development-workflow.md](docs/development-workflow.md) (section 5).
+- If a preferred `jj` operation fails, stop and report it; do not switch to
+  Git porcelain or another checkout kind to get past it.
+- A source correction is done only when its diff is non-empty, it was tested
+  at its exact commit, and GitHub was read back with
+  `scripts/verify-published-commit.sh`. An empty commit is not a fix.
+- Do not report success from a pipeline's hidden exit status, another
+  revision's run, an unpushed fix, a stale review, or pending CI.
+- Cleanup outside your own workspace (toolchains, `~/.cargo`, other
+  workspaces) needs explicit authorization.
 
 ### Tooling
 

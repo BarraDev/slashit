@@ -60,6 +60,9 @@ jobs:
       - name: Self-test the checker
         run: scripts/test-check-agent-docs.sh
 
+      - name: Self-test the publication read-back guard
+        run: scripts/test-verify-published-commit.sh
+
   # The Linux validation is three independent jobs rather than one serial one,
   # so the wall-clock is the slowest of them, not their sum. Each installs and
   # caches only what its own steps need; none consumes anything another job
