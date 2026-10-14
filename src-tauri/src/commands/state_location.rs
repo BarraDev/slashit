@@ -290,18 +290,28 @@ pub(crate) async fn apply_state_migration_committed(
         // went must be reported rather than logged. Swallowing it would leave
         // the project reading from the directory the data just left, and the
         // user would open an empty board with nothing to explain it. Memory
-        // is left holding the pre-migration map — consistent with what disk
-        // still has — rather than a location the persisted config disagrees
-        // with.
-        crate::commands::project::try_persist_projects(ctx.storage, &proposed).map_err(|e| {
-            format!(
-                "State was moved to {} but the setting could not be saved: {e}. \
-                 The move is safely on disk; re-select the location in Settings to finish.",
-                to.display()
-            )
+        // is left holding the pre-migration map when nothing was written --
+        // consistent with what disk still has -- and follows the file when a
+        // write replaced it without confirming it durable.
+        let outcome = crate::commands::project::try_persist_projects(ctx.storage, &proposed);
+        let published = outcome.as_ref().err().is_none_or(|e| e.is_published());
+        crate::config::adopt_published(&mut *projects_w, proposed, outcome).map_err(|e| {
+            if published {
+                format!(
+                    "State was moved to {} and the setting is in place, but it could not be \
+                     confirmed durable: {e}. Do not repeat the move; if the location setting \
+                     is lost after a restart, re-select it in Settings.",
+                    to.display()
+                )
+            } else {
+                format!(
+                    "State was moved to {} but the setting could not be saved: {e}. \
+                     The move itself is not confirmed durable by this check; re-select the \
+                     location in Settings to finish.",
+                    to.display()
+                )
+            }
         })?;
-
-        *projects_w = proposed;
     }
 
     // Saving config rebuilt the routing table, so subsequent task reads and
@@ -396,10 +406,9 @@ async fn set_state_location_committed(
     project.state_location = location;
     project.updated_at = chrono::Utc::now();
 
-    crate::commands::project::try_persist_projects(storage, &proposed)
-        .map_err(|e| format!("Failed to save the storage location: {e}"))?;
-
-    *projects_w = proposed;
+    let outcome = crate::commands::project::try_persist_projects(storage, &proposed);
+    crate::config::adopt_published(&mut *projects_w, proposed, outcome)
+        .map_err(|e| e.describe("save the storage location"))?;
     Ok(())
 }
 
@@ -708,6 +717,63 @@ mod tests {
             projects.read().await.get(&project_id).unwrap().state_location,
             StateLocation::InProject
         );
+    }
+
+    #[tokio::test]
+    async fn a_location_the_config_holds_but_could_not_confirm_is_adopted_and_reported() {
+        let (storage, _temp) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let project = test_project(project_id);
+        let current = project.updated_at;
+        let projects = RwLock::new(HashMap::from([(project_id, project)]));
+        let locks = StateLocationLocks::new();
+        let gate = crate::lifecycle::ProjectLifecycleGate::new();
+
+        let _fault = slashit_durable_fs::fault::fail_at_file(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+            "config.toml",
+        );
+        let error = set_state_location_committed(
+            &locks, &gate, &projects, &storage, project_id, StateLocation::InProject, current,
+        )
+        .await
+        .expect_err("the durability is unconfirmed");
+
+        assert!(error.contains("could not confirm"), "{error}");
+        assert_eq!(projects.read().await[&project_id].state_location, StateLocation::InProject);
+        let restarted = Storage::with_paths(storage.paths().clone());
+        assert_eq!(
+            restarted.load_config().unwrap().projects[&project_id.to_string()].state_location,
+            StateLocation::InProject,
+            "memory, routes and a restart agree"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_location_whose_write_failed_before_publication_changes_nothing() {
+        let (storage, _temp) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let project = test_project(project_id);
+        let current = project.updated_at;
+        let before = project.state_location;
+        let projects = RwLock::new(HashMap::from([(project_id, project)]));
+        let locks = StateLocationLocks::new();
+        let gate = crate::lifecycle::ProjectLifecycleGate::new();
+
+        let _fault = slashit_durable_fs::fault::fail_at_file(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+            "config.toml",
+        );
+        let error = set_state_location_committed(
+            &locks, &gate, &projects, &storage, project_id, StateLocation::InProject, current,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.starts_with("Failed to save the storage location"), "{error}");
+        assert_eq!(projects.read().await[&project_id].state_location, before);
     }
 
     #[test]

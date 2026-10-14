@@ -1,0 +1,17 @@
+[package]
+name = "slashit-durable-fs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Barradev Digital Services <admin@barradev.com>"]
+license = "Apache-2.0"
+description = "Per-file durable atomic replacement shared by SlashIt's Task, configuration and Conversation storage"
+repository = "https://github.com/BarraDev/slashit"
+
+[features]
+# Deterministic fault injection and call tracing for tests in other crates.
+# Always available to this crate's own tests. Never enable it in a product
+# build: it adds a thread-local lookup at every step of every write.
+fault-injection = []
+
+[dev-dependencies]
+tempfile = "3"

@@ -58,6 +58,114 @@ pub struct ProjectTasksFile {
     pub tasks: Vec<Task>,
 }
 
+/// A configuration-class write (`config.toml`, the workspace registry, the
+/// feature flags) that did not complete, and what that means for the file.
+///
+/// The distinction is the contract. Every caller used to assume that an error
+/// means the file is exactly as it was, which stops being true once a write
+/// can fail *after* the replacement:
+///
+/// * [`Self::NotPublished`] -- the destination was not replaced. Memory that
+///   was not changed agrees with disk, and the operation can be retried.
+/// * [`Self::PublishedNotDurable`] -- the new content is what every reader of
+///   the file now sees, but the final synchronization failed, so a crash may
+///   bring the previous content back. Memory must follow the *visible* state
+///   ([`adopt_published`]), the operation must not be repeated as if it had not
+///   happened, no destructive step that depends on this commit may run until
+///   [`Storage::confirm_config_durable`] succeeds, and the caller must say so
+///   instead of reporting either success or "nothing was saved".
+///
+/// A fully durable success is the `Ok` of the call that returned this. On a
+/// filesystem that cannot synchronize a directory at all
+/// (`slashit_durable_fs::DirectorySync::Unsupported`) the write is accepted as
+/// confirmed, because nothing more can be asked of it; that is the one place
+/// "durable" means "as durable as that filesystem gets".
+#[derive(Debug)]
+pub enum ConfigWriteError {
+    NotPublished(anyhow::Error),
+    PublishedNotDurable(anyhow::Error),
+}
+
+impl ConfigWriteError {
+    /// True when the new content is already visible on disk.
+    pub fn is_published(&self) -> bool {
+        matches!(self, Self::PublishedNotDurable(_))
+    }
+
+    fn inner(&self) -> &anyhow::Error {
+        match self {
+            Self::NotPublished(e) | Self::PublishedNotDurable(e) => e,
+        }
+    }
+
+    /// A sentence for the person: what was being done and, if the change is
+    /// already in place, that its durability is unconfirmed.
+    pub fn describe(&self, action: &str) -> String {
+        match self {
+            Self::NotPublished(e) => format!("Failed to {action}: {e}"),
+            Self::PublishedNotDurable(e) => format!(
+                "The change was applied, but SlashIt could not confirm that it reached stable \
+                 storage (while trying to {action}), so it may be lost if the computer stops \
+                 before the next successful save. Do not repeat the action: {e:#}"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Only the outermost layer, as before: it names the stage that
+            // failed ("Failed to load config before updating it"), and callers
+            // render with `{e}`.
+            Self::NotPublished(e) => write!(f, "{e}"),
+            Self::PublishedNotDurable(e) => write!(
+                f,
+                "the change is in place but not confirmed durable (it may be lost if the \
+                 computer stops before the next successful save): {e:#}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.inner().as_ref())
+    }
+}
+
+impl From<ConfigWriteError> for String {
+    fn from(error: ConfigWriteError) -> Self {
+        error.to_string()
+    }
+}
+
+/// Make `current` follow a write's outcome: the proposed value replaces it
+/// when the file now holds it, whether or not that was confirmed durable.
+///
+/// This is the one rule every caller that stages a change in a clone shares.
+/// Leaving memory on the old value after [`ConfigWriteError::PublishedNotDurable`]
+/// would let the next save write the old value back over a change the file
+/// already shows, and would leave routes (rebuilt from the file) disagreeing
+/// with the map they were derived for.
+pub fn adopt_published<T>(
+    current: &mut T,
+    proposed: T,
+    outcome: std::result::Result<(), ConfigWriteError>,
+) -> std::result::Result<(), ConfigWriteError> {
+    match outcome {
+        Ok(()) => {
+            *current = proposed;
+            Ok(())
+        }
+        Err(error) if error.is_published() => {
+            *current = proposed;
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -229,6 +337,10 @@ pub struct Storage {
     /// a `std::sync::Mutex` rather than a Tokio one because the transaction
     /// it protects is entirely synchronous file I/O with no `await` inside.
     config_tx: Arc<Mutex<()>>,
+    /// Set while the last configuration write replaced the file but could not
+    /// confirm it durable, cleared by the next write that completes. See
+    /// [`Self::confirm_config_durable`].
+    config_unconfirmed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One durable Task cleanup retry record: the Project whose board file
@@ -275,7 +387,7 @@ impl Storage {
             &self.paths.primary_conversation_file(project_id),
             conversation.id.to_string().as_bytes(),
         )
-        .context("Failed to persist primary Conversation pointer")?;
+        .map_err(|e| write_failure(e, "persist primary Conversation pointer"))?;
         Ok(conversation)
     }
 
@@ -288,7 +400,8 @@ impl Storage {
         let bytes =
             serde_json::to_vec_pretty(conversation).context("Failed to serialize Conversation")?;
         write_private_atomic(&self.paths.conversation_file(conversation.id), &bytes)
-            .context("Failed to atomically persist Conversation")
+            .map(|_| ())
+            .map_err(|e| write_failure(e, "atomically persist Conversation"))
     }
 
     /// Remove a Project's primary pointer and its document only after the
@@ -385,7 +498,8 @@ impl Storage {
     pub fn mark_project_conversation_deletion_pending(&self, project_id: Uuid) -> Result<()> {
         let path = self.paths.pending_project_conversation_deletion_file(project_id);
         write_private_atomic(&path, project_id.to_string().as_bytes())
-            .context("Failed to persist pending Project Conversation cleanup")
+            .map(|_| ())
+            .map_err(|e| write_failure(e, "persist pending Project Conversation cleanup"))
     }
 
     /// Drop the retry reference. Call only once Conversation cleanup has
@@ -451,7 +565,8 @@ impl Storage {
             contents.push_str(board_file.to_str().expect("checked above"));
         }
         write_private_atomic(&path, contents.as_bytes())
-            .context("Failed to persist pending Project Task cleanup")
+            .map(|_| ())
+            .map_err(|e| write_failure(e, "persist pending Project Task cleanup"))
     }
 
     /// Whether the pending-cleanup record format can name these paths without
@@ -572,6 +687,7 @@ impl Storage {
             routes: Arc::new(RwLock::new(HashMap::new())),
             unloaded_boards: Arc::new(Mutex::new(HashMap::new())),
             config_tx: Arc::new(Mutex::new(())),
+            config_unconfirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -749,7 +865,7 @@ impl Storage {
     /// value it is handed, so building that value from a separately-loaded
     /// config reintroduces the lost-update window the transaction exists to
     /// close.
-    pub fn save_config(&self, config: &AppConfig) -> Result<()> {
+    pub fn save_config(&self, config: &AppConfig) -> std::result::Result<(), ConfigWriteError> {
         let _tx = self.lock_config_tx();
         self.write_config(config)
     }
@@ -770,9 +886,11 @@ impl Storage {
     /// kind propagates without writing anything, so the file on disk is left
     /// exactly as it was for the user to repair.
     ///
+    /// The error says whether the file was replaced: see [`ConfigWriteError`].
+    ///
     /// `mutate` runs while the transaction guard is held, so it must not
     /// acquire any other lock or block.
-    pub fn update_config<F>(&self, mutate: F) -> Result<()>
+    pub fn update_config<F>(&self, mutate: F) -> std::result::Result<(), ConfigWriteError>
     where
         F: FnOnce(&mut AppConfig),
     {
@@ -780,9 +898,34 @@ impl Storage {
         // No wrapping `context` on purpose: callers render this with `{e}`,
         // which shows only the outermost layer, and the reader's own message
         // is the one that tells the user which file to repair and why.
-        let mut config = self.read_config_strict()?;
+        let mut config = self.read_config_strict().map_err(ConfigWriteError::NotPublished)?;
         mutate(&mut config);
         self.write_config(&config)
+    }
+
+    /// Make sure the configuration on disk is confirmed durable, rewriting it
+    /// if an earlier write replaced it without confirming.
+    ///
+    /// Anything destructive that depends on a configuration change having
+    /// stuck (deleting a deleted Project's Task files and Conversation, say)
+    /// calls this first and stops, keeping its retry records, when it fails.
+    /// The rewrite is the full protocol over the file as it is now, so it is
+    /// also the retry that can clear the uncertainty. A no-op when the last
+    /// write was confirmed.
+    pub fn confirm_config_durable(&self) -> std::result::Result<(), ConfigWriteError> {
+        if !self.config_unconfirmed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.update_config(|_| {})
+    }
+
+    /// [`Self::confirm_config_durable`] without trusting this process's memory
+    /// of what it wrote: rewrite the configuration through the full protocol
+    /// once. A new process cannot know that the file it loaded was left
+    /// unconfirmed by the previous one, so startup uses this before it deletes
+    /// anything on the strength of what the configuration says is absent.
+    pub fn reconfirm_config_durable(&self) -> std::result::Result<(), ConfigWriteError> {
+        self.update_config(|_| {})
     }
 
     /// Take the config transaction guard.
@@ -801,13 +944,29 @@ impl Storage {
     /// Serialize and atomically replace the config file.
     ///
     /// Assumes [`Self::config_tx`] is already held by the caller.
-    fn write_config(&self, config: &AppConfig) -> Result<()> {
+    fn write_config(&self, config: &AppConfig) -> std::result::Result<(), ConfigWriteError> {
         let contents = toml::to_string_pretty(config)
-            .context("Failed to serialize config")?;
-        write_private_atomic(&self.config_file, contents.as_bytes())
-            .context("Failed to write config file")?;
-        self.refresh_routes(config);
-        Ok(())
+            .context("Failed to serialize config")
+            .map_err(ConfigWriteError::NotPublished)?;
+        match write_private_atomic(&self.config_file, contents.as_bytes()) {
+            Ok(_) => {
+                self.config_unconfirmed.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.refresh_routes(config);
+                Ok(())
+            }
+            Err(error) if error.is_published() => {
+                // The file holds this config now, so the routes derived from
+                // it follow it before the failure is reported.
+                self.config_unconfirmed.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.refresh_routes(config);
+                Err(ConfigWriteError::PublishedNotDurable(
+                    anyhow::Error::new(error).context("Failed to write config file"),
+                ))
+            }
+            Err(error) => Err(ConfigWriteError::NotPublished(
+                anyhow::Error::new(error).context("Failed to write config file"),
+            )),
+        }
     }
 
     // --- Project state routing --------------------------------------------
@@ -876,73 +1035,34 @@ impl Storage {
     }
 }
 
-/// Per-process, monotonically increasing counter used to make temp file names
-/// for atomic writes unique across concurrent callers.
-static ATOMIC_WRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A sibling of `path` with a name no other in-flight atomic write can be
-/// using: the process id rules out collisions across processes, and the
-/// counter rules them out between concurrent writers inside this one. Kept in
-/// the same directory as `path` so the final rename stays on one filesystem.
-pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
-    let counter = ATOMIC_WRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    path.with_file_name(format!("{file_name}.{}-{counter}.tmp", std::process::id()))
-}
-
-/// Write a file atomically with owner-only permissions.
-///
-/// The temp file is created in the destination directory, under a name unique
-/// to this call (see [`unique_temp_path`]) so concurrent writers never race on
-/// the same temp path, and is opened already restricted to owner-only
-/// permissions so the secret it carries is never briefly world-readable, at
-/// the temporary path or the final one.
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+/// A durable-write failure as an `anyhow` error whose outermost message is
+/// true. Callers render with `{e}`, which shows only that layer, so it must
+/// itself say when the new content is already in place: "failed to write X"
+/// for a write that replaced X would be a false report.
+fn write_failure(error: slashit_durable_fs::WriteError, what: &str) -> anyhow::Error {
+    let published = error.is_published();
+    let error = anyhow::Error::new(error);
+    if published {
+        error.context(format!(
+            "{what}: the new content is in place but not confirmed durable (it may be lost if \
+             the computer stops before the next successful save)"
+        ))
+    } else {
+        error.context(format!("Failed to {what}"))
     }
-    let tmp = unique_temp_path(path);
-    create_owner_only_file(&tmp, bytes)?;
-    fs::rename(&tmp, path)
 }
 
-/// Write a file atomically, leaving permissions at the platform default.
+/// Write a file durably and atomically with owner-only permissions.
 ///
-/// Only the temp-name uniqueness test uses it; the Task file write does its own
-/// temp-and-rename so it can re-check its target before replacing it.
-#[cfg(test)]
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = unique_temp_path(path);
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)
-}
-
-/// Create `path` containing `bytes`, restricted to owner-only permissions
-/// from the moment it exists. On Unix this opens the file with mode `0600`
-/// set at creation time rather than writing at the platform default and
-/// tightening permissions afterward, which would leave a window where the
-/// file is briefly world-readable.
-#[cfg(unix)]
-fn create_owner_only_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)
-}
-
-#[cfg(not(unix))]
-fn create_owner_only_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    // Windows inherits the parent ACL, which is already user-scoped under
-    // %APPDATA%. There is no portable mode bit to set here.
-    fs::write(path, bytes)
+/// The protocol, its guarantee and its failure model live in
+/// [`slashit_durable_fs`]. A failure is a [`slashit_durable_fs::WriteError`];
+/// one that says the new content is already in place but not confirmed durable
+/// is not a write that changed nothing.
+fn write_private_atomic(
+    path: &Path,
+    bytes: &[u8],
+) -> std::result::Result<slashit_durable_fs::Committed, slashit_durable_fs::WriteError> {
+    slashit_durable_fs::write_atomic(path, bytes, slashit_durable_fs::Permissions::OwnerOnly)
 }
 
 impl Default for Storage {
@@ -1188,18 +1308,18 @@ impl Storage {
         };
         let contents = toml::to_string_pretty(&tasks_file).context("Failed to serialize tasks")?;
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).context("Failed to write tasks file")?;
-        }
-        let tmp = unique_temp_path(&path);
-        fs::write(&tmp, contents.as_bytes()).context("Failed to write tasks file")?;
-        let published = self
-            .ensure_board_replaceable(project_id, &path, &legacy)
-            .and_then(|()| fs::rename(&tmp, &path).context("Failed to write tasks file"));
-        if let Err(e) = published {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
+        let staged = slashit_durable_fs::stage(&path, contents.as_bytes(), slashit_durable_fs::Permissions::Preserve)
+            .map_err(|e| write_failure(e, "write tasks file"))?;
+        // The last look at the file being replaced, as close to the rename as
+        // the protocol allows. Dropping `staged` removes the temporary file.
+        self.ensure_board_replaceable(project_id, &path, &legacy)?;
+        // A `PublishedNotDurable` error leaves the new board in place, so the
+        // legacy copy below must not be retired on that path: it is retired
+        // only after the new file's write completed. (On a filesystem that
+        // cannot synchronize a directory the write completes without that
+        // confirmation; the legacy copy is then retired on the same terms as
+        // any other file there.)
+        staged.publish().map_err(|e| write_failure(e, "write tasks file"))?;
 
         if legacy != path && legacy.is_file() {
             // A legacy copy that cannot be read is the only record of
@@ -1692,6 +1812,174 @@ mod tests {
         storage.save_project_tasks(project_id, &tasks).unwrap();
         assert!(storage.tasks_path(project_id).is_file());
         assert!(!legacy.exists());
+    }
+
+    // ==================== Durable write semantics ====================
+
+    fn write_error(error: &anyhow::Error) -> &slashit_durable_fs::WriteError {
+        error
+            .downcast_ref::<slashit_durable_fs::WriteError>()
+            .unwrap_or_else(|| panic!("not a durable write failure: {error:#}"))
+    }
+
+    #[test]
+    fn a_board_save_that_fails_before_publication_keeps_the_previous_board() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let mut first = crate::test_helpers::create_test_task("first");
+        first.project_id = project_id;
+        storage.save_project_tasks(project_id, std::slice::from_ref(&first)).unwrap();
+        let before = fs::read(storage.tasks_path(project_id)).unwrap();
+
+        let mut second = crate::test_helpers::create_test_task("second");
+        second.project_id = project_id;
+        let _fault = fault::fail_at(Stage::SyncTemp, std::io::ErrorKind::Other);
+        let error = storage.save_project_tasks(project_id, &[first, second]).unwrap_err();
+
+        assert!(!write_error(&error).is_published(), "{error:#}");
+        assert_eq!(fs::read(storage.tasks_path(project_id)).unwrap(), before);
+        let strays: Vec<_> = fs::read_dir(storage.tasks_path(project_id).parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "{strays:?}");
+    }
+
+    #[test]
+    fn a_board_that_is_published_but_not_durable_is_reported_and_keeps_the_legacy_copy() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, temp) = create_test_storage();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let project_id = Uuid::new_v4();
+        route_project_to(&storage, project_id, &repo);
+        let legacy = storage.legacy_tasks_path(project_id);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, valid_board_text(project_id)).unwrap();
+        let tasks = storage.load_project_tasks(project_id).unwrap();
+
+        let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = storage.save_project_tasks(project_id, &tasks).unwrap_err();
+
+        // The new board is what readers see, so this is not "nothing happened"...
+        assert!(write_error(&error).is_published(), "{error:#}");
+        assert!(storage.tasks_path(project_id).is_file());
+        // ...but the move is not confirmed, so the old copy is not retired.
+        assert!(legacy.exists(), "the legacy board must outlive an unconfirmed move");
+        // A later successful save completes the move.
+        storage.save_project_tasks(project_id, &tasks).unwrap();
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn the_board_guard_runs_after_the_temporary_file_is_written_and_removes_it() {
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let path = storage.tasks_path(project_id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"tasks = [ not toml").unwrap();
+        assert!(storage.save_project_tasks(project_id, &[]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"tasks = [ not toml");
+        let strays = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(strays, 0);
+    }
+
+    #[test]
+    fn a_config_published_but_not_durable_still_updates_routes_and_reports_it() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, dir) = create_test_storage();
+        let (donor, _donor_dir) = create_test_storage();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let project_id = Uuid::new_v4();
+        let routed = route_project_to(&donor, project_id, &repo);
+
+        let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = storage.update_config(|config| *config = routed.clone()).unwrap_err();
+
+        assert!(error.is_published(), "{error:#}");
+        assert!(storage.routed_state_dir(project_id).is_some(), "routes follow the visible config");
+        assert!(storage.read_config_strict().unwrap().projects.contains_key(&project_id.to_string()));
+    }
+
+    #[test]
+    fn an_unconfirmed_config_is_rewritten_by_the_barrier_and_only_then_confirmed() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, _dir) = create_test_storage();
+        storage.confirm_config_durable().expect("nothing to confirm is not a failure");
+
+        let fault_a = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = storage
+            .update_config(|config| config.ui_preferences.theme = "light".to_string())
+            .unwrap_err();
+        drop(fault_a);
+        assert!(error.is_published());
+
+        // Still failing: the barrier says so and the file keeps the change.
+        let fault_b = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        assert!(storage.confirm_config_durable().unwrap_err().is_published());
+        drop(fault_b);
+        assert_eq!(storage.load_config().unwrap().ui_preferences.theme, "light");
+
+        // The rewrite that completes is the confirmation, and clears the state.
+        storage.confirm_config_durable().expect("the retry completes");
+        let trace = fault::trace();
+        storage.confirm_config_durable().unwrap();
+        assert!(trace.stages().is_empty(), "a confirmed config is not rewritten again");
+    }
+
+    #[test]
+    fn a_config_that_fails_before_publication_changes_nothing() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, _dir) = create_test_storage();
+        storage.save_config(&AppConfig::default()).unwrap();
+        let before = fs::read(&storage.config_file).unwrap();
+        let _fault = fault::fail_at(Stage::Replace, std::io::ErrorKind::Other);
+        let error = storage
+            .update_config(|config| config.ui_preferences.theme = "light".to_string())
+            .unwrap_err();
+        assert!(!error.is_published(), "{error:#}");
+        assert_eq!(fs::read(&storage.config_file).unwrap(), before);
+    }
+
+    #[test]
+    fn a_conversation_is_synced_before_it_is_replaced_and_failures_are_typed() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let conversation = Conversation::new(project_id);
+
+        let trace = fault::trace();
+        storage.save_conversation(&conversation).unwrap();
+        let stages = trace.stages();
+        let sync_temp = stages.iter().position(|s| *s == Stage::SyncTemp).unwrap();
+        let replace = stages.iter().position(|s| *s == Stage::Replace).unwrap();
+        let sync_dir = stages.iter().position(|s| *s == Stage::SyncDirectory).unwrap();
+        assert!(sync_temp < replace && replace < sync_dir, "{stages:?}");
+        drop(trace);
+
+        let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = storage.save_conversation(&conversation).unwrap_err();
+        assert!(write_error(&error).is_published(), "{error:#}");
+    }
+
+    #[test]
+    fn a_primary_conversation_pointer_is_not_written_when_its_document_is_not_durable() {
+        use slashit_durable_fs::{fault, Stage};
+        let (storage, _dir) = create_test_storage();
+        let project_id = Uuid::new_v4();
+        let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        assert!(storage.create_primary_conversation(project_id).is_err());
+        assert!(
+            !storage.paths.primary_conversation_file(project_id).exists(),
+            "the pointer must never name a document that is not confirmed durable"
+        );
     }
 
     #[test]
@@ -2679,79 +2967,8 @@ user_name = "Test"
         }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn private_temp_file_is_owner_only_from_creation() {
-        // The temp file itself (not just the final path) must never be
-        // briefly world-readable, since save_config carries api_key.
-        let (storage, _temp) = create_test_storage();
-        storage.save_config(&AppConfig::default()).unwrap();
-
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = unique_temp_path(&storage.config_file);
-        create_owner_only_file(&tmp, b"secret").unwrap();
-        let mode = fs::metadata(&tmp).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "temp file must be owner-only at creation");
-        fs::remove_file(&tmp).unwrap();
-    }
-
-    // ==================== Atomic write temp-name uniqueness Tests ====================
-
-    #[test]
-    fn unique_temp_path_never_collides_across_calls() {
-        let path = Path::new("/tmp/example-dir/config.toml");
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..1000 {
-            let tmp = unique_temp_path(path);
-            assert!(seen.insert(tmp.clone()), "temp path collided: {tmp:?}");
-            assert_eq!(tmp.parent(), path.parent(), "temp file must stay a sibling of the destination");
-        }
-    }
-
-    #[test]
-    fn concurrent_atomic_writes_to_same_destination_do_not_corrupt() {
-        // Two writers targeting the same destination used to share one fixed
-        // temp name and race on it. With per-call unique temp names, each
-        // writer's rename is independent, so the final file must be exactly
-        // one writer's complete payload — never a truncated or interleaved
-        // mix of two — and no stray temp files should be left behind.
-        use std::sync::Barrier;
-        use std::thread;
-
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let path = Arc::new(temp_dir.path().join("shared.toml"));
-
-        let writer_count = 8usize;
-        let barrier = Arc::new(Barrier::new(writer_count));
-
-        let handles: Vec<_> = (0..writer_count)
-            .map(|i| {
-                let barrier = Arc::clone(&barrier);
-                let path = Arc::clone(&path);
-                thread::spawn(move || {
-                    let payload = format!("writer-{i}-").repeat(2048);
-                    barrier.wait();
-                    write_atomic(&path, payload.as_bytes()).expect("write should succeed");
-                    payload
-                })
-            })
-            .collect();
-
-        let payloads: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-        let final_contents = fs::read_to_string(&*path).expect("final file should be readable");
-        assert!(
-            payloads.iter().any(|p| p == &final_contents),
-            "final file must be exactly one writer's complete payload, not a mix"
-        );
-
-        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path() != *path)
-            .collect();
-        assert!(leftovers.is_empty(), "unexpected leftover temp files: {leftovers:?}");
-    }
+    // The temporary-file protocol (unique names, owner-only creation,
+    // concurrent writers, fsync ordering) is tested in `slashit-durable-fs`.
 
     // ==================== parse_github_url Tests ====================
 

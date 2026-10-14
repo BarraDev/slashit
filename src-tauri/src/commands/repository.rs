@@ -29,7 +29,7 @@ type Repositories = Arc<RwLock<HashMap<Uuid, Repository>>>;
 pub(crate) fn try_persist_repositories(
     storage: &Storage,
     repositories: &HashMap<Uuid, Repository>,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::config::ConfigWriteError> {
     // See `try_persist_projects` for why this deliberately adds no context of
     // its own: callers render with `{e}`, so an outer wrapper would hide the
     // failing stage.
@@ -199,10 +199,11 @@ async fn create_repository_core(
 /// Persists a fully-built [`Repository`], called by [`create_repository_core`]
 /// after any requested git initialization has already succeeded.
 ///
-/// Inserts into a cloned map, persists the clone, and only replaces the
-/// shared map on success — a failed persist never leaves memory holding a
+/// Inserts into a cloned map, persists the clone, and replaces the shared map
+/// once the file holds it — a failed persist never leaves memory holding a
 /// repository disk never recorded (which a later successful persist could
-/// otherwise write).
+/// otherwise write), and a write that replaced the file without confirming it
+/// durable never leaves memory behind the file (see [`adopt_published`]).
 async fn create_repository_committed(
     repositories: &RwLock<HashMap<Uuid, Repository>>,
     storage: &Storage,
@@ -212,10 +213,9 @@ async fn create_repository_committed(
     let mut proposed = repositories_w.clone();
     proposed.insert(repository.id, repository.clone());
 
-    try_persist_repositories(storage, &proposed)
-        .map_err(|e| format!("Failed to persist repository: {e}"))?;
-
-    *repositories_w = proposed;
+    let outcome = try_persist_repositories(storage, &proposed);
+    crate::config::adopt_published(&mut *repositories_w, proposed, outcome)
+        .map_err(|e| e.describe("persist repository"))?;
     Ok(repository)
 }
 

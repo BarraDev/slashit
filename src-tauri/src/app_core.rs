@@ -208,6 +208,30 @@ pub async fn build_state_with_paths(
     // proof every record is left for a later start. With it, a present
     // Project means its removal never committed (drop the record); an absent
     // one means the record authorizes finishing Conversation cleanup.
+    //
+    // "Absent" is only as trustworthy as the file it was read from. A previous
+    // process may have removed the Project and been unable to confirm that
+    // write; this process cannot know, and the file it read may still lose the
+    // removal in a later crash. So before anything is deleted on that basis the
+    // configuration is rewritten through the full durable protocol; if that
+    // fails the records are kept and the cleanup waits for a later start.
+    let mut projects_are_authoritative = projects_are_authoritative;
+    if projects_are_authoritative {
+        let owed = app_state.storage.pending_project_conversation_deletions().map(|p| !p.is_empty()).unwrap_or(false)
+            || app_state.storage.pending_project_tasks_deletions().map(|p| !p.is_empty()).unwrap_or(false);
+        if owed {
+            if let Err(error) = app_state.storage.reconfirm_config_durable() {
+                eprintln!(
+                    "Warning: the configuration could not be confirmed durable, so pending Project \
+                     cleanup is left for a later start: {error}"
+                );
+                report.project_conversation_cleanup_failures.push(format!(
+                    "pending cleanup deferred: configuration not confirmed durable: {error}"
+                ));
+                projects_are_authoritative = false;
+            }
+        }
+    }
     if projects_are_authoritative {
         match app_state.storage.pending_project_conversation_deletions() {
             Ok(pending) => {
@@ -738,6 +762,42 @@ mod tests {
         assert!(state.task.tasks.read().await.is_empty());
         assert!(state.project.projects.read().await.is_empty());
         assert!(state.repository.repositories.read().await.is_empty());
+    }
+
+    /// A previous process may have removed a Project and been unable to
+    /// confirm that write. Startup must not delete on the strength of that
+    /// absence until it has confirmed the configuration itself.
+    #[tokio::test]
+    async fn startup_defers_pending_cleanup_while_the_configuration_cannot_be_confirmed() {
+        let tmp = TempDir::new().unwrap();
+        let paths = test_paths(&tmp);
+        let seed = Storage::with_paths((*paths).clone());
+        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let conversation = seed.create_primary_conversation(project_id).unwrap();
+        let pointer = paths.primary_conversation_file(project_id);
+        let document = paths.conversation_file(conversation.id);
+        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+
+        let fault = slashit_durable_fs::fault::fail_at_file(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+            "config.toml",
+        );
+        let (_state, report) = build_state_with_paths(paths.clone()).await.unwrap();
+        drop(fault);
+        assert!(pointer.exists() && document.exists(), "nothing is deleted on an unconfirmed absence");
+        assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
+        assert!(
+            report.project_conversation_cleanup_failures.iter().any(|f| f.contains("not confirmed durable")),
+            "{:?}",
+            report.project_conversation_cleanup_failures
+        );
+
+        // The next start confirms the configuration, then finishes.
+        let (_state, _report) = build_state_with_paths(paths.clone()).await.unwrap();
+        assert!(!pointer.exists() && !document.exists());
+        assert!(!paths.pending_project_conversation_deletion_file(project_id).exists());
     }
 
     #[tokio::test]

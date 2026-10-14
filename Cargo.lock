@@ -5163,6 +5163,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "slashit-durable-fs"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "slashit-frontend"
 version = "0.1.0"
 dependencies = [
@@ -5236,6 +5243,7 @@ dependencies = [
  "sha2",
  "slashit-activity",
  "slashit-attention",
+ "slashit-durable-fs",
  "slashit-ipc",
  "slashit-review-content",
  "sysinfo",

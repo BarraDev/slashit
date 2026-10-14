@@ -13,6 +13,7 @@ use super::migration::StateMigrator;
 use super::paths::IN_PROJECT_DIR;
 #[cfg(doc)]
 use super::paths::AppPaths;
+use super::storage::{adopt_published, ConfigWriteError};
 use crate::domain::Workspace;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -94,25 +95,24 @@ impl WorkspaceRegistry {
         Ok(Self { workspaces, config_path })
     }
 
-    pub fn upsert(&mut self, workspace: Workspace) -> io::Result<()> {
-        // Stage the change in a clone, persist, and only commit to self on success.
-        // This keeps the in-memory map consistent with disk even if the write fails.
+    pub fn upsert(&mut self, workspace: Workspace) -> Result<(), ConfigWriteError> {
+        // Stage the change in a clone and persist it. The map follows the file:
+        // it is replaced when the write succeeded, and also when it replaced
+        // the file without confirming it durable (the error still says so).
         let mut next = self.workspaces.clone();
         next.insert(workspace.id, workspace);
-        Self::persist_map(&self.config_path, &next)?;
-        self.workspaces = next;
-        Ok(())
+        let outcome = Self::persist_map(&self.config_path, &next);
+        adopt_published(&mut self.workspaces, next, outcome)
     }
 
-    pub fn remove(&mut self, id: &Uuid) -> io::Result<bool> {
+    pub fn remove(&mut self, id: &Uuid) -> Result<bool, ConfigWriteError> {
         if !self.workspaces.contains_key(id) {
             return Ok(false);
         }
         let mut next = self.workspaces.clone();
         next.remove(id);
-        Self::persist_map(&self.config_path, &next)?;
-        self.workspaces = next;
-        Ok(true)
+        let outcome = Self::persist_map(&self.config_path, &next);
+        adopt_published(&mut self.workspaces, next, outcome).map(|()| true)
     }
 
     pub fn get(&self, id: &Uuid) -> Option<&Workspace> {
@@ -145,19 +145,26 @@ impl WorkspaceRegistry {
             .count()
     }
 
-    fn persist_map(path: &Path, map: &HashMap<Uuid, Workspace>) -> io::Result<()> {
+    fn persist_map(path: &Path, map: &HashMap<Uuid, Workspace>) -> Result<(), ConfigWriteError> {
         let file = RegistryFile {
             workspaces: map.values().cloned().collect(),
         };
         let toml_text = toml::to_string_pretty(&file)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        // Write to a sibling temp file then atomically rename so a crash or
-        // partial write cannot leave the registry truncated. The temp name is
-        // unique per call (shared with `storage::write_atomic`) so concurrent
-        // writers never race on the same temp path.
-        let tmp = crate::config::storage::unique_temp_path(path);
-        fs::write(&tmp, toml_text)?;
-        fs::rename(&tmp, path)
+            .map_err(|e| ConfigWriteError::NotPublished(anyhow::Error::new(e)))?;
+        // Durable atomic replacement (see `slashit_durable_fs`): a crash or
+        // partial write cannot leave the registry truncated, and a failure
+        // after the replacement is reported as such rather than as success.
+        slashit_durable_fs::write_atomic(path, toml_text.as_bytes(), slashit_durable_fs::Permissions::Preserve)
+            .map(|_| ())
+            .map_err(|e| {
+                let published = e.is_published();
+                let error = anyhow::Error::new(e).context("Failed to write the workspace registry");
+                if published {
+                    ConfigWriteError::PublishedNotDurable(error)
+                } else {
+                    ConfigWriteError::NotPublished(error)
+                }
+            })
     }
 
 }
@@ -175,6 +182,56 @@ mod tests {
         let registry = WorkspaceRegistry::load_from(path).expect("should load a default registry");
 
         assert!(registry.all().next().is_none());
+    }
+
+    fn workspace_in(root: &Path) -> Workspace {
+        Workspace::new(
+            "ws".to_string(),
+            crate::domain::WorkspaceRoot::try_new(root).expect("real dir must validate"),
+        )
+    }
+
+    #[test]
+    fn a_registry_write_that_replaced_the_file_without_confirming_it_is_adopted_and_reported() {
+        use slashit_durable_fs::{fault, Stage};
+        let temp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let path = temp.path().join("workspaces.toml");
+        let mut registry = WorkspaceRegistry::load_from(path.clone()).unwrap();
+        let workspace = workspace_in(root.path());
+        let id = workspace.id;
+
+        let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = registry.upsert(workspace).expect_err("unconfirmed");
+        drop(fault);
+        assert!(error.is_published());
+        assert!(registry.get(&id).is_some(), "memory follows the file");
+        assert!(WorkspaceRegistry::load_from(path.clone()).unwrap().get(&id).is_some(), "so does a restart");
+
+        // The removal is the same story, and the stale map cannot bring it back.
+        let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = registry.remove(&id).expect_err("unconfirmed");
+        drop(fault);
+        assert!(error.is_published());
+        assert!(registry.get(&id).is_none());
+        assert!(WorkspaceRegistry::load_from(path).unwrap().get(&id).is_none());
+    }
+
+    #[test]
+    fn a_registry_write_that_failed_before_publication_changes_nothing() {
+        use slashit_durable_fs::{fault, Stage};
+        let temp = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let path = temp.path().join("workspaces.toml");
+        let mut registry = WorkspaceRegistry::load_from(path.clone()).unwrap();
+        let workspace = workspace_in(root.path());
+        let id = workspace.id;
+
+        let _fault = fault::fail_at(Stage::Replace, std::io::ErrorKind::Other);
+        let error = registry.upsert(workspace).expect_err("not written");
+        assert!(!error.is_published());
+        assert!(registry.get(&id).is_none());
+        assert!(!path.exists());
     }
 
     #[test]
