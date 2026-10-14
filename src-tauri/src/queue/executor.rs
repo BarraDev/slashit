@@ -1784,9 +1784,6 @@ impl TaskExecutor {
             | Err(crate::lifecycle::TerminalizeRefusal::Quarantined(_))
             | Err(crate::lifecycle::TerminalizeRefusal::Busy(_))
             | Err(crate::lifecycle::TerminalizeRefusal::TaskNotFound) => {}
-
-            // Only a delete answers this; a terminalization never does.
-            Err(crate::lifecycle::TerminalizeRefusal::DeleteBlockedByIntegration) => {}
         }
     }
 
