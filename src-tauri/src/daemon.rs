@@ -135,7 +135,8 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
                 "slashitd: {} project(s) could not be saved to disk yet and will be retried automatically",
                 report.unsaved_migrated_projects
             );
-        } else if report.unconfirmed_migrated_projects > 0 {
+        }
+        if report.unconfirmed_migrated_projects > 0 {
             println!(
                 "slashitd: {} project(s) were saved but SlashIt could not confirm that reached stable storage (a restart repeats the same reconciliation either way)",
                 report.unconfirmed_migrated_projects

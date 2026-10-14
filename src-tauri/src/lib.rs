@@ -181,12 +181,14 @@ pub fn run() {
                 "SlashIt: Migrated tasks in {} project(s); {} could not be saved to disk yet and will be retried automatically",
                 report.migrated_projects, report.unsaved_migrated_projects
             );
-        } else if report.unconfirmed_migrated_projects > 0 {
+        }
+        if report.unconfirmed_migrated_projects > 0 {
             println!(
                 "SlashIt: Migrated tasks in {} project(s); {} were saved but SlashIt could not confirm that reached stable storage (a restart repeats the same reconciliation either way)",
                 report.migrated_projects, report.unconfirmed_migrated_projects
             );
-        } else {
+        }
+        if report.unsaved_migrated_projects == 0 && report.unconfirmed_migrated_projects == 0 {
             println!(
                 "SlashIt: Migrated tasks in {} project(s) and saved to disk",
                 report.migrated_projects
