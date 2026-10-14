@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// A coding run whose start is on disk.
+#[derive(Debug)]
 struct RunStart {
     working_dir: String,
     /// The run's number, as its recorded [`ActivityKind::RunStarted`] has it.
@@ -2093,12 +2094,13 @@ impl TaskExecutor {
     /// recorded by the start that created it, so a retry or a restart keeps
     /// the stack parent the branch was actually built on.
     ///
-    /// `Err` means nothing was recorded and the agent must not start. A
-    /// checkout this start created is taken back first (see
-    /// [`WorktreeManager::undo_created_checkout`]): left behind unrecorded,
-    /// the next start would adopt it, and an adopted checkout records no
-    /// starting commit and no origin. The message says what was kept, if
-    /// anything.
+    /// `Err` means the agent must not start. A checkout this start created is
+    /// taken back, but only when the record published nothing (see
+    /// [`WorktreeManager::undo_created_checkout`]): a record the file
+    /// accepted without confirming its durability has already replaced the
+    /// board, its checkout is one the published board references, and taking
+    /// it back would delete recorded state. The message says what was kept,
+    /// if anything.
     async fn record_run_start(
         &self,
         task_id: Uuid,
@@ -2132,10 +2134,29 @@ impl TaskExecutor {
                 run: run.load(std::sync::atomic::Ordering::Relaxed),
             }),
             Err(e) => {
-                let outcome = self
-                    .worktree_manager
-                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
-                    .await;
+                let published = crate::config::says_in_place_but_unconfirmed(&e);
+                let outcome = if published {
+                    // The record reached the board file, which now names
+                    // this checkout, its branch and its starting commit.
+                    // Taking the checkout back would undo a published
+                    // record: it would delete a checkout the persisted
+                    // board references, and the branch itself while it
+                    // still stands exactly at its creation commit -- the
+                    // direction `commit` and the delete path refuse for
+                    // the same outcome. Nothing can undo a write the file
+                    // already accepted, so the checkout stays and the
+                    // refusal says where things stand.
+                    format!(
+                        "the checkout at {path} stands on branch {branch} as the board \
+                         already records, so it was not undone",
+                        path = acquired.info.path,
+                        branch = acquired.info.branch,
+                    )
+                } else {
+                    self.worktree_manager
+                        .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                        .await
+                };
                 Err(format!(
                     "The task's worktree could not be recorded ({e}), so the task was not \
                      started; {outcome}"
@@ -2185,9 +2206,6 @@ impl TaskExecutor {
             .await
     }
 
-    /// [`Self::spawn_task_execution`] for a caller that already holds
-    /// `task_id`'s lifecycle lease, which `lease` stands for.
-    ///
     /// The one place a task execution is decided, under the lease, so no
     /// other lifecycle transition can land between the answer and the start
     /// it allowed. A live owner, the task's own state, the unrecorded-worktree
@@ -2360,7 +2378,10 @@ impl TaskExecutor {
                     .to_string(),
             });
         }
-        let RunStart { working_dir, run } = match self.record_run_start(task_id, &repo_path, acquired).await {
+        let RunStart { working_dir, run } = match self
+            .record_run_start(task_id, &repo_path, acquired)
+            .await
+        {
             Ok(start) => {
                 self.unrecorded_backoff_lock().remove(&task_id);
                 start
@@ -8307,6 +8328,296 @@ mod tests {
             persisted_task(&executor, project_id, task_id).branch_origin,
             Some(BranchOrigin::Stacked { parent_branch: "task-deadbeef".to_string() })
         );
+    }
+
+    /// What a run start's record changes: the task's name, path, branch,
+    /// phase and activity, in memory and on disk. `Task` deliberately has no
+    /// `PartialEq`, so tests compare this instead.
+    fn run_start_fingerprint(task: &Task) -> String {
+        format!(
+            "path={:?} branch={:?} phase={:?} progress={} activity={}",
+            task.worktree_path,
+            task.branch_name,
+            task.phase,
+            task.phase_progress,
+            task.activity.len(),
+        )
+    }
+
+    /// A run start whose record already reached the board file but could not
+    /// be confirmed durable must not take the checkout it created back.
+    ///
+    /// `lifecycle::publish` adopts a board the file holds but could not
+    /// confirm durable: on this outcome the file on disk already names the
+    /// checkout, its branch and its starting commit, so a rollback would
+    /// delete a checkout the published board references (and, while the
+    /// branch still stands at `created_at`, the branch as a whole) -- the
+    /// opposite of the fail-closed direction every other board write keeps.
+    /// Releasing the checkout stays reserved for a record that published
+    /// nothing (`NotPublished`), where the next attempt really does start
+    /// over.
+    #[tokio::test]
+    async fn a_published_but_unconfirmed_run_start_record_keeps_its_created_checkout() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        seed_stacked_fixture_board(&executor).await;
+        publish_default_base(&repo);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("a created checkout");
+        let path = acquired.info.path.clone();
+        let branch = acquired.info.branch.clone();
+        let created_at = acquired
+            .created_at
+            .clone()
+            .expect("a created checkout knows its starting commit");
+        assert!(std::path::Path::new(&path).is_dir());
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        assert_eq!(
+            on_disk_task(&executor, project_id, task_id).worktree_path,
+            None,
+            "precondition: the board has never named the checkout"
+        );
+
+        // Failing the directory sync after the replacement is the real
+        // production shape of "published, durability unconfirmed".
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        let error = executor
+            .record_run_start(task_id, repo.to_str().unwrap(), acquired)
+            .await
+            .expect_err("the unconfirmed record is reported");
+        drop(fault);
+
+        // The refusal says where the already-published record stands, and
+        // never claims to be safe to retry from the top.
+        assert!(error.contains("in place but not confirmed durable"), "{error}");
+        assert!(
+            !error.contains("was removed again"),
+            "the checkout must not be taken back on this outcome: {error}"
+        );
+
+        // The persisted board already names the checkout the record wrote.
+        let persisted = on_disk_task(&executor, project_id, task_id);
+        assert_eq!(persisted.worktree_path.as_deref(), Some(path.as_str()));
+        assert_eq!(persisted.branch_name.as_deref(), Some(branch.as_str()));
+        assert_eq!(persisted.phase, TaskPhase::Coding, "the run's phase reached the file");
+        assert_eq!(persisted.activity.len(), 1, "the RunStarted record reached the file");
+
+        // The checkout survives, still registered with git, and the branch
+        // still stands at the commit the record captured.
+        assert!(std::path::Path::new(&path).is_dir(), "the checkout file tree must be kept");
+        let list = git_in(&repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            list.contains(&format!("worktree {path}")),
+            "the worktree must stay registered: {list}"
+        );
+        assert_eq!(
+            git_in(std::path::Path::new(&path), &["rev-parse", "HEAD"]),
+            created_at,
+            "the branch keeps the starting commit it was created at"
+        );
+
+        // A restart can still start from here: the reloadable task names a
+        // checkout that really is there, on the branch the record captured.
+        let reloaded = on_disk_task(&executor, project_id, task_id);
+        assert_eq!(reloaded.worktree_path.as_deref(), Some(path.as_str()));
+        assert_eq!(reloaded.branch_name.as_deref(), Some(branch.as_str()));
+    }
+
+    /// A record that published nothing still releases the checkout it
+    /// created, so a retry starts over instead of adopting one whose origin
+    /// and starting commit were never recorded.
+    #[tokio::test]
+    async fn a_run_start_record_that_published_nothing_still_releases_its_created_checkout() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        seed_stacked_fixture_board(&executor).await;
+        publish_default_base(&repo);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("a created checkout");
+        let path = acquired.info.path.clone();
+        let created_at = acquired
+            .created_at
+            .clone()
+            .expect("a created checkout knows its starting commit");
+        assert!(std::path::Path::new(&path).is_dir());
+
+        // Failing the replacement leaves the board file exactly as it was:
+        // nothing about this start is on disk.
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+        );
+        let error = executor
+            .record_run_start(task_id, repo.to_str().unwrap(), acquired)
+            .await
+            .expect_err("the unpublished record is reported");
+        drop(fault);
+
+        assert!(
+            !error.contains("in place but not confirmed durable"),
+            "the record published nothing, so the refusal must not say it did: {error}"
+        );
+        assert!(error.contains("was removed again"), "{error}");
+        assert!(!std::path::Path::new(&path).is_dir(), "the unrecorded checkout is taken back");
+        assert_eq!(worktree_count(&repo), 1, "only the main checkout remains");
+        let created = git_in(&repo, &["cat-file", "-t", &created_at]);
+        assert_eq!(created, "commit", "the commit the branch rose from must survive");
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let persisted = on_disk_task(&executor, project_id, task_id);
+        assert!(persisted.worktree_path.is_none(), "the board never named the checkout");
+    }
+
+    /// A run start that only reattached to a checkout of a branch a previous
+    /// process recorded fails closed on an unconfirmable record: the record
+    /// is on the file already, memory adopts it, and nothing is removed.
+    #[tokio::test]
+    async fn a_reattached_run_start_with_an_unconfirmable_record_removes_nothing() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        let task_branch = WorktreeManager::branch_for_task(task_id);
+        git_in(&repo, &["branch", &task_branch]);
+        seed_recorded_branch_without_checkout(&executor, task_id, &task_branch).await;
+        publish_default_base(&repo);
+
+        let (existing, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        assert_eq!(existing, Some(task_branch.clone()), "the recorded branch is reattached");
+        let acquired = acquired.expect("reattached");
+        assert_eq!(acquired.what_happened, "Reattached worktree");
+        assert!(acquired.created_at.is_none(), "a reattached checkout was not created here");
+        let repo_path = repo.to_str().unwrap();
+        let path = acquired.info.path.clone();
+        assert!(std::path::Path::new(&path).is_dir());
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let fingerprint_before = run_start_fingerprint(&executor.tasks.read().await[&task_id]);
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::SyncDirectory,
+            std::io::ErrorKind::Other,
+        );
+        let error = executor
+            .record_run_start(task_id, repo_path, acquired)
+            .await
+            .expect_err("the unconfirmed record is reported");
+        drop(fault);
+
+        assert!(error.contains("in place but not confirmed durable"), "{error}");
+        let after = &executor.tasks.read().await[&task_id];
+        assert_ne!(
+            run_start_fingerprint(after),
+            fingerprint_before,
+            "memory publishes what the file already holds, or the next save of a sibling              restores the previous board and the record of the run's start is lost: {after:?}"
+        );
+        assert_eq!(
+            after.worktree_path.as_deref(),
+            on_disk_task(&executor, project_id, task_id).worktree_path.as_deref(),
+            "memory and the file agree on the checkout"
+        );
+        assert!(
+            !error.contains("was removed again"),
+            "a reattached checkout is never this start's to remove: {error}"
+        );
+        assert!(std::path::Path::new(&path).is_dir(), "a reattached checkout is not removed");
+        assert_eq!(worktree_count(&repo), 2);
+    }
+
+    /// Write every task currently in memory to its project's board file, so a
+    /// failing record has a real file to fail against.
+    async fn seed_stacked_fixture_board(executor: &TaskExecutor) {
+        let snapshot = executor.tasks.read().await.clone();
+        let mut by_project: HashMap<Uuid, Vec<Task>> = HashMap::new();
+        for task in snapshot.into_values() {
+            by_project.entry(task.project_id).or_default().push(task);
+        }
+        for (project_id, list) in by_project {
+            executor
+                .storage
+                .save_project_tasks(project_id, &list)
+                .expect("seed the board");
+        }
+    }
+
+    /// Record `task_id`'s branch without a checkout, in memory and on disk:
+    /// the state a restart after a removed checkout reads.
+    async fn seed_recorded_branch_without_checkout(executor: &TaskExecutor, task_id: Uuid, branch: &str) {
+        {
+            let mut tasks_w = executor.tasks.write().await;
+            if let Some(task) = tasks_w.get_mut(&task_id) {
+                task.branch_name = Some(branch.to_string());
+                task.worktree_path = None;
+            }
+        }
+        seed_stacked_fixture_board(executor).await;
+    }
+
+    /// A record that published nothing still leaves memory where it was:
+    /// the save refused before the replacement, so the board in memory goes
+    /// on describing exactly what the file holds.
+    #[tokio::test]
+    async fn a_run_start_record_that_published_nothing_leaves_memory_unpublished() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        )
+        .await;
+        executor.tasks.write().await.get_mut(&task_id).unwrap().dependencies.clear();
+        let task_branch = WorktreeManager::branch_for_task(task_id);
+        git_in(&repo, &["branch", &task_branch]);
+        seed_recorded_branch_without_checkout(&executor, task_id, &task_branch).await;
+        publish_default_base(&repo);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let acquired = acquired.expect("reattached");
+        assert_eq!(acquired.what_happened, "Reattached worktree");
+        let repo_path = repo.to_str().unwrap();
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let fingerprint_before = run_start_fingerprint(&executor.tasks.read().await[&task_id]);
+
+        let fault = slashit_durable_fs::fault::fail_at(
+            slashit_durable_fs::Stage::Replace,
+            std::io::ErrorKind::Other,
+        );
+        let error = executor
+            .record_run_start(task_id, repo_path, acquired)
+            .await
+            .expect_err("the unpublished record is reported");
+        drop(fault);
+
+        assert!(!error.contains("in place but not confirmed durable"), "{error}");
+        let after = &executor.tasks.read().await[&task_id];
+        assert_eq!(
+            run_start_fingerprint(after),
+            fingerprint_before,
+            "memory follows a file that was never replaced: {after:?}"
+        );
+        let persisted = on_disk_task(&executor, project_id, task_id);
+        assert!(persisted.worktree_path.is_none(), "the file was never replaced");
+        assert_eq!(persisted.phase, TaskPhase::Idle, "no run phase reached the file");
+        assert!(persisted.activity.is_empty(), "no run was recorded on disk");
     }
 
     /// A done dependency whose recorded branch is not a branch name is
