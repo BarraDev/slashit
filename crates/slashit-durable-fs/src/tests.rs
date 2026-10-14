@@ -38,13 +38,12 @@ fn creates_missing_parent_directories() {
 fn syncs_the_file_before_replacing_and_the_directory_after() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("board.toml");
-    // The first write into a directory also syncs that directory's own entry.
-    write_atomic(&path, b"first", Permissions::Preserve).unwrap();
     let t = trace();
     write_atomic(&path, b"x", Permissions::Preserve).unwrap();
     assert_eq!(
         t.stages(),
         [
+            Stage::SyncCreatedDirectory,
             Stage::CreateTemp,
             Stage::WriteTemp,
             Stage::SetPermissions,
@@ -195,14 +194,14 @@ fn running_out_of_temporary_names_is_a_clean_failure() {
 }
 
 #[test]
-fn the_first_write_into_a_directory_syncs_that_directorys_own_entry_once() {
+fn every_write_syncs_the_destination_directorys_own_entry() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("board.toml");
     let t = trace();
     write_atomic(&path, b"1", Permissions::Preserve).unwrap();
     write_atomic(&path, b"2", Permissions::Preserve).unwrap();
     let synced = t.stages().iter().filter(|s| **s == Stage::SyncCreatedDirectory).count();
-    assert_eq!(synced, 1, "{:?}", t.stages());
+    assert_eq!(synced, 2, "{:?}", t.stages());
 }
 
 #[test]
@@ -220,6 +219,46 @@ fn a_directory_whose_entry_sync_failed_is_not_reported_durable_by_the_retry() {
     write_atomic(&path, b"x", Permissions::Preserve).unwrap();
     let resynced = t.stages().iter().filter(|s| **s == Stage::SyncCreatedDirectory).count();
     assert_eq!(resynced, 2, "both created entries are synced by the retry: {:?}", t.stages());
+}
+
+#[test]
+fn a_directory_entry_that_could_not_be_synced_is_not_reported_fully_durable() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("a/b/board.toml");
+    // The created directories' entries cannot be synchronized, but the final
+    // directory sync works: the write must not claim more than it confirmed.
+    let committed = {
+        let _fault = fail_at(Stage::SyncCreatedDirectory, io::ErrorKind::Unsupported);
+        write_atomic(&path, b"x", Permissions::Preserve).unwrap()
+    };
+    assert_eq!(committed.directory, DirectorySync::Unsupported, "{committed:?}");
+    assert!(!committed.is_fully_durable());
+
+    // The entry stays owed: the next write asks again, and only a sync that
+    // really succeeds makes it durable.
+    let t = trace();
+    let retried = write_atomic(&path, b"y", Permissions::Preserve).unwrap();
+    let resynced = t.stages().iter().filter(|s| **s == Stage::SyncCreatedDirectory).count();
+    assert_eq!(resynced, 2, "{:?}", t.stages());
+    assert!(retried.is_fully_durable(), "{retried:?}");
+}
+
+#[test]
+fn a_directory_recreated_behind_our_back_gets_its_entry_synced_again() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state");
+    let path = state.join("board.toml");
+    write_atomic(&path, b"1", Permissions::Preserve).unwrap();
+
+    // Someone else removes and recreates the directory: it is a new entry in
+    // its parent that nothing has synchronized.
+    fs::remove_dir_all(&state).unwrap();
+    fs::create_dir(&state).unwrap();
+
+    let t = trace();
+    write_atomic(&path, b"2", Permissions::Preserve).unwrap();
+    let synced = t.stages().iter().filter(|s| **s == Stage::SyncCreatedDirectory).count();
+    assert_eq!(synced, 1, "{:?}", t.stages());
 }
 
 #[test]

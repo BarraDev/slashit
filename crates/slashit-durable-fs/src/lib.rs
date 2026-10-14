@@ -25,9 +25,13 @@
 //! The directory entries that make the file reachable are covered like this:
 //! the file's own entry (synced after the replacement), the entry of every
 //! directory this process created through [`write_atomic`] (synced as it is
-//! created, and re-synced on a later write if that sync had failed), and the
-//! entry of the destination directory itself in its parent, once per process.
-//! Older ancestors are assumed to have been durable since an earlier run.
+//! created, and re-synced on a later write if that sync had failed or the
+//! filesystem could not be asked), and the entry of the destination directory
+//! itself in its parent, on every write: a directory removed and recreated by
+//! someone else is a new entry. When any of these entries could not be asked
+//! about, [`Committed::directory`] is [`DirectorySync::Unsupported`] even if
+//! the final directory sync worked. Older ancestors are assumed to have been
+//! durable since an earlier run.
 //!
 //! It is not a transaction. Two files written by two calls, a file and a Git
 //! ref, or a file and a running process can each be at a different point after
@@ -326,17 +330,21 @@ pub struct StagedFile {
     tmp: PathBuf,
     dest: PathBuf,
     published: bool,
+    /// Whether the entries of the directories this write needed could be
+    /// synchronized; folded into what [`StagedFile::publish`] reports.
+    entries: DirectorySync,
 }
 
 /// Stage `bytes` for `path`: everything in [`write_atomic`] up to, but not
 /// including, the replacement.
 pub fn stage(path: &Path, bytes: &[u8], permissions: Permissions) -> Result<StagedFile, WriteError> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        create_dir_all_durable(parent)?;
-    }
+    let entries = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => create_dir_all_durable(parent)?,
+        None => DirectorySync::Synced,
+    };
     let (mut file, tmp) = create_temp(path, permissions)?;
     // From here the temporary file exists; any early return removes it.
-    let staged = StagedFile { tmp, dest: path.to_path_buf(), published: false };
+    let staged = StagedFile { tmp, dest: path.to_path_buf(), published: false, entries };
     step(Stage::WriteTemp, path, || file.write_all(bytes)).map_err(not_published(Stage::WriteTemp))?;
     step(Stage::SetPermissions, path, || platform::finish_permissions(&file, path, permissions))
         .map_err(not_published(Stage::SetPermissions))?;
@@ -352,7 +360,12 @@ impl StagedFile {
         self.published = true;
         let parent = self.dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         match step(Stage::SyncDirectory, &self.dest, || platform::sync_directory(parent)).or_else(tolerate_unsupported) {
-            Ok(directory) => Ok(Committed { directory }),
+            Ok(mut directory) => {
+                // The replacement is only as durable as the weakest entry
+                // this write relied on.
+                merge_sync(&mut directory, self.entries);
+                Ok(Committed { directory })
+            }
             Err(source) => Err(WriteError::PublishedNotDurable { stage: Stage::SyncDirectory, source }),
         }
     }
@@ -402,14 +415,16 @@ fn create_temp_with(
     })
 }
 
-/// Directory entries whose durability is still owed, and directories whose own
-/// entry was already synced by this process. Held across the creation and the
-/// syncs, so a concurrent writer that finds a directory another thread just
-/// created waits for that thread's syncs, and learns if they failed.
+/// Directory entries whose durability is still owed. Held across the creation
+/// and the syncs, so a concurrent writer that finds a directory another thread
+/// just created waits for that thread's syncs, and learns if they failed.
+///
+/// Nothing remembers that an entry was once synced: a directory can be removed
+/// and recreated by someone else at the same path, and the new one is a new
+/// entry that no earlier sync covered.
 #[derive(Default)]
 struct DirectoryState {
     owed: Vec<PathBuf>,
-    entry_synced: std::collections::HashSet<PathBuf>,
 }
 
 static DIRECTORY_STATE: std::sync::Mutex<Option<DirectoryState>> = std::sync::Mutex::new(None);
@@ -419,9 +434,12 @@ fn parent_of(path: &Path) -> &Path {
 }
 
 /// `create_dir_all`, then synchronize the entry of every directory this
-/// process created and has not yet confirmed, plus (once) the destination
+/// process created and has not yet confirmed, plus the destination
 /// directory's own entry. See the crate documentation for what that covers.
-pub fn create_dir_all_durable(dir: &Path) -> Result<(), WriteError> {
+///
+/// [`DirectorySync::Unsupported`] says at least one of those entries could not
+/// be asked about; it stays owed, so the next call asks again.
+pub fn create_dir_all_durable(dir: &Path) -> Result<DirectorySync, WriteError> {
     let mut guard = DIRECTORY_STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let state = guard.get_or_insert_with(DirectoryState::default);
 
@@ -442,10 +460,10 @@ pub fn create_dir_all_durable(dir: &Path) -> Result<(), WriteError> {
         state.owed.extend(missing);
         step(Stage::CreateDirectory, dir, || fs::create_dir_all(dir)).map_err(not_published(Stage::CreateDirectory))?;
     }
-    // The destination directory's own entry in its parent, once per process:
-    // a directory created by someone else (the application's start-up) has no
-    // reason to have been synced.
-    if !state.entry_synced.contains(dir) && !state.owed.iter().any(|d| d == dir) {
+    // The destination directory's own entry in its parent: a directory created
+    // by someone else (the application's start-up, or a removal and recreation
+    // since our last write) has no reason to have been synced.
+    if !state.owed.iter().any(|d| d == dir) {
         state.owed.push(dir.to_path_buf());
     }
 
@@ -454,18 +472,26 @@ pub fn create_dir_all_durable(dir: &Path) -> Result<(), WriteError> {
     // entry above it exists durably.
     let mut relevant: Vec<PathBuf> = state.owed.iter().filter(|d| dir.starts_with(d)).cloned().collect();
     relevant.sort_by_key(|d| d.components().count());
+    let mut result = DirectorySync::Synced;
     for entry in relevant {
         if !entry.exists() {
             state.owed.retain(|d| d != &entry);
             continue;
         }
-        step(Stage::SyncCreatedDirectory, &entry, || platform::sync_directory(parent_of(&entry)))
+        let synced = step(Stage::SyncCreatedDirectory, &entry, || platform::sync_directory(parent_of(&entry)))
             .or_else(tolerate_unsupported)
             .map_err(not_published(Stage::SyncCreatedDirectory))?;
-        state.owed.retain(|d| d != &entry);
-        state.entry_synced.insert(entry);
+        merge_sync(&mut result, synced);
+        if synced == DirectorySync::Synced {
+            state.owed.retain(|d| d != &entry);
+        }
     }
-    Ok(())
+    // An entry that stayed owed because it could not be synchronized still
+    // limits what this call may claim, now and on every later call.
+    if state.owed.iter().any(|d| dir.starts_with(d)) {
+        result = DirectorySync::Unsupported;
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

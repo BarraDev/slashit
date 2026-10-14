@@ -390,7 +390,7 @@ impl StateMigrator {
                 io::Error::from(io::ErrorKind::InvalidInput),
             )
         })?;
-        slashit_durable_fs::create_dir_all_durable(parent)
+        let parent_entries = slashit_durable_fs::create_dir_all_durable(parent)
             .map_err(|e| MigrationError::io(format!("creating {}", parent.display()), e.into_io()))?;
 
         // Scoped to this exact destination and this exact call, so a second
@@ -456,6 +456,12 @@ impl StateMigrator {
                 ));
             }
         };
+
+        // The destination's parent must itself survive a power loss, or the
+        // whole migrated tree can vanish with it.
+        if parent_entries == slashit_durable_fs::DirectorySync::Unsupported {
+            proven = false;
+        }
 
         let mut retired_copy = None;
         if to.exists() {
@@ -1135,6 +1141,24 @@ mod tests {
         seed(&from);
 
         let _fault = fault::fail_every(Stage::SyncTreeDirectory, io::ErrorKind::Unsupported);
+        let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
+
+        assert!(matches!(report.outcome, MigrationOutcome::Migrated { files: 3, .. }));
+        assert!(report.warnings.iter().any(|w| w.contains("was kept")), "{:?}", report.warnings);
+        assert_seeded_at(&from);
+        assert_seeded_at(&to);
+    }
+
+    #[test]
+    fn a_destination_parent_whose_entry_cannot_be_synced_never_loses_the_source() {
+        let tmp = TempDir::new().unwrap();
+        let from = tmp.path().join("external/proj");
+        let to = tmp.path().join("repo/.slashit");
+        seed(&from);
+
+        // `repo` is created by the migration; its entry in the temporary
+        // directory cannot be synchronized, whatever the later syncs say.
+        let _fault = fault::fail_at(Stage::SyncCreatedDirectory, io::ErrorKind::Unsupported);
         let report = StateMigrator::migrate(&from, &to, ConflictPolicy::Abort).unwrap();
 
         assert!(matches!(report.outcome, MigrationOutcome::Migrated { files: 3, .. }));
