@@ -146,8 +146,14 @@ Rules:
 
 Run this before the first mutation of a session or of a unit, and again after
 anything that could have changed the answers (a fetch, another agent's
-activity, a failed command). It is read-only; use `--ignore-working-copy` in
-the canonical root.
+activity, a failed command). It is read-only in intent, but an ordinary `jj`
+command snapshots the working copy, and in the colocated canonical root it also
+imports and exports Git refs. So the flag depends on where you are:
+
+- Canonical root: put `--ignore-working-copy` on every `jj` command below.
+- Your own developer workspace: use ordinary commands. The snapshot is what
+  makes step 3 true; with the flag, `@` shows the last snapshot and reports an
+  edited change as empty.
 
 ```bash
 # 1. Which kind of checkout is this? A JJ developer workspace has no .git; the

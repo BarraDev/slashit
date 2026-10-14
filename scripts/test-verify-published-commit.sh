@@ -18,7 +18,12 @@ cat >"$tmp/gh" <<'FAKE'
 case $2 in
   */git/ref/heads/*) [ -n "${FAKE_HEAD-}" ] || { echo "Not Found" >&2; exit 1; }; echo "$FAKE_HEAD" ;;
   */commits/*) [ "${FAKE_COMMIT_API_FAILS-}" = 1 ] && { echo "boom" >&2; exit 1; }
-               if [ -n "${FAKE_FILES-}" ]; then printf '%s\n' "$FAKE_FILES"; fi ;;
+               if [ -n "${FAKE_FILES-}" ]; then printf '%s\n' "$FAKE_FILES"; fi
+               # Later pages exist only for a paginated request.
+               case " $* " in *" --paginate "*)
+                 [ "${FAKE_PAGE2_FAILS-}" = 1 ] && { echo "page 2 boom" >&2; exit 1; }
+                 if [ -n "${FAKE_FILES_PAGE2-}" ]; then printf '%s\n' "$FAKE_FILES_PAGE2"; fi ;;
+               esac ;;
   *) exit 1 ;;
 esac
 FAKE
@@ -61,6 +66,24 @@ FAKE_HEAD=$good FAKE_COMMIT_API_FAILS=1 \
   expect "commit API error is not a pass" 2 "cannot read commit" o/r fix/x "$good"
 FAKE_HEAD=$good FAKE_FILES=x \
   expect "abbreviated commit refused" 2 "full 40-hex" o/r fix/x "aaaa"
+FAKE_HEAD=$good FAKE_FILES=$'docs/b.md' \
+  expect "empty path prefix refused" 2 "non-empty prefix" o/r fix/x "$good" --path ""
+FAKE_HEAD=$good FAKE_FILES=$'docs/b.md' FAKE_FILES_PAGE2=$'src-tauri/z.rs' \
+  expect "path found only on a later page" 0 "^OK: .* 2 file" o/r fix/x "$good" --path src-tauri/
+FAKE_HEAD=$good FAKE_FILES=$'docs/b.md' FAKE_FILES_PAGE2=$'docs/c.md' \
+  expect "path absent on every page" 1 "nothing under 'src-tauri/'" o/r fix/x "$good" --path src-tauri/
+FAKE_HEAD=$good FAKE_FILES=$'docs/b.md' FAKE_PAGE2_FAILS=1 \
+  expect "later page error is not a pass" 2 "cannot read commit" o/r fix/x "$good"
+
+# At GitHub's 3000-file cap the list may be truncated.
+capped=$(seq -f 'docs/f%g.md' 1 3000)
+FAKE_HEAD=$good FAKE_FILES=$capped \
+  expect "capped list, path not found is unprovable" 2 "cannot prove nothing under 'src-tauri/'" o/r fix/x "$good" --path src-tauri/
+FAKE_HEAD=$good FAKE_FILES=$capped \
+  expect "capped list, path found is labelled partial" 0 "3000 file.*partial" o/r fix/x "$good" --path docs/f12
+FAKE_HEAD=$good FAKE_FILES=$(seq -f 'docs/f%g.md' 1 2999) \
+  expect "just under the cap is complete" 1 "nothing under 'src-tauri/'" o/r fix/x "$good" --path src-tauri/
+
 FAKE_HEAD=$good FAKE_FILES=x \
   expect "missing arguments" 2 "usage" o/r
 

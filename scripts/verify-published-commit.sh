@@ -13,6 +13,12 @@
 #   - <commit> changes no files (an empty "correction"); or
 #   - a given --path prefix is touched by none of its changed files.
 #
+# --path prefixes must be non-empty (an empty prefix matches every file). The
+# changed files are read across all pages, but GitHub lists at most 3000 files
+# per commit: when the list reaches that cap, a --path that is not found is
+# reported as unprovable (exit 2) instead of absent, and an OK is labelled as
+# partial coverage.
+#
 # It proves what GitHub holds, not that hosted checks passed or that the code
 # is right. Run it after the push and before reporting a fix as published.
 #
@@ -32,6 +38,7 @@ shift 3
 paths=()
 while [ "$#" -gt 0 ]; do
   [ "$1" = "--path" ] && [ "$#" -ge 2 ] || usage
+  [ -n "$2" ] || { echo "error: --path needs a non-empty prefix" >&2; exit 2; }
   paths+=("$2")
   shift 2
 done
@@ -51,7 +58,8 @@ if [ "$head" != "$commit" ]; then
   exit 1
 fi
 
-if ! files=$(gh api "repos/$repo/commits/$commit" --jq '.files[].filename' 2>&1); then
+max_files=3000 # GitHub's cap on the files it lists for one commit
+if ! files=$(gh api "repos/$repo/commits/$commit" --paginate --jq '.files[].filename' 2>&1); then
   echo "FAIL: cannot read commit $commit of $repo: $files" >&2
   exit 2
 fi
@@ -60,16 +68,25 @@ if [ -z "$files" ]; then
   exit 1
 fi
 
+count=$(printf '%s\n' "$files" | wc -l)
+capped=0
+[ "$count" -ge "$max_files" ] && capped=1
+
 for prefix in "${paths[@]}"; do
   hit=0
   while IFS= read -r f; do
     case $f in "$prefix"*) hit=1; break ;; esac
   done <<<"$files"
+  if [ "$hit" -eq 0 ] && [ "$capped" -eq 1 ]; then
+    echo "FAIL: $commit lists $count files, GitHub's limit; cannot prove nothing under '$prefix' changed" >&2
+    exit 2
+  fi
   if [ "$hit" -eq 0 ]; then
     echo "FAIL: $commit changes nothing under '$prefix'" >&2
     exit 1
   fi
 done
 
-count=$(printf '%s\n' "$files" | wc -l)
-echo "OK: $repo '$branch' is at $commit, which changes $count file(s)"
+note=""
+[ "$capped" -eq 1 ] && note=" (GitHub lists at most $max_files files; coverage of the commit is partial)"
+echo "OK: $repo '$branch' is at $commit, which changes $count file(s)$note"
