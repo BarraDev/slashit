@@ -228,7 +228,8 @@ impl<'a> TerminalizeRequest<'a> {
     }
 }
 
-const REPUBLISH_PENDING_REASON: &str = "a restack of this task's published branch is unfinished, so its \
+const REPUBLISH_PENDING_REASON: &str =
+    "a restack of this task's published branch is unfinished, so its \
      checkout and branch were kept; resume or discard the restack first";
 
 /// What the merged-pull-request poll puts on a task whose terminalization a
@@ -266,7 +267,10 @@ pub enum TerminalizeRefusal {
     /// to run git in.
     RepositoryUnresolved(String),
     /// Git refused to remove the checkout, and said why. Nothing was deleted.
-    CleanupRefused { worktree_path: String, reason: String },
+    CleanupRefused {
+        worktree_path: String,
+        reason: String,
+    },
     /// The removal happened but the board could not be written.
     NotRecorded(String),
     /// An unfinished restack of the task's published branch owns its checkout
@@ -278,6 +282,9 @@ pub enum TerminalizeRefusal {
     /// started and not finished. It may already have moved its target, and
     /// only the person's Resume or Discard decides how it ends.
     IntegrationUnfinished,
+    /// The Task Checkout is the only remaining evidence for an uncertain
+    /// Worker outcome, so terminalization may not remove it.
+    WorkerRecoveryRequired,
     /// The task records an unfinished local integration, in whatever status it
     /// happens to be. Only a delete asks this: the record is durable evidence
     /// of a Git operation that may already have moved its target branch, and
@@ -303,13 +310,15 @@ impl std::fmt::Display for TerminalizeRefusal {
             Self::CleanupRefused {
                 worktree_path,
                 reason,
-            } => write!(
-                f,
-                "the worktree at {worktree_path} was kept: {reason}"
-            ),
+            } => write!(f, "the worktree at {worktree_path} was kept: {reason}"),
             Self::NotRecorded(m) => write!(f, "{m}"),
             Self::RepublishPending => f.write_str(REPUBLISH_PENDING_REASON),
-            Self::IntegrationUnfinished => f.write_str(crate::domain::task::INTEGRATION_UNFINISHED_REFUSAL),
+            Self::IntegrationUnfinished => {
+                f.write_str(crate::domain::task::INTEGRATION_UNFINISHED_REFUSAL)
+            }
+            Self::WorkerRecoveryRequired => f.write_str(
+                "Worker recovery is unresolved; the Task Checkout was kept for inspection",
+            ),
             Self::DeleteBlockedByIntegration => f.write_str(DELETE_BLOCKED_BY_INTEGRATION_REASON),
         }
     }
@@ -375,7 +384,6 @@ pub async fn terminalize(
     terminalize_leased(ctx, task_id, origin, request).await
 }
 
-
 /// Record facts about a task durably, without attempting any transition.
 ///
 /// The persist-before-publish half of [`terminalize`] on its own, for a caller
@@ -397,9 +405,41 @@ pub async fn record(
     task_id: Uuid,
     amend: Amend<'_>,
 ) -> Result<(), String> {
+    record_typed(tasks, storage, task_id, &amend)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Typed board-write result for Task Worker handoff boundaries. Callers must
+/// not infer publication from rendered error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordWriteError {
+    NotPublished(String),
+    PublishedNotDurable(String),
+}
+
+impl std::fmt::Display for RecordWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPublished(message) | Self::PublishedNotDurable(message) => {
+                f.write_str(message)
+            }
+        }
+    }
+}
+
+/// `record` with the board's publication state retained as typed data.
+pub async fn record_typed(
+    tasks: &Tasks,
+    storage: &Storage,
+    task_id: Uuid,
+    amend: Amend<'_>,
+) -> Result<(), RecordWriteError> {
     let mut tasks_w = tasks.write().await;
     let Some(project_id) = tasks_w.get(&task_id).map(|t| t.project_id) else {
-        return Err(format!("task {task_id} is no longer on the board"));
+        return Err(RecordWriteError::NotPublished(format!(
+            "task {task_id} is no longer on the board"
+        )));
     };
 
     let mut staged = stage_project(&tasks_w, project_id);
@@ -408,7 +448,7 @@ pub async fn record(
         task.updated_at = chrono::Utc::now();
     }
 
-    publish(&mut tasks_w, storage, project_id, staged)
+    publish_typed(&mut tasks_w, storage, project_id, staged)
 }
 
 /// Changes a caller may need made in [`record_if_changed`]'s write, answering
@@ -463,6 +503,18 @@ pub async fn commit_task(
 ) -> Result<Option<Task>, String> {
     if !tasks.read().await.contains_key(&task_id) {
         return Ok(None);
+    }
+
+    let recovery_refusal = tasks
+        .read()
+        .await
+        .get(&task_id)
+        .and_then(Task::worker_recovery_refusal);
+    if let Some(refusal) = recovery_refusal {
+        // The caller's intent is opaque, so fail closed for every command that
+        // uses this lifecycle transition boundary. Same-status recovery writes
+        // use `record_typed` directly.
+        return Err(refusal);
     }
 
     record(tasks, storage, task_id, amend).await?;
@@ -583,8 +635,16 @@ pub async fn create_batch(
     for task in new_tasks {
         staged.insert(task.id, task.clone());
     }
-    publish(&mut tasks_w, storage, project_id, staged)
-        .map_err(|e| creation_consequence(&e, if new_tasks.len() > 1 { "batch of tasks" } else { "task" }))
+    publish(&mut tasks_w, storage, project_id, staged).map_err(|e| {
+        creation_consequence(
+            &e,
+            if new_tasks.len() > 1 {
+                "batch of tasks"
+            } else {
+                "task"
+            },
+        )
+    })
 }
 
 /// Renumber `target_status`'s column so `task_id` sits at `new_position` and
@@ -681,6 +741,10 @@ pub async fn enqueue_leased(
                 EnqueueVerdict::Blocked(
                     "A restack of this Task's published branch is unfinished, so it cannot run yet".into(),
                 ),
+                false,
+            ),
+            Some(task) if task.worker_recovery_refusal().is_some() => (
+                EnqueueVerdict::Blocked(task.worker_recovery_refusal().unwrap_or_default()),
                 false,
             ),
             Some(task) if task.integration_unfinished_refusal().is_some() => (
@@ -807,7 +871,10 @@ pub(crate) fn classify_status_transition(
     if matches!(new_status, TaskStatus::Done) {
         StatusTransitionEffect::CleanUpWorktree
     } else if *old_status == TaskStatus::Error
-        || matches!(new_status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress)
+        || matches!(
+            new_status,
+            TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::InProgress
+        )
     {
         StatusTransitionEffect::ResetExecutionState
     } else {
@@ -836,7 +903,11 @@ pub const DELETE_BLOCKED_BY_INTEGRATION_REASON: &str =
 /// [`Task::integration_unfinished_refusal`] answers for a status move) and an
 /// unfinished restack of its published branch.
 pub fn task_deletion_refusal(task: &Task) -> Option<TerminalizeRefusal> {
-    if task.local_integration.as_ref().is_some_and(|r| r.is_pending()) {
+    if task
+        .local_integration
+        .as_ref()
+        .is_some_and(|r| r.is_pending())
+    {
         return Some(TerminalizeRefusal::DeleteBlockedByIntegration);
     }
     if task.republish_pending_refusal().is_some() {
@@ -959,7 +1030,6 @@ pub async fn delete(ctx: TerminalizeCtx<'_>, task_id: Uuid) -> Result<bool, Term
     tasks_w.remove(&task_id);
     Ok(true)
 }
-
 
 /// Per-Project barrier serializing Project deletion against Task creation.
 ///
@@ -1124,7 +1194,9 @@ pub async fn terminalize_leased(
     // guess about the past.
     let (project_id, worktree_path, branch_name, quarantined) = {
         let tasks = ctx.tasks.read().await;
-        let task = tasks.get(&task_id).ok_or(TerminalizeRefusal::TaskNotFound)?;
+        let task = tasks
+            .get(&task_id)
+            .ok_or(TerminalizeRefusal::TaskNotFound)?;
         // Before anything else, whatever the origin: a merged pull request, a
         // card dragged to Done, a delete and an explicit cleanup all end here,
         // and every one of them would remove the checkout and branch that the
@@ -1132,6 +1204,9 @@ pub async fn terminalize_leased(
         // and its backup are exactly as found.
         if task.republish_pending_refusal().is_some() {
             return Err(TerminalizeRefusal::RepublishPending);
+        }
+        if task.worker_recovery_refusal().is_some() {
+            return Err(TerminalizeRefusal::WorkerRecoveryRequired);
         }
         // Likewise for an unfinished local integration: finishing the task
         // here would remove the checkout and withdraw the state its Resume
@@ -1227,7 +1302,10 @@ pub async fn terminalize_leased(
 
 enum Outcome {
     Cleaned,
-    Kept { worktree_path: String, reason: String },
+    Kept {
+        worktree_path: String,
+        reason: String,
+    },
 }
 
 /// Resolve a project's repository local path.
@@ -1266,7 +1344,9 @@ async fn stamp_cleanup_in_flight(
         amend(&mut staged);
     }
     let Some(task) = staged.get_mut(&task_id) else {
-        return Err(format!("task {task_id} vanished before its cleanup was recorded"));
+        return Err(format!(
+            "task {task_id} vanished before its cleanup was recorded"
+        ));
     };
     task.cleanup_in_flight = true;
     task.updated_at = chrono::Utc::now();
@@ -1412,18 +1492,37 @@ fn publish(
     project_id: Uuid,
     staged: HashMap<Uuid, Task>,
 ) -> Result<(), String> {
+    publish_typed(tasks_w, storage, project_id, staged).map_err(|e| e.to_string())
+}
+
+fn publish_typed(
+    tasks_w: &mut HashMap<Uuid, Task>,
+    storage: &Storage,
+    project_id: Uuid,
+    staged: HashMap<Uuid, Task>,
+) -> Result<(), RecordWriteError> {
     let list: Vec<Task> = staged.values().cloned().collect();
     let saved = storage.save_project_tasks(project_id, &list);
     // A board the file already holds but could not confirm durable is still
     // the file's board: memory follows it, or the next save of any sibling
     // would write the previous board back over it. The error is still
     // returned, and says the change is in place.
-    if saved.as_ref().err().is_none_or(crate::config::board_write_published) {
+    if saved
+        .as_ref()
+        .err()
+        .is_none_or(crate::config::board_write_published)
+    {
         for (id, task) in staged {
             tasks_w.insert(id, task);
         }
     }
-    saved.map_err(|e| e.to_string())
+    saved.map_err(|e| {
+        if crate::config::board_write_published(&e) {
+            RecordWriteError::PublishedNotDurable(e.to_string())
+        } else {
+            RecordWriteError::NotPublished(e.to_string())
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1532,8 +1631,14 @@ mod tests {
             // A bare `origin` whose `HEAD` is recorded locally, so that a
             // task checkout has a default base to start from.
             let origin = root.join("origin.git");
-            git(&repo_dir, &["init", "-q", "--bare", origin.to_str().unwrap()]);
-            git(&repo_dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+            git(
+                &repo_dir,
+                &["init", "-q", "--bare", origin.to_str().unwrap()],
+            );
+            git(
+                &repo_dir,
+                &["remote", "add", "origin", origin.to_str().unwrap()],
+            );
             git(&repo_dir, &["push", "-q", "origin", "main"]);
             git(&repo_dir, &["remote", "set-head", "origin", "main"]);
             repositories.insert(
@@ -1654,7 +1759,10 @@ mod tests {
             Some("task-abcd1234"),
             "the branch names the commits the task produced and is never touched"
         );
-        assert!(!std::path::Path::new(&wt).exists(), "the checkout must be gone");
+        assert!(
+            !std::path::Path::new(&wt).exists(),
+            "the checkout must be gone"
+        );
 
         // The same three facts on disk, because that is what a restart reads.
         let persisted = world.persisted(id);
@@ -1683,7 +1791,11 @@ mod tests {
         let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
         // Uncommitted, non-ignored work: git refuses to remove this checkout,
         // through the ordinary production path.
-        std::fs::write(std::path::Path::new(&wt).join("unsaved.txt"), "not committed\n").unwrap();
+        std::fs::write(
+            std::path::Path::new(&wt).join("unsaved.txt"),
+            "not committed\n",
+        )
+        .unwrap();
         let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
 
         let refusal = terminalize(
@@ -1704,10 +1816,17 @@ mod tests {
         );
 
         let after = world.task(id).await;
-        assert_eq!(after.status, TaskStatus::InProgress, "the status must not move");
+        assert_eq!(
+            after.status,
+            TaskStatus::InProgress,
+            "the status must not move"
+        );
         assert_eq!(after.worktree_path.as_deref(), Some(wt.as_str()));
         assert_eq!(after.branch_name.as_deref(), Some("task-abcd1234"));
-        assert!(!after.cleanup_in_flight, "the attempt concluded, so nothing is in flight");
+        assert!(
+            !after.cleanup_in_flight,
+            "the attempt concluded, so nothing is in flight"
+        );
         assert!(
             after.error_message.is_some(),
             "a refusal the user has to act on has to be visible on the task"
@@ -1742,7 +1861,10 @@ mod tests {
         .await
         .expect_err("with no repository there is nowhere to run git");
 
-        assert!(matches!(refusal, TerminalizeRefusal::RepositoryUnresolved(_)));
+        assert!(matches!(
+            refusal,
+            TerminalizeRefusal::RepositoryUnresolved(_)
+        ));
         let after = world.task(id).await;
         assert_eq!(after.worktree_path.as_deref(), Some("/tmp/does-not-matter"));
         assert_eq!(after.status, TaskStatus::InProgress);
@@ -1896,9 +2018,14 @@ mod tests {
         let mut ctx = world.ctx();
         ctx.running = Some(&owner);
 
-        let refusal = terminalize(ctx, id, Origin::User, TerminalizeRequest::new(TaskStatus::Done))
-            .await
-            .expect_err("a live agent's working directory must not be deleted under it");
+        let refusal = terminalize(
+            ctx,
+            id,
+            Origin::User,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect_err("a live agent's working directory must not be deleted under it");
 
         assert!(matches!(refusal, TerminalizeRefusal::ExecutionActive));
         assert!(std::path::Path::new(&wt).exists());
@@ -1938,17 +2065,30 @@ mod tests {
             let mut tasks = world.tasks.write().await;
             tasks.get_mut(&id).unwrap().pending_republish = Some(pending.clone());
             let board: Vec<Task> = tasks.values().cloned().collect();
-            world.storage.save_project_tasks(world.project_id, &board).expect("persist the record");
+            world
+                .storage
+                .save_project_tasks(world.project_id, &board)
+                .expect("persist the record");
         }
         let before = world.task(id).await;
 
         for origin in [Origin::Automatic, Origin::User] {
-            let refusal = terminalize(world.ctx(), id, origin, TerminalizeRequest::new(TaskStatus::Done))
-                .await
-                .expect_err("the restack's recovery needs this checkout and branch");
-            assert!(matches!(refusal, TerminalizeRefusal::RepublishPending), "{origin:?}: {refusal}");
+            let refusal = terminalize(
+                world.ctx(),
+                id,
+                origin,
+                TerminalizeRequest::new(TaskStatus::Done),
+            )
+            .await
+            .expect_err("the restack's recovery needs this checkout and branch");
+            assert!(
+                matches!(refusal, TerminalizeRefusal::RepublishPending),
+                "{origin:?}: {refusal}"
+            );
         }
-        let refusal = delete(world.ctx(), id).await.expect_err("a delete removes the checkout too");
+        let refusal = delete(world.ctx(), id)
+            .await
+            .expect_err("a delete removes the checkout too");
         assert!(matches!(refusal, TerminalizeRefusal::RepublishPending));
 
         assert!(std::path::Path::new(&wt).exists(), "the checkout survives");
@@ -1958,7 +2098,10 @@ mod tests {
         assert_eq!(after.worktree_path, before.worktree_path);
         assert_eq!(after.branch_name, before.branch_name);
         assert!(!after.cleanup_in_flight, "no cleanup was announced");
-        assert_eq!(world.persisted(id).pending_republish, after.pending_republish);
+        assert_eq!(
+            world.persisted(id).pending_republish,
+            after.pending_republish
+        );
     }
 
     /// The guard is the task's own: a task with no restack pending, on the same
@@ -1969,9 +2112,14 @@ mod tests {
         let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
         let (id, _) = seed(&world, TaskStatus::PrCreated, Some(&wt)).await;
 
-        terminalize(world.ctx(), id, Origin::Automatic, TerminalizeRequest::new(TaskStatus::Done))
-            .await
-            .expect("nothing is pending");
+        terminalize(
+            world.ctx(),
+            id,
+            Origin::Automatic,
+            TerminalizeRequest::new(TaskStatus::Done),
+        )
+        .await
+        .expect("nothing is pending");
 
         assert!(!std::path::Path::new(&wt).exists());
         let after = world.task(id).await;
@@ -1988,7 +2136,13 @@ mod tests {
         let world = world(true);
         let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
         let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
-        world.tasks.write().await.get_mut(&id).unwrap().cleanup_in_flight = true;
+        world
+            .tasks
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .cleanup_in_flight = true;
 
         let refusal = terminalize(
             world.ctx(),
@@ -2015,7 +2169,13 @@ mod tests {
         let world = world(true);
         let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
         let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
-        world.tasks.write().await.get_mut(&id).unwrap().cleanup_in_flight = true;
+        world
+            .tasks
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .cleanup_in_flight = true;
 
         let done = terminalize(
             world.ctx(),
@@ -2069,7 +2229,11 @@ mod tests {
             Some("https://example.invalid/pull/1"),
             "a fact established before the cleanup is true whatever git decided"
         );
-        assert_eq!(after.status, TaskStatus::PrCreated, "and the task is not Done");
+        assert_eq!(
+            after.status,
+            TaskStatus::PrCreated,
+            "and the task is not Done"
+        );
         assert_eq!(after.overall_progress, 0);
         assert_ne!(after.phase, TaskPhase::Complete);
     }
@@ -2104,7 +2268,10 @@ mod tests {
         assert_eq!(after.worktree_path, None);
         assert_eq!(after.overall_progress, 100);
         assert_eq!(after.phase, TaskPhase::Complete);
-        assert_eq!(after.pr_url.as_deref(), Some("https://example.invalid/pull/1"));
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://example.invalid/pull/1")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2134,8 +2301,15 @@ mod tests {
         // `pr_url` and a moved status visible on the board and absent from the
         // file, which is the one state a restart silently undoes.
         let after = world.task(id).await;
-        assert_eq!(after.pr_url, None, "nothing may be published that the file did not accept");
-        assert_eq!(after.status, TaskStatus::InProgress, "including the status it implied");
+        assert_eq!(
+            after.pr_url, None,
+            "nothing may be published that the file did not accept"
+        );
+        assert_eq!(
+            after.status,
+            TaskStatus::InProgress,
+            "including the status it implied"
+        );
     }
 
     #[tokio::test]
@@ -2154,7 +2328,10 @@ mod tests {
             .expect("an ordinary record must succeed");
 
         let after = world.task(id).await;
-        assert_eq!(after.pr_url.as_deref(), Some("https://example.invalid/pr/1"));
+        assert_eq!(
+            after.pr_url.as_deref(),
+            Some("https://example.invalid/pr/1")
+        );
         assert_eq!(after.status, TaskStatus::PrCreated);
         assert_eq!(
             world.persisted(id).pr_url.as_deref(),
@@ -2217,7 +2394,11 @@ mod tests {
         );
 
         let after = world.task(id).await;
-        assert_ne!(after.status, TaskStatus::Done, "and nothing may claim it finished");
+        assert_ne!(
+            after.status,
+            TaskStatus::Done,
+            "and nothing may claim it finished"
+        );
         assert_eq!(
             after.pr_url.as_deref(),
             Some("https://example.invalid/pull/7"),
@@ -2296,7 +2477,11 @@ mod tests {
         let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
         // Uncommitted, non-ignored work: git refuses this checkout through the
         // ordinary production path, and refusing is the whole point.
-        std::fs::write(std::path::Path::new(&wt).join("unsaved.txt"), "not committed\n").unwrap();
+        std::fs::write(
+            std::path::Path::new(&wt).join("unsaved.txt"),
+            "not committed\n",
+        )
+        .unwrap();
         let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
 
         let refusal = delete(world.ctx(), id)
@@ -2358,12 +2543,26 @@ mod tests {
         assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }));
 
         let after = world.task(id).await;
-        assert_eq!(after.status, TaskStatus::HumanReview, "the status must not move");
+        assert_eq!(
+            after.status,
+            TaskStatus::HumanReview,
+            "the status must not move"
+        );
         assert_eq!(after.worktree_path.as_deref(), Some(wt.as_str()));
-        assert!(after.error_message.as_deref().unwrap_or_default().contains(reason));
-        assert_eq!(world.persisted(id).worktree_path.as_deref(), Some(wt.as_str()));
+        assert!(after
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains(reason));
+        assert_eq!(
+            world.persisted(id).worktree_path.as_deref(),
+            Some(wt.as_str())
+        );
 
-        git(std::path::Path::new(&repo_path(&world)), &["worktree", "unlock", &wt]);
+        git(
+            std::path::Path::new(&repo_path(&world)),
+            &["worktree", "unlock", &wt],
+        );
         let done = terminalize(
             world.ctx(),
             id,
@@ -2382,7 +2581,11 @@ mod tests {
         let wt = worktree_with_committed_work(world, "task-abcd1234").await;
         let dir = std::path::PathBuf::from(&wt);
         git(&dir, &["checkout", "-q", "--detach"]);
-        std::fs::write(dir.join("detached.txt"), "only the detached HEAD names this\n").unwrap();
+        std::fs::write(
+            dir.join("detached.txt"),
+            "only the detached HEAD names this\n",
+        )
+        .unwrap();
         git(&dir, &["add", "."]);
         git(&dir, &["commit", "-q", "-m", "detached work"]);
         let commit = git_output(&dir, &["rev-parse", "HEAD"]);
@@ -2410,22 +2613,39 @@ mod tests {
     /// commit, and the commit still reachable through the registration.
     async fn assert_detached_work_kept(world: &World, id: Uuid, wt: &str, commit: &str) {
         let after = world.task(id).await;
-        assert_eq!(after.status, TaskStatus::HumanReview, "the status must not move");
+        assert_eq!(
+            after.status,
+            TaskStatus::HumanReview,
+            "the status must not move"
+        );
         assert_eq!(after.worktree_path.as_deref(), Some(wt));
         assert!(after.branch_name.is_some(), "the branch is still recorded");
         assert!(!after.cleanup_in_flight, "the cleanup lease is released");
         assert!(
-            after.error_message.as_deref().unwrap_or_default().contains(commit),
+            after
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains(commit),
             "the task says which commit: {:?}",
             after.error_message
         );
         assert_eq!(world.persisted(id).worktree_path.as_deref(), Some(wt));
         let repo = std::path::PathBuf::from(repo_path(world));
         assert!(
-            git_output(&repo, &["worktree", "list", "--porcelain"]).contains(&format!("HEAD {commit}")),
+            git_output(&repo, &["worktree", "list", "--porcelain"])
+                .contains(&format!("HEAD {commit}")),
             "the registration, and the HEAD it keeps, are left alone"
         );
-        git(&repo, &["rev-parse", "--verify", "-q", &format!("{commit}^{{commit}}")]);
+        git(
+            &repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("{commit}^{{commit}}"),
+            ],
+        );
         assert!(!git_output(&repo, &["fsck", "--unreachable", "--no-reflogs"]).contains(commit));
     }
 
@@ -2443,17 +2663,31 @@ mod tests {
         )
         .await
         .expect_err("removing the checkout would make its only commit unreachable");
-        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }),
+            "{refusal:?}"
+        );
         assert!(std::path::Path::new(&wt).is_dir());
         assert_detached_work_kept(&world, id, &wt, &commit).await;
 
-        let refusal = delete(world.ctx(), id).await.expect_err("nor is deleting the task");
-        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
-        assert!(world.tasks.read().await.contains_key(&id), "the task is not deleted");
+        let refusal = delete(world.ctx(), id)
+            .await
+            .expect_err("nor is deleting the task");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }),
+            "{refusal:?}"
+        );
+        assert!(
+            world.tasks.read().await.contains_key(&id),
+            "the task is not deleted"
+        );
         assert_eq!(world.persisted(id).id, id, "and neither is its record");
         assert_detached_work_kept(&world, id, &wt, &commit).await;
 
-        git(std::path::Path::new(&repo_path(&world)), &["branch", "kept-work", &commit]);
+        git(
+            std::path::Path::new(&repo_path(&world)),
+            &["branch", "kept-work", &commit],
+        );
         let done = terminalize(
             world.ctx(),
             id,
@@ -2481,16 +2715,32 @@ mod tests {
         )
         .await
         .expect_err("clearing the registration would make its only commit unreachable");
-        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }),
+            "{refusal:?}"
+        );
         assert_detached_work_kept(&world, id, &wt, &commit).await;
 
-        let refusal = delete(world.ctx(), id).await.expect_err("nor is deleting the task");
-        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
-        assert!(world.tasks.read().await.contains_key(&id), "the task is not deleted");
+        let refusal = delete(world.ctx(), id)
+            .await
+            .expect_err("nor is deleting the task");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }),
+            "{refusal:?}"
+        );
+        assert!(
+            world.tasks.read().await.contains_key(&id),
+            "the task is not deleted"
+        );
         assert_detached_work_kept(&world, id, &wt, &commit).await;
 
-        git(std::path::Path::new(&repo_path(&world)), &["tag", "kept-work", &commit]);
-        assert!(delete(world.ctx(), id).await.expect("once named, the delete goes through"));
+        git(
+            std::path::Path::new(&repo_path(&world)),
+            &["tag", "kept-work", &commit],
+        );
+        assert!(delete(world.ctx(), id)
+            .await
+            .expect("once named, the delete goes through"));
         assert!(!world.tasks.read().await.contains_key(&id));
     }
 
@@ -2502,7 +2752,10 @@ mod tests {
         // Move the checkout onto a commit a branch names: the commit it made
         // is now reached only by the checkout's HEAD reflog.
         git(&repo, &["branch", "elsewhere", "HEAD"]);
-        git(std::path::Path::new(&wt), &["checkout", "-q", "--detach", "elsewhere"]);
+        git(
+            std::path::Path::new(&wt),
+            &["checkout", "-q", "--detach", "elsewhere"],
+        );
         let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
 
         let refusal = terminalize(
@@ -2513,12 +2766,26 @@ mod tests {
         )
         .await
         .expect_err("removing the checkout would delete the reflog that reaches the commit");
-        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
-        let refusal = delete(world.ctx(), id).await.expect_err("nor is deleting the task");
-        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
-        assert!(world.tasks.read().await.contains_key(&id), "the task is not deleted");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }),
+            "{refusal:?}"
+        );
+        let refusal = delete(world.ctx(), id)
+            .await
+            .expect_err("nor is deleting the task");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }),
+            "{refusal:?}"
+        );
+        assert!(
+            world.tasks.read().await.contains_key(&id),
+            "the task is not deleted"
+        );
         assert!(std::path::Path::new(&wt).is_dir());
-        assert_eq!(world.persisted(id).worktree_path.as_deref(), Some(wt.as_str()));
+        assert_eq!(
+            world.persisted(id).worktree_path.as_deref(),
+            Some(wt.as_str())
+        );
         assert!(!git_output(&repo, &["fsck", "--unreachable"]).contains(&first));
     }
 
@@ -2546,17 +2813,32 @@ mod tests {
         )
         .await
         .expect_err("the checkout's reflog cannot be inspected under reftable");
-        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
-        let refusal = delete(world.ctx(), id).await.expect_err("nor is deleting the task");
-        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }),
+            "{refusal:?}"
+        );
+        let refusal = delete(world.ctx(), id)
+            .await
+            .expect_err("nor is deleting the task");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }),
+            "{refusal:?}"
+        );
         let after = world.task(id).await;
         assert_eq!(after.status, TaskStatus::HumanReview);
         assert!(world.tasks.read().await.contains_key(&id));
         assert!(!after.cleanup_in_flight);
         assert!(std::path::Path::new(&wt).is_dir());
-        assert_eq!(world.persisted(id).worktree_path.as_deref(), Some(wt.as_str()));
+        assert_eq!(
+            world.persisted(id).worktree_path.as_deref(),
+            Some(wt.as_str())
+        );
         assert!(
-            after.error_message.as_deref().unwrap_or_default().contains("reftable"),
+            after
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("reftable"),
             "{:?}",
             after.error_message
         );
@@ -2568,7 +2850,11 @@ mod tests {
         let world = world(true);
         let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
         git(std::path::Path::new(&wt), &["checkout", "-q", "--detach"]);
-        std::fs::write(std::path::Path::new(&wt).join(".git"), "not a gitdir pointer\n").unwrap();
+        std::fs::write(
+            std::path::Path::new(&wt).join(".git"),
+            "not a gitdir pointer\n",
+        )
+        .unwrap();
         let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
 
         let refusal = terminalize(
@@ -2579,17 +2865,32 @@ mod tests {
         )
         .await
         .expect_err("safety could not be established");
-        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
-        let refusal = delete(world.ctx(), id).await.expect_err("nor is deleting the task");
-        assert!(matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }), "{refusal:?}");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }),
+            "{refusal:?}"
+        );
+        let refusal = delete(world.ctx(), id)
+            .await
+            .expect_err("nor is deleting the task");
+        assert!(
+            matches!(refusal, TerminalizeRefusal::CleanupRefused { .. }),
+            "{refusal:?}"
+        );
         let after = world.task(id).await;
         assert_eq!(after.status, TaskStatus::HumanReview);
         assert!(world.tasks.read().await.contains_key(&id));
         assert!(!after.cleanup_in_flight);
         assert!(std::path::Path::new(&wt).is_dir());
-        assert_eq!(world.persisted(id).worktree_path.as_deref(), Some(wt.as_str()));
+        assert_eq!(
+            world.persisted(id).worktree_path.as_deref(),
+            Some(wt.as_str())
+        );
         assert!(
-            after.error_message.as_deref().unwrap_or_default().contains("could not be read"),
+            after
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not be read"),
             "the underlying reason is given: {:?}",
             after.error_message
         );
@@ -2632,11 +2933,17 @@ mod tests {
                 .current_dir(&dir)
                 .output()
                 .unwrap();
-            assert!(rebased.status.success(), "{}", String::from_utf8_lossy(&rebased.stderr));
+            assert!(
+                rebased.status.success(),
+                "{}",
+                String::from_utf8_lossy(&rebased.stderr)
+            );
             let (id, _) = seed(&world, TaskStatus::HumanReview, Some(&wt)).await;
 
             if delete_it {
-                delete(world.ctx(), id).await.expect("only a finished rebase's steps are left");
+                delete(world.ctx(), id)
+                    .await
+                    .expect("only a finished rebase's steps are left");
                 assert!(!world.tasks.read().await.contains_key(&id));
             } else {
                 let done = terminalize(
@@ -2687,7 +2994,9 @@ mod tests {
         let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
         let (id, sibling_id) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
 
-        assert!(delete(world.ctx(), id).await.expect("the delete must succeed"));
+        assert!(delete(world.ctx(), id)
+            .await
+            .expect("the delete must succeed"));
 
         assert!(!world.tasks.read().await.contains_key(&id));
         assert!(
@@ -2699,7 +3008,10 @@ mod tests {
                 .any(|t| t.id == id),
             "a delete the file did not accept is one the next start undoes"
         );
-        assert!(!std::path::Path::new(&wt).exists(), "the checkout goes with it");
+        assert!(
+            !std::path::Path::new(&wt).exists(),
+            "the checkout goes with it"
+        );
         let branches = std::process::Command::new("git")
             .args(["branch", "--list", "task-abcd1234"])
             .current_dir(repo_path(&world))
@@ -2725,7 +3037,9 @@ mod tests {
         // takes the task off the board is made to fail. Blocking persistence
         // any earlier would refuse before anything destructive ran, which is a
         // different contract and already covered.
-        assert!(delete(world.ctx(), id).await.expect("the first delete succeeds"));
+        assert!(delete(world.ctx(), id)
+            .await
+            .expect("the first delete succeeds"));
         let (id2, _) = seed(&world, TaskStatus::InProgress, None).await;
         world.block_persistence();
 
@@ -2760,9 +3074,16 @@ mod tests {
         .expect_err("the caller is told the durability is unconfirmed");
         drop(fault);
         assert!(error.contains("not confirmed durable"), "{error}");
-        assert_eq!(world.tasks.read().await[&id].title, "renamed", "memory follows the visible file");
+        assert_eq!(
+            world.tasks.read().await[&id].title,
+            "renamed",
+            "memory follows the visible file"
+        );
         let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();
-        assert_eq!(on_disk.iter().find(|t| t.id == id).unwrap().title, "renamed");
+        assert_eq!(
+            on_disk.iter().find(|t| t.id == id).unwrap().title,
+            "renamed"
+        );
 
         // An unrelated save rewrites the whole board from memory.
         record(&world.tasks, &world.storage, sibling_id, &|staged| {
@@ -2771,8 +3092,15 @@ mod tests {
         .await
         .expect("the next save completes");
         let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();
-        assert_eq!(on_disk.iter().find(|t| t.id == id).unwrap().title, "renamed", "the earlier change survives");
-        assert_eq!(on_disk.iter().find(|t| t.id == sibling_id).unwrap().title, "sibling renamed");
+        assert_eq!(
+            on_disk.iter().find(|t| t.id == id).unwrap().title,
+            "renamed",
+            "the earlier change survives"
+        );
+        assert_eq!(
+            on_disk.iter().find(|t| t.id == sibling_id).unwrap().title,
+            "sibling renamed"
+        );
     }
 
     /// A create whose directory sync failed has still put the task on the
@@ -2787,38 +3115,67 @@ mod tests {
         let mut created_id: Option<Uuid> = None;
 
         let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
-        let error = create(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, |_| {
-            let mut t = crate::test_helpers::create_test_task("Created");
-            t.project_id = world.project_id;
-            created_id = Some(t.id);
-            t
-        })
+        let error = create(
+            &world.gate,
+            &world.tasks,
+            &world.projects,
+            &world.storage,
+            world.project_id,
+            |_| {
+                let mut t = crate::test_helpers::create_test_task("Created");
+                t.project_id = world.project_id;
+                created_id = Some(t.id);
+                t
+            },
+        )
         .await
         .expect_err("the caller is told the durability is unconfirmed");
         drop(fault);
-        assert!(error.contains("in place but not confirmed durable"), "{error}");
+        assert!(
+            error.contains("in place but not confirmed durable"),
+            "{error}"
+        );
         assert!(error.contains("makes a duplicate"), "{error}");
         assert!(error.contains("nothing survived"), "{error}");
         let id = created_id.expect("the created id");
-        assert_eq!(world.tasks.read().await[&id].title, "Created", "the task is on the board");
+        assert_eq!(
+            world.tasks.read().await[&id].title,
+            "Created",
+            "the task is on the board"
+        );
         assert_eq!(world.tasks.read().await.len(), 1);
         let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();
-        assert_eq!(on_disk.len(), 1, "the whole board is the one published task");
+        assert_eq!(
+            on_disk.len(),
+            1,
+            "the whole board is the one published task"
+        );
         assert_eq!(on_disk[0].id, id, "the file holds the task");
 
         // A NotPublished failure leaves the map and the file as they were, and
         // says nothing about a task in place.
         world.block_persistence();
-        let error = create(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, |_| {
-            let mut t = crate::test_helpers::create_test_task("Interrupted");
-            t.project_id = world.project_id;
-            t
-        })
+        let error = create(
+            &world.gate,
+            &world.tasks,
+            &world.projects,
+            &world.storage,
+            world.project_id,
+            |_| {
+                let mut t = crate::test_helpers::create_test_task("Interrupted");
+                t.project_id = world.project_id;
+                t
+            },
+        )
         .await
         .expect_err("nothing could be written");
         assert!(error.contains("cannot be used as a board"), "{error}");
         assert!(!error.contains("makes a duplicate"), "{error}");
-        assert_eq!(world.tasks.read().await.len(), 1, "the refused create left the board as it was");
+        assert_eq!(
+            world.tasks.read().await.len(),
+            1,
+            "the refused create left the board as it was"
+        );
     }
 
     /// Same for a batch import: the whole batch is in place after a
@@ -2838,11 +3195,21 @@ mod tests {
             .collect();
 
         let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
-        let error = create_batch(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, &batch)
-            .await
-            .expect_err("the caller is told the durability is unconfirmed");
+        let error = create_batch(
+            &world.gate,
+            &world.tasks,
+            &world.projects,
+            &world.storage,
+            world.project_id,
+            &batch,
+        )
+        .await
+        .expect_err("the caller is told the durability is unconfirmed");
         drop(fault);
-        assert!(error.contains("in place but not confirmed durable"), "{error}");
+        assert!(
+            error.contains("in place but not confirmed durable"),
+            "{error}"
+        );
         assert!(error.contains("batch of tasks is in place"), "{error}");
         {
             let board = world.tasks.read().await;
@@ -2863,11 +3230,18 @@ mod tests {
         let (id, _) = seed(&world, TaskStatus::Backlog, None).await;
         let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
         let request = TerminalizeRequest::new(TaskStatus::Backlog);
-        let error = stamp_cleanup_in_flight(&world.tasks, &world.storage, id, world.project_id, &request)
-            .await
-            .unwrap_err();
-        assert!(error.contains("flagged as having a cleanup in flight"), "{error}");
-        assert!(world.tasks.read().await[&id].cleanup_in_flight, "memory follows the file");
+        let error =
+            stamp_cleanup_in_flight(&world.tasks, &world.storage, id, world.project_id, &request)
+                .await
+                .unwrap_err();
+        assert!(
+            error.contains("flagged as having a cleanup in flight"),
+            "{error}"
+        );
+        assert!(
+            world.tasks.read().await[&id].cleanup_in_flight,
+            "memory follows the file"
+        );
     }
 
     /// A write that did not replace the file leaves memory and file as they were.
@@ -2901,13 +3275,25 @@ mod tests {
         // A delete makes two board writes: the terminalization record, then the
         // removal. Let the first through and fail the second one's sync.
         let fault = fault::fail_after(Stage::SyncDirectory, std::io::ErrorKind::Other, 1);
-        let refusal = delete(world.ctx(), id).await.expect_err("an unconfirmed delete is reported");
+        let refusal = delete(world.ctx(), id)
+            .await
+            .expect_err("an unconfirmed delete is reported");
         drop(fault);
-        let TerminalizeRefusal::NotRecorded(message) = refusal else { panic!("{refusal:?}") };
+        let TerminalizeRefusal::NotRecorded(message) = refusal else {
+            panic!("{refusal:?}")
+        };
         assert!(message.contains("may reappear"), "{message}");
         assert!(!message.contains("still there"), "{message}");
-        assert!(!world.tasks.read().await.contains_key(&id), "memory follows the file");
-        assert!(!world.storage.load_project_tasks(world.project_id).unwrap().iter().any(|t| t.id == id));
+        assert!(
+            !world.tasks.read().await.contains_key(&id),
+            "memory follows the file"
+        );
+        assert!(!world
+            .storage
+            .load_project_tasks(world.project_id)
+            .unwrap()
+            .iter()
+            .any(|t| t.id == id));
 
         record(&world.tasks, &world.storage, sibling_id, &|staged| {
             staged.get_mut(&sibling_id).unwrap().title = "sibling renamed".into();
@@ -2915,12 +3301,19 @@ mod tests {
         .await
         .expect("the next save completes");
         assert!(
-            !world.storage.load_project_tasks(world.project_id).unwrap().iter().any(|t| t.id == id),
+            !world
+                .storage
+                .load_project_tasks(world.project_id)
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id),
             "the deleted Task is not written back"
         );
     }
 
-    fn integration_record(state: crate::domain::IntegrationState) -> crate::domain::LocalIntegration {
+    fn integration_record(
+        state: crate::domain::IntegrationState,
+    ) -> crate::domain::LocalIntegration {
         crate::domain::LocalIntegration {
             state,
             target_branch: "main".into(),
@@ -2948,7 +3341,10 @@ mod tests {
 
     async fn persist_board(world: &World) {
         let board: Vec<Task> = world.tasks.read().await.values().cloned().collect();
-        world.storage.save_project_tasks(world.project_id, &board).expect("persist the record");
+        world
+            .storage
+            .save_project_tasks(world.project_id, &board)
+            .expect("persist the record");
     }
 
     /// A pending local integration is the only record of a Git operation that
@@ -2963,10 +3359,18 @@ mod tests {
             let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
             let (id, sibling) = seed(&world, status.clone(), Some(&wt)).await;
             let record = integration_record(crate::domain::IntegrationState::Pending);
-            world.tasks.write().await.get_mut(&id).unwrap().local_integration = Some(record.clone());
+            world
+                .tasks
+                .write()
+                .await
+                .get_mut(&id)
+                .unwrap()
+                .local_integration = Some(record.clone());
             persist_board(&world).await;
 
-            let refusal = delete(world.ctx(), id).await.expect_err("the record must not be destroyed");
+            let refusal = delete(world.ctx(), id)
+                .await
+                .expect_err("the record must not be destroyed");
 
             assert!(
                 matches!(refusal, TerminalizeRefusal::DeleteBlockedByIntegration),
@@ -2974,10 +3378,20 @@ mod tests {
             );
             for after in [world.task(id).await, world.persisted(id)] {
                 assert_eq!(after.local_integration, Some(record.clone()), "{status:?}");
-                assert_eq!(after.worktree_path.as_deref(), Some(wt.as_str()), "{status:?}");
-                assert!(!after.cleanup_in_flight, "{status:?}: nothing was announced");
+                assert_eq!(
+                    after.worktree_path.as_deref(),
+                    Some(wt.as_str()),
+                    "{status:?}"
+                );
+                assert!(
+                    !after.cleanup_in_flight,
+                    "{status:?}: nothing was announced"
+                );
             }
-            assert!(std::path::Path::new(&wt).exists(), "{status:?}: the checkout survives");
+            assert!(
+                std::path::Path::new(&wt).exists(),
+                "{status:?}: the checkout survives"
+            );
             assert!(world.tasks.read().await.contains_key(&sibling));
         }
     }
@@ -2989,13 +3403,27 @@ mod tests {
             let world = world(true);
             let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
             let (id, _) = seed(&world, status.clone(), Some(&wt)).await;
-            world.tasks.write().await.get_mut(&id).unwrap().pending_republish = Some(pending_restack());
+            world
+                .tasks
+                .write()
+                .await
+                .get_mut(&id)
+                .unwrap()
+                .pending_republish = Some(pending_restack());
             persist_board(&world).await;
 
-            let refusal = delete(world.ctx(), id).await.expect_err("the restack's recovery needs it");
+            let refusal = delete(world.ctx(), id)
+                .await
+                .expect_err("the restack's recovery needs it");
 
-            assert!(matches!(refusal, TerminalizeRefusal::RepublishPending), "{status:?}: {refusal:?}");
-            assert!(world.persisted(id).pending_republish.is_some(), "{status:?}");
+            assert!(
+                matches!(refusal, TerminalizeRefusal::RepublishPending),
+                "{status:?}: {refusal:?}"
+            );
+            assert!(
+                world.persisted(id).pending_republish.is_some(),
+                "{status:?}"
+            );
             assert!(std::path::Path::new(&wt).exists(), "{status:?}");
         }
     }
@@ -3004,16 +3432,33 @@ mod tests {
     /// owed, and the Project-deletion predicate's other reasons (an ordinary
     /// checkout, an interrupted cleanup) are exactly what a Task delete is for.
     #[tokio::test]
-    async fn a_finished_integration_an_ordinary_checkout_and_an_interrupted_cleanup_do_not_block_a_delete() {
+    async fn a_finished_integration_an_ordinary_checkout_and_an_interrupted_cleanup_do_not_block_a_delete(
+    ) {
         for (label, prepare) in [
-            ("integrated", Some(integration_record(crate::domain::IntegrationState::Integrated))),
+            (
+                "integrated",
+                Some(integration_record(
+                    crate::domain::IntegrationState::Integrated,
+                )),
+            ),
             ("ordinary checkout", None),
         ] {
             let world = world(true);
             let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
             let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
-            world.tasks.write().await.get_mut(&id).unwrap().local_integration = prepare;
-            assert!(delete(world.ctx(), id).await.unwrap_or_else(|e| panic!("{label}: {e}")), "{label}");
+            world
+                .tasks
+                .write()
+                .await
+                .get_mut(&id)
+                .unwrap()
+                .local_integration = prepare;
+            assert!(
+                delete(world.ctx(), id)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: {e}")),
+                "{label}"
+            );
             assert!(!std::path::Path::new(&wt).exists(), "{label}");
         }
 
@@ -3021,8 +3466,16 @@ mod tests {
         let world = world(true);
         let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
         let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
-        world.tasks.write().await.get_mut(&id).unwrap().cleanup_in_flight = true;
-        assert!(delete(world.ctx(), id).await.expect("an explicit delete retries the cleanup"));
+        world
+            .tasks
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .cleanup_in_flight = true;
+        assert!(delete(world.ctx(), id)
+            .await
+            .expect("an explicit delete retries the cleanup"));
         assert!(!std::path::Path::new(&wt).exists());
         assert!(!world.tasks.read().await.contains_key(&id));
     }
@@ -3043,11 +3496,9 @@ mod tests {
     #[tokio::test]
     async fn a_delete_of_a_task_that_is_not_there_is_not_a_failure() {
         let world = world(true);
-        assert!(
-            !delete(world.ctx(), Uuid::new_v4())
-                .await
-                .expect("asking for something already gone is not an error"),
-        );
+        assert!(!delete(world.ctx(), Uuid::new_v4())
+            .await
+            .expect("asking for something already gone is not an error"),);
     }
 
     #[tokio::test]
@@ -3132,18 +3583,31 @@ mod tests {
         let existing_id = existing.id;
         let mut existing = existing;
         existing.project_id = world.project_id;
-        world.storage.save_project_tasks(world.project_id, &[existing.clone()]).unwrap();
+        world
+            .storage
+            .save_project_tasks(world.project_id, &[existing.clone()])
+            .unwrap();
         world.tasks.write().await.insert(existing_id, existing);
 
-        let file = world.storage_paths.legacy_tasks_dir().join(format!("{}.toml", world.project_id));
+        let file = world
+            .storage_paths
+            .legacy_tasks_dir()
+            .join(format!("{}.toml", world.project_id));
         let damaged = b"tasks = [ not toml".to_vec();
         std::fs::write(&file, &damaged).unwrap();
 
-        let created = create(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, |_| {
-            let mut t = crate::test_helpers::create_test_task("New");
-            t.project_id = world.project_id;
-            t
-        })
+        let created = create(
+            &world.gate,
+            &world.tasks,
+            &world.projects,
+            &world.storage,
+            world.project_id,
+            |_| {
+                let mut t = crate::test_helpers::create_test_task("New");
+                t.project_id = world.project_id;
+                t
+            },
+        )
         .await;
         let message = created.expect_err("create must not report success");
         assert!(message.contains("will not overwrite"), "{message}");
@@ -3158,7 +3622,16 @@ mod tests {
 
         let mut imported = crate::test_helpers::create_test_task("Imported");
         imported.project_id = world.project_id;
-        assert!(create_batch(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, &[imported]).await.is_err());
+        assert!(create_batch(
+            &world.gate,
+            &world.tasks,
+            &world.projects,
+            &world.storage,
+            world.project_id,
+            &[imported]
+        )
+        .await
+        .is_err());
 
         let board = world.tasks.read().await;
         assert_eq!(board.len(), 1, "no refused change may appear on the board");
@@ -3191,11 +3664,18 @@ mod tests {
                 updated_at: chrono::Utc::now(),
             },
         );
-        let ok = create(&world.gate, &world.tasks, &world.projects, &world.storage, other, |_| {
-            let mut t = crate::test_helpers::create_test_task("Elsewhere");
-            t.project_id = other;
-            t
-        })
+        let ok = create(
+            &world.gate,
+            &world.tasks,
+            &world.projects,
+            &world.storage,
+            other,
+            |_| {
+                let mut t = crate::test_helpers::create_test_task("Elsewhere");
+                t.project_id = other;
+                t
+            },
+        )
         .await;
         assert!(ok.is_ok());
     }
@@ -3209,7 +3689,16 @@ mod tests {
         let mut existing = crate::test_helpers::create_test_task("Existing");
         existing.project_id = world.project_id;
         let existing_id = existing.id;
-        create_batch(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, &[existing]).await.unwrap();
+        create_batch(
+            &world.gate,
+            &world.tasks,
+            &world.projects,
+            &world.storage,
+            world.project_id,
+            &[existing],
+        )
+        .await
+        .unwrap();
 
         let batch: Vec<Task> = ["One", "Two", "Three"]
             .iter()
@@ -3221,7 +3710,16 @@ mod tests {
                 t
             })
             .collect();
-        create_batch(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, &batch).await.unwrap();
+        create_batch(
+            &world.gate,
+            &world.tasks,
+            &world.projects,
+            &world.storage,
+            world.project_id,
+            &batch,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(world.tasks.read().await.len(), 4);
         let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();

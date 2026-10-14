@@ -116,7 +116,10 @@ pub async fn build_state_with_paths(
     // is brought into range rather than trusted.
     let (queue_config, queue_warning) = loaded_config.queue.clone().bounded();
     if let Some(warning) = queue_warning {
-        eprintln!("Warning: saved Queue settings: {warning}; running with {}", queue_config.parallel_task_limit);
+        eprintln!(
+            "Warning: saved Queue settings: {warning}; running with {}",
+            queue_config.parallel_task_limit
+        );
     }
     let queue_state = commands::queue::QueueState::new(task_state.tasks.clone(), queue_config);
     let project_state = commands::project::ProjectState::new();
@@ -229,8 +232,16 @@ pub async fn build_state_with_paths(
     // fails the records are kept and the cleanup waits for a later start.
     let mut projects_are_authoritative = projects_are_authoritative;
     if projects_are_authoritative {
-        let owed = app_state.storage.pending_project_conversation_deletions().map(|p| !p.is_empty()).unwrap_or(true)
-            || app_state.storage.pending_project_tasks_deletions().map(|p| !p.is_empty()).unwrap_or(true);
+        let owed = app_state
+            .storage
+            .pending_project_conversation_deletions()
+            .map(|p| !p.is_empty())
+            .unwrap_or(true)
+            || app_state
+                .storage
+                .pending_project_tasks_deletions()
+                .map(|p| !p.is_empty())
+                .unwrap_or(true);
         if owed {
             if let Err(error) = app_state.storage.reconfirm_config_durable() {
                 eprintln!(
@@ -250,7 +261,8 @@ pub async fn build_state_with_paths(
                 let projects = app_state.project.projects.read().await;
                 for project_id in pending {
                     if projects.contains_key(&project_id) {
-                        if let Err(error) = app_state.storage
+                        if let Err(error) = app_state
+                            .storage
                             .clear_project_conversation_deletion_pending(project_id)
                         {
                             eprintln!("Warning: Failed to clear uncommitted Project deletion record for {project_id}: {error}");
@@ -259,19 +271,27 @@ pub async fn build_state_with_paths(
                             ));
                         }
                     } else {
-                        let result = app_state.storage.delete_project_conversation(project_id)
-                            .and_then(|()| app_state.storage.clear_project_conversation_deletion_pending(project_id));
+                        let result = app_state
+                            .storage
+                            .delete_project_conversation(project_id)
+                            .and_then(|()| {
+                                app_state
+                                    .storage
+                                    .clear_project_conversation_deletion_pending(project_id)
+                            });
                         if let Err(error) = result {
                             eprintln!("Warning: Project Conversation cleanup remains pending for {project_id}: {error}");
-                            report.project_conversation_cleanup_failures.push(format!(
-                                "{project_id}: {error}"
-                            ));
+                            report
+                                .project_conversation_cleanup_failures
+                                .push(format!("{project_id}: {error}"));
                         }
                     }
                 }
             }
             Err(error) => {
-                eprintln!("Warning: Failed to discover pending Project Conversation cleanup: {error}");
+                eprintln!(
+                    "Warning: Failed to discover pending Project Conversation cleanup: {error}"
+                );
                 report.project_conversation_cleanup_failures.push(format!(
                     "could not discover pending cleanup records: {error}"
                 ));
@@ -295,7 +315,8 @@ pub async fn build_state_with_paths(
                 for record in pending {
                     let project_id = record.project_id;
                     if projects.contains_key(&project_id) {
-                        if let Err(error) = app_state.storage
+                        if let Err(error) = app_state
+                            .storage
                             .clear_project_tasks_deletion_pending(project_id)
                         {
                             eprintln!("Warning: Failed to clear uncommitted Project Task deletion record for {project_id}: {error}");
@@ -304,14 +325,19 @@ pub async fn build_state_with_paths(
                             ));
                         }
                     } else {
-                        let result = app_state.storage
+                        let result = app_state
+                            .storage
                             .delete_task_files(&record.board_files)
-                            .and_then(|()| app_state.storage.clear_project_tasks_deletion_pending(project_id));
+                            .and_then(|()| {
+                                app_state
+                                    .storage
+                                    .clear_project_tasks_deletion_pending(project_id)
+                            });
                         if let Err(error) = result {
                             eprintln!("Warning: Project Task cleanup remains pending for {project_id}: {error}");
-                            report.project_tasks_cleanup_failures.push(format!(
-                                "{project_id}: {error}"
-                            ));
+                            report
+                                .project_tasks_cleanup_failures
+                                .push(format!("{project_id}: {error}"));
                         }
                     }
                 }
@@ -366,6 +392,18 @@ pub async fn build_state_with_paths(
         let mut porcelain_cache: HashMap<String, Option<String>> = HashMap::new();
 
         for task in tasks.values_mut() {
+            // The executor's recovery gate must inspect the original Task
+            // Checkout registration, path and branch as one predicate. Do
+            // not let generic startup reconciliation clear or reattach any
+            // path while an exact Worker handoff is pending or ambiguous.
+            if task.worker_handoff.as_ref().is_some_and(|handoff| {
+                !matches!(
+                    &handoff.stage,
+                    domain::task::WorkerHandoffStage::ResolvedToAiReview { .. }
+                ) || !task.worker_handoff_confirmed
+            }) {
+                continue;
+            }
             let Some(wt_path) = task.worktree_path.clone() else {
                 // No checkout recorded, so an interrupted cleanup has nothing
                 // left to be interrupted about: the flag is stale.
@@ -506,7 +544,9 @@ pub async fn build_state_with_paths(
             };
 
             match recovery {
-                worktree::WorktreeRecovery::Adopt(path) if shared_branch_owner.contains_key(&task.id) => {
+                worktree::WorktreeRecovery::Adopt(path)
+                    if shared_branch_owner.contains_key(&task.id) =>
+                {
                     let other = shared_branch_owner[&task.id];
                     let branch = task.branch_name.as_deref().unwrap_or_default();
                     eprintln!(
@@ -548,7 +588,11 @@ pub async fn build_state_with_paths(
                 // task says what only the user may do. Nothing is run against
                 // git: unlocking is the user's decision. The next start after
                 // they do reconciles the task like any other missing checkout.
-                worktree::WorktreeRecovery::Locked { path, branch, reason } => {
+                worktree::WorktreeRecovery::Locked {
+                    path,
+                    branch,
+                    reason,
+                } => {
                     let repo = repo_for_project
                         .get(&task.project_id)
                         .map(String::as_str)
@@ -664,7 +708,10 @@ const GIT_LIST_FAILED: &str = "`git worktree list` could not be run";
 /// miss blocked the current worker until git exited. Wrapping the one
 /// blocking call site rather than the whole loop keeps every other line here
 /// -- including the `tasks` write guard held across it -- exactly as it was.
-async fn cached_porcelain(cache: &mut HashMap<String, Option<String>>, repo: &str) -> Option<String> {
+async fn cached_porcelain(
+    cache: &mut HashMap<String, Option<String>>,
+    repo: &str,
+) -> Option<String> {
     if !cache.contains_key(repo) {
         let repo_owned = repo.to_string();
         let listed = match tokio::task::spawn_blocking(move || {
@@ -715,20 +762,54 @@ fn migrate_task(task: &mut Task) -> bool {
         changed = true;
     }
 
-    // A task left mid-flight by a crash has no agent behind it any more.
-    // Returning it to the queue is what makes a restart resume work rather
-    // than stall on a task nothing is driving.
-    if matches!(
-        task.status,
-        domain::TaskStatus::InProgress | domain::TaskStatus::AiReview
-    ) {
-        println!(
-            "SlashIt: Resetting orphaned task '{}' from {:?} back to Queue",
-            task.title, task.status
+    // A completed commit handoff is resolved by TaskExecutor before review or
+    // coding eligibility. An uncommitted/legacy interrupted Worker is held for
+    // the user, because startup cannot prove that another provider is safe.
+    if task.status == domain::TaskStatus::InProgress {
+        let run = task.next_run().checked_sub(1).filter(|run| {
+            task.activity.iter().any(|entry| matches!(entry.kind, domain::task::ActivityKind::RunStarted { run: started, .. } if started == *run))
+                && !task.activity.iter().any(|entry| matches!(entry.kind,
+                    domain::task::ActivityKind::RunCompleted { run: ended }
+                    | domain::task::ActivityKind::RunFailed { run: Some(ended), .. } if ended == *run))
+        });
+        match task.worker_handoff.as_ref().map(|h| &h.stage) {
+            Some(domain::task::WorkerHandoffStage::CommittedAwaitingReview { .. }) => {}
+            Some(domain::task::WorkerHandoffStage::RecoveryRequired { .. }) => {}
+            Some(domain::task::WorkerHandoffStage::Started) => {
+                mark_worker_recovery_required(task, run, "The Worker start was recorded, but its provider and Git outcome were not durably recorded. The Task Checkout was preserved; inspect it before any new attempt.");
+                changed = true;
+            }
+            Some(domain::task::WorkerHandoffStage::ResolvedToAiReview { .. }) => {}
+            None if run.is_some() || task.phase == domain::TaskPhase::Coding => {
+                mark_worker_recovery_required(task, run, "This older interrupted Worker has no exact per-run branch HEAD or commit evidence. Its changes cannot be attributed safely; inspect the preserved Task Checkout.");
+                changed = true;
+            }
+            None => {
+                // A task promoted to InProgress but not yet durably started a
+                // Worker remains eligible through the ordinary queue path.
+                let from = task.status.column();
+                task.status = domain::TaskStatus::Queue;
+                task.record_activity(domain::task::ActivityKind::Interrupted { from });
+                changed = true;
+            }
+        }
+    }
+
+    // A prior runtime may have recorded a failure while the exact run stage
+    // was still Started. Preserve it even when its status is already Error;
+    // startup must never turn that record back into an ordinary Retry.
+    if task.status != domain::TaskStatus::InProgress
+        && matches!(
+            task.worker_handoff.as_ref().map(|handoff| &handoff.stage),
+            Some(domain::task::WorkerHandoffStage::Started)
+        )
+    {
+        let run = task.worker_handoff.as_ref().and_then(|handoff| handoff.run);
+        mark_worker_recovery_required(
+            task,
+            run,
+            "The previous Worker ended before its provider and Git outcome were durably confirmed. Its Task Checkout was preserved for inspection.",
         );
-        let from = task.status.column();
-        task.status = domain::TaskStatus::Queue;
-        task.record_activity(domain::task::ActivityKind::Interrupted { from });
         changed = true;
     }
 
@@ -748,6 +829,49 @@ fn migrate_task(task: &mut Task) -> bool {
     }
 
     changed
+}
+
+fn mark_worker_recovery_required(task: &mut Task, run: Option<u32>, reason: &str) {
+    let observed_commit = task
+        .worker_handoff
+        .as_ref()
+        .and_then(|handoff| match &handoff.stage {
+            domain::task::WorkerHandoffStage::CommittedAwaitingReview { commit }
+            | domain::task::WorkerHandoffStage::ResolvedToAiReview { commit } => {
+                Some(commit.clone())
+            }
+            domain::task::WorkerHandoffStage::RecoveryRequired {
+                observed_commit, ..
+            } => observed_commit.clone(),
+            domain::task::WorkerHandoffStage::Started => None,
+        });
+    let handoff = task
+        .worker_handoff
+        .get_or_insert(domain::task::WorkerHandoff {
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run,
+            branch: task.branch_name.clone(),
+            start_head: None,
+            stage: domain::task::WorkerHandoffStage::RecoveryRequired {
+                reason: reason.to_string(),
+                observed_commit: observed_commit.clone(),
+            },
+        });
+    handoff.run = run.or(handoff.run);
+    handoff.stage = domain::task::WorkerHandoffStage::RecoveryRequired {
+        reason: reason.to_string(),
+        observed_commit,
+    };
+    task.status = domain::TaskStatus::Error;
+    task.phase = domain::TaskPhase::Idle;
+    task.phase_progress = 0;
+    task.error_message = Some(reason.to_string());
+    task.record_activity(domain::task::ActivityKind::RecoveryRequired {
+        run,
+        reason: reason.to_string(),
+    });
 }
 
 #[cfg(test)]
@@ -799,12 +923,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = test_paths(&tmp);
         let seed = Storage::with_paths((*paths).clone());
-        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        seed.save_config(&config::storage::AppConfig::default())
+            .unwrap();
         let project_id = uuid::Uuid::new_v4();
         let conversation = seed.create_primary_conversation(project_id).unwrap();
         let pointer = paths.primary_conversation_file(project_id);
         let document = paths.conversation_file(conversation.id);
-        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+        seed.mark_project_conversation_deletion_pending(project_id)
+            .unwrap();
 
         let fault = slashit_durable_fs::fault::fail_at_file(
             slashit_durable_fs::Stage::SyncDirectory,
@@ -813,10 +939,18 @@ mod tests {
         );
         let (_state, report) = build_state_with_paths(paths.clone()).await.unwrap();
         drop(fault);
-        assert!(pointer.exists() && document.exists(), "nothing is deleted on an unconfirmed absence");
-        assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
         assert!(
-            report.project_conversation_cleanup_failures.iter().any(|f| f.contains("not confirmed durable")),
+            pointer.exists() && document.exists(),
+            "nothing is deleted on an unconfirmed absence"
+        );
+        assert!(paths
+            .pending_project_conversation_deletion_file(project_id)
+            .exists());
+        assert!(
+            report
+                .project_conversation_cleanup_failures
+                .iter()
+                .any(|f| f.contains("not confirmed durable")),
             "{:?}",
             report.project_conversation_cleanup_failures
         );
@@ -824,7 +958,9 @@ mod tests {
         // The next start confirms the configuration, then finishes.
         let (_state, _report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert!(!pointer.exists() && !document.exists());
-        assert!(!paths.pending_project_conversation_deletion_file(project_id).exists());
+        assert!(!paths
+            .pending_project_conversation_deletion_file(project_id)
+            .exists());
     }
 
     /// On a filesystem that cannot synchronize a directory the configuration is
@@ -835,12 +971,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = test_paths(&tmp);
         let seed = Storage::with_paths((*paths).clone());
-        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        seed.save_config(&config::storage::AppConfig::default())
+            .unwrap();
         let project_id = uuid::Uuid::new_v4();
         let conversation = seed.create_primary_conversation(project_id).unwrap();
         let pointer = paths.primary_conversation_file(project_id);
         let document = paths.conversation_file(conversation.id);
-        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+        seed.mark_project_conversation_deletion_pending(project_id)
+            .unwrap();
 
         let _fault = slashit_durable_fs::fault::fail_every(
             slashit_durable_fs::Stage::SyncDirectory,
@@ -848,10 +986,18 @@ mod tests {
         );
         for _ in 0..2 {
             let (_state, report) = build_state_with_paths(paths.clone()).await.unwrap();
-            assert!(pointer.exists() && document.exists(), "nothing is deleted on an unprovable absence");
-            assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
             assert!(
-                report.project_conversation_cleanup_failures.iter().any(|f| f.contains("not confirmed durable")),
+                pointer.exists() && document.exists(),
+                "nothing is deleted on an unprovable absence"
+            );
+            assert!(paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists());
+            assert!(
+                report
+                    .project_conversation_cleanup_failures
+                    .iter()
+                    .any(|f| f.contains("not confirmed durable")),
                 "{:?}",
                 report.project_conversation_cleanup_failures
             );
@@ -863,13 +1009,15 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = test_paths(&tmp);
         let seed = Storage::with_paths((*paths).clone());
-        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        seed.save_config(&config::storage::AppConfig::default())
+            .unwrap();
         let project_id = uuid::Uuid::new_v4();
         let conversation = seed.create_primary_conversation(project_id).unwrap();
         let pointer = paths.primary_conversation_file(project_id);
         let document = paths.conversation_file(conversation.id);
         std::fs::write(&document, "malformed Conversation").unwrap();
-        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+        seed.mark_project_conversation_deletion_pending(project_id)
+            .unwrap();
 
         // First fresh AppState models restart after committed deletion. The
         // malformed document blocks cleanup, so the durable retry record must
@@ -877,10 +1025,17 @@ mod tests {
         let (first_state, first_report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert_eq!(first_report.projects, 0);
         assert_eq!(first_report.project_conversation_cleanup_failures.len(), 1);
-        assert!(!first_state.project.projects.read().await.contains_key(&project_id));
+        assert!(!first_state
+            .project
+            .projects
+            .read()
+            .await
+            .contains_key(&project_id));
         assert!(pointer.exists());
         assert!(document.exists());
-        assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
+        assert!(paths
+            .pending_project_conversation_deletion_file(project_id)
+            .exists());
 
         // Repair the unreadable document, then a later restart retries and
         // finishes the same deletion.
@@ -889,19 +1044,26 @@ mod tests {
 
         assert_eq!(report.projects, 0);
         assert!(report.project_conversation_cleanup_failures.is_empty());
-        assert!(!state.project.projects.read().await.contains_key(&project_id));
+        assert!(!state
+            .project
+            .projects
+            .read()
+            .await
+            .contains_key(&project_id));
         assert!(!pointer.exists());
         assert!(!document.exists());
-        assert!(!paths.pending_project_conversation_deletion_file(project_id).exists());
+        assert!(!paths
+            .pending_project_conversation_deletion_file(project_id)
+            .exists());
     }
-
 
     #[tokio::test]
     async fn startup_retries_a_committed_project_task_cleanup_with_recorded_board_files() {
         let tmp = TempDir::new().unwrap();
         let paths = test_paths(&tmp);
         let seed = Storage::with_paths((*paths).clone());
-        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        seed.save_config(&config::storage::AppConfig::default())
+            .unwrap();
         let project_id = uuid::Uuid::new_v4();
         // A routed board file recorded by the committed deletion.
         let routed = tmp.path().join("state").join("routed").join("tasks.toml");
@@ -909,7 +1071,10 @@ mod tests {
         std::fs::write(&routed, "tasks = []").unwrap();
         seed.mark_project_tasks_deletion_pending(
             project_id,
-            &[routed.clone(), seed.tasks_board_files(project_id).pop().unwrap()],
+            &[
+                routed.clone(),
+                seed.tasks_board_files(project_id).pop().unwrap(),
+            ],
         )
         .unwrap();
 
@@ -918,14 +1083,29 @@ mod tests {
         // routed to anymore.
         let (state, report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert_eq!(report.projects, 0);
-        assert!(report.project_tasks_cleanup_failures.is_empty(), "{:?}", report.project_tasks_cleanup_failures);
+        assert!(
+            report.project_tasks_cleanup_failures.is_empty(),
+            "{:?}",
+            report.project_tasks_cleanup_failures
+        );
         assert!(!routed.exists());
-        assert!(!state.project.projects.read().await.contains_key(&project_id));
-        assert!(!paths.pending_project_tasks_deletion_file(project_id).exists());
+        assert!(!state
+            .project
+            .projects
+            .read()
+            .await
+            .contains_key(&project_id));
+        assert!(!paths
+            .pending_project_tasks_deletion_file(project_id)
+            .exists());
         // The legacy candidate that never existed was a no-op.
         let (second, report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert!(report.project_tasks_cleanup_failures.is_empty());
-        assert!(!second.storage.paths().pending_project_tasks_deletion_file(project_id).exists());
+        assert!(!second
+            .storage
+            .paths()
+            .pending_project_tasks_deletion_file(project_id)
+            .exists());
     }
 
     #[tokio::test]
@@ -940,13 +1120,23 @@ mod tests {
         let board = seed.tasks_board_files(project_id);
         std::fs::create_dir_all(board[0].parent().unwrap()).unwrap();
         std::fs::write(&board[0], "tasks = []").unwrap();
-        seed.mark_project_tasks_deletion_pending(project_id, &board).unwrap();
+        seed.mark_project_tasks_deletion_pending(project_id, &board)
+            .unwrap();
 
         let (state, report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert_eq!(report.projects, 1);
-        assert!(report.project_tasks_cleanup_failures.is_empty(), "{:?}", report.project_tasks_cleanup_failures);
-        assert!(board[0].exists(), "an uncommitted deletion must not delete Task records");
-        assert!(!paths.pending_project_tasks_deletion_file(project_id).exists());
+        assert!(
+            report.project_tasks_cleanup_failures.is_empty(),
+            "{:?}",
+            report.project_tasks_cleanup_failures
+        );
+        assert!(
+            board[0].exists(),
+            "an uncommitted deletion must not delete Task records"
+        );
+        assert!(!paths
+            .pending_project_tasks_deletion_file(project_id)
+            .exists());
         assert!(!state.project.projects.read().await.is_empty());
     }
 
@@ -982,23 +1172,31 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = test_paths(&tmp);
         let seed = Storage::with_paths((*paths).clone());
-        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        seed.save_config(&config::storage::AppConfig::default())
+            .unwrap();
         let project_id = uuid::Uuid::new_v4();
         let conversation = seed.create_primary_conversation(project_id).unwrap();
         let pointer = paths.primary_conversation_file(project_id);
         let document = paths.conversation_file(conversation.id);
-        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+        seed.mark_project_conversation_deletion_pending(project_id)
+            .unwrap();
 
         // `load_config` salvages this structurally invalid section as an Ok
         // partial default, but absence of Projects is not authoritative.
-        std::fs::write(paths.config_file(), "[worktree]\nplacement = \"shared_root\"\n").unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "[worktree]\nplacement = \"shared_root\"\n",
+        )
+        .unwrap();
         assert!(seed.load_config_strict().is_err());
 
         let (_state, _report) = build_state_with_paths(paths.clone()).await.unwrap();
 
         assert!(pointer.exists());
         assert!(document.exists());
-        assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
+        assert!(paths
+            .pending_project_conversation_deletion_file(project_id)
+            .exists());
     }
 
     #[tokio::test]
@@ -1006,12 +1204,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = test_paths(&tmp);
         let seed = Storage::with_paths((*paths).clone());
-        seed.save_config(&config::storage::AppConfig::default()).unwrap();
+        seed.save_config(&config::storage::AppConfig::default())
+            .unwrap();
         let project_id = uuid::Uuid::new_v4();
         let conversation = seed.create_primary_conversation(project_id).unwrap();
         let pointer = paths.primary_conversation_file(project_id);
         let document = paths.conversation_file(conversation.id);
-        seed.mark_project_conversation_deletion_pending(project_id).unwrap();
+        seed.mark_project_conversation_deletion_pending(project_id)
+            .unwrap();
 
         // A syntactically valid config still cannot prove Project absence if
         // it predates or lost the projects section; serde would default it.
@@ -1021,7 +1221,9 @@ mod tests {
 
         assert!(pointer.exists());
         assert!(document.exists());
-        assert!(paths.pending_project_conversation_deletion_file(project_id).exists());
+        assert!(paths
+            .pending_project_conversation_deletion_file(project_id)
+            .exists());
     }
 
     #[tokio::test]
@@ -1082,10 +1284,7 @@ mod tests {
             domain::TaskPhase::Coding,
             "default",
         );
-        let task = Task {
-            project_id,
-            ..task
-        };
+        let task = Task { project_id, ..task };
         let task_id = task.id;
 
         let seed_storage = Storage::with_paths((*paths).clone());
@@ -1106,7 +1305,10 @@ mod tests {
         // Seed the task at the *legacy* path directly, bypassing
         // `save_project_tasks` (which would write to the now-routable path
         // instead).
-        let legacy_file = paths.config_dir().join("tasks").join(format!("{project_id}.toml"));
+        let legacy_file = paths
+            .config_dir()
+            .join("tasks")
+            .join(format!("{project_id}.toml"));
         std::fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
         let legacy_contents = toml::to_string_pretty(&config::storage::ProjectTasksFile {
             version: 1,
@@ -1144,8 +1346,8 @@ mod tests {
             let published = tasks.get(&task_id).expect("task must still be published");
             assert_eq!(
                 published.status,
-                domain::TaskStatus::Queue,
-                "the recovered state must still be published even though it could not be saved"
+                domain::TaskStatus::Error,
+                "an old interrupted Worker without exact evidence stays held for recovery"
             );
             published.clone()
         };
@@ -1219,10 +1421,7 @@ mod tests {
             domain::TaskPhase::Coding,
             "default",
         );
-        let task = Task {
-            project_id,
-            ..task
-        };
+        let task = Task { project_id, ..task };
         let task_id = task.id;
 
         let seed_storage = Storage::with_paths((*paths).clone());
@@ -1245,7 +1444,10 @@ mod tests {
         // above, nothing occupies that path: the save must reach its replace
         // and fail only at the directory sync. The fault is narrowed to the
         // board file so every other durable write of the start-up runs.
-        let legacy_file = paths.config_dir().join("tasks").join(format!("{project_id}.toml"));
+        let legacy_file = paths
+            .config_dir()
+            .join("tasks")
+            .join(format!("{project_id}.toml"));
         std::fs::create_dir_all(legacy_file.parent().unwrap()).unwrap();
         let legacy_contents = toml::to_string_pretty(&config::storage::ProjectTasksFile {
             version: 1,
@@ -1285,23 +1487,30 @@ mod tests {
         );
 
         let on_disk: config::storage::ProjectTasksFile = {
-            let bytes = std::fs::read_to_string(&routed_file).expect("the routed board was written");
+            let bytes =
+                std::fs::read_to_string(&routed_file).expect("the routed board was written");
             toml::from_str(&bytes).expect("the written board parses")
         };
         assert_eq!(on_disk.tasks.len(), 1);
         assert_eq!(on_disk.tasks[0].id, task_id);
         assert_eq!(
             on_disk.tasks[0].status,
-            domain::TaskStatus::Queue,
-            "the file holds the reconciled board, so a restart reads the recovery even \
-             though the save's durability was never confirmed"
+            domain::TaskStatus::Error,
+            "the file holds a durable recovery requirement for this old run"
         );
 
         let recovered = {
             let tasks = state.task.tasks.read().await;
-            tasks.get(&task_id).expect("task is still published").clone()
+            tasks
+                .get(&task_id)
+                .expect("task is still published")
+                .clone()
         };
-        assert_eq!(recovered.status, domain::TaskStatus::Queue);
+        assert_eq!(recovered.status, domain::TaskStatus::Error);
+        assert!(matches!(
+            recovered.worker_handoff.as_ref().map(|h| &h.stage),
+            Some(domain::task::WorkerHandoffStage::RecoveryRequired { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1315,20 +1524,19 @@ mod tests {
     }
 
     #[test]
-    fn an_orphaned_in_progress_task_returns_to_the_queue() {
+    fn an_orphaned_legacy_worker_is_held_for_recovery_without_replaying() {
         let mut task = task_with(
             domain::TaskStatus::InProgress,
             domain::TaskPhase::Coding,
             "default",
         );
         assert!(migrate_task(&mut task));
-        assert_eq!(task.status, domain::TaskStatus::Queue);
-        // Queue implies Idle, so the phase reset applies in the same pass.
+        assert_eq!(task.status, domain::TaskStatus::Error);
         assert_eq!(task.phase, domain::TaskPhase::Idle);
-        // The run the restart abandoned stays visible on the timeline.
+        // The missing per-run evidence is stated, not guessed from base_commit.
         assert_eq!(
             task.activity.iter().map(|e| e.kind.clone()).collect::<Vec<_>>(),
-            [domain::task::ActivityKind::Interrupted { from: domain::task::ActivityColumn::InProgress }]
+            [domain::task::ActivityKind::RecoveryRequired { run: None, reason: "This older interrupted Worker has no exact per-run branch HEAD or commit evidence. Its changes cannot be attributed safely; inspect the preserved Task Checkout.".into() }]
         );
         // A second pass finds nothing left to do and records nothing more.
         assert!(!migrate_task(&mut task));
@@ -1336,14 +1544,47 @@ mod tests {
     }
 
     #[test]
-    fn an_orphaned_ai_review_task_returns_to_the_queue() {
+    fn an_orphaned_ai_review_keeps_its_stage_and_is_not_requeued_as_coding() {
         let mut task = task_with(
             domain::TaskStatus::AiReview,
             domain::TaskPhase::QaReview,
             "default",
         );
-        assert!(migrate_task(&mut task));
-        assert_eq!(task.status, domain::TaskStatus::Queue);
+        assert!(!migrate_task(&mut task));
+        assert_eq!(task.status, domain::TaskStatus::AiReview);
+    }
+
+    #[test]
+    fn an_exact_committed_handoff_survives_startup_migration_for_executor_reconciliation() {
+        let mut task = task_with(
+            domain::TaskStatus::InProgress,
+            domain::TaskPhase::Coding,
+            "default",
+        );
+        let run = task.next_run();
+        task.record_activity(domain::task::ActivityKind::RunStarted {
+            run,
+            addressing_feedback: false,
+        });
+        task.worker_handoff = Some(domain::task::WorkerHandoff {
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run: Some(run),
+            branch: Some("task/example".into()),
+            start_head: Some("a".repeat(40)),
+            stage: domain::task::WorkerHandoffStage::CommittedAwaitingReview {
+                commit: "b".repeat(40),
+            },
+        });
+
+        assert!(!migrate_task(&mut task));
+        assert_eq!(task.status, domain::TaskStatus::InProgress);
+        assert!(matches!(
+            task.worker_handoff.as_ref().unwrap().stage,
+            domain::task::WorkerHandoffStage::CommittedAwaitingReview { .. }
+        ));
+        assert!(!task.is_ready_to_execute());
     }
 
     #[test]
@@ -1506,7 +1747,10 @@ mod tests {
             .expect("hydration must succeed");
 
         assert_eq!(report.adopted_worktrees, 1, "expected one adoption");
-        assert_eq!(report.cleared_worktrees, 0, "must not clear a live worktree");
+        assert_eq!(
+            report.cleared_worktrees, 0,
+            "must not clear a live worktree"
+        );
 
         let tasks = state.task.tasks.read().await;
         let hydrated = tasks.get(&task.id).expect("task must still exist");
@@ -1531,10 +1775,23 @@ mod tests {
         run_git(&repo_dir, &["init", "-q"]);
         run_git(&repo_dir, &["config", "user.email", "test@example.com"]);
         run_git(&repo_dir, &["config", "user.name", "Test"]);
-        run_git(&repo_dir, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+        run_git(
+            &repo_dir,
+            &["commit", "-q", "--allow-empty", "-m", "initial"],
+        );
         let branch = "task-12345678";
         let moved_to = tmp.path().join("wherever-it-moved");
-        run_git(&repo_dir, &["worktree", "add", "-q", moved_to.to_str().unwrap(), "-b", branch]);
+        run_git(
+            &repo_dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                moved_to.to_str().unwrap(),
+                "-b",
+                branch,
+            ],
+        );
 
         let repository = domain::Repository {
             id: uuid::Uuid::new_v4(),
@@ -1562,7 +1819,11 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        let stale = tmp.path().join("stale-recorded-path").to_string_lossy().to_string();
+        let stale = tmp
+            .path()
+            .join("stale-recorded-path")
+            .to_string_lossy()
+            .to_string();
         let ids = [
             uuid::Uuid::from_u128(0x12345678_0000_4000_8000_000000000001),
             uuid::Uuid::from_u128(0x12345678_0000_4000_8000_000000000002),
@@ -1590,14 +1851,22 @@ mod tests {
             ui_preferences: Default::default(),
             queue: Default::default(),
         };
-        cfg.repositories.insert(repository.id.to_string(), repository);
+        cfg.repositories
+            .insert(repository.id.to_string(), repository);
         cfg.projects.insert(project.id.to_string(), project.clone());
         storage.save_config(&cfg).expect("save config");
-        storage.save_project_tasks(project.id, &tasks).expect("save tasks");
+        storage
+            .save_project_tasks(project.id, &tasks)
+            .expect("save tasks");
 
-        let (state, report) = build_state_with_paths(paths).await.expect("hydration must succeed");
+        let (state, report) = build_state_with_paths(paths)
+            .await
+            .expect("hydration must succeed");
 
-        assert_eq!(report.adopted_worktrees, 0, "neither task is given the moved checkout");
+        assert_eq!(
+            report.adopted_worktrees, 0,
+            "neither task is given the moved checkout"
+        );
         assert_eq!(report.cleared_worktrees, 0, "neither reference is spent");
         let hydrated = state.task.tasks.read().await;
         for (id, other) in [(ids[0], ids[1]), (ids[1], ids[0])] {
@@ -1608,7 +1877,10 @@ mod tests {
         }
         drop(hydrated);
         let persisted = storage.load_project_tasks(project.id).expect("load tasks");
-        assert!(persisted.iter().all(|t| t.error_message.is_some()), "the reason survives a restart");
+        assert!(
+            persisted.iter().all(|t| t.error_message.is_some()),
+            "the reason survives a restart"
+        );
     }
 
     /// Two tasks whose ids share their first 8 hex digits, each recording
@@ -1624,7 +1896,10 @@ mod tests {
         run_git(&repo_dir, &["init", "-q"]);
         run_git(&repo_dir, &["config", "user.email", "test@example.com"]);
         run_git(&repo_dir, &["config", "user.name", "Test"]);
-        run_git(&repo_dir, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+        run_git(
+            &repo_dir,
+            &["commit", "-q", "--allow-empty", "-m", "initial"],
+        );
 
         let repository = domain::Repository {
             id: uuid::Uuid::new_v4(),
@@ -1652,7 +1927,11 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        let stale = tmp.path().join("stale-recorded-path").to_string_lossy().to_string();
+        let stale = tmp
+            .path()
+            .join("stale-recorded-path")
+            .to_string_lossy()
+            .to_string();
         let ids = [
             uuid::Uuid::from_u128(0x12345678_0000_4000_8000_000000000001),
             uuid::Uuid::from_u128(0x12345678_0000_4000_8000_000000000002),
@@ -1663,7 +1942,17 @@ mod tests {
             .map(|id| {
                 let branch = worktree::WorktreeManager::branch_for_task(*id);
                 let moved = tmp.path().join(format!("moved-{id}"));
-                run_git(&repo_dir, &["worktree", "add", "-q", moved.to_str().unwrap(), "-b", &branch]);
+                run_git(
+                    &repo_dir,
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        moved.to_str().unwrap(),
+                        "-b",
+                        &branch,
+                    ],
+                );
                 moved_to.insert(*id, moved.to_string_lossy().to_string());
                 let mut task = crate::test_helpers::create_test_task("A task");
                 task.id = *id;
@@ -1677,17 +1966,25 @@ mod tests {
 
         let storage = Storage::with_paths((*paths).clone());
         let mut cfg = config::storage::AppConfig::default();
-        cfg.repositories.insert(repository.id.to_string(), repository);
+        cfg.repositories
+            .insert(repository.id.to_string(), repository);
         cfg.projects.insert(project.id.to_string(), project.clone());
         storage.save_config(&cfg).expect("save config");
-        storage.save_project_tasks(project.id, &tasks).expect("save tasks");
+        storage
+            .save_project_tasks(project.id, &tasks)
+            .expect("save tasks");
 
-        let (state, report) = build_state_with_paths(paths).await.expect("hydration must succeed");
+        let (state, report) = build_state_with_paths(paths)
+            .await
+            .expect("hydration must succeed");
 
         assert_eq!(report.adopted_worktrees, 2);
         let hydrated = state.task.tasks.read().await;
         for id in ids {
-            assert_eq!(hydrated[&id].worktree_path.as_deref(), Some(moved_to[&id].as_str()));
+            assert_eq!(
+                hydrated[&id].worktree_path.as_deref(),
+                Some(moved_to[&id].as_str())
+            );
             assert_eq!(hydrated[&id].error_message, None);
         }
     }
@@ -1714,7 +2011,11 @@ mod tests {
                 .current_dir(&repo_root)
                 .output()
                 .expect("git must be spawnable");
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.email", "test@example.com"]);
@@ -1780,9 +2081,12 @@ mod tests {
             queue: Default::default(),
         };
         cfg.projects.insert(project.id.to_string(), project.clone());
-        cfg.repositories.insert(repository.id.to_string(), repository);
+        cfg.repositories
+            .insert(repository.id.to_string(), repository);
         storage.save_config(&cfg).expect("save config");
-        storage.save_project_tasks(project.id, &[task]).expect("save tasks");
+        storage
+            .save_project_tasks(project.id, &[task])
+            .expect("save tasks");
 
         (paths, task_id, wt_path)
     }
@@ -1880,7 +2184,10 @@ mod tests {
                 toml::from_str(&std::fs::read_to_string(&routed).unwrap()).unwrap();
             seeded.tasks[0].project_id
         };
-        let legacy = paths.config_dir().join("tasks").join(format!("{project_id}.toml"));
+        let legacy = paths
+            .config_dir()
+            .join("tasks")
+            .join(format!("{project_id}.toml"));
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::rename(&routed, &legacy).unwrap();
         std::fs::create_dir_all(&routed).unwrap();
@@ -1897,7 +2204,11 @@ mod tests {
 
         let on_disk: config::storage::ProjectTasksFile =
             toml::from_str(&std::fs::read_to_string(&legacy).unwrap()).unwrap();
-        let durable = on_disk.tasks.iter().find(|t| t.id == task_id).expect("still on disk");
+        let durable = on_disk
+            .tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .expect("still on disk");
         assert!(
             durable.cleanup_in_flight,
             "the file must still say a cleanup was interrupted, because that flag is what makes \
@@ -1951,8 +2262,14 @@ mod tests {
 
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_id).expect("task must still exist");
-        assert!(!task.cleanup_in_flight, "the interrupted cleanup is resolved");
-        assert_eq!(task.worktree_path, None, "and the checkout it named is gone");
+        assert!(
+            !task.cleanup_in_flight,
+            "the interrupted cleanup is resolved"
+        );
+        assert_eq!(
+            task.worktree_path, None,
+            "and the checkout it named is gone"
+        );
         // The status this task ends on is decided by the pre-existing
         // crashed-run recovery a few lines above, which puts an `InProgress`
         // task nothing is driving back on the queue. What matters here is what
@@ -2095,10 +2412,16 @@ mod tests {
             .expect("a checkout at the managed path")
             .path;
         if detach {
-            run_git(std::path::Path::new(&checkout), &["checkout", "-q", "--detach"]);
+            run_git(
+                std::path::Path::new(&checkout),
+                &["checkout", "-q", "--detach"],
+            );
         }
         if let Some(reason) = lock {
-            run_git(&repo_root, &["worktree", "lock", "--reason", reason, &checkout]);
+            run_git(
+                &repo_root,
+                &["worktree", "lock", "--reason", reason, &checkout],
+            );
         }
         std::fs::remove_dir_all(&checkout).unwrap();
 
@@ -2149,9 +2472,12 @@ mod tests {
         };
         let project_id = project.id;
         cfg.projects.insert(project_id.to_string(), project);
-        cfg.repositories.insert(repository.id.to_string(), repository);
+        cfg.repositories
+            .insert(repository.id.to_string(), repository);
         storage.save_config(&cfg).expect("save config");
-        storage.save_project_tasks(project_id, &[task]).expect("save tasks");
+        storage
+            .save_project_tasks(project_id, &[task])
+            .expect("save tasks");
 
         (paths, task_id, repo, checkout)
     }
@@ -2166,7 +2492,8 @@ mod tests {
     async fn startup_keeps_a_missing_checkout_git_holds_locked_until_it_is_unlocked() {
         let tmp = TempDir::new().unwrap();
         let reason = "on a drive that is not mounted";
-        let (paths, task_id, repo, checkout) = vanished_checkout_fixture(&tmp, Some(reason), false, false).await;
+        let (paths, task_id, repo, checkout) =
+            vanished_checkout_fixture(&tmp, Some(reason), false, false).await;
 
         for start in ["first", "second"] {
             let (state, report) = build_state_with_paths(paths.clone())
@@ -2194,7 +2521,10 @@ mod tests {
             "startup runs nothing destructive: the lock is still there"
         );
 
-        run_git(std::path::Path::new(&repo), &["worktree", "unlock", &checkout]);
+        run_git(
+            std::path::Path::new(&repo),
+            &["worktree", "unlock", &checkout],
+        );
         let (state, report) = build_state_with_paths(paths)
             .await
             .expect("hydration must succeed");
@@ -2202,8 +2532,14 @@ mod tests {
         {
             let tasks = state.task.tasks.read().await;
             let task = tasks.get(&task_id).expect("task must still exist");
-            assert_eq!(task.worktree_path, None, "once unlocked, the reference is reconciled");
-            assert_eq!(task.error_message, None, "and the notice about the lock goes with it");
+            assert_eq!(
+                task.worktree_path, None,
+                "once unlocked, the reference is reconciled"
+            );
+            assert_eq!(
+                task.error_message, None,
+                "and the notice about the lock goes with it"
+            );
         }
         let again = state
             .worktree_manager
@@ -2219,14 +2555,22 @@ mod tests {
     #[tokio::test]
     async fn startup_clears_a_prunable_missing_checkout_and_the_task_can_acquire_it_again() {
         let tmp = TempDir::new().unwrap();
-        let (paths, task_id, repo, checkout) = vanished_checkout_fixture(&tmp, None, false, false).await;
+        let (paths, task_id, repo, checkout) =
+            vanished_checkout_fixture(&tmp, None, false, false).await;
 
         let (state, report) = build_state_with_paths(paths)
             .await
             .expect("hydration must succeed");
         assert_eq!(report.cleared_worktrees, 1);
         assert_eq!(
-            state.task.tasks.read().await.get(&task_id).unwrap().worktree_path,
+            state
+                .task
+                .tasks
+                .read()
+                .await
+                .get(&task_id)
+                .unwrap()
+                .worktree_path,
             None
         );
 
@@ -2271,7 +2615,10 @@ mod tests {
             "and removal agrees"
         );
 
-        run_git(std::path::Path::new(&repo), &["worktree", "unlock", &checkout]);
+        run_git(
+            std::path::Path::new(&repo),
+            &["worktree", "unlock", &checkout],
+        );
         let (state, report) = build_state_with_paths(paths)
             .await
             .expect("hydration must succeed");
@@ -2279,7 +2626,11 @@ mod tests {
         // The detached registration is now merely prunable, and acquisition
         // still leaves it for the user (see the next test); once they prune
         // it, the checkout is acquired again.
-        assert!(state.worktree_manager.reattach(&repo, "task-abcd1234").await.is_err());
+        assert!(state
+            .worktree_manager
+            .reattach(&repo, "task-abcd1234")
+            .await
+            .is_err());
         run_git(std::path::Path::new(&repo), &["worktree", "prune"]);
         let again = state
             .worktree_manager
@@ -2304,7 +2655,11 @@ mod tests {
             .expect("git listing")
             .split("\0\0")
             .find(|r| r.starts_with(&format!("worktree {checkout}\0")))
-            .and_then(|r| r.split('\0').find_map(|f| f.strip_prefix("HEAD ")).map(str::to_string))
+            .and_then(|r| {
+                r.split('\0')
+                    .find_map(|f| f.strip_prefix("HEAD "))
+                    .map(str::to_string)
+            })
             .expect("the detached registration and its HEAD");
 
         let (state, report) = build_state_with_paths(paths)
@@ -2319,7 +2674,10 @@ mod tests {
             .await
             .err()
             .expect("the detached registration is not pruned automatically");
-        assert!(refused.contains(&head), "the detached commit is named: {refused}");
+        assert!(
+            refused.contains(&head),
+            "the detached commit is named: {refused}"
+        );
         assert!(
             worktree::WorktreeManager::worktree_list_porcelain(&repo)
                 .expect("git listing")
@@ -2344,30 +2702,51 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (paths, task_id, _, checkout) =
             vanished_checkout_fixture(&tmp, Some(reason), false, false).await;
-        let (state, _) = build_state_with_paths(paths.clone()).await.expect("hydration");
-        assert!(notice_of(&state, task_id).await.is_some_and(|m| m.contains(reason)));
+        let (state, _) = build_state_with_paths(paths.clone())
+            .await
+            .expect("hydration");
+        assert!(notice_of(&state, task_id)
+            .await
+            .is_some_and(|m| m.contains(reason)));
         drop(state);
         std::fs::create_dir_all(&checkout).unwrap();
         let (state, _) = build_state_with_paths(paths).await.expect("hydration");
-        assert_eq!(notice_of(&state, task_id).await, None, "the checkout is back");
+        assert_eq!(
+            notice_of(&state, task_id).await,
+            None,
+            "the checkout is back"
+        );
 
         // Unlocked, and the branch checked out somewhere else.
         let tmp = TempDir::new().unwrap();
         let (paths, task_id, repo, checkout) =
             vanished_checkout_fixture(&tmp, Some(reason), false, false).await;
-        let (state, _) = build_state_with_paths(paths.clone()).await.expect("hydration");
-        assert!(notice_of(&state, task_id).await.is_some_and(|m| m.contains(reason)));
+        let (state, _) = build_state_with_paths(paths.clone())
+            .await
+            .expect("hydration");
+        assert!(notice_of(&state, task_id)
+            .await
+            .is_some_and(|m| m.contains(reason)));
         drop(state);
         let repo_dir = std::path::Path::new(&repo);
         run_git(repo_dir, &["worktree", "unlock", &checkout]);
         run_git(repo_dir, &["worktree", "prune"]);
         let elsewhere = tmp.path().join("elsewhere").to_string_lossy().to_string();
-        run_git(repo_dir, &["worktree", "add", "-q", "--", &elsewhere, "task-abcd1234"]);
+        run_git(
+            repo_dir,
+            &["worktree", "add", "-q", "--", &elsewhere, "task-abcd1234"],
+        );
         let (state, report) = build_state_with_paths(paths).await.expect("hydration");
         assert_eq!(report.adopted_worktrees, 1);
         let tasks = state.task.tasks.read().await;
-        assert_eq!(tasks[&task_id].worktree_path.as_deref(), Some(elsewhere.as_str()));
-        assert_eq!(tasks[&task_id].error_message, None, "the lock is gone and the checkout found");
+        assert_eq!(
+            tasks[&task_id].worktree_path.as_deref(),
+            Some(elsewhere.as_str())
+        );
+        assert_eq!(
+            tasks[&task_id].error_message, None,
+            "the lock is gone and the checkout found"
+        );
     }
 
     /// An interrupted cleanup of a checkout that is gone is reconciled only
@@ -2420,14 +2799,21 @@ mod tests {
             refusal,
             crate::lifecycle::TerminalizeRefusal::CleanupRefused { .. }
         ));
-        let kept = state.task.tasks.read().await[&task_id].error_message.clone();
+        let kept = state.task.tasks.read().await[&task_id]
+            .error_message
+            .clone();
         assert!(
-            kept.as_deref().unwrap_or_default().starts_with("The worktree at"),
+            kept.as_deref()
+                .unwrap_or_default()
+                .starts_with("The worktree at"),
             "the refused cleanup's own wording is on the task: {kept:?}"
         );
         drop(state);
 
-        run_git(std::path::Path::new(&repo), &["worktree", "unlock", &checkout]);
+        run_git(
+            std::path::Path::new(&repo),
+            &["worktree", "unlock", &checkout],
+        );
         let (state, report) = build_state_with_paths(paths)
             .await
             .expect("hydration must succeed");
@@ -2435,7 +2821,10 @@ mod tests {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_id).expect("task must still exist");
         assert_eq!(task.worktree_path, None);
-        assert_eq!(task.error_message, None, "the notice about the lifted lock is gone");
+        assert_eq!(
+            task.error_message, None,
+            "the notice about the lifted lock is gone"
+        );
     }
 
     /// Proves the mechanism `cached_porcelain` relies on -- `tokio::task::
@@ -2468,7 +2857,11 @@ mod tests {
         /// blocking call on that same thread starves it completely, so the
         /// final count is a direct measurement of scheduler interleaving, not
         /// a timing guess.
-        fn spawn_progress_counter() -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        fn spawn_progress_counter() -> (
+            tokio::task::JoinHandle<()>,
+            Arc<AtomicUsize>,
+            Arc<AtomicBool>,
+        ) {
             let counter = Arc::new(AtomicUsize::new(0));
             let stop = Arc::new(AtomicBool::new(false));
             let (counter_clone, stop_clone) = (counter.clone(), stop.clone());
@@ -2540,7 +2933,9 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             name: "orphaned-member".to_string(),
             repository_id: None,
-            scope: domain::ProjectScope::InWorkspace { workspace_id: lost_workspace },
+            scope: domain::ProjectScope::InWorkspace {
+                workspace_id: lost_workspace,
+            },
             state_location: config::paths::StateLocation::External,
             base: None,
             agent_type: domain::AgentType::ClaudeCode,
@@ -2584,13 +2979,24 @@ mod tests {
                     .starts_with("workspaces.toml.corrupt-")
             })
             .count();
-        assert_eq!(quarantined, 1, "the corrupt registry must be kept as a backup");
+        assert_eq!(
+            quarantined, 1,
+            "the corrupt registry must be kept as a backup"
+        );
         assert!(
-            state.workspace.registry.read().await.get(&lost_workspace).is_none(),
+            state
+                .workspace
+                .registry
+                .read()
+                .await
+                .get(&lost_workspace)
+                .is_none(),
             "the registry must have started empty"
         );
         assert_eq!(
-            state.project.projects.read().await[&project.id].scope.workspace_id(),
+            state.project.projects.read().await[&project.id]
+                .scope
+                .workspace_id(),
             Some(lost_workspace),
             "startup must not rewrite a membership it cannot resolve"
         );

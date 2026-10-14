@@ -6,9 +6,19 @@ use uuid::Uuid;
 #[serde(tag = "ref_type")]
 pub enum ExternalRef {
     #[serde(rename = "github_issue")]
-    GithubIssue { url: String, number: u32, repo: String, state: Option<String> },
+    GithubIssue {
+        url: String,
+        number: u32,
+        repo: String,
+        state: Option<String>,
+    },
     #[serde(rename = "github_pr")]
-    GithubPr { url: String, number: u32, repo: String, state: Option<String> },
+    GithubPr {
+        url: String,
+        number: u32,
+        repo: String,
+        state: Option<String>,
+    },
     #[serde(rename = "gitlab_issue")]
     GitlabIssue { url: String },
     #[serde(rename = "jira_ticket")]
@@ -22,9 +32,11 @@ impl ExternalRef {
         match self {
             Self::GithubIssue { number, .. } => format!("#{}", number),
             Self::GithubPr { number, .. } => format!("PR #{}", number),
-            Self::GitlabIssue { url } => {
-                url.rsplit('/').next().map(|n| format!("#{}", n)).unwrap_or("Issue".to_string())
-            }
+            Self::GitlabIssue { url } => url
+                .rsplit('/')
+                .next()
+                .map(|n| format!("#{}", n))
+                .unwrap_or("Issue".to_string()),
             Self::JiraTicket { key, .. } => key.clone(),
             Self::LinearTicket { id } => id.clone(),
         }
@@ -32,7 +44,9 @@ impl ExternalRef {
 
     pub fn url(&self) -> Option<&str> {
         match self {
-            Self::GithubIssue { url, .. } | Self::GithubPr { url, .. } | Self::GitlabIssue { url } => Some(url),
+            Self::GithubIssue { url, .. }
+            | Self::GithubPr { url, .. }
+            | Self::GitlabIssue { url } => Some(url),
             Self::JiraTicket { .. } | Self::LinearTicket { .. } => None,
         }
     }
@@ -111,6 +125,8 @@ pub struct Task {
     /// `created_at` and `human_review`.
     #[serde(default, deserialize_with = "slashit_activity::lenient")]
     pub activity: Vec<slashit_activity::Entry>,
+    #[serde(default)]
+    pub worker_handoff: Option<WorkerHandoff>,
 
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -135,12 +151,16 @@ impl Task {
 
     /// What happened to the task, oldest first.
     pub fn timeline(&self) -> Vec<slashit_activity::Item<'_>> {
-        let decisions = self.human_review.entries.iter().map(|e| slashit_activity::Decision {
-            sequence: e.sequence,
-            at: e.decided_at,
-            approved: e.decision == HumanReviewDecision::Approved,
-            feedback: e.feedback.as_deref(),
-        });
+        let decisions = self
+            .human_review
+            .entries
+            .iter()
+            .map(|e| slashit_activity::Decision {
+                sequence: e.sequence,
+                at: e.decided_at,
+                approved: e.decision == HumanReviewDecision::Approved,
+                feedback: e.feedback.as_deref(),
+            });
         slashit_activity::timeline(self.created_at, decisions, &self.activity)
     }
 
@@ -151,6 +171,11 @@ impl Task {
     /// `delivery_in_flight` is whether its pull request is being opened at
     /// this moment.
     pub fn needs_you(&self, delivery_in_flight: bool) -> Option<AttentionReason> {
+        if self.worker_handoff.as_ref().is_some_and(|handoff| {
+            matches!(&handoff.stage, WorkerHandoffStage::RecoveryRequired { .. })
+        }) {
+            return Some(AttentionReason::Recovery);
+        }
         use slashit_attention::{Decision, Facts, Status};
         Facts {
             status: match self.status {
@@ -165,17 +190,56 @@ impl Task {
                 | TaskStatus::PrCreated
                 | TaskStatus::Done => Status::Other,
             },
-            decision: self.human_review.current_decision().map(|e| match e.decision {
-                HumanReviewDecision::Approved => Decision::Approved,
-                HumanReviewDecision::ChangesRequested => Decision::ChangesRequested,
-            }),
+            decision: self
+                .human_review
+                .current_decision()
+                .map(|e| match e.decision {
+                    HumanReviewDecision::Approved => Decision::Approved,
+                    HumanReviewDecision::ChangesRequested => Decision::ChangesRequested,
+                }),
             pr_error_recorded: self.human_review.pr_error.is_some(),
             pr_linked: self.pr_url.is_some() || self.external_refs.iter().any(ExternalRef::is_pr),
             delivery_in_flight,
-            integration_pending: self.local_integration.as_ref().is_some_and(|r| r.state == crate::models::integration::IntegrationState::Pending),
+            integration_pending: self
+                .local_integration
+                .as_ref()
+                .is_some_and(|r| r.state == crate::models::integration::IntegrationState::Pending),
         }
         .needs_you()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerHandoff {
+    pub task_id: Uuid,
+    pub project_id: Uuid,
+    #[serde(default)]
+    pub repository_id: Option<Uuid>,
+    #[serde(default)]
+    pub run: Option<u32>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub start_head: Option<String>,
+    pub stage: WorkerHandoffStage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerHandoffStage {
+    Started,
+    CommittedAwaitingReview {
+        commit: String,
+    },
+    RecoveryRequired {
+        reason: String,
+        #[serde(default)]
+        observed_commit: Option<String>,
+    },
+    ResolvedToAiReview {
+        commit: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -221,7 +285,9 @@ impl PrReviewPlan {
         let Some(comment) = self.comments.iter().find(|c| c.id == Some(comment_id)) else {
             return true;
         };
-        let recorded = self.fixed_content.iter()
+        let recorded = self
+            .fixed_content
+            .iter()
             .find(|f| f.comment_id == comment_id)
             .map(|f| f.fingerprint.as_str());
         slashit_review_content::fixed_content_is_current(
@@ -241,9 +307,15 @@ impl PrReviewPlan {
     /// A comment whose text is no longer the text its fix was made from
     /// regains neither flag.
     pub fn backfill_lifecycle_from_last_apply(&mut self) {
-        let Some(last) = self.last_apply.clone() else { return; };
-        if last.dry_run { return; }
-        let failed_reply_ids: std::collections::HashSet<u64> = last.reply_errors.iter()
+        let Some(last) = self.last_apply.clone() else {
+            return;
+        };
+        if last.dry_run {
+            return;
+        }
+        let failed_reply_ids: std::collections::HashSet<u64> = last
+            .reply_errors
+            .iter()
             .filter_map(|s| {
                 let rest = s.strip_prefix("comment ")?;
                 let (id, _) = rest.split_once(':')?;
@@ -251,7 +323,9 @@ impl PrReviewPlan {
             })
             .collect();
         for idx in 0..self.items.len() {
-            let Some(cid) = self.items[idx].comment_id else { continue; };
+            let Some(cid) = self.items[idx].comment_id else {
+                continue;
+            };
             let current = last.fixed_ids.contains(&cid)
                 && self.fixed_content_is_current(cid, last.applied_at);
             let item = &mut self.items[idx];
@@ -603,7 +677,10 @@ fn strip_finding_prefixes(issue: &str) -> &str {
                 text = rest.trim_start();
             }
         }
-        if text.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("issue:")) {
+        if text
+            .get(..6)
+            .is_some_and(|p| p.eq_ignore_ascii_case("issue:"))
+        {
             text = text[6..].trim_start();
         }
         if text == before {
@@ -611,9 +688,6 @@ fn strip_finding_prefixes(issue: &str) -> &str {
         }
     }
 }
-
-
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueConfig {
@@ -660,7 +734,10 @@ pub struct PrStatusEntry {
 
 impl PrStatusEntry {
     pub fn key(&self) -> PrKey {
-        PrKey { repo: self.repo.clone(), number: self.number }
+        PrKey {
+            repo: self.repo.clone(),
+            number: self.number,
+        }
     }
 }
 
@@ -753,8 +830,17 @@ mod tests {
         assert_eq!(status.checks, ChecksState::NoChecks);
         assert_eq!(status.review_decision, Some(ReviewDecision::ReviewRequired));
         assert_eq!(status.mergeable, Some(Mergeability::Mergeable));
-        assert_eq!(entry.error.as_ref().map(|e| e.kind), Some(PrFetchErrorKind::Timeout));
-        assert_eq!(entry.key(), PrKey { repo: "o/r".to_string(), number: 7 });
+        assert_eq!(
+            entry.error.as_ref().map(|e| e.kind),
+            Some(PrFetchErrorKind::Timeout)
+        );
+        assert_eq!(
+            entry.key(),
+            PrKey {
+                repo: "o/r".to_string(),
+                number: 7
+            }
+        );
     }
 
     /// Two Fix items, comments 1 and 2, fixed and answered by an apply at
@@ -801,8 +887,14 @@ mod tests {
         plan.backfill_lifecycle_from_last_apply();
 
         assert!(!plan.items[0].fix_done && !plan.items[0].reply_posted);
-        assert!(plan.items[0].fix_uncommitted, "the checkout fact survives the edit");
-        assert!(plan.items[1].fix_done && plan.items[1].reply_posted, "unchanged comments keep the backfill");
+        assert!(
+            plan.items[0].fix_uncommitted,
+            "the checkout fact survives the edit"
+        );
+        assert!(
+            plan.items[1].fix_done && plan.items[1].reply_posted,
+            "unchanged comments keep the backfill"
+        );
     }
 
     #[test]
@@ -833,10 +925,12 @@ mod tests {
     fn backfill_follows_the_recorded_text_and_falls_back_to_timestamps_only_without_one() {
         for (recorded, current, updated_at, restored) in BACKFILL_CASES {
             let fixed: Vec<serde_json::Value> = recorded
-                .map(|r| serde_json::json!({
-                    "comment_id": 1,
-                    "fingerprint": slashit_review_content::fingerprint(r),
-                }))
+                .map(|r| {
+                    serde_json::json!({
+                        "comment_id": 1,
+                        "fingerprint": slashit_review_content::fingerprint(r),
+                    })
+                })
                 .into_iter()
                 .collect();
             let mut plan: PrReviewPlan = serde_json::from_value(serde_json::json!({
@@ -904,12 +998,18 @@ mod tests {
         let plan = plan_applied_at("2024-06-01T00:00:30Z", [None, None]);
         assert!(plan.fixed_content.is_empty());
         let mut recorded = plan;
-        recorded.fixed_content.push(FixedContent { comment_id: 1, fingerprint: "sha256-v1:x".to_string() });
+        recorded.fixed_content.push(FixedContent {
+            comment_id: 1,
+            fingerprint: "sha256-v1:x".to_string(),
+        });
         let back: PrReviewPlan =
             serde_json::from_str(&serde_json::to_string(&recorded).unwrap()).unwrap();
         assert_eq!(back.fixed_content, recorded.fixed_content);
         let none = plan_applied_at("2024-06-01T00:00:30Z", [None, None]);
-        assert!(serde_json::to_value(&none).unwrap().get("fixed_content").is_none());
+        assert!(serde_json::to_value(&none)
+            .unwrap()
+            .get("fixed_content")
+            .is_none());
     }
 
     #[test]
@@ -949,12 +1049,23 @@ mod tests {
 
     #[test]
     fn findings_that_only_look_like_prefixes_are_kept_intact() {
-        assert_eq!(review_findings(&issues(&["Issues found in parser"])), vec!["Issues found in parser"]);
-        assert_eq!(review_findings(&issues(&["ÉISSUE: accent"])), vec!["ÉISSUE: accent"]);
+        assert_eq!(
+            review_findings(&issues(&["Issues found in parser"])),
+            vec!["Issues found in parser"]
+        );
+        assert_eq!(
+            review_findings(&issues(&["ÉISSUE: accent"])),
+            vec!["ÉISSUE: accent"]
+        );
         assert_eq!(review_findings(&issues(&["ISSUE:"])), Vec::<String>::new());
     }
 
-    fn entry(sequence: u32, arrival: u32, decision: HumanReviewDecision, feedback: Option<&str>) -> HumanReviewEntry {
+    fn entry(
+        sequence: u32,
+        arrival: u32,
+        decision: HumanReviewDecision,
+        feedback: Option<&str>,
+    ) -> HumanReviewEntry {
         HumanReviewEntry {
             sequence,
             arrival,
@@ -967,16 +1078,29 @@ mod tests {
 
     #[test]
     fn the_current_decision_and_earlier_requests_follow_the_arrivals() {
-        let mut review = HumanReviewRecord { arrivals: 1, ..Default::default() };
+        let mut review = HumanReviewRecord {
+            arrivals: 1,
+            ..Default::default()
+        };
         assert!(review.current_decision().is_none());
-        review.entries.push(entry(1, 1, HumanReviewDecision::ChangesRequested, Some("fix it")));
-        assert!(review.earlier_requests().is_empty(), "not earlier yet: it is this review's");
+        review.entries.push(entry(
+            1,
+            1,
+            HumanReviewDecision::ChangesRequested,
+            Some("fix it"),
+        ));
+        assert!(
+            review.earlier_requests().is_empty(),
+            "not earlier yet: it is this review's"
+        );
 
         review.arrivals = 2;
         assert!(review.current_decision().is_none());
         assert_eq!(review.earlier_requests().len(), 1);
 
-        review.entries.push(entry(2, 2, HumanReviewDecision::Approved, None));
+        review
+            .entries
+            .push(entry(2, 2, HumanReviewDecision::Approved, None));
         assert!(review.is_approved());
     }
 
@@ -1008,21 +1132,53 @@ mod tests {
     #[test]
     fn attention_reads_the_record_the_backend_sends() {
         let undecided = serde_json::json!({ "arrivals": 1, "entries": [] });
-        assert_eq!(task_json("error", undecided.clone(), None).needs_you(false), Some(AttentionReason::Failed));
-        assert_eq!(task_json("human_review", undecided.clone(), None).needs_you(false), Some(AttentionReason::Review));
-        assert_eq!(task_json("human_review", undecided.clone(), None).needs_you(true), None);
-        assert_eq!(task_json("human_review", decided("approved", None), None).needs_you(false), None);
         assert_eq!(
-            task_json("human_review", decided("approved", Some("gh failed")), None).needs_you(false),
+            task_json("error", undecided.clone(), None).needs_you(false),
+            Some(AttentionReason::Failed)
+        );
+        assert_eq!(
+            task_json("human_review", undecided.clone(), None).needs_you(false),
+            Some(AttentionReason::Review)
+        );
+        assert_eq!(
+            task_json("human_review", undecided.clone(), None).needs_you(true),
+            None
+        );
+        assert_eq!(
+            task_json("human_review", decided("approved", None), None).needs_you(false),
+            None
+        );
+        assert_eq!(
+            task_json("human_review", decided("approved", Some("gh failed")), None)
+                .needs_you(false),
             Some(AttentionReason::PrNotCreated)
         );
         assert_eq!(
-            task_json("human_review", decided("approved", Some("gh failed")), Some("https://x/pull/1")).needs_you(false),
+            task_json(
+                "human_review",
+                decided("approved", Some("gh failed")),
+                Some("https://x/pull/1")
+            )
+            .needs_you(false),
             None
         );
-        assert_eq!(task_json("human_review", decided("changes_requested", None), None).needs_you(false), None);
-        for status in ["backlog", "queue", "in_progress", "ai_review", "pr_created", "done"] {
-            assert_eq!(task_json(status, undecided.clone(), None).needs_you(false), None, "{status}");
+        assert_eq!(
+            task_json("human_review", decided("changes_requested", None), None).needs_you(false),
+            None
+        );
+        for status in [
+            "backlog",
+            "queue",
+            "in_progress",
+            "ai_review",
+            "pr_created",
+            "done",
+        ] {
+            assert_eq!(
+                task_json(status, undecided.clone(), None).needs_you(false),
+                None,
+                "{status}"
+            );
         }
     }
 
@@ -1043,18 +1199,25 @@ mod tests {
     fn a_pending_integration_needs_the_user_exactly_as_the_backend_says() {
         let approved = decided("approved", None);
         let unfinished = AttentionReason::IntegrationUnfinished;
-        let review = |state| with_integration(task_json("human_review", approved.clone(), None), state);
+        let review =
+            |state| with_integration(task_json("human_review", approved.clone(), None), state);
         assert_eq!(review("pending").needs_you(false), Some(unfinished));
         assert_eq!(review("pending").needs_you(true), Some(unfinished));
         assert_eq!(review("integrated").needs_you(false), None);
         let pr_failed = decided("approved", Some("gh failed"));
         assert_eq!(
-            with_integration(task_json("human_review", pr_failed, None), "pending").needs_you(false),
+            with_integration(task_json("human_review", pr_failed, None), "pending")
+                .needs_you(false),
             Some(unfinished)
         );
         let undecided = serde_json::json!({ "arrivals": 1, "entries": [] });
-        let other = |status, state| with_integration(task_json(status, undecided.clone(), None), state);
-        assert_eq!(other("done", "pending").needs_you(false), None, "not completed locally: no controls");
+        let other =
+            |status, state| with_integration(task_json(status, undecided.clone(), None), state);
+        assert_eq!(
+            other("done", "pending").needs_you(false),
+            None,
+            "not completed locally: no controls"
+        );
         let completed = |state| {
             let mut task = other("done", state);
             task.activity = serde_json::from_value(serde_json::json!([
@@ -1065,8 +1228,14 @@ mod tests {
         };
         assert_eq!(completed("pending").needs_you(false), Some(unfinished));
         assert_eq!(completed("integrated").needs_you(false), None);
-        assert_eq!(other("human_review", "pending").needs_you(false), Some(AttentionReason::Review));
-        assert_eq!(other("error", "pending").needs_you(false), Some(AttentionReason::Failed));
+        assert_eq!(
+            other("human_review", "pending").needs_you(false),
+            Some(AttentionReason::Review)
+        );
+        assert_eq!(
+            other("error", "pending").needs_you(false),
+            Some(AttentionReason::Failed)
+        );
         assert_eq!(other("queue", "pending").needs_you(false), None);
     }
 
@@ -1100,7 +1269,11 @@ pub enum RepublishStatus {
     Blocked { reason: String },
     /// A restack was started and did not finish. `discard_blocked` says why
     /// Discard would be refused, when it already is known to be.
-    Interrupted { rewritten: bool, detail: String, discard_blocked: Option<String> },
+    Interrupted {
+        rewritten: bool,
+        detail: String,
+        discard_blocked: Option<String>,
+    },
 }
 
 /// What a finished restack did, as `commands::pr::RepublishOutcome` serializes it.

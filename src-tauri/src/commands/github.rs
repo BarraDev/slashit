@@ -1,6 +1,9 @@
-use crate::domain::github::{GithubIssue, PullRequest, Label, Assignee, Review};
-use crate::domain::{Task, TaskStatus, TaskCategory, TaskPriority, TaskComplexity, TaskImpact, SecuritySeverity, TaskPhase};
+use crate::domain::github::{Assignee, GithubIssue, Label, PullRequest, Review};
 use crate::domain::task::ExternalRef;
+use crate::domain::{
+    SecuritySeverity, Task, TaskCategory, TaskComplexity, TaskImpact, TaskPhase, TaskPriority,
+    TaskStatus,
+};
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -8,11 +11,15 @@ use uuid::Uuid;
 pub struct GithubState;
 
 impl GithubState {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl Default for GithubState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Check if `gh` CLI is available and authenticated.
@@ -21,11 +28,19 @@ async fn check_gh() -> Result<(), String> {
         .args(["auth", "status"])
         .output()
         .await
-        .map_err(|e| format!("gh CLI not found: {}. Install with: sudo pacman -S github-cli", e))?;
+        .map_err(|e| {
+            format!(
+                "gh CLI not found: {}. Install with: sudo pacman -S github-cli",
+                e
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh not authenticated: {}. Run: gh auth login", stderr));
+        return Err(format!(
+            "gh not authenticated: {}. Run: gh auth login",
+            stderr
+        ));
     }
     Ok(())
 }
@@ -52,43 +67,80 @@ pub async fn get_issues(repo: String) -> Result<Vec<GithubIssue>, String> {
     check_gh().await?;
 
     let json = run_gh(&[
-        "issue", "list",
-        "--repo", &repo,
-        "--json", "number,title,body,state,labels,assignees,comments,createdAt,updatedAt",
-        "--limit", "50",
-    ]).await?;
+        "issue",
+        "list",
+        "--repo",
+        &repo,
+        "--json",
+        "number,title,body,state,labels,assignees,comments,createdAt,updatedAt",
+        "--limit",
+        "50",
+    ])
+    .await?;
 
-    let issues: Vec<GithubIssue> = json.as_array()
+    let issues: Vec<GithubIssue> = json
+        .as_array()
         .unwrap_or(&Vec::new())
         .iter()
         .filter_map(|v| {
             Some(GithubIssue {
                 number: v.get("number")?.as_i64()? as i32,
                 title: v.get("title")?.as_str()?.to_string(),
-                body: v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string(),
-                state: v.get("state").and_then(|s| s.as_str()).unwrap_or("OPEN").to_string(),
-                labels: v.get("labels").and_then(|l| l.as_array()).map(|arr| {
-                    arr.iter().filter_map(|lbl| {
-                        Some(Label {
-                            name: lbl.get("name")?.as_str()?.to_string(),
-                            color: lbl.get("color").and_then(|c| c.as_str()).unwrap_or("").to_string(),
-                        })
-                    }).collect()
-                }).unwrap_or_default(),
-                assignees: v.get("assignees").and_then(|a| a.as_array()).map(|arr| {
-                    arr.iter().filter_map(|asn| {
-                        Some(Assignee {
-                            login: asn.get("login")?.as_str()?.to_string(),
-                            avatar_url: asn.get("avatarUrl").and_then(|u| u.as_str()).map(|s| s.to_string()),
-                        })
-                    }).collect()
-                }).unwrap_or_default(),
+                body: v
+                    .get("body")
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                state: v
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("OPEN")
+                    .to_string(),
+                labels: v
+                    .get("labels")
+                    .and_then(|l| l.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|lbl| {
+                                Some(Label {
+                                    name: lbl.get("name")?.as_str()?.to_string(),
+                                    color: lbl
+                                        .get("color")
+                                        .and_then(|c| c.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                assignees: v
+                    .get("assignees")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|asn| {
+                                Some(Assignee {
+                                    login: asn.get("login")?.as_str()?.to_string(),
+                                    avatar_url: asn
+                                        .get("avatarUrl")
+                                        .and_then(|u| u.as_str())
+                                        .map(|s| s.to_string()),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 comments: v.get("comments").and_then(|c| c.as_i64()).unwrap_or(0) as i32,
-                created_at: v.get("createdAt").and_then(|d| d.as_str())
+                created_at: v
+                    .get("createdAt")
+                    .and_then(|d| d.as_str())
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .map(|d| d.with_timezone(&chrono::Utc))
                     .unwrap_or_else(chrono::Utc::now),
-                updated_at: v.get("updatedAt").and_then(|d| d.as_str())
+                updated_at: v
+                    .get("updatedAt")
+                    .and_then(|d| d.as_str())
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .map(|d| d.with_timezone(&chrono::Utc))
                     .unwrap_or_else(chrono::Utc::now),
@@ -104,17 +156,33 @@ pub async fn get_issue(repo: String, number: i32) -> Result<GithubIssue, String>
     check_gh().await?;
 
     let json = run_gh(&[
-        "issue", "view",
+        "issue",
+        "view",
         &number.to_string(),
-        "--repo", &repo,
-        "--json", "number,title,body,state,labels,assignees,comments,createdAt,updatedAt",
-    ]).await?;
+        "--repo",
+        &repo,
+        "--json",
+        "number,title,body,state,labels,assignees,comments,createdAt,updatedAt",
+    ])
+    .await?;
 
     Ok(GithubIssue {
         number: json.get("number").and_then(|n| n.as_i64()).unwrap_or(0) as i32,
-        title: json.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-        body: json.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string(),
-        state: json.get("state").and_then(|s| s.as_str()).unwrap_or("OPEN").to_string(),
+        title: json
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
+        body: json
+            .get("body")
+            .and_then(|b| b.as_str())
+            .unwrap_or("")
+            .to_string(),
+        state: json
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or("OPEN")
+            .to_string(),
         labels: Vec::new(),
         assignees: Vec::new(),
         comments: json.get("comments").and_then(|c| c.as_i64()).unwrap_or(0) as i32,
@@ -162,7 +230,10 @@ pub async fn create_task_from_issue(
         subtasks: Vec::new(),
         sequence_number: 0,
         position: 0,
-        github_issue_url: Some(format!("https://github.com/{}/issues/{}", repo, issue_number)),
+        github_issue_url: Some(format!(
+            "https://github.com/{}/issues/{}",
+            repo, issue_number
+        )),
         gitlab_issue_url: None,
         linear_ticket_id: None,
         jira_issue_key: None,
@@ -186,6 +257,8 @@ pub async fn create_task_from_issue(
         cleanup_in_flight: false,
         pr_review_plan: None,
         activity: Vec::new(),
+        worker_handoff: None,
+        worker_handoff_confirmed: false,
         created_at: now,
         updated_at: now,
     };
@@ -215,10 +288,14 @@ pub async fn import_github_issues(
     check_gh().await?;
 
     let mut args = vec![
-        "issue", "list",
-        "--repo", &repo,
-        "--json", "number,title,body,state,labels,assignees,comments,createdAt,updatedAt",
-        "--limit", "100",
+        "issue",
+        "list",
+        "--repo",
+        &repo,
+        "--json",
+        "number,title,body,state,labels,assignees,comments,createdAt,updatedAt",
+        "--limit",
+        "100",
     ];
 
     let filter_str;
@@ -231,8 +308,8 @@ pub async fn import_github_issues(
     }
 
     let json = run_gh(&args).await?;
-    let issues: Vec<GithubIssue> = serde_json::from_value(json)
-        .map_err(|e| format!("Parse error: {}", e))?;
+    let issues: Vec<GithubIssue> =
+        serde_json::from_value(json).map_err(|e| format!("Parse error: {}", e))?;
 
     let now = chrono::Utc::now();
     let mut imported = Vec::new();
@@ -263,7 +340,10 @@ pub async fn import_github_issues(
             subtasks: Vec::new(),
             sequence_number: 0,
             position: imported.len() as i32,
-            github_issue_url: Some(format!("https://github.com/{}/issues/{}", repo, issue.number)),
+            github_issue_url: Some(format!(
+                "https://github.com/{}/issues/{}",
+                repo, issue.number
+            )),
             gitlab_issue_url: None,
             linear_ticket_id: None,
             jira_issue_key: None,
@@ -287,6 +367,8 @@ pub async fn import_github_issues(
             cleanup_in_flight: false,
             pr_review_plan: None,
             activity: Vec::new(),
+            worker_handoff: None,
+            worker_handoff_confirmed: false,
             created_at: now,
             updated_at: now,
         };
@@ -313,33 +395,66 @@ pub async fn get_prs(repo: String) -> Result<Vec<PullRequest>, String> {
     check_gh().await?;
 
     let json = run_gh(&[
-        "pr", "list",
-        "--repo", &repo,
-        "--json", "number,title,body,state,author,createdAt,updatedAt,reviews,additions,deletions",
-        "--limit", "50",
-    ]).await?;
+        "pr",
+        "list",
+        "--repo",
+        &repo,
+        "--json",
+        "number,title,body,state,author,createdAt,updatedAt,reviews,additions,deletions",
+        "--limit",
+        "50",
+    ])
+    .await?;
 
-    let prs: Vec<PullRequest> = json.as_array()
+    let prs: Vec<PullRequest> = json
+        .as_array()
         .unwrap_or(&Vec::new())
         .iter()
         .filter_map(|v| {
             Some(PullRequest {
                 number: v.get("number")?.as_i64()? as i32,
                 title: v.get("title")?.as_str()?.to_string(),
-                body: v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string(),
-                state: v.get("state").and_then(|s| s.as_str()).unwrap_or("OPEN").to_string(),
-                author: v.get("author").and_then(|a| a.get("login")).and_then(|l| l.as_str()).unwrap_or("").to_string(),
+                body: v
+                    .get("body")
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                state: v
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("OPEN")
+                    .to_string(),
+                author: v
+                    .get("author")
+                    .and_then(|a| a.get("login"))
+                    .and_then(|l| l.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
-                reviews: v.get("reviews").and_then(|r| r.as_array()).map(|arr| {
-                    arr.iter().filter_map(|rev| {
-                        Some(Review {
-                            user: rev.get("author").and_then(|a| a.get("login")).and_then(|l| l.as_str())?.to_string(),
-                            state: rev.get("state").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                            submitted_at: None,
-                        })
-                    }).collect()
-                }).unwrap_or_default(),
+                reviews: v
+                    .get("reviews")
+                    .and_then(|r| r.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|rev| {
+                                Some(Review {
+                                    user: rev
+                                        .get("author")
+                                        .and_then(|a| a.get("login"))
+                                        .and_then(|l| l.as_str())?
+                                        .to_string(),
+                                    state: rev
+                                        .get("state")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    submitted_at: None,
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 additions: v.get("additions").and_then(|a| a.as_i64()).unwrap_or(0) as i32,
                 deletions: v.get("deletions").and_then(|d| d.as_i64()).unwrap_or(0) as i32,
             })
@@ -354,18 +469,39 @@ pub async fn get_pr(repo: String, number: i32) -> Result<PullRequest, String> {
     check_gh().await?;
 
     let json = run_gh(&[
-        "pr", "view",
+        "pr",
+        "view",
         &number.to_string(),
-        "--repo", &repo,
-        "--json", "number,title,body,state,author,createdAt,updatedAt,reviews,additions,deletions",
-    ]).await?;
+        "--repo",
+        &repo,
+        "--json",
+        "number,title,body,state,author,createdAt,updatedAt,reviews,additions,deletions",
+    ])
+    .await?;
 
     Ok(PullRequest {
         number: json.get("number").and_then(|n| n.as_i64()).unwrap_or(0) as i32,
-        title: json.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
-        body: json.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string(),
-        state: json.get("state").and_then(|s| s.as_str()).unwrap_or("OPEN").to_string(),
-        author: json.get("author").and_then(|a| a.get("login")).and_then(|l| l.as_str()).unwrap_or("").to_string(),
+        title: json
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
+        body: json
+            .get("body")
+            .and_then(|b| b.as_str())
+            .unwrap_or("")
+            .to_string(),
+        state: json
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or("OPEN")
+            .to_string(),
+        author: json
+            .get("author")
+            .and_then(|a| a.get("login"))
+            .and_then(|l| l.as_str())
+            .unwrap_or("")
+            .to_string(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         reviews: Vec::new(),
@@ -379,15 +515,33 @@ pub async fn get_pr(repo: String, number: i32) -> Result<PullRequest, String> {
 fn map_labels_to_category(labels: &[Label]) -> TaskCategory {
     for label in labels {
         let name = label.name.to_lowercase();
-        if name.contains("bug") || name.contains("fix") { return TaskCategory::BugFix; }
-        if name.contains("feature") || name.contains("enhancement") { return TaskCategory::Feature; }
-        if name.contains("doc") { return TaskCategory::Documentation; }
-        if name.contains("security") { return TaskCategory::Security; }
-        if name.contains("perf") { return TaskCategory::Performance; }
-        if name.contains("ui") || name.contains("ux") { return TaskCategory::UiUx; }
-        if name.contains("test") { return TaskCategory::Testing; }
-        if name.contains("infra") || name.contains("ci") { return TaskCategory::Infrastructure; }
-        if name.contains("refactor") { return TaskCategory::Refactoring; }
+        if name.contains("bug") || name.contains("fix") {
+            return TaskCategory::BugFix;
+        }
+        if name.contains("feature") || name.contains("enhancement") {
+            return TaskCategory::Feature;
+        }
+        if name.contains("doc") {
+            return TaskCategory::Documentation;
+        }
+        if name.contains("security") {
+            return TaskCategory::Security;
+        }
+        if name.contains("perf") {
+            return TaskCategory::Performance;
+        }
+        if name.contains("ui") || name.contains("ux") {
+            return TaskCategory::UiUx;
+        }
+        if name.contains("test") {
+            return TaskCategory::Testing;
+        }
+        if name.contains("infra") || name.contains("ci") {
+            return TaskCategory::Infrastructure;
+        }
+        if name.contains("refactor") {
+            return TaskCategory::Refactoring;
+        }
     }
     TaskCategory::Feature
 }
@@ -395,9 +549,15 @@ fn map_labels_to_category(labels: &[Label]) -> TaskCategory {
 fn map_labels_to_priority(labels: &[Label]) -> TaskPriority {
     for label in labels {
         let name = label.name.to_lowercase();
-        if name.contains("critical") || name.contains("urgent") || name.contains("p0") { return TaskPriority::Urgent; }
-        if name.contains("high") || name.contains("p1") { return TaskPriority::High; }
-        if name.contains("low") || name.contains("p3") { return TaskPriority::Low; }
+        if name.contains("critical") || name.contains("urgent") || name.contains("p0") {
+            return TaskPriority::Urgent;
+        }
+        if name.contains("high") || name.contains("p1") {
+            return TaskPriority::High;
+        }
+        if name.contains("low") || name.contains("p3") {
+            return TaskPriority::Low;
+        }
     }
     TaskPriority::Medium
 }

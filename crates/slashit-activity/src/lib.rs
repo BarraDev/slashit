@@ -92,7 +92,10 @@ pub struct Entry {
 pub enum Kind {
     /// A person moved the task: Start, Retry, Add to Queue, a drag, Move to,
     /// or a close. Also written when a task reaches Done by any route.
-    Moved { from: Column, to: Column },
+    Moved {
+        from: Column,
+        to: Column,
+    },
     /// A coding run began. `addressing_feedback` is whether it started with
     /// Human Review change requests to answer.
     RunStarted {
@@ -110,9 +113,19 @@ pub enum Kind {
         count: u32,
     },
     /// Tool calls in `run` past [`MAX_TOOL_ENTRIES_PER_RUN`].
-    ToolsOmitted { run: u32, count: u32 },
+    ToolsOmitted {
+        run: u32,
+        count: u32,
+    },
     /// The run finished and its work was committed.
-    RunCompleted { run: u32 },
+    RunCompleted {
+        run: u32,
+    },
+    /// A coding Worker outcome could not be safely attributed or transitioned.
+    RecoveryRequired {
+        run: Option<u32>,
+        reason: String,
+    },
     /// The run failed, or with `run: None`, the task failed before a run
     /// could start.
     RunFailed {
@@ -121,29 +134,59 @@ pub enum Kind {
         reason: String,
     },
     /// A person stopped the task while it was in `from`.
-    Stopped { from: Column },
+    Stopped {
+        from: Column,
+    },
     /// SlashIt started with the task left in `from` by an earlier session --
     /// running, or waiting to run or be reviewed -- and put it back in the
     /// queue. Says nothing about whether a run had begun.
-    Interrupted { from: Column },
-    AiReviewStarted { review: u32 },
-    AiReviewApproved { review: u32 },
+    Interrupted {
+        from: Column,
+    },
+    AiReviewStarted {
+        review: u32,
+    },
+    AiReviewApproved {
+        review: u32,
+    },
     /// The reviewer asked for changes; `issues` is how many it listed.
-    AiReviewChangesRequested { review: u32, issues: u32 },
+    AiReviewChangesRequested {
+        review: u32,
+        issues: u32,
+    },
     /// The reviewer could not produce a verdict.
-    AiReviewFailed { review: u32, reason: String },
+    AiReviewFailed {
+        review: u32,
+        reason: String,
+    },
     /// No AI review ran for these changes.
-    AiReviewSkipped { review: u32, reason: String },
-    AiFixStarted { review: u32 },
-    AiFixApplied { review: u32 },
+    AiReviewSkipped {
+        review: u32,
+        reason: String,
+    },
+    AiFixStarted {
+        review: u32,
+    },
+    AiFixApplied {
+        review: u32,
+    },
     /// The fix agent finished without changing any file.
-    AiFixUnchanged { review: u32 },
-    AiFixFailed { review: u32, reason: String },
+    AiFixUnchanged {
+        review: u32,
+    },
+    AiFixFailed {
+        review: u32,
+        reason: String,
+    },
     /// A run carried the task into Human Review; `arrival` is the Human
     /// Review record's arrival count after it did.
-    ReadyForReview { arrival: u32 },
+    ReadyForReview {
+        arrival: u32,
+    },
     /// Opening the pull request for approved changes failed.
-    DeliveryFailed { reason: String },
+    DeliveryFailed {
+        reason: String,
+    },
     /// A pull request was recorded on the task: one SlashIt opened, or an
     /// open one it found for the task's branch.
     PrLinked {
@@ -151,8 +194,12 @@ pub enum Kind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         number: Option<u32>,
     },
-    PrMerged { number: u32 },
-    PrClosed { number: u32 },
+    PrMerged {
+        number: u32,
+    },
+    PrClosed {
+        number: u32,
+    },
     /// A person completed approved changes locally: the task is Done, its
     /// Task Checkout is gone, and its branch was neither merged nor pushed.
     CompletedLocally,
@@ -161,7 +208,11 @@ pub enum Kind {
     /// target branch was advanced to, `strategy` how (`fast_forward`,
     /// `merge_commit`, or `already_contained` when the target already held
     /// the work and nothing moved).
-    IntegratedLocally { target: String, strategy: String, commit: String },
+    IntegratedLocally {
+        target: String,
+        strategy: String,
+        commit: String,
+    },
 }
 
 fn one() -> u32 {
@@ -179,15 +230,16 @@ impl Kind {
             Self::RunCompleted { run } | Self::RunFailed { run: Some(run), .. } => {
                 Identity::RunEnded(*run)
             }
+            Self::RecoveryRequired { run: Some(run), .. } => Identity::RecoveryRequired(*run),
             Self::AiReviewStarted { review } => Identity::ReviewStarted(*review),
             Self::AiReviewApproved { review }
             | Self::AiReviewChangesRequested { review, .. }
             | Self::AiReviewFailed { review, .. }
             | Self::AiReviewSkipped { review, .. } => Identity::ReviewVerdict(*review),
             Self::AiFixStarted { review } => Identity::FixStarted(*review),
-            Self::AiFixApplied { review } | Self::AiFixUnchanged { review } | Self::AiFixFailed { review, .. } => {
-                Identity::FixEnded(*review)
-            }
+            Self::AiFixApplied { review }
+            | Self::AiFixUnchanged { review }
+            | Self::AiFixFailed { review, .. } => Identity::FixEnded(*review),
             Self::ReadyForReview { arrival } => Identity::Arrival(*arrival),
             Self::PrLinked { url, .. } => Identity::PrLinked(url),
             Self::PrMerged { number } => Identity::PrMerged(*number),
@@ -198,6 +250,7 @@ impl Kind {
             | Self::ToolUsed { .. }
             | Self::ToolsOmitted { .. }
             | Self::RunFailed { run: None, .. }
+            | Self::RecoveryRequired { run: None, .. }
             | Self::Stopped { .. }
             | Self::Interrupted { .. }
             | Self::DeliveryFailed { .. } => return None,
@@ -213,6 +266,7 @@ impl Kind {
 enum Identity<'a> {
     RunStarted(u32),
     RunEnded(u32),
+    RecoveryRequired(u32),
     ReviewStarted(u32),
     ReviewVerdict(u32),
     FixStarted(u32),
@@ -234,7 +288,10 @@ enum Identity<'a> {
 pub fn record(entries: &mut Vec<Entry>, at: DateTime<Utc>, mut kind: Kind) -> bool {
     sanitize_text(&mut kind);
     if let Some(identity) = kind.identity() {
-        if entries.iter().any(|e| e.kind.identity().as_ref() == Some(&identity)) {
+        if entries
+            .iter()
+            .any(|e| e.kind.identity().as_ref() == Some(&identity))
+        {
             return false;
         }
     }
@@ -245,14 +302,32 @@ pub fn record(entries: &mut Vec<Entry>, at: DateTime<Utc>, mut kind: Kind) -> bo
 /// Record one tool call in `run`: a repeat of the run's last call (same tool,
 /// same detail) adds to its count, and calls past the run's cap are counted
 /// rather than listed. The detail is [`sanitize`]d first.
-pub fn record_tool(entries: &mut Vec<Entry>, at: DateTime<Utc>, run: u32, tool: &str, detail: Option<&str>) {
-    let detail = detail.map(|d| sanitize(d, MAX_DETAIL_CHARS)).filter(|d| !d.is_empty());
+pub fn record_tool(
+    entries: &mut Vec<Entry>,
+    at: DateTime<Utc>,
+    run: u32,
+    tool: &str,
+    detail: Option<&str>,
+) {
+    let detail = detail
+        .map(|d| sanitize(d, MAX_DETAIL_CHARS))
+        .filter(|d| !d.is_empty());
     let detail = detail.as_deref();
     let last_tool = entries.iter_mut().rev().find(|e| match &e.kind {
         Kind::ToolUsed { run: r, .. } => *r == run,
         _ => false,
     });
-    if let Some(Entry { kind: Kind::ToolUsed { tool: t, detail: d, count, .. }, .. }) = last_tool {
+    if let Some(Entry {
+        kind:
+            Kind::ToolUsed {
+                tool: t,
+                detail: d,
+                count,
+                ..
+            },
+        ..
+    }) = last_tool
+    {
         if t == tool && d.as_deref() == detail {
             *count = count.saturating_add(1);
             return;
@@ -276,7 +351,12 @@ pub fn record_tool(entries: &mut Vec<Entry>, at: DateTime<Utc>, run: u32, tool: 
     push(
         entries,
         at,
-        Kind::ToolUsed { run, tool: tool.to_string(), detail: detail.map(str::to_string), count: 1 },
+        Kind::ToolUsed {
+            run,
+            tool: tool.to_string(),
+            detail: detail.map(str::to_string),
+            count: 1,
+        },
     );
 }
 
@@ -296,7 +376,12 @@ pub fn append(entries: &mut Vec<Entry>, recorded: Vec<Entry>) {
 }
 
 fn push(entries: &mut Vec<Entry>, at: DateTime<Utc>, kind: Kind) {
-    let seq = entries.iter().map(|e| e.seq).max().unwrap_or(0).saturating_add(1);
+    let seq = entries
+        .iter()
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
     entries.push(Entry { seq, at, kind });
     while entries.len() > MAX_ENTRIES {
         let oldest = entries.iter().position(|e| e.kind.is_tool()).unwrap_or(0);
@@ -311,8 +396,12 @@ fn sanitize_text(kind: &mut Kind) {
         | Kind::AiReviewFailed { reason, .. }
         | Kind::AiReviewSkipped { reason, .. }
         | Kind::AiFixFailed { reason, .. }
-        | Kind::DeliveryFailed { reason } => *reason = sanitize(reason, MAX_REASON_CHARS),
-        Kind::ToolUsed { detail: Some(detail), .. } => *detail = sanitize(detail, MAX_DETAIL_CHARS),
+        | Kind::DeliveryFailed { reason }
+        | Kind::RecoveryRequired { reason, .. } => *reason = sanitize(reason, MAX_REASON_CHARS),
+        Kind::ToolUsed {
+            detail: Some(detail),
+            ..
+        } => *detail = sanitize(detail, MAX_DETAIL_CHARS),
         Kind::PrLinked { url, .. } => *url = redact(url),
         _ => {}
     }
@@ -417,7 +506,10 @@ pub struct Decision<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row<'a> {
     Created,
-    Decision { approved: bool, feedback: Option<&'a str> },
+    Decision {
+        approved: bool,
+        feedback: Option<&'a str>,
+    },
     Recorded(&'a Kind),
 }
 
@@ -452,11 +544,22 @@ pub fn timeline<'a>(
     decisions: impl IntoIterator<Item = Decision<'a>>,
     entries: &'a [Entry],
 ) -> Vec<Item<'a>> {
-    let mut items = vec![Item { at: created_at, row: Row::Created, order: (0, 0) }];
-    items.extend(entries.iter().map(|e| Item { at: e.at, row: Row::Recorded(&e.kind), order: (1, e.seq) }));
+    let mut items = vec![Item {
+        at: created_at,
+        row: Row::Created,
+        order: (0, 0),
+    }];
+    items.extend(entries.iter().map(|e| Item {
+        at: e.at,
+        row: Row::Recorded(&e.kind),
+        order: (1, e.seq),
+    }));
     items.extend(decisions.into_iter().map(|d| Item {
         at: d.at,
-        row: Row::Decision { approved: d.approved, feedback: d.feedback },
+        row: Row::Decision {
+            approved: d.approved,
+            feedback: d.feedback,
+        },
         order: (2, d.sequence),
     }));
     items.sort_by_key(|item| (item.at, item.order));
@@ -469,7 +572,9 @@ impl Item<'_> {
         match &self.row {
             Row::Created => "Task created".to_string(),
             Row::Decision { approved: true, .. } => "You approved the changes".to_string(),
-            Row::Decision { approved: false, .. } => "You requested changes".to_string(),
+            Row::Decision {
+                approved: false, ..
+            } => "You requested changes".to_string(),
             Row::Recorded(kind) => kind_title(kind),
         }
     }
@@ -487,13 +592,16 @@ impl Item<'_> {
         match &self.row {
             Row::Created => Tone::Neutral,
             Row::Decision { approved: true, .. } => Tone::Good,
-            Row::Decision { approved: false, .. } => Tone::Neutral,
+            Row::Decision {
+                approved: false, ..
+            } => Tone::Neutral,
             Row::Recorded(kind) => match kind {
                 Kind::ToolUsed { .. } | Kind::ToolsOmitted { .. } => Tone::Quiet,
                 Kind::RunFailed { .. }
                 | Kind::AiReviewFailed { .. }
                 | Kind::AiFixFailed { .. }
                 | Kind::DeliveryFailed { .. }
+                | Kind::RecoveryRequired { .. }
                 | Kind::PrClosed { .. } => Tone::Bad,
                 Kind::RunCompleted { .. }
                 | Kind::AiReviewApproved { .. }
@@ -503,7 +611,9 @@ impl Item<'_> {
                 | Kind::CompletedLocally
                 | Kind::IntegratedLocally { .. } => Tone::Good,
                 Kind::ReadyForReview { .. } => Tone::Attention,
-                Kind::Moved { to: Column::Done, .. } => Tone::Good,
+                Kind::Moved {
+                    to: Column::Done, ..
+                } => Tone::Good,
                 _ => Tone::Neutral,
             },
         }
@@ -530,13 +640,16 @@ impl Item<'_> {
         match &self.row {
             Row::Created => "created",
             Row::Decision { approved: true, .. } => "approved",
-            Row::Decision { approved: false, .. } => "changes_requested",
+            Row::Decision {
+                approved: false, ..
+            } => "changes_requested",
             Row::Recorded(kind) => match kind {
                 Kind::Moved { .. } => "moved",
                 Kind::RunStarted { .. } => "run_started",
                 Kind::ToolUsed { .. } => "tool_used",
                 Kind::ToolsOmitted { .. } => "tools_omitted",
                 Kind::RunCompleted { .. } => "run_completed",
+                Kind::RecoveryRequired { .. } => "recovery_required",
                 Kind::RunFailed { .. } => "run_failed",
                 Kind::Stopped { .. } => "stopped",
                 Kind::Interrupted { .. } => "interrupted",
@@ -571,22 +684,40 @@ fn nth(label: &str, n: u32) -> String {
 
 fn kind_title(kind: &Kind) -> String {
     match kind {
-        Kind::Moved { from: Column::Error, to: Column::Queue } => "Retried".to_string(),
-        Kind::Moved { from: Column::Backlog, to: Column::Queue } => "Added to the queue".to_string(),
-        Kind::Moved { to: Column::Done, .. } => "Moved to Done".to_string(),
+        Kind::Moved {
+            from: Column::Error,
+            to: Column::Queue,
+        } => "Retried".to_string(),
+        Kind::Moved {
+            from: Column::Backlog,
+            to: Column::Queue,
+        } => "Added to the queue".to_string(),
+        Kind::Moved {
+            to: Column::Done, ..
+        } => "Moved to Done".to_string(),
         Kind::Moved { to, .. } => format!("Moved to {}", to.label()),
-        Kind::RunStarted { addressing_feedback: true, .. } => "Coding started on your feedback".to_string(),
+        Kind::RunStarted {
+            addressing_feedback: true,
+            ..
+        } => "Coding started on your feedback".to_string(),
         Kind::RunStarted { run, .. } => nth("Coding started", *run),
         Kind::ToolUsed { tool, count, .. } if *count > 1 => format!("Used {tool} ×{count}"),
         Kind::ToolUsed { tool, .. } => format!("Used {tool}"),
         Kind::ToolsOmitted { count, .. } => {
-            format!("{count} more tool call{}", if *count == 1 { "" } else { "s" })
+            format!(
+                "{count} more tool call{}",
+                if *count == 1 { "" } else { "s" }
+            )
         }
         Kind::RunCompleted { .. } => "Coding finished".to_string(),
+        Kind::RecoveryRequired { .. } => "Worker recovery required".to_string(),
         Kind::RunFailed { run: Some(_), .. } => "Coding failed".to_string(),
         Kind::RunFailed { run: None, .. } => "Could not start".to_string(),
         Kind::Stopped { from } => format!("Stopped during {}", from.label()),
-        Kind::Interrupted { from } => format!("Returned to the queue from {} when SlashIt restarted", from.label()),
+        Kind::Interrupted { from } => format!(
+            "Returned to the queue from {} when SlashIt restarted",
+            from.label()
+        ),
         Kind::AiReviewStarted { review } => nth("AI review started", *review),
         Kind::AiReviewApproved { .. } => "AI review approved".to_string(),
         Kind::AiReviewChangesRequested { .. } => "AI review requested changes".to_string(),
@@ -613,13 +744,20 @@ fn kind_detail(kind: &Kind) -> Option<String> {
         | Kind::AiReviewFailed { reason, .. }
         | Kind::AiReviewSkipped { reason, .. }
         | Kind::AiFixFailed { reason, .. }
-        | Kind::DeliveryFailed { reason } => Some(reason.clone()),
-        Kind::AiReviewChangesRequested { issues, .. } if *issues > 0 => {
-            Some(format!("{issues} issue{} found", if *issues == 1 { "" } else { "s" }))
-        }
-        Kind::PrLinked { number: Some(number), .. } => Some(format!("#{number}")),
+        | Kind::DeliveryFailed { reason }
+        | Kind::RecoveryRequired { reason, .. } => Some(reason.clone()),
+        Kind::AiReviewChangesRequested { issues, .. } if *issues > 0 => Some(format!(
+            "{issues} issue{} found",
+            if *issues == 1 { "" } else { "s" }
+        )),
+        Kind::PrLinked {
+            number: Some(number),
+            ..
+        } => Some(format!("#{number}")),
         Kind::PrMerged { number } | Kind::PrClosed { number } => Some(format!("#{number}")),
-        Kind::IntegratedLocally { strategy, commit, .. } => {
+        Kind::IntegratedLocally {
+            strategy, commit, ..
+        } => {
             let short: String = commit.chars().take(12).collect();
             Some(format!("{} {short}", strategy.replace('_', " ")))
         }

@@ -1,9 +1,12 @@
 //! Test helper utilities
 //! Common test fixtures and utilities for backend testing
 
-use crate::domain::{Task, TaskStatus, TaskCategory, TaskPriority, TaskComplexity, TaskImpact, SecuritySeverity, TaskPhase};
-pub use uuid::Uuid;
+use crate::domain::{
+    SecuritySeverity, Task, TaskCategory, TaskComplexity, TaskImpact, TaskPhase, TaskPriority,
+    TaskStatus,
+};
 use chrono::Utc;
+pub use uuid::Uuid;
 
 /// The one process-global lock for every `--lib` unit test that mutates
 /// process-wide `PATH` to install a fake command shim (a fixture `claude` or
@@ -72,7 +75,8 @@ pub struct FakeProgram {
 /// the next process to claim a root. See [`ShadowRoot`].
 #[cfg(all(test, unix))]
 static SHADOW_ROOT: std::sync::LazyLock<ShadowRoot> = std::sync::LazyLock::new(|| {
-    let root = ShadowRoot::claim(&shadow_parent(&std::env::temp_dir())).expect("claim the shadow root");
+    let root =
+        ShadowRoot::claim(&shadow_parent(&std::env::temp_dir())).expect("claim the shadow root");
     let _ = EXIT_ROOT.set(root.path().to_path_buf());
     // Safety: `reclaim_at_exit` is a plain `extern "C"` function that
     // touches no state but `EXIT_ROOT`, set above.
@@ -97,7 +101,9 @@ extern "C" fn reclaim_at_exit() {
 #[cfg(all(test, unix))]
 fn shadow_parent(base: &std::path::Path) -> std::path::PathBuf {
     // Safety: `geteuid` has no preconditions.
-    base.join(format!("slashit-test-shadows-{}", unsafe { libc::geteuid() }))
+    base.join(format!("slashit-test-shadows-{}", unsafe {
+        libc::geteuid()
+    }))
 }
 
 /// A directory of `PATH` shadows owned by one test process.
@@ -126,7 +132,10 @@ impl ShadowRoot {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         // Safety: `geteuid` has no preconditions.
         let me = unsafe { libc::geteuid() };
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
         let meta = std::fs::symlink_metadata(parent)?;
         if !meta.is_dir() || meta.uid() != me {
             return Err(std::io::Error::other(format!(
@@ -155,11 +164,21 @@ impl ShadowRoot {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
-        let path = parent.join(format!("root-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        let path = parent.join(format!(
+            "root-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir(&path)?;
-        let alive = std::fs::OpenOptions::new().create_new(true).write(true).open(path.join(".alive"))?;
+        let alive = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path.join(".alive"))?;
         alive.lock()?;
-        Ok(ShadowRoot { path, _alive: alive })
+        Ok(ShadowRoot {
+            path,
+            _alive: alive,
+        })
     }
 
     fn path(&self) -> &std::path::Path {
@@ -171,7 +190,9 @@ impl ShadowRoot {
 impl FakeProgram {
     /// Take `PATH` over, with `entries` after the fake programs' own
     /// directory.
-    async fn take_path(entries: impl FnOnce(&Option<std::ffi::OsString>) -> Vec<std::path::PathBuf>) -> Self {
+    async fn take_path(
+        entries: impl FnOnce(&Option<std::ffi::OsString>) -> Vec<std::path::PathBuf>,
+    ) -> Self {
         let lock = crate::test_helpers::PATH_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("invocations.log");
@@ -184,7 +205,12 @@ impl FakeProgram {
         unsafe {
             std::env::set_var("PATH", new_path);
         }
-        FakeProgram { _lock: lock, dir, log, saved_path }
+        FakeProgram {
+            _lock: lock,
+            dir,
+            log,
+            saved_path,
+        }
     }
 
     /// An executable `name` at the front of `PATH`. `body` runs after
@@ -192,7 +218,10 @@ impl FakeProgram {
     /// spawned it from.
     pub async fn install(name: &str, body: &str) -> Self {
         let fake = Self::take_path(|saved| {
-            saved.as_ref().map(|p| std::env::split_paths(p).collect()).unwrap_or_default()
+            saved
+                .as_ref()
+                .map(|p| std::env::split_paths(p).collect())
+                .unwrap_or_default()
         })
         .await;
         fake.add(name, body);
@@ -209,7 +238,9 @@ impl FakeProgram {
     pub async fn without(hidden: &[&str]) -> Self {
         let shadows = SHADOW_ROOT.path().join(uuid::Uuid::new_v4().to_string());
         Self::take_path(|saved| {
-            let Some(saved) = saved else { return Vec::new() };
+            let Some(saved) = saved else {
+                return Vec::new();
+            };
             path_entries_without(saved, hidden, &shadows)
         })
         .await
@@ -220,7 +251,9 @@ impl FakeProgram {
     /// can hand the calls it does not intercept to.
     pub fn original(&self, name: &str) -> Option<std::path::PathBuf> {
         let saved = self.saved_path.as_ref()?;
-        std::env::split_paths(saved).map(|dir| dir.join(name)).find(|p| p.is_file())
+        std::env::split_paths(saved)
+            .map(|dir| dir.join(name))
+            .find(|p| p.is_file())
     }
 
     /// Install one more fake program `name` beside the others.
@@ -369,9 +402,7 @@ pub fn ipc_test_context(paths: std::sync::Arc<crate::config::paths::AppPaths>) -
         storage: crate::config::Storage::with_paths((*paths).clone()),
         events: crate::events::null_sink(),
         control: Arc::new(crate::instance::InertControl),
-        features: Arc::new(RwLock::new(
-            crate::config::features::FeatureFlags::default(),
-        )),
+        features: Arc::new(RwLock::new(crate::config::features::FeatureFlags::default())),
         repositories: Arc::new(RwLock::new(HashMap::new())),
         worktree_manager: Arc::new(crate::worktree::WorktreeManager::new(paths.clone())),
         task_lifecycle_locks: Arc::new(crate::lifecycle::TaskLifecycleLocks::new()),
@@ -409,13 +440,16 @@ impl FakeDisk {
     }
 
     pub fn set_available(&self, bytes: u64) {
-        self.available.store(bytes, std::sync::atomic::Ordering::SeqCst);
-        self.failing.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.available
+            .store(bytes, std::sync::atomic::Ordering::SeqCst);
+        self.failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Make every reading fail, as a `statvfs` error would.
     pub fn fail(&self) {
-        self.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.failing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// How many times the filesystem has been read.
@@ -425,17 +459,19 @@ impl FakeDisk {
 
     pub fn guard(&self) -> std::sync::Arc<crate::queue::start_guard::StartGuard> {
         let disk = self.clone();
-        std::sync::Arc::new(crate::queue::start_guard::StartGuard::new(std::sync::Arc::new(move || {
-            use std::sync::atomic::Ordering;
-            disk.reads.fetch_add(1, Ordering::SeqCst);
-            if disk.failing.load(Ordering::SeqCst) {
-                return Err(std::io::Error::other("statvfs failed"));
-            }
-            Ok(crate::domain::storage_usage::FilesystemSpace {
-                total_bytes: Self::TOTAL,
-                available_bytes: disk.available.load(Ordering::SeqCst),
-            })
-        })))
+        std::sync::Arc::new(crate::queue::start_guard::StartGuard::new(
+            std::sync::Arc::new(move || {
+                use std::sync::atomic::Ordering;
+                disk.reads.fetch_add(1, Ordering::SeqCst);
+                if disk.failing.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::other("statvfs failed"));
+                }
+                Ok(crate::domain::storage_usage::FilesystemSpace {
+                    total_bytes: Self::TOTAL,
+                    available_bytes: disk.available.load(Ordering::SeqCst),
+                })
+            }),
+        ))
     }
 }
 
@@ -456,9 +492,14 @@ pub fn no_github() -> std::sync::Arc<crate::pr_status::PrStatuses> {
 /// [`crate::queue::start_guard::StartGuard`].
 pub fn plenty_of_disk() -> std::sync::Arc<crate::queue::start_guard::StartGuard> {
     use crate::domain::storage_usage::{FilesystemSpace, GIB};
-    std::sync::Arc::new(crate::queue::start_guard::StartGuard::new(std::sync::Arc::new(|| {
-        Ok(FilesystemSpace { total_bytes: 1000 * GIB, available_bytes: 900 * GIB })
-    })))
+    std::sync::Arc::new(crate::queue::start_guard::StartGuard::new(
+        std::sync::Arc::new(|| {
+            Ok(FilesystemSpace {
+                total_bytes: 1000 * GIB,
+                available_bytes: 900 * GIB,
+            })
+        }),
+    ))
 }
 
 /// A real [`crate::queue::TaskExecutor`], wired to an already-built
@@ -504,7 +545,9 @@ pub fn attach_test_executor(state: &crate::AppState) -> std::sync::Arc<crate::qu
 /// [`crate::AppState`] -- the daemon's own handles, so an IPC handler test
 /// can prove the same thing through `ctx.executor` that the desktop test
 /// proves through `state.executor`.
-pub async fn attach_test_executor_ipc(ctx: &IpcContext) -> std::sync::Arc<crate::queue::TaskExecutor> {
+pub async fn attach_test_executor_ipc(
+    ctx: &IpcContext,
+) -> std::sync::Arc<crate::queue::TaskExecutor> {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -578,6 +621,8 @@ pub fn create_test_task(title: &str) -> Task {
         position: 0,
         pr_review_plan: None,
         activity: Vec::new(),
+        worker_handoff: None,
+        worker_handoff_confirmed: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -609,7 +654,7 @@ pub fn create_test_task_full(
 /// inline comment) and one Skip.
 pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan) {
     use crate::domain::task::{
-        PrReviewComment, PrReviewDecision, PrReviewItem, PrReviewPlan, PrCommentKind,
+        PrCommentKind, PrReviewComment, PrReviewDecision, PrReviewItem, PrReviewPlan,
     };
 
     let mut task = create_test_task("Fix login bug");
@@ -657,10 +702,10 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
-        pr_reply_text: None,
-        reply_comment_id: None,
-        fix_commit: None,
-        fix_effect: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
+            fix_commit: None,
+            fix_effect: None,
         },
         PrReviewItem {
             comment_id: Some(102),
@@ -675,10 +720,10 @@ pub fn create_test_pr_review_setup() -> (Task, crate::domain::task::PrReviewPlan
             reply_posted: false,
             last_agent_summary: None,
             last_error: None,
-        pr_reply_text: None,
-        reply_comment_id: None,
-        fix_commit: None,
-        fix_effect: None,
+            pr_reply_text: None,
+            reply_comment_id: None,
+            fix_commit: None,
+            fix_effect: None,
         },
     ];
 
@@ -736,7 +781,9 @@ mod shadow_tests {
     }
 
     fn roots_in(tmp: &std::path::Path) -> Vec<String> {
-        let Ok(read) = std::fs::read_dir(shadow_parent(tmp)) else { return Vec::new() };
+        let Ok(read) = std::fs::read_dir(shadow_parent(tmp)) else {
+            return Vec::new();
+        };
         read.flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with("root-"))
@@ -745,9 +792,15 @@ mod shadow_tests {
 
     /// Run [`process_probe`] in a fresh process of this same test binary,
     /// with its temporary directory, and so its shadow root, under `tmp`.
-    fn run_probe(mode: &str, tmp: &std::path::Path, fixture: &std::path::Path) -> std::process::Output {
+    fn run_probe(
+        mode: &str,
+        tmp: &std::path::Path,
+        fixture: &std::path::Path,
+    ) -> std::process::Output {
         let mut path = vec![fixture.to_path_buf()];
-        path.extend(std::env::split_paths(&std::env::var_os("PATH").expect("PATH")));
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").expect("PATH"),
+        ));
         let output = Command::new(std::env::current_exe().expect("test binary"))
             .args([PROBE, "--exact", "--test-threads=1"])
             .env("TMPDIR", tmp)
@@ -756,8 +809,7 @@ mod shadow_tests {
             .output()
             .expect("run the probe");
         assert!(
-            String::from_utf8_lossy(&output.stdout).contains("1 passed")
-                || mode == "abort",
+            String::from_utf8_lossy(&output.stdout).contains("1 passed") || mode == "abort",
             "the probe did not run: {}",
             String::from_utf8_lossy(&output.stdout)
         );
@@ -768,7 +820,9 @@ mod shadow_tests {
     /// way a test does, then ends the process the requested way.
     #[tokio::test]
     async fn process_probe() {
-        let Some(mode) = std::env::var_os("SLASHIT_SHADOW_PROBE") else { return };
+        let Some(mode) = std::env::var_os("SLASHIT_SHADOW_PROBE") else {
+            return;
+        };
         let fake = FakeProgram::without(&["hide-me"]).await;
         assert!(!roots_in(&std::env::temp_dir()).is_empty());
         drop(fake);
@@ -794,12 +848,20 @@ mod shadow_tests {
             .expect("spawn child");
 
         // A `FakeProgram` coming and going while the child holds the shadow.
-        let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
         rt.block_on(async { drop(FakeProgram::install("unused", "").await) });
-        assert!(shadow.join("tool").exists(), "the shadow went with the fake program");
+        assert!(
+            shadow.join("tool").exists(),
+            "the shadow went with the fake program"
+        );
 
         drop(child.stdin.take()); // lets `read` return
-        assert!(child.wait().expect("wait").success(), "the child lost its tools");
+        assert!(
+            child.wait().expect("wait").success(),
+            "the child lost its tools"
+        );
     }
 
     #[test]
@@ -824,13 +886,25 @@ mod shadow_tests {
         let mut names = roots_in(tmp.path());
         names.sort();
         let mut want = vec![
-            live.path().file_name().unwrap().to_string_lossy().into_owned(),
-            second.path().file_name().unwrap().to_string_lossy().into_owned(),
+            live.path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            second
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
         ];
         want.sort();
         assert_eq!(names, want, "only live roots remain");
         assert!(parent.join("keep-me").exists());
-        assert!(outside.path().join("precious").exists(), "cleanup followed a symlink out");
+        assert!(
+            outside.path().join("precious").exists(),
+            "cleanup followed a symlink out"
+        );
     }
 
     #[test]
@@ -838,7 +912,9 @@ mod shadow_tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let fixture = fixture();
         for _ in 0..3 {
-            assert!(run_probe("exit", tmp.path(), fixture.path()).status.success());
+            assert!(run_probe("exit", tmp.path(), fixture.path())
+                .status
+                .success());
             assert_eq!(roots_in(tmp.path()), Vec::<String>::new());
         }
     }
@@ -847,9 +923,17 @@ mod shadow_tests {
     fn a_crashed_process_leaves_a_root_that_the_next_process_reaps() {
         let tmp = tempfile::tempdir().expect("tmp");
         let fixture = fixture();
-        assert!(!run_probe("abort", tmp.path(), fixture.path()).status.success());
-        assert_eq!(roots_in(tmp.path()).len(), 1, "an abort cannot run exit handlers");
-        assert!(run_probe("exit", tmp.path(), fixture.path()).status.success());
+        assert!(!run_probe("abort", tmp.path(), fixture.path())
+            .status
+            .success());
+        assert_eq!(
+            roots_in(tmp.path()).len(),
+            1,
+            "an abort cannot run exit handlers"
+        );
+        assert!(run_probe("exit", tmp.path(), fixture.path())
+            .status
+            .success());
         assert_eq!(roots_in(tmp.path()), Vec::<String>::new());
     }
 }

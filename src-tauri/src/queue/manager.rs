@@ -1,5 +1,5 @@
 use crate::config::QueueConfig;
-use crate::domain::{Task, TaskStatus, TaskPhase};
+use crate::domain::{Task, TaskPhase, TaskStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -78,7 +78,10 @@ impl QueueManager {
             .collect();
 
         if self.config.fifo_ordering {
-            queued_tasks.into_iter().min_by_key(|t| t.created_at).map(|t| t.id)
+            queued_tasks
+                .into_iter()
+                .min_by_key(|t| t.created_at)
+                .map(|t| t.id)
         } else {
             queued_tasks.first().map(|t| t.id)
         }
@@ -121,7 +124,9 @@ impl QueueManager {
 
     pub async fn get_capacity_available(&self) -> usize {
         let in_progress = self.get_in_progress_count().await;
-        self.config.parallel_task_limit.saturating_sub(in_progress as u32) as usize
+        self.config
+            .parallel_task_limit
+            .saturating_sub(in_progress as u32) as usize
     }
 }
 
@@ -190,6 +195,8 @@ mod tests {
                 position: 0,
                 pr_review_plan: None,
                 activity: Vec::new(),
+                worker_handoff: None,
+                worker_handoff_confirmed: false,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };
@@ -240,7 +247,9 @@ mod tests {
     async fn promote(manager: &QueueManager, tasks: &Tasks) -> Option<Uuid> {
         let mut store = tasks.write().await;
         let task_id = manager.select_promotable(&store)?;
-        let task = store.get_mut(&task_id).expect("selected id must be in the map");
+        let task = store
+            .get_mut(&task_id)
+            .expect("selected id must be in the map");
         QueueManager::apply_promotion(task);
         Some(task_id)
     }

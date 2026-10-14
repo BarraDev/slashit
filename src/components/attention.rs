@@ -42,7 +42,10 @@ pub struct DeliveryRecord {
 
 impl Deliveries {
     pub fn provide() {
-        provide_context(Self { records: RwSignal::new(HashMap::new()), settled: RwSignal::new(0) });
+        provide_context(Self {
+            records: RwSignal::new(HashMap::new()),
+            settled: RwSignal::new(0),
+        });
     }
 
     pub fn get() -> Option<Self> {
@@ -51,12 +54,14 @@ impl Deliveries {
 
     /// Whether a pull request is being opened for `task_id`. Tracked.
     pub fn in_flight(self, task_id: Uuid) -> bool {
-        self.records.with(|m| m.get(&task_id).is_some_and(|r| r.in_flight > 0))
+        self.records
+            .with(|m| m.get(&task_id).is_some_and(|r| r.in_flight > 0))
     }
 
     /// [`Self::in_flight`], without subscribing to changes.
     pub fn in_flight_untracked(self, task_id: Uuid) -> bool {
-        self.records.with_untracked(|m| m.get(&task_id).is_some_and(|r| r.in_flight > 0))
+        self.records
+            .with_untracked(|m| m.get(&task_id).is_some_and(|r| r.in_flight > 0))
     }
 
     /// How many attempts have been answered so far. Tracked.
@@ -70,7 +75,8 @@ impl Deliveries {
     }
 
     pub fn begin(self, task_id: Uuid) {
-        self.records.update(|m| m.entry(task_id).or_default().in_flight += 1);
+        self.records
+            .update(|m| m.entry(task_id).or_default().in_flight += 1);
     }
 
     /// The attempt was answered. Call it in the same tick as applying the
@@ -81,7 +87,8 @@ impl Deliveries {
     /// tried; a refusal before that (the approval was not recorded, say) is
     /// not numbered as an attempt.
     pub fn finish(self, task_id: Uuid, attempted: bool) {
-        let at = attempted.then(|| String::from(js_sys::Date::new_0().to_locale_time_string("en-US")));
+        let at =
+            attempted.then(|| String::from(js_sys::Date::new_0().to_locale_time_string("en-US")));
         self.records.update(|m| {
             let record = m.entry(task_id).or_default();
             record.in_flight = record.in_flight.saturating_sub(1);
@@ -131,7 +138,10 @@ pub fn attention_order(
         })
         .collect();
     found.sort_by_key(|(column, position, id, _)| (*column, *position, *id));
-    found.into_iter().map(|(_, _, id, reason)| (id, reason)).collect()
+    found
+        .into_iter()
+        .map(|(_, _, id, reason)| (id, reason))
+        .collect()
 }
 
 /// The task after `current` in `order`, wrapping around; the first one if
@@ -149,10 +159,13 @@ pub fn next_after(order: &[Uuid], current: Option<Uuid>) -> Option<Uuid> {
 /// that was started and not finished.
 pub fn chip_classes(reason: AttentionReason) -> &'static str {
     match reason {
+        AttentionReason::Recovery => "bg-red-500/15 text-red-200 border-red-500/40",
         AttentionReason::Failed => "bg-red-500/15 text-red-200 border-red-500/40",
         AttentionReason::Review => "bg-violet-500/15 text-violet-200 border-violet-400/40",
         AttentionReason::PrNotCreated => "bg-amber-500/15 text-amber-200 border-amber-400/40",
-        AttentionReason::IntegrationUnfinished => "bg-orange-500/15 text-orange-200 border-orange-400/40",
+        AttentionReason::IntegrationUnfinished => {
+            "bg-orange-500/15 text-orange-200 border-orange-400/40"
+        }
     }
 }
 
@@ -269,7 +282,11 @@ mod tests {
 
         let delivering = Uuid::from_u128(3);
         let order = attention_order(&tasks, rank, |id| id == delivering);
-        assert_eq!(order.len(), 2, "a task whose pull request is being opened waits on SlashIt");
+        assert_eq!(
+            order.len(),
+            2,
+            "a task whose pull request is being opened waits on SlashIt"
+        );
     }
 
     #[test]

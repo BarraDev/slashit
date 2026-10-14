@@ -15,8 +15,8 @@ use crate::components::new_work_pause::NewWorkPauseNotice;
 use crate::components::pr_status::PullRequestSection;
 use crate::components::task_activity::TaskActivity;
 use crate::components::task_live::{
-    format_elapsed, output_provenance, project_run, DrawerActions, OutputProvenance, RefreshGate, RunBadge,
-    StartRequest,
+    format_elapsed, output_provenance, project_run, DrawerActions, OutputProvenance, RefreshGate,
+    RunBadge, StartRequest,
 };
 use crate::components::task_review::{AiReviewSection, HumanReviewPanel};
 use crate::components::toast;
@@ -59,7 +59,9 @@ pub fn TaskDrawer(
     // person, in which case that is what it says.
     let badge = Memo::new(move |_| {
         let attention = task.with(|t| {
-            t.as_ref().and_then(|t| t.needs_you(crate::components::attention::delivery_in_flight(task_id)))
+            t.as_ref().and_then(|t| {
+                t.needs_you(crate::components::attention::delivery_in_flight(task_id))
+            })
         });
         run_status.with(|run| project_run(run.as_ref(), attention))
     });
@@ -119,15 +121,30 @@ pub fn TaskDrawer(
 
     // A clock for the elapsed time, owned by the drawer.
     let now = RwSignal::new(chrono::Utc::now());
-    let ticker = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(1_000, move || {
-        now.try_set(chrono::Utc::now());
-    })));
+    let ticker = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(
+        1_000,
+        move || {
+            now.try_set(chrono::Utc::now());
+        },
+    )));
     on_cleanup(move || ticker.dispose());
 
     let actions = Memo::new(move |_| {
-        status
-            .get()
-            .map(|s| run.with(|r| DrawerActions::for_task(&s, r)))
+        task.get()
+            .map(|task| {
+                run.with(|r| {
+                    DrawerActions::for_task_with_recovery(
+                        &task.status,
+                        r,
+                        task.worker_handoff.as_ref().is_some_and(|handoff| {
+                            matches!(
+                                &handoff.stage,
+                                crate::models::WorkerHandoffStage::RecoveryRequired { .. }
+                            )
+                        }),
+                    )
+                })
+            })
             .unwrap_or_default()
     });
 
@@ -223,7 +240,9 @@ pub fn TaskDrawer(
                 Ok(EnqueueOutcome::AlreadyMoved(current)) => {
                     apply_task.try_run(current);
                 }
-                Ok(EnqueueOutcome::Missing) => toast::error("This task no longer exists".to_string()),
+                Ok(EnqueueOutcome::Missing) => {
+                    toast::error("This task no longer exists".to_string())
+                }
                 Err(e) => toast::error(format!("Could not retry the task: {e}")),
             }
             retrying.try_set(false);
@@ -239,7 +258,9 @@ pub fn TaskDrawer(
         spawn_local(async move {
             let loaded = match get_task_diff(task_id.to_string()).await {
                 Ok(diff) => {
-                    let stat = get_task_diff_stat(task_id.to_string()).await.unwrap_or_default();
+                    let stat = get_task_diff_stat(task_id.to_string())
+                        .await
+                        .unwrap_or_default();
                     Ok((diff, stat))
                 }
                 Err(e) => Err(e),
@@ -429,15 +450,21 @@ pub fn TaskDrawer(
                     })}
 
                     // What happened, if it failed.
-                    {move || task.get().filter(|t| t.status == TaskStatus::Error).map(|t| view! {
+                    {move || task.get().filter(|t| t.status == TaskStatus::Error || t.worker_handoff.as_ref().is_some_and(|handoff| matches!(&handoff.stage, crate::models::WorkerHandoffStage::RecoveryRequired { .. }))).map(|t| view! {
                         <section data-testid="task-drawer-failure" class="rounded-lg border border-red-500/20 bg-red-500/[0.06] p-3 space-y-2">
-                            <h3 class="text-xs font-semibold uppercase tracking-wide text-red-300">"What went wrong"</h3>
+                            <h3 class="text-xs font-semibold uppercase tracking-wide text-red-300">
+                                {if t.worker_handoff.as_ref().is_some_and(|handoff| matches!(&handoff.stage, crate::models::WorkerHandoffStage::RecoveryRequired { .. })) { "Worker recovery required" } else { "What went wrong" }}
+                            </h3>
                             <p data-testid="task-drawer-error" class="text-sm text-red-200 whitespace-pre-wrap break-words">
                                 {t.error_message.clone().unwrap_or_else(|| "The run failed without recording a reason.".to_string())}
                             </p>
-                            <p data-testid="task-drawer-retry-note" class="text-xs text-white/40">
-                                {retry_note(&t)}
-                            </p>
+                            {t.worker_handoff.as_ref().and_then(|handoff| matches!(&handoff.stage, crate::models::WorkerHandoffStage::RecoveryRequired { .. }).then_some(handoff)).map(|handoff| view! {
+                                <p data-testid="task-drawer-recovery-guidance" class="text-xs text-white/50">
+                                    {format!("Task Checkout preserved at {} on branch {}. Use Changes and Activity to inspect it. No new Worker can start until this recovery is resolved.", t.worktree_path.as_deref().unwrap_or("an unrecorded path"), handoff.branch.as_deref().unwrap_or("unknown"))}
+                                </p>
+                            }).unwrap_or_else(|| view! {
+                                <p data-testid="task-drawer-retry-note" class="text-xs text-white/40">{retry_note(&t).to_string()}</p>
+                            })}
                         </section>
                     })}
                     {move || previous_error.get().filter(|_| !run.with(|r| r.live)).map(|message| view! {
@@ -535,7 +562,11 @@ pub fn TaskDrawer(
 }
 
 #[component]
-fn DrawerHeader(task: Task, badge: Memo<Option<RunBadge>>, on_close: Callback<()>) -> impl IntoView {
+fn DrawerHeader(
+    task: Task,
+    badge: Memo<Option<RunBadge>>,
+    on_close: Callback<()>,
+) -> impl IntoView {
     let (status_label, class) = status_badge(&task.status);
     // A task in the In Progress column says what its run is only while
     // SlashIt owns one; the column alone does not say anything is running.
@@ -689,7 +720,8 @@ mod tests {
 
     #[test]
     fn retry_promises_continuation_only_when_there_is_a_checkout_to_continue_in() {
-        assert!(retry_note(&failed_task(Some("/tmp/wt/task-1"))).contains("continues from the work already done"));
+        assert!(retry_note(&failed_task(Some("/tmp/wt/task-1")))
+            .contains("continues from the work already done"));
         let note = retry_note(&failed_task(None));
         assert!(!note.contains("continues"), "{note}");
         assert!(note.contains("Retry puts the task back in the queue."));
