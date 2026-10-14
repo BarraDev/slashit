@@ -4337,8 +4337,15 @@ impl TaskExecutor {
                     "it is still {:?} in phase {:?}, which nothing picks up again while SlashIt \
                      keeps running, so it stays there with no run attached until you act: move \
                      it to Backlog or Queue to run it again, or to Error to record that it \
-                     failed. Restarting SlashIt returns it to Queue, and it will run again",
-                    task.status, task.phase
+                     failed{}",
+                    task.status,
+                    task.phase,
+                    // `migrate_task` returns exactly these two to Queue at start-up.
+                    if matches!(task.status, TaskStatus::InProgress | TaskStatus::AiReview) {
+                        ". Restarting SlashIt returns it to Queue, and it will run again"
+                    } else {
+                        ""
+                    }
                 ),
                 None => "it is no longer on the board".to_string(),
             };
@@ -6259,6 +6266,39 @@ mod tests {
         let errors = recorded_error_messages(&recording);
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("not published as errored"), "{errors:?}");
+    }
+
+    /// A restart only returns an in-flight task to Queue. Telling the person a
+    /// restart will run a task in any other status again would be false.
+    #[tokio::test]
+    async fn the_stranded_error_promises_a_restart_only_where_a_restart_requeues() {
+        for (status, promised) in [
+            (TaskStatus::InProgress, true),
+            (TaskStatus::AiReview, true),
+            (TaskStatus::HumanReview, false),
+            (TaskStatus::Done, false),
+        ] {
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let (executor, temps) = test_executor_with_events(recording.clone());
+            let (id, _project_id) = seed_task(&executor, status.clone()).await;
+            {
+                let mut tasks = executor.tasks.write().await;
+                let task = tasks.get_mut(&id).unwrap();
+                task.phase = TaskPhase::Coding;
+            }
+            block_persistence(&temps[0]);
+
+            TaskExecutor::set_task_error_static(&executor.tasks, &executor.storage, &executor.events, id, "x", None)
+                .await;
+
+            assert_eq!(
+                warn_message_containing(&recording, "Restarting SlashIt returns it to Queue"),
+                promised,
+                "{status:?}: {:?}",
+                recording.recorded()
+            );
+            assert!(warn_message_containing(&recording, &format!("{status:?}")), "{status:?}");
+        }
     }
 
     /// The path the message names is real: moving the stranded task to Queue or
