@@ -460,6 +460,29 @@ pub async fn commit_task(
     Ok(tasks.read().await.get(&task_id).cloned())
 }
 
+/// Say what a creation failure did, not only what broke.
+///
+/// A task id is the only dedup key, and every caller builds a fresh one per
+/// attempt -- the desktop form, the CLI, the issue importers. So a save that
+/// replaced the file and then could not confirm it durable
+/// (`PublishedNotDurable`, which [`publish`] adopted into memory) must not
+/// read as "nothing was created": a caller that retries duplicates the task,
+/// or the whole imported batch. The wording follows [`delete`]'s published
+/// arm: the caller is told the change is in place and only the confirmation
+/// is missing. A NotPublished failure left nothing anywhere, so it passes
+/// through unchanged.
+fn creation_consequence(rendered: &str, what: &str) -> String {
+    if crate::config::says_in_place_but_unconfirmed(rendered) {
+        format!(
+            "{rendered} The {what} is in place on the board and in the written file, so \
+             creating it again makes a duplicate of it; if it is missing after the next \
+             start, this write was lost and nothing survived."
+        )
+    } else {
+        rendered.to_string()
+    }
+}
+
 /// Insert a brand-new task durably.
 ///
 /// The stage/persist/publish contract [`record`] gives an existing task,
@@ -468,9 +491,14 @@ pub async fn commit_task(
 /// `project_id` -- under the same lock the insert commits with, so a value it
 /// derives from that set (a board position, a sequence number) answers a
 /// question nothing racing this call could have already invalidated -- and
-/// returns the task to insert. A save failure leaves the shared map exactly as
-/// it was, so a caller told creation failed never goes on to see the task
-/// anyway.
+/// returns the task to insert. A save that failed before the replacement
+/// leaves the shared map exactly as it was, so a caller told creation failed
+/// never goes on to see the task anyway -- but a save that replaced the file
+/// and then could not confirm it durable nevertheless put the task there:
+/// `publish` adopts that board. Because the task id is the dedup key and
+/// callers build a fresh one per attempt, the returned error says the task is
+/// in place and that creating it again duplicates it (see
+/// [`creation_consequence`]).
 pub async fn create(
     gate: &ProjectLifecycleGate,
     tasks: &Tasks,
@@ -505,15 +533,20 @@ pub async fn create(
     let mut staged = stage_project(&tasks_w, project_id);
     let task = build(&staged);
     staged.insert(task.id, task.clone());
-    publish(&mut tasks_w, storage, project_id, staged)?;
+    publish(&mut tasks_w, storage, project_id, staged)
+        .map_err(|e| creation_consequence(&e, "task"))?;
     Ok(task)
 }
 
 /// [`create`], for several Tasks that arrive together (an import).
 ///
-/// All of them reach the board in one write, after the file accepted the
-/// whole batch, so a refused save leaves neither the board nor the disk with
-/// a part of it.
+/// All of them reach the board in one write after the file accepted the whole
+/// batch, so a save refused before the replacement leaves neither the board
+/// nor the disk with a part of it. A batch that replaced the file and then
+/// could not confirm it durable is nevertheless entirely in place -- `publish`
+/// adopts that board -- so the returned error says the batch is in place and
+/// that retrying the import reimports a duplicate batch (see
+/// [`creation_consequence`]).
 pub async fn create_batch(
     gate: &ProjectLifecycleGate,
     tasks: &Tasks,
@@ -541,6 +574,7 @@ pub async fn create_batch(
         staged.insert(task.id, task.clone());
     }
     publish(&mut tasks_w, storage, project_id, staged)
+        .map_err(|e| creation_consequence(&e, if new_tasks.len() > 1 { "batch of tasks" } else { "task" }))
 }
 
 /// Renumber `target_status`'s column so `task_id` sits at `new_position` and
@@ -2691,6 +2725,86 @@ mod tests {
         let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();
         assert_eq!(on_disk.iter().find(|t| t.id == id).unwrap().title, "renamed", "the earlier change survives");
         assert_eq!(on_disk.iter().find(|t| t.id == sibling_id).unwrap().title, "sibling renamed");
+    }
+
+    /// A create whose directory sync failed has still put the task on the
+    /// board and in the file: the error must say so, or a caller that retries
+    /// with the fresh id it builds per attempt duplicates the task. It also
+    /// covers a NotPublished failure, which must stay silent about a board it
+    /// never reached.
+    #[tokio::test]
+    async fn a_create_that_published_but_could_not_confirm_durable_tells_the_caller_so() {
+        use slashit_durable_fs::{fault, Stage};
+        let world = world(false);
+        let mut created_id: Option<Uuid> = None;
+
+        let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = create(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, |_| {
+            let mut t = crate::test_helpers::create_test_task("Created");
+            t.project_id = world.project_id;
+            created_id = Some(t.id);
+            t
+        })
+        .await
+        .expect_err("the caller is told the durability is unconfirmed");
+        drop(fault);
+        assert!(error.contains("in place but not confirmed durable"), "{error}");
+        assert!(error.contains("makes a duplicate"), "{error}");
+        assert!(error.contains("nothing survived"), "{error}");
+        let id = created_id.expect("the created id");
+        assert_eq!(world.tasks.read().await[&id].title, "Created", "the task is on the board");
+        assert_eq!(world.tasks.read().await.len(), 1);
+        let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();
+        assert_eq!(on_disk.len(), 1, "the whole board is the one published task");
+        assert_eq!(on_disk[0].id, id, "the file holds the task");
+
+        // A NotPublished failure leaves the map and the file as they were, and
+        // says nothing about a task in place.
+        world.block_persistence();
+        let error = create(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, |_| {
+            let mut t = crate::test_helpers::create_test_task("Interrupted");
+            t.project_id = world.project_id;
+            t
+        })
+        .await
+        .expect_err("nothing could be written");
+        assert!(error.contains("cannot be used as a board"), "{error}");
+        assert!(!error.contains("makes a duplicate"), "{error}");
+        assert_eq!(world.tasks.read().await.len(), 1, "the refused create left the board as it was");
+    }
+
+    /// Same for a batch import: the whole batch is in place after a
+    /// published-but-unconfirmed save, so the error tells the caller that a
+    /// retry reimports it as a duplicate batch.
+    #[tokio::test]
+    async fn a_create_batch_that_published_but_could_not_confirm_durable_tells_the_caller_so() {
+        use slashit_durable_fs::{fault, Stage};
+        let world = world(false);
+        let batch: Vec<Task> = ["One", "Two"]
+            .iter()
+            .map(|title| {
+                let mut t = crate::test_helpers::create_test_task(title);
+                t.project_id = world.project_id;
+                t
+            })
+            .collect();
+
+        let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        let error = create_batch(&world.gate, &world.tasks, &world.projects, &world.storage, world.project_id, &batch)
+            .await
+            .expect_err("the caller is told the durability is unconfirmed");
+        drop(fault);
+        assert!(error.contains("in place but not confirmed durable"), "{error}");
+        assert!(error.contains("batch of tasks is in place"), "{error}");
+        {
+            let board = world.tasks.read().await;
+            assert_eq!(board.len(), batch.len(), "every batch task is on the board");
+            for task in &batch {
+                assert!(&board.contains_key(&task.id));
+            }
+        }
+        let on_disk = world.storage.load_project_tasks(world.project_id).unwrap();
+        assert_eq!(on_disk.len(), batch.len(), "the file holds the batch");
     }
 
     /// The message names what actually happened to the task's cleanup flag.
