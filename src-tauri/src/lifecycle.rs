@@ -278,6 +278,11 @@ pub enum TerminalizeRefusal {
     /// started and not finished. It may already have moved its target, and
     /// only the person's Resume or Discard decides how it ends.
     IntegrationUnfinished,
+    /// The task records an unfinished local integration, in whatever status it
+    /// happens to be. Only a delete asks this: the record is durable evidence
+    /// of a Git operation that may already have moved its target branch, and
+    /// removing the task removes the only copy of it.
+    DeleteBlockedByIntegration,
 }
 
 impl std::fmt::Display for TerminalizeRefusal {
@@ -305,6 +310,7 @@ impl std::fmt::Display for TerminalizeRefusal {
             Self::NotRecorded(m) => write!(f, "{m}"),
             Self::RepublishPending => f.write_str(REPUBLISH_PENDING_REASON),
             Self::IntegrationUnfinished => f.write_str(crate::domain::task::INTEGRATION_UNFINISHED_REFUSAL),
+            Self::DeleteBlockedByIntegration => f.write_str(DELETE_BLOCKED_BY_INTEGRATION_REASON),
         }
     }
 }
@@ -771,6 +777,36 @@ pub(crate) fn classify_status_transition(
     }
 }
 
+/// Why deleting a Task is refused while it records an unfinished integration.
+pub const DELETE_BLOCKED_BY_INTEGRATION_REASON: &str =
+    "This Task records an unfinished integration of its approved work into a local branch. \
+     Deleting it would remove the only record of that operation, which may already have moved \
+     the target branch, so the Task was kept. Resume or discard the integration first (its \
+     controls are in the Task's Human Review panel). A record found in a status that offers no \
+     such panel cannot be deleted until that is handled.";
+
+/// Why this Task may not be deleted for reasons that no cleanup can settle, or
+/// `None`.
+///
+/// Deliberately narrower than [`project_deletion_refusal`]. That predicate also
+/// refuses a Task that still has a checkout or an interrupted cleanup, because
+/// a Project deletion cannot clean them; a Task deletion is exactly the
+/// operation that does, and refusing there would remove the retry path for an
+/// interrupted cleanup. What is refused here is only what deleting the record
+/// would destroy: an unfinished local integration (wherever the Task's status
+/// put it, which is not the same set as
+/// [`Task::integration_unfinished_refusal`] answers for a status move) and an
+/// unfinished restack of its published branch.
+pub fn task_deletion_refusal(task: &Task) -> Option<TerminalizeRefusal> {
+    if task.local_integration.as_ref().is_some_and(|r| r.is_pending()) {
+        return Some(TerminalizeRefusal::DeleteBlockedByIntegration);
+    }
+    if task.republish_pending_refusal().is_some() {
+        return Some(TerminalizeRefusal::RepublishPending);
+    }
+    None
+}
+
 /// Remove a task's record, once and only once nothing is owed on its behalf.
 ///
 /// Deleting is not a status change, so nothing here moves a task to a terminal
@@ -808,7 +844,15 @@ pub async fn delete(ctx: TerminalizeCtx<'_>, task_id: Uuid) -> Result<bool, Term
     let (project_id, current_status) = {
         let tasks_r = tasks.read().await;
         match tasks_r.get(&task_id) {
-            Some(task) => (task.project_id, task.status.clone()),
+            Some(task) => {
+                // Before the terminalization below, which only recognizes an
+                // unfinished integration in the two statuses that offer a
+                // Resume. Nothing has been touched when this answers.
+                if let Some(refusal) = task_deletion_refusal(task) {
+                    return Err(refusal);
+                }
+                (task.project_id, task.status.clone())
+            }
             None => return Ok(false),
         }
     };
@@ -2624,6 +2668,126 @@ mod tests {
             "the record has to survive, because a task the user is still shown is a task they \
              can delete again"
         );
+    }
+
+    fn integration_record(state: crate::domain::IntegrationState) -> crate::domain::LocalIntegration {
+        crate::domain::LocalIntegration {
+            state,
+            target_branch: "main".into(),
+            target_old_oid: "a".repeat(40),
+            approved_tip: "b".repeat(40),
+            result_oid: "c".repeat(40),
+            strategy: crate::domain::IntegrationStrategy::FastForward,
+            checkout_path: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            completes_task: false,
+        }
+    }
+
+    const EVERY_STATUS: [TaskStatus; 8] = [
+        TaskStatus::Backlog,
+        TaskStatus::Queue,
+        TaskStatus::InProgress,
+        TaskStatus::AiReview,
+        TaskStatus::HumanReview,
+        TaskStatus::Done,
+        TaskStatus::PrCreated,
+        TaskStatus::Error,
+    ];
+
+    async fn persist_board(world: &World) {
+        let board: Vec<Task> = world.tasks.read().await.values().cloned().collect();
+        world.storage.save_project_tasks(world.project_id, &board).expect("persist the record");
+    }
+
+    /// A pending local integration is the only record of a Git operation that
+    /// may already have moved its target. Whatever status the Task is in
+    /// (including the ones where no Resume is offered), deleting it is refused
+    /// before anything is touched: record, checkout and branch survive, in
+    /// memory and on disk.
+    #[tokio::test]
+    async fn a_task_with_a_pending_integration_is_never_deleted_in_any_status() {
+        for status in EVERY_STATUS {
+            let world = world(true);
+            let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+            let (id, sibling) = seed(&world, status.clone(), Some(&wt)).await;
+            let record = integration_record(crate::domain::IntegrationState::Pending);
+            world.tasks.write().await.get_mut(&id).unwrap().local_integration = Some(record.clone());
+            persist_board(&world).await;
+
+            let refusal = delete(world.ctx(), id).await.expect_err("the record must not be destroyed");
+
+            assert!(
+                matches!(refusal, TerminalizeRefusal::DeleteBlockedByIntegration),
+                "{status:?}: {refusal:?}"
+            );
+            for after in [world.task(id).await, world.persisted(id)] {
+                assert_eq!(after.local_integration, Some(record.clone()), "{status:?}");
+                assert_eq!(after.worktree_path.as_deref(), Some(wt.as_str()), "{status:?}");
+                assert!(!after.cleanup_in_flight, "{status:?}: nothing was announced");
+            }
+            assert!(std::path::Path::new(&wt).exists(), "{status:?}: the checkout survives");
+            assert!(world.tasks.read().await.contains_key(&sibling));
+        }
+    }
+
+    /// The same for an unfinished restack, in every status.
+    #[tokio::test]
+    async fn a_task_with_a_pending_restack_is_never_deleted_in_any_status() {
+        for status in EVERY_STATUS {
+            let world = world(true);
+            let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+            let (id, _) = seed(&world, status.clone(), Some(&wt)).await;
+            world.tasks.write().await.get_mut(&id).unwrap().pending_republish = Some(pending_restack());
+            persist_board(&world).await;
+
+            let refusal = delete(world.ctx(), id).await.expect_err("the restack's recovery needs it");
+
+            assert!(matches!(refusal, TerminalizeRefusal::RepublishPending), "{status:?}: {refusal:?}");
+            assert!(world.persisted(id).pending_republish.is_some(), "{status:?}");
+            assert!(std::path::Path::new(&wt).exists(), "{status:?}");
+        }
+    }
+
+    /// Only a *pending* integration blocks. One that finished holds nothing
+    /// owed, and the Project-deletion predicate's other reasons (an ordinary
+    /// checkout, an interrupted cleanup) are exactly what a Task delete is for.
+    #[tokio::test]
+    async fn a_finished_integration_an_ordinary_checkout_and_an_interrupted_cleanup_do_not_block_a_delete() {
+        for (label, prepare) in [
+            ("integrated", Some(integration_record(crate::domain::IntegrationState::Integrated))),
+            ("ordinary checkout", None),
+        ] {
+            let world = world(true);
+            let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+            let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
+            world.tasks.write().await.get_mut(&id).unwrap().local_integration = prepare;
+            assert!(delete(world.ctx(), id).await.unwrap_or_else(|e| panic!("{label}: {e}")), "{label}");
+            assert!(!std::path::Path::new(&wt).exists(), "{label}");
+        }
+
+        // The retry path for a removal that was interrupted: still a delete.
+        let world = world(true);
+        let wt = worktree_with_committed_work(&world, "task-abcd1234").await;
+        let (id, _) = seed(&world, TaskStatus::InProgress, Some(&wt)).await;
+        world.tasks.write().await.get_mut(&id).unwrap().cleanup_in_flight = true;
+        assert!(delete(world.ctx(), id).await.expect("an explicit delete retries the cleanup"));
+        assert!(!std::path::Path::new(&wt).exists());
+        assert!(!world.tasks.read().await.contains_key(&id));
+    }
+
+    /// Project deletion keeps its own, wider predicate: it cannot clean a
+    /// checkout, so it still refuses one that Task deletion handles.
+    #[test]
+    fn task_and_project_deletion_share_the_recovery_reasons_but_not_the_checkout_one() {
+        let mut task = create_test_task_full("t", Uuid::new_v4(), TaskStatus::InProgress, 0);
+        task.worktree_path = Some("/somewhere".into());
+        assert!(task_deletion_refusal(&task).is_none());
+        assert!(project_deletion_refusal(&task).is_some());
+        task.local_integration = Some(integration_record(crate::domain::IntegrationState::Pending));
+        assert!(task_deletion_refusal(&task).is_some());
+        assert!(project_deletion_refusal(&task).is_some());
     }
 
     #[tokio::test]

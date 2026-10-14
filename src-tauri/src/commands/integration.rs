@@ -2494,7 +2494,7 @@ mod tests {
             let refusal = crate::commands::task::delete_task(b.app.state(), b.task_id.to_string())
                 .await
                 .expect_err("a delete would drop the only record of the integration");
-            assert_eq!(refusal, REFUSAL);
+            assert_eq!(refusal, crate::lifecycle::DELETE_BLOCKED_BY_INTEGRATION_REASON);
 
             assert_eq!(recovery(&b.in_memory().await), before);
             assert_eq!(recovery(&b.on_disk()), before);
