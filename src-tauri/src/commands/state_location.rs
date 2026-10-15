@@ -6,6 +6,7 @@
 //! and machine-local caches are not part of that choice and are never offered
 //! — see [`crate::config::paths`] for the classification.
 
+use crate::commands::gui_admission::GuiMutation;
 use crate::config::migration::{ConflictPolicy, MigrationPlan, MigrationReport, StateMigrator};
 use crate::config::paths::{AppPaths, ProjectKey, ResolvedLocation, StateLocation};
 use crate::config::Storage;
@@ -186,6 +187,7 @@ pub async fn get_state_location(
 /// Describe what moving to `target` would do, without touching anything.
 #[tauri::command]
 pub async fn plan_state_migration(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     target: StateLocation,
@@ -325,6 +327,7 @@ pub(crate) async fn apply_state_migration_committed(
 /// would leave the project pointing at a directory the data never reached.
 #[tauri::command]
 pub async fn apply_state_migration(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     target: StateLocation,
@@ -425,6 +428,7 @@ async fn set_state_location_committed(
 /// completed after it last read the project's state.
 #[tauri::command]
 pub async fn set_state_location(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     location: StateLocation,
@@ -454,6 +458,7 @@ pub async fn set_state_location(
 /// switched to external storage.
 #[tauri::command]
 pub async fn clean_legacy_state_dirs(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<String>, String> {
     let roots: Vec<PathBuf> = {

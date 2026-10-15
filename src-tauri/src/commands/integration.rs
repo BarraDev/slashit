@@ -28,6 +28,7 @@
 //! persist `Integrated` -> unpin. The target branch alone says whether the
 //! move happened, which is what [`resume`] and [`discard`] read.
 
+use crate::commands::gui_admission::GuiMutation;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -166,6 +167,7 @@ pub struct IntegrationConfirmation {
 
 #[tauri::command]
 pub async fn get_integration_preview(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<IntegrationPreview, String> {
@@ -175,6 +177,7 @@ pub async fn get_integration_preview(
 
 #[tauri::command]
 pub async fn integrate_task_locally(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     confirmation: IntegrationConfirmation,
@@ -189,6 +192,7 @@ pub async fn integrate_task_locally(
 /// owed; the Task says why in `error_message`.
 #[tauri::command]
 pub async fn complete_and_integrate_task(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     confirmation: IntegrationConfirmation,
@@ -199,6 +203,7 @@ pub async fn complete_and_integrate_task(
 
 #[tauri::command]
 pub async fn reconfirm_approved_tip(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     tip: String,
@@ -209,6 +214,7 @@ pub async fn reconfirm_approved_tip(
 
 #[tauri::command]
 pub async fn resume_local_integration(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<Task, String> {
@@ -218,6 +224,7 @@ pub async fn resume_local_integration(
 
 #[tauri::command]
 pub async fn discard_local_integration(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<Task, String> {
@@ -2348,7 +2355,7 @@ mod tests {
             }
 
             async fn status(&self, to: TaskStatus) -> Result<Option<Task>, String> {
-                crate::commands::task::update_task_status(
+                crate::commands::task::update_task_status(GuiMutation::untracked(), 
                     self.app.state(),
                     self.task_id.to_string(),
                     to,
@@ -2358,7 +2365,7 @@ mod tests {
             }
 
             async fn drag(&self, to: Option<TaskStatus>, position: i32) -> Result<Option<Task>, String> {
-                crate::commands::task::reorder_task(
+                crate::commands::task::reorder_task(GuiMutation::untracked(), 
                     self.app.state(),
                     self.task_id.to_string(),
                     to,
@@ -2491,7 +2498,7 @@ mod tests {
             .unwrap();
             assert!(matches!(verdict, crate::lifecycle::EnqueueVerdict::Blocked(_)), "{verdict:?}");
 
-            let refusal = crate::commands::task::delete_task(b.app.state(), b.task_id.to_string())
+            let refusal = crate::commands::task::delete_task(GuiMutation::untracked(), b.app.state(), b.task_id.to_string())
                 .await
                 .expect_err("a delete would drop the only record of the integration");
             assert_eq!(refusal, crate::lifecycle::DELETE_BLOCKED_BY_INTEGRATION_REASON);
@@ -2509,13 +2516,13 @@ mod tests {
                 let before = recovery(&b.in_memory().await);
 
                 let id = b.task_id.to_string();
-                let refusal = crate::commands::queue::add_to_queue(b.app.state(), id.clone()).await.unwrap_err();
+                let refusal = crate::commands::queue::add_to_queue(GuiMutation::untracked(), b.app.state(), id.clone()).await.unwrap_err();
                 assert_eq!(refusal, REFUSAL);
-                let results = crate::commands::queue::bulk_add_to_queue(b.app.state(), vec![id.clone()])
+                let results = crate::commands::queue::bulk_add_to_queue(GuiMutation::untracked(), b.app.state(), vec![id.clone()])
                     .await
                     .unwrap();
                 assert!(results[0].contains(REFUSAL), "{results:?}");
-                let refusal = crate::commands::pr::create_pr(b.app.state(), id).await.unwrap_err();
+                let refusal = crate::commands::pr::create_pr(GuiMutation::untracked(), b.app.state(), id).await.unwrap_err();
                 assert_eq!(refusal, REFUSAL);
 
                 assert_eq!(recovery(&b.in_memory().await), before);

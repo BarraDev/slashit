@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::appearance::{Theme, AppearanceMode, ThemeColors};
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +37,7 @@ pub async fn get_theme(state: tauri::State<'_, crate::AppState>) -> Result<Theme
 
 #[tauri::command]
 pub async fn set_theme(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     theme: Theme,
 ) -> Result<(), String> {
@@ -169,6 +171,7 @@ pub async fn get_appearance_mode(state: tauri::State<'_, crate::AppState>) -> Re
 
 #[tauri::command]
 pub async fn set_appearance_mode(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     mode: AppearanceMode,
 ) -> Result<(), String> {
@@ -185,6 +188,7 @@ pub async fn get_use_project_rail(state: tauri::State<'_, crate::AppState>) -> R
 
 #[tauri::command]
 pub async fn set_use_project_rail(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     enabled: bool,
 ) -> Result<(), String> {

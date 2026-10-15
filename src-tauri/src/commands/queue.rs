@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::config::QueueConfig;
 use crate::domain::{Task, TaskStatus};
 use crate::queue::QueueManager;
@@ -42,6 +43,7 @@ pub async fn get_queue_config(
 
 #[tauri::command]
 pub async fn update_queue_config(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     parallel_task_limit: Option<u32>,
     auto_promote: Option<bool>,
@@ -187,6 +189,7 @@ async fn enqueue_durably(
 
 #[tauri::command]
 pub async fn add_to_queue(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<(), String> {
@@ -196,6 +199,7 @@ pub async fn add_to_queue(
 
 #[tauri::command]
 pub async fn bulk_add_to_queue(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_ids: Vec<String>,
 ) -> Result<Vec<String>, String> {
@@ -233,6 +237,7 @@ pub async fn get_queue_position(
 
 #[tauri::command]
 pub async fn promote_next_task(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Option<String>, String> {
     // Promotion asks the executor to start the task, so it waits while new
@@ -269,6 +274,7 @@ pub async fn get_in_progress_count(
 
 #[tauri::command]
 pub async fn requeue_task(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<(), String> {
@@ -323,7 +329,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = add_to_queue(app.state(), task_id.to_string()).await;
+        let result = add_to_queue(GuiMutation::untracked(), app.state(), task_id.to_string()).await;
 
         assert!(result.is_ok(), "{result:?}");
         assert!(
@@ -349,7 +355,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = add_to_queue(app.state(), task_id.to_string()).await;
+        let result = add_to_queue(GuiMutation::untracked(), app.state(), task_id.to_string()).await;
 
         assert!(result.is_err(), "{result:?}");
         let live: &crate::AppState = app.state::<crate::AppState>().inner();
@@ -412,7 +418,7 @@ mod enqueue_parity {
         app.manage(state);
         let live: &crate::AppState = app.state::<crate::AppState>().inner();
 
-        crate::commands::task::reorder_task(
+        crate::commands::task::reorder_task(GuiMutation::untracked(), 
             app.state(),
             by_board.to_string(),
             Some(TaskStatus::Queue),

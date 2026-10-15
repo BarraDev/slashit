@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::{BranchOrigin, Task, TaskStatus};
 use crate::domain::task::{
     ExternalRef, PrCommentKind, PrReviewApplyResult, PrReviewComment, PrReviewDecision,
@@ -395,6 +396,7 @@ async fn rewrite_git_branch_tip_author(
 
 #[tauri::command]
 pub async fn create_pr(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<String, String> {
@@ -405,6 +407,7 @@ pub async fn create_pr(
 /// landed: see [`republish::status`]. Reads only.
 #[tauri::command]
 pub async fn get_published_restack_status(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<Option<RepublishStatus>, String> {
@@ -418,6 +421,7 @@ pub async fn get_published_restack_status(
 /// person's explicit confirmation; nothing calls this on its own.
 #[tauri::command]
 pub async fn restack_published_task(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<RepublishOutcome, String> {
@@ -428,6 +432,7 @@ pub async fn restack_published_task(
 /// Go back to the tip a restack started from, without touching the remote.
 #[tauri::command]
 pub async fn discard_published_restack(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<(), String> {
@@ -525,6 +530,7 @@ pub(crate) async fn pr_availability(
 
 #[tauri::command]
 pub async fn get_pr_availability(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<PrAvailability, String> {
@@ -557,6 +563,7 @@ fn is_github_remote(url: &str) -> bool {
 
 #[tauri::command]
 pub async fn bulk_create_prs(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_ids: Vec<String>,
 ) -> Result<Vec<String>, String> {
@@ -574,6 +581,7 @@ pub async fn bulk_create_prs(
 
 #[tauri::command]
 pub async fn sync_existing_pr(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<Option<Task>, String> {
@@ -617,6 +625,7 @@ pub struct PrCandidate {
 
 #[tauri::command]
 pub async fn find_pr_candidates(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<Vec<PrCandidate>, String> {
@@ -722,6 +731,7 @@ pub struct PrPushRecoveryPlan {
 
 #[tauri::command]
 pub async fn get_pr_push_recovery(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<PrPushRecoveryPlan, String> {
@@ -738,6 +748,7 @@ pub async fn get_pr_push_recovery(
 
 #[tauri::command]
 pub async fn recover_private_email_and_create_pr(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     author_email: String,
@@ -842,6 +853,7 @@ async fn reauthored_tip(working_dir: &str, branch: &str, approved: &str) -> Resu
 
 #[tauri::command]
 pub async fn analyze_pr_comments(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<PrReviewPlan, String> {
@@ -1090,6 +1102,7 @@ fn carry_forward_reanalysis_lifecycle(
 /// Other items are left untouched. Returns the merged plan.
 #[tauri::command]
 pub async fn discuss_pr_review_questions(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     plan: PrReviewPlan,
@@ -1236,6 +1249,7 @@ pub fn no_progress() -> ProgressSink {
 
 #[tauri::command]
 pub async fn address_pr_review(
+    _gui: GuiMutation,
     app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
@@ -2099,6 +2113,7 @@ pub struct SyncPrRepliesResult {
 /// the plan and post only the deferred replies.
 #[tauri::command]
 pub async fn sync_pr_review_replies(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<SyncPrRepliesResult, String> {
@@ -5082,6 +5097,7 @@ async fn fetch_pr_state(statuses: &crate::pr_status::PrStatuses, pr_url: &str) -
 /// can ask on every refresh.
 #[tauri::command]
 pub async fn list_pr_statuses(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
 ) -> Result<Vec<crate::pr_status::PrStatusEntry>, String> {
@@ -5121,6 +5137,7 @@ async fn pr_statuses_for_project(
 /// entry's `error`, beside the last good status.
 #[tauri::command]
 pub async fn refresh_pr_status(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<Vec<crate::pr_status::PrStatusEntry>, String> {
@@ -5168,6 +5185,7 @@ fn pr_refresh_changes(task: &Task, pr_url: &str, remote: &str) -> bool {
 
 #[tauri::command]
 pub async fn refresh_task_pr_state(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<Option<Task>, String> {
@@ -12712,7 +12730,7 @@ mod tests {
                 let app = tauri::test::mock_app();
                 app.manage(state);
 
-                let updated = refresh_task_pr_state(app.state(), task_id.to_string())
+                let updated = refresh_task_pr_state(GuiMutation::untracked(), app.state(), task_id.to_string())
                     .await
                     .expect("refreshing must succeed once the live owner is safely ended");
 
@@ -12880,7 +12898,7 @@ mod tests {
 
                 let app = tauri::test::mock_app();
                 app.manage(state);
-                let synced = sync_existing_pr(app.state(), task_id.to_string())
+                let synced = sync_existing_pr(GuiMutation::untracked(), app.state(), task_id.to_string())
                     .await
                     .expect("an existing pull request is a fact to sync, whatever the pin")
                     .expect("the pull request for the branch is found");
@@ -12922,7 +12940,7 @@ mod tests {
 
                 let app = tauri::test::mock_app();
                 app.manage(state);
-                let synced = sync_existing_pr(app.state(), task_id.to_string())
+                let synced = sync_existing_pr(GuiMutation::untracked(), app.state(), task_id.to_string())
                     .await
                     .expect("asking succeeds");
                 assert!(synced.is_none(), "no pull request exists for the branch");
@@ -13210,7 +13228,7 @@ mod tests {
 
                     let app = tauri::test::mock_app();
                     app.manage(state);
-                    let after = refresh_task_pr_state(app.state(), task_id.to_string())
+                    let after = refresh_task_pr_state(GuiMutation::untracked(), app.state(), task_id.to_string())
                         .await
                         .expect("a refreshed remote state is a fact to record, whatever the pin")
                         .expect("the task is there");
@@ -13264,7 +13282,7 @@ mod tests {
 
                 let app = tauri::test::mock_app();
                 app.manage(state);
-                let after = refresh_task_pr_state(app.state(), task_id.to_string())
+                let after = refresh_task_pr_state(GuiMutation::untracked(), app.state(), task_id.to_string())
                     .await
                     .expect("the merge is a fact; the pin refuses only the finishing")
                     .expect("the task is there");
@@ -13435,7 +13453,7 @@ mod tests {
                 let app = tauri::test::mock_app();
                 app.manage(state);
 
-                let refresh = refresh_task_pr_state(app.state(), task_id.to_string());
+                let refresh = refresh_task_pr_state(GuiMutation::untracked(), app.state(), task_id.to_string());
                 let driver = async {
                     gh.asked().await;
                     let st = app.state::<crate::AppState>();
@@ -13453,7 +13471,7 @@ mod tests {
                             .expect("unlinking succeeds");
                         }
                         WhileAsking::Relink(url) => {
-                            crate::commands::task::link_pr(app.state(), task_id.to_string(), url.to_string())
+                            crate::commands::task::link_pr(GuiMutation::untracked(), app.state(), task_id.to_string(), url.to_string())
                                 .await
                                 .expect("relinking succeeds");
                         }
@@ -13738,7 +13756,7 @@ mod tests {
                 let lease = state.task_lifecycle_locks.acquire(id).await.unwrap();
                 let app = tauri::test::mock_app();
                 app.manage(state);
-                let mut relink = Box::pin(crate::commands::task::link_pr(app.state(), id.to_string(), PR_B.to_string()));
+                let mut relink = Box::pin(crate::commands::task::link_pr(GuiMutation::untracked(), app.state(), id.to_string(), PR_B.to_string()));
                 assert!(relink.as_mut().now_or_never().is_none(), "blocked by the lease holder");
                 assert_eq!(app.state::<crate::AppState>().task.tasks.read().await[&id].pr_url, None);
                 drop(lease);
@@ -13811,7 +13829,7 @@ mod tests {
 
                 let app = tauri::test::mock_app();
                 app.manage(state);
-                let result = recover_private_email_and_create_pr(
+                let result = recover_private_email_and_create_pr(GuiMutation::untracked(), 
                     app.state(),
                     task_id.to_string(),
                     "recovered+12345@users.noreply.github.com".to_string(),
@@ -13904,7 +13922,7 @@ mod tests {
 
                 let app = tauri::test::mock_app();
                 app.manage(state);
-                let result = recover_private_email_and_create_pr(
+                let result = recover_private_email_and_create_pr(GuiMutation::untracked(), 
                     app.state(),
                     task_id.to_string(),
                     "recovered+12345@users.noreply.github.com".to_string(),
@@ -13984,7 +14002,7 @@ mod tests {
 
                 let app = tauri::test::mock_app();
                 app.manage(state);
-                let result = recover_private_email_and_create_pr(
+                let result = recover_private_email_and_create_pr(GuiMutation::untracked(), 
                     app.state(),
                     task_id.to_string(),
                     "recovered+99999@users.noreply.github.com".to_string(),

@@ -3,6 +3,7 @@
 //! item. See `worktree::orphans` for what is an orphan and what a reclaim
 //! refuses.
 
+use crate::commands::gui_admission::GuiMutation;
 use crate::worktree::{owners_in_repository, OrphanScan, Owners};
 use uuid::Uuid;
 
@@ -53,6 +54,7 @@ async fn context(state: &crate::AppState, project_id: &str) -> Result<(String, O
 /// branches. Changes nothing.
 #[tauri::command]
 pub async fn scan_orphans(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
 ) -> Result<OrphanScan, String> {
@@ -63,6 +65,7 @@ pub async fn scan_orphans(
 /// Remove one orphaned Task Checkout, never forcing. Its branch stays.
 #[tauri::command]
 pub async fn reclaim_orphan_checkout(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     path: String,
@@ -74,6 +77,7 @@ pub async fn reclaim_orphan_checkout(
 /// Delete one orphaned task branch whose commits another durable ref has.
 #[tauri::command]
 pub async fn reclaim_orphan_branch(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     branch: String,

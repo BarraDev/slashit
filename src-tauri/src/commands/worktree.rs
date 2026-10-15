@@ -1,9 +1,11 @@
+use crate::commands::gui_admission::GuiMutation;
 use uuid::Uuid;
 use crate::domain::{BranchOrigin, ProjectBase};
 use crate::worktree::{WorktreeInfo, WorktreeManager};
 
 #[tauri::command]
 pub async fn create_worktree(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<String, String> {
@@ -196,6 +198,7 @@ async fn acquire_checkout(
 /// button again once they have dealt with whatever git objected to.
 #[tauri::command]
 pub async fn cleanup_worktree(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<(), String> {

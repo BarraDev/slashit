@@ -15,4 +15,7 @@ pub mod handlers;
 pub mod server;
 
 pub use handlers::Dispatch;
-pub use server::{serve, BoundIpc, IpcContext, IpcServer, PeerContext};
+pub use server::{
+    drain_execution, poller_join, quiesce_after_supervisor_failure, serve, BoundIpc, IpcContext,
+    HandlerRescue, IpcOwnership, IpcServer, PeerContext, Supervision,
+};

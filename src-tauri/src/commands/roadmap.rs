@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::{
     RoadmapFeature, CreateFeatureRequest, UpdateFeatureRequest,
     RoadmapStatus,
@@ -28,6 +29,7 @@ impl Default for RoadmapState {
 
 #[tauri::command]
 pub async fn create_roadmap_feature(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     request: CreateFeatureRequest,
 ) -> Result<RoadmapFeature, String> {
@@ -58,6 +60,7 @@ pub async fn create_roadmap_feature(
 
 #[tauri::command]
 pub async fn update_roadmap_feature(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     feature_id: String,
     request: UpdateFeatureRequest,
@@ -100,6 +103,7 @@ pub async fn update_roadmap_feature(
 
 #[tauri::command]
 pub async fn delete_roadmap_feature(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     feature_id: String,
 ) -> Result<bool, String> {
@@ -168,6 +172,7 @@ pub async fn get_roadmap_feature(
 
 #[tauri::command]
 pub async fn link_task_to_feature(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     feature_id: String,
     task_id: String,
@@ -190,6 +195,7 @@ pub async fn link_task_to_feature(
 
 #[tauri::command]
 pub async fn unlink_task_from_feature(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     feature_id: String,
     task_id: String,
@@ -232,13 +238,13 @@ mod tests {
             update: UpdateFeatureRequest,
             id: String,
         ) {
-            let _ = create_roadmap_feature(state.clone(), create).await;
-            let _ = update_roadmap_feature(state.clone(), id.clone(), update).await;
-            let _ = delete_roadmap_feature(state.clone(), id.clone()).await;
+            let _ = create_roadmap_feature(GuiMutation::untracked(), state.clone(), create).await;
+            let _ = update_roadmap_feature(GuiMutation::untracked(), state.clone(), id.clone(), update).await;
+            let _ = delete_roadmap_feature(GuiMutation::untracked(), state.clone(), id.clone()).await;
             let _ = list_roadmap_features(state.clone(), None, None).await;
             let _ = get_roadmap_feature(state.clone(), id.clone()).await;
-            let _ = link_task_to_feature(state.clone(), id.clone(), id.clone()).await;
-            let _ = unlink_task_from_feature(state, id.clone(), id).await;
+            let _ = link_task_to_feature(GuiMutation::untracked(), state.clone(), id.clone(), id.clone()).await;
+            let _ = unlink_task_from_feature(GuiMutation::untracked(), state, id.clone(), id).await;
         }
 
         let _ = &binds_to_app_state;

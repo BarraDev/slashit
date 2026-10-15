@@ -1,8 +1,10 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::{Task, QaSignoff, QaStatus};
 use uuid::Uuid;
 
 #[tauri::command]
 pub async fn submit_qa_review(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     status: QaStatus,

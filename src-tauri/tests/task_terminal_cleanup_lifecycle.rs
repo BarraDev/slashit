@@ -57,6 +57,7 @@
 //! file-wide.
 #![cfg(target_os = "linux")]
 
+use slashit_ui_lib::commands::gui_admission::GuiMutation;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -626,7 +627,7 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
         //     Not awaited to exhaustion here: an implementation is free to hold
         //     this open until its cleanup has finished, and this test must not
         //     require it to answer early.
-        let terminal = slashit_ui_lib::commands::task::update_task_status(
+        let terminal = slashit_ui_lib::commands::task::update_task_status(GuiMutation::untracked(), 
             app.state(),
             fixture.task_id.to_string(),
             TaskStatus::Done,
@@ -707,7 +708,7 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
 
         // (4b) Ask for the task to be reactivated, the same way a card dragged
         //      back out of Done does.
-        let reactivation = slashit_ui_lib::commands::task::update_task_status(
+        let reactivation = slashit_ui_lib::commands::task::update_task_status(GuiMutation::untracked(), 
             app.state(),
             fixture.task_id.to_string(),
             TaskStatus::InProgress,
@@ -738,7 +739,7 @@ fn a_reactivated_task_does_not_become_executable_while_its_cleanup_can_still_des
         //      answer.
         let successor_checkout = tokio::time::timeout(
             DESIGN_MAY_WAIT,
-            slashit_ui_lib::commands::worktree::create_worktree(
+            slashit_ui_lib::commands::worktree::create_worktree(GuiMutation::untracked(), 
                 app.state(),
                 fixture.task_id.to_string(),
             ),
@@ -858,7 +859,7 @@ fn a_terminal_transition_whose_cleanup_did_not_happen_is_not_reported_as_done() 
             "the fixture must start in a non-terminal state"
         );
 
-        let terminal = slashit_ui_lib::commands::task::update_task_status(
+        let terminal = slashit_ui_lib::commands::task::update_task_status(GuiMutation::untracked(), 
             app.state(),
             fixture.task_id.to_string(),
             TaskStatus::Done,
@@ -1017,7 +1018,7 @@ fn a_terminal_drag_commits_column_positions_computed_after_its_cleanup() {
         // Dropped between them. The cleanup is real and succeeds -- the
         // fixture's checkout is clean -- so this is the ordinary terminal drag,
         // with a `git worktree remove` between the drop and the commit.
-        let moved = slashit_ui_lib::commands::task::reorder_task(
+        let moved = slashit_ui_lib::commands::task::reorder_task(GuiMutation::untracked(), 
             app.state(),
             fixture.task_id.to_string(),
             Some(TaskStatus::Done),
@@ -1120,7 +1121,7 @@ fn a_drag_that_waited_for_the_lease_is_classified_against_the_task_it_finds() {
 
         // Dropped onto `Done`, from `Done`. Whatever the command samples now is
         // what it must not still be acting on after it has waited.
-        let drag = slashit_ui_lib::commands::task::reorder_task(
+        let drag = slashit_ui_lib::commands::task::reorder_task(GuiMutation::untracked(), 
             app.state(),
             fixture.task_id.to_string(),
             Some(TaskStatus::Done),

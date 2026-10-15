@@ -8,6 +8,7 @@
 //! is opened or a task is started. See `worktree::readiness` for what is
 //! reported.
 
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::{Project, ProjectBase};
 use crate::worktree::resolve_default_base;
 use crate::worktree::readiness::{readiness, Readiness};
@@ -81,6 +82,7 @@ pub async fn get_project_readiness(
 /// Make the local branch `branch` the project's base, on explicit request.
 #[tauri::command]
 pub async fn set_project_base(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     branch: String,
@@ -110,6 +112,7 @@ pub(crate) async fn set_project_base_core(
 /// repository; the choice is the project's, and survives a restart.
 #[tauri::command]
 pub async fn set_project_base_source(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     prefer_local: bool,
@@ -146,6 +149,7 @@ pub(crate) async fn set_project_base_source_core(
 /// (`git remote set-head origin --auto`), on explicit request.
 #[tauri::command]
 pub async fn detect_remote_default_branch(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
 ) -> Result<Readiness, String> {
@@ -162,9 +166,12 @@ pub(crate) async fn detect_remote_default_branch_core(
     report(state, project_id).await
 }
 
-/// What initializing version control in `path` would do. Writes nothing.
+/// What initializing version control in `path` would do. Writes nothing to the
+/// folder, but it creates and removes a scratch Git repository to list the
+/// files a first commit would hold, so it takes a [`GuiMutation`] like the
+/// commands that run Git for real: the drain waits for it.
 #[tauri::command]
-pub async fn preview_vcs_initialization(path: String) -> Result<InitPreview, String> {
+pub async fn preview_vcs_initialization(_gui: GuiMutation, path: String) -> Result<InitPreview, String> {
     vcs_init::preview(&path).await
 }
 
@@ -173,6 +180,7 @@ pub async fn preview_vcs_initialization(path: String) -> Result<InitPreview, Str
 /// tool created as the project's base. On explicit request only.
 #[tauri::command]
 pub async fn initialize_project_vcs(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     kind: VcsInitKind,

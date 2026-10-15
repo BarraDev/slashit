@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::memory::{Memory, MemoryMetadata, GraphStatus};
 use uuid::Uuid;
 
@@ -52,7 +53,7 @@ pub async fn get_graph_status() -> Result<GraphStatus, String> {
 }
 
 #[tauri::command]
-pub async fn store_memory(content: String, metadata: MemoryMetadata) -> Result<Memory, String> {
+pub async fn store_memory(_gui: GuiMutation, content: String, metadata: MemoryMetadata) -> Result<Memory, String> {
     Ok(Memory {
         id: Uuid::new_v4().to_string(),
         content,
@@ -62,6 +63,6 @@ pub async fn store_memory(content: String, metadata: MemoryMetadata) -> Result<M
 }
 
 #[tauri::command]
-pub async fn delete_memory(_memory_id: String) -> Result<(), String> {
+pub async fn delete_memory(_gui: GuiMutation, _memory_id: String) -> Result<(), String> {
     Ok(())
 }

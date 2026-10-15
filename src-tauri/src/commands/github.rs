@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::github::{Assignee, GithubIssue, Label, PullRequest, Review};
 use crate::domain::task::ExternalRef;
 use crate::domain::{
@@ -193,6 +194,7 @@ pub async fn get_issue(repo: String, number: i32) -> Result<GithubIssue, String>
 
 #[tauri::command]
 pub async fn create_task_from_issue(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     repo: String,
     issue_number: i32,
@@ -279,6 +281,7 @@ pub async fn create_task_from_issue(
 
 #[tauri::command]
 pub async fn import_github_issues(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     repo: String,
     project_id: String,

@@ -32,6 +32,7 @@ pub mod jira;
 pub mod features;
 pub mod state_location;
 pub mod updater;
+pub mod gui_admission;
 
 pub use repository::*;
 pub use repository_setup::*;

@@ -111,10 +111,93 @@ Both were real, both caused a crash rather than a missing feature:
 
 ## Shutdown
 
-`SIGTERM` or `SIGINT` (or an IPC `Quit`) stops accepting connections, then
-waits up to 30 seconds for running agents to finish. Tasks still running when
-the grace period expires are left as they are and returned to the queue by the
-next start's migration, and the daemon says so rather than exiting silently.
+An instance stays the exclusive owner of its endpoint for as long as it can
+admit, run or persist anything that would conflict with another instance. The
+ownership resource (the Unix `flock` lease and socket, or the Windows
+first-instance named pipe) is held by the process supervisor, never by an accept
+loop, and is released last.
+
+`SIGTERM`, `SIGINT` or an IPC `Quit` (intentional), and the mandatory local
+listener failing, an accept loop or a connection handler panicking, or every
+listener being lost (a failure) all take the same path, in this order:
+
+1. Admission closes. No Worker, AI review or fix, PR helper or PR operation,
+   or Project Conversation Run can start, and mutating IPC requests are
+   refused. A start that had already passed its check is waited for until its
+   owner is registered, so none can slip in afterwards.
+2. The listeners stop accepting and every connection handler is joined.
+3. The queue poller returns.
+4. Running work is drained. An intentional daemon shutdown first lets agents
+   finish for up to 30 seconds; a failure, and the desktop app (where the user
+   has already confirmed quitting), do not wait. Whatever remains is cancelled
+   and reaped through the executor's existing owner-ending paths. These do not
+   change any Task: a Task that was `in_progress` stays `in_progress`, and its
+   checkout, branch, commits and recovery evidence are untouched, so the next
+   start requeues it exactly as after a crash.
+5. Only then is the endpoint released and the process exits.
+
+A bounded wait is not proof that a provider process stopped. If an owner cannot
+be reaped, the instance keeps its ownership, says so, and keeps retrying; it
+does not exit as if the shutdown were clean. A failure-triggered shutdown
+exits non-zero once drained.
+
+Desktop commands go through the same fence. Every `#[tauri::command]` that can
+change anything takes a `GuiMutation` argument (`commands/gui_admission.rs`):
+Tauri builds it when the invocation is dispatched, so a command dispatched after
+the fence closed is refused before its body runs, and the lease it holds lives
+as long as the command's own future, so the drain waits for every command that
+was admitted earlier. Commands that only read, and the two that perform the
+shutdown itself (`force_quit`, `updater_restart`), are listed by name; a test
+fails when a command is neither. The desktop therefore releases the endpoint
+(at `RunEvent::Exit`) only after no admitted command is still running.
+
+If the task running the server dies, the supervisor above it still holds the
+ownership claim, the poller's join and the connection handlers. It closes the
+fence, lets every handler that was running finish, waits for the poller to
+return (a poll pass that began before the fence closed is not stopped by it),
+and reaps every owner before releasing anything.
+
+The handlers are never aborted. A handler that has started a `git` run is
+waiting on a blocking call, and aborting the task stops only the wait: the `git`
+process would finish by itself, possibly after the endpoint was released. The
+server therefore hands its live handlers to the supervisor (`HandlerRescue`)
+when it dies instead of dropping them, and the supervisor joins them. A handler
+serves one request and is bounded by the operation it runs; one that does not
+return keeps the instance alive and holding ownership,
+as every other part of the drain does.
+
+On Windows the updater plugin's install step launches the installer and then
+calls `std::process::exit(0)` itself. SlashIt therefore downloads the installer
+and stages it, and runs it from the shutdown path after the drain
+(`install_staged_after_drain`); no code calls the plugin's combined
+download-and-install. An installer, user or administrator that terminates the
+process from outside is a forced external termination, below.
+
+Not covered, and not promised:
+
+- `SIGKILL`, `TerminateProcess`, an installer or service manager killing the
+  process, and power loss. No supervisor runs. The kernel drops the lease at
+  once, a successor can own the endpoint immediately, and any provider process
+  the old instance started may outlive it. Startup recovery handles the Task
+  state exactly as after a crash.
+- Signals sent to a daemon that is already draining are ignored; only `SIGKILL`
+  ends it early.
+- A poll pass that began just before the fence closed may promote a Task to
+  `in_progress`. It finishes before ownership is released (the poller is
+  awaited), leaves no owner behind, and startup recovery requeues the Task.
+- User terminals (PTY sessions) are interactive shells under the user's control,
+  not provider processes, and the drain does not reap them. A command the user
+  typed (`git`, a provider CLI) can keep running between the endpoint being
+  released and the process ending. Starting a terminal and writing to one are
+  refused after the fence closes.
+- A Windows installer that fails to start after the drain is logged and the
+  application restarts into the old version; no progress event reports it.
+- Admitted desktop commands hold the drain until they return. A long download
+  (`updater_download_and_install`) or a provider turn delays a quit; Project
+  Runs are cancelled before the wait, so a Coordinator turn does not.
+- The webview is not granted the updater plugin's own commands
+  (`capabilities/default.json`), so JavaScript cannot reach the plugin's
+  install step, which exits the process on Windows.
 
 The PID file at `AppPaths::pid_file()` is informational only. Endpoint
 ownership is the authoritative single-instance mechanism, because a PID file

@@ -29,6 +29,10 @@ pub mod instance;
 // works on every supported platform.
 pub mod ipc;
 
+/// Set by the updater when the application should come back up after the
+/// ownership-preserving shutdown instead of staying down.
+pub struct RestartRequested(pub Arc<std::sync::atomic::AtomicBool>);
+
 use commands::*;
 use config::Storage;
 use pty::PtyState;
@@ -147,6 +151,18 @@ pub fn run() {
     let (app_state, report) = tauri::async_runtime::block_on(app_core::build_state())
         .expect("Failed to build application state");
 
+    // Desktop and daemon share the same cooperative poller-stop signal. The
+    // desktop intercepts Tauri's exit request and lets the IPC owner release
+    // that signal only after its drain completes.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let restart_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The exclusive endpoint claim, parked here after the drain and dropped
+    // only at `RunEvent::Exit`, so no in-flight command can still be writing
+    // when a successor becomes the owner.
+    let ownership_slot: Arc<std::sync::Mutex<Option<ipc::IpcOwnership>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
     let cleanup_failures = report
         .project_conversation_cleanup_failures
         .iter()
@@ -211,7 +227,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app_state)
-        .setup(|app| {
+        .manage(RestartRequested(restart_requested.clone()))
+        .setup({
+            let shutdown_rx = shutdown_rx.clone();
+            let shutdown_complete = shutdown_complete.clone();
+            let restart_requested = restart_requested.clone();
+            let ownership_slot = ownership_slot.clone();
+            move |app| {
             let state: tauri::State<AppState> = app.state();
 
             // The webview exists now, so the sink the rest of the backend
@@ -245,7 +267,9 @@ pub fn run() {
             // Tauri's runtime, not `tokio::spawn`: this closure runs on the
             // main thread before the event loop starts, with no reactor in
             // thread-local scope. Same idiom as the IPC server below.
-            tauri::async_runtime::spawn(executor.polling_loop(None));
+            let polling_handle = tauri::async_runtime::spawn(
+                executor.polling_loop(Some(shutdown_rx.clone())),
+            );
             println!("SlashIt: Task executor started");
 
             // The control channel. The same server the daemon runs; only the
@@ -275,10 +299,66 @@ pub fn run() {
                 // instance took them in the meantime — that race was decided
                 // at the top of `run()`, while there was still nothing to
                 // corrupt.
+                let app_handle = app.handle().clone();
+                // The claim on the endpoints stays with this supervising task,
+                // not with the server task inside it, and is released only
+                // after the executor is quiescent.
+                let ownership = bound.ownership();
+                let poller = ipc::poller_join(polling_handle);
+                let handlers = ipc::HandlerRescue::default();
+                let supervision = ipc::Supervision {
+                    shutdown: shutdown_rx.clone(),
+                    poller: Some(poller.clone()),
+                    handlers: handlers.clone(),
+                    // The user already confirmed quitting with work running
+                    // (`request_quit`), so running agents are cancelled and
+                    // reaped, not waited for.
+                    finish_grace: std::time::Duration::ZERO,
+                };
+                let executor_cell = state.executor.clone();
+                let agent_clients = state.agent.running_clients.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = bound.attach(ipc_ctx).serve().await {
-                        eprintln!("SlashIt: IPC server error: {e}");
+                    let server = tauri::async_runtime::spawn(async move {
+                        bound.attach(ipc_ctx).serve_until(supervision).await
+                    });
+                    let result = match server.await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            eprintln!("SlashIt: the IPC supervisor task failed: {error}");
+                            ipc::quiesce_after_supervisor_failure(
+                                executor_cell.get().map(|executor| executor.as_ref()),
+                                Some(poller),
+                                &handlers,
+                            )
+                            .await;
+                            Err(anyhow::anyhow!("the IPC supervisor task failed: {error}"))
+                        }
+                    };
+                    if let Err(error) = &result {
+                        eprintln!("SlashIt: the instance failed closed and is exiting: {error}");
                     }
+                    // Legacy ACP agents belong to the app state, not the
+                    // executor; the fence is closed, so none can be added.
+                    let clients: Vec<_> = agent_clients.write().await.drain().collect();
+                    for (_, client) in clients {
+                        let _ = client.kill().await;
+                    }
+                    *ownership_slot.lock().unwrap() = Some(ownership);
+                    shutdown_complete.store(true, std::sync::atomic::Ordering::Release);
+                    // An update restart waits for the same drain as a quit.
+                    if result.is_ok()
+                        && restart_requested.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        // Windows installs here, after the drain: the
+                        // installer step ends the process.
+                        if let Err(error) =
+                            commands::updater::install_staged_after_drain(&app_handle).await
+                        {
+                            eprintln!("SlashIt: the staged update could not be installed: {error}");
+                        }
+                        app_handle.restart();
+                    }
+                    app_handle.exit(if result.is_ok() { 0 } else { 1 });
                 });
                 println!("SlashIt: IPC server starting");
             }
@@ -321,7 +401,8 @@ pub fn run() {
                 println!("SlashIt: System tray initialized");
             }
 
-            Ok(())
+                Ok(())
+            }
         })
         .invoke_handler(tauri::generate_handler![
             greet,
@@ -514,7 +595,16 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| {
+        .run(move |app_handle, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                ownership_slot.lock().unwrap().take();
+            }
+            if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+                if !shutdown_complete.load(std::sync::atomic::Ordering::Acquire) {
+                    api.prevent_exit();
+                    let _ = shutdown_tx.send(true);
+                }
+            }
             if let tauri::RunEvent::WindowEvent {
                 label,
                 event: tauri::WindowEvent::CloseRequested { api, .. },

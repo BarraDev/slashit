@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::jj::JjManager;
 use std::sync::Arc;
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ impl Default for JjState {
 
 #[tauri::command]
 pub async fn new_change(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     workspace_path: String,
     description: String,
@@ -37,6 +39,7 @@ pub async fn new_change(
 
 #[tauri::command]
 pub async fn describe_change(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     workspace_path: String,
     change_id: String,
@@ -51,6 +54,7 @@ pub async fn describe_change(
 
 #[tauri::command]
 pub async fn abandon_change(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     workspace_path: String,
     change_id: String,
@@ -64,6 +68,7 @@ pub async fn abandon_change(
 
 #[tauri::command]
 pub async fn jj_get_workspace_status(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     workspace_path: String,
 ) -> Result<crate::jj::JjStatus, String> {
@@ -76,6 +81,7 @@ pub async fn jj_get_workspace_status(
 
 #[tauri::command]
 pub async fn git_export(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     workspace_path: String,
 ) -> Result<(), String> {
@@ -134,6 +140,7 @@ async fn fetch_task_diff(
 
 #[tauri::command]
 pub async fn get_task_diff(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<String, String> {
@@ -143,6 +150,7 @@ pub async fn get_task_diff(
 
 #[tauri::command]
 pub async fn get_task_diff_stat(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<String, String> {
@@ -174,19 +182,19 @@ mod tests {
             change_id: String,
             description: String,
         ) {
-            let _ = new_change(state.clone(), workspace_path.clone(), description.clone()).await;
-            let _ = describe_change(
+            let _ = new_change(GuiMutation::untracked(), state.clone(), workspace_path.clone(), description.clone()).await;
+            let _ = describe_change(GuiMutation::untracked(), 
                 state.clone(),
                 workspace_path.clone(),
                 change_id.clone(),
                 description,
             )
             .await;
-            let _ = abandon_change(state.clone(), workspace_path.clone(), change_id.clone()).await;
-            let _ = jj_get_workspace_status(state.clone(), workspace_path.clone()).await;
-            let _ = git_export(state.clone(), workspace_path).await;
-            let _ = get_task_diff(state.clone(), change_id.clone()).await;
-            let _ = get_task_diff_stat(state, change_id).await;
+            let _ = abandon_change(GuiMutation::untracked(), state.clone(), workspace_path.clone(), change_id.clone()).await;
+            let _ = jj_get_workspace_status(GuiMutation::untracked(), state.clone(), workspace_path.clone()).await;
+            let _ = git_export(GuiMutation::untracked(), state.clone(), workspace_path).await;
+            let _ = get_task_diff(GuiMutation::untracked(), state.clone(), change_id.clone()).await;
+            let _ = get_task_diff_stat(GuiMutation::untracked(), state, change_id).await;
         }
 
         let _ = &binds_to_app_state;

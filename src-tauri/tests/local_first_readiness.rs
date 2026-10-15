@@ -17,6 +17,7 @@
 //! because that environment is process-wide.
 #![cfg(target_os = "linux")]
 
+use slashit_ui_lib::commands::gui_admission::GuiMutation;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -163,7 +164,7 @@ impl World {
     async fn register(&self, folder: &Path, initialize: Option<&str>) -> Result<String, String> {
         let kind =
             initialize.map(|k| serde_json::from_value(Value::String(k.to_string())).unwrap());
-        let repository = slashit_ui_lib::commands::create_repository(
+        let repository = slashit_ui_lib::commands::create_repository(GuiMutation::untracked(), 
             self.state(),
             folder.to_string_lossy().to_string(),
             None,
@@ -171,7 +172,7 @@ impl World {
             None,
         )
         .await?;
-        let project = slashit_ui_lib::commands::create_project(
+        let project = slashit_ui_lib::commands::create_project(GuiMutation::untracked(), 
             self.state(),
             "readiness".to_string(),
             Some(repository.id.to_string()),
@@ -201,7 +202,7 @@ impl World {
             .storage
             .save_project_tasks(project_id, &[task])
             .expect("seed board");
-        slashit_ui_lib::commands::create_worktree(self.state(), task_id.to_string()).await?;
+        slashit_ui_lib::commands::create_worktree(GuiMutation::untracked(), self.state(), task_id.to_string()).await?;
         Ok(state.task.tasks.read().await[&task_id].clone())
     }
 }
@@ -301,7 +302,7 @@ async fn a_remote_without_origin_head_does_not_block_tasks_and_can_be_detected()
     );
 
     let report =
-        slashit_ui_lib::commands::detect_remote_default_branch(world.state(), project.clone())
+        slashit_ui_lib::commands::detect_remote_default_branch(GuiMutation::untracked(), world.state(), project.clone())
             .await
             .expect("detected");
     let report = serde_json::to_value(report).unwrap();
@@ -347,7 +348,7 @@ async fn a_new_git_repository_uses_the_branch_git_chose() {
     fs::write(folder.join("target/junk"), "built").unwrap();
 
     let preview =
-        slashit_ui_lib::commands::preview_vcs_initialization(folder.to_string_lossy().to_string())
+        slashit_ui_lib::commands::preview_vcs_initialization(GuiMutation::untracked(), folder.to_string_lossy().to_string())
             .await
             .unwrap();
     let preview = serde_json::to_value(preview).unwrap();
@@ -434,7 +435,7 @@ async fn a_colocated_jj_repository_with_a_detached_git_head_runs_tasks() {
         .start_task(&project)
         .await
         .expect_err("no base until confirmed");
-    slashit_ui_lib::commands::set_project_base(world.state(), project.clone(), "trunk".to_string())
+    slashit_ui_lib::commands::set_project_base(GuiMutation::untracked(), world.state(), project.clone(), "trunk".to_string())
         .await
         .expect("confirmed");
 
@@ -499,7 +500,7 @@ async fn ambiguity_is_refused_and_nothing_is_guessed() {
     assert_eq!(fingerprint(&repo), before, "nothing was created or moved");
 
     // An explicit choice resolves it.
-    let report = slashit_ui_lib::commands::set_project_base(
+    let report = slashit_ui_lib::commands::set_project_base(GuiMutation::untracked(), 
         world.state(),
         project.clone(),
         "other".to_string(),
@@ -569,7 +570,7 @@ async fn ambiguity_is_refused_and_nothing_is_guessed() {
     let project = world.register(&repo, None).await.unwrap();
     let (local_before, remote_before) = (fingerprint(&repo), fingerprint(&origin));
     let refused =
-        slashit_ui_lib::commands::detect_remote_default_branch(world.state(), project.clone())
+        slashit_ui_lib::commands::detect_remote_default_branch(GuiMutation::untracked(), world.state(), project.clone())
             .await
             .expect_err("ambiguous remote");
     assert!(refused.contains("will not guess"), "{refused}");
@@ -633,7 +634,7 @@ async fn a_folder_without_version_control_needs_an_explicit_initialization() {
 
         let kind_value = || serde_json::from_value(Value::String(kind.to_string())).unwrap();
         if kind == "jujutsu" {
-            let refused = slashit_ui_lib::commands::initialize_project_vcs(
+            let refused = slashit_ui_lib::commands::initialize_project_vcs(GuiMutation::untracked(), 
                 world.state(),
                 project.clone(),
                 kind_value(),
@@ -650,7 +651,7 @@ async fn a_folder_without_version_control_needs_an_explicit_initialization() {
         }
         // A count other than what the folder holds means the person saw
         // something else: refused, nothing changed.
-        let refused = slashit_ui_lib::commands::initialize_project_vcs(
+        let refused = slashit_ui_lib::commands::initialize_project_vcs(GuiMutation::untracked(), 
             world.state(),
             project.clone(),
             kind_value(),
@@ -661,7 +662,7 @@ async fn a_folder_without_version_control_needs_an_explicit_initialization() {
         assert!(refused.contains("not the 99 shown"), "{refused}");
         assert!(!folder.join(".jj").exists() && !folder.join(".git").exists());
         let shown = if kind == "jujutsu" { 1 } else { 2 };
-        let report = slashit_ui_lib::commands::initialize_project_vcs(
+        let report = slashit_ui_lib::commands::initialize_project_vcs(GuiMutation::untracked(), 
             world.state(),
             project.clone(),
             kind_value(),
@@ -721,7 +722,7 @@ async fn a_repository_without_commits_gets_its_first_commit_on_request() {
     assert!(refused.contains("no commits yet"), "{refused}");
 
     let kind = serde_json::from_value(Value::String("git".to_string())).unwrap();
-    let report = slashit_ui_lib::commands::initialize_project_vcs(
+    let report = slashit_ui_lib::commands::initialize_project_vcs(GuiMutation::untracked(), 
         world.state(),
         project.clone(),
         kind,

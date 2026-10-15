@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::{Project, ProjectScope, AgentType, AgentConfig, Task};
 use crate::config::{Storage, WorkspaceRegistry};
 use uuid::Uuid;
@@ -85,6 +86,7 @@ fn get_default_agent_config(agent_type: &AgentType) -> AgentConfig {
 
 #[tauri::command]
 pub async fn create_project(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     name: String,
     repository_id: Option<String>,
@@ -168,6 +170,7 @@ pub async fn get_project(
 
 #[tauri::command]
 pub async fn delete_project(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     id: String,
 ) -> Result<bool, String> {
@@ -692,6 +695,7 @@ fn project_task_refusal(task: &Task) -> Option<String> {
 
 #[tauri::command]
 pub async fn update_project(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     id: String,
     name: Option<String>,
@@ -745,6 +749,7 @@ async fn update_project_committed(
 
 #[tauri::command]
 pub async fn attach_project_to_workspace(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     workspace_id: String,
@@ -806,6 +811,7 @@ async fn attach_project_to_workspace_committed(
 
 #[tauri::command]
 pub async fn detach_project_from_workspace(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
 ) -> Result<Project, String> {

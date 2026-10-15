@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::changelog::{ChangelogSource, ChangelogOptions, GitCommit};
 
 #[derive(Clone)]
@@ -17,6 +18,7 @@ impl Default for ChangelogState {
 
 #[tauri::command]
 pub async fn generate_changelog(
+    _gui: GuiMutation,
     source: ChangelogSource,
     _options: ChangelogOptions,
 ) -> Result<String, String> {
@@ -35,6 +37,7 @@ pub async fn generate_changelog(
 
 #[tauri::command]
 pub async fn get_git_history(
+    _gui: GuiMutation,
     _repo_path: String,
     _count: usize,
     _include_merges: bool,
@@ -44,6 +47,7 @@ pub async fn get_git_history(
 
 #[tauri::command]
 pub async fn compare_branches(
+    _gui: GuiMutation,
     _repo_path: String,
     _base: String,
     _compare: String,
