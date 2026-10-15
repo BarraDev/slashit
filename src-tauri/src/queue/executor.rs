@@ -768,6 +768,23 @@ pub enum PrHelperRefusal {
     /// An integration of the task into a local branch was started and not
     /// finished; resuming or discarding it comes first.
     IntegrationUnfinished,
+    /// The task still holds unresolved Worker recovery evidence, and a helper
+    /// that can edit its checkout would change what a person has yet to
+    /// inspect. Carries `Task::worker_recovery_refusal`'s own wording.
+    WorkerRecovery(String),
+}
+
+/// What a PR helper may do to the Task Checkout it is admitted for.
+///
+/// Chosen by the code that builds the provider configuration: a request flag
+/// may only select `Inspection` where the same flag also makes the provider
+/// read-only (`dry_run`), never grant editing. `Inspection` is for a provider run with `ToolAccess::ReadOnly`
+/// (Read, Glob and Grep only), `Editing` for any provider that can write,
+/// build, commit or push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrHelperPurpose {
+    Inspection,
+    Editing,
 }
 
 impl std::fmt::Display for PrHelperRefusal {
@@ -805,6 +822,7 @@ impl std::fmt::Display for PrHelperRefusal {
                 "an integration of this task into a local branch was started and not finished, so \
                  an agent cannot work in its checkout. Resume or discard the integration first"
             ),
+            Self::WorkerRecovery(refusal) => f.write_str(refusal),
         }
     }
 }
@@ -1141,6 +1159,11 @@ pub struct TaskExecutor {
     /// why this is a blocking `std::sync::Mutex` rather than the `tokio::
     /// sync::RwLock` the other two handle maps use.
     pr_helper_handles: Arc<std::sync::Mutex<HashMap<Uuid, PrHelperOwner>>>,
+    /// Tasks whose review-admission marker is on the board and possibly in the
+    /// file although no review started, and whose recovery record could not be
+    /// published either. Process-local: it is all this process can know when
+    /// storage refuses every write. See [`Self::settle_unconfirmed_review_admission`].
+    unconfirmed_review_admissions: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
     /// Project Conversation Runs share this executor's admission gate and
     /// cancellation ownership. They are keyed by Conversation identity.
     project_runs: Arc<std::sync::Mutex<HashMap<Uuid, ProjectRunOwner>>>,
@@ -1410,6 +1433,7 @@ impl TaskExecutor {
             reviewing_handles: Arc::new(RwLock::new(HashMap::new())),
             ending_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pr_helper_handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            unconfirmed_review_admissions: Arc::default(),
             project_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             admission: Admission::new(initial_limit),
             process_admission: Arc::default(),
@@ -4299,9 +4323,15 @@ impl TaskExecutor {
     /// `self: &Arc<Self>` because the returned lease's `Drop` needs to reach
     /// this executor's `pr_helper_handles` map on every exit path, including
     /// one this module did not spawn or `.await` to completion itself.
+    ///
+    /// An [`PrHelperPurpose::Editing`] helper is also refused while the Task
+    /// holds unresolved Worker recovery evidence, decided here under the
+    /// lease so it cannot race a recovery write; a read-only helper may still
+    /// inspect such a Task.
     pub async fn try_begin_pr_helper(
         self: &Arc<Self>,
         task_id: Uuid,
+        purpose: PrHelperPurpose,
     ) -> Result<PrHelperLease, PrHelperRefusal> {
         let _process_admission = self
             .process_admission
@@ -4320,6 +4350,17 @@ impl TaskExecutor {
                 .contains_key(&task_id);
         if already_owned {
             return Err(PrHelperRefusal::TaskAlreadyOwned);
+        }
+        if purpose == PrHelperPurpose::Editing {
+            if let Some(refusal) = self
+                .tasks
+                .read()
+                .await
+                .get(&task_id)
+                .and_then(Task::worker_recovery_refusal)
+            {
+                return Err(PrHelperRefusal::WorkerRecovery(refusal));
+            }
         }
         if self
             .tasks
@@ -4840,40 +4881,90 @@ impl TaskExecutor {
             .await
         {
             Ok(_) => true,
-            Err(_) => {
-                self.withdraw_review_admission(task_id, review, now).await;
+            // Nothing reached the board or the file: no marker anywhere.
+            Err(crate::lifecycle::RecordWriteError::NotPublished(_)) => false,
+            Err(crate::lifecycle::RecordWriteError::PublishedNotDurable(_)) => {
+                self.settle_unconfirmed_review_admission(task_id, review, now)
+                    .await;
                 false
             }
         }
     }
 
-    /// Remove the marker `record_review_admission` published but could not
-    /// make durable: no review started, so none may count as admitted.
-    async fn withdraw_review_admission(
+    /// The marker is on the board and probably in the file, but no review
+    /// started. Memory must keep following the file, so it is never edited on
+    /// its own: the marker is withdrawn through a write, and only a withdrawal
+    /// that is published *and* durable lets the next attempt re-prove the
+    /// exact commit. Any other outcome leaves the marker possibly on disk,
+    /// where a restart would read it as proof that a review ran and relax the
+    /// exact-tip proof; that is put into recovery instead, which a person
+    /// resolves with a new acceptance that post-dates the marker. If that
+    /// record cannot be published either, nothing durable can be added, and
+    /// this process refuses further admission for the Task.
+    async fn settle_unconfirmed_review_admission(
         &self,
         task_id: Uuid,
         review: u32,
         at: chrono::DateTime<chrono::Utc>,
     ) {
-        let withdraw = |t: &mut Task| {
-            let before = t.activity.len();
-            t.activity.retain(|e| {
-                !(e.at == at
-                    && matches!(e.kind, ActivityKind::AiReviewStarted { review: r } if r == review))
-            });
-            t.activity.len() != before
+        let withdraw = |staged: &mut HashMap<Uuid, Task>| {
+            staged.get_mut(&task_id).is_some_and(|t| {
+                let before = t.activity.len();
+                t.activity.retain(|e| {
+                    !(e.at == at
+                        && matches!(e.kind, ActivityKind::AiReviewStarted { review: r } if r == review))
+                });
+                t.activity.len() != before
+            })
         };
-        let revise =
-            |staged: &mut HashMap<Uuid, Task>| staged.get_mut(&task_id).is_some_and(withdraw);
-        if crate::lifecycle::record_typed_if_changed(&self.tasks, &self.storage, task_id, &revise)
+        if crate::lifecycle::record_typed_if_changed(&self.tasks, &self.storage, task_id, &withdraw)
             .await
-            .is_err()
+            .is_ok()
         {
-            // The board still shows what was published; remove it there too.
-            if let Some(task) = self.tasks.write().await.get_mut(&task_id) {
-                withdraw(task);
-            }
+            return;
         }
+        let recorded = Self::record_recovery_required(
+            &self.tasks,
+            &self.storage,
+            task_id,
+            None,
+            None,
+            "The start of the AI Review could not be confirmed on disk and could not be withdrawn; work was preserved.",
+        )
+        .await;
+        if matches!(recorded, Err(crate::lifecycle::RecordWriteError::NotPublished(_))) {
+            self.unconfirmed_review_admissions
+                .lock()
+                .unwrap()
+                .insert(task_id);
+        }
+    }
+
+    /// Whether this process must not admit a review for the Task because an
+    /// unconfirmed admission marker is still held for it. Forgets the Task
+    /// once its handoff is no longer awaiting a first review.
+    async fn review_admission_unconfirmed(&self, task_id: Uuid) -> bool {
+        if !self
+            .unconfirmed_review_admissions
+            .lock()
+            .unwrap()
+            .contains(&task_id)
+        {
+            return false;
+        }
+        let still_resolved = self.tasks.read().await.get(&task_id).is_some_and(|t| {
+            matches!(
+                t.worker_handoff.as_ref().map(|h| &h.stage),
+                Some(crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { .. })
+            )
+        });
+        if !still_resolved {
+            self.unconfirmed_review_admissions
+                .lock()
+                .unwrap()
+                .remove(&task_id);
+        }
+        still_resolved
     }
 
     async fn spawn_review(&self, task_id: Uuid) {
@@ -4929,6 +5020,9 @@ impl TaskExecutor {
         // serialized by the lease held here; a Git writer outside SlashIt is
         // not, so this is a point-in-time proof taken immediately before the
         // review is registered, not a lock on the repository.
+        if self.review_admission_unconfirmed(task_id).await {
+            return;
+        }
         if !self.worker_commit_still_verifies(task_id).await {
             return;
         }
@@ -9569,7 +9663,7 @@ mod tests {
         let task_id = Uuid::new_v4();
         let conversation_id = Uuid::new_v4();
         let task_lease = executor
-            .try_begin_pr_helper(task_id)
+            .try_begin_pr_helper(task_id, PrHelperPurpose::Editing)
             .await
             .expect("admit Task Worker");
         let worker_run = executor
@@ -14408,6 +14502,42 @@ VERDICT: APPROVED"
             );
         }
 
+        /// A review-admission marker that could not be withdrawn or replaced by
+        /// a recovery record leaves the Task admitted nowhere: the real
+        /// `spawn_review` registers nothing and starts no reviewer.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_review_does_not_start_while_its_admission_marker_is_unconfirmed() {
+            let _path_guard = PATH_LOCK.lock().await;
+            let mock = MockClaude::install("review");
+
+            let (executor, _temps) = test_executor();
+            let (repo, base_commit) = git_repo_with_change();
+            let mut task =
+                reviewing_task(Uuid::new_v4(), repo.path().to_str().unwrap(), &base_commit);
+            task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                task_id: task.id,
+                project_id: task.project_id,
+                repository_id: None,
+                run: Some(1),
+                branch: Some("task".into()),
+                start_head: None,
+                acceptance: None,
+                stage: crate::domain::task::WorkerHandoffStage::ResolvedToAiReview {
+                    commit: base_commit.clone(),
+                },
+            });
+            task.worker_handoff_confirmed = true;
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+            executor
+                .unconfirmed_review_admissions
+                .lock()
+                .unwrap()
+                .insert(task_id);
+
+            review_declines(&executor, &mock, task_id, "unconfirmed admission marker").await;
+        }
+
         /// One owner per task, in both directions. `try_begin_pr_helper`
         /// already refuses a task under review; a review must equally not
         /// start while a PR helper -- or a PR side-effect operation -- owns
@@ -14426,7 +14556,7 @@ VERDICT: APPROVED"
             executor.tasks.write().await.insert(task_id, task);
 
             let helper = executor
-                .try_begin_pr_helper(task_id)
+                .try_begin_pr_helper(task_id, PrHelperPurpose::Editing)
                 .await
                 .expect("setup: the PR helper is admitted");
             review_declines(&executor, &mock, task_id, "PR helper").await;
@@ -14481,7 +14611,7 @@ VERDICT: APPROVED"
                 .await
                 .insert(approved_id, approved.clone());
             assert_eq!(
-                executor.try_begin_pr_helper(approved_id).await.err(),
+                executor.try_begin_pr_helper(approved_id, PrHelperPurpose::Editing).await.err(),
                 Some(crate::queue::PrHelperRefusal::ApprovedWork)
             );
 
@@ -14491,7 +14621,7 @@ VERDICT: APPROVED"
             delivered.pr_url = Some("https://github.com/o/r/pull/1".to_string());
             let delivered_id = delivered.id;
             executor.tasks.write().await.insert(delivered_id, delivered);
-            assert!(executor.try_begin_pr_helper(delivered_id).await.is_ok());
+            assert!(executor.try_begin_pr_helper(delivered_id, PrHelperPurpose::Editing).await.is_ok());
 
             // An unfinished integration has its own remedy.
             let mut integrating = approved.clone();
@@ -14515,7 +14645,7 @@ VERDICT: APPROVED"
                 .await
                 .insert(integrating_id, integrating);
             assert_eq!(
-                executor.try_begin_pr_helper(integrating_id).await.err(),
+                executor.try_begin_pr_helper(integrating_id, PrHelperPurpose::Editing).await.err(),
                 Some(crate::queue::PrHelperRefusal::IntegrationUnfinished)
             );
 
@@ -14525,7 +14655,7 @@ VERDICT: APPROVED"
             undecided.human_review.record_arrival();
             let undecided_id = undecided.id;
             executor.tasks.write().await.insert(undecided_id, undecided);
-            assert!(executor.try_begin_pr_helper(undecided_id).await.is_ok());
+            assert!(executor.try_begin_pr_helper(undecided_id, PrHelperPurpose::Editing).await.is_ok());
         }
 
         /// An unfinished restack of a published branch owns the task: no
@@ -14562,7 +14692,7 @@ VERDICT: APPROVED"
 
             // PR helper (analyze, discuss, apply fixes).
             assert_eq!(
-                executor.try_begin_pr_helper(blocked_id).await.err(),
+                executor.try_begin_pr_helper(blocked_id, PrHelperPurpose::Editing).await.err(),
                 Some(crate::queue::PrHelperRefusal::RepublishPending)
             );
 
@@ -16972,7 +17102,7 @@ VERDICT: APPROVED"
             let (executor, _temps) = test_executor_with_events(recording.clone());
             let helper_task = Uuid::new_v4();
             let helper = executor
-                .try_begin_pr_helper(helper_task)
+                .try_begin_pr_helper(helper_task, PrHelperPurpose::Editing)
                 .await
                 .expect("helper admission");
 
@@ -17032,7 +17162,7 @@ VERDICT: APPROVED"
             task.phase = TaskPhase::QaReview;
             executor.tasks.write().await.insert(task_id, task);
             let helper = executor
-                .try_begin_pr_helper(task_id)
+                .try_begin_pr_helper(task_id, PrHelperPurpose::Editing)
                 .await
                 .expect("helper admission");
 
@@ -17608,7 +17738,7 @@ VERDICT: APPROVED"
             executor.spawn_review(review_id).await;
             // PR helper and PR side effects.
             assert!(matches!(
-                executor.try_begin_pr_helper(coding_id).await,
+                executor.try_begin_pr_helper(coding_id, PrHelperPurpose::Editing).await,
                 Err(PrHelperRefusal::ProcessShuttingDown)
             ));
             assert!(executor
@@ -17870,6 +18000,342 @@ VERDICT: APPROVED"
             assert!(std::path::Path::new(&checkout).exists(), "the checkout survives");
             assert_eq!(refs_of(&repo), refs_before, "no branch or commit was touched");
             assert_eq!(worktree_count(&repo), worktrees_before);
+        }
+    }
+
+    /// Recovery admission: an agent that can edit a Task Checkout is refused
+    /// while Worker recovery evidence is unresolved, and the review-admission
+    /// marker never leaves memory and the file disagreeing.
+    mod recovery_admission {
+        use super::*;
+        use crate::domain::task::{WorkerHandoff, WorkerHandoffStage};
+
+        fn handoff(task: &Task, stage: WorkerHandoffStage) -> WorkerHandoff {
+            WorkerHandoff {
+                task_id: task.id,
+                project_id: task.project_id,
+                repository_id: None,
+                run: Some(1),
+                branch: Some("task-recovery".into()),
+                start_head: None,
+                acceptance: None,
+                stage,
+            }
+        }
+
+        async fn seed(
+            executor: &TaskExecutor,
+            status: TaskStatus,
+            stage: Option<WorkerHandoffStage>,
+            confirmed: bool,
+        ) -> (Uuid, Uuid) {
+            let (id, project_id) = seed_task(executor, status).await;
+            let mut task = executor.tasks.read().await[&id].clone();
+            task.worker_handoff = stage.map(|stage| handoff(&task, stage));
+            task.worker_handoff_confirmed = confirmed;
+            task.record_activity(ActivityKind::RunCompleted { run: 1 });
+            executor.tasks.write().await.insert(id, task.clone());
+            let sibling = executor
+                .tasks
+                .read()
+                .await
+                .values()
+                .find(|t| t.id != id && t.project_id == project_id)
+                .cloned()
+                .expect("sibling");
+            executor
+                .storage
+                .save_project_tasks(project_id, &[task, sibling])
+                .expect("seed handoff");
+            (id, project_id)
+        }
+
+        fn commit() -> String {
+            "c".repeat(40)
+        }
+
+        fn no_owner(executor: &TaskExecutor, id: Uuid) -> bool {
+            !executor.pr_helper_handles.lock().unwrap().contains_key(&id)
+        }
+
+        #[tokio::test]
+        async fn editing_admission_is_refused_for_every_unresolved_handoff() {
+            let stages = [
+                (TaskStatus::InProgress, WorkerHandoffStage::Started, false),
+                (
+                    TaskStatus::InProgress,
+                    WorkerHandoffStage::CommittedAwaitingReview { commit: commit() },
+                    false,
+                ),
+                (
+                    TaskStatus::Error,
+                    WorkerHandoffStage::RecoveryRequired {
+                        reason: "interrupted".into(),
+                        observed_commit: Some(commit()),
+                    },
+                    false,
+                ),
+                // Resolved by a person, but the resolution is not yet confirmed
+                // durable: `worker_recovery_refusal` still holds it.
+                (
+                    TaskStatus::AiReview,
+                    WorkerHandoffStage::ResolvedToAiReview { commit: commit() },
+                    false,
+                ),
+            ];
+            for (status, stage, confirmed) in stages {
+                let (executor, _temps) = test_executor();
+                let (id, _) = seed(&executor, status.clone(), Some(stage.clone()), confirmed).await;
+                let refusal = executor
+                    .try_begin_pr_helper(id, PrHelperPurpose::Editing)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("{stage:?} must refuse an editing helper"));
+                assert!(matches!(refusal, PrHelperRefusal::WorkerRecovery(_)), "{refusal:?}");
+                assert!(no_owner(&executor, id), "no ownership may be registered");
+                assert!(!executor.is_task_running(id).await);
+                let after = executor.tasks.read().await[&id].clone();
+                assert_eq!(after.status, status, "no lifecycle transition");
+                assert_eq!(after.worker_handoff.as_ref().map(|h| &h.stage), Some(&stage));
+            }
+        }
+
+        #[tokio::test]
+        async fn editing_admission_works_for_a_confirmed_or_handoff_free_task() {
+            let (executor, _temps) = test_executor();
+            let (confirmed, _) = seed(
+                &executor,
+                TaskStatus::AiReview,
+                Some(WorkerHandoffStage::ResolvedToAiReview { commit: commit() }),
+                true,
+            )
+            .await;
+            let lease = executor
+                .try_begin_pr_helper(confirmed, PrHelperPurpose::Editing)
+                .await
+                .expect("a confirmed resolution is eligible");
+            drop(lease);
+            let (plain, _) = seed(&executor, TaskStatus::HumanReview, None, false).await;
+            assert!(
+                executor
+                    .try_begin_pr_helper(plain, PrHelperPurpose::Editing)
+                    .await
+                    .is_ok()
+            );
+        }
+
+        #[tokio::test]
+        async fn read_only_admission_stays_possible_for_a_recovery_task() {
+            let (executor, _temps) = test_executor();
+            let (id, _) = seed(
+                &executor,
+                TaskStatus::Error,
+                Some(WorkerHandoffStage::RecoveryRequired {
+                    reason: "interrupted".into(),
+                    observed_commit: None,
+                }),
+                false,
+            )
+            .await;
+            let lease = executor
+                .try_begin_pr_helper(id, PrHelperPurpose::Inspection)
+                .await
+                .expect("inspection of a recovery Task stays available");
+            assert!(!no_owner(&executor, id), "the read-only helper owns the Task while it runs");
+            drop(lease);
+        }
+
+        /// The recovery check is made under the lifecycle lease: while another
+        /// operation holds it nothing is admitted or registered, and once the
+        /// lease is free the same call is refused for recovery, not admitted.
+        #[tokio::test]
+        async fn the_recovery_check_runs_under_the_lifecycle_lease() {
+            let (executor, _temps) = test_executor();
+            let (id, _) = seed(
+                &executor,
+                TaskStatus::Error,
+                Some(WorkerHandoffStage::RecoveryRequired {
+                    reason: "interrupted".into(),
+                    observed_commit: None,
+                }),
+                false,
+            )
+            .await;
+            let held = executor.lifecycle.acquire(id).await.expect("lease");
+            assert_eq!(
+                executor.try_begin_pr_helper(id, PrHelperPurpose::Editing).await.err(),
+                Some(PrHelperRefusal::LifecycleContended)
+            );
+            assert!(no_owner(&executor, id));
+            drop(held);
+            assert!(matches!(
+                executor.try_begin_pr_helper(id, PrHelperPurpose::Editing).await.err(),
+                Some(PrHelperRefusal::WorkerRecovery(_))
+            ));
+        }
+
+        // ---- Review-admission marker ------------------------------------
+
+        fn markers(task: &Task) -> usize {
+            task.activity
+                .iter()
+                .filter(|e| matches!(e.kind, ActivityKind::AiReviewStarted { .. }))
+                .count()
+        }
+
+        async fn resolved(executor: &TaskExecutor) -> (Uuid, Uuid) {
+            seed(
+                executor,
+                TaskStatus::AiReview,
+                Some(WorkerHandoffStage::ResolvedToAiReview { commit: commit() }),
+                true,
+            )
+            .await
+        }
+
+        /// Publish the marker normally, as `record_review_admission` does, and
+        /// answer when it was stamped.
+        async fn publish_marker(
+            executor: &TaskExecutor,
+            id: Uuid,
+        ) -> chrono::DateTime<chrono::Utc> {
+            let at = chrono::Utc::now();
+            let mark = move |staged: &mut HashMap<Uuid, Task>| {
+                staged.get_mut(&id).is_some_and(|t| {
+                    t.record_activity_at(at, ActivityKind::AiReviewStarted { review: 1 })
+                })
+            };
+            crate::lifecycle::record_typed_if_changed(
+                &executor.tasks,
+                &executor.storage,
+                id,
+                &mark,
+            )
+            .await
+            .expect("setup: marker published");
+            at
+        }
+
+        /// Memory and the file hold the same handoff stage and marker count.
+        async fn assert_memory_follows_file(executor: &TaskExecutor, project: Uuid, id: Uuid) {
+            let memory = executor.tasks.read().await[&id].clone();
+            let disk = on_disk_task(executor, project, id);
+            assert_eq!(markers(&memory), markers(&disk), "marker: memory vs file");
+            assert_eq!(
+                memory.worker_handoff.as_ref().map(|h| &h.stage),
+                disk.worker_handoff.as_ref().map(|h| &h.stage),
+                "stage: memory vs file"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_marker_that_was_not_published_leaves_no_trace() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let fault = slashit_durable_fs::fault::fail_at(
+                slashit_durable_fs::Stage::CreateTemp,
+                std::io::ErrorKind::Other,
+            );
+            assert!(!executor.record_review_admission(id, 1).await);
+            drop(fault);
+            assert_eq!(markers(&executor.tasks.read().await[&id]), 0);
+            assert_memory_follows_file(&executor, project, id).await;
+            assert!(!executor.review_admission_unconfirmed(id).await);
+        }
+
+        #[tokio::test]
+        async fn an_unconfirmed_marker_is_withdrawn_when_the_withdrawal_is_durable() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            // Fires once, on the marker's write; the withdrawal then succeeds.
+            let fault = slashit_durable_fs::fault::fail_at(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            assert!(!executor.record_review_admission(id, 1).await);
+            drop(fault);
+            let memory = executor.tasks.read().await[&id].clone();
+            assert_eq!(markers(&memory), 0);
+            assert!(!memory.review_admitted_for_current_result());
+            assert!(matches!(
+                memory.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::ResolvedToAiReview { .. }
+            ));
+            assert_memory_follows_file(&executor, project, id).await;
+            assert!(!executor.review_admission_unconfirmed(id).await);
+        }
+
+        #[tokio::test]
+        async fn a_withdrawal_that_is_not_published_fails_closed_into_recovery() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let at = publish_marker(&executor, id).await;
+            // The withdrawal write fails once; the recovery record then lands.
+            let fault = slashit_durable_fs::fault::fail_at(
+                slashit_durable_fs::Stage::CreateTemp,
+                std::io::ErrorKind::Other,
+            );
+            executor.settle_unconfirmed_review_admission(id, 1, at).await;
+            drop(fault);
+            let memory = executor.tasks.read().await[&id].clone();
+            assert_eq!(markers(&memory), 1, "memory keeps what the file holds");
+            assert!(matches!(
+                memory.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::RecoveryRequired { .. }
+            ));
+            assert!(memory.worker_recovery_refusal().is_some());
+            assert_memory_follows_file(&executor, project, id).await;
+
+            // Restart after the recovery record was durable: still held.
+            let restarted = on_disk_task(&executor, project, id);
+            assert!(restarted.worker_recovery_refusal().is_some());
+            assert!(!executor.review_admission_unconfirmed(id).await);
+        }
+
+        #[tokio::test]
+        async fn a_withdrawal_that_is_not_durable_either_also_ends_in_recovery() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let at = publish_marker(&executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            executor.settle_unconfirmed_review_admission(id, 1, at).await;
+            drop(fault);
+            let memory = executor.tasks.read().await[&id].clone();
+            assert!(matches!(
+                memory.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::RecoveryRequired { .. }
+            ));
+            assert_memory_follows_file(&executor, project, id).await;
+        }
+
+        #[tokio::test]
+        async fn when_no_recovery_record_can_be_published_the_task_is_refused_in_process() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let at = publish_marker(&executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::CreateTemp,
+                std::io::ErrorKind::Other,
+            );
+            executor.settle_unconfirmed_review_admission(id, 1, at).await;
+            drop(fault);
+            // Nothing was published: memory still equals the file, marker and all.
+            let memory = executor.tasks.read().await[&id].clone();
+            assert_eq!(markers(&memory), 1);
+            assert!(matches!(
+                memory.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::ResolvedToAiReview { .. }
+            ));
+            assert_memory_follows_file(&executor, project, id).await;
+            assert!(executor.review_admission_unconfirmed(id).await);
+
+            // A restart cannot tell this marker from a real review's: the
+            // limitation is that storage accepted no recovery state to read.
+            let restarted = on_disk_task(&executor, project, id);
+            assert!(restarted.review_admitted_for_current_result());
         }
     }
 }

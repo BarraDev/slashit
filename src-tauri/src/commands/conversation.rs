@@ -666,6 +666,12 @@ pub async fn act_on_project_conversation(
                 if target.project_id != project_id {
                     return Err("Target Task belongs to another Project".into());
                 }
+                // An early answer, before a new approval is recorded for a Task
+                // that cannot run it. The admission below stays authoritative:
+                // the Task can change after this read.
+                if let Some(refusal) = target.worker_recovery_refusal() {
+                    return Err(refusal);
+                }
                 let (request, already_approved) =
                     record_human_approval(&mut conversation, action_id, request)?;
                 if target
@@ -696,7 +702,7 @@ pub async fn act_on_project_conversation(
         .ok_or("Task executor is not ready")?
         .clone();
     let lease = executor
-        .try_begin_pr_helper(target_task_id)
+        .try_begin_pr_helper(target_task_id, crate::queue::PrHelperPurpose::Editing)
         .await
         .map_err(|error| error.to_string())?;
     // The first snapshot was only used to validate and record the Human's
@@ -1283,5 +1289,172 @@ mod tests {
         let mut retry = saved;
         record_followup_proposal(&mut retry, project_id, Conversation::parse_output(&json).unwrap(), &tasks);
         assert_eq!(retry.project_actions.len(), 1, "exactly one proposal after the retry");
+    }
+
+    /// A Conversation Worker delegation must not reach a Task Checkout whose
+    /// Worker recovery evidence is unresolved, whether or not the Human had
+    /// already approved the action.
+    #[cfg(unix)]
+    mod recovery_refusal {
+        use super::*;
+        use crate::commands::gui_admission::GuiMutation;
+        use crate::domain::task::{WorkerHandoff, WorkerHandoffStage};
+        use crate::domain::{TaskStatus, Repository};
+        use tauri::Manager;
+
+        fn git(dir: &std::path::Path, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_recovery_required_task_launches_no_provider_and_keeps_the_action_unstarted() {
+            let fake = crate::test_helpers::FakeProgram::install("claude", "exit 0\n").await;
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+                tmp.path().join("config"),
+                tmp.path().join("data"),
+                tmp.path().join("cache"),
+                tmp.path().join("runtime"),
+            ));
+            let (state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
+            let executor = crate::test_helpers::attach_test_executor(&state);
+
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git(&repo, &["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join("a.txt"), "a").unwrap();
+            git(&repo, &["add", "."]);
+            git(&repo, &["commit", "-q", "-m", "init"]);
+            let checkout = tmp.path().join("checkout");
+            git(&repo, &["worktree", "add", "-q", "-b", "task-branch", checkout.to_str().unwrap()]);
+            let head = git(&checkout, &["rev-parse", "HEAD"]);
+
+            let repository_id = Uuid::new_v4();
+            state.repository.repositories.write().await.insert(
+                repository_id,
+                Repository {
+                    id: repository_id,
+                    local_path: repo.to_str().unwrap().to_string(),
+                    remote_url: None,
+                    remote_type: None,
+                    created_at: chrono::Utc::now(),
+                },
+            );
+            let project_id = Uuid::new_v4();
+            state.project.projects.write().await.insert(
+                project_id,
+                crate::domain::Project {
+                    id: project_id,
+                    name: "p".into(),
+                    repository_id: Some(repository_id),
+                    scope: Default::default(),
+                    state_location: crate::config::paths::StateLocation::External,
+                    base: None,
+                    agent_type: crate::domain::project::AgentType::ClaudeCode,
+                    agent_config: crate::domain::project::AgentConfig {
+                        agent_type: crate::domain::project::AgentType::ClaudeCode,
+                        command: "claude".into(),
+                        args: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                        model: None,
+                        api_key: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                },
+            );
+            let mut task = board_task(project_id, TaskStatus::Error);
+            task.worktree_path = Some(checkout.to_str().unwrap().to_string());
+            task.branch_name = Some("task-branch".into());
+            task.worker_handoff = Some(WorkerHandoff {
+                task_id: task.id,
+                project_id,
+                repository_id: None,
+                run: Some(1),
+                branch: Some("task-branch".into()),
+                start_head: Some(head.clone()),
+                acceptance: None,
+                stage: WorkerHandoffStage::RecoveryRequired {
+                    reason: "interrupted".into(),
+                    observed_commit: None,
+                },
+            });
+            let task_id = task.id;
+            state.task.tasks.write().await.insert(task_id, task.clone());
+            state.storage.save_project_tasks(project_id, &[task.clone()]).unwrap();
+
+            // One action not yet decided, one the Human had already approved.
+            let mut conversation = state.storage.create_primary_conversation(project_id).unwrap();
+            let make = |status, approved: Option<&str>| TaskAction {
+                id: Uuid::new_v4(),
+                target_task_id: task_id,
+                target_task_title: "Task".into(),
+                request: "change a.txt".into(),
+                explanation: "why".into(),
+                approved_request: approved.map(str::to_string),
+                status,
+                worker_result: None,
+                coordinator_replied: false,
+                created_at: chrono::Utc::now(),
+            };
+            let proposed = make(ActionStatus::Proposed, None);
+            let approved = make(ActionStatus::Approved, Some("change a.txt"));
+            let (proposed_id, approved_id) = (proposed.id, approved.id);
+            conversation.actions.push(proposed);
+            conversation.actions.push(approved);
+            state.storage.save_conversation(&conversation).unwrap();
+            let before = state.storage.load_primary_conversation(project_id).unwrap().unwrap();
+
+            let app = tauri::test::mock_app();
+            app.manage(state);
+            for action_id in [proposed_id, approved_id] {
+                let current = app
+                    .state::<crate::AppState>()
+                    .storage
+                    .load_primary_conversation(project_id)
+                    .unwrap()
+                    .unwrap();
+                let refusal = super::super::act_on_project_conversation(
+                    GuiMutation::untracked(),
+                    app.state(),
+                    project_id.to_string(),
+                    current.id.to_string(),
+                    current.revision,
+                    action_id.to_string(),
+                    super::super::HumanAction::Approve { request: None },
+                )
+                .await
+                .expect_err("recovery evidence refuses the delegation");
+                assert!(refusal.contains("unresolved Worker recovery"), "{refusal}");
+            }
+
+            assert!(fake.invocations().is_empty(), "no provider was launched: {}", fake.invocations());
+            assert_eq!(git(&checkout, &["rev-parse", "HEAD"]), head, "HEAD did not move");
+            assert_eq!(git(&checkout, &["status", "--porcelain"]), "", "checkout untouched");
+            assert_eq!(git(&repo, &["rev-parse", "task-branch"]), head, "branch did not move");
+            assert!(!executor.is_task_running(task_id).await);
+            let live: &crate::AppState = app.state::<crate::AppState>().inner();
+            let after = live.storage.load_primary_conversation(project_id).unwrap().unwrap();
+            assert_eq!(after.revision, before.revision, "nothing was written");
+            let status_of = |c: &Conversation, id| c.actions.iter().find(|a| a.id == id).unwrap().status;
+            assert_eq!(status_of(&after, proposed_id), ActionStatus::Proposed);
+            assert_eq!(status_of(&after, approved_id), ActionStatus::Approved, "history preserved, not Running");
+            let kept = live.task.tasks.read().await[&task_id].clone();
+            assert!(matches!(
+                kept.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::RecoveryRequired { .. }
+            ));
+            assert_eq!(kept.status, TaskStatus::Error);
+        }
     }
 }
