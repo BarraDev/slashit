@@ -16,6 +16,7 @@
 //! directory, which has no portable equivalent.
 #![cfg(unix)]
 
+use slashit_ui_lib::commands::gui_admission::GuiMutation;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
@@ -88,7 +89,7 @@ async fn desktop_mutation_refuses_to_publish_when_the_durable_write_fails() {
     let app = tauri::test::mock_app();
     app.manage(state);
 
-    let result = slashit_ui_lib::commands::task::update_task_status(
+    let result = slashit_ui_lib::commands::task::update_task_status(GuiMutation::untracked(), 
         app.state(),
         task_id.to_string(),
         TaskStatus::InProgress,

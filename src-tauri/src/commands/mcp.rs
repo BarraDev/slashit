@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::mcp::{McpServer, McpAgent, McpAgentConfig};
 
 #[derive(Clone)]
@@ -43,7 +44,7 @@ pub async fn list_mcp_servers() -> Vec<McpServer> {
 }
 
 #[tauri::command]
-pub async fn toggle_mcp_server(_server_id: String, _enabled: bool) -> Result<(), String> {
+pub async fn toggle_mcp_server(_gui: GuiMutation, _server_id: String, _enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
@@ -63,6 +64,6 @@ pub async fn get_mcp_agents() -> Vec<McpAgent> {
 }
 
 #[tauri::command]
-pub async fn configure_agent(_agent_id: String, _config: McpAgentConfig) -> Result<(), String> {
+pub async fn configure_agent(_gui: GuiMutation, _agent_id: String, _config: McpAgentConfig) -> Result<(), String> {
     Ok(())
 }

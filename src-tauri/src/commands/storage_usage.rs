@@ -1,10 +1,12 @@
 //! How much disk SlashIt uses. Read-only: see [`crate::storage_accounting`].
 
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::storage_usage::{StartBlock, StorageStatus};
 
 /// The latest measurement, without measuring.
 #[tauri::command]
 pub async fn get_storage_usage(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<StorageStatus, String> {
     Ok(state.storage_accounting.status())
@@ -14,6 +16,7 @@ pub async fn get_storage_usage(
 /// the result.
 #[tauri::command]
 pub async fn refresh_storage_usage(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<StorageStatus, String> {
     Ok(state.storage_accounting.refresh().await)
@@ -23,6 +26,7 @@ pub async fn refresh_storage_usage(
 /// not. Asks the filesystem afresh; it does not read the last measurement.
 #[tauri::command]
 pub async fn get_new_work_pause(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Option<StartBlock>, String> {
     Ok(state.start_guard.check().await.err())

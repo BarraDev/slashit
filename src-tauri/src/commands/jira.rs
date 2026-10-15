@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::jira::{JiraIssue, JiraProject};
 use crate::domain::task::ExternalRef;
 use crate::domain::{
@@ -70,6 +71,7 @@ pub async fn list_jira_projects() -> Result<Vec<JiraProject>, String> {
 /// Import Jira issues as tasks.
 #[tauri::command]
 pub async fn import_jira_issues(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_key: String,
     jql_filter: Option<String>,

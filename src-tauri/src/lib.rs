@@ -304,11 +304,10 @@ pub fn run() {
                 // not with the server task inside it, and is released only
                 // after the executor is quiescent.
                 let ownership = bound.ownership();
+                let poller = ipc::poller_join(polling_handle);
                 let supervision = ipc::Supervision {
                     shutdown: shutdown_rx.clone(),
-                    poller: Some(Box::pin(async move {
-                        polling_handle.await.map_err(|error| error.to_string())
-                    })),
+                    poller: Some(poller.clone()),
                     // The user already confirmed quitting with work running
                     // (`request_quit`), so running agents are cancelled and
                     // reaped, not waited for.
@@ -324,9 +323,11 @@ pub fn run() {
                         Ok(result) => result,
                         Err(error) => {
                             eprintln!("SlashIt: the IPC supervisor task failed: {error}");
-                            if let Some(executor) = executor_cell.get() {
-                                ipc::drain_execution(executor, std::time::Duration::ZERO).await;
-                            }
+                            ipc::quiesce_after_supervisor_failure(
+                                executor_cell.get().map(|executor| executor.as_ref()),
+                                Some(poller),
+                            )
+                            .await;
                             Err(anyhow::anyhow!("the IPC supervisor task failed: {error}"))
                         }
                     };
@@ -345,6 +346,13 @@ pub fn run() {
                     if result.is_ok()
                         && restart_requested.load(std::sync::atomic::Ordering::SeqCst)
                     {
+                        // Windows installs here, after the drain: the
+                        // installer step ends the process.
+                        if let Err(error) =
+                            commands::updater::install_staged_after_drain(&app_handle).await
+                        {
+                            eprintln!("SlashIt: the staged update could not be installed: {error}");
+                        }
                         app_handle.restart();
                     }
                     app_handle.exit(if result.is_ok() { 0 } else { 1 });

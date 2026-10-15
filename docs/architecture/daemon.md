@@ -141,15 +141,56 @@ be reaped, the instance keeps its ownership, says so, and keeps retrying; it
 does not exit as if the shutdown were clean. A failure-triggered shutdown
 exits non-zero once drained.
 
-Not covered: Tauri commands from the desktop window are not individually
-fenced (only IPC requests and execution starts are); the desktop keeps the
-endpoint until `RunEvent::Exit` to bound that window. On Windows the updater
-plugin's installer exits the process directly, bypassing the drain. Signals sent
-to a draining daemon are ignored; only `SIGKILL` ends it early. A process that
-is killed outright (`SIGKILL`, power loss) gives up
-its endpoint at once because the kernel drops the lease, and any provider
-process it had started may outlive it. A graceful shutdown never leaves one
-behind unless the retry above is still going.
+Desktop commands go through the same fence. Every `#[tauri::command]` that can
+change anything takes a `GuiMutation` argument (`commands/gui_admission.rs`):
+Tauri builds it when the invocation is dispatched, so a command dispatched after
+the fence closed is refused before its body runs, and the lease it holds lives
+as long as the command's own future, so the drain waits for every command that
+was admitted earlier. Commands that only read, and the two that perform the
+shutdown itself (`force_quit`, `updater_restart`), are listed by name; a test
+fails when a command is neither. The desktop therefore releases the endpoint
+(at `RunEvent::Exit`) only after no admitted command is still running.
+
+If the task running the server dies, the supervisor above it still holds the
+ownership claim and the poller's join. It closes the fence, waits for the poller
+to return (a poll pass that began before the fence closed is not stopped by it),
+and reaps every owner before releasing anything.
+
+On Windows the updater plugin's install step launches the installer and then
+calls `std::process::exit(0)` itself. SlashIt therefore downloads the installer
+and stages it, and runs it from the shutdown path after the drain
+(`install_staged_after_drain`); no code calls the plugin's combined
+download-and-install. An installer, user or administrator that terminates the
+process from outside is a forced external termination, below.
+
+Not covered, and not promised:
+
+- `SIGKILL`, `TerminateProcess`, an installer or service manager killing the
+  process, and power loss. No supervisor runs. The kernel drops the lease at
+  once, a successor can own the endpoint immediately, and any provider process
+  the old instance started may outlive it. Startup recovery handles the Task
+  state exactly as after a crash.
+- Signals sent to a daemon that is already draining are ignored; only `SIGKILL`
+  ends it early.
+- A poll pass that began just before the fence closed may promote a Task to
+  `in_progress`. It finishes before ownership is released (the poller is
+  awaited), leaves no owner behind, and startup recovery requeues the Task.
+- User terminals (PTY sessions) are interactive shells under the user's control,
+  not provider processes, and the drain does not reap them. A command the user
+  typed (`git`, a provider CLI) can keep running between the endpoint being
+  released and the process ending. Starting a terminal and writing to one are
+  refused after the fence closes.
+- If the task running the server dies, its connection handlers are aborted, not
+  joined. A handler suspended at an await point stops; one inside
+  `spawn_blocking` may finish.
+- A Windows installer that fails to start after the drain is logged and the
+  application restarts into the old version; no progress event reports it.
+- Admitted desktop commands hold the drain until they return. A long download
+  (`updater_download_and_install`) or a provider turn delays a quit; Project
+  Runs are cancelled before the wait, so a Coordinator turn does not.
+- The webview is not granted the updater plugin's own commands
+  (`capabilities/default.json`), so JavaScript cannot reach the plugin's
+  install step, which exits the process on Windows.
 
 The PID file at `AppPaths::pid_file()` is informational only. Endpoint
 ownership is the authoritative single-instance mechanism, because a PID file

@@ -1,5 +1,6 @@
 //! Commands for reading and toggling runtime feature flags.
 
+use crate::commands::gui_admission::GuiMutation;
 use crate::config::features::FeatureFlags;
 use crate::config::paths::AppPaths;
 
@@ -24,6 +25,7 @@ pub async fn get_feature_flags(
 /// than appearing to accept the toggle.
 #[tauri::command]
 pub async fn set_feature_flag(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     name: String,
     enabled: bool,

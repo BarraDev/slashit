@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::AgentLogEntry;
 use crate::queue::workflow::{Workflow, WorkflowMode};
 use crate::queue::workflow::WorkflowConfig;
@@ -12,6 +13,7 @@ pub async fn get_workflow_config(
 
 #[tauri::command]
 pub async fn update_workflow_config(
+    _gui: GuiMutation,
     _state: tauri::State<'_, crate::AppState>,
     mode: Option<String>,
     parallel_limit: Option<u32>,

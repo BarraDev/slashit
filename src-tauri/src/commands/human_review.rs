@@ -6,6 +6,7 @@
 //! request is a second step whose failure is recorded next to the approval
 //! and never undoes it. See [`crate::domain::task::HumanReviewRecord`].
 
+use crate::commands::gui_admission::GuiMutation;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -97,6 +98,7 @@ pub enum PrDelivery {
 /// as an error, because the approval happened.
 #[tauri::command]
 pub async fn approve_task(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     create_pr: bool,
@@ -109,6 +111,7 @@ pub async fn approve_task(
 /// without approving them again.
 #[tauri::command]
 pub async fn create_approved_task_pr(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<ApprovalOutcome, String> {
@@ -125,6 +128,7 @@ pub async fn create_approved_task_pr(
 /// separate decision.
 #[tauri::command]
 pub async fn complete_task_locally(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     without_pull_request: Option<bool>,
@@ -141,6 +145,7 @@ pub async fn complete_task_locally(
 /// the feedback. `Err` means neither happened.
 #[tauri::command]
 pub async fn request_task_changes(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     feedback: String,
@@ -182,6 +187,7 @@ pub struct ApprovalStatus {
 /// only.
 #[tauri::command]
 pub async fn get_approval_status(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<ApprovalStatus, String> {
@@ -236,6 +242,7 @@ pub(crate) async fn approval_status(state: &crate::AppState, task_id: Uuid) -> R
 /// or completed by it.
 #[tauri::command]
 pub async fn approve_task_again(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     tip: String,
@@ -812,13 +819,13 @@ mod tests {
 
         let app = tauri::test::mock_app();
         app.manage(state);
-        let waiting = crate::commands::queue::promote_next_task(app.state()).await;
+        let waiting = crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await;
         assert!(waiting.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{waiting:?}");
         let state: tauri::State<'_, crate::AppState> = app.state();
         assert_eq!(on_disk(&state, project_id, task_id).status, TaskStatus::Queue);
 
         disk.set_available(300 * GIB);
-        let promoted = crate::commands::queue::promote_next_task(app.state()).await.expect("promoted");
+        let promoted = crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await.expect("promoted");
         assert_eq!(promoted, Some(task_id.to_string()));
     }
 
@@ -872,12 +879,12 @@ mod tests {
         app.manage(state);
 
         for status in [TaskStatus::Queue, TaskStatus::HumanReview] {
-            crate::commands::task::update_task_status(app.state(), moved.to_string(), status, None)
+            crate::commands::task::update_task_status(GuiMutation::untracked(), app.state(), moved.to_string(), status, None)
                 .await
                 .expect("moved");
         }
-        crate::commands::queue::add_to_queue(app.state(), queued.to_string()).await.expect("queued");
-        crate::commands::task::update_task_status(app.state(), queued.to_string(), TaskStatus::HumanReview, None)
+        crate::commands::queue::add_to_queue(GuiMutation::untracked(), app.state(), queued.to_string()).await.expect("queued");
+        crate::commands::task::update_task_status(GuiMutation::untracked(), app.state(), queued.to_string(), TaskStatus::HumanReview, None)
             .await
             .expect("moved back");
 

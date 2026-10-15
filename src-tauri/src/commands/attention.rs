@@ -5,6 +5,7 @@
 //! say "this project needs you" -- the project rail, today -- without
 //! loading whole boards to find out.
 
+use crate::commands::gui_admission::GuiMutation;
 use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
@@ -56,6 +57,7 @@ pub fn summarize(
 
 #[tauri::command]
 pub async fn get_attention_summary(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<ProjectAttention>, String> {
     let tasks = state.task.tasks.read().await;

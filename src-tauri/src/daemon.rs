@@ -242,11 +242,10 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     // the executor is quiescent, so even a server task that dies without
     // draining cannot release the instance under a running agent.
     let ownership = bound.ownership();
+    let poller = crate::ipc::poller_join(polling_handle);
     let supervision = crate::ipc::Supervision {
         shutdown: shutdown_tx.subscribe(),
-        poller: Some(Box::pin(async move {
-            polling_handle.await.map_err(|error| error.to_string())
-        })),
+        poller: Some(poller.clone()),
         finish_grace: SHUTDOWN_GRACE,
     };
     let mut server = tokio::spawn({
@@ -298,7 +297,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
         // still ours, so finish the drain here before releasing it.
         Err(error) => {
             eprintln!("slashitd: the IPC supervisor task failed ({error}); draining here");
-            crate::ipc::drain_execution(&executor, std::time::Duration::ZERO).await;
+            crate::ipc::quiesce_after_supervisor_failure(Some(&executor), Some(poller)).await;
             Err(anyhow::anyhow!("the IPC supervisor task failed: {error}"))
         }
     };

@@ -1,8 +1,10 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::AgentLogEntry;
 use uuid::Uuid;
 
 #[tauri::command]
 pub async fn execute_task(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<(), String> {
@@ -14,6 +16,7 @@ pub async fn execute_task(
 
 #[tauri::command]
 pub async fn stop_task_execution(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<(), String> {

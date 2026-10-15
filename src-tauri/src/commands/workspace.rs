@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::config::paths::AppPaths;
 use crate::config::WorkspaceRegistry;
 use crate::domain::{Project, Workspace, WorkspaceRoot};
@@ -24,6 +25,7 @@ impl WorkspaceState {
 
 #[tauri::command]
 pub async fn create_workspace(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     name: String,
     root_path: String,
@@ -81,6 +83,7 @@ fn projects_referencing(projects: &HashMap<Uuid, Project>, workspace_id: Uuid) -
 
 #[tauri::command]
 pub async fn delete_workspace(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     workspace_id: String,
 ) -> Result<bool, String> {

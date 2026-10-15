@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::agents::runner::{ClaudeRunConfig, ClaudeRunner, ToolAccess};
 use crate::domain::conversation::{
     ActionStatus, Conversation, CoordinatorOutput, EntryKind, Role, TaskAction,
@@ -168,6 +169,7 @@ async fn project_after_lock(
 
 #[tauri::command]
 pub async fn open_project_conversation(
+    _gui: GuiMutation,
     state: tauri::State<'_, AppState>,
     project_id: String,
 ) -> Result<Snapshot, String> {
@@ -178,11 +180,12 @@ pub async fn open_project_conversation(
         project_after_lock(&state.project.projects, project_id).await?;
         load_or_create(&state, project_id).await?;
     }
-    get_project_conversation(state, project_id.to_string()).await
+    get_project_conversation(_gui, state, project_id.to_string()).await
 }
 
 #[tauri::command]
 pub async fn get_project_conversation(
+    _gui: GuiMutation,
     state: tauri::State<'_, AppState>,
     project_id: String,
 ) -> Result<Snapshot, String> {
@@ -269,6 +272,7 @@ pub async fn get_project_conversation(
 
 #[tauri::command]
 pub async fn retry_project_conversation_continuation(
+    _gui: GuiMutation,
     state: tauri::State<'_, AppState>,
     project_id: String,
     conversation_id: String,
@@ -318,6 +322,7 @@ pub async fn retry_project_conversation_continuation(
 
 #[tauri::command]
 pub async fn send_project_message(
+    _gui: GuiMutation,
     state: tauri::State<'_, AppState>,
     project_id: String,
     message: String,
@@ -553,6 +558,7 @@ async fn run_with_lease(
 
 #[tauri::command]
 pub async fn stop_project_conversation(
+    _gui: GuiMutation,
     state: tauri::State<'_, AppState>,
     project_id: String,
 ) -> Result<(), String> {
@@ -571,6 +577,7 @@ pub async fn stop_project_conversation(
 
 #[tauri::command]
 pub async fn act_on_project_conversation(
+    _gui: GuiMutation,
     state: tauri::State<'_, AppState>,
     project_id: String,
     conversation_id: String,

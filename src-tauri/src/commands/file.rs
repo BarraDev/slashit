@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::file::{FileItem, FileInfo};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,7 +72,7 @@ pub async fn read_file(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn write_file(path: String, content: String) -> Result<(), String> {
+pub async fn write_file(_gui: GuiMutation, path: String, content: String) -> Result<(), String> {
     fs::write(&path, content)
         .map_err(|e| format!("Failed to write file: {}", e))
 }

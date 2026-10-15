@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::{
     Task, NewTask, TaskStatus, TaskCategory, TaskPriority, TaskComplexity,
     TaskImpact, SecuritySeverity, TaskPhase, Subtask,
@@ -82,6 +83,7 @@ pub struct CreateTaskParams {
 
 #[tauri::command]
 pub async fn create_task(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     params: CreateTaskParams,
 ) -> Result<Task, String> {
@@ -157,6 +159,7 @@ pub async fn list_tasks(
 /// is `Some(true)`; see [`refuse_unconfirmed_close`].
 #[tauri::command]
 pub async fn update_task_status(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     status: TaskStatus,
@@ -251,6 +254,7 @@ pub async fn update_task_status(
 
 #[tauri::command]
 pub async fn set_task_dependencies(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     dependencies: Vec<String>,
@@ -269,7 +273,12 @@ pub async fn set_task_dependencies(
 }
 
 #[tauri::command]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parameters are the frontend's invoke() contract; the admission argument is the eighth"
+)]
 pub async fn update_task_metadata(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     category: Option<TaskCategory>,
@@ -303,6 +312,7 @@ pub async fn update_task_metadata(
 
 #[tauri::command]
 pub async fn update_task_progress(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     phase: TaskPhase,
@@ -324,6 +334,7 @@ pub async fn update_task_progress(
 
 #[tauri::command]
 pub async fn add_subtask(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     title: String,
@@ -348,6 +359,7 @@ pub async fn add_subtask(
 
 #[tauri::command]
 pub async fn toggle_subtask(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     subtask_id: String,
@@ -382,6 +394,7 @@ pub async fn toggle_subtask(
 
 #[tauri::command]
 pub async fn link_github_issue(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     issue_url: String,
@@ -417,6 +430,7 @@ pub async fn link_github_issue(
 
 #[tauri::command]
 pub async fn link_pr(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     pr_url: String,
@@ -456,6 +470,7 @@ pub async fn link_pr(
 
 #[tauri::command]
 pub async fn mark_task_stuck(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<Option<Task>, String> {
@@ -470,6 +485,7 @@ pub async fn mark_task_stuck(
 
 #[tauri::command]
 pub async fn unstick_task(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<Option<Task>, String> {
@@ -499,6 +515,7 @@ pub struct UpdateTaskParams {
 
 #[tauri::command]
 pub async fn update_task(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     params: UpdateTaskParams,
 ) -> Result<Option<Task>, String> {
@@ -539,6 +556,7 @@ pub async fn update_task(
 
 #[tauri::command]
 pub async fn delete_task(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<bool, String> {
@@ -616,6 +634,7 @@ pub(crate) use crate::lifecycle::renumber_column;
 /// without merging) passes `None` and keeps its existing behavior.
 #[tauri::command]
 pub async fn reorder_task(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     new_status: Option<TaskStatus>,
@@ -726,6 +745,7 @@ pub async fn reorder_task(
 
 #[tauri::command]
 pub async fn add_external_ref(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     external_ref: ExternalRef,
@@ -741,6 +761,7 @@ pub async fn add_external_ref(
 
 #[tauri::command]
 pub async fn remove_external_ref(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
     ref_index: usize,
@@ -1827,11 +1848,11 @@ mod lifecycle_ownership {
         app.manage(state);
 
         for confirmed in [None, Some(false)] {
-            let refused = update_task_status(app.state(), by_status.to_string(), TaskStatus::Done, confirmed)
+            let refused = update_task_status(GuiMutation::untracked(), app.state(), by_status.to_string(), TaskStatus::Done, confirmed)
                 .await
                 .expect_err("not confirmed");
             assert_eq!(refused, CLOSE_WITHOUT_MERGE_REQUIRED);
-            let refused = reorder_task(app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, confirmed, None)
+            let refused = reorder_task(GuiMutation::untracked(), app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, confirmed, None)
                 .await
                 .expect_err("not confirmed");
             assert_eq!(refused, CLOSE_WITHOUT_MERGE_REQUIRED);
@@ -1841,12 +1862,12 @@ mod lifecycle_ownership {
             assert_eq!(state.task.tasks.read().await[&id].status, TaskStatus::HumanReview);
         }
 
-        let closed = update_task_status(app.state(), by_status.to_string(), TaskStatus::Done, Some(true))
+        let closed = update_task_status(GuiMutation::untracked(), app.state(), by_status.to_string(), TaskStatus::Done, Some(true))
             .await
             .expect("confirmed")
             .expect("the task exists");
         assert_eq!(closed.status, TaskStatus::Done);
-        let closed = reorder_task(app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, Some(true), None)
+        let closed = reorder_task(GuiMutation::untracked(), app.state(), by_drag.to_string(), Some(TaskStatus::Done), 0, Some(true), None)
             .await
             .expect("confirmed")
             .expect("the task exists");
@@ -1862,12 +1883,12 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let done = update_task_status(app.state(), from_backlog.to_string(), TaskStatus::Done, None)
+        let done = update_task_status(GuiMutation::untracked(), app.state(), from_backlog.to_string(), TaskStatus::Done, None)
             .await
             .expect("no guard")
             .expect("exists");
         assert_eq!(done.status, TaskStatus::Done);
-        let done = reorder_task(app.state(), from_pr.to_string(), Some(TaskStatus::Done), 0, None, None)
+        let done = reorder_task(GuiMutation::untracked(), app.state(), from_pr.to_string(), Some(TaskStatus::Done), 0, None, None)
             .await
             .expect("no guard")
             .expect("exists");
@@ -1884,7 +1905,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
+        let result = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
 
         assert!(result.is_ok(), "the transition must succeed: {result:?}");
         assert!(
@@ -1914,7 +1935,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
+        let result = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
 
         assert!(result.is_ok(), "the transition must succeed: {result:?}");
         assert!(
@@ -1935,7 +1956,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
+        let result = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
 
         assert!(
             result.is_err(),
@@ -1978,7 +1999,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
+        let result = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::Backlog, None).await;
         assert!(result.is_ok(), "{result:?}");
 
         let live: &crate::AppState = app.state::<crate::AppState>().inner();
@@ -2008,7 +2029,7 @@ mod lifecycle_ownership {
         app.manage(state);
 
         // Same column: `new_status` names the column the task is already in.
-        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
+        let result = reorder_task(GuiMutation::untracked(), app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
 
         assert!(result.is_ok(), "{result:?}");
         assert!(
@@ -2032,7 +2053,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::Backlog), 0, None, None).await;
+        let result = reorder_task(GuiMutation::untracked(), app.state(), task_id.to_string(), Some(TaskStatus::Backlog), 0, None, None).await;
 
         assert!(result.is_ok(), "{result:?}");
         assert!(
@@ -2061,7 +2082,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let result = reorder_task(
+        let result = reorder_task(GuiMutation::untracked(), 
             app.state(),
             task_id.to_string(),
             Some(TaskStatus::Queue),
@@ -2112,7 +2133,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let answered = reorder_task(
+        let answered = reorder_task(GuiMutation::untracked(), 
             app.state(),
             task_id.to_string(),
             Some(TaskStatus::Queue),
@@ -2139,7 +2160,7 @@ mod lifecycle_ownership {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let answered = reorder_task(
+        let answered = reorder_task(GuiMutation::untracked(), 
             app.state(),
             task_id.to_string(),
             Some(TaskStatus::Queue),
@@ -2212,13 +2233,13 @@ mod disk_pressure {
         app.manage(state);
         let state: &crate::AppState = app.state::<crate::AppState>().inner();
 
-        let result = update_task_status(app.state(), by_status.to_string(), TaskStatus::InProgress, None).await;
+        let result = update_task_status(GuiMutation::untracked(), app.state(), by_status.to_string(), TaskStatus::InProgress, None).await;
         assert!(paused(&result), "{result:?}");
         assert_eq!(on_disk(state, project_a, by_status).status, TaskStatus::Backlog);
         assert_eq!(state.task.tasks.read().await[&by_status].status, TaskStatus::Backlog);
 
         let result =
-            reorder_task(app.state(), by_drag.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
+            reorder_task(GuiMutation::untracked(), app.state(), by_drag.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
         assert!(paused(&result), "{result:?}");
         let task = on_disk(state, project_b, by_drag);
         assert_eq!(task.status, TaskStatus::Error, "not reset, not moved");
@@ -2235,7 +2256,7 @@ mod disk_pressure {
         app.manage(state);
 
         let result =
-            reorder_task(app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
+            reorder_task(GuiMutation::untracked(), app.state(), task_id.to_string(), Some(TaskStatus::InProgress), 0, None, None).await;
 
         assert!(paused(&result), "{result:?}");
         assert!(!review_ended.load(std::sync::atomic::Ordering::SeqCst), "the review keeps running");
@@ -2252,7 +2273,7 @@ mod disk_pressure {
         app.manage(state);
         let state: &crate::AppState = app.state::<crate::AppState>().inner();
 
-        let result = update_task_status(app.state(), task_id.to_string(), TaskStatus::InProgress, None).await;
+        let result = update_task_status(GuiMutation::untracked(), app.state(), task_id.to_string(), TaskStatus::InProgress, None).await;
 
         assert!(
             result.as_ref().is_err_and(|m| m.contains("couldn't verify free disk space")),
@@ -2273,7 +2294,7 @@ mod disk_pressure {
         app.manage(state);
 
         // The drawer's Start: enqueue, as seen in Backlog.
-        let queued = reorder_task(
+        let queued = reorder_task(GuiMutation::untracked(), 
             app.state(),
             started.to_string(),
             Some(TaskStatus::Queue),
@@ -2287,7 +2308,7 @@ mod disk_pressure {
         assert_eq!(queued.status, TaskStatus::Queue, "it waits in the queue");
 
         disk.set_available(100 * GIB); // Warning
-        let moved = update_task_status(app.state(), dragged.to_string(), TaskStatus::InProgress, None)
+        let moved = update_task_status(GuiMutation::untracked(), app.state(), dragged.to_string(), TaskStatus::InProgress, None)
             .await
             .expect("Warning does not pause new work")
             .expect("the task exists");
@@ -2303,12 +2324,12 @@ mod disk_pressure {
         app.manage(state);
         let state: &crate::AppState = app.state::<crate::AppState>().inner();
 
-        let result = crate::commands::queue::promote_next_task(app.state()).await;
+        let result = crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await;
         assert!(result.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{result:?}");
         assert_eq!(on_disk(state, project_id, task_id).status, TaskStatus::Queue);
 
         disk.set_available(300 * GIB);
-        let promoted = crate::commands::queue::promote_next_task(app.state()).await.expect("promoted");
+        let promoted = crate::commands::queue::promote_next_task(GuiMutation::untracked(), app.state()).await.expect("promoted");
         assert_eq!(promoted, Some(task_id.to_string()));
     }
 
@@ -2321,11 +2342,11 @@ mod disk_pressure {
         app.manage(state);
         let state: &crate::AppState = app.state::<crate::AppState>().inner();
 
-        let refused = crate::commands::worktree::create_worktree(app.state(), task_id.to_string()).await;
+        let refused = crate::commands::worktree::create_worktree(GuiMutation::untracked(), app.state(), task_id.to_string()).await;
         assert!(refused.as_ref().is_err_and(|m| m.starts_with("New work paused")), "{refused:?}");
         assert!(on_disk(state, project_id, task_id).worktree_path.is_none());
 
-        let refused = crate::commands::agent::start_agent(
+        let refused = crate::commands::agent::start_agent(GuiMutation::untracked(), 
             app.state(),
             Uuid::new_v4().to_string(),
             Some(task_id.to_string()),
@@ -2342,7 +2363,7 @@ mod disk_pressure {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let pause = crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap();
+        let pause = crate::commands::storage_usage::get_new_work_pause(GuiMutation::untracked(), app.state()).await.unwrap();
         assert_eq!(
             pause,
             Some(crate::domain::storage_usage::StartBlock::CriticalDisk {
@@ -2351,10 +2372,10 @@ mod disk_pressure {
             })
         );
         disk.set_available(100 * GIB);
-        assert_eq!(crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap(), None);
+        assert_eq!(crate::commands::storage_usage::get_new_work_pause(GuiMutation::untracked(), app.state()).await.unwrap(), None);
         disk.fail();
         assert!(matches!(
-            crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap(),
+            crate::commands::storage_usage::get_new_work_pause(GuiMutation::untracked(), app.state()).await.unwrap(),
             Some(crate::domain::storage_usage::StartBlock::DiskSpaceUnavailable { .. })
         ));
     }

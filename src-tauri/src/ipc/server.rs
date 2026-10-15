@@ -603,21 +603,9 @@ impl IpcServer {
             }
         }
 
-        if let Some(mut poller) = poller {
-            loop {
-                match tokio::time::timeout(POLLER_STOP_REPORT, &mut poller).await {
-                    Ok(Ok(())) => break,
-                    Ok(Err(error)) => {
-                        failure.get_or_insert_with(|| {
-                            anyhow::anyhow!("the queue poller failed: {error}")
-                        });
-                        break;
-                    }
-                    Err(_) => eprintln!(
-                        "[ipc] the queue poller has not returned after {POLLER_STOP_REPORT:?}; \
-                         still holding local ownership"
-                    ),
-                }
+        if let Some(poller) = poller {
+            if let Err(error) = await_poller(poller).await {
+                failure.get_or_insert_with(|| anyhow::anyhow!("the queue poller failed: {error}"));
             }
         }
 
@@ -656,8 +644,68 @@ pub struct Supervision {
 }
 
 /// The queue poller's join, as a future the server can wait on.
-pub type PollerJoin =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+///
+/// Cloneable on purpose: the server task waits on one copy, and the task that
+/// supervises the server keeps another. If the server task dies, its copy is
+/// gone with it, and the supervisor must still be able to prove the poller has
+/// returned before it releases ownership. Closing the admission fence does not
+/// prove that: a poll pass that began earlier keeps running until it returns.
+pub type PollerJoin = futures::future::Shared<
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
+>;
+
+/// Wrap the poller's task handle as a [`PollerJoin`]. A panic in the poller
+/// resolves it to an error rather than being lost.
+pub fn poller_join<H, E>(handle: H) -> PollerJoin
+where
+    H: std::future::Future<Output = Result<(), E>> + Send + 'static,
+    E: std::fmt::Display,
+{
+    use futures::FutureExt;
+    let joined: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>> =
+        Box::pin(async move { handle.await.map_err(|error| error.to_string()) });
+    joined.shared()
+}
+
+/// Wait, as long as it takes, for the poller to return. A bounded wait would
+/// be a guess: the poller may be partway through a pass that changes a Task.
+async fn await_poller(poller: PollerJoin) -> Result<(), String> {
+    let mut poller = poller;
+    loop {
+        match tokio::time::timeout(POLLER_STOP_REPORT, &mut poller).await {
+            Ok(result) => return result,
+            Err(_) => eprintln!(
+                "[ipc] the queue poller has not returned after {POLLER_STOP_REPORT:?}; still \
+                 holding local ownership"
+            ),
+        }
+    }
+}
+
+/// Finish the shutdown when the task running [`IpcServer::serve_until`] died
+/// (panicked or was cancelled) before it could do so.
+///
+/// The caller still holds the ownership claim. This does what the server
+/// would have done, in the same order: close the admission fence, wait for the
+/// poller to return (a pass that began before the fence is not stopped by it),
+/// then reap every execution owner. Only when this returns may the caller
+/// release ownership.
+pub async fn quiesce_after_supervisor_failure(
+    executor: Option<&crate::queue::TaskExecutor>,
+    poller: Option<PollerJoin>,
+) {
+    if let Some(executor) = executor {
+        executor.close_admission_cancelling_runs().await;
+    }
+    if let Some(poller) = poller {
+        if let Err(error) = await_poller(poller).await {
+            eprintln!("[ipc] the queue poller failed: {error}");
+        }
+    }
+    if let Some(executor) = executor {
+        drain_execution(executor, Duration::ZERO).await;
+    }
+}
 
 impl Supervision {
     /// Supervision with no poller and no grace for running work.
@@ -991,7 +1039,7 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use tempfile::TempDir;
@@ -1002,6 +1050,7 @@ pub(crate) mod tests {
     use slashit_ipc::{IpcRequest, IpcResponse};
 
     use super::*;
+    use crate::commands::gui_admission::GuiMutation;
     use crate::config::paths::AppPaths;
     use crate::domain::task::{TaskStatus, WorkerHandoff, WorkerHandoffStage};
     use crate::instance::{InstanceControl, InstanceMode, SharedInstanceControl};
@@ -1569,6 +1618,77 @@ pub(crate) mod tests {
         assert!(rig.executor.running_task_count().await == 0);
     }
 
+    // --- supervisor panic ---------------------------------------------------
+
+    /// The task that runs the server dies. The supervisor above it holds the
+    /// ownership claim, and the poller's join, so a poll pass that began
+    /// before the fence closed is still waited for: closing the fence is not
+    /// proof that it has stopped.
+    #[tokio::test]
+    async fn a_supervisor_panic_waits_for_the_running_poll_pass_before_ownership_can_go() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let paths = Arc::new(AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        ));
+        let ctx = Arc::new(ipc_test_context(paths.clone()));
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let local = local_endpoint(&root);
+        let bound = BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&local), &BindOptions::default())
+            .await
+            .expect("bind");
+        let ownership = bound.ownership();
+        let second = || async {
+            BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&local), &BindOptions::default())
+                .await
+        };
+
+        // A poll pass held mid-way at a barrier. When it is let go it changes
+        // "state", standing for a Task update.
+        let (release, mut gate) = tokio::sync::watch::channel(false);
+        let in_pass = Arc::new(AtomicBool::new(false));
+        let pass_finished = Arc::new(AtomicBool::new(false));
+        let poller = poller_join(tokio::spawn({
+            let (in_pass, pass_finished) = (in_pass.clone(), pass_finished.clone());
+            async move {
+                in_pass.store(true, Ordering::SeqCst);
+                let _ = gate.wait_for(|released| *released).await;
+                pass_finished.store(true, Ordering::SeqCst);
+            }
+        }));
+        eventually("the poll pass to start", || in_pass.load(Ordering::SeqCst)).await;
+
+        // The supervisor task holds the listeners and dies without draining.
+        let server = tokio::spawn(async move {
+            let _listeners = bound;
+            if true {
+                panic!("the supervisor failed");
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        assert!(server.await.expect_err("it panicked").is_panic());
+
+        let quiesced = tokio::spawn({
+            let executor = executor.clone();
+            async move { quiesce_after_supervisor_failure(Some(&executor), Some(poller)).await }
+        });
+        eventually("admission to close", || !executor.is_accepting_work()).await;
+        settle().await;
+        assert!(!quiesced.is_finished(), "closing the fence is not the poller returning");
+        assert!(!pass_finished.load(Ordering::SeqCst));
+        assert!(second().await.is_err(), "ownership is held while the pass is running");
+
+        release.send(true).unwrap();
+        quiesced.await.expect("quiescence completes");
+        assert!(pass_finished.load(Ordering::SeqCst), "the pass finished before quiescence did");
+
+        drop(ownership);
+        acquire_after_release(second).await;
+    }
+
     // --- 12, 13: a second OS process ---------------------------------------
 
     const CHILD_ROOT: &str = "SLASHIT_SHUTDOWN_CHILD_ROOT";
@@ -1675,6 +1795,122 @@ pub(crate) mod tests {
         assert!(status.success(), "the first instance failed closed and exited: {status}");
 
         acquire_after_release(|| second_instance_at(root.path())).await;
+    }
+
+    // --- GUI commands -----------------------------------------------------
+
+    /// What a desktop mutation does in this test: record that it started,
+    /// wait at a barrier, then change "state" (a flag). It stands for any
+    /// command that saves a Task or moves a Git reference.
+    struct GuiGate {
+        started: Arc<AtomicUsize>,
+        performed: Arc<AtomicBool>,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[tauri::command]
+    async fn gated_gui_mutation(
+        _gui: GuiMutation,
+        gate: tauri::State<'_, GuiGate>,
+    ) -> Result<(), String> {
+        gate.started.fetch_add(1, Ordering::SeqCst);
+        let mut release = gate.release.clone();
+        let _ = release.wait_for(|released| *released).await;
+        gate.performed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn invoke_gated(
+        webview: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+    ) -> Result<tauri::ipc::InvokeResponseBody, serde_json::Value> {
+        tauri::test::get_ipc_response(
+            webview,
+            tauri::webview::InvokeRequest {
+                cmd: "gated_gui_mutation".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::default(),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_string(),
+            },
+        )
+    }
+
+    /// The desktop's version of the confirmed defect. A GUI command is already
+    /// running when the local listener fails. Ownership must outlive it: a
+    /// second acquirer is refused until the command has finished its mutation,
+    /// a command dispatched after the fence is refused without running, and
+    /// only then is the endpoint released.
+    #[tokio::test]
+    async fn an_in_flight_gui_mutation_finishes_before_ownership_is_released() {
+        let mut rig = Rig::start(Layout::local_only()).await;
+
+        let (state, _report) = crate::app_core::build_state_with_paths(rig.paths.clone())
+            .await
+            .expect("build state");
+        state.executor.set(rig.executor.clone()).ok().expect("one executor");
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let performed = Arc::new(AtomicBool::new(false));
+        let (release, released) = tokio::sync::watch::channel(false);
+        let app = tauri::test::mock_builder()
+            .invoke_handler(tauri::generate_handler![gated_gui_mutation])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app");
+        {
+            use tauri::Manager;
+            app.manage(state);
+            app.manage(GuiGate {
+                started: started.clone(),
+                performed: performed.clone(),
+                release: released,
+            });
+        }
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("webview");
+
+        // The command is admitted and parked at the barrier.
+        let in_flight = tokio::task::spawn_blocking({
+            let webview = webview.clone();
+            move || invoke_gated(&webview)
+        });
+        let mut in_flight = in_flight;
+        tokio::select! {
+            result = &mut in_flight => panic!("the command returned early: {:?}", result),
+            _ = eventually("the command to be in flight", || started.load(Ordering::SeqCst) == 1) => {}
+        }
+
+        rig.local_fault.as_ref().unwrap().fail();
+        eventually("admission to close", || !rig.executor.is_accepting_work()).await;
+        settle().await;
+        assert!(!rig.server_finished(), "the supervisor waits for the admitted command");
+        assert!(rig.second_instance().await.is_err(), "ownership is still held");
+        assert!(!performed.load(Ordering::SeqCst));
+
+        // A command dispatched now is refused before its body runs.
+        let refused = tokio::task::spawn_blocking({
+            let webview = webview.clone();
+            move || invoke_gated(&webview)
+        })
+        .await
+        .unwrap()
+        .expect_err("refused after the fence");
+        assert!(refused.to_string().contains("shutting down"), "{refused}");
+        assert_eq!(started.load(Ordering::SeqCst), 1, "the refused command never started");
+
+        // Let the admitted command finish. Only after it has mutated may the
+        // supervisor release the endpoint.
+        release.send(true).unwrap();
+        in_flight.await.unwrap().expect("the admitted command completes");
+        assert!(performed.load(Ordering::SeqCst));
+
+        let error = rig.finish().await.expect_err("fail closed");
+        assert!(error.to_string().contains("mandatory local"), "{error}");
+        drop(rig.ownership.take());
+        acquire_after_release(|| rig.second_instance()).await;
+        assert!(performed.load(Ordering::SeqCst), "nothing ran after release");
     }
 
     /// What is *not* promised, pinned so it stays honest: killing the owner

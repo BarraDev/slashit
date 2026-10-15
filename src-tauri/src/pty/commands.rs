@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use super::manager::{spawn_pty_session, resize_pty_session};
 use super::store::SessionMetadata;
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,12 @@ pub struct PtyExit {
 
 /// Spawn a new PTY session with a shell
 #[tauri::command]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parameters are the frontend's invoke() contract; the admission argument is the eighth"
+)]
 pub async fn spawn_pty(
+    _gui: GuiMutation,
     app: AppHandle,
     state: tauri::State<'_, crate::AppState>,
     name: Option<String>,
@@ -198,6 +204,7 @@ pub async fn spawn_pty(
 /// Write data to a PTY session
 #[tauri::command]
 pub async fn write_pty(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     session_id: String,
     data: Vec<u8>,
@@ -228,6 +235,7 @@ pub async fn write_pty(
 /// Resize a PTY session
 #[tauri::command]
 pub async fn resize_pty(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     session_id: String,
     cols: u16,
@@ -254,6 +262,7 @@ pub async fn resize_pty(
 /// Kill a PTY session
 #[tauri::command]
 pub async fn kill_pty(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     session_id: String,
 ) -> Result<(), String> {
@@ -318,6 +327,7 @@ pub async fn get_pty_scrollback(
 /// Write data to all active PTY sessions
 #[tauri::command]
 pub async fn write_to_all_ptys(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     data: Vec<u8>,
 ) -> Result<u32, String> {
@@ -342,6 +352,7 @@ pub async fn write_to_all_ptys(
 /// Attach to an existing PTY session (update last attached time)
 #[tauri::command]
 pub async fn attach_pty_session(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     session_id: String,
 ) -> Result<PtyInfo, String> {

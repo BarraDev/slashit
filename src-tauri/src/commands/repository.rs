@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::Repository;
 use crate::config::Storage;
 use crate::commands::file::{git_location, GitLocation};
@@ -120,6 +121,7 @@ async fn ensure_vcs_initialized(
 
 #[tauri::command]
 pub async fn create_repository(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     local_path: String,
     remote_url: Option<String>,

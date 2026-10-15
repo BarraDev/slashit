@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::{AgentExecution, AgentStatus, AgentLogEntry, LogLevel};
 use crate::acp::AcpClient;
 use uuid::Uuid;
@@ -70,6 +71,7 @@ pub(crate) async fn active_agent_count(
 
 #[tauri::command]
 pub async fn start_agent(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     worktree_id: String,
     task_id: Option<String>,
@@ -179,6 +181,7 @@ fn start_log_collection(client: Arc<AcpClient>, execution_id: Uuid, logs: AgentL
 
 #[tauri::command]
 pub async fn stop_agent(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     execution_id: String,
 ) -> Result<bool, String> {

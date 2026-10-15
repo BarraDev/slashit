@@ -896,29 +896,33 @@ struct ProcessAdmissionState {
     starting: usize,
 }
 
-struct ProcessAdmissionLease<'a> {
-    gate: &'a ProcessAdmission,
+/// An operation admitted by the process-wide gate. Dropping it ends the
+/// operation, which is what lets the shutdown drain finish.
+pub struct AdmissionLease {
+    gate: Arc<ProcessAdmission>,
 }
 
 impl ProcessAdmission {
-    fn enter(&self) -> Result<ProcessAdmissionLease<'_>, String> {
+    fn enter(self: &Arc<Self>) -> Result<AdmissionLease, String> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.closed {
             return Err("this SlashIt instance is shutting down and no longer accepts new work".into());
         }
         state.starting += 1;
-        Ok(ProcessAdmissionLease { gate: self })
+        Ok(AdmissionLease { gate: Arc::clone(self) })
     }
 
     fn is_open(&self) -> bool {
         !self.state.lock().unwrap_or_else(|p| p.into_inner()).closed
     }
 
+    /// Refuse every later `enter` without waiting for the ones already in.
+    fn close(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+    }
+
     async fn close_and_wait(&self) {
-        {
-            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            state.closed = true;
-        }
+        self.close();
         loop {
             let notified = self.drained.notified();
             if self.state.lock().unwrap_or_else(|p| p.into_inner()).starting == 0 {
@@ -929,7 +933,7 @@ impl ProcessAdmission {
     }
 }
 
-impl Drop for ProcessAdmissionLease<'_> {
+impl Drop for AdmissionLease {
     fn drop(&mut self) {
         let mut state = self.gate.state.lock().unwrap_or_else(|p| p.into_inner());
         state.starting -= 1;
@@ -981,7 +985,7 @@ pub struct TaskExecutor {
     /// fact.
     admission: Admission,
     /// Process-wide fence for starts and state-changing execution owners.
-    process_admission: ProcessAdmission,
+    process_admission: Arc<ProcessAdmission>,
     /// Capacity reserved for a task at `Queue -> InProgress` promotion time,
     /// held until that task's execution actually starts and takes ownership
     /// of it (see [`Self::spawn_task_execution`]).
@@ -1242,7 +1246,7 @@ impl TaskExecutor {
             pr_helper_handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
             project_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             admission: Admission::new(initial_limit),
-            process_admission: ProcessAdmission::default(),
+            process_admission: Arc::default(),
             reserved_permits: Arc::new(RwLock::new(HashMap::new())),
             lifecycle: config.lifecycle,
             logs: config.logs,
@@ -1339,7 +1343,7 @@ impl TaskExecutor {
     /// Admit a provider start owned by code outside this module (the legacy
     /// ACP agent). The returned lease must be held until the process it
     /// guards is registered where shutdown will find and kill it.
-    pub fn admit_external_start(&self) -> Result<impl Drop + '_, String> {
+    pub fn admit_external_start(&self) -> Result<AdmissionLease, String> {
         self.process_admission.enter()
     }
 
@@ -1359,9 +1363,14 @@ impl TaskExecutor {
     /// between steps and consults only its own cancellation, so the fence
     /// alone would not stop it launching the next step. Used when running
     /// work is not being given a grace period.
+    ///
+    /// The runs are cancelled *before* waiting for admitted operations: a
+    /// desktop command that drives a whole Coordinator turn holds its lease
+    /// until the turn ends, and the turn only ends when it is cancelled.
     pub async fn close_admission_cancelling_runs(&self) {
-        self.close_admission().await;
+        self.process_admission.close();
         self.cancel_project_runs();
+        self.close_admission().await;
     }
 
     fn cancel_project_runs(&self) {
@@ -1381,11 +1390,11 @@ impl TaskExecutor {
     /// Task lifecycle or recovery records. The process must retain exclusive
     /// local ownership if this returns an error.
     pub async fn quiesce_for_shutdown(&self) -> Result<(), String> {
-        self.process_admission.close_and_wait().await;
-
-        // Conversation Runs are told to stop first, so a stuck Task owner
-        // below can never keep one of them launching providers.
+        // Closed and cancelled before waiting: an admitted desktop command
+        // that drives a Coordinator turn holds its lease until the turn ends.
+        self.process_admission.close();
         self.cancel_project_runs();
+        self.process_admission.close_and_wait().await;
 
         // Starts admitted before the fence either registered their owners or
         // returned before this snapshot is taken. Every owner is attempted
@@ -17072,6 +17081,37 @@ VERDICT: APPROVED"
             })
             .await
             .expect("admission closes promptly");
+        }
+
+        /// A desktop command that drives a whole Coordinator turn holds its
+        /// admission lease until the turn ends, and the turn ends only when
+        /// it is cancelled. Closing must therefore cancel the Project Runs
+        /// before it waits for the lease, or an unconfirmed-grace quit would
+        /// wait on work it never told to stop.
+        #[tokio::test]
+        async fn closing_cancels_project_runs_before_waiting_for_admitted_commands() {
+            let (executor, _temps) = test_executor();
+            let run = executor
+                .begin_project_run(Uuid::new_v4(), false)
+                .await
+                .expect("a run starts while open");
+            let command = executor.admit_external_start().expect("open");
+
+            let closing = tokio::spawn({
+                let executor = executor.clone();
+                async move { executor.close_admission_cancelling_runs().await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !run.is_cancelled() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the run is cancelled while the command still holds its lease");
+            assert!(!closing.is_finished(), "the close still waits for the lease");
+
+            drop(command);
+            closing.await.unwrap();
         }
 
         /// A start that read "open" before the fence closed is waited for, and

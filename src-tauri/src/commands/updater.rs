@@ -18,16 +18,26 @@
 //! is down" are the same `Err(String)` on the wire, and the frontend has to tell
 //! them apart to say anything useful.
 //!
-//! **Nothing here restarts the application.** SlashIt holds running agents and
-//! live PTYs; killing the process to swap a binary would discard both without
-//! asking. The install ends by emitting [`UpdaterProgress::Finished`] and
-//! stopping. The frontend then does what it already does before a quit — count
-//! active processes, show the confirmation dialog — and calls
-//! [`updater_restart`] once the user agrees.
+//! **Nothing here restarts the application, and nothing ends it before the
+//! shutdown drain.** SlashIt holds running agents and live PTYs; killing the
+//! process to swap a binary would discard both without asking. The install
+//! ends by emitting [`UpdaterProgress::Finished`] and stopping. The frontend
+//! then does what it already does before a quit — count active processes, show
+//! the confirmation dialog — and calls [`updater_restart`] once the user
+//! agrees.
+//!
+//! One platform cannot honor that on its own. On Windows the plugin's install
+//! step launches the installer and then calls `std::process::exit(0)` itself,
+//! so installing from inside the command would end the process with Workers
+//! and provider processes still running and the instance's exclusive local
+//! ownership dropped without a drain. [`install_timing`] therefore has Windows
+//! download and *stage* the installer, and [`install_staged_after_drain`] runs
+//! it from the shutdown path after the instance has quiesced.
 //!
 //! Progress leaves through the [`EventSink`](crate::events::EventSink) rather
 //! than an `AppHandle`, so the flow is not tied to a webview existing.
 
+use crate::commands::gui_admission::GuiMutation;
 use crate::events::EventSinkExt;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -69,6 +79,37 @@ pub struct UpdaterState {
     /// regardless, and a stalled install followed by a retry is an ordinary
     /// sequence.
     installing: Arc<std::sync::atomic::AtomicBool>,
+    /// A downloaded installer that must not run until the instance has
+    /// drained. See [`InstallTiming::AfterDrain`].
+    staged: Arc<Mutex<Option<StagedInstall>>>,
+}
+
+/// A downloaded update waiting for [`install_staged_after_drain`].
+struct StagedInstall {
+    update: Update,
+    bytes: Vec<u8>,
+}
+
+/// When the plugin's install step may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallTiming {
+    /// Inside the install command. The step replaces files and returns.
+    Now,
+    /// Only once the instance has drained. The step ends the process, so
+    /// running it earlier would exit with work still live.
+    AfterDrain,
+}
+
+/// Windows is the platform whose install step terminates the process (it
+/// launches the installer, then `std::process::exit(0)`). Elsewhere the step
+/// replaces the installation in place and returns, and the application keeps
+/// running until the user restarts it.
+pub fn install_timing(os: &str) -> InstallTiming {
+    if os == "windows" {
+        InstallTiming::AfterDrain
+    } else {
+        InstallTiming::Now
+    }
 }
 
 impl UpdaterState {
@@ -520,6 +561,7 @@ pub async fn updater_status(
 /// to offer the install button.
 #[tauri::command]
 pub async fn updater_check(
+    _gui: GuiMutation,
     app: AppHandle,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<UpdateCheckResult, String> {
@@ -566,6 +608,7 @@ pub async fn updater_check(
 /// calls [`updater_restart`].
 #[tauri::command]
 pub async fn updater_download_and_install(
+    _gui: GuiMutation,
     app: AppHandle,
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<(), String> {
@@ -617,8 +660,8 @@ pub async fn updater_download_and_install(
 
     let chunk_events = state.events();
     let mut downloaded: u64 = 0;
-    let outcome = update
-        .download_and_install(
+    let downloaded_bytes = update
+        .download(
             move |chunk_length, content_length| {
                 downloaded = downloaded.saturating_add(chunk_length as u64);
                 chunk_events.emit(
@@ -636,6 +679,20 @@ pub async fn updater_download_and_install(
             || {},
         )
         .await;
+    let outcome = match downloaded_bytes {
+        Ok(bytes) => match install_timing(std::env::consts::OS) {
+            InstallTiming::Now => update.install(&bytes),
+            InstallTiming::AfterDrain => {
+                // Kept for the restart, which drains first.
+                *state.updater.staged.lock().await = Some(StagedInstall {
+                    update: update.clone(),
+                    bytes,
+                });
+                Ok(())
+            }
+        },
+        Err(e) => Err(e),
+    };
 
     match outcome {
         Ok(()) => {
@@ -652,7 +709,29 @@ pub async fn updater_download_and_install(
     }
 }
 
+/// Run the installer that [`updater_download_and_install`] staged, if any.
+///
+/// Called only from the shutdown path, after the instance has fenced new work
+/// and reaped every execution owner, and while it still holds its local
+/// ownership. On Windows a successful install does not return: the plugin
+/// launches the installer and exits the process. An `Err` means the installer
+/// did not start, and the caller continues the ordinary restart.
+pub async fn install_staged_after_drain(app: &AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let state: tauri::State<'_, crate::AppState> = app.state();
+    let staged = state.updater.staged.lock().await.take();
+    match staged {
+        None => Ok(()),
+        Some(staged) => staged
+            .update
+            .install(&staged.bytes)
+            .map_err(|e| from_plugin(&e)),
+    }
+}
+
 /// Restart into the installed version.
+///
+/// On Windows this is also what runs the installer, once the drain is done.
 ///
 /// Unconditional by design, and therefore only ever called by a frontend that
 /// has already asked. Deliberately not gated on the feature flag: once a new
@@ -689,6 +768,43 @@ mod tests {
             InstallGuard::try_acquire(&flag).is_some(),
             "dropping the guard must release the flag for the next caller"
         );
+    }
+
+    /// The plugin's Windows install step launches the installer and then
+    /// exits the process. It must never run inside the install command, where
+    /// Workers and provider processes may still be live; only the drained
+    /// shutdown path may run it. Every other platform replaces files in place
+    /// and returns, so it keeps installing inside the command.
+    #[test]
+    fn only_windows_defers_the_installer_until_the_instance_has_drained() {
+        assert_eq!(install_timing("windows"), InstallTiming::AfterDrain);
+        for os in ["linux", "macos"] {
+            assert_eq!(install_timing(os), InstallTiming::Now, "{os}");
+        }
+    }
+
+    /// The plugin's one-call download-and-install would run the Windows
+    /// installer, and so end the process, wherever it is called from. The only
+    /// install calls allowed are the two in this module, which are ordered
+    /// around the drain.
+    #[test]
+    fn no_code_calls_the_plugins_combined_download_and_install() {
+        fn walk(dir: &std::path::Path, hits: &mut Vec<String>, needle: &str) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, hits, needle);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && std::fs::read_to_string(&path).unwrap().contains(needle)
+                {
+                    hits.push(path.display().to_string());
+                }
+            }
+        }
+        let needle = [".download_and", "_install("].concat();
+        let mut hits = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut hits, &needle);
+        assert!(hits.is_empty(), "the combined call bypasses the drain on Windows: {hits:?}");
     }
 
     fn probe(os: &'static str, install: InstallKind) -> InstallProbe {

@@ -16,5 +16,6 @@ pub mod server;
 
 pub use handlers::Dispatch;
 pub use server::{
-    drain_execution, serve, BoundIpc, IpcContext, IpcOwnership, IpcServer, PeerContext, Supervision,
+    drain_execution, poller_join, quiesce_after_supervisor_failure, serve, BoundIpc, IpcContext,
+    IpcOwnership, IpcServer, PeerContext, Supervision,
 };

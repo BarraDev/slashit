@@ -1,3 +1,4 @@
+use crate::commands::gui_admission::GuiMutation;
 use crate::domain::{ChatSession, ChatMessage, MessageRole};
 use uuid::Uuid;
 use std::collections::HashMap;
@@ -30,6 +31,7 @@ impl Default for SessionState {
 
 #[tauri::command]
 pub async fn create_session(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
     title: String,
@@ -54,6 +56,7 @@ pub async fn create_session(
 
 #[tauri::command]
 pub async fn send_message(
+    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     session_id: String,
     message: String,
