@@ -1,0 +1,418 @@
+//! Recovering an interrupted coding Worker from the task drawer: what is
+//! confirmed, what is uncertain, and one explicit decision that accepts the
+//! exact commit the person inspected.
+//!
+//! The snapshot shown here is informational. The decision is sent with every
+//! fact it was shown as a compare-and-set expectation, and the backend
+//! re-verifies all of it; nothing here decides on its own that anything
+//! succeeded. No control here starts, retries or resumes a Worker.
+
+use leptos::prelude::*;
+use leptos::task::spawn_local;
+use uuid::Uuid;
+
+use crate::models::{Task, WorkerHandoffStage};
+use crate::services::worker_recovery_service::{
+    accept_worker_result, get_worker_recovery_evidence, AcceptWorkerResultOutcome,
+    AcceptWorkerResultRequest, WorkerRecoveryEvidence,
+};
+
+/// What a decision's answer means for the drawer.
+#[derive(Debug, Clone)]
+pub enum DecisionView {
+    /// The record changed: adopt it.
+    Applied { task: Task, message: &'static str },
+    /// The record changed, but its durability is unconfirmed: adopt it, say so
+    /// and do not offer to repeat the decision.
+    Held { task: Task, detail: String },
+    /// Nothing was recorded.
+    Refused(String),
+}
+
+pub fn classify(outcome: AcceptWorkerResultOutcome) -> DecisionView {
+    match outcome {
+        AcceptWorkerResultOutcome::Accepted { task } => DecisionView::Applied {
+            task,
+            message: "The commit was accepted. The Task continues into AI Review.",
+        },
+        AcceptWorkerResultOutcome::AlreadyApplied { task } => DecisionView::Applied {
+            task,
+            message: "This commit was already accepted.",
+        },
+        AcceptWorkerResultOutcome::DurabilityUnconfirmed { task, detail } => {
+            DecisionView::Held { task, detail }
+        }
+        AcceptWorkerResultOutcome::Refused { reason } => DecisionView::Refused(reason),
+    }
+}
+
+/// Facts SlashIt verified, as lines for the "Confirmed" list.
+pub fn confirmed_lines(evidence: &WorkerRecoveryEvidence) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(run) = evidence.run {
+        lines.push(format!("Interrupted run: {run}"));
+    }
+    if let Some(branch) = &evidence.branch {
+        lines.push(format!("Branch: {branch}"));
+    }
+    if let Some(start) = &evidence.start_head {
+        lines.push(format!("Branch HEAD before the run: {}", short(start)));
+    }
+    if let Some(tip) = &evidence.branch_tip {
+        lines.push(format!("Branch tip now: {tip}"));
+    }
+    if let Some(checkout) = &evidence.checkout {
+        lines.push(format!("Task Checkout: {}", checkout.path));
+        match checkout.clean {
+            Some(true) => lines.push("The checkout has no uncommitted changes.".to_string()),
+            Some(false) => lines.push(format!(
+                "The checkout has uncommitted changes: {}",
+                checkout.dirty_paths.join(", ")
+            )),
+            None => {}
+        }
+    }
+    for commit in &evidence.commits {
+        lines.push(format!("Commit {}: {}", short(&commit.sha), commit.subject));
+    }
+    if evidence.commits_truncated {
+        lines.push("More commits follow; only the newest are listed.".to_string());
+    }
+    lines
+}
+
+/// What SlashIt cannot prove, as lines for the "Uncertain" list. Always
+/// includes the provider disclosure: acceptance does not stop a process.
+pub fn uncertain_lines(evidence: &WorkerRecoveryEvidence) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(reason) = &evidence.reason {
+        lines.push(reason.clone());
+    }
+    match &evidence.observed_commit {
+        Some(observed) => lines.push(format!(
+            "SlashIt noticed commit {} during the interruption but could not attribute it.",
+            short(observed)
+        )),
+        None => lines.push("SlashIt did not record which commit, if any, the run produced.".to_string()),
+    }
+    lines.push(
+        "The interrupted provider process may have survived the application crash and may still \
+         be changing files or have external effects. Accepting a commit does not prove it has \
+         stopped."
+            .to_string(),
+    );
+    lines
+}
+
+fn short(sha: &str) -> &str {
+    sha.get(..8).unwrap_or(sha)
+}
+
+#[component]
+pub fn WorkerRecoveryPanel(
+    task_id: Uuid,
+    #[prop(into)] task: Signal<Option<Task>>,
+    apply_task: Callback<Task>,
+) -> impl IntoView {
+    let evidence = RwSignal::new(None::<Result<WorkerRecoveryEvidence, String>>);
+    let confirming = RwSignal::new(false);
+    let busy = RwSignal::new(false);
+    let refusal = RwSignal::new(None::<String>);
+    let held = RwSignal::new(None::<String>);
+    // One id per confirmation, kept across clicks and unknown outcomes so a
+    // repeated request is the same decision. A definite refusal discards it.
+    let decision_id = StoredValue::new(None::<Uuid>);
+    let asked = StoredValue::new(0u32);
+
+    let reload = move || {
+        let ask = asked.try_update_value(|n| {
+            *n += 1;
+            *n
+        });
+        spawn_local(async move {
+            let answer = get_worker_recovery_evidence(task_id.to_string()).await;
+            if asked.try_get_value() == ask {
+                evidence.try_set(Some(answer));
+            }
+        });
+    };
+    let recovering = Memo::new(move |_| {
+        task.with(|t| {
+            t.as_ref().and_then(|t| t.worker_handoff.as_ref()).is_some_and(|h| {
+                matches!(&h.stage, WorkerHandoffStage::RecoveryRequired { .. })
+            })
+        })
+    });
+    // Git is only asked about a Task that is waiting for this decision.
+    Effect::new(move |_| {
+        task.track();
+        if recovering.get() {
+            reload();
+        }
+    });
+
+    let confirm = move |_| {
+        if busy.get_untracked() {
+            return;
+        }
+        let Some(Ok(shown)) = evidence.get_untracked() else {
+            return;
+        };
+        let id = decision_id
+            .try_update_value(|slot| *slot.get_or_insert_with(Uuid::new_v4))
+            .unwrap_or_else(Uuid::new_v4);
+        let Some(request) = AcceptWorkerResultRequest::for_evidence(&shown, id) else {
+            refusal.set(Some("The evidence is incomplete, so nothing can be accepted.".to_string()));
+            return;
+        };
+        busy.set(true);
+        refusal.set(None);
+        spawn_local(async move {
+            match accept_worker_result(request).await {
+                Ok(outcome) => match classify(outcome) {
+                    DecisionView::Applied { task, message } => {
+                        apply_task.try_run(task);
+                        crate::components::toast::success(message.to_string());
+                        confirming.try_set(false);
+                    }
+                    DecisionView::Held { task, detail } => {
+                        apply_task.try_run(task);
+                        held.try_set(Some(detail));
+                        confirming.try_set(false);
+                    }
+                    DecisionView::Refused(reason) => {
+                        decision_id.try_set_value(None);
+                        refusal.try_set(Some(reason));
+                        reload();
+                    }
+                },
+                Err(e) => {
+                    // The answer is unknown: the same decision id is kept so
+                    // trying again cannot apply it twice.
+                    refusal.try_set(Some(format!(
+                        "The decision may or may not have been recorded ({e}). Check the Task, \
+                         then confirm again if it is still waiting."
+                    )));
+                    reload();
+                }
+            }
+            busy.try_set(false);
+        });
+    };
+
+    view! {
+        <Show when=move || recovering.get() || held.get().is_some()>
+            <section data-testid="worker-recovery-panel" class="rounded-lg border border-white/10 bg-white/[0.03] p-3 space-y-3">
+                <h3 class="text-xs font-semibold uppercase tracking-wide text-white/60">"Interrupted Worker"</h3>
+                <p data-testid="worker-recovery-explanation" class="text-xs text-white/50">
+                    "The coding Worker was interrupted, so Start and Retry are blocked: running it again could repeat work or its external effects. If the preserved branch already holds the result you want, you can accept that exact commit. It then continues into AI Review. No Worker is started."
+                </p>
+                {move || held.get().map(|detail| view! {
+                    <p data-testid="worker-recovery-held" role="alert" class="text-xs text-amber-200 whitespace-pre-wrap break-words">
+                        {format!("The decision is on the board, but SlashIt could not confirm it was saved to disk: {detail}. Do not repeat it. SlashIt re-checks the commit before AI Review begins.")}
+                    </p>
+                })}
+                <Show when=move || recovering.get()>
+                    {move || match evidence.get() {
+                        None => view! { <p class="text-xs text-white/40">"Reading the preserved evidence…"</p> }.into_any(),
+                        Some(Err(e)) => view! {
+                            <p data-testid="worker-recovery-evidence-error" role="alert" class="text-xs text-red-300 break-words">
+                                {format!("The evidence could not be read: {e}")}
+                            </p>
+                        }.into_any(),
+                        Some(Ok(shown)) => {
+                            let eligible = shown.eligible && shown.branch_tip.is_some();
+                            let tip = shown.branch_tip.clone().unwrap_or_default();
+                            view! {
+                                <div class="space-y-2">
+                                    <div>
+                                        <p class="text-xs font-semibold text-emerald-300">"Confirmed"</p>
+                                        <ul data-testid="worker-recovery-confirmed" class="list-disc pl-5 space-y-0.5 text-xs text-white/60">
+                                            {confirmed_lines(&shown).into_iter().map(|l| view! { <li class="break-words">{l}</li> }).collect_view()}
+                                        </ul>
+                                    </div>
+                                    <div>
+                                        <p class="text-xs font-semibold text-amber-300">"Uncertain"</p>
+                                        <ul data-testid="worker-recovery-uncertain" class="list-disc pl-5 space-y-0.5 text-xs text-white/60">
+                                            {uncertain_lines(&shown).into_iter().map(|l| view! { <li class="break-words">{l}</li> }).collect_view()}
+                                        </ul>
+                                    </div>
+                                    {(!shown.refusals.is_empty()).then(|| view! {
+                                        <div>
+                                            <p class="text-xs font-semibold text-red-300">"Cannot be accepted yet"</p>
+                                            <ul data-testid="worker-recovery-refusals" class="list-disc pl-5 space-y-0.5 text-xs text-red-200">
+                                                {shown.refusals.iter().map(|l| view! { <li class="break-words">{l.clone()}</li> }).collect_view()}
+                                            </ul>
+                                        </div>
+                                    })}
+                                    {move || refusal.get().map(|reason| view! {
+                                        <p data-testid="worker-recovery-error" role="alert" class="text-xs text-red-300 whitespace-pre-wrap break-words">{reason}</p>
+                                    })}
+                                    <Show when=move || !confirming.get()>
+                                        <button
+                                            data-testid="worker-recovery-review"
+                                            class="px-3 py-1.5 rounded-lg text-sm bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25 disabled:opacity-50"
+                                            disabled=!eligible
+                                            on:click=move |_| {
+                                                refusal.set(None);
+                                                confirming.set(true);
+                                            }
+                                        >
+                                            "Accept this commit…"
+                                        </button>
+                                    </Show>
+                                    <Show when=move || confirming.get()>
+                                        <div data-testid="worker-recovery-confirm" class="rounded-md border border-white/10 bg-black/20 p-2 space-y-2">
+                                            <p class="text-xs font-semibold text-white/70">"Accept this exact commit as the Worker's result?"</p>
+                                            <p data-testid="worker-recovery-confirm-commit" class="text-xs font-mono break-all text-white/80">{tip.clone()}</p>
+                                            <p class="text-xs text-white/50">"The Task moves to AI Review with this commit. Nothing is reset, cleaned or restarted. A provider process from the interrupted run may still be running."</p>
+                                            <div class="flex gap-2">
+                                                <button
+                                                    data-testid="worker-recovery-accept"
+                                                    class="px-3 py-1.5 rounded-lg text-sm font-medium bg-emerald-500/25 text-emerald-100 hover:bg-emerald-500/35 disabled:opacity-50"
+                                                    disabled=move || busy.get()
+                                                    on:click=confirm
+                                                >
+                                                    {move || if busy.get() { "Accepting…" } else { "Accept and continue to AI Review" }}
+                                                </button>
+                                                <button
+                                                    data-testid="worker-recovery-cancel"
+                                                    class="px-3 py-1.5 rounded-lg text-sm bg-white/5 text-white/60 hover:bg-white/10"
+                                                    disabled=move || busy.get()
+                                                    on:click=move |_| {
+                                                        decision_id.set_value(None);
+                                                        confirming.set(false);
+                                                    }
+                                                >
+                                                    "Cancel"
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </Show>
+                                </div>
+                            }.into_any()
+                        }
+                    }}
+                </Show>
+            </section>
+        </Show>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::worker_recovery_service::{CheckoutEvidence, EvidenceCommit};
+
+    fn evidence() -> WorkerRecoveryEvidence {
+        WorkerRecoveryEvidence {
+            task_id: Uuid::from_u128(1),
+            project_id: Uuid::from_u128(2),
+            repository_id: Some(Uuid::from_u128(3)),
+            stage: "recovery_required".into(),
+            reason: Some("The Worker start was recorded but its outcome was not.".into()),
+            run: Some(2),
+            branch: Some("task/one".into()),
+            start_head: Some("a".repeat(40)),
+            observed_commit: None,
+            branch_tip: Some("b".repeat(40)),
+            commits: vec![EvidenceCommit { sha: "b".repeat(40), subject: "Add the feature".into() }],
+            commits_truncated: false,
+            checkout: Some(CheckoutEvidence {
+                path: "/work/one".into(),
+                exists: true,
+                registered: true,
+                head: Some("b".repeat(40)),
+                clean: Some(true),
+                dirty_paths: Vec::new(),
+            }),
+            active_execution: false,
+            eligible: true,
+            refusals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn confirmed_and_uncertain_facts_are_listed_separately() {
+        let shown = evidence();
+        let confirmed = confirmed_lines(&shown).join("\n");
+        assert!(confirmed.contains(&"b".repeat(40)), "the exact tip is shown whole");
+        assert!(confirmed.contains("Add the feature"));
+        assert!(confirmed.contains("no uncommitted changes"));
+        let uncertain = uncertain_lines(&shown).join("\n");
+        assert!(uncertain.contains("may have survived the application crash"));
+        assert!(uncertain.contains("did not record which commit"));
+        assert!(!confirmed.contains("survived"), "uncertainty never appears as confirmed");
+    }
+
+    #[test]
+    fn an_observed_commit_is_described_as_unattributed() {
+        let mut shown = evidence();
+        shown.observed_commit = Some("c".repeat(40));
+        let uncertain = uncertain_lines(&shown).join("\n");
+        assert!(uncertain.contains("could not attribute"), "{uncertain}");
+    }
+
+    #[test]
+    fn a_dirty_checkout_names_its_paths() {
+        let mut shown = evidence();
+        let checkout = shown.checkout.as_mut().unwrap();
+        checkout.clean = Some(false);
+        checkout.dirty_paths = vec!["?? scratch.txt".into()];
+        assert!(confirmed_lines(&shown).join("\n").contains("?? scratch.txt"));
+    }
+
+    fn task() -> Task {
+        serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(),
+            "project_id": Uuid::new_v4(),
+            "title": "t",
+            "description": null,
+            "status": "ai_review",
+            "model": "default",
+            "planning_mode": false,
+            "dependencies": [],
+            "workspace_id": null,
+            "jj_change_id": null,
+            "category": "feature",
+            "priority": "medium",
+            "complexity": "moderate",
+            "impact": "medium",
+            "security_severity": "none",
+            "phase": "qa_review",
+            "phase_progress": 80,
+            "overall_progress": 80,
+            "subtasks": [],
+            "sequence_number": 0,
+            "github_issue_url": null,
+            "gitlab_issue_url": null,
+            "linear_ticket_id": null,
+            "pr_url": null,
+            "qa_signoff": null,
+            "stuck_since": null,
+            "created_at": chrono::Utc::now(),
+            "updated_at": chrono::Utc::now(),
+        }))
+        .expect("a task decodes")
+    }
+
+    #[test]
+    fn each_answer_maps_to_exactly_one_drawer_behavior() {
+        assert!(matches!(
+            classify(AcceptWorkerResultOutcome::Accepted { task: task() }),
+            DecisionView::Applied { .. }
+        ));
+        assert!(matches!(
+            classify(AcceptWorkerResultOutcome::AlreadyApplied { task: task() }),
+            DecisionView::Applied { .. }
+        ));
+        assert!(matches!(
+            classify(AcceptWorkerResultOutcome::DurabilityUnconfirmed { task: task(), detail: "x".into() }),
+            DecisionView::Held { .. }
+        ));
+        assert!(matches!(
+            classify(AcceptWorkerResultOutcome::Refused { reason: "stale".into() }),
+            DecisionView::Refused(reason) if reason == "stale"
+        ));
+    }
+}

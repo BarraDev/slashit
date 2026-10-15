@@ -1,0 +1,1530 @@
+//! Human-guided recovery of an interrupted coding Worker.
+//!
+//! A Worker whose outcome SlashIt could not attribute (see
+//! [`crate::domain::task::WorkerHandoffStage::RecoveryRequired`]) leaves its
+//! Task Checkout and branch untouched. This module offers exactly two things
+//! on top of that: a read-only snapshot of the preserved evidence, and one
+//! human decision that accepts an exact, verified, existing commit as the
+//! run's result so the Task continues into the ordinary AI Review lifecycle.
+//!
+//! Nothing here starts, retries or resumes a Worker, and nothing moves a Git
+//! reference or touches the checkout: every Git call is a read, with optional
+//! index locks disabled. The snapshot is informational only; acceptance
+//! re-reads every consequential fact under the Task's lifecycle lease.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::commands::gui_admission::GuiMutation;
+use crate::domain::task::ActivityKind;
+use crate::domain::task::{
+    Task, TaskPhase, TaskStatus, WorkerHandoffStage, WorkerResultAcceptance,
+};
+
+/// The most commits listed in a snapshot; more are reported as truncated.
+const MAX_LISTED_COMMITS: usize = 20;
+/// The most dirty paths listed in a snapshot.
+const MAX_LISTED_PATHS: usize = 20;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceCommit {
+    pub sha: String,
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckoutEvidence {
+    pub path: String,
+    pub exists: bool,
+    /// Git lists exactly one unlocked registration of this path on the
+    /// recorded branch.
+    pub registered: bool,
+    pub head: Option<String>,
+    pub clean: Option<bool>,
+    /// A bounded sample of the dirty paths, as `git status --porcelain`
+    /// prints them.
+    pub dirty_paths: Vec<String>,
+}
+
+/// What SlashIt can see about an interrupted Worker right now. Informational
+/// only: accepting a result re-verifies everything.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerRecoveryEvidence {
+    pub task_id: Uuid,
+    pub project_id: Uuid,
+    pub repository_id: Option<Uuid>,
+    /// `started`, `committed_awaiting_review`, `recovery_required`,
+    /// `resolved_to_ai_review`, or `none` when the Task has no handoff.
+    pub stage: String,
+    pub reason: Option<String>,
+    pub run: Option<u32>,
+    pub branch: Option<String>,
+    pub start_head: Option<String>,
+    pub observed_commit: Option<String>,
+    /// The exact tip of the recorded branch now.
+    pub branch_tip: Option<String>,
+    /// Commits from `start_head` to the tip, newest first, bounded.
+    pub commits: Vec<EvidenceCommit>,
+    pub commits_truncated: bool,
+    pub checkout: Option<CheckoutEvidence>,
+    /// An executor or review currently owns the Task in this process.
+    pub active_execution: bool,
+    pub eligible: bool,
+    /// Why the tip cannot be accepted now; empty when `eligible`.
+    pub refusals: Vec<String>,
+}
+
+/// The human decision that accepts a result. Every field is a compare-and-set
+/// expectation: the decision applies only if the Task is exactly as shown.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcceptWorkerResultRequest {
+    /// Client-generated; identifies this decision across retries.
+    pub decision_id: Uuid,
+    pub task_id: Uuid,
+    pub project_id: Uuid,
+    pub repository_id: Uuid,
+    pub run: u32,
+    /// Must be `recovery_required`.
+    pub stage: String,
+    pub branch: String,
+    pub checkout: String,
+    #[serde(default)]
+    pub observed_commit: Option<String>,
+    /// The exact tip the person inspected and approves.
+    pub tip: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AcceptWorkerResultOutcome {
+    /// The decision was recorded durably and the Task is in AI Review.
+    Accepted { task: Task },
+    /// An identical earlier decision had already been applied.
+    AlreadyApplied { task: Task },
+    /// Nothing was recorded.
+    Refused { reason: String },
+    /// The decision is published on the board but its durability could not be
+    /// confirmed. It must not be repeated blindly: the Task stays held until
+    /// SlashIt re-validates the commit and confirms the write.
+    DurabilityUnconfirmed { task: Task, detail: String },
+}
+
+fn stage_name(stage: &WorkerHandoffStage) -> &'static str {
+    match stage {
+        WorkerHandoffStage::Started => "started",
+        WorkerHandoffStage::CommittedAwaitingReview { .. } => "committed_awaiting_review",
+        WorkerHandoffStage::RecoveryRequired { .. } => "recovery_required",
+        WorkerHandoffStage::ResolvedToAiReview { .. } => "resolved_to_ai_review",
+    }
+}
+
+fn is_object_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A read-only Git call. `--no-optional-locks` keeps `status` from refreshing
+/// the index, so inspection leaves the checkout byte-for-byte alone.
+async fn git_read(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let output = tokio::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .await
+        .map_err(|e| format!("git could not run: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn commit_at(dir: &Path, rev: &str) -> Option<String> {
+    git_read(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .await
+    .ok()
+    .map(|out| out.trim().to_string())
+    .filter(|sha| is_object_id(sha))
+}
+
+/// Everything read for one evaluation: the snapshot, plus the facts acceptance
+/// compares against.
+struct Evaluation {
+    evidence: WorkerRecoveryEvidence,
+}
+
+async fn evaluate(state: &crate::AppState, task: &Task) -> Evaluation {
+    let handoff = task.worker_handoff.as_ref();
+    let mut refusals: Vec<String> = Vec::new();
+    let mut evidence = WorkerRecoveryEvidence {
+        task_id: task.id,
+        project_id: task.project_id,
+        repository_id: handoff.and_then(|h| h.repository_id),
+        stage: handoff.map_or("none", |h| stage_name(&h.stage)).to_string(),
+        reason: None,
+        run: handoff.and_then(|h| h.run),
+        branch: handoff.and_then(|h| h.branch.clone()),
+        start_head: handoff.and_then(|h| h.start_head.clone()),
+        observed_commit: None,
+        branch_tip: None,
+        commits: Vec::new(),
+        commits_truncated: false,
+        checkout: None,
+        active_execution: false,
+        eligible: false,
+        refusals: Vec::new(),
+    };
+
+    let Some(handoff) = handoff else {
+        refusals.push("This Task has no Worker recovery evidence.".into());
+        evidence.refusals = refusals;
+        return Evaluation { evidence };
+    };
+    if let WorkerHandoffStage::RecoveryRequired {
+        reason,
+        observed_commit,
+    } = &handoff.stage
+    {
+        evidence.reason = Some(reason.clone());
+        evidence.observed_commit = observed_commit.clone();
+    } else {
+        refusals.push("This Worker is not waiting for a recovery decision.".into());
+    }
+
+    if let Some(executor) = state.executor.get() {
+        if crate::lifecycle::ExecutionOwnership::is_task_running(executor.as_ref(), task.id).await {
+            evidence.active_execution = true;
+            refusals.push("An execution or review currently owns this Task.".into());
+        }
+    }
+
+    // Identity: every recorded fact must still agree with the Task.
+    if handoff.task_id != task.id || handoff.project_id != task.project_id {
+        refusals.push("The recovery record does not belong to this Task and Project.".into());
+    }
+    let run = handoff.run;
+    if run.is_none() {
+        refusals.push("The recovery record has no run ordinal (legacy evidence).".into());
+    }
+    let start_head = handoff.start_head.clone().filter(|sha| is_object_id(sha));
+    if start_head.is_none() {
+        refusals.push(
+            "The branch HEAD before this run was not reliably recorded, so a result cannot be \
+             accepted."
+                .into(),
+        );
+    }
+    let branch = handoff.branch.clone().filter(|b| !b.is_empty());
+    if branch.is_none() || branch.as_deref() != task.branch_name.as_deref() {
+        refusals.push("The recorded branch is missing or differs from the Task's branch.".into());
+    }
+    if let Some(observed) = evidence.observed_commit.as_deref() {
+        if !is_object_id(observed) {
+            refusals.push("The recorded observed commit is not a valid object id.".into());
+        }
+    }
+
+    // Lifecycle: nothing durable may already have ended or advanced this run.
+    if !matches!(task.status, TaskStatus::Error | TaskStatus::Backlog) {
+        refusals
+            .push("The Task has moved to a lifecycle state this decision cannot override.".into());
+    }
+    if task.cleanup_in_flight
+        || task.pending_republish.is_some()
+        || task.local_integration.is_some()
+        || task.pr_url.is_some()
+    {
+        refusals.push(
+            "The Task has an unfinished cleanup, restack, integration or pull request.".into(),
+        );
+    }
+    if let Some(run) = run {
+        // A completion left by an earlier acceptance or reconciliation whose
+        // result no longer verified is not a reason to refuse a fresh decision:
+        // completions are once-only, so accepting again cannot duplicate it.
+        let resolved_before = handoff.acceptance.is_some() || evidence.observed_commit.is_some();
+        let ended = task.activity.iter().any(|entry| match &entry.kind {
+            ActivityKind::RunCompleted { run: r } => *r == run && !resolved_before,
+            ActivityKind::RunFailed { run: Some(r), .. } => *r == run,
+            _ => false,
+        });
+        if ended {
+            refusals.push("This run already has a durable completion or failure.".into());
+        }
+    }
+
+    // Project, repository and checkout.
+    let project = state
+        .project
+        .projects
+        .read()
+        .await
+        .get(&task.project_id)
+        .cloned();
+    let repo_path = match &project {
+        None => {
+            refusals.push("The owning Project is unavailable.".into());
+            None
+        }
+        Some(project) => {
+            if project.repository_id.is_none() || project.repository_id != handoff.repository_id {
+                refusals.push(
+                    "The Project repository differs from the one recorded for this run.".into(),
+                );
+            }
+            evidence.repository_id = handoff.repository_id;
+            match project.repository_id {
+                Some(id) => state
+                    .repository
+                    .repositories
+                    .read()
+                    .await
+                    .get(&id)
+                    .map(|r| r.local_path.clone()),
+                None => None,
+            }
+        }
+    };
+    if repo_path.is_none() {
+        refusals.push("The owning repository is unavailable.".into());
+    }
+
+    let checkout_path = task.worktree_path.clone();
+    if checkout_path.is_none() {
+        refusals.push("The Task Checkout path is missing from the Task record.".into());
+    }
+
+    if let (Some(repo), Some(branch)) = (repo_path.as_deref(), branch.as_deref()) {
+        let repo_dir = Path::new(repo);
+        evidence.branch_tip = commit_at(repo_dir, &format!("refs/heads/{branch}")).await;
+        if evidence.branch_tip.is_none() {
+            refusals.push("The recorded branch cannot be resolved to a commit.".into());
+        }
+
+        if let (Some(tip), Some(start)) = (evidence.branch_tip.as_deref(), start_head.as_deref()) {
+            if tip == start {
+                refusals.push("The branch tip is still the commit the run started from; there is no result to accept.".into());
+            } else {
+                match crate::worktree::restack::is_ancestor(repo_dir, start, tip).await {
+                    Ok(true) => {}
+                    Ok(false) => refusals.push(
+                        "The branch tip does not descend from the commit the run started from."
+                            .into(),
+                    ),
+                    Err(e) => refusals.push(format!("Ancestry could not be verified: {e}")),
+                }
+                if let Some(observed) = evidence
+                    .observed_commit
+                    .as_deref()
+                    .filter(|o| is_object_id(o))
+                {
+                    if observed != tip {
+                        match crate::worktree::restack::is_ancestor(repo_dir, observed, tip).await {
+                            Ok(true) => {}
+                            Ok(false) => refusals.push(
+                                "The recorded observed commit is not an ancestor of the branch tip."
+                                    .into(),
+                            ),
+                            Err(e) => refusals.push(format!("Ancestry could not be verified: {e}")),
+                        }
+                    }
+                }
+                if let Ok(listing) = git_read(
+                    repo_dir,
+                    &[
+                        "log",
+                        "--format=%H%x1f%s",
+                        &format!("-n{}", MAX_LISTED_COMMITS + 1),
+                        &format!("{start}..{tip}"),
+                    ],
+                )
+                .await
+                {
+                    let mut commits: Vec<EvidenceCommit> = listing
+                        .lines()
+                        .filter_map(|line| {
+                            let (sha, subject) = line.split_once('\u{1f}')?;
+                            Some(EvidenceCommit {
+                                sha: sha.to_string(),
+                                subject: subject.to_string(),
+                            })
+                        })
+                        .collect();
+                    if commits.len() > MAX_LISTED_COMMITS {
+                        commits.truncate(MAX_LISTED_COMMITS);
+                        evidence.commits_truncated = true;
+                    }
+                    evidence.commits = commits;
+                }
+            }
+        }
+
+        if let Some(path) = checkout_path.as_deref() {
+            let mut checkout = CheckoutEvidence {
+                path: path.to_string(),
+                exists: Path::new(path).is_dir(),
+                registered: false,
+                head: None,
+                clean: None,
+                dirty_paths: Vec::new(),
+            };
+            if checkout.exists {
+                let dir = Path::new(path);
+                checkout.head = commit_at(dir, "HEAD").await;
+                if let Ok(status) =
+                    git_read(dir, &["status", "--porcelain=v1", "--untracked-files=all"]).await
+                {
+                    checkout.clean = Some(status.trim().is_empty());
+                    checkout.dirty_paths = status
+                        .lines()
+                        .take(MAX_LISTED_PATHS)
+                        .map(str::to_string)
+                        .collect();
+                }
+            }
+            if let Some(tip) = evidence.branch_tip.as_deref() {
+                match crate::queue::executor::TaskExecutor::validate_worker_checkout(
+                    repo, path, branch, tip,
+                )
+                .await
+                {
+                    Ok(()) => checkout.registered = true,
+                    Err(reason) => {
+                        // A dirty checkout is registered correctly; only the
+                        // cleanliness fact is missing.
+                        checkout.registered =
+                            checkout.clean == Some(false) && reason.contains("dirty");
+                        refusals.push(reason);
+                    }
+                }
+            }
+            evidence.checkout = Some(checkout);
+        }
+
+        // Another Task claiming the same branch makes ownership ambiguous.
+        let (snapshot, repo_map) = {
+            let all: Vec<Task> = state.task.tasks.read().await.values().cloned().collect();
+            let projects = state.project.projects.read().await;
+            let repositories = state.repository.repositories.read().await;
+            let paths: HashMap<Uuid, String> = projects
+                .iter()
+                .filter_map(|(id, p)| {
+                    Some((*id, repositories.get(&p.repository_id?)?.local_path.clone()))
+                })
+                .collect();
+            (all, paths)
+        };
+        if crate::worktree::tasks_sharing_a_recorded_branch(&snapshot, &repo_map)
+            .await
+            .contains_key(&task.id)
+        {
+            refusals.push("Another Task records ownership of this Git branch.".into());
+        }
+    }
+
+    refusals.dedup();
+    evidence.eligible = refusals.is_empty();
+    evidence.refusals = refusals;
+    Evaluation { evidence }
+}
+
+/// Read-only snapshot of an interrupted Worker's preserved evidence.
+#[tauri::command]
+pub async fn get_worker_recovery_evidence(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<WorkerRecoveryEvidence, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    worker_recovery_evidence(&state, task_id).await
+}
+
+pub(crate) async fn worker_recovery_evidence(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<WorkerRecoveryEvidence, String> {
+    let task = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .cloned()
+        .ok_or("Task not found")?;
+    Ok(evaluate(state, &task).await.evidence)
+}
+
+/// Accept one exact, verified commit as the result of the interrupted run.
+#[tauri::command]
+pub async fn accept_worker_result(
+    _gui: GuiMutation,
+    state: tauri::State<'_, crate::AppState>,
+    request: AcceptWorkerResultRequest,
+) -> Result<AcceptWorkerResultOutcome, String> {
+    accept_result(&state, request).await
+}
+
+fn refused(reason: impl Into<String>) -> Result<AcceptWorkerResultOutcome, String> {
+    Ok(AcceptWorkerResultOutcome::Refused {
+        reason: reason.into(),
+    })
+}
+
+/// Whether `request` repeats the decision already recorded on the handoff.
+fn repeats(task: &Task, request: &AcceptWorkerResultRequest) -> Option<bool> {
+    let handoff = task.worker_handoff.as_ref()?;
+    let recorded = handoff.acceptance.as_ref()?;
+    if recorded.decision_id != request.decision_id {
+        return None;
+    }
+    Some(
+        handoff.run == Some(request.run)
+            && handoff.task_id == request.task_id
+            && handoff.project_id == request.project_id
+            && handoff.repository_id == Some(request.repository_id)
+            && handoff.branch.as_deref() == Some(request.branch.as_str())
+            && task.worktree_path.as_deref() == Some(request.checkout.as_str())
+            && recorded.commit == request.tip,
+    )
+}
+
+async fn branch_still_at(state: &crate::AppState, task: &Task, tip: &str) -> bool {
+    let (Some(branch), Ok(repo)) = (
+        task.branch_name.as_deref(),
+        crate::commands::integration::repo_path_of(state, task.project_id).await,
+    ) else {
+        return false;
+    };
+    commit_at(Path::new(&repo), &format!("refs/heads/{branch}"))
+        .await
+        .as_deref()
+        == Some(tip)
+}
+
+pub(crate) async fn accept_result(
+    state: &crate::AppState,
+    request: AcceptWorkerResultRequest,
+) -> Result<AcceptWorkerResultOutcome, String> {
+    if !is_object_id(&request.tip) {
+        return refused("The commit to accept is not a full object id.");
+    }
+    if request.stage != "recovery_required" {
+        return refused("Only a Worker waiting in recovery can be accepted.");
+    }
+    let task_id = request.task_id;
+    let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+
+    let task = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .cloned()
+        .ok_or("Task not found")?;
+
+    // Idempotency first: the same decision never has an effect twice, and the
+    // same id with different content is never silently reinterpreted.
+    match repeats(&task, &request) {
+        Some(true) => {
+            let resolved = task.worker_handoff.as_ref().is_some_and(|h| {
+                matches!(&h.stage, WorkerHandoffStage::ResolvedToAiReview { commit } if *commit == request.tip)
+            });
+            return if resolved {
+                Ok(AcceptWorkerResultOutcome::AlreadyApplied { task })
+            } else {
+                refused(
+                    "This decision was applied earlier, but the Task has since returned to \
+                     recovery. Inspect it again and make a new decision.",
+                )
+            };
+        }
+        Some(false) => {
+            return refused("This decision id was already used for a different request.");
+        }
+        None => {}
+    }
+
+    // Compare-and-set against what the person was shown.
+    let Some(handoff) = task.worker_handoff.as_ref() else {
+        return refused("This Task has no Worker recovery evidence.");
+    };
+    let WorkerHandoffStage::RecoveryRequired {
+        observed_commit, ..
+    } = &handoff.stage
+    else {
+        return refused("This Worker is no longer waiting for a recovery decision.");
+    };
+    let stale = handoff.run != Some(request.run)
+        || handoff.task_id != request.task_id
+        || handoff.project_id != request.project_id
+        || task.project_id != request.project_id
+        || handoff.repository_id != Some(request.repository_id)
+        || handoff.branch.as_deref() != Some(request.branch.as_str())
+        || task.worktree_path.as_deref() != Some(request.checkout.as_str())
+        || *observed_commit != request.observed_commit;
+    if stale {
+        return refused(
+            "The recovery evidence changed after it was shown to you. Inspect it again.",
+        );
+    }
+
+    let evaluation = evaluate(state, &task).await;
+    if evaluation.evidence.branch_tip.as_deref() != Some(request.tip.as_str()) {
+        return refused(
+            "The branch tip is not the commit you approved. Inspect the current tip and decide \
+             again.",
+        );
+    }
+    if !evaluation.evidence.eligible {
+        return refused(evaluation.evidence.refusals.join(" "));
+    }
+
+    let now = chrono::Utc::now();
+    let decision = WorkerResultAcceptance {
+        decision_id: request.decision_id,
+        commit: request.tip.clone(),
+        decided_at: now,
+    };
+    let applied = std::sync::atomic::AtomicBool::new(false);
+    let expected = request.clone();
+    let amend = |staged: &mut HashMap<Uuid, Task>| {
+        let Some(current) = staged.get_mut(&task_id) else {
+            return;
+        };
+        let still_current = current.project_id == expected.project_id
+            && matches!(current.status, TaskStatus::Error | TaskStatus::Backlog)
+            && !current.cleanup_in_flight
+            && current.pending_republish.is_none()
+            && current.local_integration.is_none()
+            && current.pr_url.is_none()
+            && current.branch_name.as_deref() == Some(expected.branch.as_str())
+            && current.worktree_path.as_deref() == Some(expected.checkout.as_str())
+            && current.worker_handoff.as_ref().is_some_and(|h| {
+                h.run == Some(expected.run)
+                    && matches!(&h.stage,
+                        WorkerHandoffStage::RecoveryRequired { observed_commit, .. }
+                            if *observed_commit == expected.observed_commit)
+            });
+        if !still_current {
+            return;
+        }
+        current.status = TaskStatus::AiReview;
+        current.phase = TaskPhase::QaReview;
+        current.phase_progress = 80;
+        current.overall_progress = 80;
+        current.error_message = None;
+        current.record_activity_at(now, ActivityKind::RunCompleted { run: expected.run });
+        if let Some(handoff) = current.worker_handoff.as_mut() {
+            handoff.stage = WorkerHandoffStage::ResolvedToAiReview {
+                commit: expected.tip.clone(),
+            };
+            handoff.acceptance = Some(decision.clone());
+        }
+        applied.store(true, std::sync::atomic::Ordering::Relaxed);
+    };
+
+    let written =
+        crate::lifecycle::record_typed(&state.task.tasks, &state.storage, task_id, &amend).await;
+    let published = applied.load(std::sync::atomic::Ordering::Relaxed);
+    match written {
+        Err(crate::lifecycle::RecordWriteError::NotPublished(reason)) => {
+            refused(format!("Nothing was recorded: {reason}"))
+        }
+        Err(crate::lifecycle::RecordWriteError::PublishedNotDurable(detail)) => {
+            let task = state
+                .task
+                .tasks
+                .read()
+                .await
+                .get(&task_id)
+                .cloned()
+                .ok_or("Task not found")?;
+            if !published {
+                return refused(format!("Nothing was recorded: {detail}"));
+            }
+            // Left unconfirmed on purpose: startup and the executor poll
+            // re-validate the commit before AI Review is admitted.
+            Ok(AcceptWorkerResultOutcome::DurabilityUnconfirmed { task, detail })
+        }
+        Ok(()) if !published => refused(
+            "The Task changed while the decision was being recorded, so nothing was recorded.",
+        ),
+        Ok(()) => {
+            let mut tasks = state.task.tasks.write().await;
+            let task = tasks.get_mut(&task_id).ok_or("Task not found")?;
+            // The write is confirmed durable. The acknowledgement is earned
+            // only if the branch still sits on the accepted commit; otherwise
+            // it stays unset and the executor re-validates before review.
+            if branch_still_at(state, &task.clone(), &request.tip).await {
+                task.worker_handoff_confirmed = true;
+            }
+            Ok(AcceptWorkerResultOutcome::Accepted { task: task.clone() })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{AgentConfig, AgentType, Project, ProjectScope, Repository};
+    use crate::test_helpers::create_test_task_full;
+    use slashit_durable_fs::{fault, Stage};
+    use std::path::PathBuf;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args([
+                "--no-optional-locks",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=T",
+            ])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    struct Fx {
+        _tmp: tempfile::TempDir,
+        state: crate::AppState,
+        repo: PathBuf,
+        checkout: PathBuf,
+        project_id: Uuid,
+        repository_id: Uuid,
+        task_id: Uuid,
+        branch: String,
+        start: String,
+        tip: String,
+    }
+
+    impl Fx {
+        fn request(&self, decision_id: Uuid) -> AcceptWorkerResultRequest {
+            AcceptWorkerResultRequest {
+                decision_id,
+                task_id: self.task_id,
+                project_id: self.project_id,
+                repository_id: self.repository_id,
+                run: 1,
+                stage: "recovery_required".into(),
+                branch: self.branch.clone(),
+                checkout: self.checkout.to_string_lossy().to_string(),
+                observed_commit: None,
+                tip: self.tip.clone(),
+            }
+        }
+
+        async fn task(&self) -> Task {
+            self.state.task.tasks.read().await[&self.task_id].clone()
+        }
+
+        fn on_disk(&self) -> Task {
+            self.state
+                .storage
+                .load_project_tasks(self.project_id)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.id == self.task_id)
+                .unwrap()
+        }
+
+        async fn edit(&self, change: impl FnOnce(&mut Task)) {
+            let mut tasks = self.state.task.tasks.write().await;
+            change(tasks.get_mut(&self.task_id).unwrap());
+            let board: Vec<Task> = tasks.values().cloned().collect();
+            self.state
+                .storage
+                .save_project_tasks(self.project_id, &board)
+                .unwrap();
+        }
+
+        /// Everything Git and the checkout hold that accepting must never
+        /// change: references, registrations, HEAD, status and the index file.
+        fn repo_state(&self) -> String {
+            let index = git(&self.checkout, &["rev-parse", "--git-path", "index"]);
+            let index = if Path::new(&index).is_absolute() {
+                PathBuf::from(index)
+            } else {
+                self.checkout.join(index)
+            };
+            let stamp = std::fs::metadata(&index)
+                .and_then(|m| m.modified())
+                .map(|t| format!("{t:?}"))
+                .unwrap_or_default();
+            format!(
+                "{}\n{}\n{}\n{}\n{stamp}",
+                git(&self.repo, &["for-each-ref"]),
+                git(&self.repo, &["worktree", "list", "--porcelain"]),
+                git(&self.checkout, &["rev-parse", "HEAD"]),
+                git(
+                    &self.checkout,
+                    &["status", "--porcelain=v1", "--untracked-files=all"]
+                ),
+            )
+        }
+
+        fn commit_in_checkout(&self, name: &str) -> String {
+            std::fs::write(self.checkout.join(name), name).unwrap();
+            git(&self.checkout, &["add", "-A"]);
+            git(&self.checkout, &["commit", "-q", "-m", name]);
+            git(&self.checkout, &["rev-parse", "HEAD"])
+        }
+    }
+
+    async fn fixture() -> Fx {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .unwrap();
+        crate::test_helpers::attach_test_executor(&state);
+
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+        let start = git(&repo, &["rev-parse", "HEAD"]);
+        let branch = "task-interrupted".to_string();
+        let checkout = tmp.path().join("checkout");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                checkout.to_str().unwrap(),
+                "main",
+            ],
+        );
+
+        let repository_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        state.repository.repositories.write().await.insert(
+            repository_id,
+            Repository {
+                id: repository_id,
+                local_path: repo.to_string_lossy().to_string(),
+                remote_url: None,
+                remote_type: None,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        state.project.projects.write().await.insert(
+            project_id,
+            Project {
+                id: project_id,
+                name: "p".into(),
+                repository_id: Some(repository_id),
+                scope: ProjectScope::default(),
+                state_location: crate::config::paths::StateLocation::External,
+                base: None,
+                agent_type: AgentType::ClaudeCode,
+                agent_config: AgentConfig {
+                    agent_type: AgentType::ClaudeCode,
+                    command: "claude".into(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    model: None,
+                    api_key: None,
+                },
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+        );
+
+        let mut task = create_test_task_full("interrupted", project_id, TaskStatus::Error, 0);
+        task.branch_name = Some(branch.clone());
+        task.worktree_path = Some(checkout.to_string_lossy().to_string());
+        task.phase = TaskPhase::Idle;
+        task.error_message = Some("interrupted".into());
+        task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+            task_id: task.id,
+            project_id,
+            repository_id: Some(repository_id),
+            run: Some(1),
+            branch: Some(branch.clone()),
+            start_head: Some(start.clone()),
+            acceptance: None,
+            stage: WorkerHandoffStage::RecoveryRequired {
+                reason: "interrupted".into(),
+                observed_commit: None,
+            },
+        });
+        task.record_activity(ActivityKind::RunStarted {
+            run: 1,
+            addressing_feedback: false,
+        });
+        task.record_activity(ActivityKind::RecoveryRequired {
+            run: Some(1),
+            reason: "interrupted".into(),
+        });
+        let task_id = task.id;
+        state.task.tasks.write().await.insert(task_id, task.clone());
+        state
+            .storage
+            .save_project_tasks(project_id, &[task])
+            .unwrap();
+
+        let mut fx = Fx {
+            _tmp: tmp,
+            state,
+            repo,
+            checkout,
+            project_id,
+            repository_id,
+            task_id,
+            branch,
+            start,
+            tip: String::new(),
+        };
+        fx.tip = fx.commit_in_checkout("work.txt");
+        fx
+    }
+
+    fn completions(task: &Task) -> usize {
+        task.activity
+            .iter()
+            .filter(|e| matches!(e.kind, ActivityKind::RunCompleted { run: 1 }))
+            .count()
+    }
+
+    fn refusal(outcome: Result<AcceptWorkerResultOutcome, String>) -> String {
+        match outcome.expect("a refusal is an answer, not an error") {
+            AcceptWorkerResultOutcome::Refused { reason } => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    async fn assert_untouched(fx: &Fx, before_task: &Task, before_repo: &str) {
+        let after = fx.task().await;
+        assert_eq!(after.status, before_task.status);
+        assert_eq!(after.worker_handoff, before_task.worker_handoff);
+        assert_eq!(after.activity, before_task.activity);
+        assert_eq!(fx.repo_state(), before_repo);
+    }
+
+    #[tokio::test]
+    async fn the_evidence_query_reads_everything_and_changes_nothing() {
+        let fx = fixture().await;
+        let before = (fx.task().await, fx.repo_state(), fx.on_disk());
+
+        let evidence = worker_recovery_evidence(&fx.state, fx.task_id)
+            .await
+            .unwrap();
+
+        assert!(evidence.eligible, "{:?}", evidence.refusals);
+        assert_eq!(evidence.stage, "recovery_required");
+        assert_eq!(evidence.run, Some(1));
+        assert_eq!(evidence.start_head.as_deref(), Some(fx.start.as_str()));
+        assert_eq!(evidence.branch_tip.as_deref(), Some(fx.tip.as_str()));
+        assert_eq!(evidence.commits.len(), 1);
+        assert_eq!(evidence.commits[0].sha, fx.tip);
+        let checkout = evidence.checkout.unwrap();
+        assert!(checkout.exists && checkout.registered);
+        assert_eq!(checkout.clean, Some(true));
+        assert!(!evidence.active_execution);
+        assert_eq!(fx.task().await.activity, before.0.activity);
+        assert_eq!(
+            fx.repo_state(),
+            before.1,
+            "no ref, registration or index changed"
+        );
+        assert_eq!(fx.on_disk().worker_handoff, before.2.worker_handoff);
+    }
+
+    #[tokio::test]
+    async fn an_exact_verified_tip_is_accepted_into_ai_review_once() {
+        let fx = fixture().await;
+        let refs_before = git(&fx.repo, &["for-each-ref"]);
+        let head_before = git(&fx.checkout, &["rev-parse", "HEAD"]);
+        let id = Uuid::new_v4();
+
+        let outcome = accept_result(&fx.state, fx.request(id)).await.unwrap();
+
+        let AcceptWorkerResultOutcome::Accepted { task } = outcome else {
+            panic!("expected Accepted, got {outcome:?}");
+        };
+        assert_eq!(task.status, TaskStatus::AiReview);
+        assert_eq!(task.phase, TaskPhase::QaReview);
+        assert_eq!((task.phase_progress, task.overall_progress), (80, 80));
+        assert_eq!(task.error_message, None);
+        let handoff = task.worker_handoff.as_ref().unwrap();
+        assert_eq!(
+            handoff.stage,
+            WorkerHandoffStage::ResolvedToAiReview {
+                commit: fx.tip.clone()
+            }
+        );
+        let acceptance = handoff.acceptance.as_ref().unwrap();
+        assert_eq!(
+            (acceptance.decision_id, acceptance.commit.as_str()),
+            (id, fx.tip.as_str())
+        );
+        assert_eq!(completions(&task), 1);
+        assert!(task.worker_handoff_confirmed);
+        assert!(
+            task.worker_recovery_refusal().is_none(),
+            "AI Review is admitted"
+        );
+        assert_eq!(task.needs_you(false), None);
+        assert_eq!(
+            fx.on_disk().worker_handoff,
+            task.worker_handoff,
+            "the file agrees"
+        );
+        assert_eq!(completions(&fx.on_disk()), 1);
+        assert_eq!(git(&fx.repo, &["for-each-ref"]), refs_before);
+        assert_eq!(git(&fx.checkout, &["rev-parse", "HEAD"]), head_before);
+    }
+
+    #[tokio::test]
+    async fn the_same_decision_again_changes_nothing_and_a_different_one_with_its_id_is_refused() {
+        let fx = fixture().await;
+        let id = Uuid::new_v4();
+        accept_result(&fx.state, fx.request(id)).await.unwrap();
+        let settled = fx.task().await;
+        let repo_state = fx.repo_state();
+
+        let again = accept_result(&fx.state, fx.request(id)).await.unwrap();
+        assert!(
+            matches!(again, AcceptWorkerResultOutcome::AlreadyApplied { .. }),
+            "{again:?}"
+        );
+        assert_untouched(&fx, &settled, &repo_state).await;
+
+        let mut conflicting = fx.request(id);
+        conflicting.tip = "f".repeat(40);
+        let reason = refusal(accept_result(&fx.state, conflicting).await);
+        assert!(reason.contains("different request"), "{reason}");
+
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+        assert!(reason.contains("no longer waiting"), "{reason}");
+        assert_untouched(&fx, &settled, &repo_state).await;
+        assert_eq!(completions(&fx.task().await), 1);
+    }
+
+    #[tokio::test]
+    async fn the_same_decision_after_a_restart_still_has_no_second_effect() {
+        let fx = fixture().await;
+        let id = Uuid::new_v4();
+        accept_result(&fx.state, fx.request(id)).await.unwrap();
+        let reloaded = fx.on_disk();
+        fx.state
+            .task
+            .tasks
+            .write()
+            .await
+            .insert(fx.task_id, reloaded);
+
+        let again = accept_result(&fx.state, fx.request(id)).await.unwrap();
+
+        assert!(
+            matches!(again, AcceptWorkerResultOutcome::AlreadyApplied { .. }),
+            "{again:?}"
+        );
+        assert_eq!(completions(&fx.task().await), 1);
+    }
+
+    #[tokio::test]
+    async fn two_racing_decisions_record_one_completion() {
+        let fx = fixture().await;
+        let (a, b) = tokio::join!(
+            accept_result(&fx.state, fx.request(Uuid::new_v4())),
+            accept_result(&fx.state, fx.request(Uuid::new_v4())),
+        );
+        let outcomes = [a.unwrap(), b.unwrap()];
+        let accepted = outcomes
+            .iter()
+            .filter(|o| matches!(o, AcceptWorkerResultOutcome::Accepted { .. }))
+            .count();
+        let refused = outcomes
+            .iter()
+            .filter(|o| matches!(o, AcceptWorkerResultOutcome::Refused { .. }))
+            .count();
+        assert_eq!((accepted, refused), (1, 1), "{outcomes:?}");
+        assert_eq!(completions(&fx.task().await), 1);
+    }
+
+    #[tokio::test]
+    async fn a_tip_that_advanced_past_the_recorded_observation_can_be_accepted_exactly() {
+        let fx = fixture().await;
+        let observed = fx.tip.clone();
+        let newer = fx.commit_in_checkout("more.txt");
+        fx.edit(|t| {
+            t.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::RecoveryRequired {
+                reason: "interrupted".into(),
+                observed_commit: Some(observed.clone()),
+            }
+        })
+        .await;
+        let mut request = fx.request(Uuid::new_v4());
+        request.observed_commit = Some(observed);
+        request.tip = newer.clone();
+
+        let outcome = accept_result(&fx.state, request).await.unwrap();
+
+        let AcceptWorkerResultOutcome::Accepted { task } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(
+            task.worker_handoff.unwrap().stage,
+            WorkerHandoffStage::ResolvedToAiReview { commit: newer }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tip_that_moved_after_it_was_shown_is_never_silently_replaced() {
+        let fx = fixture().await;
+        let request = fx.request(Uuid::new_v4());
+        fx.commit_in_checkout("late.txt");
+        let (task, repo_state) = (fx.task().await, fx.repo_state());
+
+        let reason = refusal(accept_result(&fx.state, request).await);
+
+        assert!(reason.contains("not the commit you approved"), "{reason}");
+        assert_untouched(&fx, &task, &repo_state).await;
+    }
+
+    #[tokio::test]
+    async fn an_observed_commit_that_is_not_an_ancestor_of_the_tip_is_refused() {
+        let fx = fixture().await;
+        git(&fx.repo, &["branch", "side", &fx.start]);
+        let side = tempfile::TempDir::new().unwrap();
+        let side_dir = side.path().join("side");
+        git(
+            &fx.repo,
+            &["worktree", "add", "-q", side_dir.to_str().unwrap(), "side"],
+        );
+        std::fs::write(side_dir.join("other.txt"), "x").unwrap();
+        git(&side_dir, &["add", "-A"]);
+        git(&side_dir, &["commit", "-q", "-m", "other"]);
+        let foreign = git(&side_dir, &["rev-parse", "HEAD"]);
+        fx.edit(|t| {
+            t.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::RecoveryRequired {
+                reason: "interrupted".into(),
+                observed_commit: Some(foreign.clone()),
+            }
+        })
+        .await;
+        let mut request = fx.request(Uuid::new_v4());
+        request.observed_commit = Some(foreign);
+
+        let reason = refusal(accept_result(&fx.state, request).await);
+
+        assert!(
+            reason.contains("observed commit is not an ancestor"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tip_that_does_not_descend_from_the_recorded_start_is_refused() {
+        let fx = fixture().await;
+        let unrelated = "e".repeat(40);
+        fx.edit(|t| t.worker_handoff.as_mut().unwrap().start_head = Some(unrelated))
+            .await;
+
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+
+        assert!(
+            reason.contains("Ancestry") || reason.contains("descend"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tip_equal_to_the_start_is_not_a_result() {
+        let fx = fixture().await;
+        git(&fx.checkout, &["reset", "-q", "--hard", &fx.start]);
+        let mut request = fx.request(Uuid::new_v4());
+        request.tip = fx.start.clone();
+
+        let reason = refusal(accept_result(&fx.state, request).await);
+
+        assert!(reason.contains("no result to accept"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn legacy_evidence_without_a_start_head_cannot_be_accepted() {
+        let fx = fixture().await;
+        fx.edit(|t| t.worker_handoff.as_mut().unwrap().start_head = None)
+            .await;
+
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+        assert!(reason.contains("not reliably recorded"), "{reason}");
+
+        fx.edit(|t| {
+            let h = t.worker_handoff.as_mut().unwrap();
+            h.start_head = Some(fx.start.clone());
+            h.run = None;
+        })
+        .await;
+        let evidence = worker_recovery_evidence(&fx.state, fx.task_id)
+            .await
+            .unwrap();
+        assert!(!evidence.eligible);
+    }
+
+    #[tokio::test]
+    async fn a_dirty_checkout_is_refused_and_left_alone() {
+        let fx = fixture().await;
+        std::fs::write(fx.checkout.join("scratch.txt"), "unsaved").unwrap();
+        let (task, repo_state) = (fx.task().await, fx.repo_state());
+
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+
+        assert!(reason.contains("dirty"), "{reason}");
+        assert_untouched(&fx, &task, &repo_state).await;
+        assert_eq!(
+            std::fs::read_to_string(fx.checkout.join("scratch.txt")).unwrap(),
+            "unsaved"
+        );
+        let evidence = worker_recovery_evidence(&fx.state, fx.task_id)
+            .await
+            .unwrap();
+        assert_eq!(evidence.checkout.unwrap().clean, Some(false));
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_unregistered_checkout_is_refused() {
+        let fx = fixture().await;
+        let moved = fx.checkout.with_extension("moved");
+        std::fs::rename(&fx.checkout, &moved).unwrap();
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+        assert!(
+            reason.contains("missing") || reason.contains("unavailable"),
+            "{reason}"
+        );
+
+        // A directory at the recorded path that Git does not know.
+        std::fs::create_dir_all(&fx.checkout).unwrap();
+        git(&fx.checkout, &["init", "-q", "-b", &fx.branch]);
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+        assert!(!reason.is_empty());
+        assert_eq!(fx.task().await.status, TaskStatus::Error);
+    }
+
+    #[tokio::test]
+    async fn a_locked_registration_is_refused() {
+        let fx = fixture().await;
+        git(
+            &fx.repo,
+            &["worktree", "lock", fx.checkout.to_str().unwrap()],
+        );
+
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+
+        assert!(reason.contains("locked"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn another_task_claiming_the_branch_makes_ownership_ambiguous() {
+        let fx = fixture().await;
+        let mut other = create_test_task_full("other", fx.project_id, TaskStatus::Backlog, 1);
+        other.branch_name = Some(fx.branch.clone());
+        fx.state.task.tasks.write().await.insert(other.id, other);
+
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+
+        assert!(reason.contains("Another Task"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_live_executor_owner_blocks_acceptance() {
+        let fx = fixture().await;
+        fx.state
+            .executor
+            .get()
+            .unwrap()
+            .hold_running_for_test(fx.task_id)
+            .await;
+        let (task, repo_state) = (fx.task().await, fx.repo_state());
+
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+
+        assert!(reason.contains("currently owns"), "{reason}");
+        assert_untouched(&fx, &task, &repo_state).await;
+        let evidence = worker_recovery_evidence(&fx.state, fx.task_id)
+            .await
+            .unwrap();
+        assert!(evidence.active_execution);
+    }
+
+    #[tokio::test]
+    async fn stale_expectations_are_refused_field_by_field() {
+        let fx = fixture().await;
+        let base = fx.request(Uuid::new_v4());
+        let variants: Vec<(&str, AcceptWorkerResultRequest)> = vec![
+            (
+                "run",
+                AcceptWorkerResultRequest {
+                    run: 2,
+                    ..base.clone()
+                },
+            ),
+            (
+                "branch",
+                AcceptWorkerResultRequest {
+                    branch: "other".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "checkout",
+                AcceptWorkerResultRequest {
+                    checkout: "/elsewhere".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "observed",
+                AcceptWorkerResultRequest {
+                    observed_commit: Some("a".repeat(40)),
+                    ..base.clone()
+                },
+            ),
+            (
+                "repository",
+                AcceptWorkerResultRequest {
+                    repository_id: Uuid::new_v4(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "project",
+                AcceptWorkerResultRequest {
+                    project_id: Uuid::new_v4(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "stage",
+                AcceptWorkerResultRequest {
+                    stage: "started".into(),
+                    ..base.clone()
+                },
+            ),
+        ];
+        let (task, repo_state) = (fx.task().await, fx.repo_state());
+        for (field, request) in variants {
+            let outcome = accept_result(&fx.state, request).await;
+            assert!(
+                matches!(outcome, Ok(AcceptWorkerResultOutcome::Refused { .. })),
+                "{field}: {outcome:?}"
+            );
+        }
+        assert_untouched(&fx, &task, &repo_state).await;
+    }
+
+    #[tokio::test]
+    async fn a_task_that_moved_out_of_recovery_or_already_ended_the_run_is_refused() {
+        let fx = fixture().await;
+        fx.edit(|t| t.status = TaskStatus::HumanReview).await;
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+        assert!(reason.contains("lifecycle state"), "{reason}");
+
+        fx.edit(|t| {
+            t.status = TaskStatus::Error;
+            t.record_activity(ActivityKind::RunFailed {
+                run: Some(1),
+                reason: "x".into(),
+            });
+        })
+        .await;
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+        assert!(reason.contains("durable completion or failure"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_write_that_publishes_nothing_leaves_the_task_in_recovery() {
+        let fx = fixture().await;
+        let (task, repo_state) = (fx.task().await, fx.repo_state());
+
+        let reason = {
+            let _fault = fault::fail_at(Stage::Replace, std::io::ErrorKind::Other);
+            refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await)
+        };
+
+        assert!(reason.contains("Nothing was recorded"), "{reason}");
+        assert_untouched(&fx, &task, &repo_state).await;
+        assert!(matches!(
+            fx.on_disk().worker_handoff.unwrap().stage,
+            WorkerHandoffStage::RecoveryRequired { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_published_but_unconfirmed_write_is_reported_and_stays_gated_until_revalidated() {
+        let fx = fixture().await;
+
+        let outcome = {
+            let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+            accept_result(&fx.state, fx.request(Uuid::new_v4()))
+                .await
+                .unwrap()
+        };
+
+        let AcceptWorkerResultOutcome::DurabilityUnconfirmed { task, .. } = outcome else {
+            panic!("expected DurabilityUnconfirmed, got {outcome:?}");
+        };
+        assert_eq!(task.status, TaskStatus::AiReview);
+        assert!(
+            !task.worker_handoff_confirmed,
+            "an unconfirmed write earns no acknowledgement"
+        );
+        assert!(
+            task.worker_recovery_refusal().is_some(),
+            "AI Review is not admitted"
+        );
+
+        // The executor's reconciliation re-validates the commit and then
+        // confirms; it neither repeats the completion nor starts a Worker.
+        let agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
+        let executor = fx.state.executor.get().unwrap().clone();
+        executor.reconcile_committed_worker_handoffs().await;
+        let confirmed = fx.task().await;
+        assert!(confirmed.worker_handoff_confirmed);
+        assert!(confirmed.worker_recovery_refusal().is_none());
+        assert_eq!(completions(&confirmed), 1);
+        assert!(
+            !agent.invocations().contains("claude"),
+            "no coding Worker was launched"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_a_restart_review_waits_for_the_commit_to_be_revalidated() {
+        let fx = fixture().await;
+        accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let reloaded = fx.on_disk();
+        assert!(
+            !reloaded.worker_handoff_confirmed,
+            "the acknowledgement is process-local"
+        );
+        fx.state
+            .task
+            .tasks
+            .write()
+            .await
+            .insert(fx.task_id, reloaded);
+        assert!(fx.task().await.worker_recovery_refusal().is_some());
+
+        let agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
+        fx.state
+            .executor
+            .get()
+            .unwrap()
+            .reconcile_committed_worker_handoffs()
+            .await;
+
+        let task = fx.task().await;
+        assert!(task.worker_handoff_confirmed);
+        assert_eq!(task.status, TaskStatus::AiReview);
+        assert_eq!(completions(&task), 1);
+        assert!(!agent.invocations().contains("claude"));
+    }
+
+    #[tokio::test]
+    async fn if_the_branch_moves_before_a_restart_the_acceptance_is_not_trusted() {
+        let fx = fixture().await;
+        accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let reloaded = fx.on_disk();
+        fx.state
+            .task
+            .tasks
+            .write()
+            .await
+            .insert(fx.task_id, reloaded);
+        fx.commit_in_checkout("sneaky.txt");
+
+        fx.state
+            .executor
+            .get()
+            .unwrap()
+            .reconcile_committed_worker_handoffs()
+            .await;
+
+        let task = fx.task().await;
+        assert!(matches!(
+            task.worker_handoff.as_ref().unwrap().stage,
+            WorkerHandoffStage::RecoveryRequired { .. }
+        ));
+        assert_eq!(
+            task.needs_you(false),
+            Some(crate::domain::task::AttentionReason::Recovery)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_acceptance_that_stopped_verifying_can_be_decided_again_on_the_new_tip() {
+        let fx = fixture().await;
+        let first = fx.tip.clone();
+        accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let reloaded = fx.on_disk();
+        fx.state
+            .task
+            .tasks
+            .write()
+            .await
+            .insert(fx.task_id, reloaded);
+        let newer = fx.commit_in_checkout("after.txt");
+        fx.state
+            .executor
+            .get()
+            .unwrap()
+            .reconcile_committed_worker_handoffs()
+            .await;
+        assert!(matches!(
+            fx.task().await.worker_handoff.unwrap().stage,
+            WorkerHandoffStage::RecoveryRequired { .. }
+        ));
+
+        let mut request = fx.request(Uuid::new_v4());
+        request.observed_commit = Some(first);
+        request.tip = newer.clone();
+        let outcome = accept_result(&fx.state, request).await.unwrap();
+
+        let AcceptWorkerResultOutcome::Accepted { task } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(
+            task.worker_handoff.clone().unwrap().stage,
+            WorkerHandoffStage::ResolvedToAiReview { commit: newer }
+        );
+        assert_eq!(completions(&task), 1, "completions stay once-only");
+    }
+}

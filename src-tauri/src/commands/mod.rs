@@ -10,6 +10,7 @@ pub mod jj;
 pub mod queue;
 pub mod qa;
 pub mod human_review;
+pub mod worker_recovery;
 pub mod integration;
 #[cfg(test)]
 mod complete_and_integrate_tests;
@@ -49,6 +50,7 @@ pub use jj::*;
 pub use queue::*;
 pub use qa::*;
 pub use human_review::*;
+pub use worker_recovery::{accept_worker_result, get_worker_recovery_evidence};
 pub use integration::*;
 pub use attention::get_attention_summary;
 pub use storage_usage::{get_new_work_pause, get_storage_usage, refresh_storage_usage};

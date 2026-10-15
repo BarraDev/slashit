@@ -272,6 +272,22 @@ pub struct WorkerHandoff {
     #[serde(default)]
     pub start_head: Option<String>,
     pub stage: WorkerHandoffStage,
+    /// The one human decision that resolved this run's recovery, if any. It
+    /// lives and dies with the handoff of the run it resolved: the next run
+    /// replaces the whole record, and a stale run is refused by its run
+    /// ordinal and stage, never by remembering old decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<WorkerResultAcceptance>,
+}
+
+/// A person's acceptance of one exact existing commit as the result of an
+/// interrupted coding run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerResultAcceptance {
+    /// Client-generated identity of the decision, for idempotent retries.
+    pub decision_id: Uuid,
+    pub commit: String,
+    pub decided_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1775,6 +1791,7 @@ mod tests {
             run: Some(1),
             branch: Some("task/example".into()),
             start_head: Some("a".repeat(40)),
+            acceptance: None,
             stage: WorkerHandoffStage::RecoveryRequired {
                 reason: "exact commit unknown".into(),
                 observed_commit: None,
@@ -1813,6 +1830,7 @@ mod tests {
             run: Some(1),
             branch: Some("task/example".into()),
             start_head: Some("a".repeat(40)),
+            acceptance: None,
             stage: WorkerHandoffStage::ResolvedToAiReview {
                 commit: "b".repeat(40),
             },
@@ -1841,6 +1859,7 @@ mod tests {
             run: Some(1),
             branch: Some("task/example".into()),
             start_head: Some("a".repeat(40)),
+            acceptance: None,
             stage: WorkerHandoffStage::ResolvedToAiReview {
                 commit: "b".repeat(40),
             },

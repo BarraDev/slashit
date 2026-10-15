@@ -1596,6 +1596,21 @@ impl TaskExecutor {
         task.is_ready_to_execute()
     }
 
+    /// Test hook: make `task_id` look owned by a live execution for the rest
+    /// of the test.
+    #[cfg(test)]
+    pub(crate) async fn hold_running_for_test(&self, task_id: Uuid) {
+        let (cancel, _watch) = tokio::sync::watch::channel(false);
+        self.running_handles.write().await.insert(
+            task_id,
+            RunningTask {
+                handle: tokio::spawn(std::future::pending::<()>()),
+                cancel,
+                execution_id: None,
+            },
+        );
+    }
+
     /// Whether an agent is attached to this task right now.
     ///
     /// The handle maps are the live ownership fact, and they are the only one:
@@ -1880,7 +1895,7 @@ impl TaskExecutor {
     /// `CommittedAwaitingReview` write happens after `ClaudeRunner::wait()` has
     /// joined the provider process; this is the process-completion proof and
     /// does not depend on an in-memory handle map surviving restart.
-    async fn reconcile_committed_worker_handoffs(&self) {
+    pub(crate) async fn reconcile_committed_worker_handoffs(&self) {
         let candidates: Vec<Uuid> =
             {
                 let tasks = self.tasks.read().await;
@@ -2069,7 +2084,7 @@ impl TaskExecutor {
         }
     }
 
-    async fn validate_worker_checkout(
+    pub(crate) async fn validate_worker_checkout(
         repo: &str,
         checkout: &str,
         branch: &str,
@@ -2166,8 +2181,16 @@ impl TaskExecutor {
         {
             return Err("The Task Checkout HEAD is not the exact recorded Worker commit; work was preserved.".into());
         }
+        // Never refresh the index: validating must leave the checkout
+        // byte-for-byte as it found it.
         let status = tokio::process::Command::new("git")
-            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .args([
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ])
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .current_dir(&checkout_real)
             .output()
             .await
@@ -3006,6 +3029,7 @@ impl TaskExecutor {
                     run: Some(next),
                     branch: Some(branch.clone()),
                     start_head: Some(start_head.clone()),
+                    acceptance: None,
                     stage: crate::domain::task::WorkerHandoffStage::Started,
                 });
                 run.store(next, std::sync::atomic::Ordering::Relaxed);
@@ -5668,6 +5692,7 @@ impl TaskExecutor {
                             run,
                             branch: task.branch_name.clone(),
                             start_head: None,
+                            acceptance: None,
                             stage: crate::domain::task::WorkerHandoffStage::RecoveryRequired {
                                 reason: reason.clone(),
                                 observed_commit: observed_commit.clone(),
@@ -8759,6 +8784,7 @@ mod tests {
                 run: Some(1),
                 branch: Some("task-recovery".into()),
                 start_head: Some("a".repeat(40)),
+                acceptance: None,
                 stage: crate::domain::task::WorkerHandoffStage::Started,
             });
             (task.id, task.project_id)
@@ -8830,6 +8856,7 @@ mod tests {
                 run: Some(1),
                 branch: task.branch_name.clone(),
                 start_head: Some("a".repeat(40)),
+                acceptance: None,
                 stage: crate::domain::task::WorkerHandoffStage::Started,
             });
             task.clone()
@@ -8891,6 +8918,7 @@ mod tests {
                 run: Some(1),
                 branch: Some("task-completion".into()),
                 start_head: Some("a".repeat(40)),
+                acceptance: None,
                 stage: crate::domain::task::WorkerHandoffStage::CommittedAwaitingReview {
                     commit: "b".repeat(40),
                 },
@@ -15229,6 +15257,7 @@ VERDICT: APPROVED"
                     run: Some(1),
                     branch: Some(WorktreeManager::branch_for_task(w.task_id)),
                     start_head: Some(w.main_tip.clone()),
+                    acceptance: None,
                     stage: crate::domain::task::WorkerHandoffStage::Started,
                 });
                 let board: Vec<_> = tasks

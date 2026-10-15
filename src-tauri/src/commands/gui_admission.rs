@@ -73,6 +73,7 @@ const READ_ONLY: &[&str] = &[
     "get_appearance_mode",
     "get_use_project_rail",
     "get_execution_status",
+    "get_worker_recovery_evidence",
     "get_storage_usage",
     "get_new_work_pause",
     "get_project_readiness",

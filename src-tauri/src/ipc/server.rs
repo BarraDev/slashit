@@ -1452,6 +1452,7 @@ pub(crate) mod tests {
             run: Some(1),
             branch: Some("task-branch".into()),
             start_head: None,
+            acceptance: None,
             stage: WorkerHandoffStage::RecoveryRequired {
                 reason: "evidence that must survive".into(),
                 observed_commit: None,
