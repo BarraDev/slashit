@@ -884,6 +884,7 @@ fn mark_worker_recovery_required(task: &mut Task, run: Option<u32>, reason: &str
         reason: reason.to_string(),
         observed_commit,
     };
+    task.worker_handoff_confirmed = false;
     task.status = domain::TaskStatus::Error;
     task.phase = domain::TaskPhase::Idle;
     task.phase_progress = 0;

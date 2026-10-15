@@ -127,6 +127,172 @@ fn review_verdict(run: &AgentRun) -> ReviewVerdict {
 const NO_TASK_BRANCH: &str = "this task records no branch, so SlashIt cannot tell which branch its work belongs on, and \
      nothing was committed";
 
+/// How [`TaskExecutor::verify_worker_checkout`] relates the branch to the
+/// commit SlashIt recorded for a Worker result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerCommitProof {
+    /// The branch tip is exactly the commit. Required before the first review
+    /// of a result, when nothing legitimate has advanced the branch.
+    ExactTip,
+    /// The commit is still in the branch's history. Used once a review has
+    /// been admitted, because that review's fix agent may have committed on
+    /// top. This is reachability only: it does not say who wrote the commits
+    /// after it.
+    ReachableFromTip,
+}
+
+/// Why a Task Checkout cannot be trusted with a Worker result. Each variant
+/// is a different fact; none claims the branch moved unless Git showed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckoutRefusal {
+    RepositoryUnavailable(String),
+    CheckoutUnavailable(String),
+    /// `git worktree list` could not be run or read.
+    RegistrationUnreadable(String),
+    /// The path is registered to another branch, or the registration is locked.
+    RegisteredElsewhere,
+    /// Git lists no unique registration of this checkout and branch.
+    NotRegistered,
+    BranchMissing,
+    /// A Git subprocess failed or answered unreadably.
+    GitUnreadable(String),
+    CommitMissing {
+        commit: String,
+    },
+    /// The branch holds the recorded commit and more.
+    BranchAdvanced {
+        expected: String,
+        tip: String,
+    },
+    /// The recorded commit is no longer in the branch's history.
+    HistoryRewritten {
+        expected: String,
+        tip: String,
+    },
+    AncestryUnreadable(String),
+    /// The checkout is detached or names another branch.
+    UnexpectedBranch,
+    HeadMismatch {
+        expected: String,
+        found: Option<String>,
+    },
+    /// The checkout's own state could not be read.
+    CheckoutUnreadable(String),
+    Dirty,
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+impl std::fmt::Display for CheckoutRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const KEPT: &str = "work was preserved";
+        match self {
+            Self::RepositoryUnavailable(e) => write!(
+                f,
+                "The owning repository cannot be verified ({e}); the checkout was preserved."
+            ),
+            Self::CheckoutUnavailable(e) => write!(
+                f,
+                "The recorded Task Checkout is missing or unavailable ({e}); its Git references \
+                 were preserved."
+            ),
+            Self::RegistrationUnreadable(e) => write!(
+                f,
+                "Git Task Checkout registration could not be read ({e}); {KEPT}."
+            ),
+            Self::RegisteredElsewhere => write!(
+                f,
+                "The recorded Task Checkout is locked or registered to a different branch; \
+                 {KEPT}."
+            ),
+            Self::NotRegistered => write!(
+                f,
+                "Git does not list exactly one registration of the recorded checkout and branch; \
+                 {KEPT}."
+            ),
+            Self::BranchMissing => {
+                write!(f, "The recorded Task branch no longer exists; {KEPT}.")
+            }
+            Self::GitUnreadable(e) => {
+                write!(
+                    f,
+                    "Git could not be read to verify the checkout ({e}); {KEPT}."
+                )
+            }
+            Self::CommitMissing { commit } => write!(
+                f,
+                "The recorded commit {} is not in the repository; {KEPT}.",
+                short_sha(commit)
+            ),
+            Self::BranchAdvanced { expected, tip } => write!(
+                f,
+                "The Task branch is at {}, past the recorded Worker commit {}; {KEPT}.",
+                short_sha(tip),
+                short_sha(expected)
+            ),
+            Self::HistoryRewritten { expected, tip } => write!(
+                f,
+                "The recorded commit {} is not in the history of the Task branch (now at {}); \
+                 the branch was rewritten or rewound. {KEPT}.",
+                short_sha(expected),
+                short_sha(tip)
+            ),
+            Self::AncestryUnreadable(e) => {
+                write!(f, "Ancestry could not be verified ({e}); {KEPT}.")
+            }
+            Self::UnexpectedBranch => write!(
+                f,
+                "The Task Checkout is detached or names a branch other than the recorded one; \
+                 {KEPT}."
+            ),
+            Self::HeadMismatch { expected, found } => write!(
+                f,
+                "The Task Checkout HEAD ({}) is not the Task branch tip {}; {KEPT}.",
+                found.as_deref().map_or("unreadable", short_sha),
+                short_sha(expected)
+            ),
+            Self::CheckoutUnreadable(e) => {
+                write!(f, "The Task Checkout cannot be read ({e}); {KEPT}.")
+            }
+            Self::Dirty => write!(
+                f,
+                "The Task Checkout is dirty; all files and Git references were preserved for \
+                 inspection."
+            ),
+        }
+    }
+}
+
+/// The commit `rev` names in `dir`, or `None` when Git says there is none.
+/// A Git failure is an error, never "absent".
+async fn resolve_commit(
+    dir: &std::path::Path,
+    rev: &str,
+) -> Result<Option<String>, CheckoutRefusal> {
+    let output = tokio::process::Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .current_dir(dir)
+        .output()
+        .await
+        .map_err(|e| CheckoutRefusal::GitUnreadable(e.to_string()))?;
+    match output.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )),
+        Some(1) if output.stderr.iter().all(u8::is_ascii_whitespace) => Ok(None),
+        _ => Err(CheckoutRefusal::GitUnreadable(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        )),
+    }
+}
+
 /// What a fix-agent run means for the review's signoff.
 #[derive(Debug, PartialEq, Eq)]
 enum FixOutcome {
@@ -2004,28 +2170,37 @@ impl TaskExecutor {
                 continue;
             };
             let branch = handoff.branch.as_deref().unwrap_or_default();
-            // A durable admission marker is the proof that the exact commit was
-            // re-proved before a review began; the fix agent's own later
-            // commits are then legitimate, and re-proving the Worker's commit
-            // would wrongly send the Task back to recovery.
-            let already_admitted = matches!(
+            // A durable admission marker records that an admission decision was
+            // made; it proves neither that the checkout is still safe nor that
+            // a reviewer ever started. Once it exists the fix agent's own later
+            // commits are legitimate, so the branch need not still sit on the
+            // Worker's commit, but the commit must remain in its history and
+            // the checkout must still be the Task's own clean working copy.
+            let proof = if matches!(
                 handoff_stage,
                 crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { .. }
-            ) && task.review_admitted_for_current_result();
-            let validation = if already_admitted {
-                Ok(())
+            ) && task.review_admitted_for_current_result()
+            {
+                WorkerCommitProof::ReachableFromTip
             } else {
-                Self::validate_worker_checkout(&repository.local_path, checkout, branch, &commit)
-                    .await
+                WorkerCommitProof::ExactTip
             };
-            if let Err(reason) = validation {
+            if let Err(refusal) = Self::verify_worker_checkout(
+                &repository.local_path,
+                checkout,
+                branch,
+                &commit,
+                proof,
+            )
+            .await
+            {
                 let _ = Self::record_recovery_required(
                     &self.tasks,
                     &self.storage,
                     task_id,
                     Some(run),
                     None,
-                    &reason,
+                    &refusal.to_string(),
                 )
                 .await;
                 continue;
@@ -2076,6 +2251,7 @@ impl TaskExecutor {
                     {
                         return;
                     }
+                    current.worker_handoff_confirmed = false;
                     current.status = TaskStatus::AiReview;
                     current.phase = TaskPhase::QaReview;
                     current.phase_progress = 80;
@@ -2113,41 +2289,42 @@ impl TaskExecutor {
         }
     }
 
-    pub(crate) async fn validate_worker_checkout(
+    /// Read-only proof that the Task Checkout is still the Task's own, clean,
+    /// registered working copy of `branch`, and that `commit` is where the
+    /// branch stands (`ExactTip`) or is still in its history
+    /// (`ReachableFromTip`). It never resets, cleans, checks out or prunes
+    /// anything: every failure preserves the checkout as found.
+    ///
+    /// Ancestry establishes reachability only, not who wrote the commits that
+    /// follow `commit`.
+    pub(crate) async fn verify_worker_checkout(
         repo: &str,
         checkout: &str,
         branch: &str,
-        expected_commit: &str,
-    ) -> Result<(), String> {
-        let repo_real = std::fs::canonicalize(repo).map_err(|e| {
-            format!("The owning repository cannot be verified ({e}); the checkout was preserved.")
-        })?;
-        let checkout_real = std::fs::canonicalize(checkout).map_err(|e| format!("The recorded Task Checkout is missing or unavailable ({e}); its Git references were preserved."))?;
+        commit: &str,
+        proof: WorkerCommitProof,
+    ) -> Result<(), CheckoutRefusal> {
+        let repo_real = std::fs::canonicalize(repo)
+            .map_err(|e| CheckoutRefusal::RepositoryUnavailable(e.to_string()))?;
+        let checkout_real = std::fs::canonicalize(checkout)
+            .map_err(|e| CheckoutRefusal::CheckoutUnavailable(e.to_string()))?;
         let listing = tokio::process::Command::new("git")
             .args(["worktree", "list", "--porcelain"])
             .current_dir(&repo_real)
             .output()
             .await
-            .map_err(|e| {
-                format!(
-                    "Git Task Checkout registration could not be read ({e}); work was preserved."
-                )
-            })?;
+            .map_err(|e| CheckoutRefusal::RegistrationUnreadable(e.to_string()))?;
         if !listing.status.success() {
-            return Err(
-                "Git Task Checkout registration could not be verified; work was preserved.".into(),
-            );
+            return Err(CheckoutRefusal::RegistrationUnreadable(
+                String::from_utf8_lossy(&listing.stderr).trim().to_string(),
+            ));
         }
         let text = String::from_utf8_lossy(&listing.stdout);
-        let records: Vec<_> = text
-            .split("\n\n")
-            .filter(|record| !record.trim().is_empty())
-            .collect();
         let branch_ref = format!("refs/heads/{branch}");
         let mut matching_path = 0;
         let mut matching_branch = 0;
         let mut registered_head = None;
-        for record in records {
+        for record in text.split("\n\n").filter(|r| !r.trim().is_empty()) {
             let path = record
                 .lines()
                 .find_map(|line| line.strip_prefix("worktree "));
@@ -2162,53 +2339,82 @@ impl TaskExecutor {
                 if branch_line != Some(branch_ref.as_str())
                     || record.lines().any(|line| line.starts_with("locked"))
                 {
-                    return Err("The recorded Task Checkout is locked or registered to a different branch; work was preserved.".into());
+                    return Err(CheckoutRefusal::RegisteredElsewhere);
                 }
-                registered_head = record.lines().find_map(|line| line.strip_prefix("HEAD "));
+                registered_head = record
+                    .lines()
+                    .find_map(|line| line.strip_prefix("HEAD "))
+                    .map(str::to_string);
             }
         }
-        if matching_path != 1 || matching_branch != 1 || registered_head != Some(expected_commit) {
-            return Err("Git does not show exactly one unlocked registration of the expected branch, checkout and commit; work was preserved.".into());
+        if matching_path != 1 || matching_branch != 1 {
+            return Err(CheckoutRefusal::NotRegistered);
         }
-        let branch_head = tokio::process::Command::new("git")
-            .args(["rev-parse", "--verify", &format!("{branch_ref}^{{commit}}")])
-            .current_dir(&repo_real)
-            .output()
+
+        let tip = match resolve_commit(&repo_real, &branch_ref).await? {
+            Some(tip) => tip,
+            None => return Err(CheckoutRefusal::BranchMissing),
+        };
+        if tip != commit {
+            // Say what actually differs, not just that something does.
+            if resolve_commit(&repo_real, commit).await?.is_none() {
+                return Err(CheckoutRefusal::CommitMissing {
+                    commit: commit.to_string(),
+                });
+            }
+            match crate::worktree::restack::is_ancestor(
+                std::path::Path::new(&repo_real),
+                commit,
+                &tip,
+            )
             .await
-            .map_err(|e| {
-                format!("The Task branch tip could not be checked ({e}); work was preserved.")
-            })?;
-        if !branch_head.status.success()
-            || String::from_utf8_lossy(&branch_head.stdout).trim() != expected_commit
-        {
-            return Err("The Task branch moved away from the exact recorded Worker commit; work was preserved.".into());
+            {
+                Ok(true) if proof == WorkerCommitProof::ExactTip => {
+                    return Err(CheckoutRefusal::BranchAdvanced {
+                        expected: commit.to_string(),
+                        tip,
+                    });
+                }
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(CheckoutRefusal::HistoryRewritten {
+                        expected: commit.to_string(),
+                        tip,
+                    });
+                }
+                Err(e) => return Err(CheckoutRefusal::AncestryUnreadable(e)),
+            }
+        } else if resolve_commit(&repo_real, commit).await?.is_none() {
+            return Err(CheckoutRefusal::CommitMissing {
+                commit: commit.to_string(),
+            });
         }
+        if registered_head.as_deref() != Some(tip.as_str()) {
+            return Err(CheckoutRefusal::HeadMismatch {
+                expected: tip,
+                found: registered_head,
+            });
+        }
+
         let checkout_branch = tokio::process::Command::new("git")
             .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
             .current_dir(&checkout_real)
             .output()
             .await
-            .map_err(|e| {
-                format!("The Task Checkout branch cannot be read ({e}); work was preserved.")
-            })?;
+            .map_err(|e| CheckoutRefusal::CheckoutUnreadable(e.to_string()))?;
         if !checkout_branch.status.success()
             || String::from_utf8_lossy(&checkout_branch.stdout).trim() != branch
         {
-            return Err(
-                "The Task Checkout no longer names the recorded branch; work was preserved.".into(),
-            );
+            return Err(CheckoutRefusal::UnexpectedBranch);
         }
-        let head = tokio::process::Command::new("git")
-            .args(["rev-parse", "--verify", "HEAD^{commit}"])
-            .current_dir(&checkout_real)
-            .output()
-            .await
-            .map_err(|e| {
-                format!("The Task Checkout HEAD cannot be read ({e}); work was preserved.")
-            })?;
-        if !head.status.success() || String::from_utf8_lossy(&head.stdout).trim() != expected_commit
-        {
-            return Err("The Task Checkout HEAD is not the exact recorded Worker commit; work was preserved.".into());
+        match resolve_commit(&checkout_real, "HEAD").await? {
+            Some(head) if head == tip => {}
+            found => {
+                return Err(CheckoutRefusal::HeadMismatch {
+                    expected: tip,
+                    found,
+                });
+            }
         }
         // Never refresh the index: validating must leave the checkout
         // byte-for-byte as it found it.
@@ -2223,13 +2429,14 @@ impl TaskExecutor {
             .current_dir(&checkout_real)
             .output()
             .await
-            .map_err(|e| {
-                format!(
-                    "The Task Checkout cleanliness cannot be checked ({e}); work was preserved."
-                )
-            })?;
-        if !status.status.success() || !status.stdout.is_empty() {
-            return Err("The Task Checkout is dirty; all files and Git references were preserved for inspection.".into());
+            .map_err(|e| CheckoutRefusal::CheckoutUnreadable(e.to_string()))?;
+        if !status.status.success() {
+            return Err(CheckoutRefusal::CheckoutUnreadable(
+                String::from_utf8_lossy(&status.stderr).trim().to_string(),
+            ));
+        }
+        if !status.stdout.is_empty() {
+            return Err(CheckoutRefusal::Dirty);
         }
         Ok(())
     }
@@ -3051,6 +3258,7 @@ impl TaskExecutor {
                     run: next,
                     addressing_feedback,
                 });
+                t.worker_handoff_confirmed = false;
                 t.worker_handoff = Some(crate::domain::task::WorkerHandoff {
                     task_id,
                     project_id: t.project_id,
@@ -4382,6 +4590,7 @@ impl TaskExecutor {
                     observed_commit: None,
                 };
                 stopped.error_message = Some(reason.to_string());
+                stopped.worker_handoff_confirmed = false;
                 Some((handoff.run, reason.to_string()))
             } else {
                 None
@@ -4547,9 +4756,15 @@ impl TaskExecutor {
         else {
             return true;
         };
-        if task.review_admitted_for_current_result() {
-            return true;
-        }
+        // The first review of a result must find the branch exactly on the
+        // Worker's commit. After an admission marker, only continuing
+        // integrity can be demanded: the commit stays in history and the
+        // checkout is still the Task's own and clean.
+        let proof = if task.review_admitted_for_current_result() {
+            WorkerCommitProof::ReachableFromTip
+        } else {
+            WorkerCommitProof::ExactTip
+        };
         let repository_path = match self.projects.read().await.get(&task.project_id) {
             Some(project) => match project.repository_id {
                 Some(id) => self
@@ -4568,7 +4783,9 @@ impl TaskExecutor {
             handoff.branch.as_deref(),
         ) {
             (Some(repo), Some(checkout), Some(branch)) => {
-                Self::validate_worker_checkout(repo, checkout, branch, commit).await
+                Self::verify_worker_checkout(repo, checkout, branch, commit, proof)
+                    .await
+                    .map_err(|refusal| refusal.to_string())
             }
             _ => Err(
                 "The repository, Task Checkout or branch needed to verify the Worker commit \
@@ -5748,6 +5965,7 @@ impl TaskExecutor {
                 }) {
                     return;
                 }
+                t.worker_handoff_confirmed = false;
                 t.status = TaskStatus::AiReview;
                 t.phase = TaskPhase::QaReview;
                 t.phase_progress = 80;
@@ -5813,6 +6031,7 @@ impl TaskExecutor {
                             crate::domain::task::WorkerHandoffStage::CommittedAwaitingReview {
                                 commit: commit.to_string(),
                             };
+                        task.worker_handoff_confirmed = false;
                         updated.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
@@ -5876,6 +6095,9 @@ impl TaskExecutor {
                     reason: reason.clone(),
                     observed_commit,
                 };
+                // Whatever was confirmed no longer holds: the next acceptance
+                // must earn its own acknowledgement.
+                task.worker_handoff_confirmed = false;
                 task.status = TaskStatus::Error;
                 task.phase = TaskPhase::Idle;
                 task.phase_progress = 0;
@@ -5952,6 +6174,7 @@ impl TaskExecutor {
             if let Some(t) = staged.get_mut(&task_id) {
                 t.status = TaskStatus::Error;
                 t.phase = TaskPhase::Failed;
+                t.worker_handoff_confirmed = false;
                 t.error_message = Some(msg_owned.clone());
                 if let Some(tools) = &tools {
                     tools.apply_to(t);

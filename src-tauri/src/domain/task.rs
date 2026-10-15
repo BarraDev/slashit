@@ -420,9 +420,13 @@ impl Task {
     }
 
     /// Whether an AI Review has already been admitted for the current Worker
-    /// run's result. Review admission re-proves the exact handoff commit only
-    /// before the first review of a result: a later review of the same result
-    /// legitimately sees the fix agent's own commits.
+    /// run's result. Review admission requires the branch to sit exactly on the
+    /// handoff commit only before the first review of a result: a later review
+    /// of the same result legitimately sees the fix agent's own commits.
+    ///
+    /// This is a record that an admission decision was made, nothing more. It
+    /// does not prove the checkout is still safe or that a reviewer ever
+    /// started, so callers still verify the checkout once it exists.
     pub fn review_admitted_for_current_result(&self) -> bool {
         let Some(handoff) = self.worker_handoff.as_ref() else {
             return false;
