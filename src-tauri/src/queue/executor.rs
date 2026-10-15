@@ -133,17 +133,13 @@ const NO_TASK_BRANCH: &str =
 const ADMISSION_SETTLEMENT_REASON: &str =
     "The start of the AI Review could not be confirmed on disk and could not be withdrawn; work was preserved.";
 
-/// Waits between retries of the recovery record for a held admission. The
-/// first retry runs on the next pass, with no wait; after each failed retry
-/// the next one waits for the matching entry here. After the last wait the
-/// retries stop, and the Task stays held in process without further writes.
-const ADMISSION_RECOVERY_RETRY_DELAYS: [std::time::Duration; 5] = [
-    std::time::Duration::from_secs(5),
-    std::time::Duration::from_secs(15),
-    std::time::Duration::from_secs(30),
-    std::time::Duration::from_secs(60),
-    std::time::Duration::from_secs(120),
-];
+/// Backoff for the recovery record of a held admission. The first retry runs
+/// on the next pass, with no wait. After a failed retry the next one waits
+/// twice as long as the one before, starting from this base, and never longer
+/// than the maximum. The retries never stop, so a Task held through a long
+/// outage settles on the first pass after storage accepts writes again.
+const ADMISSION_RECOVERY_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(5);
+const ADMISSION_RECOVERY_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A Task whose review-admission marker is in its activity but not yet
 /// superseded by a recovery record confirmed durable. It holds what a retry
@@ -155,19 +151,24 @@ struct UnsettledAdmission {
     run: Option<u32>,
     /// The Worker commit the marker was recorded for.
     commit: String,
-    /// Retries of the recovery record that failed so far.
+    /// Retries of the recovery record that failed so far. A count, not a log:
+    /// the schedule is what it implies.
     failed_retries: u32,
-    /// When the next retry may run; `None` once the retries are exhausted.
-    retry_at: Option<std::time::Instant>,
+    /// When the next retry may run.
+    retry_at: std::time::Instant,
 }
 
 impl UnsettledAdmission {
-    /// Record one more failed retry and schedule the next one, if any.
+    /// Record one more failed retry and schedule the next one.
     fn after_failed_retry(&mut self) {
-        self.failed_retries += 1;
-        self.retry_at = ADMISSION_RECOVERY_RETRY_DELAYS
-            .get(self.failed_retries as usize - 1)
-            .map(|delay| std::time::Instant::now() + *delay);
+        self.failed_retries = self.failed_retries.saturating_add(1);
+        // `failed_retries` is at least one here. The shift is capped well
+        // before `u32` overflow; the maximum applies long before that.
+        let doublings = (self.failed_retries - 1).min(16);
+        let wait = ADMISSION_RECOVERY_RETRY_BASE
+            .saturating_mul(1 << doublings)
+            .min(ADMISSION_RECOVERY_RETRY_MAX);
+        self.retry_at = std::time::Instant::now() + wait;
     }
 }
 
@@ -5014,7 +5015,7 @@ impl TaskExecutor {
                         run: handoff.run,
                         commit: commit.clone(),
                         failed_retries: 0,
-                        retry_at: None,
+                        retry_at: std::time::Instant::now(),
                     })
                 }
                 _ => None,
@@ -5039,7 +5040,7 @@ impl TaskExecutor {
             Ok(()) => {}
             Err(_) => {
                 // The first retry runs on the next pass.
-                pending.retry_at = Some(std::time::Instant::now());
+                pending.retry_at = std::time::Instant::now();
                 self.unconfirmed_review_admissions
                     .lock()
                     .unwrap()
@@ -5087,10 +5088,7 @@ impl TaskExecutor {
                 .remove(&task_id);
             return true;
         }
-        if pending
-            .retry_at
-            .is_some_and(|due| std::time::Instant::now() >= due)
-        {
+        if std::time::Instant::now() >= pending.retry_at {
             self.retry_admission_recovery(task_id, pending).await;
         }
         true
@@ -5129,23 +5127,14 @@ impl TaskExecutor {
             // Published or not, the record is not confirmed. Memory follows
             // the file on a published write, so the Task stays held and the
             // next retry confirms the same record.
+            // No warning per failure: the hold was announced on entry, and a
+            // long outage must not repeat it on every backed-off attempt.
             Err(_) => {
                 pending.after_failed_retry();
-                let exhausted = pending.retry_at.is_none();
-                let attempts = pending.failed_retries;
                 self.unconfirmed_review_admissions
                     .lock()
                     .unwrap()
                     .insert(task_id, pending);
-                if exhausted {
-                    self.events.agent_event(AgentEvent::Log {
-                        task_id: task_id.to_string(),
-                        level: LogLevel::Warn,
-                        message: format!(
-                            "AI Review stays held: the recovery record could not be confirmed on disk after {attempts} retries. SlashIt has stopped retrying; no review was started and the Task stays held while this process runs."
-                        ),
-                    });
-                }
             }
         }
     }
@@ -14734,7 +14723,8 @@ VERDICT: APPROVED"
                         run: Some(1),
                         commit: base_commit.clone(),
                         failed_retries: 0,
-                        retry_at: None,
+                        // Not due in this test: the hold must decline without a write.
+                        retry_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
                     },
                 );
 
@@ -18586,14 +18576,12 @@ VERDICT: APPROVED"
             assert!(restarted.worker_recovery_refusal().is_some());
         }
 
-        /// Make a held admission's next retry due now, as if its wait had
-        /// passed. An exhausted hold has no retry scheduled and stays so.
+        /// Make a held admission's next retry due now, as if its backoff had
+        /// passed.
         fn retry_due_now(executor: &TaskExecutor, id: Uuid) {
             let mut held = executor.unconfirmed_review_admissions.lock().unwrap();
             if let Some(held) = held.get_mut(&id) {
-                if held.retry_at.is_some() {
-                    held.retry_at = Some(std::time::Instant::now());
-                }
+                held.retry_at = std::time::Instant::now();
             }
         }
 
@@ -18626,8 +18614,8 @@ VERDICT: APPROVED"
         }
 
         /// A. Storage that never accepts a write again: the Task stays held
-        /// through every pass and its retry budget, nothing is published, no
-        /// reviewer or owner starts, and the warnings are bounded.
+        /// through every pass, nothing is published, no reviewer or owner
+        /// starts, and the warning is given once, on entry.
         #[tokio::test]
         async fn permanent_storage_failure_keeps_the_task_held_without_publishing() {
             let recording = Arc::new(crate::events::RecordingEventSink::new());
@@ -18642,7 +18630,7 @@ VERDICT: APPROVED"
             executor
                 .settle_unconfirmed_review_admission(id, 1, at)
                 .await;
-            // Far more passes than the retry budget allows.
+            // Far more due attempts than the old retry budget allowed.
             for _ in 0..12 {
                 retry_due_now(&executor, id);
                 executor.spawn_review(id).await;
@@ -18664,20 +18652,17 @@ VERDICT: APPROVED"
             assert!(no_owner(&executor, id), "no ownership was registered");
 
             let held = held(&executor, id).expect("the Task stays held");
-            assert_eq!(
-                held.failed_retries,
-                ADMISSION_RECOVERY_RETRY_DELAYS.len() as u32 + 1
-            );
+            assert_eq!(held.failed_retries, 12, "each due attempt was made once");
             assert!(
-                held.retry_at.is_none(),
-                "the retries stop once the budget is spent"
+                held.retry_at > std::time::Instant::now(),
+                "the next attempt stays scheduled"
             );
-            // Exhausted: a pass that is due does not write again.
+            // Not yet due: a pass writes nothing.
             assert!(executor.review_admission_unconfirmed(id).await);
             assert_eq!(
                 held_warnings(&recording),
-                2,
-                "one warning on entry, one when retries stop"
+                1,
+                "the hold is announced once, on entry"
             );
         }
 
@@ -18899,6 +18884,102 @@ VERDICT: APPROVED"
             ));
             assert_eq!(recovery_records(&memory), 0, "the settlement wrote nothing");
             assert_memory_follows_file(&executor, project, id).await;
+        }
+
+        /// H. An outage longer than the old retry budget: the Task stays held
+        /// through every due retry, and the first pass after storage returns
+        /// settles it without a restart.
+        #[tokio::test]
+        async fn an_outage_longer_than_the_retry_budget_still_settles_once_storage_returns() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let at = publish_marker(&executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::CreateTemp,
+                std::io::ErrorKind::Other,
+            );
+            executor
+                .settle_unconfirmed_review_admission(id, 1, at)
+                .await;
+            for _ in 0..12 {
+                retry_due_now(&executor, id);
+                executor.spawn_review(id).await;
+            }
+            assert!(held(&executor, id).is_some(), "still held during the outage");
+            drop(fault);
+
+            retry_due_now(&executor, id);
+            executor.spawn_review(id).await;
+
+            let memory = executor.tasks.read().await[&id].clone();
+            assert!(
+                matches!(
+                    memory.worker_handoff.as_ref().unwrap().stage,
+                    WorkerHandoffStage::RecoveryRequired { .. }
+                ),
+                "the long outage must still settle: {:?}",
+                memory.worker_handoff.as_ref().unwrap().stage
+            );
+            assert_eq!(
+                recovery_records(&memory),
+                1,
+                "recorded once across every attempt"
+            );
+            assert!(held(&executor, id).is_none(), "settled, so nothing is held");
+            assert!(executor.reviewing_handles.read().await.is_empty());
+            assert_memory_follows_file(&executor, project, id).await;
+            assert!(on_disk_task(&executor, project, id)
+                .worker_recovery_refusal()
+                .is_some());
+        }
+
+        /// I. A permanent outage is retried at a bounded, backed-off rate: a
+        /// pass that is not due writes nothing, and due retries wait longer
+        /// each time up to a fixed maximum.
+        #[tokio::test]
+        async fn a_permanent_outage_backs_off_to_a_bounded_rate_without_a_busy_loop() {
+            let (executor, _temps) = test_executor();
+            let (id, _project) = resolved(&executor).await;
+            let at = publish_marker(&executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::CreateTemp,
+                std::io::ErrorKind::Other,
+            );
+            executor
+                .settle_unconfirmed_review_admission(id, 1, at)
+                .await;
+            // The first retry is due at once: it runs on the next pass and fails.
+            executor.spawn_review(id).await;
+            let after_first = held(&executor, id).expect("held").failed_retries;
+            assert_eq!(after_first, 1);
+
+            for _ in 0..50 {
+                executor.spawn_review(id).await;
+            }
+            assert_eq!(
+                held(&executor, id).expect("held").failed_retries,
+                after_first,
+                "passes that are not due write nothing"
+            );
+
+            for _ in 0..20 {
+                retry_due_now(&executor, id);
+                executor.spawn_review(id).await;
+            }
+            drop(fault);
+
+            let pending = held(&executor, id).expect("still held");
+            let wait = pending
+                .retry_at
+                .saturating_duration_since(std::time::Instant::now());
+            assert!(
+                wait <= std::time::Duration::from_secs(300),
+                "the backoff is capped at five minutes, waited {wait:?}"
+            );
+            assert!(
+                pending.failed_retries > after_first,
+                "the due retries were attempted"
+            );
         }
     }
 }
