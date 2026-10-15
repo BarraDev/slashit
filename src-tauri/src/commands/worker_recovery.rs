@@ -591,7 +591,11 @@ pub(crate) async fn accept_result(
             let resolved = task.worker_handoff.as_ref().is_some_and(|h| {
                 matches!(&h.stage, WorkerHandoffStage::ResolvedToAiReview { commit } if *commit == request.tip)
             });
-            return if resolved && task.worker_handoff_confirmed {
+            // "Applied" needs more than the record: the acceptance must be
+            // confirmed durable and re-proved in this process, or a later
+            // durable lifecycle state must already prove it (the same rule
+            // startup uses to decide whether recovery still holds).
+            return if resolved && task.worker_recovery_refusal().is_none() {
                 Ok(AcceptWorkerResultOutcome::AlreadyApplied { task })
             } else if resolved {
                 // Applied, but this process has not confirmed the write or
@@ -851,7 +855,6 @@ mod tests {
         /// inode (an atomic replacement changes it), mtime and bytes. Equal
         /// snapshots mean no board file was rewritten.
         fn board_files(&self) -> String {
-            use std::os::unix::fs::MetadataExt;
             fn walk(dir: &Path, out: &mut Vec<String>) {
                 let Ok(entries) = std::fs::read_dir(dir) else {
                     return;
@@ -863,12 +866,23 @@ mod tests {
                     } else if let (Ok(meta), Ok(bytes)) =
                         (std::fs::metadata(&path), std::fs::read(&path))
                     {
+                        // A rewrite that keeps the bytes still shows up as a new
+                        // file identity (Unix) or modification time.
+                        #[cfg(unix)]
+                        let identity = {
+                            use std::os::unix::fs::MetadataExt;
+                            format!(
+                                "ino={} mtime={}.{}",
+                                meta.ino(),
+                                meta.mtime(),
+                                meta.mtime_nsec()
+                            )
+                        };
+                        #[cfg(not(unix))]
+                        let identity = format!("mtime={:?}", meta.modified().ok());
                         out.push(format!(
-                            "{} ino={} mtime={}.{} {:x}",
+                            "{} {identity} {:x}",
                             path.display(),
-                            meta.ino(),
-                            meta.mtime(),
-                            meta.mtime_nsec(),
                             md5_like(&bytes)
                         ));
                     }
@@ -1143,6 +1157,7 @@ mod tests {
         assert_eq!(completions(&fx.task().await), 1);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_same_decision_after_a_restart_has_no_second_effect_and_is_confirmed_only_once_revalidated(
     ) {
@@ -1185,6 +1200,41 @@ mod tests {
         );
         assert_eq!(completions(&fx.task().await), 1);
         assert!(!agent.invocations().contains("claude"));
+    }
+
+    #[tokio::test]
+    async fn a_task_that_durably_progressed_past_ai_review_still_answers_an_identical_replay() {
+        let fx = fixture().await;
+        let id = Uuid::new_v4();
+        accept_result(&fx.state, fx.request(id)).await.unwrap();
+        // Restart (the acknowledgement is lost), then review completed and
+        // the Task durably moved on.
+        fx.edit(|t| t.status = TaskStatus::HumanReview).await;
+        let reloaded = fx.on_disk();
+        assert!(!reloaded.worker_handoff_confirmed);
+        fx.state
+            .task
+            .tasks
+            .write()
+            .await
+            .insert(fx.task_id, reloaded);
+        let (task, repo_state, board) = (fx.task().await, fx.repo_state(), fx.board_files());
+
+        let again = accept_result(&fx.state, fx.request(id)).await.unwrap();
+        assert!(
+            matches!(again, AcceptWorkerResultOutcome::AlreadyApplied { .. }),
+            "{again:?}"
+        );
+        let mut conflicting = fx.request(id);
+        conflicting.observed_commit = Some("a".repeat(40));
+        let reason = refusal(accept_result(&fx.state, conflicting).await);
+        assert!(reason.contains("different request"), "{reason}");
+        let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
+        assert!(reason.contains("no longer waiting"), "{reason}");
+
+        assert_untouched(&fx, &task, &repo_state).await;
+        assert_eq!(fx.board_files(), board);
+        assert_eq!(completions(&fx.task().await), 1);
     }
 
     #[tokio::test]
@@ -1600,6 +1650,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_published_but_unconfirmed_write_is_reported_and_stays_gated_until_revalidated() {
         let fx = fixture().await;
@@ -1639,6 +1690,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn after_a_restart_review_waits_for_the_commit_to_be_revalidated() {
         let fx = fixture().await;
@@ -1753,6 +1805,7 @@ mod tests {
     /// it is queued for the write lock. No timing: a queued writer makes
     /// `try_read` fail, and that is the condition awaited. `at_barrier` runs
     /// with the decision parked between validation and persistence.
+    #[cfg(unix)]
     async fn decide_with_barrier<T>(
         fx: &Fx,
         decision: AcceptWorkerResultRequest,
@@ -1775,6 +1828,7 @@ mod tests {
         outcome
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_tip_that_moves_between_validation_and_persistence_is_never_reviewed() {
         let fx = fixture().await;
@@ -1832,6 +1886,7 @@ mod tests {
         assert_eq!(completions(&fx.task().await), 1);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_tip_that_moves_after_acceptance_is_caught_before_review_is_admitted() {
         let fx = fixture().await;
@@ -1884,6 +1939,15 @@ mod tests {
         let refs_before = git(&fx.repo, &["for-each-ref"]);
 
         assert!(executor.worker_commit_still_verifies(fx.task_id).await);
+        assert!(
+            !fx.task()
+                .await
+                .activity
+                .iter()
+                .any(|e| matches!(e.kind, ActivityKind::AiReviewStarted { .. })),
+            "proving the commit records nothing"
+        );
+        assert!(executor.record_review_admission(fx.task_id, 1).await);
 
         let admitted = |task: &Task| {
             task.activity
@@ -1899,6 +1963,7 @@ mod tests {
         // is admitted without being sent back to recovery.
         let fix = fx.commit_in_checkout("fix.txt");
         assert!(executor.worker_commit_still_verifies(fx.task_id).await);
+        assert!(executor.record_review_admission(fx.task_id, 2).await);
         let task = fx.task().await;
         assert_eq!(task.status, TaskStatus::AiReview);
         assert!(matches!(
@@ -1909,6 +1974,186 @@ mod tests {
         assert_eq!(git(&fx.checkout, &["rev-parse", "HEAD"]), fix);
     }
 
+    fn started(task: &Task) -> Vec<u32> {
+        task.activity
+            .iter()
+            .filter_map(|e| match e.kind {
+                ActivityKind::AiReviewStarted { review } => Some(review),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    async fn settle(fx: &Fx) {
+        let executor = fx.state.executor.get().unwrap().clone();
+        for _ in 0..200 {
+            if !executor.is_task_running(fx.task_id).await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the review did not finish");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_review_without_capacity_leaves_no_marker_and_is_proved_again_before_it_starts() {
+        let fx = fixture().await;
+        let agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
+        accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let executor = fx.state.executor.get().unwrap().clone();
+
+        let held = executor.hold_all_capacity_for_test();
+        executor.poll_once_for_test().await;
+        assert_eq!(started(&fx.task().await), Vec::<u32>::new());
+        assert_eq!(started(&fx.on_disk()), Vec::<u32>::new());
+        assert_eq!(fx.task().await.status, TaskStatus::AiReview);
+
+        // The branch changes while the review waits for capacity.
+        let moved = fx.commit_in_checkout("outside.txt");
+        drop(held);
+        executor.poll_once_for_test().await;
+
+        let task = fx.task().await;
+        assert_eq!(task.status, TaskStatus::Error, "back in recovery");
+        assert_eq!(started(&task), Vec::<u32>::new());
+        assert!(!agent.invocations().contains("claude"), "nothing ran");
+        assert_eq!(
+            git(
+                &fx.repo,
+                &["rev-parse", &format!("refs/heads/{}", fx.branch)]
+            ),
+            moved
+        );
+        assert_eq!(completions(&task), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_review_that_waited_for_capacity_starts_once_under_one_number() {
+        let fx = fixture().await;
+        let _agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
+        accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let executor = fx.state.executor.get().unwrap().clone();
+
+        let held = executor.hold_all_capacity_for_test();
+        executor.poll_once_for_test().await;
+        executor.poll_once_for_test().await;
+        assert_eq!(started(&fx.task().await), Vec::<u32>::new());
+        drop(held);
+
+        executor.poll_once_for_test().await;
+        settle(&fx).await;
+
+        let task = fx.task().await;
+        assert_eq!(started(&task), vec![1], "one start, one number");
+        assert_eq!(started(&fx.on_disk()), vec![1]);
+        let numbers: Vec<u32> = task
+            .activity
+            .iter()
+            .filter_map(|e| match e.kind {
+                ActivityKind::AiReviewFailed { review, .. }
+                | ActivityKind::AiReviewSkipped { review, .. }
+                | ActivityKind::AiReviewApproved { review }
+                | ActivityKind::AiReviewChangesRequested { review, .. } => Some(review),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !numbers.is_empty() && numbers.iter().all(|n| *n == 1),
+            "the review ran to an outcome under its admission number: {numbers:?}"
+        );
+        assert_eq!(completions(&task), 1);
+    }
+
+    #[tokio::test]
+    async fn after_a_restart_an_admitted_review_is_not_sent_back_to_recovery_by_its_own_fix_commit()
+    {
+        let fx = fixture().await;
+        accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let executor = fx.state.executor.get().unwrap().clone();
+        assert!(executor.worker_commit_still_verifies(fx.task_id).await);
+        assert!(executor.record_review_admission(fx.task_id, 1).await);
+        let fix = fx.commit_in_checkout("fix.txt");
+
+        let reloaded = fx.on_disk();
+        assert!(!reloaded.worker_handoff_confirmed);
+        fx.state
+            .task
+            .tasks
+            .write()
+            .await
+            .insert(fx.task_id, reloaded);
+        executor.reconcile_committed_worker_handoffs().await;
+
+        let task = fx.task().await;
+        assert_eq!(task.status, TaskStatus::AiReview);
+        assert!(task.worker_handoff_confirmed);
+        assert_eq!(started(&task), vec![1]);
+        assert_eq!(completions(&task), 1);
+        assert_eq!(git(&fx.checkout, &["rev-parse", "HEAD"]), fix);
+    }
+
+    #[tokio::test]
+    async fn an_admission_marker_that_is_not_durable_is_withdrawn_and_the_commit_proved_again() {
+        let fx = fixture().await;
+        accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let executor = fx.state.executor.get().unwrap().clone();
+        assert!(executor.worker_commit_still_verifies(fx.task_id).await);
+
+        for stage in [Stage::Replace, Stage::SyncDirectory] {
+            let admitted = {
+                let _fault = fault::fail_at(stage, std::io::ErrorKind::Other);
+                executor.record_review_admission(fx.task_id, 1).await
+            };
+            assert!(!admitted, "{stage:?}: no review without durable evidence");
+            let task = fx.task().await;
+            assert_eq!(started(&task), Vec::<u32>::new(), "{stage:?}");
+            assert!(!task.review_admitted_for_current_result(), "{stage:?}");
+        }
+
+        // An outside writer moves the branch: the next attempt notices.
+        fx.commit_in_checkout("outside.txt");
+        assert!(!executor.worker_commit_still_verifies(fx.task_id).await);
+        assert_eq!(fx.task().await.status, TaskStatus::Error);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_review_does_not_start_while_another_lifecycle_operation_owns_the_task() {
+        let fx = fixture().await;
+        let agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
+        accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let executor = fx.state.executor.get().unwrap().clone();
+        let before = fx.board_files();
+
+        let lease = fx
+            .state
+            .task_lifecycle_locks
+            .acquire(fx.task_id)
+            .await
+            .unwrap();
+        executor.spawn_review_for_test(fx.task_id).await;
+        drop(lease);
+
+        assert!(!executor.is_task_running(fx.task_id).await);
+        assert_eq!(started(&fx.task().await), Vec::<u32>::new());
+        assert_eq!(fx.board_files(), before, "nothing was written");
+        assert!(!agent.invocations().contains("claude"));
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_unconfirmed_write_repeated_is_never_reported_applied_and_has_no_second_write() {
         let fx = fixture().await;
@@ -1980,6 +2225,7 @@ mod tests {
         assert_eq!(completions(&fx.task().await), 1);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_refused_or_stale_decision_never_launches_a_coding_worker() {
         let fx = fixture().await;
@@ -1996,6 +2242,7 @@ mod tests {
         assert_untouched(&fx, &task, &repo_state).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_new_human_acceptance_after_failed_revalidation_is_current_and_consistent() {
         let fx = fixture().await;

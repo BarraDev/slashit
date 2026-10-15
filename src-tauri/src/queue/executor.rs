@@ -1653,9 +1653,20 @@ impl TaskExecutor {
 
     /// One poller pass, for tests that drive review admission from outside
     /// this module.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn poll_once_for_test(&self) {
         self.check_and_execute().await;
+    }
+
+    /// Take every free execution permit, so the next review finds no capacity.
+    #[cfg(all(test, unix))]
+    pub(crate) fn hold_all_capacity_for_test(&self) -> Vec<AdmissionPermit> {
+        std::iter::from_fn(|| self.admission.try_acquire()).collect()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) async fn spawn_review_for_test(&self, task_id: Uuid) {
+        self.spawn_review(task_id).await;
     }
 
     async fn check_and_execute(&self) {
@@ -1993,9 +2004,20 @@ impl TaskExecutor {
                 continue;
             };
             let branch = handoff.branch.as_deref().unwrap_or_default();
-            let validation =
+            // A durable admission marker is the proof that the exact commit was
+            // re-proved before a review began; the fix agent's own later
+            // commits are then legitimate, and re-proving the Worker's commit
+            // would wrongly send the Task back to recovery.
+            let already_admitted = matches!(
+                handoff_stage,
+                crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { .. }
+            ) && task.review_admitted_for_current_result();
+            let validation = if already_admitted {
+                Ok(())
+            } else {
                 Self::validate_worker_checkout(&repository.local_path, checkout, branch, &commit)
-                    .await;
+                    .await
+            };
             if let Err(reason) = validation {
                 let _ = Self::record_recovery_required(
                     &self.tasks,
@@ -4511,7 +4533,9 @@ impl TaskExecutor {
     /// Re-prove the exact Worker commit before the first AI Review of its
     /// result. A failure puts the Task back into recovery with the checkout
     /// and references untouched; it never starts a provider or moves Git.
-    /// The caller holds the Task's lifecycle lease.
+    /// Success changes nothing: it only says the proof held now. The caller
+    /// holds the Task's lifecycle lease and, once it has capacity, records the
+    /// admission with [`Self::record_review_admission`].
     pub(crate) async fn worker_commit_still_verifies(&self, task_id: Uuid) -> bool {
         let Some(task) = self.tasks.read().await.get(&task_id).cloned() else {
             return false;
@@ -4553,26 +4577,9 @@ impl TaskExecutor {
             ),
         };
         match verdict {
-            Ok(()) => {
-                // Durable before the review can write to Git: a retried review
-                // after the fix agent committed must not be re-proved against
-                // the Worker's commit. Declining leaves the next pass to retry.
-                let review = task.next_review();
-                let now = chrono::Utc::now();
-                let mark = |staged: &mut HashMap<Uuid, Task>| {
-                    staged.get_mut(&task_id).is_some_and(|t| {
-                        t.record_activity_at(now, ActivityKind::AiReviewStarted { review })
-                    })
-                };
-                crate::lifecycle::record_typed_if_changed(
-                    &self.tasks,
-                    &self.storage,
-                    task_id,
-                    &mark,
-                )
-                .await
-                .is_ok()
-            }
+            // Read-only so far: the durable admission marker is written by
+            // `record_review_admission`, only once a review can really start.
+            Ok(()) => true,
             Err(reason) => {
                 let _ = Self::record_recovery_required(
                     &self.tasks,
@@ -4584,6 +4591,70 @@ impl TaskExecutor {
                 )
                 .await;
                 false
+            }
+        }
+    }
+
+    /// Make the first AI Review of a Worker result durable before it can write
+    /// to Git, under the number it will run with. Called with the lifecycle
+    /// lease and an admission permit held, after `worker_commit_still_verifies`
+    /// and immediately before the review is registered, so a review that
+    /// cannot get capacity leaves no marker behind. A review that is not the
+    /// first of a Worker result needs none. Answers whether the review may
+    /// start; when the marker is not durable it is withdrawn, so the next
+    /// attempt re-proves the commit instead of trusting it.
+    pub(crate) async fn record_review_admission(&self, task_id: Uuid, review: u32) -> bool {
+        let needs_marker = self.tasks.read().await.get(&task_id).is_some_and(|task| {
+            matches!(
+                task.worker_handoff.as_ref().map(|h| &h.stage),
+                Some(crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { .. })
+            ) && !task.review_admitted_for_current_result()
+        });
+        if !needs_marker {
+            return true;
+        }
+        let now = chrono::Utc::now();
+        let mark = |staged: &mut HashMap<Uuid, Task>| {
+            staged.get_mut(&task_id).is_some_and(|t| {
+                t.record_activity_at(now, ActivityKind::AiReviewStarted { review })
+            })
+        };
+        match crate::lifecycle::record_typed_if_changed(&self.tasks, &self.storage, task_id, &mark)
+            .await
+        {
+            Ok(_) => true,
+            Err(_) => {
+                self.withdraw_review_admission(task_id, review, now).await;
+                false
+            }
+        }
+    }
+
+    /// Remove the marker `record_review_admission` published but could not
+    /// make durable: no review started, so none may count as admitted.
+    async fn withdraw_review_admission(
+        &self,
+        task_id: Uuid,
+        review: u32,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let withdraw = |t: &mut Task| {
+            let before = t.activity.len();
+            t.activity.retain(|e| {
+                !(e.at == at
+                    && matches!(e.kind, ActivityKind::AiReviewStarted { review: r } if r == review))
+            });
+            t.activity.len() != before
+        };
+        let revise =
+            |staged: &mut HashMap<Uuid, Task>| staged.get_mut(&task_id).is_some_and(withdraw);
+        if crate::lifecycle::record_typed_if_changed(&self.tasks, &self.storage, task_id, &revise)
+            .await
+            .is_err()
+        {
+            // The board still shows what was published; remove it there too.
+            if let Some(task) = self.tasks.write().await.get_mut(&task_id) {
+                withdraw(task);
             }
         }
     }
@@ -4715,6 +4786,12 @@ impl TaskExecutor {
         let Some(permit) = self.admission.try_acquire() else {
             return;
         };
+
+        // Durable evidence that this review was admitted, before anything in
+        // it can run. Dropping the permit on a refusal leaves no marker.
+        if !self.record_review_admission(task_id, review).await {
+            return;
+        }
 
         let tasks = self.tasks.clone();
         let reviewing_handles = self.reviewing_handles.clone();
