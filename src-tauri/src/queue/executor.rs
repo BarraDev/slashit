@@ -10296,6 +10296,8 @@ mod tests {
             .unwrap()
             .dependencies
             .clear();
+        git_in(&repo, &["config", "user.email", "test@example.com"]);
+        git_in(&repo, &["config", "user.name", "Test"]);
         publish_default_base(&repo);
         let (_, acquired) = executor
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
@@ -10423,6 +10425,8 @@ mod tests {
             .unwrap()
             .dependencies
             .clear();
+        git_in(&repo, &["config", "user.email", "test@example.com"]);
+        git_in(&repo, &["config", "user.name", "Test"]);
         publish_default_base(&repo);
         let (_, acquired) = executor
             .acquire_task_worktree(task_id, repo.to_str().unwrap())
