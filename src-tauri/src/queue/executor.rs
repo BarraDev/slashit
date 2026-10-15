@@ -124,8 +124,77 @@ fn review_verdict(run: &AgentRun) -> ReviewVerdict {
 /// path, so only a task record written by hand or by a much older version
 /// can lack it, and committing to whatever the checkout has out could put
 /// the work on a branch the task never names.
-const NO_TASK_BRANCH: &str = "this task records no branch, so SlashIt cannot tell which branch its work belongs on, and \
+const NO_TASK_BRANCH: &str =
+    "this task records no branch, so SlashIt cannot tell which branch its work belongs on, and \
      nothing was committed";
+
+/// Reason written to a Task whose review-admission marker could not be
+/// withdrawn. [`admission_settlement_needed`] recognizes the record by it.
+const ADMISSION_SETTLEMENT_REASON: &str =
+    "The start of the AI Review could not be confirmed on disk and could not be withdrawn; work was preserved.";
+
+/// Waits between retries of the recovery record for a held admission. The
+/// first retry runs on the next pass, with no wait; after each failed retry
+/// the next one waits for the matching entry here. After the last wait the
+/// retries stop, and the Task stays held in process without further writes.
+const ADMISSION_RECOVERY_RETRY_DELAYS: [std::time::Duration; 5] = [
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(15),
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(120),
+];
+
+/// A Task whose review-admission marker is in its activity but not yet
+/// superseded by a recovery record confirmed durable. It holds what a retry
+/// needs to tell whether the Task still needs settling, so a newer handoff or
+/// decision is never overwritten.
+#[derive(Debug, Clone)]
+struct UnsettledAdmission {
+    /// The run the admitted result came from.
+    run: Option<u32>,
+    /// The Worker commit the marker was recorded for.
+    commit: String,
+    /// Retries of the recovery record that failed so far.
+    failed_retries: u32,
+    /// When the next retry may run; `None` once the retries are exhausted.
+    retry_at: Option<std::time::Instant>,
+}
+
+impl UnsettledAdmission {
+    /// Record one more failed retry and schedule the next one, if any.
+    fn after_failed_retry(&mut self) {
+        self.failed_retries += 1;
+        self.retry_at = ADMISSION_RECOVERY_RETRY_DELAYS
+            .get(self.failed_retries as usize - 1)
+            .map(|delay| std::time::Instant::now() + *delay);
+    }
+}
+
+/// Whether the Task still needs `pending` settled: its handoff is still the one
+/// the marker was recorded for, or it is the recovery record a retry wrote for
+/// that same commit. A newer handoff, or a decision that replaced the record,
+/// needs nothing from the settlement.
+fn admission_settlement_needed(task: &Task, pending: &UnsettledAdmission) -> bool {
+    let Some(handoff) = task.worker_handoff.as_ref() else {
+        return false;
+    };
+    match &handoff.stage {
+        crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { commit } => {
+            task.status == TaskStatus::AiReview
+                && *commit == pending.commit
+                && handoff.run == pending.run
+        }
+        crate::domain::task::WorkerHandoffStage::RecoveryRequired {
+            reason,
+            observed_commit,
+        } => {
+            reason.as_str() == ADMISSION_SETTLEMENT_REASON
+                && observed_commit.as_deref() == Some(pending.commit.as_str())
+        }
+        _ => false,
+    }
+}
 
 /// How [`TaskExecutor::verify_worker_checkout`] relates the branch to the
 /// commit SlashIt recorded for a Worker result.
@@ -1160,10 +1229,10 @@ pub struct TaskExecutor {
     /// sync::RwLock` the other two handle maps use.
     pr_helper_handles: Arc<std::sync::Mutex<HashMap<Uuid, PrHelperOwner>>>,
     /// Tasks whose review-admission marker is on the board and possibly in the
-    /// file although no review started, and whose recovery record could not be
-    /// published either. Process-local: it is all this process can know when
-    /// storage refuses every write. See [`Self::settle_unconfirmed_review_admission`].
-    unconfirmed_review_admissions: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    /// file although no review started, and whose recovery record is not yet
+    /// confirmed durable. Process-local: it is all this process can know when
+    /// storage refuses writes. See [`Self::settle_unconfirmed_review_admission`].
+    unconfirmed_review_admissions: Arc<std::sync::Mutex<HashMap<Uuid, UnsettledAdmission>>>,
     /// Project Conversation Runs share this executor's admission gate and
     /// cancellation ownership. They are keyed by Conversation identity.
     project_runs: Arc<std::sync::Mutex<HashMap<Uuid, ProjectRunOwner>>>,
@@ -1910,16 +1979,28 @@ impl TaskExecutor {
         let review_pending: Vec<Uuid> = {
             let tasks = self.tasks.read().await;
             let reviewing = self.reviewing_handles.read().await;
+            // A held admission is settled whatever its Task's status now is:
+            // its recovery record may be the only write left to publish. A
+            // Task that no longer exists has nothing left to settle.
+            let held: HashSet<Uuid> = {
+                let mut held = self.unconfirmed_review_admissions.lock().unwrap();
+                held.retain(|id, _| tasks.contains_key(id));
+                held.keys().copied().collect()
+            };
             tasks
                 .values()
-                .filter(|t| t.status == TaskStatus::AiReview && t.phase == TaskPhase::QaReview)
                 .filter(|t| {
-                    t.worker_handoff.as_ref().is_none_or(|handoff| {
-                        matches!(
-                            &handoff.stage,
-                            crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { .. }
-                        ) && t.worker_handoff_confirmed
-                    })
+                    held.contains(&t.id)
+                        || (t.status == TaskStatus::AiReview && t.phase == TaskPhase::QaReview)
+                })
+                .filter(|t| {
+                    held.contains(&t.id)
+                        || t.worker_handoff.as_ref().is_none_or(|handoff| {
+                            matches!(
+                                &handoff.stage,
+                                crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { .. }
+                            ) && t.worker_handoff_confirmed
+                        })
                 })
                 .filter(|t| !reviewing.contains_key(&t.id))
                 .map(|t| t.id)
@@ -4923,48 +5004,150 @@ impl TaskExecutor {
         {
             return;
         }
-        let recorded = Self::record_recovery_required(
+        // The marker is only ever attempted for a ResolvedToAiReview handoff,
+        // so the commit it was recorded for is still on the Task here.
+        let Some(mut pending) = self.tasks.read().await.get(&task_id).and_then(|t| {
+            let handoff = t.worker_handoff.as_ref()?;
+            match &handoff.stage {
+                crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { commit } => {
+                    Some(UnsettledAdmission {
+                        run: handoff.run,
+                        commit: commit.clone(),
+                        failed_retries: 0,
+                        retry_at: None,
+                    })
+                }
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+        // Whatever the result, the recovery record is the only write left
+        // that can make the marker stop reading as an admitted review. Only a
+        // confirmed one ends the hold; anything else keeps the Task held and
+        // retried, because a restart could otherwise read the old marker.
+        match Self::record_recovery_required(
             &self.tasks,
             &self.storage,
             task_id,
+            pending.run,
             None,
-            None,
-            "The start of the AI Review could not be confirmed on disk and could not be withdrawn; work was preserved.",
+            ADMISSION_SETTLEMENT_REASON,
         )
-        .await;
-        if matches!(recorded, Err(crate::lifecycle::RecordWriteError::NotPublished(_))) {
-            self.unconfirmed_review_admissions
-                .lock()
-                .unwrap()
-                .insert(task_id);
+        .await
+        {
+            Ok(()) => {}
+            Err(_) => {
+                // The first retry runs on the next pass.
+                pending.retry_at = Some(std::time::Instant::now());
+                self.unconfirmed_review_admissions
+                    .lock()
+                    .unwrap()
+                    .insert(task_id, pending);
+                self.events.agent_event(AgentEvent::Log {
+                    task_id: task_id.to_string(),
+                    level: LogLevel::Warn,
+                    message: "AI Review is held: its admission marker could not be withdrawn, and the recovery record could not be confirmed on disk. SlashIt will retry the recovery record; no review will start meanwhile.".into(),
+                });
+            }
         }
     }
 
-    /// Whether this process must not admit a review for the Task because an
-    /// unconfirmed admission marker is still held for it. Forgets the Task
-    /// once its handoff is no longer awaiting a first review.
+    /// Whether this process must not admit a review for the Task because a
+    /// held admission marker is still unsettled for it. Called under the
+    /// Task's lifecycle lease, from the review path, before any reviewer,
+    /// fix agent or Worker could start. A held admission is forgotten once the
+    /// Task no longer needs it. When one is due, this makes one bounded retry
+    /// of its recovery record; it is never a reason to start a review.
+    ///
+    /// Releasing a hold answers `true` for this pass too: the Task's state
+    /// moved on under the marker, so this pass must not fall through to a
+    /// review. The next pass selects it again only if its state is still
+    /// awaiting a first review.
     async fn review_admission_unconfirmed(&self, task_id: Uuid) -> bool {
-        if !self
+        let Some(pending) = self
             .unconfirmed_review_admissions
             .lock()
             .unwrap()
-            .contains(&task_id)
-        {
+            .get(&task_id)
+            .cloned()
+        else {
             return false;
-        }
-        let still_resolved = self.tasks.read().await.get(&task_id).is_some_and(|t| {
-            matches!(
-                t.worker_handoff.as_ref().map(|h| &h.stage),
-                Some(crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { .. })
-            )
-        });
-        if !still_resolved {
+        };
+        let needed = self
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .is_some_and(|t| admission_settlement_needed(t, &pending));
+        if !needed {
             self.unconfirmed_review_admissions
                 .lock()
                 .unwrap()
                 .remove(&task_id);
+            return true;
         }
-        still_resolved
+        if pending
+            .retry_at
+            .is_some_and(|due| std::time::Instant::now() >= due)
+        {
+            self.retry_admission_recovery(task_id, pending).await;
+        }
+        true
+    }
+
+    /// One retry of the recovery record a held admission needs. The check and
+    /// the write run under one write guard, so a decision or handoff published
+    /// meanwhile is never overwritten by this stale settlement.
+    async fn retry_admission_recovery(&self, task_id: Uuid, mut pending: UnsettledAdmission) {
+        let revise = |staged: &mut HashMap<Uuid, Task>| {
+            let needed = staged
+                .get(&task_id)
+                .is_some_and(|t| admission_settlement_needed(t, &pending));
+            if needed {
+                Self::stage_recovery_required(
+                    staged,
+                    task_id,
+                    pending.run,
+                    None,
+                    ADMISSION_SETTLEMENT_REASON,
+                );
+            }
+            needed
+        };
+        let outcome =
+            crate::lifecycle::record_typed_if_changed(&self.tasks, &self.storage, task_id, &revise)
+                .await;
+        match outcome {
+            // Confirmed durable, or the Task no longer needs it: nothing held.
+            Ok(_) => {
+                self.unconfirmed_review_admissions
+                    .lock()
+                    .unwrap()
+                    .remove(&task_id);
+            }
+            // Published or not, the record is not confirmed. Memory follows
+            // the file on a published write, so the Task stays held and the
+            // next retry confirms the same record.
+            Err(_) => {
+                pending.after_failed_retry();
+                let exhausted = pending.retry_at.is_none();
+                let attempts = pending.failed_retries;
+                self.unconfirmed_review_admissions
+                    .lock()
+                    .unwrap()
+                    .insert(task_id, pending);
+                if exhausted {
+                    self.events.agent_event(AgentEvent::Log {
+                        task_id: task_id.to_string(),
+                        level: LogLevel::Warn,
+                        message: format!(
+                            "AI Review stays held: the recovery record could not be confirmed on disk after {attempts} retries. SlashIt has stopped retrying; no review was started and the Task stays held while this process runs."
+                        ),
+                    });
+                }
+            }
+        }
     }
 
     async fn spawn_review(&self, task_id: Uuid) {
@@ -6151,58 +6334,69 @@ impl TaskExecutor {
         explicit_commit: Option<&str>,
         reason: &str,
     ) -> Result<(), crate::lifecycle::RecordWriteError> {
-        let reason = slashit_activity::one_line(reason, 350);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
-            if let Some(task) = staged.get_mut(&task_id) {
-                let observed_commit = explicit_commit.map(str::to_string).or_else(|| {
-                    task.worker_handoff.as_ref().and_then(|h| match &h.stage {
-                            crate::domain::task::WorkerHandoffStage::CommittedAwaitingReview {
-                                commit,
-                            }
-                            | crate::domain::task::WorkerHandoffStage::ResolvedToAiReview {
-                                commit,
-                            } => Some(commit.clone()),
-                            crate::domain::task::WorkerHandoffStage::RecoveryRequired {
-                                observed_commit,
-                                ..
-                            } => observed_commit.clone(),
-                            crate::domain::task::WorkerHandoffStage::Started => None,
-                        })
-                });
-                let handoff =
-                    task.worker_handoff
-                        .get_or_insert(crate::domain::task::WorkerHandoff {
-                            task_id,
-                            project_id: task.project_id,
-                            repository_id: None,
-                            run,
-                            branch: task.branch_name.clone(),
-                            start_head: None,
-                            acceptance: None,
-                            stage: crate::domain::task::WorkerHandoffStage::RecoveryRequired {
-                                reason: reason.clone(),
-                                observed_commit: observed_commit.clone(),
-                            },
-                        });
-                handoff.run = run.or(handoff.run);
-                handoff.stage = crate::domain::task::WorkerHandoffStage::RecoveryRequired {
-                    reason: reason.clone(),
-                    observed_commit,
-                };
-                // Whatever was confirmed no longer holds: the next acceptance
-                // must earn its own acknowledgement.
-                task.worker_handoff_confirmed = false;
-                task.status = TaskStatus::Error;
-                task.phase = TaskPhase::Idle;
-                task.phase_progress = 0;
-                task.error_message = Some(reason.clone());
-                task.record_activity(ActivityKind::RecoveryRequired {
-                    run,
-                    reason: reason.clone(),
-                });
-            }
+            Self::stage_recovery_required(staged, task_id, run, explicit_commit, reason);
         };
         crate::lifecycle::record_typed(tasks, storage, task_id, &amend).await
+    }
+
+    /// The change [`Self::record_recovery_required`] publishes, applied to
+    /// staged state, so a retry can run it under a check of its own. Repeating
+    /// it adds no second activity entry: the entry is once per run.
+    fn stage_recovery_required(
+        staged: &mut HashMap<Uuid, Task>,
+        task_id: Uuid,
+        run: Option<u32>,
+        explicit_commit: Option<&str>,
+        reason: &str,
+    ) {
+        let reason = slashit_activity::one_line(reason, 350);
+        if let Some(task) = staged.get_mut(&task_id) {
+            let observed_commit = explicit_commit.map(str::to_string).or_else(|| {
+                task.worker_handoff.as_ref().and_then(|h| match &h.stage {
+                    crate::domain::task::WorkerHandoffStage::CommittedAwaitingReview { commit }
+                    | crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { commit } => {
+                        Some(commit.clone())
+                    }
+                    crate::domain::task::WorkerHandoffStage::RecoveryRequired {
+                        observed_commit,
+                        ..
+                    } => observed_commit.clone(),
+                    crate::domain::task::WorkerHandoffStage::Started => None,
+                })
+            });
+            let handoff = task
+                .worker_handoff
+                .get_or_insert(crate::domain::task::WorkerHandoff {
+                    task_id,
+                    project_id: task.project_id,
+                    repository_id: None,
+                    run,
+                    branch: task.branch_name.clone(),
+                    start_head: None,
+                    acceptance: None,
+                    stage: crate::domain::task::WorkerHandoffStage::RecoveryRequired {
+                        reason: reason.clone(),
+                        observed_commit: observed_commit.clone(),
+                    },
+                });
+            handoff.run = run.or(handoff.run);
+            handoff.stage = crate::domain::task::WorkerHandoffStage::RecoveryRequired {
+                reason: reason.clone(),
+                observed_commit,
+            };
+            // Whatever was confirmed no longer holds: the next acceptance
+            // must earn its own acknowledgement.
+            task.worker_handoff_confirmed = false;
+            task.status = TaskStatus::Error;
+            task.phase = TaskPhase::Idle;
+            task.phase_progress = 0;
+            task.error_message = Some(reason.clone());
+            task.record_activity(ActivityKind::RecoveryRequired {
+                run,
+                reason: reason.clone(),
+            });
+        }
     }
 
     /// Move a task to `Error`/`Failed`, durably before the board can show it.
@@ -14529,11 +14723,20 @@ VERDICT: APPROVED"
             task.worker_handoff_confirmed = true;
             let task_id = task.id;
             executor.tasks.write().await.insert(task_id, task);
+            // Held with no retry due: the review must still decline.
             executor
                 .unconfirmed_review_admissions
                 .lock()
                 .unwrap()
-                .insert(task_id);
+                .insert(
+                    task_id,
+                    UnsettledAdmission {
+                        run: Some(1),
+                        commit: base_commit.clone(),
+                        failed_retries: 0,
+                        retry_at: None,
+                    },
+                );
 
             review_declines(&executor, &mock, task_id, "unconfirmed admission marker").await;
         }
@@ -18320,8 +18523,9 @@ VERDICT: APPROVED"
                 slashit_durable_fs::Stage::CreateTemp,
                 std::io::ErrorKind::Other,
             );
-            executor.settle_unconfirmed_review_admission(id, 1, at).await;
-            drop(fault);
+            executor
+                .settle_unconfirmed_review_admission(id, 1, at)
+                .await;
             // Nothing was published: memory still equals the file, marker and all.
             let memory = executor.tasks.read().await[&id].clone();
             assert_eq!(markers(&memory), 1);
@@ -18330,12 +18534,371 @@ VERDICT: APPROVED"
                 WorkerHandoffStage::ResolvedToAiReview { .. }
             ));
             assert_memory_follows_file(&executor, project, id).await;
+            // Storage still refuses: the retry that is due now fails and the hold stays.
             assert!(executor.review_admission_unconfirmed(id).await);
+            drop(fault);
 
             // A restart cannot tell this marker from a real review's: the
             // limitation is that storage accepted no recovery state to read.
             let restarted = on_disk_task(&executor, project, id);
             assert!(restarted.review_admitted_for_current_result());
+        }
+
+        /// Central defect: when the withdrawal and the recovery record both
+        /// fail, the Task is held in process, and nothing ever wrote again
+        /// even after storage returned. The marker stayed on disk with no
+        /// recovery state beside it, so a restart could read it as an admitted
+        /// review. The next pass after storage recovers must record
+        /// `RecoveryRequired`, and no reviewer may start meanwhile.
+        #[tokio::test]
+        async fn a_held_admission_is_recorded_as_recovery_once_storage_returns() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let at = publish_marker(&executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::CreateTemp,
+                std::io::ErrorKind::Other,
+            );
+            executor
+                .settle_unconfirmed_review_admission(id, 1, at)
+                .await;
+            drop(fault);
+
+            // Storage is writable again; the periodic pass runs spawn_review.
+            executor.spawn_review(id).await;
+
+            let memory = executor.tasks.read().await[&id].clone();
+            assert!(
+                matches!(
+                    memory.worker_handoff.as_ref().unwrap().stage,
+                    WorkerHandoffStage::RecoveryRequired { .. }
+                ),
+                "the held admission must be settled by the next pass: {:?}",
+                memory.worker_handoff.as_ref().unwrap().stage
+            );
+            assert_eq!(
+                markers(&memory),
+                1,
+                "memory keeps the marker the file holds"
+            );
+            assert_memory_follows_file(&executor, project, id).await;
+            let restarted = on_disk_task(&executor, project, id);
+            assert!(restarted.worker_recovery_refusal().is_some());
+        }
+
+        /// Make a held admission's next retry due now, as if its wait had
+        /// passed. An exhausted hold has no retry scheduled and stays so.
+        fn retry_due_now(executor: &TaskExecutor, id: Uuid) {
+            let mut held = executor.unconfirmed_review_admissions.lock().unwrap();
+            if let Some(held) = held.get_mut(&id) {
+                if held.retry_at.is_some() {
+                    held.retry_at = Some(std::time::Instant::now());
+                }
+            }
+        }
+
+        fn held(executor: &TaskExecutor, id: Uuid) -> Option<UnsettledAdmission> {
+            executor
+                .unconfirmed_review_admissions
+                .lock()
+                .unwrap()
+                .get(&id)
+                .cloned()
+        }
+
+        fn recovery_records(task: &Task) -> usize {
+            task.activity
+                .iter()
+                .filter(|e| matches!(e.kind, ActivityKind::RecoveryRequired { .. }))
+                .count()
+        }
+
+        /// How many warnings about a held admission the executor reported.
+        fn held_warnings(recording: &crate::events::RecordingEventSink) -> usize {
+            recording
+                .recorded()
+                .iter()
+                .filter(|(_, payload)| {
+                    let text = payload.to_string();
+                    text.contains("AI Review is held") || text.contains("AI Review stays held")
+                })
+                .count()
+        }
+
+        /// A. Storage that never accepts a write again: the Task stays held
+        /// through every pass and its retry budget, nothing is published, no
+        /// reviewer or owner starts, and the warnings are bounded.
+        #[tokio::test]
+        async fn permanent_storage_failure_keeps_the_task_held_without_publishing() {
+            let recording = Arc::new(crate::events::RecordingEventSink::new());
+            let (executor, _temps) = test_executor_with_events(recording.clone());
+            let (id, project) = resolved(&executor).await;
+            let at = publish_marker(&executor, id).await;
+            let before = executor.tasks.read().await[&id].clone();
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::CreateTemp,
+                std::io::ErrorKind::Other,
+            );
+            executor
+                .settle_unconfirmed_review_admission(id, 1, at)
+                .await;
+            // Far more passes than the retry budget allows.
+            for _ in 0..12 {
+                retry_due_now(&executor, id);
+                executor.spawn_review(id).await;
+            }
+            drop(fault);
+
+            let memory = executor.tasks.read().await[&id].clone();
+            assert_eq!(
+                memory.worker_handoff, before.worker_handoff,
+                "checkout, branch and commit evidence are unchanged"
+            );
+            assert_eq!(recovery_records(&memory), 0, "no recovery was published");
+            assert_eq!(markers(&memory), 1);
+            assert_memory_follows_file(&executor, project, id).await;
+            assert!(
+                executor.reviewing_handles.read().await.is_empty(),
+                "no reviewer started"
+            );
+            assert!(no_owner(&executor, id), "no ownership was registered");
+
+            let held = held(&executor, id).expect("the Task stays held");
+            assert_eq!(
+                held.failed_retries,
+                ADMISSION_RECOVERY_RETRY_DELAYS.len() as u32 + 1
+            );
+            assert!(
+                held.retry_at.is_none(),
+                "the retries stop once the budget is spent"
+            );
+            // Exhausted: a pass that is due does not write again.
+            assert!(executor.review_admission_unconfirmed(id).await);
+            assert_eq!(
+                held_warnings(&recording),
+                2,
+                "one warning on entry, one when retries stop"
+            );
+        }
+
+        /// B. Transient storage failure: the marker, its withdrawal and the
+        /// recovery record are all refused, then storage accepts writes again
+        /// without a restart. The next due retry persists RecoveryRequired,
+        /// the Task leaves AiReview, and no reviewer starts while it settles.
+        #[tokio::test]
+        async fn transient_storage_failure_is_settled_by_the_next_due_retry() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            assert!(!executor.record_review_admission(id, 1).await);
+            // One pass while storage still refuses: nothing launches.
+            retry_due_now(&executor, id);
+            executor.spawn_review(id).await;
+            assert!(executor.reviewing_handles.read().await.is_empty());
+            drop(fault);
+
+            // Storage writable again, same process.
+            retry_due_now(&executor, id);
+            executor.spawn_review(id).await;
+
+            let memory = executor.tasks.read().await[&id].clone();
+            assert!(
+                matches!(
+                    memory.worker_handoff.as_ref().unwrap().stage,
+                    WorkerHandoffStage::RecoveryRequired { .. }
+                ),
+                "{:?}",
+                memory.worker_handoff.as_ref().unwrap().stage
+            );
+            assert_eq!(
+                memory.status,
+                TaskStatus::Error,
+                "no longer stuck in AiReview"
+            );
+            assert_eq!(
+                recovery_records(&memory),
+                1,
+                "the recovery was recorded once, not once per attempt"
+            );
+            assert!(held(&executor, id).is_none(), "settled, so nothing is held");
+            assert!(executor.reviewing_handles.read().await.is_empty());
+            assert_memory_follows_file(&executor, project, id).await;
+            let restarted = on_disk_task(&executor, project, id);
+            assert!(restarted.worker_recovery_refusal().is_some());
+        }
+
+        /// C. A durable recovery record is the authority after a restart. The
+        /// old marker cannot admit a review once a later acceptance anchors
+        /// past it, so the next proof is a new one.
+        #[tokio::test]
+        async fn a_durable_recovery_record_outlives_restart_and_the_old_marker() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let at = publish_marker(&executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::CreateTemp,
+                std::io::ErrorKind::Other,
+            );
+            executor
+                .settle_unconfirmed_review_admission(id, 1, at)
+                .await;
+            drop(fault);
+            retry_due_now(&executor, id);
+            executor.spawn_review(id).await;
+
+            let mut restarted = on_disk_task(&executor, project, id);
+            assert!(restarted.worker_recovery_refusal().is_some());
+            // The marker remains in the activity; a person's acceptance made
+            // after it is the new anchor, and the old marker no longer counts.
+            assert!(restarted.review_admitted_for_current_result());
+            restarted.worker_handoff.as_mut().unwrap().acceptance =
+                Some(crate::domain::task::WorkerResultAcceptance {
+                    decision_id: Uuid::new_v4(),
+                    commit: commit(),
+                    observed_commit: None,
+                    decided_at: chrono::Utc::now() + chrono::Duration::seconds(1),
+                });
+            assert!(!restarted.review_admitted_for_current_result());
+        }
+
+        /// E. A decision published while the admission is held wins: the
+        /// stale settlement neither overwrites it nor keeps the hold.
+        #[tokio::test]
+        async fn a_newer_decision_is_not_overwritten_by_a_held_settlement() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let at = publish_marker(&executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::CreateTemp,
+                std::io::ErrorKind::Other,
+            );
+            executor
+                .settle_unconfirmed_review_admission(id, 1, at)
+                .await;
+            drop(fault);
+            assert!(held(&executor, id).is_some());
+
+            let decide = |staged: &mut HashMap<Uuid, Task>| {
+                if let Some(task) = staged.get_mut(&id) {
+                    task.worker_handoff.as_mut().unwrap().stage =
+                        WorkerHandoffStage::RecoveryRequired {
+                            reason: "decided by a person".into(),
+                            observed_commit: None,
+                        };
+                }
+            };
+            crate::lifecycle::record_typed(&executor.tasks, &executor.storage, id, &decide)
+                .await
+                .expect("the decision publishes");
+            retry_due_now(&executor, id);
+
+            // The review path must not fall through to a review on this pass.
+            executor.spawn_review(id).await;
+            assert!(
+                executor.reviewing_handles.read().await.is_empty(),
+                "no reviewer started"
+            );
+            assert!(held(&executor, id).is_none(), "the hold no longer applies");
+            let memory = executor.tasks.read().await[&id].clone();
+            assert!(matches!(
+                &memory.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::RecoveryRequired { reason, .. } if reason == "decided by a person"
+            ));
+            assert_eq!(recovery_records(&memory), 0, "the settlement wrote nothing");
+            assert_memory_follows_file(&executor, project, id).await;
+        }
+
+        /// F. A recovery record whose write is visible but not confirmed
+        /// durable is not treated as confirmed: the Task stays held, and a
+        /// later retry confirms the same record without a second activity.
+        #[tokio::test]
+        async fn an_unconfirmed_recovery_record_is_held_until_a_retry_confirms_it() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let at = publish_marker(&executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            executor
+                .settle_unconfirmed_review_admission(id, 1, at)
+                .await;
+            let memory = executor.tasks.read().await[&id].clone();
+            assert!(matches!(
+                memory.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::RecoveryRequired { .. }
+            ));
+            assert_eq!(recovery_records(&memory), 1);
+            assert_memory_follows_file(&executor, project, id).await;
+            assert!(
+                held(&executor, id).is_some(),
+                "visible but unconfirmed is not confirmed"
+            );
+
+            // Still refusing to confirm: the due retry fails and the hold stays.
+            assert!(executor.review_admission_unconfirmed(id).await);
+            assert!(held(&executor, id).is_some());
+            drop(fault);
+
+            retry_due_now(&executor, id);
+            assert!(executor.review_admission_unconfirmed(id).await);
+            assert!(held(&executor, id).is_none(), "the retry confirmed it");
+            let after = executor.tasks.read().await[&id].clone();
+            assert_eq!(
+                recovery_records(&after),
+                1,
+                "the confirming retry adds no activity"
+            );
+            assert!(on_disk_task(&executor, project, id)
+                .worker_recovery_refusal()
+                .is_some());
+        }
+
+        /// G. A held Task that a person moved on (here to Done, its handoff
+        /// still ResolvedToAiReview) is released without a write: a retry must
+        /// not stamp a recovery record onto a Task that no longer awaits review.
+        #[tokio::test]
+        async fn a_held_task_moved_on_is_released_without_a_write() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let at = publish_marker(&executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::CreateTemp,
+                std::io::ErrorKind::Other,
+            );
+            executor
+                .settle_unconfirmed_review_admission(id, 1, at)
+                .await;
+            drop(fault);
+            assert!(held(&executor, id).is_some());
+
+            let finish = |staged: &mut HashMap<Uuid, Task>| {
+                if let Some(task) = staged.get_mut(&id) {
+                    task.status = TaskStatus::Done;
+                }
+            };
+            crate::lifecycle::record_typed(&executor.tasks, &executor.storage, id, &finish)
+                .await
+                .expect("the move publishes");
+            retry_due_now(&executor, id);
+            executor.spawn_review(id).await;
+
+            assert!(held(&executor, id).is_none(), "released");
+            assert!(
+                executor.reviewing_handles.read().await.is_empty(),
+                "no reviewer started"
+            );
+            let memory = executor.tasks.read().await[&id].clone();
+            assert_eq!(memory.status, TaskStatus::Done);
+            assert!(matches!(
+                memory.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::ResolvedToAiReview { .. }
+            ));
+            assert_eq!(recovery_records(&memory), 0, "the settlement wrote nothing");
+            assert_memory_follows_file(&executor, project, id).await;
         }
     }
 }
