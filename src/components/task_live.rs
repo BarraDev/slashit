@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
-use crate::models::{AgentEvent, AgentStatus, AttentionReason, LiveRun, TaskRunSnapshot, TaskStatus};
+use crate::models::{
+    AgentEvent, AgentStatus, AttentionReason, LiveRun, TaskRunSnapshot, TaskStatus,
+};
 
 /// The most characters of the agent's latest words a one-line activity shows.
 const ACTIVITY_LIMIT: usize = 120;
@@ -27,13 +29,15 @@ pub fn activity_from_event(event: &AgentEvent) -> Option<ActivityUpdate> {
     match event {
         AgentEvent::ToolUse { tool, .. } => Some(ActivityUpdate::Set(format!("Using {tool}"))),
         AgentEvent::Output { text, .. } => last_line(text).map(ActivityUpdate::Set),
-        AgentEvent::PhaseChange { .. } | AgentEvent::Completed { .. } | AgentEvent::Error { .. } => {
-            Some(ActivityUpdate::Clear)
-        }
+        AgentEvent::PhaseChange { .. }
+        | AgentEvent::Completed { .. }
+        | AgentEvent::Error { .. } => Some(ActivityUpdate::Clear),
         // A run beginning or ending belongs to another moment than whatever
         // was shown; one that is running or stopping adds nothing.
         AgentEvent::RunState { status, .. } => match status {
-            AgentStatus::Starting | AgentStatus::Stopped | AgentStatus::Failed(_) => Some(ActivityUpdate::Clear),
+            AgentStatus::Starting | AgentStatus::Stopped | AgentStatus::Failed(_) => {
+                Some(ActivityUpdate::Clear)
+            }
             AgentStatus::Running | AgentStatus::Stopping => None,
         },
         AgentEvent::Log { .. } => None,
@@ -46,7 +50,10 @@ fn last_line(text: &str) -> Option<String> {
     if line.chars().count() <= ACTIVITY_LIMIT {
         Some(line.to_string())
     } else {
-        Some(format!("{}…", line.chars().take(ACTIVITY_LIMIT).collect::<String>()))
+        Some(format!(
+            "{}…",
+            line.chars().take(ACTIVITY_LIMIT).collect::<String>()
+        ))
     }
 }
 
@@ -60,7 +67,10 @@ pub fn changes_task_record(event: &AgentEvent) -> bool {
         event,
         // A run ending is when a stop settles the task, which announces
         // nothing else.
-        AgentEvent::RunState { status: AgentStatus::Stopped | AgentStatus::Failed(_), .. }
+        AgentEvent::RunState {
+            status: AgentStatus::Stopped | AgentStatus::Failed(_),
+            ..
+        }
     )
 }
 
@@ -108,7 +118,10 @@ impl RunBadge {
 ///
 /// A task that needs the person (`attention`) shows that, never a run badge:
 /// the reason is the more useful thing to say.
-pub fn project_run(run: Option<&AgentStatus>, attention: Option<AttentionReason>) -> Option<RunBadge> {
+pub fn project_run(
+    run: Option<&AgentStatus>,
+    attention: Option<AttentionReason>,
+) -> Option<RunBadge> {
     if attention.is_some() {
         return None;
     }
@@ -195,19 +208,34 @@ pub struct DrawerActions {
 
 impl DrawerActions {
     pub fn for_task(status: &TaskStatus, run: &TaskRunSnapshot) -> Self {
+        Self::for_task_with_recovery(status, run, false)
+    }
+
+    pub fn for_task_with_recovery(
+        status: &TaskStatus,
+        run: &TaskRunSnapshot,
+        recovery_required: bool,
+    ) -> Self {
         let live = run.live;
         Self {
-            start: *status == TaskStatus::Backlog && !live,
+            start: *status == TaskStatus::Backlog && !live && !recovery_required,
             // Only a running execution. Stopping an AI review would also
             // send the task back to Backlog, which is a decision this surface
             // does not offer yet.
             stop: live && *status == TaskStatus::InProgress,
-            retry: *status == TaskStatus::Error && !live,
-            edit: matches!(status, TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::Error) && !live,
+            retry: *status == TaskStatus::Error && !live && !recovery_required,
+            edit: matches!(
+                status,
+                TaskStatus::Backlog | TaskStatus::Queue | TaskStatus::Error
+            ) && !live
+                && !recovery_required,
             changes: matches!(
                 status,
-                TaskStatus::AiReview | TaskStatus::HumanReview | TaskStatus::Done | TaskStatus::PrCreated
-            ),
+                TaskStatus::AiReview
+                    | TaskStatus::HumanReview
+                    | TaskStatus::Done
+                    | TaskStatus::PrCreated
+            ) || recovery_required,
         }
     }
 }
@@ -278,7 +306,8 @@ impl StartRequest {
     /// can leave Backlog while the request is still in flight, and a failure
     /// that lands after that no longer describes where the task is.
     pub fn failure_for(&self, status: Option<&TaskStatus>) -> Option<&str> {
-        self.failure().filter(|_| status == Some(&TaskStatus::Backlog))
+        self.failure()
+            .filter(|_| status == Some(&TaskStatus::Backlog))
     }
 }
 
@@ -411,7 +440,10 @@ mod tests {
     }
 
     fn tool(tool: &str) -> AgentEvent {
-        AgentEvent::ToolUse { task_id: "t".into(), tool: tool.into() }
+        AgentEvent::ToolUse {
+            task_id: "t".into(),
+            tool: tool.into(),
+        }
     }
 
     fn run(live: bool, execution: Option<bool>) -> TaskRunSnapshot {
@@ -428,12 +460,24 @@ mod tests {
 
     #[test]
     fn activity_follows_what_the_agent_does_and_ignores_plumbing() {
-        assert_eq!(activity_from_event(&tool("Edit")), Some(ActivityUpdate::Set("Using Edit".into())));
         assert_eq!(
-            activity_from_event(&AgentEvent::Output { task_id: "t".into(), text: "first\n  second  \n\n".into() }),
+            activity_from_event(&tool("Edit")),
+            Some(ActivityUpdate::Set("Using Edit".into()))
+        );
+        assert_eq!(
+            activity_from_event(&AgentEvent::Output {
+                task_id: "t".into(),
+                text: "first\n  second  \n\n".into()
+            }),
             Some(ActivityUpdate::Set("second".into()))
         );
-        assert_eq!(activity_from_event(&AgentEvent::Output { task_id: "t".into(), text: " \n ".into() }), None);
+        assert_eq!(
+            activity_from_event(&AgentEvent::Output {
+                task_id: "t".into(),
+                text: " \n ".into()
+            }),
+            None
+        );
         assert_eq!(
             activity_from_event(&AgentEvent::Log {
                 task_id: "t".into(),
@@ -444,7 +488,11 @@ mod tests {
             "executor bookkeeping (paths) is not the agent's activity"
         );
         assert_eq!(
-            activity_from_event(&AgentEvent::PhaseChange { task_id: "t".into(), phase: TaskPhase::Coding, progress: 10 }),
+            activity_from_event(&AgentEvent::PhaseChange {
+                task_id: "t".into(),
+                phase: TaskPhase::Coding,
+                progress: 10
+            }),
             Some(ActivityUpdate::Clear)
         );
     }
@@ -452,9 +500,10 @@ mod tests {
     #[test]
     fn long_activity_is_cut_to_one_short_line() {
         let long = "x".repeat(500);
-        let Some(ActivityUpdate::Set(shown)) =
-            activity_from_event(&AgentEvent::Output { task_id: "t".into(), text: long })
-        else {
+        let Some(ActivityUpdate::Set(shown)) = activity_from_event(&AgentEvent::Output {
+            task_id: "t".into(),
+            text: long,
+        }) else {
             panic!("expected an activity");
         };
         assert_eq!(shown.chars().count(), ACTIVITY_LIMIT + 1);
@@ -467,7 +516,11 @@ mod tests {
         assert!(!DrawerActions::for_task(&TaskStatus::InProgress, &run(false, Some(true))).stop);
         // An AI review is live, but stopping it is not offered here.
         assert!(!DrawerActions::for_task(&TaskStatus::AiReview, &run(true, Some(true))).stop);
-        for status in [TaskStatus::Backlog, TaskStatus::Error, TaskStatus::HumanReview] {
+        for status in [
+            TaskStatus::Backlog,
+            TaskStatus::Error,
+            TaskStatus::HumanReview,
+        ] {
             assert!(!DrawerActions::for_task(&status, &run(false, None)).stop);
         }
     }
@@ -486,14 +539,39 @@ mod tests {
             TaskStatus::Done,
             TaskStatus::PrCreated,
         ] {
-            assert!(!DrawerActions::for_task(&status, &run(false, Some(true))).retry, "{status:?}");
+            assert!(
+                !DrawerActions::for_task(&status, &run(false, Some(true))).retry,
+                "{status:?}"
+            );
         }
     }
 
     #[test]
     fn human_review_is_read_only_apart_from_its_changes() {
         let actions = DrawerActions::for_task(&TaskStatus::HumanReview, &run(false, Some(true)));
-        assert_eq!(actions, DrawerActions { start: false, stop: false, retry: false, edit: false, changes: true });
+        assert_eq!(
+            actions,
+            DrawerActions {
+                start: false,
+                stop: false,
+                retry: false,
+                edit: false,
+                changes: true
+            }
+        );
+    }
+
+    #[test]
+    fn ambiguous_worker_recovery_offers_changes_but_never_retry_or_edit() {
+        for status in [TaskStatus::Error, TaskStatus::Backlog] {
+            let actions =
+                DrawerActions::for_task_with_recovery(&status, &run(false, Some(true)), true);
+            assert!(!actions.start, "{status:?}");
+            assert!(!actions.stop, "{status:?}");
+            assert!(!actions.retry, "{status:?}");
+            assert!(!actions.edit, "{status:?}");
+            assert!(actions.changes, "{status:?}");
+        }
     }
 
     #[test]
@@ -511,7 +589,10 @@ mod tests {
             TaskStatus::PrCreated,
             TaskStatus::Error,
         ] {
-            assert!(!DrawerActions::for_task(&status, &run(false, None)).start, "{status:?}");
+            assert!(
+                !DrawerActions::for_task(&status, &run(false, None)).start,
+                "{status:?}"
+            );
         }
     }
 
@@ -520,7 +601,10 @@ mod tests {
         let mut start = StartRequest::default();
         assert!(start.begin());
         assert!(start.is_pending());
-        assert!(!start.begin(), "a second press while the first is in flight must not enqueue again");
+        assert!(
+            !start.begin(),
+            "a second press while the first is in flight must not enqueue again"
+        );
         assert_eq!(start.settle(Ok(Some(7))), Some(7));
         assert_eq!(start, StartRequest::Idle);
     }
@@ -529,8 +613,14 @@ mod tests {
     fn a_failed_start_keeps_its_reason_and_can_be_pressed_again() {
         let mut start = StartRequest::default();
         assert!(start.begin());
-        assert_eq!(start.settle::<()>(Err("the board could not be saved".into())), None);
-        assert_eq!(start.failure(), Some("Could not start the task: the board could not be saved"));
+        assert_eq!(
+            start.settle::<()>(Err("the board could not be saved".into())),
+            None
+        );
+        assert_eq!(
+            start.failure(),
+            Some("Could not start the task: the board could not be saved")
+        );
         assert!(!start.is_pending());
 
         // Retrying clears the old reason while the new request is in flight.
@@ -565,10 +655,19 @@ mod tests {
 
     #[test]
     fn output_is_labelled_by_where_it_came_from() {
-        assert_eq!(output_provenance(&run(true, Some(false))), OutputProvenance::Live);
-        assert_eq!(output_provenance(&run(false, Some(true))), OutputProvenance::LastAttempt);
+        assert_eq!(
+            output_provenance(&run(true, Some(false))),
+            OutputProvenance::Live
+        );
+        assert_eq!(
+            output_provenance(&run(false, Some(true))),
+            OutputProvenance::LastAttempt
+        );
         // An AI review is live, but the coding execution it follows has ended.
-        assert_eq!(output_provenance(&run(true, Some(true))), OutputProvenance::LastAttempt);
+        assert_eq!(
+            output_provenance(&run(true, Some(true))),
+            OutputProvenance::LastAttempt
+        );
         assert_eq!(output_provenance(&run(false, None)), OutputProvenance::None);
     }
 
@@ -586,11 +685,17 @@ mod tests {
         let poll = order.issue();
         let after_event = order.issue();
         assert!(order.accept(after_event));
-        assert!(!order.accept(poll), "the poll was answered late and is stale");
+        assert!(
+            !order.accept(poll),
+            "the poll was answered late and is stale"
+        );
 
         let in_flight = order.issue();
         order.supersede_pending();
-        assert!(!order.accept(in_flight), "a command's own answer superseded it");
+        assert!(
+            !order.accept(in_flight),
+            "a command's own answer superseded it"
+        );
         let fresh = order.issue();
         assert!(order.accept(fresh));
     }
@@ -601,20 +706,33 @@ mod tests {
         assert!(gate.request());
         assert!(!gate.request());
         assert!(!gate.request());
-        assert!(gate.finish(), "one more read covers everything that asked meanwhile");
+        assert!(
+            gate.finish(),
+            "one more read covers everything that asked meanwhile"
+        );
         assert!(!gate.finish());
         assert!(gate.request(), "idle again");
     }
 
     #[test]
     fn only_state_changing_events_refresh_the_task_record() {
-        assert!(changes_task_record(&AgentEvent::Completed { task_id: "t".into(), success: true, message: None }));
-        assert!(changes_task_record(&AgentEvent::Error { task_id: "t".into(), message: "m".into() }));
+        assert!(changes_task_record(&AgentEvent::Completed {
+            task_id: "t".into(),
+            success: true,
+            message: None
+        }));
+        assert!(changes_task_record(&AgentEvent::Error {
+            task_id: "t".into(),
+            message: "m".into()
+        }));
         assert!(!changes_task_record(&tool("Read")));
     }
 
     fn run_state(task: Uuid, status: AgentStatus) -> AgentEvent {
-        AgentEvent::RunState { task_id: task.to_string(), status }
+        AgentEvent::RunState {
+            task_id: task.to_string(),
+            status,
+        }
     }
 
     fn working(runs: &LiveRuns, task: &Uuid) -> Option<RunBadge> {
@@ -643,7 +761,11 @@ mod tests {
         runs.apply_event(task, AgentStatus::Stopping);
         assert_eq!(working(&runs, &task), Some(RunBadge::Stopping));
         runs.apply_event(task, AgentStatus::Stopped);
-        assert_eq!(working(&runs, &task), None, "no stale Working after the run ends");
+        assert_eq!(
+            working(&runs, &task),
+            None,
+            "no stale Working after the run ends"
+        );
     }
 
     // matrix 6, 7
@@ -654,7 +776,10 @@ mod tests {
         runs.apply_event(task, AgentStatus::Running);
         runs.apply_event(task, AgentStatus::Failed("boom".into()));
         assert_eq!(working(&runs, &task), None);
-        assert_eq!(RunBadge::from_status(&AgentStatus::Failed("x".into())), None);
+        assert_eq!(
+            RunBadge::from_status(&AgentStatus::Failed("x".into())),
+            None
+        );
     }
 
     // matrix 5: what the agent says moves the activity line, never the run
@@ -666,7 +791,10 @@ mod tests {
         let before = runs.clone();
         for event in [
             tool("Edit"),
-            AgentEvent::Output { task_id: task.to_string(), text: "next step".into() },
+            AgentEvent::Output {
+                task_id: task.to_string(),
+                text: "next step".into(),
+            },
             tool("Bash"),
         ] {
             // Only `run_state` events are fed to the registry.
@@ -693,7 +821,9 @@ mod tests {
                 AgentStatus::Starting | AgentStatus::Running | AgentStatus::Stopping => {
                     assert!(RunBadge::from_status(&status).is_some())
                 }
-                AgentStatus::Stopped | AgentStatus::Failed(_) => assert!(RunBadge::from_status(&status).is_none()),
+                AgentStatus::Stopped | AgentStatus::Failed(_) => {
+                    assert!(RunBadge::from_status(&status).is_none())
+                }
             }
         }
     }
@@ -704,9 +834,18 @@ mod tests {
         let mut runs = LiveRuns::default();
         let task = Uuid::from_u128(1);
         runs.apply_event(task, AgentStatus::Running);
-        assert_eq!(project_run(runs.status(&task).as_ref(), Some(AttentionReason::Review)), None);
-        assert_eq!(project_run(runs.status(&task).as_ref(), Some(AttentionReason::Failed)), None);
-        assert_eq!(project_run(runs.status(&task).as_ref(), None), Some(RunBadge::Working));
+        assert_eq!(
+            project_run(runs.status(&task).as_ref(), Some(AttentionReason::Review)),
+            None
+        );
+        assert_eq!(
+            project_run(runs.status(&task).as_ref(), Some(AttentionReason::Failed)),
+            None
+        );
+        assert_eq!(
+            project_run(runs.status(&task).as_ref(), None),
+            Some(RunBadge::Working)
+        );
     }
 
     // matrix 13
@@ -727,7 +866,10 @@ mod tests {
         let mut runs = LiveRuns::default();
         let task = Uuid::from_u128(1);
         runs.begin_hydration();
-        runs.finish_hydration(Some(vec![LiveRun { task_id: task, status: AgentStatus::Running }]));
+        runs.finish_hydration(Some(vec![LiveRun {
+            task_id: task,
+            status: AgentStatus::Running,
+        }]));
         assert_eq!(working(&runs, &task), Some(RunBadge::Working));
     }
 
@@ -740,10 +882,20 @@ mod tests {
         runs.apply_event(ended, AgentStatus::Stopped);
         runs.apply_event(begun, AgentStatus::Starting);
         runs.finish_hydration(Some(vec![
-            LiveRun { task_id: ended, status: AgentStatus::Running },
-            LiveRun { task_id: quiet, status: AgentStatus::Running },
+            LiveRun {
+                task_id: ended,
+                status: AgentStatus::Running,
+            },
+            LiveRun {
+                task_id: quiet,
+                status: AgentStatus::Running,
+            },
         ]));
-        assert_eq!(working(&runs, &ended), None, "the run ended after the snapshot; no phantom");
+        assert_eq!(
+            working(&runs, &ended),
+            None,
+            "the run ended after the snapshot; no phantom"
+        );
         assert_eq!(working(&runs, &begun), Some(RunBadge::Starting));
         assert_eq!(working(&runs, &quiet), Some(RunBadge::Working));
     }
@@ -765,10 +917,18 @@ mod tests {
     fn a_run_ending_announces_a_task_record_change_and_clears_activity() {
         let task = Uuid::from_u128(1);
         assert!(changes_task_record(&run_state(task, AgentStatus::Stopped)));
-        assert!(changes_task_record(&run_state(task, AgentStatus::Failed("x".into()))));
+        assert!(changes_task_record(&run_state(
+            task,
+            AgentStatus::Failed("x".into())
+        )));
         assert!(!changes_task_record(&run_state(task, AgentStatus::Running)));
-        assert_eq!(activity_from_event(&run_state(task, AgentStatus::Stopped)), Some(ActivityUpdate::Clear));
-        assert_eq!(activity_from_event(&run_state(task, AgentStatus::Running)), None);
+        assert_eq!(
+            activity_from_event(&run_state(task, AgentStatus::Stopped)),
+            Some(ActivityUpdate::Clear)
+        );
+        assert_eq!(
+            activity_from_event(&run_state(task, AgentStatus::Running)),
+            None
+        );
     }
-
 }

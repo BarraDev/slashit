@@ -1,16 +1,16 @@
 use crate::domain::jira::{JiraIssue, JiraProject};
-use crate::domain::{Task, TaskStatus, TaskCategory, TaskPriority, TaskComplexity, TaskImpact, SecuritySeverity, TaskPhase};
 use crate::domain::task::ExternalRef;
+use crate::domain::{
+    SecuritySeverity, Task, TaskCategory, TaskComplexity, TaskImpact, TaskPhase, TaskPriority,
+    TaskStatus,
+};
 use tokio::process::Command;
 use uuid::Uuid;
 
 /// Check if `acli` (Atlassian CLI) is available.
 #[tauri::command]
 pub async fn check_acli_available() -> Result<bool, String> {
-    let output = Command::new("acli")
-        .args(["--version"])
-        .output()
-        .await;
+    let output = Command::new("acli").args(["--version"]).output().await;
 
     match output {
         Ok(o) if o.status.success() => Ok(true),
@@ -40,17 +40,26 @@ async fn run_acli(args: &[&str]) -> Result<serde_json::Value, String> {
 #[tauri::command]
 pub async fn list_jira_projects() -> Result<Vec<JiraProject>, String> {
     let json = run_acli(&[
-        "jira", "--action", "getProjectList", "--outputFormat", "json",
-    ]).await?;
+        "jira",
+        "--action",
+        "getProjectList",
+        "--outputFormat",
+        "json",
+    ])
+    .await?;
 
-    let projects: Vec<JiraProject> = json.as_array()
+    let projects: Vec<JiraProject> = json
+        .as_array()
         .unwrap_or(&Vec::new())
         .iter()
         .filter_map(|v| {
             Some(JiraProject {
                 key: v.get("key")?.as_str()?.to_string(),
                 name: v.get("name")?.as_str()?.to_string(),
-                lead: v.get("lead").and_then(|l| l.as_str()).map(|s| s.to_string()),
+                lead: v
+                    .get("lead")
+                    .and_then(|l| l.as_str())
+                    .map(|s| s.to_string()),
             })
         })
         .collect();
@@ -68,31 +77,75 @@ pub async fn import_jira_issues(
 ) -> Result<Vec<Task>, String> {
     let project_id = Uuid::parse_str(&target_project_id).map_err(|e| e.to_string())?;
 
-    let jql = jql_filter.unwrap_or_else(|| format!("project = {} AND status != Done ORDER BY created DESC", project_key));
+    let jql = jql_filter.unwrap_or_else(|| {
+        format!(
+            "project = {} AND status != Done ORDER BY created DESC",
+            project_key
+        )
+    });
 
     let json = run_acli(&[
-        "jira", "--action", "getIssueList",
-        "--jql", &jql,
-        "--outputFormat", "json",
-        "--limit", "100",
-    ]).await?;
+        "jira",
+        "--action",
+        "getIssueList",
+        "--jql",
+        &jql,
+        "--outputFormat",
+        "json",
+        "--limit",
+        "100",
+    ])
+    .await?;
 
-    let issues: Vec<JiraIssue> = json.as_array()
+    let issues: Vec<JiraIssue> = json
+        .as_array()
         .unwrap_or(&Vec::new())
         .iter()
         .filter_map(|v| {
             Some(JiraIssue {
                 key: v.get("key")?.as_str()?.to_string(),
-                summary: v.get("summary").or(v.get("fields").and_then(|f| f.get("summary"))).and_then(|s| s.as_str())?.to_string(),
-                description: v.get("description").or(v.get("fields").and_then(|f| f.get("description"))).and_then(|d| d.as_str()).map(|s| s.to_string()),
-                status: v.get("status").and_then(|s| s.as_str()).unwrap_or("To Do").to_string(),
-                issue_type: v.get("issuetype").or(v.get("type")).and_then(|t| t.as_str()).unwrap_or("Task").to_string(),
-                priority: v.get("priority").and_then(|p| p.as_str()).map(|s| s.to_string()),
-                assignee: v.get("assignee").and_then(|a| a.as_str()).map(|s| s.to_string()),
-                reporter: v.get("reporter").and_then(|r| r.as_str()).map(|s| s.to_string()),
-                labels: v.get("labels").and_then(|l| l.as_array()).map(|arr| {
-                    arr.iter().filter_map(|l| l.as_str().map(|s| s.to_string())).collect()
-                }).unwrap_or_default(),
+                summary: v
+                    .get("summary")
+                    .or(v.get("fields").and_then(|f| f.get("summary")))
+                    .and_then(|s| s.as_str())?
+                    .to_string(),
+                description: v
+                    .get("description")
+                    .or(v.get("fields").and_then(|f| f.get("description")))
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.to_string()),
+                status: v
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("To Do")
+                    .to_string(),
+                issue_type: v
+                    .get("issuetype")
+                    .or(v.get("type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("Task")
+                    .to_string(),
+                priority: v
+                    .get("priority")
+                    .and_then(|p| p.as_str())
+                    .map(|s| s.to_string()),
+                assignee: v
+                    .get("assignee")
+                    .and_then(|a| a.as_str())
+                    .map(|s| s.to_string()),
+                reporter: v
+                    .get("reporter")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string()),
+                labels: v
+                    .get("labels")
+                    .and_then(|l| l.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|l| l.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 story_points: v.get("storyPoints").and_then(|sp| sp.as_f64()),
                 created: chrono::Utc::now(),
                 updated: chrono::Utc::now(),
@@ -152,6 +205,8 @@ pub async fn import_jira_issues(
             cleanup_in_flight: false,
             pr_review_plan: None,
             activity: Vec::new(),
+            worker_handoff: None,
+            worker_handoff_confirmed: false,
             created_at: now,
             updated_at: now,
         };

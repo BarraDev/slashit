@@ -5,15 +5,27 @@ use slashit_attention as attention;
 pub use slashit_attention::AttentionReason;
 use uuid::Uuid;
 
-pub use slashit_activity::{Column as ActivityColumn, Entry as ActivityEntry, Kind as ActivityKind};
+pub use slashit_activity::{
+    Column as ActivityColumn, Entry as ActivityEntry, Kind as ActivityKind,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "ref_type")]
 pub enum ExternalRef {
     #[serde(rename = "github_issue")]
-    GithubIssue { url: String, number: u32, repo: String, state: Option<String> },
+    GithubIssue {
+        url: String,
+        number: u32,
+        repo: String,
+        state: Option<String>,
+    },
     #[serde(rename = "github_pr")]
-    GithubPr { url: String, number: u32, repo: String, state: Option<String> },
+    GithubPr {
+        url: String,
+        number: u32,
+        repo: String,
+        state: Option<String>,
+    },
     #[serde(rename = "gitlab_issue")]
     GitlabIssue { url: String },
     #[serde(rename = "jira_ticket")]
@@ -27,9 +39,11 @@ impl ExternalRef {
         match self {
             Self::GithubIssue { number, .. } => format!("#{}", number),
             Self::GithubPr { number, .. } => format!("PR #{}", number),
-            Self::GitlabIssue { url } => {
-                url.rsplit('/').next().map(|n| format!("#{}", n)).unwrap_or("Issue".to_string())
-            }
+            Self::GitlabIssue { url } => url
+                .rsplit('/')
+                .next()
+                .map(|n| format!("#{}", n))
+                .unwrap_or("Issue".to_string()),
             Self::JiraTicket { key, .. } => key.clone(),
             Self::LinearTicket { id } => id.clone(),
         }
@@ -37,7 +51,9 @@ impl ExternalRef {
 
     pub fn url(&self) -> Option<&str> {
         match self {
-            Self::GithubIssue { url, .. } | Self::GithubPr { url, .. } | Self::GitlabIssue { url } => Some(url),
+            Self::GithubIssue { url, .. }
+            | Self::GithubPr { url, .. }
+            | Self::GitlabIssue { url } => Some(url),
             Self::JiraTicket { .. } | Self::LinearTicket { .. } => None,
         }
     }
@@ -220,11 +236,59 @@ pub struct Task {
     /// A task written before this existed has none, and its timeline shows
     /// only what the rest of its record proves. An entry a newer version
     /// wrote is skipped rather than failing the load.
-    #[serde(default, deserialize_with = "slashit_activity::lenient", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "slashit_activity::lenient",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub activity: Vec<ActivityEntry>,
+
+    /// Durable evidence for the current or most recent coding Worker handoff.
+    /// Missing evidence on an older Task is unknown and must never be inferred
+    /// from `base_commit` or commit ancestry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_handoff: Option<WorkerHandoff>,
+
+    /// Current-process durability acknowledgement only; always re-proved on
+    /// startup, since it is intentionally not serialized.
+    #[serde(skip)]
+    pub worker_handoff_confirmed: bool,
 
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Task-owned evidence that binds one coding run to its exact branch state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerHandoff {
+    pub task_id: Uuid,
+    pub project_id: Uuid,
+    #[serde(default)]
+    pub repository_id: Option<Uuid>,
+    #[serde(default)]
+    pub run: Option<u32>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub start_head: Option<String>,
+    pub stage: WorkerHandoffStage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkerHandoffStage {
+    Started,
+    CommittedAwaitingReview {
+        commit: String,
+    },
+    RecoveryRequired {
+        reason: String,
+        #[serde(default)]
+        observed_commit: Option<String>,
+    },
+    ResolvedToAiReview {
+        commit: String,
+    },
 }
 
 /// `text` with the user's home directory written as `~`, for text the task
@@ -244,19 +308,26 @@ pub(crate) fn without_home_dir(text: &str) -> String {
 /// matches, so `/home/me` leaves `/home/meg` alone. A home at a filesystem
 /// or drive root is left alone rather than turning every path into `~`.
 fn with_home_as_tilde(text: &str, home: &str) -> String {
-    let home = home.strip_prefix(r"\\?\").unwrap_or(home).trim_end_matches(['/', '\\']);
+    let home = home
+        .strip_prefix(r"\\?\")
+        .unwrap_or(home)
+        .trim_end_matches(['/', '\\']);
     if home.is_empty() || home.len() == 2 && home.ends_with(':') {
         return text.to_string();
     }
     let (bytes, needle) = (text.as_bytes(), home.as_bytes());
-    let same = |a: u8, b: u8| a.eq_ignore_ascii_case(&b) || matches!(a, b'/' | b'\\') && matches!(b, b'/' | b'\\');
+    let same = |a: u8, b: u8| {
+        a.eq_ignore_ascii_case(&b) || matches!(a, b'/' | b'\\') && matches!(b, b'/' | b'\\')
+    };
     let mut out = String::with_capacity(text.len());
     let (mut at, mut copied) = (0, 0);
     // A match starts on `needle`'s first byte and ends on its last, both
     // character boundaries, so the slices below never split a character.
     while at + needle.len() <= bytes.len() {
         let end = at + needle.len();
-        let whole = bytes.get(end).is_none_or(|&c| !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')));
+        let whole = bytes
+            .get(end)
+            .is_none_or(|&c| !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')));
         if whole && bytes[at..end].iter().zip(needle).all(|(&a, &b)| same(a, b)) {
             out.push_str(&text[copied..at]);
             out.push('~');
@@ -297,6 +368,58 @@ pub const INTEGRATION_UNFINISHED_REFUSAL: &str =
     "An integration is unfinished. Resume or Discard it before moving this Task.";
 
 impl Task {
+    /// Whether a resolved Worker handoff was followed by a durable human
+    /// request for another implementation run. This does not apply to an
+    /// interrupted or ambiguous handoff: only a later decision in the current
+    /// Human Review arrival can supersede an already completed run.
+    pub fn resolved_worker_handoff_was_superseded(&self) -> bool {
+        let Some(handoff) = self.worker_handoff.as_ref() else {
+            return false;
+        };
+        let Some(run) = handoff.run else {
+            return false;
+        };
+        if !matches!(handoff.stage, WorkerHandoffStage::ResolvedToAiReview { .. }) {
+            return false;
+        }
+
+        let Some(completed_at) = self.activity.iter().find_map(|entry| {
+            matches!(entry.kind, ActivityKind::RunCompleted { run: completed } if completed == run)
+                .then_some(entry.at)
+        }) else {
+            return false;
+        };
+
+        self.human_review
+            .current_decision()
+            .is_some_and(|decision| {
+                decision.decision == HumanReviewDecision::ChangesRequested
+                    && decision.decided_at >= completed_at
+            })
+    }
+
+    /// Why ordinary Queue/status commands may not bypass recovery.
+    pub fn worker_recovery_refusal(&self) -> Option<String> {
+        self.worker_handoff
+            .as_ref()
+            .filter(|handoff| match &handoff.stage {
+                WorkerHandoffStage::Started
+                | WorkerHandoffStage::CommittedAwaitingReview { .. }
+                | WorkerHandoffStage::RecoveryRequired { .. } => true,
+                // A persisted later lifecycle state is itself evidence that
+                // the already resolved handoff was followed by another
+                // durable Task transition. Startup must not roll HumanReview,
+                // Done or PRCreated back into recovery merely because the
+                // process-local durability acknowledgement is absent.
+                WorkerHandoffStage::ResolvedToAiReview { .. } => {
+                    !self.resolved_worker_handoff_was_superseded()
+                        && !self.worker_handoff_confirmed
+                        && matches!(self.status, TaskStatus::InProgress | TaskStatus::AiReview)
+                }
+            })
+            .map(|_| "This Task has unresolved Worker recovery evidence. Inspect and preserve its Task Checkout before any new attempt.".to_string())
+    }
+
     /// Why this task may not change status right now, or `None`.
     ///
     /// A pending [`Self::local_integration`] is a persisted Git operation
@@ -408,6 +531,8 @@ impl Task {
             cleanup_in_flight: false,
             pr_review_plan: None,
             activity: Vec::new(),
+            worker_handoff: None,
+            worker_handoff_confirmed: false,
             created_at: now,
             updated_at: now,
         }
@@ -455,6 +580,13 @@ impl Task {
             && self.phase == TaskPhase::Idle
             && !self.cleanup_in_flight
             && self.pending_republish.is_none()
+            && self.worker_handoff.as_ref().is_none_or(|handoff| {
+                matches!(
+                    &handoff.stage,
+                    WorkerHandoffStage::ResolvedToAiReview { .. }
+                ) && (self.worker_handoff_confirmed
+                    || self.resolved_worker_handoff_was_superseded())
+            })
     }
 
     /// Record a milestone on the task's timeline now, unless it is a
@@ -468,7 +600,11 @@ impl Task {
     /// A reason is subprocess or agent text, so the home directory in it is
     /// written as `~` here; the timeline masks credentials in it on the way
     /// in (see [`slashit_activity::sanitize`]).
-    pub fn record_activity_at(&mut self, at: chrono::DateTime<chrono::Utc>, mut kind: ActivityKind) -> bool {
+    pub fn record_activity_at(
+        &mut self,
+        at: chrono::DateTime<chrono::Utc>,
+        mut kind: ActivityKind,
+    ) -> bool {
         match &mut kind {
             ActivityKind::RunFailed { reason, .. }
             | ActivityKind::AiReviewFailed { reason, .. }
@@ -484,7 +620,10 @@ impl Task {
     /// that is a move at all.
     pub fn record_move(&mut self, from: &TaskStatus) {
         if *from != self.status {
-            let kind = ActivityKind::Moved { from: from.column(), to: self.status.column() };
+            let kind = ActivityKind::Moved {
+                from: from.column(),
+                to: self.status.column(),
+            };
             self.record_activity(kind);
         }
     }
@@ -549,6 +688,12 @@ impl Task {
     /// `delivery_in_flight` is whether its pull request is being opened at
     /// this moment, which the record cannot say.
     pub fn needs_you(&self, delivery_in_flight: bool) -> Option<AttentionReason> {
+        if matches!(
+            self.worker_handoff.as_ref().map(|handoff| &handoff.stage),
+            Some(WorkerHandoffStage::RecoveryRequired { .. })
+        ) {
+            return Some(AttentionReason::Recovery);
+        }
         attention::Facts {
             status: match self.status {
                 TaskStatus::Error => attention::Status::Error,
@@ -562,14 +707,20 @@ impl Task {
                 | TaskStatus::PrCreated
                 | TaskStatus::Done => attention::Status::Other,
             },
-            decision: self.human_review.current_decision().map(|e| match e.decision {
-                HumanReviewDecision::Approved => attention::Decision::Approved,
-                HumanReviewDecision::ChangesRequested => attention::Decision::ChangesRequested,
-            }),
+            decision: self
+                .human_review
+                .current_decision()
+                .map(|e| match e.decision {
+                    HumanReviewDecision::Approved => attention::Decision::Approved,
+                    HumanReviewDecision::ChangesRequested => attention::Decision::ChangesRequested,
+                }),
             pr_error_recorded: self.human_review.pr_error.is_some(),
             pr_linked: self.pr_url.is_some() || self.external_refs.iter().any(ExternalRef::is_pr),
             delivery_in_flight,
-            integration_pending: self.local_integration.as_ref().is_some_and(|r| r.is_pending()),
+            integration_pending: self
+                .local_integration
+                .as_ref()
+                .is_some_and(|r| r.is_pending()),
         }
         .needs_you()
     }
@@ -687,17 +838,25 @@ impl PrReviewPlan {
     /// nothing is known about what the agent saw, and the entry stays absent
     /// (legacy behavior) rather than guessed.
     pub fn record_fixed_content(&mut self, comment_id: u64) {
-        let Some(fingerprint) = self.comments.iter()
+        let Some(fingerprint) = self
+            .comments
+            .iter()
             .find(|c| c.id == Some(comment_id))
             .map(PrReviewComment::fingerprint)
-        else { return; };
+        else {
+            return;
+        };
         self.fixed_content.retain(|f| f.comment_id != comment_id);
-        self.fixed_content.push(FixedContent { comment_id, fingerprint });
+        self.fixed_content.push(FixedContent {
+            comment_id,
+            fingerprint,
+        });
     }
 
     /// The fingerprint recorded for the text fixed for `comment_id`, if any.
     pub fn fixed_fingerprint(&self, comment_id: u64) -> Option<&str> {
-        self.fixed_content.iter()
+        self.fixed_content
+            .iter()
             .find(|f| f.comment_id == comment_id)
             .map(|f| f.fingerprint.as_str())
     }
@@ -745,11 +904,17 @@ impl PrReviewPlan {
     /// processes the comment afresh. `fix_uncommitted` is not touched; it
     /// describes the checkout, not the comment.
     pub fn backfill_lifecycle_from_last_apply(&mut self) {
-        let Some(last) = self.last_apply.clone() else { return; };
-        if last.dry_run { return; }
+        let Some(last) = self.last_apply.clone() else {
+            return;
+        };
+        if last.dry_run {
+            return;
+        }
         // `reply_errors` come back as `"comment <id>: <msg>"`. Lift the ids out
         // so we know which fixed items missed the reply step.
-        let failed_reply_ids: std::collections::HashSet<u64> = last.reply_errors.iter()
+        let failed_reply_ids: std::collections::HashSet<u64> = last
+            .reply_errors
+            .iter()
             .filter_map(|s| {
                 let rest = s.strip_prefix("comment ")?;
                 let (id, _) = rest.split_once(':')?;
@@ -757,7 +922,9 @@ impl PrReviewPlan {
             })
             .collect();
         for idx in 0..self.items.len() {
-            let Some(cid) = self.items[idx].comment_id else { continue; };
+            let Some(cid) = self.items[idx].comment_id else {
+                continue;
+            };
             let current = last.fixed_ids.contains(&cid)
                 && self.fixed_content_is_current(cid, last.applied_at);
             let item = &mut self.items[idx];
@@ -1309,7 +1476,10 @@ impl HumanReviewRecord {
         feedback: Option<String>,
         decided_at: chrono::DateTime<chrono::Utc>,
     ) {
-        let sequence = self.entries.last().map_or(1, |e| e.sequence.saturating_add(1));
+        let sequence = self
+            .entries
+            .last()
+            .map_or(1, |e| e.sequence.saturating_add(1));
         self.entries.push(HumanReviewEntry {
             sequence,
             arrival: self.arrivals,
@@ -1343,8 +1513,15 @@ impl HumanReviewRecord {
     /// of it, so a descendant, a rewrite and a missing branch all refuse.
     /// A task with no branch has nothing to bind, and a task without a
     /// current approval is for the caller's own approval check.
-    pub fn binds(&self, has_branch: bool, branch_tip: Option<&str>) -> Result<(), ApprovalBindingRefusal> {
-        let Some(entry) = self.current_decision().filter(|e| e.decision == HumanReviewDecision::Approved) else {
+    pub fn binds(
+        &self,
+        has_branch: bool,
+        branch_tip: Option<&str>,
+    ) -> Result<(), ApprovalBindingRefusal> {
+        let Some(entry) = self
+            .current_decision()
+            .filter(|e| e.decision == HumanReviewDecision::Approved)
+        else {
             return Ok(());
         };
         if !has_branch {
@@ -1355,8 +1532,13 @@ impl HumanReviewRecord {
         };
         match branch_tip {
             Some(tip) if tip == approved => Ok(()),
-            Some(tip) => Err(ApprovalBindingRefusal::Moved { approved: approved.to_string(), current: tip.to_string() }),
-            None => Err(ApprovalBindingRefusal::BranchMissing { approved: approved.to_string() }),
+            Some(tip) => Err(ApprovalBindingRefusal::Moved {
+                approved: approved.to_string(),
+                current: tip.to_string(),
+            }),
+            None => Err(ApprovalBindingRefusal::BranchMissing {
+                approved: approved.to_string(),
+            }),
         }
     }
 
@@ -1430,16 +1612,25 @@ mod tests {
         assert_eq!(review.binds(true, Some(&a)), Ok(()));
         assert_eq!(
             review.binds(true, Some(&b)),
-            Err(ApprovalBindingRefusal::Moved { approved: a.clone(), current: b })
+            Err(ApprovalBindingRefusal::Moved {
+                approved: a.clone(),
+                current: b
+            })
         );
-        assert_eq!(review.binds(true, None), Err(ApprovalBindingRefusal::BranchMissing { approved: a }));
+        assert_eq!(
+            review.binds(true, None),
+            Err(ApprovalBindingRefusal::BranchMissing { approved: a })
+        );
         // A task with no branch has nothing to bind.
         assert_eq!(review.binds(false, None), Ok(()));
 
         let mut legacy = HumanReviewRecord::default();
         legacy.record_arrival();
         legacy.approve(None, chrono::Utc::now());
-        assert_eq!(legacy.binds(true, Some(&"c".repeat(40))), Err(ApprovalBindingRefusal::Unrecorded));
+        assert_eq!(
+            legacy.binds(true, Some(&"c".repeat(40))),
+            Err(ApprovalBindingRefusal::Unrecorded)
+        );
         assert_eq!(legacy.binds(false, None), Ok(()));
     }
 
@@ -1542,6 +1733,10 @@ mod tests {
             Some(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap()),
             "worktree_id should be populated from the legacy `workspace_id` key",
         );
+        assert!(
+            task.worker_handoff.is_none(),
+            "historical Tasks have no guessed run evidence"
+        );
     }
 
     #[test]
@@ -1556,6 +1751,114 @@ mod tests {
         let task: Task = toml::from_str(&toml_str)
             .expect("record with no worktree reference at all must still deserialize");
         assert_eq!(task.worktree_id, None);
+    }
+
+    #[test]
+    fn old_json_and_toml_tasks_load_without_worker_handoff_evidence() {
+        let from_toml: Task =
+            toml::from_str(LEGACY_TASK_TOML).expect("old Task TOML remains compatible");
+        let mut old_json = serde_json::to_value(&from_toml).expect("Task IPC JSON");
+        old_json.as_object_mut().unwrap().remove("worker_handoff");
+        let from_json: Task =
+            serde_json::from_value(old_json).expect("old JSON/IPC Task remains compatible");
+        assert!(from_json.worker_handoff.is_none());
+        assert!(!from_json.worker_handoff_confirmed);
+    }
+
+    #[test]
+    fn a_recovery_required_task_is_not_ready_and_needs_the_user() {
+        let mut task = startable_task();
+        task.worker_handoff = Some(WorkerHandoff {
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: Some("task/example".into()),
+            start_head: Some("a".repeat(40)),
+            stage: WorkerHandoffStage::RecoveryRequired {
+                reason: "exact commit unknown".into(),
+                observed_commit: None,
+            },
+        });
+        assert!(!task.is_ready_to_execute());
+        assert_eq!(task.needs_you(false), Some(AttentionReason::Recovery));
+        assert!(task.worker_recovery_refusal().is_some());
+
+        for stage in [
+            WorkerHandoffStage::Started,
+            WorkerHandoffStage::CommittedAwaitingReview {
+                commit: "b".repeat(40),
+            },
+        ] {
+            task.worker_handoff.as_mut().unwrap().stage = stage;
+            assert!(
+                !task.is_ready_to_execute(),
+                "unresolved durable stages must not become eligible"
+            );
+            assert!(
+                task.worker_recovery_refusal().is_some(),
+                "lifecycle retry/cleanup must be held too"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_later_current_changes_request_supersedes_a_resolved_handoff() {
+        let mut task = startable_task();
+        let completed_at = chrono::Utc::now();
+        task.worker_handoff = Some(WorkerHandoff {
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: Some("task/example".into()),
+            start_head: Some("a".repeat(40)),
+            stage: WorkerHandoffStage::ResolvedToAiReview {
+                commit: "b".repeat(40),
+            },
+        });
+        task.record_activity_at(completed_at, ActivityKind::RunCompleted { run: 1 });
+        task.human_review.record_arrival();
+        task.human_review.push(
+            HumanReviewDecision::ChangesRequested,
+            Some("please revise".into()),
+            completed_at + chrono::Duration::seconds(1),
+        );
+
+        assert!(task.resolved_worker_handoff_was_superseded());
+        assert!(task.worker_recovery_refusal().is_none());
+        assert!(task.is_ready_to_execute());
+    }
+
+    #[test]
+    fn an_older_changes_request_does_not_supersede_a_later_resolved_handoff() {
+        let mut task = startable_task();
+        let prior_decision_at = chrono::Utc::now();
+        task.worker_handoff = Some(WorkerHandoff {
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: Some("task/example".into()),
+            start_head: Some("a".repeat(40)),
+            stage: WorkerHandoffStage::ResolvedToAiReview {
+                commit: "b".repeat(40),
+            },
+        });
+        task.human_review.record_arrival();
+        task.human_review.push(
+            HumanReviewDecision::ChangesRequested,
+            Some("please revise".into()),
+            prior_decision_at,
+        );
+        task.record_activity_at(
+            prior_decision_at + chrono::Duration::seconds(1),
+            ActivityKind::RunCompleted { run: 1 },
+        );
+
+        assert!(!task.resolved_worker_handoff_was_superseded());
+        assert!(task.worker_recovery_refusal().is_some());
+        assert!(!task.is_ready_to_execute());
     }
 
     /// A board written by a build that predates `cleanup_in_flight` loads with
@@ -1645,14 +1948,19 @@ mod tests {
         assert_eq!(serde_json::to_string(&read).unwrap(), json_text);
 
         let resolved = Holder {
-            origin: BranchOrigin::DefaultBase { branch: Some("main".to_string()) },
+            origin: BranchOrigin::DefaultBase {
+                branch: Some("main".to_string()),
+            },
         };
         assert_eq!(
             serde_json::to_string(&resolved).unwrap(),
             r#"{"origin":{"kind":"default_base","branch":"main"}}"#
         );
         let toml_text = toml::to_string(&resolved).unwrap();
-        assert_eq!(toml_text, "[origin]\nkind = \"default_base\"\nbranch = \"main\"\n");
+        assert_eq!(
+            toml_text,
+            "[origin]\nkind = \"default_base\"\nbranch = \"main\"\n"
+        );
         assert_eq!(toml::from_str::<Holder>(&toml_text).unwrap(), resolved);
     }
 
@@ -1688,12 +1996,19 @@ mod tests {
             chrono::Utc::now(),
         );
         task.human_review.record_arrival();
-        task.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        task.human_review
+            .push(HumanReviewDecision::Approved, None, chrono::Utc::now());
         task.human_review.pr_error = Some("gh failed".to_string());
 
-        let toml_text = toml::to_string_pretty(&File { tasks: vec![task.clone()] }).unwrap();
+        let toml_text = toml::to_string_pretty(&File {
+            tasks: vec![task.clone()],
+        })
+        .unwrap();
         let loaded: File = toml::from_str(&toml_text).expect(&toml_text);
-        assert_eq!(loaded.tasks[0].human_review, task.human_review, "{toml_text}");
+        assert_eq!(
+            loaded.tasks[0].human_review, task.human_review,
+            "{toml_text}"
+        );
 
         let json = serde_json::to_string(&task).unwrap();
         let loaded: Task = serde_json::from_str(&json).unwrap();
@@ -1706,7 +2021,11 @@ mod tests {
         review.record_arrival();
         assert!(review.current_decision().is_none());
 
-        review.push(HumanReviewDecision::ChangesRequested, Some("fix it".into()), chrono::Utc::now());
+        review.push(
+            HumanReviewDecision::ChangesRequested,
+            Some("fix it".into()),
+            chrono::Utc::now(),
+        );
         assert_eq!(review.pending_feedback(), vec!["fix it"]);
         assert!(!review.is_approved());
 
@@ -1718,7 +2037,11 @@ mod tests {
         review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
         assert!(review.is_approved());
         assert_eq!(
-            review.entries.iter().map(|e| (e.sequence, e.arrival)).collect::<Vec<_>>(),
+            review
+                .entries
+                .iter()
+                .map(|e| (e.sequence, e.arrival))
+                .collect::<Vec<_>>(),
             vec![(1, 1), (2, 2)]
         );
 
@@ -1743,7 +2066,11 @@ mod tests {
         assert_eq!(task.needs_you(false), Some(AttentionReason::Review));
 
         // Request Changes records the request and queues the task in one write.
-        task.human_review.push(HumanReviewDecision::ChangesRequested, Some("again".into()), chrono::Utc::now());
+        task.human_review.push(
+            HumanReviewDecision::ChangesRequested,
+            Some("again".into()),
+            chrono::Utc::now(),
+        );
         task.status = TaskStatus::Queue;
         assert_eq!(task.needs_you(false), None, "queued");
         task.status = TaskStatus::InProgress;
@@ -1756,15 +2083,24 @@ mod tests {
         task.human_review.record_arrival();
         assert_eq!(task.needs_you(false), Some(AttentionReason::Review));
 
-        task.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        task.human_review
+            .push(HumanReviewDecision::Approved, None, chrono::Utc::now());
         assert_eq!(task.needs_you(false), None, "approved, nothing failed");
 
         task.human_review.pr_error = Some("gh: HTTP 422".into());
         assert_eq!(task.needs_you(false), Some(AttentionReason::PrNotCreated));
-        assert_eq!(task.needs_you(true), None, "while a retry is opening the pull request");
+        assert_eq!(
+            task.needs_you(true),
+            None,
+            "while a retry is opening the pull request"
+        );
 
         task.pr_url = Some("https://github.com/o/r/pull/1".into());
-        assert_eq!(task.needs_you(false), None, "a linked pull request outranks the old failure");
+        assert_eq!(
+            task.needs_you(false),
+            None,
+            "a linked pull request outranks the old failure"
+        );
     }
 
     /// A change request made on a task that was then moved back into Human
@@ -1772,7 +2108,11 @@ mod tests {
     #[test]
     fn human_review_with_changes_requested_is_not_an_undecided_review() {
         let mut task = arrived_in_review();
-        task.human_review.push(HumanReviewDecision::ChangesRequested, Some("again".into()), chrono::Utc::now());
+        task.human_review.push(
+            HumanReviewDecision::ChangesRequested,
+            Some("again".into()),
+            chrono::Utc::now(),
+        );
         assert_eq!(task.needs_you(false), None);
     }
 
@@ -1817,24 +2157,52 @@ mod tests {
     fn a_pending_integration_needs_the_user_until_it_is_integrated_or_discarded() {
         use crate::domain::IntegrationState::{Integrated, Pending};
         let mut review = arrived_in_review();
-        review.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        review
+            .human_review
+            .push(HumanReviewDecision::Approved, None, chrono::Utc::now());
         assert_eq!(review.needs_you(false), None);
         review.local_integration = Some(integration(Pending));
-        assert_eq!(review.needs_you(false), Some(AttentionReason::IntegrationUnfinished));
-        assert_eq!(review.needs_you(true), Some(AttentionReason::IntegrationUnfinished), "a pull request flag does not hide it");
+        assert_eq!(
+            review.needs_you(false),
+            Some(AttentionReason::IntegrationUnfinished)
+        );
+        assert_eq!(
+            review.needs_you(true),
+            Some(AttentionReason::IntegrationUnfinished),
+            "a pull request flag does not hide it"
+        );
         review.human_review.pr_error = Some("gh failed".into());
-        assert_eq!(review.needs_you(false), Some(AttentionReason::IntegrationUnfinished), "it outranks PR not created");
+        assert_eq!(
+            review.needs_you(false),
+            Some(AttentionReason::IntegrationUnfinished),
+            "it outranks PR not created"
+        );
         review.local_integration = Some(integration(Integrated));
-        assert_eq!(review.needs_you(false), Some(AttentionReason::PrNotCreated), "Integrated asks nothing of its own");
+        assert_eq!(
+            review.needs_you(false),
+            Some(AttentionReason::PrNotCreated),
+            "Integrated asks nothing of its own"
+        );
         review.local_integration = None;
-        assert_eq!(review.needs_you(false), Some(AttentionReason::PrNotCreated), "nor does a discarded record");
+        assert_eq!(
+            review.needs_you(false),
+            Some(AttentionReason::PrNotCreated),
+            "nor does a discarded record"
+        );
 
         let mut done = startable_task();
         done.status = TaskStatus::Done;
         done.local_integration = Some(integration(Pending));
-        assert_eq!(done.needs_you(false), None, "a Done task not completed locally offers no Resume or Discard");
+        assert_eq!(
+            done.needs_you(false),
+            None,
+            "a Done task not completed locally offers no Resume or Discard"
+        );
         done.record_activity(ActivityKind::CompletedLocally);
-        assert_eq!(done.needs_you(false), Some(AttentionReason::IntegrationUnfinished));
+        assert_eq!(
+            done.needs_you(false),
+            Some(AttentionReason::IntegrationUnfinished)
+        );
         done.local_integration = Some(integration(Integrated));
         assert_eq!(done.needs_you(false), None);
 
@@ -1846,12 +2214,20 @@ mod tests {
         let mut failed = startable_task();
         failed.status = TaskStatus::Error;
         failed.local_integration = Some(integration(Pending));
-        assert_eq!(failed.needs_you(false), Some(AttentionReason::Failed), "a failure is repaired first");
+        assert_eq!(
+            failed.needs_you(false),
+            Some(AttentionReason::Failed),
+            "a failure is repaired first"
+        );
 
         let mut queued = startable_task();
         queued.status = TaskStatus::Queue;
         queued.local_integration = Some(integration(Pending));
-        assert_eq!(queued.needs_you(false), None, "no controls to finish it are offered in this status");
+        assert_eq!(
+            queued.needs_you(false),
+            None,
+            "no controls to finish it are offered in this status"
+        );
     }
 
     #[test]
@@ -1861,21 +2237,36 @@ mod tests {
         task.human_review.approve(None, chrono::Utc::now());
         assert_eq!(task.integration_unfinished_refusal(), None, "no record");
         task.local_integration = Some(integration(Integrated));
-        assert_eq!(task.integration_unfinished_refusal(), None, "a finished record holds nothing");
+        assert_eq!(
+            task.integration_unfinished_refusal(),
+            None,
+            "a finished record holds nothing"
+        );
         task.local_integration = Some(integration(Pending));
-        assert_eq!(task.integration_unfinished_refusal().as_deref(), Some(INTEGRATION_UNFINISHED_REFUSAL));
+        assert_eq!(
+            task.integration_unfinished_refusal().as_deref(),
+            Some(INTEGRATION_UNFINISHED_REFUSAL)
+        );
 
         let mut done = startable_task();
         done.status = TaskStatus::Done;
         done.local_integration = Some(integration(Pending));
-        assert_eq!(done.integration_unfinished_refusal(), None, "not completed locally: no control to finish it");
+        assert_eq!(
+            done.integration_unfinished_refusal(),
+            None,
+            "not completed locally: no control to finish it"
+        );
         done.record_activity(ActivityKind::CompletedLocally);
         assert!(done.integration_unfinished_refusal().is_some());
 
         let mut stranded = startable_task();
         stranded.status = TaskStatus::Backlog;
         stranded.local_integration = Some(integration(Pending));
-        assert_eq!(stranded.integration_unfinished_refusal(), None, "no control exists there, so it must not pin the task");
+        assert_eq!(
+            stranded.integration_unfinished_refusal(),
+            None,
+            "no control exists there, so it must not pin the task"
+        );
     }
 
     /// Nothing about attention is stored, so a restart derives the same
@@ -1890,20 +2281,31 @@ mod tests {
         failed.status = TaskStatus::Error;
         let undecided = arrived_in_review();
         let mut pr_failed = arrived_in_review();
-        pr_failed.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        pr_failed
+            .human_review
+            .push(HumanReviewDecision::Approved, None, chrono::Utc::now());
         pr_failed.human_review.pr_error = Some("gh failed".into());
 
         let mut unfinished = arrived_in_review();
-        unfinished.human_review.push(HumanReviewDecision::Approved, None, chrono::Utc::now());
+        unfinished
+            .human_review
+            .push(HumanReviewDecision::Approved, None, chrono::Utc::now());
         unfinished.local_integration = Some(integration(crate::domain::IntegrationState::Pending));
         let mut unfinished_done = startable_task();
         unfinished_done.status = TaskStatus::Done;
         unfinished_done.record_activity(ActivityKind::CompletedLocally);
-        unfinished_done.local_integration = Some(integration(crate::domain::IntegrationState::Pending));
+        unfinished_done.local_integration =
+            Some(integration(crate::domain::IntegrationState::Pending));
 
         let tasks = vec![failed, undecided, pr_failed, unfinished, unfinished_done];
-        let toml_text = toml::to_string_pretty(&File { tasks: tasks.clone() }).unwrap();
-        assert!(!toml_text.contains("attention") && !toml_text.contains("needs_you"), "{toml_text}");
+        let toml_text = toml::to_string_pretty(&File {
+            tasks: tasks.clone(),
+        })
+        .unwrap();
+        assert!(
+            !toml_text.contains("attention") && !toml_text.contains("needs_you"),
+            "{toml_text}"
+        );
         let loaded: File = toml::from_str(&toml_text).unwrap();
         let reasons: Vec<_> = loaded.tasks.iter().map(|t| t.needs_you(false)).collect();
         assert_eq!(
@@ -1933,12 +2335,24 @@ mod tests {
     #[test]
     fn a_home_directory_is_found_however_the_path_is_written() {
         for (home, text, expected) in [
-            ("/home/me", "in /home/me/src and /home/meg/x", "in ~/src and /home/meg/x"),
+            (
+                "/home/me",
+                "in /home/me/src and /home/meg/x",
+                "in ~/src and /home/meg/x",
+            ),
             ("/home/me/", "cd /home/me", "cd ~"),
             (r"C:\Users\Me", r"at C:\Users\Me\repo", r"at ~\repo"),
-            (r"C:\Users\Me", "at C:/Users/Me/repo and c:\\users\\me\\x", "at ~/repo and ~\\x"),
+            (
+                r"C:\Users\Me",
+                "at C:/Users/Me/repo and c:\\users\\me\\x",
+                "at ~/repo and ~\\x",
+            ),
             (r"\\?\C:\Users\Me", r"at C:\Users\Me\repo", r"at ~\repo"),
-            (r"C:\", r"C:\Program Files and ABC:", r"C:\Program Files and ABC:"),
+            (
+                r"C:\",
+                r"C:\Program Files and ABC:",
+                r"C:\Program Files and ABC:",
+            ),
             ("/", "/etc/hosts", "/etc/hosts"),
             ("/home/mé", "in /home/mé/ü", "in ~/ü"),
         ] {
@@ -1980,14 +2394,23 @@ mod tests {
         }
         let mut task = startable_task();
         let run = task.next_run();
-        task.record_activity(ActivityKind::RunStarted { run, addressing_feedback: false });
-        task.record_activity(ActivityKind::RunFailed { run: Some(run), reason: "exit 1".into() });
+        task.record_activity(ActivityKind::RunStarted {
+            run,
+            addressing_feedback: false,
+        });
+        task.record_activity(ActivityKind::RunFailed {
+            run: Some(run),
+            reason: "exit 1".into(),
+        });
         let from = task.status.clone();
         task.status = TaskStatus::Queue;
         task.record_move(&from);
         assert_eq!(task.next_run(), 2);
 
-        let toml_text = toml::to_string_pretty(&File { tasks: vec![task.clone()] }).unwrap();
+        let toml_text = toml::to_string_pretty(&File {
+            tasks: vec![task.clone()],
+        })
+        .unwrap();
         let loaded: File = toml::from_str(&toml_text).expect(&toml_text);
         assert_eq!(loaded.tasks[0].activity, task.activity, "{toml_text}");
         let json = serde_json::to_string(&task).unwrap();
@@ -2004,7 +2427,10 @@ mod tests {
         task.record_move(&TaskStatus::Error);
         assert_eq!(
             task.activity[0].kind,
-            ActivityKind::Moved { from: ActivityColumn::Error, to: ActivityColumn::Queue }
+            ActivityKind::Moved {
+                from: ActivityColumn::Error,
+                to: ActivityColumn::Queue
+            }
         );
     }
 
@@ -2031,16 +2457,29 @@ mod tests {
         }
         for origin in [
             BranchOrigin::DefaultBase { branch: None },
-            BranchOrigin::DefaultBase { branch: Some("main".to_string()) },
-            BranchOrigin::Stacked { parent_branch: "task-parent".to_string() },
-            BranchOrigin::LocalBase { branch: "trunk".to_string() },
+            BranchOrigin::DefaultBase {
+                branch: Some("main".to_string()),
+            },
+            BranchOrigin::Stacked {
+                parent_branch: "task-parent".to_string(),
+            },
+            BranchOrigin::LocalBase {
+                branch: "trunk".to_string(),
+            },
         ] {
             let mut task = startable_task();
             task.branch_origin = Some(origin.clone());
 
-            let toml_text = toml::to_string_pretty(&File { tasks: vec![task.clone()] }).unwrap();
+            let toml_text = toml::to_string_pretty(&File {
+                tasks: vec![task.clone()],
+            })
+            .unwrap();
             let loaded: File = toml::from_str(&toml_text).expect(&toml_text);
-            assert_eq!(loaded.tasks[0].branch_origin.as_ref(), Some(&origin), "{toml_text}");
+            assert_eq!(
+                loaded.tasks[0].branch_origin.as_ref(),
+                Some(&origin),
+                "{toml_text}"
+            );
 
             let json = serde_json::to_string(&task).unwrap();
             let loaded: Task = serde_json::from_str(&json).unwrap();
@@ -2054,7 +2493,10 @@ mod tests {
         review.record_arrival();
         review.approve(Some("a".repeat(40)), chrono::Utc::now());
         assert_eq!(review.approved_tip(), Some("a".repeat(40).as_str()));
-        assert!(!review.reconfirm_tip(&"b".repeat(40)), "a recorded commit is not replaced");
+        assert!(
+            !review.reconfirm_tip(&"b".repeat(40)),
+            "a recorded commit is not replaced"
+        );
         assert_eq!(review.approved_tip(), Some("a".repeat(40).as_str()));
 
         let mut legacy = HumanReviewRecord::default();
@@ -2081,6 +2523,9 @@ mod tests {
         let task: Task = toml::from_str(LEGACY_TASK_TOML).expect("an earlier task");
         assert!(task.local_integration.is_none());
         let written = toml::to_string(&task).unwrap();
-        assert!(!written.contains("local_integration"), "an absent record is not written");
+        assert!(
+            !written.contains("local_integration"),
+            "an absent record is not written"
+        );
     }
 }

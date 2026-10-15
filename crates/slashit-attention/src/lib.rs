@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionReason {
+    /// A coding Worker outcome needs inspection before this task can run again.
+    Recovery,
     /// The last run failed. SlashIt does not continue a failed task on its
     /// own; someone has to repair or retry it.
     Failed,
@@ -36,6 +38,7 @@ impl AttentionReason {
     /// What a person reads, after "Needs you".
     pub fn label(self) -> &'static str {
         match self {
+            Self::Recovery => "Worker recovery required",
             Self::Failed => "Failed",
             Self::Review => "Review",
             Self::PrNotCreated => "PR not created",
@@ -46,6 +49,7 @@ impl AttentionReason {
     /// The serialized name, for places that need it as a plain string.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Recovery => "recovery",
             Self::Failed => "failed",
             Self::Review => "review",
             Self::PrNotCreated => "pr_not_created",
@@ -159,7 +163,11 @@ pub enum Review {
 /// integration outranks every Human Review reason: the target branch may
 /// already have moved. It is not hidden by `delivery_in_flight`, which
 /// describes a pull request, never an integration.
-pub fn needs_you(stage: Stage, delivery_in_flight: bool, integration_pending: bool) -> Option<AttentionReason> {
+pub fn needs_you(
+    stage: Stage,
+    delivery_in_flight: bool,
+    integration_pending: bool,
+) -> Option<AttentionReason> {
     match stage {
         Stage::Failed => Some(AttentionReason::Failed),
         Stage::HumanReview(Review::Approved { .. }) | Stage::Done if integration_pending => {
@@ -167,9 +175,10 @@ pub fn needs_you(stage: Stage, delivery_in_flight: bool, integration_pending: bo
         }
         Stage::HumanReview(_) if delivery_in_flight => None,
         Stage::HumanReview(Review::Undecided) => Some(AttentionReason::Review),
-        Stage::HumanReview(Review::Approved { pr_failed: true, pr_linked: false }) => {
-            Some(AttentionReason::PrNotCreated)
-        }
+        Stage::HumanReview(Review::Approved {
+            pr_failed: true,
+            pr_linked: false,
+        }) => Some(AttentionReason::PrNotCreated),
         Stage::HumanReview(Review::Approved { .. } | Review::ChangesRequested) => None,
         Stage::Done | Stage::Elsewhere => None,
     }
@@ -179,12 +188,21 @@ pub fn needs_you(stage: Stage, delivery_in_flight: bool, integration_pending: bo
 mod tests {
     use super::*;
 
-    const APPROVED: Review = Review::Approved { pr_failed: false, pr_linked: false };
-    const PR_FAILED: Review = Review::Approved { pr_failed: true, pr_linked: false };
+    const APPROVED: Review = Review::Approved {
+        pr_failed: false,
+        pr_linked: false,
+    };
+    const PR_FAILED: Review = Review::Approved {
+        pr_failed: true,
+        pr_linked: false,
+    };
 
     #[test]
     fn a_failed_task_needs_the_user() {
-        assert_eq!(needs_you(Stage::Failed, false, false), Some(AttentionReason::Failed));
+        assert_eq!(
+            needs_you(Stage::Failed, false, false),
+            Some(AttentionReason::Failed)
+        );
     }
 
     #[test]
@@ -194,32 +212,48 @@ mod tests {
             Some(AttentionReason::Review)
         );
         assert_eq!(needs_you(Stage::HumanReview(APPROVED), false, false), None);
-        assert_eq!(needs_you(Stage::HumanReview(Review::ChangesRequested), false, false), None);
+        assert_eq!(
+            needs_you(Stage::HumanReview(Review::ChangesRequested), false, false),
+            None
+        );
     }
 
     #[test]
     fn an_approval_whose_pull_request_failed_needs_the_user() {
-        assert_eq!(needs_you(Stage::HumanReview(PR_FAILED), false, false), Some(AttentionReason::PrNotCreated));
+        assert_eq!(
+            needs_you(Stage::HumanReview(PR_FAILED), false, false),
+            Some(AttentionReason::PrNotCreated)
+        );
     }
 
     /// A failure recorded before a pull request was linked by other means
     /// (Sync PR) describes an attempt that no longer matters.
     #[test]
     fn a_linked_pull_request_outranks_an_earlier_failure() {
-        let linked = Review::Approved { pr_failed: true, pr_linked: true };
+        let linked = Review::Approved {
+            pr_failed: true,
+            pr_linked: true,
+        };
         assert_eq!(needs_you(Stage::HumanReview(linked), false, false), None);
     }
 
     #[test]
     fn nothing_in_human_review_needs_the_user_while_its_pull_request_is_being_opened() {
         for review in [Review::Undecided, APPROVED, PR_FAILED] {
-            assert_eq!(needs_you(Stage::HumanReview(review), true, false), None, "{review:?}");
+            assert_eq!(
+                needs_you(Stage::HumanReview(review), true, false),
+                None,
+                "{review:?}"
+            );
         }
     }
 
     #[test]
     fn a_failure_is_not_hidden_by_a_delivery_flag() {
-        assert_eq!(needs_you(Stage::Failed, true, false), Some(AttentionReason::Failed));
+        assert_eq!(
+            needs_you(Stage::Failed, true, false),
+            Some(AttentionReason::Failed)
+        );
     }
 
     #[test]
@@ -239,14 +273,41 @@ mod tests {
             integration_pending: false,
         };
         let approved = Some(Decision::Approved);
-        assert_eq!(facts(Status::Error, None, false, false).needs_you(), Some(AttentionReason::Failed));
-        assert_eq!(facts(Status::HumanReview, None, false, false).needs_you(), Some(AttentionReason::Review));
-        assert_eq!(facts(Status::HumanReview, Some(Decision::ChangesRequested), false, false).needs_you(), None);
-        assert_eq!(facts(Status::HumanReview, approved, false, false).needs_you(), None);
-        assert_eq!(facts(Status::HumanReview, approved, true, false).needs_you(), Some(AttentionReason::PrNotCreated));
-        assert_eq!(facts(Status::HumanReview, approved, true, true).needs_you(), None);
+        assert_eq!(
+            facts(Status::Error, None, false, false).needs_you(),
+            Some(AttentionReason::Failed)
+        );
+        assert_eq!(
+            facts(Status::HumanReview, None, false, false).needs_you(),
+            Some(AttentionReason::Review)
+        );
+        assert_eq!(
+            facts(
+                Status::HumanReview,
+                Some(Decision::ChangesRequested),
+                false,
+                false
+            )
+            .needs_you(),
+            None
+        );
+        assert_eq!(
+            facts(Status::HumanReview, approved, false, false).needs_you(),
+            None
+        );
+        assert_eq!(
+            facts(Status::HumanReview, approved, true, false).needs_you(),
+            Some(AttentionReason::PrNotCreated)
+        );
+        assert_eq!(
+            facts(Status::HumanReview, approved, true, true).needs_you(),
+            None
+        );
         assert_eq!(facts(Status::Other, None, true, false).needs_you(), None);
-        let in_flight = Facts { delivery_in_flight: true, ..facts(Status::HumanReview, approved, true, false) };
+        let in_flight = Facts {
+            delivery_in_flight: true,
+            ..facts(Status::HumanReview, approved, true, false)
+        };
         assert_eq!(in_flight.needs_you(), None);
     }
 
@@ -255,19 +316,34 @@ mod tests {
         for (reason, label, name) in [
             (AttentionReason::Failed, "Failed", "failed"),
             (AttentionReason::Review, "Review", "review"),
-            (AttentionReason::PrNotCreated, "PR not created", "pr_not_created"),
-            (AttentionReason::IntegrationUnfinished, "Integration unfinished", "integration_unfinished"),
+            (
+                AttentionReason::PrNotCreated,
+                "PR not created",
+                "pr_not_created",
+            ),
+            (
+                AttentionReason::IntegrationUnfinished,
+                "Integration unfinished",
+                "integration_unfinished",
+            ),
         ] {
             assert_eq!(reason.label(), label);
             assert_eq!(reason.as_str(), name);
-            assert_eq!(serde_json::to_string(&reason).unwrap(), format!("\"{name}\""));
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{name}\"")
+            );
         }
     }
 
     #[test]
     fn an_unfinished_integration_needs_the_user_in_human_review_and_when_done() {
         for stage in [Stage::HumanReview(APPROVED), Stage::Done] {
-            assert_eq!(needs_you(stage, false, true), Some(AttentionReason::IntegrationUnfinished), "{stage:?}");
+            assert_eq!(
+                needs_you(stage, false, true),
+                Some(AttentionReason::IntegrationUnfinished),
+                "{stage:?}"
+            );
             assert_eq!(needs_you(stage, false, false), None, "{stage:?}");
         }
     }
@@ -276,14 +352,26 @@ mod tests {
     /// arrival that is not decided yet asks for its review, not for them.
     #[test]
     fn an_undecided_arrival_asks_for_its_review_even_with_an_old_pending_record() {
-        assert_eq!(needs_you(Stage::HumanReview(Review::Undecided), false, true), Some(AttentionReason::Review));
-        assert_eq!(needs_you(Stage::HumanReview(Review::ChangesRequested), false, true), None);
+        assert_eq!(
+            needs_you(Stage::HumanReview(Review::Undecided), false, true),
+            Some(AttentionReason::Review)
+        );
+        assert_eq!(
+            needs_you(Stage::HumanReview(Review::ChangesRequested), false, true),
+            None
+        );
     }
 
     #[test]
     fn an_unfinished_integration_outranks_the_other_review_reasons_but_not_a_failure() {
-        assert_eq!(needs_you(Stage::HumanReview(PR_FAILED), false, true), Some(AttentionReason::IntegrationUnfinished));
-        assert_eq!(needs_you(Stage::Failed, false, true), Some(AttentionReason::Failed));
+        assert_eq!(
+            needs_you(Stage::HumanReview(PR_FAILED), false, true),
+            Some(AttentionReason::IntegrationUnfinished)
+        );
+        assert_eq!(
+            needs_you(Stage::Failed, false, true),
+            Some(AttentionReason::Failed)
+        );
     }
 
     #[test]
@@ -309,11 +397,27 @@ mod tests {
             delivery_in_flight: false,
             integration_pending: true,
         };
-        assert_eq!(facts(Status::HumanReview).needs_you(), Some(AttentionReason::IntegrationUnfinished));
-        assert_eq!(facts(Status::Done).needs_you(), Some(AttentionReason::IntegrationUnfinished));
-        assert_eq!(facts(Status::Error).needs_you(), Some(AttentionReason::Failed));
+        assert_eq!(
+            facts(Status::HumanReview).needs_you(),
+            Some(AttentionReason::IntegrationUnfinished)
+        );
+        assert_eq!(
+            facts(Status::Done).needs_you(),
+            Some(AttentionReason::IntegrationUnfinished)
+        );
+        assert_eq!(
+            facts(Status::Error).needs_you(),
+            Some(AttentionReason::Failed)
+        );
         assert_eq!(facts(Status::Other).needs_you(), None);
-        let integrated = Facts { integration_pending: false, ..facts(Status::Done) };
-        assert_eq!(integrated.needs_you(), None, "an Integrated or absent record asks nothing");
+        let integrated = Facts {
+            integration_pending: false,
+            ..facts(Status::Done)
+        };
+        assert_eq!(
+            integrated.needs_you(),
+            None,
+            "an Integrated or absent record asks nothing"
+        );
     }
 }
