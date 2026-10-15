@@ -287,6 +287,11 @@ pub struct WorkerResultAcceptance {
     /// Client-generated identity of the decision, for idempotent retries.
     pub decision_id: Uuid,
     pub commit: String,
+    /// The commit the recovery evidence had observed when the person decided,
+    /// or `None` if it had observed none. Part of the decision's identity: a
+    /// retry that names a different observation is a different request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_commit: Option<String>,
     pub decided_at: chrono::DateTime<chrono::Utc>,
 }
 

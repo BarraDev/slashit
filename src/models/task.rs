@@ -234,6 +234,8 @@ pub struct WorkerHandoff {
 pub struct WorkerResultAcceptance {
     pub decision_id: Uuid,
     pub commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_commit: Option<String>,
     pub decided_at: chrono::DateTime<chrono::Utc>,
 }
 

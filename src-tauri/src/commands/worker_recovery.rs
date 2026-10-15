@@ -496,7 +496,8 @@ fn repeats(task: &Task, request: &AcceptWorkerResultRequest) -> Option<bool> {
             && handoff.repository_id == Some(request.repository_id)
             && handoff.branch.as_deref() == Some(request.branch.as_str())
             && task.worktree_path.as_deref() == Some(request.checkout.as_str())
-            && recorded.commit == request.tip,
+            && recorded.commit == request.tip
+            && recorded.observed_commit == request.observed_commit,
     )
 }
 
@@ -590,8 +591,17 @@ pub(crate) async fn accept_result(
             let resolved = task.worker_handoff.as_ref().is_some_and(|h| {
                 matches!(&h.stage, WorkerHandoffStage::ResolvedToAiReview { commit } if *commit == request.tip)
             });
-            return if resolved {
+            return if resolved && task.worker_handoff_confirmed {
                 Ok(AcceptWorkerResultOutcome::AlreadyApplied { task })
+            } else if resolved {
+                // Applied, but this process has not confirmed the write or
+                // re-proved the commit. Say so; do not repeat the transition.
+                Ok(AcceptWorkerResultOutcome::DurabilityUnconfirmed {
+                    task,
+                    detail: "This decision is recorded but not yet confirmed durable and \
+                             re-validated. SlashIt will confirm it before review starts."
+                        .into(),
+                })
             } else {
                 refused(
                     "This decision was applied earlier, but the Task has since returned to \
@@ -644,6 +654,7 @@ pub(crate) async fn accept_result(
     let decision = WorkerResultAcceptance {
         decision_id: request.decision_id,
         commit: request.tip.clone(),
+        observed_commit: request.observed_commit.clone(),
         decided_at: now,
     };
     // Evaluated under the board's write lock, with the save that follows: the
@@ -1133,7 +1144,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_same_decision_after_a_restart_still_has_no_second_effect() {
+    async fn the_same_decision_after_a_restart_has_no_second_effect_and_is_confirmed_only_once_revalidated(
+    ) {
         let fx = fixture().await;
         let id = Uuid::new_v4();
         accept_result(&fx.state, fx.request(id)).await.unwrap();
@@ -1144,12 +1156,116 @@ mod tests {
             .write()
             .await
             .insert(fx.task_id, reloaded);
+        let (task, repo_state, board) = (fx.task().await, fx.repo_state(), fx.board_files());
 
+        let early = accept_result(&fx.state, fx.request(id)).await.unwrap();
+
+        assert!(
+            matches!(
+                early,
+                AcceptWorkerResultOutcome::DurabilityUnconfirmed { .. }
+            ),
+            "{early:?}"
+        );
+        assert_untouched(&fx, &task, &repo_state).await;
+        assert_eq!(fx.board_files(), board, "nothing was written");
+
+        let agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
+        fx.state
+            .executor
+            .get()
+            .unwrap()
+            .reconcile_committed_worker_handoffs()
+            .await;
         let again = accept_result(&fx.state, fx.request(id)).await.unwrap();
 
         assert!(
             matches!(again, AcceptWorkerResultOutcome::AlreadyApplied { .. }),
             "{again:?}"
+        );
+        assert_eq!(completions(&fx.task().await), 1);
+        assert!(!agent.invocations().contains("claude"));
+    }
+
+    #[tokio::test]
+    async fn a_reused_decision_id_with_any_different_field_is_refused_without_a_write() {
+        let fx = fixture().await;
+        let id = Uuid::new_v4();
+        accept_result(&fx.state, fx.request(id)).await.unwrap();
+        let (task, repo_state, board) = (fx.task().await, fx.repo_state(), fx.board_files());
+
+        type Change = Box<dyn Fn(&mut AcceptWorkerResultRequest)>;
+        let changes: Vec<(&str, Change)> = vec![
+            (
+                "observed",
+                Box::new(|r| r.observed_commit = Some("a".repeat(40))),
+            ),
+            ("run", Box::new(|r| r.run = 2)),
+            ("branch", Box::new(|r| r.branch = "other".into())),
+            ("repository", Box::new(|r| r.repository_id = Uuid::new_v4())),
+            ("project", Box::new(|r| r.project_id = Uuid::new_v4())),
+            ("checkout", Box::new(|r| r.checkout = "/elsewhere".into())),
+            ("tip", Box::new(|r| r.tip = "f".repeat(40))),
+        ];
+        for (field, change) in changes {
+            let mut request = fx.request(id);
+            change(&mut request);
+            let reason = refusal(accept_result(&fx.state, request).await);
+            assert!(reason.contains("different request"), "{field}: {reason}");
+            assert_untouched(&fx, &task, &repo_state).await;
+            assert_eq!(fx.board_files(), board, "{field}: nothing was written");
+        }
+        assert_eq!(completions(&fx.task().await), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reused_decision_id_must_repeat_the_observed_commit_exactly_even_after_a_restart() {
+        let fx = fixture().await;
+        let observed = fx.tip.clone();
+        let newer = fx.commit_in_checkout("more.txt");
+        fx.edit(|t| {
+            t.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::RecoveryRequired {
+                reason: "interrupted".into(),
+                observed_commit: Some(observed.clone()),
+            }
+        })
+        .await;
+        let id = Uuid::new_v4();
+        let mut original = fx.request(id);
+        original.observed_commit = Some(observed.clone());
+        original.tip = newer.clone();
+        accept_result(&fx.state, original.clone()).await.unwrap();
+        assert_eq!(
+            fx.on_disk()
+                .worker_handoff
+                .unwrap()
+                .acceptance
+                .unwrap()
+                .observed_commit,
+            Some(observed),
+            "the observation is part of the persisted decision"
+        );
+        let reloaded = fx.on_disk();
+        fx.state
+            .task
+            .tasks
+            .write()
+            .await
+            .insert(fx.task_id, reloaded);
+        let (task, repo_state, board) = (fx.task().await, fx.repo_state(), fx.board_files());
+
+        for (name, other) in [("none", None), ("other commit", Some(newer.clone()))] {
+            let mut request = original.clone();
+            request.observed_commit = other;
+            let reason = refusal(accept_result(&fx.state, request).await);
+            assert!(reason.contains("different request"), "{name}: {reason}");
+            assert_untouched(&fx, &task, &repo_state).await;
+            assert_eq!(fx.board_files(), board, "{name}: nothing was written");
+        }
+        let identical = accept_result(&fx.state, original).await.unwrap();
+        assert!(
+            matches!(identical, AcceptWorkerResultOutcome::DurabilityUnconfirmed { .. }),
+            "an identical replay is recognised (and, before revalidation, unconfirmed): {identical:?}"
         );
         assert_eq!(completions(&fx.task().await), 1);
     }
@@ -1794,7 +1910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unconfirmed_write_repeated_has_no_second_write() {
+    async fn an_unconfirmed_write_repeated_is_never_reported_applied_and_has_no_second_write() {
         let fx = fixture().await;
         let id = Uuid::new_v4();
         let outcome = {
@@ -1805,19 +1921,63 @@ mod tests {
             outcome,
             AcceptWorkerResultOutcome::DurabilityUnconfirmed { .. }
         ));
-        let (task, repo_state) = (fx.task().await, fx.repo_state());
+        let (task, repo_state, board) = (fx.task().await, fx.repo_state(), fx.board_files());
 
         let again = accept_result(&fx.state, fx.request(id)).await.unwrap();
 
         assert!(
-            matches!(again, AcceptWorkerResultOutcome::AlreadyApplied { .. }),
+            matches!(
+                again,
+                AcceptWorkerResultOutcome::DurabilityUnconfirmed { .. }
+            ),
             "{again:?}"
         );
         assert_untouched(&fx, &task, &repo_state).await;
+        assert_eq!(fx.board_files(), board, "the repeat wrote nothing");
         assert!(
             !fx.task().await.worker_handoff_confirmed,
             "repeating the request does not earn the acknowledgement"
         );
+        assert_eq!(completions(&fx.task().await), 1);
+
+        let agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
+        fx.state
+            .executor
+            .get()
+            .unwrap()
+            .reconcile_committed_worker_handoffs()
+            .await;
+        assert!(fx.task().await.worker_handoff_confirmed);
+
+        let confirmed = accept_result(&fx.state, fx.request(id)).await.unwrap();
+        assert!(
+            matches!(confirmed, AcceptWorkerResultOutcome::AlreadyApplied { .. }),
+            "{confirmed:?}"
+        );
+        assert_eq!(completions(&fx.task().await), 1);
+        assert!(!agent.invocations().contains("claude"));
+    }
+
+    #[tokio::test]
+    async fn a_write_that_published_nothing_is_never_reported_applied_on_repeat() {
+        let fx = fixture().await;
+        let id = Uuid::new_v4();
+        {
+            let _fault = fault::fail_at(Stage::WriteTemp, std::io::ErrorKind::Other);
+            let first = accept_result(&fx.state, fx.request(id)).await.unwrap();
+            assert!(
+                matches!(first, AcceptWorkerResultOutcome::Refused { .. }),
+                "{first:?}"
+            );
+        }
+
+        let again = accept_result(&fx.state, fx.request(id)).await.unwrap();
+
+        assert!(
+            matches!(again, AcceptWorkerResultOutcome::Accepted { .. }),
+            "the retry is a first application: {again:?}"
+        );
+        assert_eq!(completions(&fx.task().await), 1);
     }
 
     #[tokio::test]
@@ -1879,10 +2039,13 @@ mod tests {
         assert_untouched(&fx, &settled, &repo_state).await;
 
         // The old decision is not silently treated as current.
-        let mut replay = fx.request(first_decision);
-        replay.observed_commit = Some(first.clone());
+        let replay = fx.request(first_decision);
         let reason = refusal(accept_result(&fx.state, replay).await);
         assert!(reason.contains("returned to recovery"), "{reason}");
+        let mut altered = fx.request(first_decision);
+        altered.observed_commit = Some(first.clone());
+        let reason = refusal(accept_result(&fx.state, altered).await);
+        assert!(reason.contains("different request"), "{reason}");
         assert_untouched(&fx, &settled, &repo_state).await;
 
         // A new decision binds the correct run and the new tip.
@@ -1944,6 +2107,7 @@ mod tests {
         let decision = WorkerResultAcceptance {
             decision_id: request.decision_id,
             commit: request.tip.clone(),
+            observed_commit: None,
             decided_at: chrono::Utc::now(),
         };
         let base = fx.task().await;
@@ -1991,6 +2155,7 @@ mod tests {
                     t.worker_handoff.as_mut().unwrap().acceptance = Some(WorkerResultAcceptance {
                         decision_id: recorded_id,
                         commit: "a".repeat(40),
+                        observed_commit: None,
                         decided_at: chrono::Utc::now(),
                     })
                 }),
