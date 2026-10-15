@@ -23,7 +23,7 @@
 //! amount to remote code execution are refused there regardless of the token.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use tokio::io::AsyncWrite;
@@ -474,6 +474,7 @@ impl IpcServer {
             mut shutdown,
             poller,
             finish_grace,
+            handlers: handler_rescue,
         } = supervision;
 
         let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -484,7 +485,7 @@ impl IpcServer {
             accept_endpoints.insert(abort.id(), owner.endpoint.clone());
         }
         drop(accepted_tx);
-        let mut handlers = tokio::task::JoinSet::new();
+        let mut handlers = Handlers::new(handler_rescue);
         let mut receiving = true;
 
         let cause = loop {
@@ -638,9 +639,93 @@ pub struct Supervision {
     pub shutdown: tokio::sync::watch::Receiver<bool>,
     /// Resolves once the queue poller has returned, when this process runs one.
     pub poller: Option<PollerJoin>,
+    /// Where the connection handlers go if the server task dies.
+    pub handlers: HandlerRescue,
     /// How long an *intentional* shutdown lets running work finish on its own
     /// before cancelling it.
     pub finish_grace: Duration,
+}
+
+/// The connection handlers of a server task that may not live to join them.
+///
+/// Dropping a `JoinSet` aborts its tasks. A handler that has started a
+/// `git` run is awaiting a `spawn_blocking` call; aborting the handler stops
+/// the waiting and nothing else, so the `git` process finishes on its own
+/// afterwards, possibly after the supervisor has released the endpoint. So the
+/// server never lets its handlers be dropped: if it dies, they are handed to
+/// this value, which the supervisor keeps, and [`HandlerRescue::join`] lets
+/// every one of them run to completion. A handler is one request, bounded by
+/// the request timeout and the operation it runs; it is never cancelled.
+#[derive(Clone, Default)]
+pub struct HandlerRescue(Arc<std::sync::Mutex<Option<tokio::task::JoinSet<()>>>>);
+
+impl HandlerRescue {
+    /// Wait for every rescued handler to return. Nothing is aborted. Returns
+    /// at once when the server task left no handler behind.
+    async fn join(&self) {
+        let rescued = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let Some(mut handlers) = rescued else {
+            return;
+        };
+        let mut reported = false;
+        loop {
+            match tokio::time::timeout(POLLER_STOP_REPORT, handlers.join_next()).await {
+                Ok(None) => return,
+                Ok(Some(Ok(()))) => {}
+                Ok(Some(Err(error))) => {
+                    eprintln!("[ipc] a connection handler failed during shutdown: {error}")
+                }
+                Err(_) if !reported => {
+                    reported = true;
+                    eprintln!(
+                        "[ipc] a connection handler has not returned after {POLLER_STOP_REPORT:?}; \
+                         still holding local ownership"
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+/// The server's live connection handlers. Dropping this (the server task
+/// returned, panicked or was cancelled) hands any that are still running to
+/// the [`HandlerRescue`] instead of aborting them.
+struct Handlers {
+    set: tokio::task::JoinSet<()>,
+    rescue: HandlerRescue,
+}
+
+impl Handlers {
+    fn new(rescue: HandlerRescue) -> Self {
+        Self {
+            set: tokio::task::JoinSet::new(),
+            rescue,
+        }
+    }
+}
+
+impl std::ops::Deref for Handlers {
+    type Target = tokio::task::JoinSet<()>;
+    fn deref(&self) -> &Self::Target {
+        &self.set
+    }
+}
+
+impl std::ops::DerefMut for Handlers {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.set
+    }
+}
+
+impl Drop for Handlers {
+    fn drop(&mut self) {
+        if self.set.is_empty() {
+            return;
+        }
+        let running = std::mem::take(&mut self.set);
+        *self.rescue.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(running);
+    }
 }
 
 /// The queue poller's join, as a future the server can wait on.
@@ -686,17 +771,21 @@ async fn await_poller(poller: PollerJoin) -> Result<(), String> {
 /// (panicked or was cancelled) before it could do so.
 ///
 /// The caller still holds the ownership claim. This does what the server
-/// would have done, in the same order: close the admission fence, wait for the
-/// poller to return (a pass that began before the fence is not stopped by it),
-/// then reap every execution owner. Only when this returns may the caller
-/// release ownership.
+/// would have done, in the same order: close the admission fence, let every
+/// connection handler that was running finish (a handler mid-way through a
+/// `git` run is not stopped by the server task dying), wait for the poller to
+/// return (a pass that began before the fence is not stopped by it), then reap
+/// every execution owner. Only when this returns may the caller release
+/// ownership.
 pub async fn quiesce_after_supervisor_failure(
     executor: Option<&crate::queue::TaskExecutor>,
     poller: Option<PollerJoin>,
+    handlers: &HandlerRescue,
 ) {
     if let Some(executor) = executor {
         executor.close_admission_cancelling_runs().await;
     }
+    handlers.join().await;
     if let Some(poller) = poller {
         if let Err(error) = await_poller(poller).await {
             eprintln!("[ipc] the queue poller failed: {error}");
@@ -713,6 +802,7 @@ impl Supervision {
         Self {
             shutdown,
             poller: None,
+            handlers: HandlerRescue::default(),
             finish_grace: Duration::ZERO,
         }
     }
@@ -1223,6 +1313,7 @@ pub(crate) mod tests {
             let supervision = Supervision {
                 shutdown,
                 poller: None,
+                handlers: HandlerRescue::default(),
                 finish_grace: layout.grace,
             };
             let server = tokio::spawn({
@@ -1673,7 +1764,10 @@ pub(crate) mod tests {
 
         let quiesced = tokio::spawn({
             let executor = executor.clone();
-            async move { quiesce_after_supervisor_failure(Some(&executor), Some(poller)).await }
+            async move {
+                quiesce_after_supervisor_failure(Some(&executor), Some(poller), &HandlerRescue::default())
+                    .await
+            }
         });
         eventually("admission to close", || !executor.is_accepting_work()).await;
         settle().await;
@@ -1911,6 +2005,206 @@ pub(crate) mod tests {
         drop(rig.ownership.take());
         acquire_after_release(|| rig.second_instance()).await;
         assert!(performed.load(Ordering::SeqCst), "nothing ran after release");
+    }
+
+    // --- a handler's blocking git run, after the server task dies -----------
+
+    const GIT_CHILD_ROOT: &str = "SLASHIT_HELD_GIT_ROOT";
+
+    async fn wait_for_path(path: &std::path::Path) {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while !path.exists() {
+                // The parent removes the directory when it gives up.
+                assert!(
+                    path.parent().is_some_and(|dir| dir.exists()),
+                    "the parent went away while waiting for {}",
+                    path.display()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {}", path.display()));
+    }
+
+    /// The first instance for
+    /// [`a_git_run_started_by_a_handler_does_not_outlive_ownership`], as a
+    /// separate OS process whose `git` is a wrapper that holds
+    /// `git worktree remove` until the parent says to let it go.
+    ///
+    /// It runs the production supervisor over a real listener and serves a
+    /// real `DeleteTask` for a Task with a real checkout. Once the handler is
+    /// inside the held `git`, the task that runs the server panics, and the
+    /// supervisor does what the desktop and the daemon do next. A no-op in an
+    /// ordinary test run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_git_child_process() {
+        let Ok(root) = std::env::var(GIT_CHILD_ROOT) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let (ctx, task_id, checkout) = crate::ipc::handlers::tests::world_at(&root, false).await;
+        let ctx = Arc::new(ctx);
+        let executor = attach_test_executor_ipc(&ctx).await;
+        let paths = Arc::new(AppPaths::with_roots(
+            root.join("config"),
+            root.join("data"),
+            root.join("cache"),
+            root.join("runtime"),
+        ));
+        let local = local_endpoint(&root);
+        let bound = BoundIpc::bind_endpoints(&paths, std::slice::from_ref(&local), &BindOptions::default())
+            .await
+            .expect("bind");
+        let ownership = bound.ownership();
+
+        let handlers = HandlerRescue::default();
+        let (_stop, shutdown) = tokio::sync::watch::channel(false);
+        let supervision = Supervision {
+            shutdown,
+            poller: None,
+            handlers: handlers.clone(),
+            finish_grace: Duration::ZERO,
+        };
+        let (fail, mut failing) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                tokio::select! {
+                    result = bound.attach(ctx).serve_until(supervision) => result,
+                    _ = failing.wait_for(|failing| *failing) => panic!("the server task failed"),
+                }
+            }
+        });
+
+        let request = tokio::spawn({
+            let local = local.clone();
+            async move {
+                let stream = transport::connect(&local).await.expect("connect");
+                let (reader, mut writer) = stream.into_halves();
+                let delete = slashit_ipc::IpcEnvelope::new(IpcRequest::DeleteTask {
+                    task_id: task_id.to_string(),
+                });
+                slashit_ipc::framing::write_json_frame(&mut writer, &delete).await.unwrap();
+                slashit_ipc::framing::read_frame(reader, MAX_REQUEST_BYTES).await
+            }
+        });
+
+        // The handler is inside the held `git`: the wrapper says so.
+        wait_for_path(&root.join("in-git")).await;
+        fail.send(true).unwrap();
+        assert!(server.await.expect_err("the server task panicked").is_panic());
+        std::fs::write(root.join("panicked"), b"").unwrap();
+
+        let quiesced = tokio::spawn({
+            let executor = executor.clone();
+            let handlers = handlers.clone();
+            async move { quiesce_after_supervisor_failure(Some(&executor), None, &handlers).await }
+        });
+        eventually("admission to close", || !executor.is_accepting_work()).await;
+        settle().await;
+        // Reported to the parent rather than asserted here: a failed
+        // assertion would leave this process waiting on the held `git`.
+        if quiesced.is_finished() || !std::path::Path::new(&checkout).exists() {
+            std::fs::write(root.join("released-early"), b"").unwrap();
+        }
+        std::fs::write(root.join("quiescing"), b"").unwrap();
+
+        wait_for_path(&root.join("release")).await;
+        quiesced.await.expect("quiescence completes");
+
+        // The handler was not cancelled: it finished the delete it had begun.
+        let slashit_ipc::framing::Frame::Line(line) = request.await.unwrap().expect("answered") else {
+            panic!("no answer")
+        };
+        let response: IpcResponse = serde_json::from_str(&line).unwrap();
+        assert!(response.ok, "{response:?}");
+        assert!(!std::path::Path::new(&checkout).exists(), "the checkout is gone");
+        assert!(!ctx.tasks.read().await.contains_key(&task_id));
+        std::fs::write(root.join("quiesced"), b"").unwrap();
+        drop(ownership);
+    }
+
+    /// A handler that has started a `git` run is waiting on a blocking call.
+    /// When the task running the server dies, dropping the handlers aborts the
+    /// wait and leaves `git` running, so the supervisor used to release the
+    /// endpoint with a Git mutation still in flight. Two OS processes, the
+    /// production supervisor, a real listener and a real `git worktree remove`
+    /// held at a barrier: the second process is refused ownership until the
+    /// run has finished and the handler has completed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_git_run_started_by_a_handler_does_not_outlive_ownership() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().unwrap();
+        let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("git on PATH");
+        let bin = root.path().join("fakebin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let wrapper = bin.join("git");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = worktree ] && [ \"$2\" = remove ]; then\n\
+                 : > \"${GIT_CHILD_ROOT}/in-git\"\n\
+                 while [ ! -e \"${GIT_CHILD_ROOT}/release\" ] && [ -d \"${GIT_CHILD_ROOT}\" ]; do sleep 0.02; done\n\
+                 fi\n\
+                 exec \"{}\" \"$@\"\n",
+                real_git.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut path = std::ffi::OsString::from(&bin);
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap());
+
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["ipc::server::tests::held_git_child_process", "--exact", "--nocapture"])
+            .env(GIT_CHILD_ROOT, root.path())
+            .env("PATH", path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("re-execute the test binary as the first instance");
+
+        wait_for_file(&root.path().join("panicked"), &mut child).await;
+        wait_for_file(&root.path().join("quiescing"), &mut child).await;
+
+        let registered = |root: &std::path::Path| {
+            git(&root.join("repo"), &["worktree", "list"]).contains("task-abcd1234")
+        };
+        assert!(
+            !root.path().join("released-early").exists(),
+            "the supervisor finished its quiescence while the handler's git run was still held"
+        );
+        assert!(registered(root.path()), "git has not removed the checkout yet");
+        assert!(
+            second_instance_at(root.path()).await.is_err(),
+            "a git run is still in flight: no one else may own the endpoint"
+        );
+        assert!(child.try_wait().unwrap().is_none(), "and the first instance has not exited");
+        assert!(!root.path().join("quiesced").exists());
+
+        std::fs::write(root.path().join("release"), b"").unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_secs(120),
+            tokio::task::spawn_blocking(move || child.wait()),
+        )
+        .await
+        .expect("the first instance exits once git has finished")
+        .unwrap()
+        .unwrap();
+        assert!(status.success(), "the first instance quiesced and exited: {status}");
+        assert!(root.path().join("quiesced").exists());
+
+        acquire_after_release(|| second_instance_at(root.path())).await;
+        assert!(!registered(root.path()), "the removal completed before ownership went");
     }
 
     /// What is *not* promised, pinned so it stays honest: killing the owner

@@ -305,9 +305,11 @@ pub fn run() {
                 // after the executor is quiescent.
                 let ownership = bound.ownership();
                 let poller = ipc::poller_join(polling_handle);
+                let handlers = ipc::HandlerRescue::default();
                 let supervision = ipc::Supervision {
                     shutdown: shutdown_rx.clone(),
                     poller: Some(poller.clone()),
+                    handlers: handlers.clone(),
                     // The user already confirmed quitting with work running
                     // (`request_quit`), so running agents are cancelled and
                     // reaped, not waited for.
@@ -326,6 +328,7 @@ pub fn run() {
                             ipc::quiesce_after_supervisor_failure(
                                 executor_cell.get().map(|executor| executor.as_ref()),
                                 Some(poller),
+                                &handlers,
                             )
                             .await;
                             Err(anyhow::anyhow!("the IPC supervisor task failed: {error}"))

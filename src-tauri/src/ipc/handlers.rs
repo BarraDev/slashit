@@ -598,7 +598,7 @@ fn parse_status(s: &str) -> Option<TaskStatus> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     //! The delete handler's own policy, proven against the same conditions the
     //! desktop delete is held to in `crate::lifecycle::tests`.
     //!
@@ -641,17 +641,25 @@ mod tests {
     /// project pointing at it, and one task holding a real checkout.
     async fn world(dirty: bool) -> (tempfile::TempDir, IpcContext, Uuid, String) {
         let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (ctx, task_id, checkout) = world_at(tmp.path(), dirty).await;
+        (tmp, ctx, task_id, checkout)
+    }
+
+    /// [`world`] rooted at a directory the caller owns, so that another
+    /// process can be told where it is.
+    pub(in crate::ipc) async fn world_at(root: &Path, dirty: bool) -> (IpcContext, Uuid, String) {
+        let tmp = root;
         let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
-            tmp.path().join("config"),
-            tmp.path().join("data"),
-            tmp.path().join("cache"),
-            tmp.path().join("runtime"),
+            tmp.join("config"),
+            tmp.join("data"),
+            tmp.join("cache"),
+            tmp.join("runtime"),
         ));
 
         let mut ctx = ipc_test_context(paths.clone());
         ctx.worktree_manager = Arc::new(crate::worktree::WorktreeManager::new(paths));
 
-        let repo_dir = tmp.path().join("repo");
+        let repo_dir = tmp.join("repo");
         std::fs::create_dir_all(&repo_dir).unwrap();
         git(&repo_dir, &["init", "--initial-branch=main"]);
         git(&repo_dir, &["config", "user.email", "test@example.com"]);
@@ -661,7 +669,7 @@ mod tests {
         git(&repo_dir, &["commit", "-m", "seed"]);
         // A bare `origin` whose `HEAD` is recorded locally, so that the task
         // checkout has a default base to start from.
-        let origin = tmp.path().join("origin.git");
+        let origin = tmp.join("origin.git");
         git(&repo_dir, &["init", "-q", "--bare", origin.to_str().unwrap()]);
         git(&repo_dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
         git(&repo_dir, &["push", "-q", "origin", "main"]);
@@ -729,7 +737,7 @@ mod tests {
             .save_project_tasks(project_id, &[task])
             .expect("seed the board");
 
-        (tmp, ctx, task_id, info.path)
+        (ctx, task_id, info.path)
     }
 
     #[tokio::test]

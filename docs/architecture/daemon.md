@@ -152,9 +152,19 @@ fails when a command is neither. The desktop therefore releases the endpoint
 (at `RunEvent::Exit`) only after no admitted command is still running.
 
 If the task running the server dies, the supervisor above it still holds the
-ownership claim and the poller's join. It closes the fence, waits for the poller
-to return (a poll pass that began before the fence closed is not stopped by it),
+ownership claim, the poller's join and the connection handlers. It closes the
+fence, lets every handler that was running finish, waits for the poller to
+return (a poll pass that began before the fence closed is not stopped by it),
 and reaps every owner before releasing anything.
+
+The handlers are never aborted. A handler that has started a `git` run is
+waiting on a blocking call, and aborting the task stops only the wait: the `git`
+process would finish by itself, possibly after the endpoint was released. The
+server therefore hands its live handlers to the supervisor (`HandlerRescue`)
+when it dies instead of dropping them, and the supervisor joins them. A handler
+serves one request and is bounded by the request timeout and the operation it
+runs; one that does not return keeps the instance alive and holding ownership,
+as every other part of the drain does.
 
 On Windows the updater plugin's install step launches the installer and then
 calls `std::process::exit(0)` itself. SlashIt therefore downloads the installer
@@ -180,9 +190,6 @@ Not covered, and not promised:
   typed (`git`, a provider CLI) can keep running between the endpoint being
   released and the process ending. Starting a terminal and writing to one are
   refused after the fence closes.
-- If the task running the server dies, its connection handlers are aborted, not
-  joined. A handler suspended at an await point stops; one inside
-  `spawn_blocking` may finish.
 - A Windows installer that fails to start after the drain is logged and the
   application restarts into the old version; no progress event reports it.
 - Admitted desktop commands hold the drain until they return. A long download
