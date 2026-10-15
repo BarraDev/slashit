@@ -4553,7 +4553,26 @@ impl TaskExecutor {
             ),
         };
         match verdict {
-            Ok(()) => true,
+            Ok(()) => {
+                // Durable before the review can write to Git: a retried review
+                // after the fix agent committed must not be re-proved against
+                // the Worker's commit. Declining leaves the next pass to retry.
+                let review = task.next_review();
+                let now = chrono::Utc::now();
+                let mark = |staged: &mut HashMap<Uuid, Task>| {
+                    staged.get_mut(&task_id).is_some_and(|t| {
+                        t.record_activity_at(now, ActivityKind::AiReviewStarted { review })
+                    })
+                };
+                crate::lifecycle::record_typed_if_changed(
+                    &self.tasks,
+                    &self.storage,
+                    task_id,
+                    &mark,
+                )
+                .await
+                .is_ok()
+            }
             Err(reason) => {
                 let _ = Self::record_recovery_required(
                     &self.tasks,

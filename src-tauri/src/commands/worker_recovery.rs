@@ -104,7 +104,9 @@ pub enum AcceptWorkerResultOutcome {
     Accepted { task: Task },
     /// An identical earlier decision had already been applied.
     AlreadyApplied { task: Task },
-    /// Nothing was recorded.
+    /// The decision was not accepted. Nothing was recorded, except when the
+    /// reason says the branch moved after the decision was recorded: then the
+    /// Task has been returned to recovery and must be inspected again.
     Refused { reason: String },
     /// The decision is published on the board but its durability could not be
     /// confirmed. It must not be repeated blindly: the Task stays held until
@@ -695,7 +697,7 @@ pub(crate) async fn accept_result(
                 .cloned()
                 .ok_or("Task not found")?;
             if !branch_still_at(state, &current, &request.tip).await {
-                let _ = crate::queue::executor::TaskExecutor::record_recovery_required(
+                let returned = crate::queue::executor::TaskExecutor::record_recovery_required(
                     &state.task.tasks,
                     &state.storage,
                     task_id,
@@ -705,11 +707,17 @@ pub(crate) async fn accept_result(
                      being recorded. Inspect the current tip and decide again.",
                 )
                 .await;
-                return refused(
-                    "The decision was recorded, but the branch moved away from the commit you \
-                     approved before review could start. The Task is back in recovery; inspect \
-                     the current tip and decide again.",
-                );
+                return refused(match returned {
+                    Ok(()) => "The decision was recorded, but the branch moved away from the \
+                               commit you approved before review could start. The Task is back \
+                               in recovery; inspect the current tip and decide again."
+                        .to_string(),
+                    Err(e) => format!(
+                        "The decision was recorded, but the branch moved away from the commit \
+                         you approved. Review is held and SlashIt will return the Task to \
+                         recovery on its next check ({e})."
+                    ),
+                });
             }
             let mut tasks = state.task.tasks.write().await;
             let task = tasks.get_mut(&task_id).ok_or("Task not found")?;
@@ -1751,23 +1759,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_admission_accepts_the_exact_commit_and_changes_nothing() {
+    async fn review_admission_records_the_start_durably_and_a_later_fix_commit_is_not_recovery() {
         let fx = fixture().await;
         accept_result(&fx.state, fx.request(Uuid::new_v4()))
             .await
             .unwrap();
-        let (task, repo_state) = (fx.task().await, fx.repo_state());
+        let executor = fx.state.executor.get().unwrap().clone();
+        let refs_before = git(&fx.repo, &["for-each-ref"]);
 
-        let verifies = fx
-            .state
-            .executor
-            .get()
-            .unwrap()
-            .worker_commit_still_verifies(fx.task_id)
-            .await;
+        assert!(executor.worker_commit_still_verifies(fx.task_id).await);
 
-        assert!(verifies);
-        assert_untouched(&fx, &task, &repo_state).await;
+        let admitted = |task: &Task| {
+            task.activity
+                .iter()
+                .filter(|e| matches!(e.kind, ActivityKind::AiReviewStarted { review: 1 }))
+                .count()
+        };
+        assert_eq!(admitted(&fx.task().await), 1);
+        assert_eq!(admitted(&fx.on_disk()), 1, "durable before any Git write");
+        assert_eq!(git(&fx.repo, &["for-each-ref"]), refs_before);
+
+        // The review's fix agent commits; a retried review of the same result
+        // is admitted without being sent back to recovery.
+        let fix = fx.commit_in_checkout("fix.txt");
+        assert!(executor.worker_commit_still_verifies(fx.task_id).await);
+        let task = fx.task().await;
+        assert_eq!(task.status, TaskStatus::AiReview);
+        assert!(matches!(
+            task.worker_handoff.as_ref().unwrap().stage,
+            WorkerHandoffStage::ResolvedToAiReview { .. }
+        ));
+        assert_eq!(admitted(&task), 1);
+        assert_eq!(git(&fx.checkout, &["rev-parse", "HEAD"]), fix);
     }
 
     #[tokio::test]
@@ -1803,8 +1826,8 @@ mod tests {
         let agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
         let mut stale = fx.request(Uuid::new_v4());
         stale.run = 9;
-        refusal(accept_result(&fx.state, stale).await);
         let (task, repo_state) = (fx.task().await, fx.repo_state());
+        refusal(accept_result(&fx.state, stale).await);
 
         fx.state.executor.get().unwrap().poll_once_for_test().await;
 
