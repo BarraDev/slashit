@@ -228,7 +228,6 @@ pub async fn cleanup_worktree(
 
 #[tauri::command]
 pub async fn check_worktree_exists(
-    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     task_id: String,
 ) -> Result<bool, String> {

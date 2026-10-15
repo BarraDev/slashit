@@ -184,7 +184,7 @@ impl World {
 
     async fn readiness(&self, project: &str) -> Value {
         let report =
-            slashit_ui_lib::commands::get_project_readiness(GuiMutation::untracked(), self.state(), project.to_string())
+            slashit_ui_lib::commands::get_project_readiness(self.state(), project.to_string())
                 .await
                 .expect("readiness");
         serde_json::to_value(report).unwrap()

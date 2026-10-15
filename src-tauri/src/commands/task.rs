@@ -2363,7 +2363,7 @@ mod disk_pressure {
         let app = tauri::test::mock_app();
         app.manage(state);
 
-        let pause = crate::commands::storage_usage::get_new_work_pause(GuiMutation::untracked(), app.state()).await.unwrap();
+        let pause = crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap();
         assert_eq!(
             pause,
             Some(crate::domain::storage_usage::StartBlock::CriticalDisk {
@@ -2372,10 +2372,10 @@ mod disk_pressure {
             })
         );
         disk.set_available(100 * GIB);
-        assert_eq!(crate::commands::storage_usage::get_new_work_pause(GuiMutation::untracked(), app.state()).await.unwrap(), None);
+        assert_eq!(crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap(), None);
         disk.fail();
         assert!(matches!(
-            crate::commands::storage_usage::get_new_work_pause(GuiMutation::untracked(), app.state()).await.unwrap(),
+            crate::commands::storage_usage::get_new_work_pause(app.state()).await.unwrap(),
             Some(crate::domain::storage_usage::StartBlock::DiskSpaceUnavailable { .. })
         ));
     }

@@ -72,7 +72,6 @@ async fn report(state: &crate::AppState, project_id: Uuid) -> Result<Readiness, 
 /// Whether the project can run tasks and deliver them, and why not.
 #[tauri::command]
 pub async fn get_project_readiness(
-    _gui: GuiMutation,
     state: tauri::State<'_, crate::AppState>,
     project_id: String,
 ) -> Result<Readiness, String> {
@@ -167,7 +166,10 @@ pub(crate) async fn detect_remote_default_branch_core(
     report(state, project_id).await
 }
 
-/// What initializing version control in `path` would do. Writes nothing.
+/// What initializing version control in `path` would do. Writes nothing to the
+/// folder, but it creates and removes a scratch Git repository to list the
+/// files a first commit would hold, so it takes a [`GuiMutation`] like the
+/// commands that run Git for real: the drain waits for it.
 #[tauri::command]
 pub async fn preview_vcs_initialization(_gui: GuiMutation, path: String) -> Result<InitPreview, String> {
     vcs_init::preview(&path).await
