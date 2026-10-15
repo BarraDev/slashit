@@ -183,7 +183,7 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
         Some(info)
     };
 
-    let _pid_file = PidFile::write(state.paths.pid_file())?;
+    let pid_file = PidFile::write(state.paths.pid_file())?;
 
     let executor = Arc::new(queue::TaskExecutor::new(
         queue::executor::TaskExecutorConfig {
@@ -235,9 +235,23 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     // Serving the endpoints claimed at the top of this function. Nothing is
     // bound here, so there is no second chance for another instance to have
     // taken them in the meantime.
+    //
+    // This function, not the server task, holds the claim on those endpoints
+    // (`ownership`). The server task drains the executor before it lets go of
+    // its own reference, and this function lets go of the last one only after
+    // the executor is quiescent, so even a server task that dies without
+    // draining cannot release the instance under a running agent.
+    let ownership = bound.ownership();
+    let supervision = crate::ipc::Supervision {
+        shutdown: shutdown_tx.subscribe(),
+        poller: Some(Box::pin(async move {
+            polling_handle.await.map_err(|error| error.to_string())
+        })),
+        finish_grace: SHUTDOWN_GRACE,
+    };
     let mut server = tokio::spawn({
         let ctx = ctx.clone();
-        async move { bound.attach(ctx).serve().await }
+        async move { bound.attach(ctx).serve_until(supervision).await }
     });
 
     println!("slashitd: ready (pid {})", std::process::id());
@@ -248,81 +262,63 @@ pub async fn run(options: DaemonOptions) -> anyhow::Result<()> {
     // That last arm matters. A daemon whose IPC server has stopped is a
     // process nobody can talk to: it still runs queued agents, but no CLI can
     // reach it and no operator can stop it short of a signal. Logging and
-    // carrying on would leave exactly that, so it is fatal.
+    // carrying on would leave exactly that, so it is fatal. The server drains
+    // before it reports that, so this arm never races a release of ownership.
+    let mut server_result = None;
     let outcome = tokio::select! {
         reason = wait_for_signal() => signal_outcome(reason),
         _ = shutdown_rx.changed() => {
             println!("slashitd: quit requested over IPC, shutting down");
             Ok(())
         }
-        result = &mut server => match result {
-            Ok(Ok(())) => Err(anyhow::anyhow!("the IPC server stopped on its own")),
-            Ok(Err(e)) => Err(anyhow::anyhow!("the IPC server failed: {e}")),
-            Err(e) => Err(anyhow::anyhow!("the IPC server task panicked: {e}")),
+        result = &mut server => {
+            let outcome = match &result {
+                Ok(Ok(())) => Err(anyhow::anyhow!("the IPC server stopped on its own")),
+                Ok(Err(e)) => Err(anyhow::anyhow!("the IPC server failed: {e}")),
+                Err(e) => Err(anyhow::anyhow!("the IPC server task panicked: {e}")),
+            };
+            server_result = Some(result);
+            outcome
         },
     };
 
-    // Stop accepting new work before waiting on what is running, so the
-    // in-flight set cannot grow while we drain it. Sent unconditionally
-    // because only the IPC `Quit` path already set this — a signal or a
-    // failed IPC server must stop promotion too.
+    // Intentional shutdown: tell the server (and through it the poller) to
+    // stop, then wait for it. It returns only after handlers are joined, the
+    // poller has returned and every execution owner is reaped.
     let _ = shutdown_tx.send(true);
-    server.abort();
-
-    // The signal above only stops the *next* pass; a pass already past its
-    // own shutdown check keeps running and can still promote and spawn a
-    // task, whose `running_handles` entry does not exist until that pass
-    // finishes. Waiting for the poller to actually return is what makes
-    // `shutdown`'s running-task count trustworthy — without it, `shutdown`
-    // could sample zero while such a pass is mid-promotion and return
-    // immediately, leaving that new task's worktree creation racing the
-    // process exit.
-    const POLL_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-    match tokio::time::timeout(POLL_STOP_GRACE, polling_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => println!("slashitd: the queue poller task panicked: {e}"),
-        Err(_) => println!(
-            "slashitd: the queue poller did not stop within {POLL_STOP_GRACE:?}; \
-             draining anyway. Any task it just started will be requeued on the next start."
-        ),
-    }
-
-    shutdown(&executor).await;
-    println!("slashitd: stopped");
-    outcome
-}
-
-/// Let running agents finish, within a bound.
-///
-/// A hard abort would leave a task marked `in_progress` with no process behind
-/// it — recoverable, because startup returns orphaned tasks to the queue, but
-/// it discards work the agent had already done.
-async fn shutdown(executor: &Arc<queue::TaskExecutor>) {
-    const GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-
-    let running = executor.running_task_count().await;
-    if running == 0 {
-        return;
-    }
-
-    println!("slashitd: waiting up to {GRACE:?} for {running} running task(s)");
-    let deadline = tokio::time::Instant::now() + GRACE;
-    while tokio::time::Instant::now() < deadline {
-        if executor.running_task_count().await == 0 {
-            println!("slashitd: all tasks finished");
-            return;
+    let server_result = match server_result {
+        Some(result) => result,
+        None => (&mut server).await,
+    };
+    let drained = match server_result {
+        Ok(Ok(())) => Ok(()),
+        // Drained, but the cause was a failure: not a clean stop.
+        Ok(Err(error)) => Err(error.context("the IPC server failed closed")),
+        // The supervisor itself died, possibly before draining. Ownership is
+        // still ours, so finish the drain here before releasing it.
+        Err(error) => {
+            eprintln!("slashitd: the IPC supervisor task failed ({error}); draining here");
+            crate::ipc::drain_execution(&executor, std::time::Duration::ZERO).await;
+            Err(anyhow::anyhow!("the IPC supervisor task failed: {error}"))
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
+    };
 
-    let remaining = executor.running_task_count().await;
-    // Said plainly rather than silently: these tasks return to the queue on
-    // the next start, and the operator should know why.
-    println!(
-        "slashitd: {remaining} task(s) still running after the grace period; \
-         they will be requeued on the next start"
-    );
+    // The last reference to the exclusive local resource. Nothing here can
+    // still start or finish work.
+    // The PID file goes first: once the endpoint is released a successor may
+    // write its own, and ours must not delete it.
+    drop(pid_file);
+    drop(ownership);
+    println!("slashitd: stopped");
+    drained.and(outcome)
 }
+
+/// How long an intentional shutdown lets running agents finish on their own
+/// before they are cancelled and reaped.
+///
+/// A cancelled agent's task stays `in_progress`, which startup recovery
+/// returns to the queue; letting it finish keeps the work it had already done.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Turn a `wait_for_signal` result into the daemon's overall outcome.
 ///

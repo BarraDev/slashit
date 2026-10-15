@@ -15,4 +15,6 @@ pub mod handlers;
 pub mod server;
 
 pub use handlers::Dispatch;
-pub use server::{serve, BoundIpc, IpcContext, IpcServer, PeerContext};
+pub use server::{
+    drain_execution, serve, BoundIpc, IpcContext, IpcOwnership, IpcServer, PeerContext, Supervision,
+};

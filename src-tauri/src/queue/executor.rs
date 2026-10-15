@@ -589,6 +589,8 @@ pub enum PrHelperRefusal {
     TaskAlreadyOwned,
     /// No free slot in the shared [`Admission`] gate right now.
     NoCapacity,
+    /// The process has closed admission for coordinated shutdown.
+    ProcessShuttingDown,
     /// An unfinished restack of the task's published branch owns it; see
     /// `Task::republish_pending_refusal`.
     RepublishPending,
@@ -617,6 +619,10 @@ impl std::fmt::Display for PrHelperRefusal {
             Self::NoCapacity => write!(
                 f,
                 "no agent capacity is available right now; try again shortly"
+            ),
+            Self::ProcessShuttingDown => write!(
+                f,
+                "this SlashIt instance is shutting down and no longer accepts new work"
             ),
             Self::RepublishPending => write!(
                 f,
@@ -871,6 +877,70 @@ struct StoppingMark {
     task_id: Uuid,
 }
 
+/// Process-wide gate for starts and state-changing helper work.
+///
+/// A caller takes an operation lease before it begins an asynchronous
+/// admission sequence and keeps it until the owner is registered. Closing the
+/// gate is synchronized with that lease count: after `close_and_wait` returns,
+/// no caller that passed an earlier check can still be on its way to spawning
+/// an owner.
+#[derive(Default)]
+struct ProcessAdmission {
+    state: std::sync::Mutex<ProcessAdmissionState>,
+    drained: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct ProcessAdmissionState {
+    closed: bool,
+    starting: usize,
+}
+
+struct ProcessAdmissionLease<'a> {
+    gate: &'a ProcessAdmission,
+}
+
+impl ProcessAdmission {
+    fn enter(&self) -> Result<ProcessAdmissionLease<'_>, String> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed {
+            return Err("this SlashIt instance is shutting down and no longer accepts new work".into());
+        }
+        state.starting += 1;
+        Ok(ProcessAdmissionLease { gate: self })
+    }
+
+    fn is_open(&self) -> bool {
+        !self.state.lock().unwrap_or_else(|p| p.into_inner()).closed
+    }
+
+    async fn close_and_wait(&self) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.closed = true;
+        }
+        loop {
+            let notified = self.drained.notified();
+            if self.state.lock().unwrap_or_else(|p| p.into_inner()).starting == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for ProcessAdmissionLease<'_> {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.starting -= 1;
+        let drained = state.closed && state.starting == 0;
+        drop(state);
+        if drained {
+            self.gate.drained.notify_one();
+        }
+    }
+}
+
 impl Drop for StoppingMark {
     fn drop(&mut self) {
         self.ending
@@ -910,6 +980,8 @@ pub struct TaskExecutor {
     /// permit rather than a count derived from the handle maps after the
     /// fact.
     admission: Admission,
+    /// Process-wide fence for starts and state-changing execution owners.
+    process_admission: ProcessAdmission,
     /// Capacity reserved for a task at `Queue -> InProgress` promotion time,
     /// held until that task's execution actually starts and takes ownership
     /// of it (see [`Self::spawn_task_execution`]).
@@ -1170,6 +1242,7 @@ impl TaskExecutor {
             pr_helper_handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
             project_runs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             admission: Admission::new(initial_limit),
+            process_admission: ProcessAdmission::default(),
             reserved_permits: Arc::new(RwLock::new(HashMap::new())),
             lifecycle: config.lifecycle,
             logs: config.logs,
@@ -1231,7 +1304,9 @@ impl TaskExecutor {
         async move {
             let mut shutdown = shutdown;
             loop {
-                if matches!(&shutdown, Some(rx) if *rx.borrow()) {
+                if !executor.is_accepting_work()
+                    || matches!(&shutdown, Some(rx) if *rx.borrow())
+                {
                     return;
                 }
                 executor.check_and_execute().await;
@@ -1261,6 +1336,106 @@ impl TaskExecutor {
             + self.counted_project_run_count()
     }
 
+    /// Admit a provider start owned by code outside this module (the legacy
+    /// ACP agent). The returned lease must be held until the process it
+    /// guards is registered where shutdown will find and kill it.
+    pub fn admit_external_start(&self) -> Result<impl Drop + '_, String> {
+        self.process_admission.enter()
+    }
+
+    /// Whether this process still accepts owner work.
+    pub fn is_accepting_work(&self) -> bool {
+        self.process_admission.is_open()
+    }
+
+    /// Close synchronized process-wide admission and wait for every start
+    /// already inside its critical admission sequence to register or return.
+    pub async fn close_admission(&self) {
+        self.process_admission.close_and_wait().await;
+    }
+
+    /// [`Self::close_admission`], and every Project Conversation Run is told
+    /// to stop at once: a multi-step Coordinator turn re-enters the provider
+    /// between steps and consults only its own cancellation, so the fence
+    /// alone would not stop it launching the next step. Used when running
+    /// work is not being given a grace period.
+    pub async fn close_admission_cancelling_runs(&self) {
+        self.close_admission().await;
+        self.cancel_project_runs();
+    }
+
+    fn cancel_project_runs(&self) {
+        let senders = self
+            .project_runs
+            .lock()
+            .unwrap()
+            .values()
+            .map(|owner| owner.cancel.clone())
+            .collect::<Vec<_>>();
+        for cancel in senders {
+            let _ = cancel.send(true);
+        }
+    }
+
+    /// Close process-wide admission and reap every owner without changing
+    /// Task lifecycle or recovery records. The process must retain exclusive
+    /// local ownership if this returns an error.
+    pub async fn quiesce_for_shutdown(&self) -> Result<(), String> {
+        self.process_admission.close_and_wait().await;
+
+        // Conversation Runs are told to stop first, so a stuck Task owner
+        // below can never keep one of them launching providers.
+        self.cancel_project_runs();
+
+        // Starts admitted before the fence either registered their owners or
+        // returned before this snapshot is taken. Every owner is attempted
+        // even when one cannot be reaped, so a stuck one never shields the
+        // rest from cancellation; the first failure is reported at the end.
+        let mut task_ids = self.running_handles.read().await.keys().copied().collect::<Vec<_>>();
+        task_ids.extend(self.reviewing_handles.read().await.keys().copied());
+        task_ids.extend(self.pr_helper_handles.lock().unwrap().keys().copied());
+        task_ids.sort_unstable();
+        task_ids.dedup();
+        let mut first_error = None;
+        for task_id in task_ids {
+            let ended = async {
+                let lease = self.lifecycle.acquire(task_id).await?;
+                self.end_task_owners_under_lease(task_id).await?;
+                self.end_pr_helper_owner_under_lease(task_id).await?;
+                drop(lease);
+                Ok::<(), String>(())
+            }
+            .await;
+            if let Err(error) = ended {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        // Then wait until each Conversation Run's lease drops.
+        const PROJECT_RUN_DRAIN: std::time::Duration = std::time::Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + PROJECT_RUN_DRAIN;
+        loop {
+            let remaining = self.active_project_run_count();
+            if remaining == 0 {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{remaining} Project Conversation Run(s) did not finish cancellation; instance ownership must remain held"
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        if self.running_task_count().await != 0 {
+            return Err("execution ownership remains after shutdown drain; instance ownership must remain held".into());
+        }
+        Ok(())
+    }
+
     /// Register one Project-scoped fresh Run with the same capacity gate used
     /// by Task execution. A Task Worker passes `reserve_capacity = false`
     /// because its Task ownership lease already holds that capacity.
@@ -1269,6 +1444,7 @@ impl TaskExecutor {
         conversation_id: Uuid,
         reserve_capacity: bool,
     ) -> Result<ProjectRunLease, String> {
+        let _process_admission = self.process_admission.enter()?;
         let permit = if reserve_capacity {
             self.start_guard
                 .check()
@@ -1452,6 +1628,12 @@ impl TaskExecutor {
     }
 
     async fn check_and_execute(&self) {
+        // Closed admission means shutdown has begun. Nothing below may start
+        // an owner, and the reconciliations are the poller's own work, not
+        // something the drain waits for.
+        if !self.is_accepting_work() {
+            return;
+        }
         // A completed or lost runtime owner may have left only a durable
         // Started record. Classify that uncertainty once no live TaskExecutor
         // owner remains; never infer a commit from the checkout itself.
@@ -2931,6 +3113,10 @@ impl TaskExecutor {
         task_id: Uuid,
         external_permit: Option<AdmissionPermit>,
     ) -> Result<bool, String> {
+        let _process_admission = match self.process_admission.enter() {
+            Ok(lease) => lease,
+            Err(_) => return Ok(false),
+        };
         let Some(lease) = self.lifecycle.try_acquire(task_id).await else {
             return Ok(false); // another lifecycle operation owns this task right now
         };
@@ -3608,6 +3794,7 @@ impl TaskExecutor {
     /// transition: a concurrent stop or finish either lands before it, and
     /// this sees the result, or waits until it is over.
     pub async fn execute_task(&self, task_id: Uuid) -> Result<(), String> {
+        let _process_admission = self.process_admission.enter()?;
         // A paused start is answered without waiting for the lease. This
         // writes nothing and can only refuse early: the check under the lease
         // is the one that allows a start.
@@ -3846,6 +4033,10 @@ impl TaskExecutor {
         self: &Arc<Self>,
         task_id: Uuid,
     ) -> Result<PrHelperLease, PrHelperRefusal> {
+        let _process_admission = self
+            .process_admission
+            .enter()
+            .map_err(|_| PrHelperRefusal::ProcessShuttingDown)?;
         let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
             return Err(PrHelperRefusal::LifecycleContended);
         };
@@ -3918,6 +4109,7 @@ impl TaskExecutor {
         self: &Arc<Self>,
         task_id: Uuid,
     ) -> Result<PrHelperLease, String> {
+        let _process_admission = self.process_admission.enter()?;
         if let Some(refusal) = self
             .tasks
             .read()
@@ -3937,6 +4129,7 @@ impl TaskExecutor {
         self: &Arc<Self>,
         task_id: Uuid,
     ) -> Result<PrHelperLease, String> {
+        let _process_admission = self.process_admission.enter()?;
         let in_progress = self
             .pr_helper_handles
             .lock()
@@ -4276,6 +4469,9 @@ impl TaskExecutor {
     }
 
     async fn spawn_review(&self, task_id: Uuid) {
+        let Ok(_process_admission) = self.process_admission.enter() else {
+            return;
+        };
         // Acquiring the task's worktree path is an ownership question, so it
         // happens under the task's lifecycle lease -- exactly the reason
         // `spawn_task_execution` takes it (see that function's doc). Without
@@ -5711,6 +5907,14 @@ impl crate::lifecycle::ExecutionOwnership for TaskExecutor {
 /// `end_ownership_under_lease` now shares with `stop_task`. Duplicating that
 /// subprocess proof at every call site would prove the same fact five times
 /// instead of once.
+/// What [`TaskExecutor::register_gated_running_execution_for_test`] hands back.
+#[cfg(test)]
+pub(crate) struct GatedOwner {
+    pub(crate) release: tokio::sync::watch::Sender<bool>,
+    pub(crate) cancel_seen: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) finished: Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[cfg(test)]
 impl TaskExecutor {
     /// Register a live execution owner the way
@@ -5898,6 +6102,42 @@ impl TaskExecutor {
             },
         );
         cleaned_up
+    }
+
+    /// Register a running-execution owner that notices cancellation but keeps
+    /// running until the returned gate is opened: a provider process that has
+    /// been told to stop and has not stopped yet. Unlike the unkillable
+    /// owner, it can be released, so a test can hold a drain open, observe
+    /// what is still true meanwhile, and then let it finish.
+    pub(crate) async fn register_gated_running_execution_for_test(
+        &self,
+        task_id: Uuid,
+    ) -> GatedOwner {
+        let cancel_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release, mut released) = tokio::sync::watch::channel(false);
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let seen = cancel_seen.clone();
+        let done = finished.clone();
+        let handle = tokio::spawn(async move {
+            let _ = cancelled.changed().await;
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = released.wait_for(|open| *open).await;
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        self.running_handles.write().await.insert(
+            task_id,
+            RunningTask {
+                handle,
+                cancel,
+                execution_id: None,
+            },
+        );
+        GatedOwner {
+            release,
+            cancel_seen,
+            finished,
+        }
     }
 
     pub(crate) async fn register_unkillable_running_execution_for_test(&self, task_id: Uuid) {
@@ -16813,6 +17053,358 @@ VERDICT: APPROVED"
                 ],
                 "the run's own end, and the stop's repeat of it"
             );
+        }
+
+        // --- The process-wide admission fence and the shutdown drain --------
+
+        async fn board_json(executor: &TaskExecutor) -> String {
+            let tasks = executor.tasks.read().await;
+            let mut ordered: Vec<_> = tasks.values().collect();
+            ordered.sort_by_key(|task| task.id);
+            serde_json::to_string(&ordered).expect("tasks serialize")
+        }
+
+        async fn closed_within(executor: &Arc<TaskExecutor>) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while executor.is_accepting_work() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("admission closes promptly");
+        }
+
+        /// A start that read "open" before the fence closed is waited for, and
+        /// is therefore visible to the drain: there is no instant at which an
+        /// owner is on its way into the maps and the drain cannot see it.
+        #[tokio::test]
+        async fn closing_admission_waits_for_a_start_already_inside_the_fence() {
+            let (executor, _temps) = test_executor();
+            let task_id = Uuid::new_v4();
+
+            let in_flight = executor.process_admission.enter().expect("open");
+            let closing = tokio::spawn({
+                let executor = executor.clone();
+                async move { executor.close_admission().await }
+            });
+            closed_within(&executor).await;
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !closing.is_finished(),
+                "the close must wait for the start that is already inside"
+            );
+            assert!(
+                executor.process_admission.enter().is_err(),
+                "a start arriving after the fence is refused, not queued behind it"
+            );
+
+            // The start the fence waited for registers its owner, then leaves.
+            let cleaned_up = executor.register_fake_running_execution_for_test(task_id).await;
+            drop(in_flight);
+            closing.await.expect("close returns once the start has left");
+
+            executor.quiesce_for_shutdown().await.expect("drain");
+            assert!(
+                cleaned_up.load(std::sync::atomic::Ordering::SeqCst),
+                "the owner registered inside the fence was found and ended"
+            );
+            assert_eq!(executor.running_task_count().await, 0);
+        }
+
+        /// Every class of owner the executor can register is refused once the
+        /// fence is closed, and nothing is left behind by the refusal.
+        #[tokio::test]
+        async fn no_owner_class_is_admitted_after_the_fence_closes() {
+            let (executor, _temps) = test_executor();
+            let project_id = Uuid::new_v4();
+            let coding = create_test_task_full("coding", project_id, TaskStatus::InProgress, 0);
+            let mut review = create_test_task_full("review", project_id, TaskStatus::AiReview, 1);
+            review.phase = TaskPhase::QaReview;
+            let queued = create_test_task_full("queued", project_id, TaskStatus::Queue, 2);
+            let (coding_id, review_id, queued_id) = (coding.id, review.id, queued.id);
+            for task in [coding, review, queued] {
+                executor.tasks.write().await.insert(task.id, task);
+            }
+            let before = board_json(&executor).await;
+
+            executor.close_admission().await;
+            assert!(!executor.is_accepting_work());
+
+            // Worker, both entry points.
+            assert_eq!(executor.spawn_task_execution(coding_id, None).await, Ok(false));
+            assert!(executor
+                .execute_task(coding_id)
+                .await
+                .expect_err("direct start")
+                .contains("shutting down"));
+            // AI Review / fix Run.
+            executor.spawn_review(review_id).await;
+            // PR helper and PR side effects.
+            assert!(matches!(
+                executor.try_begin_pr_helper(coding_id).await,
+                Err(PrHelperRefusal::ProcessShuttingDown)
+            ));
+            assert!(executor
+                .begin_pr_side_effect_under_lease(coding_id)
+                .await
+                .err()
+                .expect("PR side effect")
+                .contains("shutting down"));
+            assert!(executor.begin_republish_under_lease(coding_id).await.is_err());
+            // Project Conversation / Coordinator Runs, with and without capacity.
+            assert!(executor.begin_project_run(Uuid::new_v4(), true).await.is_err());
+            assert!(executor.begin_project_run(Uuid::new_v4(), false).await.is_err());
+            // A poll pass promotes nothing.
+            executor.check_and_execute().await;
+
+            assert_eq!(executor.running_task_count().await, 0, "no owner exists");
+            assert!(executor.running_handles.read().await.is_empty());
+            assert!(executor.reviewing_handles.read().await.is_empty());
+            assert!(executor.pr_helper_handles.lock().unwrap().is_empty());
+            assert_eq!(executor.active_project_run_count(), 0);
+            assert_eq!(
+                board_json(&executor).await,
+                before,
+                "refusing work changes no Task (the queued one is not promoted: {queued_id})"
+            );
+        }
+
+        /// The poller returns by itself once the fence closes, with no
+        /// shutdown receiver at all (the desktop's unexpected-failure path).
+        #[tokio::test(start_paused = true)]
+        async fn the_poller_returns_once_the_fence_closes() {
+            let (executor, _temps) = test_executor();
+            let poller = tokio::spawn(executor.polling_loop(None));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(!poller.is_finished(), "an open fence keeps polling");
+
+            executor.close_admission().await;
+            tokio::time::timeout(Duration::from_secs(10), poller)
+                .await
+                .expect("the poller notices the closed fence within one interval")
+                .expect("no panic");
+        }
+
+        /// Cancellation reaches every owner class, each is awaited, and none of
+        /// it rewrites a Task: the status a crash would have left is the status
+        /// shutdown leaves.
+        #[tokio::test]
+        async fn quiescing_reaps_every_owner_class_and_rewrites_no_task() {
+            let (executor, _temps) = test_executor();
+            let project_id = Uuid::new_v4();
+            let worker = create_test_task_full("worker", project_id, TaskStatus::InProgress, 0);
+            let mut reviewing = create_test_task_full("reviewing", project_id, TaskStatus::AiReview, 1);
+            reviewing.phase = TaskPhase::QaReview;
+            let delivering = create_test_task_full("delivering", project_id, TaskStatus::HumanReview, 2);
+            let (worker_id, reviewing_id, delivering_id) = (worker.id, reviewing.id, delivering.id);
+            for task in [worker, reviewing, delivering] {
+                executor.tasks.write().await.insert(task.id, task);
+            }
+            let before = board_json(&executor).await;
+
+            let worker_cleaned = executor.register_fake_running_execution_for_test(worker_id).await;
+            let review_cleaned = executor.register_fake_reviewing_owner_for_test(reviewing_id).await;
+            let pr_lease = executor
+                .begin_pr_side_effect_under_lease(delivering_id)
+                .await
+                .expect("PR flow admitted while open");
+            let pr_cancel = pr_lease.cancel_receiver();
+            let pr_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            tokio::spawn({
+                let pr_done = pr_done.clone();
+                let mut pr_cancel = pr_cancel;
+                async move {
+                    let _ = pr_cancel.changed().await;
+                    pr_done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    drop(pr_lease);
+                }
+            });
+            let conversation = Uuid::new_v4();
+            let run_lease = executor
+                .begin_project_run(conversation, false)
+                .await
+                .expect("Project Run admitted while open");
+            let run_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            tokio::spawn({
+                let run_done = run_done.clone();
+                let mut cancel = run_lease.cancel_receiver();
+                async move {
+                    let _ = cancel.changed().await;
+                    run_done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    drop(run_lease);
+                }
+            });
+            // A PR side effect is not a live run; the other three are.
+            assert_eq!(executor.running_task_count().await, 3);
+            assert_eq!(executor.active_project_run_count(), 1);
+
+            executor.close_admission().await;
+            executor.quiesce_for_shutdown().await.expect("every owner ends");
+
+            for (name, flag) in [
+                ("worker", &worker_cleaned),
+                ("review", &review_cleaned),
+                ("pr flow", &pr_done),
+                ("project run", &run_done),
+            ] {
+                assert!(flag.load(std::sync::atomic::Ordering::SeqCst), "{name} was cancelled and awaited");
+            }
+            assert_eq!(executor.running_task_count().await, 0);
+            assert_eq!(
+                board_json(&executor).await,
+                before,
+                "draining must not settle, fail or requeue any Task"
+            );
+        }
+
+        /// A bounded wait is not proof that an owner stopped: while one cannot
+        /// be reaped, the drain says so and the owner stays registered.
+        #[tokio::test(start_paused = true)]
+        async fn quiescing_reports_failure_while_an_owner_cannot_be_reaped() {
+            let (executor, _temps) = test_executor();
+            let task_id = Uuid::new_v4();
+            let mut task = create_test_task_full("stuck", Uuid::new_v4(), TaskStatus::InProgress, 0);
+            task.id = task_id;
+            executor.tasks.write().await.insert(task_id, task);
+            executor.register_unkillable_running_execution_for_test(task_id).await;
+
+            executor.close_admission().await;
+            for _ in 0..3 {
+                let error = executor
+                    .quiesce_for_shutdown()
+                    .await
+                    .expect_err("an owner that ignores cancellation is not quiescent");
+                assert!(error.contains("still finishing"), "{error}");
+                assert_eq!(
+                    executor.running_task_count().await,
+                    1,
+                    "the owner is put back where it was found, never forgotten"
+                );
+            }
+        }
+
+        /// One owner that will not stop must not shield the others from being
+        /// told to: every owner and every Project Run is cancelled, whatever
+        /// order they are visited in.
+        #[tokio::test(start_paused = true)]
+        async fn a_stuck_owner_does_not_stop_the_rest_being_cancelled() {
+            let (executor, _temps) = test_executor();
+            let mut ids = [Uuid::new_v4(), Uuid::new_v4()];
+            ids.sort_unstable();
+            executor.register_unkillable_running_execution_for_test(ids[0]).await;
+            let healthy = executor.register_gated_running_execution_for_test(ids[1]).await;
+            let run = executor.begin_project_run(Uuid::new_v4(), false).await.unwrap();
+            let run_cancel = run.cancel_receiver();
+
+            executor.close_admission_cancelling_runs().await;
+            assert!(*run_cancel.borrow(), "Project Runs are cancelled when the fence closes");
+            executor.quiesce_for_shutdown().await.expect_err("the stuck owner remains");
+
+            assert!(
+                healthy.cancel_seen.load(std::sync::atomic::Ordering::SeqCst),
+                "the owner visited after the stuck one was still cancelled"
+            );
+            drop(run);
+        }
+
+        /// A cancelled owner that takes a while to stop is awaited across
+        /// retries, and the drain completes once it does.
+        #[tokio::test]
+        async fn a_slow_owner_is_awaited_and_the_drain_completes_when_it_stops() {
+            let (executor, _temps) = test_executor();
+            let task_id = Uuid::new_v4();
+            let gated = executor.register_gated_running_execution_for_test(task_id).await;
+
+            executor.close_admission().await;
+            let draining = tokio::spawn({
+                let executor = executor.clone();
+                async move { executor.quiesce_for_shutdown().await }
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !gated.cancel_seen.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the owner is told to stop");
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!draining.is_finished(), "still waiting for the owner to stop");
+            assert_eq!(executor.running_task_count().await, 0, "taken out of the map while awaited");
+
+            gated.release.send(true).expect("release");
+            draining.await.expect("join").expect("drained once the owner stopped");
+            assert!(gated.finished.load(std::sync::atomic::Ordering::SeqCst));
+        }
+
+        /// A real Worker with a real provider process: shutdown ends the
+        /// process, and the Task, its checkout, its branch and every Git ref
+        /// are exactly what they were. The Task stays `InProgress`, which is
+        /// what startup recovery requeues.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_real_worker_is_reaped_at_shutdown_and_its_work_is_preserved() {
+            let w = real_world().await;
+            let pid_dir = tempfile::tempdir().unwrap();
+            let pid_file = pid_dir.path().join("pid");
+            let _agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &format!(
+                    "cat >/dev/null; printf 'work\\n' > agent_work.txt; echo $$ > '{}'; sleep 60",
+                    pid_file.display()
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                w.executor.spawn_task_execution(w.task_id, None).await,
+                Ok(true)
+            );
+            wait_for_status(&w.executor, w.task_id, AgentStatus::Running).await;
+            for _ in 0..400 {
+                if pid_file.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let pid: i32 = std::fs::read_to_string(&pid_file)
+                .expect("the provider process wrote its pid")
+                .trim()
+                .parse()
+                .unwrap();
+            // Safety: signal 0 only probes existence.
+            let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+            assert!(alive(pid), "the provider process is running");
+
+            let repo = w._temps[0].path().join("repository");
+            let refs_before = refs_of(&repo);
+            let worktrees_before = worktree_count(&repo);
+            let task_before = w.executor.tasks.read().await[&w.task_id].clone();
+            let checkout = task_before.worktree_path.clone().expect("a Task Checkout");
+            assert!(std::path::Path::new(&checkout).exists());
+
+            w.executor.close_admission().await;
+            w.executor.quiesce_for_shutdown().await.expect("drained");
+
+            for _ in 0..200 {
+                if !alive(pid) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(!alive(pid), "the provider process was reaped, not abandoned");
+            assert_eq!(w.executor.running_task_count().await, 0);
+
+            let task_after = w.executor.tasks.read().await[&w.task_id].clone();
+            assert_eq!(task_after.status, TaskStatus::InProgress);
+            assert_eq!(task_after.worktree_path, task_before.worktree_path);
+            assert_eq!(task_after.branch_name, task_before.branch_name);
+            assert!(std::path::Path::new(&checkout).exists(), "the checkout survives");
+            assert_eq!(refs_of(&repo), refs_before, "no branch or commit was touched");
+            assert_eq!(worktree_count(&repo), worktrees_before);
         }
     }
 }

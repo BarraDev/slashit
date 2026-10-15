@@ -97,6 +97,13 @@ pub async fn start_agent(
         )?
     };
 
+    // Held until the client is registered where shutdown will find and kill
+    // it: closing the fence waits for this, and refuses what comes after.
+    let _admission = match state.executor.get() {
+        Some(executor) => Some(executor.admit_external_start()?),
+        None => None,
+    };
+
     let id = Uuid::new_v4();
     let execution = AgentExecution {
         id,

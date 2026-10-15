@@ -111,10 +111,45 @@ Both were real, both caused a crash rather than a missing feature:
 
 ## Shutdown
 
-`SIGTERM` or `SIGINT` (or an IPC `Quit`) stops accepting connections, then
-waits up to 30 seconds for running agents to finish. Tasks still running when
-the grace period expires are left as they are and returned to the queue by the
-next start's migration, and the daemon says so rather than exiting silently.
+An instance stays the exclusive owner of its endpoint for as long as it can
+admit, run or persist anything that would conflict with another instance. The
+ownership resource (the Unix `flock` lease and socket, or the Windows
+first-instance named pipe) is held by the process supervisor, never by an accept
+loop, and is released last.
+
+`SIGTERM`, `SIGINT` or an IPC `Quit` (intentional), and the mandatory local
+listener failing, an accept loop or a connection handler panicking, or every
+listener being lost (a failure) all take the same path, in this order:
+
+1. Admission closes. No Worker, AI review or fix, PR helper or PR operation,
+   or Project Conversation Run can start, and mutating IPC requests are
+   refused. A start that had already passed its check is waited for until its
+   owner is registered, so none can slip in afterwards.
+2. The listeners stop accepting and every connection handler is joined.
+3. The queue poller returns.
+4. Running work is drained. An intentional daemon shutdown first lets agents
+   finish for up to 30 seconds; a failure, and the desktop app (where the user
+   has already confirmed quitting), do not wait. Whatever remains is cancelled
+   and reaped through the executor's existing owner-ending paths. These do not
+   change any Task: a Task that was `in_progress` stays `in_progress`, and its
+   checkout, branch, commits and recovery evidence are untouched, so the next
+   start requeues it exactly as after a crash.
+5. Only then is the endpoint released and the process exits.
+
+A bounded wait is not proof that a provider process stopped. If an owner cannot
+be reaped, the instance keeps its ownership, says so, and keeps retrying; it
+does not exit as if the shutdown were clean. A failure-triggered shutdown
+exits non-zero once drained.
+
+Not covered: Tauri commands from the desktop window are not individually
+fenced (only IPC requests and execution starts are); the desktop keeps the
+endpoint until `RunEvent::Exit` to bound that window. On Windows the updater
+plugin's installer exits the process directly, bypassing the drain. Signals sent
+to a draining daemon are ignored; only `SIGKILL` ends it early. A process that
+is killed outright (`SIGKILL`, power loss) gives up
+its endpoint at once because the kernel drops the lease, and any provider
+process it had started may outlive it. A graceful shutdown never leaves one
+behind unless the retry above is still going.
 
 The PID file at `AppPaths::pid_file()` is informational only. Endpoint
 ownership is the authoritative single-instance mechanism, because a PID file

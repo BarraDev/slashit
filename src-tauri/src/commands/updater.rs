@@ -658,9 +658,15 @@ pub async fn updater_download_and_install(
 /// has already asked. Deliberately not gated on the feature flag: once a new
 /// binary is on disk, refusing to restart would leave the application running
 /// code that no longer matches its own installation.
+///
+/// Goes through the same ownership-preserving shutdown as quitting: a restart
+/// that exec'd the new binary directly would drop this instance's exclusive
+/// local ownership while its agents were still running. The restart happens
+/// after the drain, in `run()`'s supervising task.
 #[tauri::command]
-pub fn updater_restart(app: AppHandle) {
-    app.restart();
+pub fn updater_restart(app: AppHandle, restart: tauri::State<'_, crate::RestartRequested>) {
+    restart.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    app.exit(0);
 }
 
 #[cfg(test)]
