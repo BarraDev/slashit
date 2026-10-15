@@ -414,6 +414,32 @@ impl Task {
             })
     }
 
+    /// Whether an AI Review has already been admitted for the current Worker
+    /// run's result. Review admission re-proves the exact handoff commit only
+    /// before the first review of a result: a later review of the same result
+    /// legitimately sees the fix agent's own commits.
+    pub fn review_admitted_for_current_result(&self) -> bool {
+        let Some(handoff) = self.worker_handoff.as_ref() else {
+            return false;
+        };
+        let Some(run) = handoff.run else {
+            return false;
+        };
+        let completed_at = self.activity.iter().find_map(|entry| {
+            matches!(entry.kind, ActivityKind::RunCompleted { run: r } if r == run)
+                .then_some(entry.at)
+        });
+        let anchor = match (completed_at, handoff.acceptance.as_ref()) {
+            (Some(done), Some(accepted)) => done.max(accepted.decided_at),
+            (Some(done), None) => done,
+            (None, Some(accepted)) => accepted.decided_at,
+            (None, None) => return false,
+        };
+        self.activity.iter().any(|entry| {
+            matches!(entry.kind, ActivityKind::AiReviewStarted { .. }) && entry.at >= anchor
+        })
+    }
+
     /// Why ordinary Queue/status commands may not bypass recovery.
     pub fn worker_recovery_refusal(&self) -> Option<String> {
         self.worker_handoff

@@ -511,6 +511,54 @@ async fn branch_still_at(state: &crate::AppState, task: &Task, tip: &str) -> boo
         == Some(tip)
 }
 
+/// The final compare-and-set and, only if it holds, the whole acceptance.
+/// Answers whether it changed the Task; a `false` leaves it untouched.
+fn apply_acceptance(
+    current: &mut Task,
+    expected: &AcceptWorkerResultRequest,
+    decision: &WorkerResultAcceptance,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let still_current = current.id == expected.task_id
+        && current.project_id == expected.project_id
+        && matches!(current.status, TaskStatus::Error | TaskStatus::Backlog)
+        && !current.cleanup_in_flight
+        && current.pending_republish.is_none()
+        && current.local_integration.is_none()
+        && current.pr_url.is_none()
+        && current.branch_name.as_deref() == Some(expected.branch.as_str())
+        && current.worktree_path.as_deref() == Some(expected.checkout.as_str())
+        && current.worker_handoff.as_ref().is_some_and(|h| {
+            h.run == Some(expected.run)
+                && h.task_id == expected.task_id
+                && h.project_id == expected.project_id
+                && h.repository_id == Some(expected.repository_id)
+                && h.branch.as_deref() == Some(expected.branch.as_str())
+                && h.acceptance
+                    .as_ref()
+                    .is_none_or(|a| a.decision_id != expected.decision_id)
+                && matches!(&h.stage,
+                    WorkerHandoffStage::RecoveryRequired { observed_commit, .. }
+                        if *observed_commit == expected.observed_commit)
+        });
+    if !still_current {
+        return false;
+    }
+    current.status = TaskStatus::AiReview;
+    current.phase = TaskPhase::QaReview;
+    current.phase_progress = 80;
+    current.overall_progress = 80;
+    current.error_message = None;
+    current.record_activity_at(now, ActivityKind::RunCompleted { run: expected.run });
+    if let Some(handoff) = current.worker_handoff.as_mut() {
+        handoff.stage = WorkerHandoffStage::ResolvedToAiReview {
+            commit: expected.tip.clone(),
+        };
+        handoff.acceptance = Some(decision.clone());
+    }
+    true
+}
+
 pub(crate) async fn accept_result(
     state: &crate::AppState,
     request: AcceptWorkerResultRequest,
@@ -596,48 +644,22 @@ pub(crate) async fn accept_result(
         commit: request.tip.clone(),
         decided_at: now,
     };
-    let applied = std::sync::atomic::AtomicBool::new(false);
-    let expected = request.clone();
-    let amend = |staged: &mut HashMap<Uuid, Task>| {
-        let Some(current) = staged.get_mut(&task_id) else {
-            return;
-        };
-        let still_current = current.project_id == expected.project_id
-            && matches!(current.status, TaskStatus::Error | TaskStatus::Backlog)
-            && !current.cleanup_in_flight
-            && current.pending_republish.is_none()
-            && current.local_integration.is_none()
-            && current.pr_url.is_none()
-            && current.branch_name.as_deref() == Some(expected.branch.as_str())
-            && current.worktree_path.as_deref() == Some(expected.checkout.as_str())
-            && current.worker_handoff.as_ref().is_some_and(|h| {
-                h.run == Some(expected.run)
-                    && matches!(&h.stage,
-                        WorkerHandoffStage::RecoveryRequired { observed_commit, .. }
-                            if *observed_commit == expected.observed_commit)
-            });
-        if !still_current {
-            return;
-        }
-        current.status = TaskStatus::AiReview;
-        current.phase = TaskPhase::QaReview;
-        current.phase_progress = 80;
-        current.overall_progress = 80;
-        current.error_message = None;
-        current.record_activity_at(now, ActivityKind::RunCompleted { run: expected.run });
-        if let Some(handoff) = current.worker_handoff.as_mut() {
-            handoff.stage = WorkerHandoffStage::ResolvedToAiReview {
-                commit: expected.tip.clone(),
-            };
-            handoff.acceptance = Some(decision.clone());
-        }
-        applied.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Evaluated under the board's write lock, with the save that follows: the
+    // checks above were a preliminary read. Answering `false` writes nothing.
+    let revise = |staged: &mut HashMap<Uuid, Task>| -> bool {
+        staged
+            .get_mut(&task_id)
+            .is_some_and(|current| apply_acceptance(current, &request, &decision, now))
     };
 
-    let written =
-        crate::lifecycle::record_typed(&state.task.tasks, &state.storage, task_id, &amend).await;
-    let published = applied.load(std::sync::atomic::Ordering::Relaxed);
-    match written {
+    match crate::lifecycle::record_typed_if_changed(
+        &state.task.tasks,
+        &state.storage,
+        task_id,
+        &revise,
+    )
+    .await
+    {
         Err(crate::lifecycle::RecordWriteError::NotPublished(reason)) => {
             refused(format!("Nothing was recorded: {reason}"))
         }
@@ -650,25 +672,48 @@ pub(crate) async fn accept_result(
                 .get(&task_id)
                 .cloned()
                 .ok_or("Task not found")?;
-            if !published {
-                return refused(format!("Nothing was recorded: {detail}"));
-            }
             // Left unconfirmed on purpose: startup and the executor poll
             // re-validate the commit before AI Review is admitted.
             Ok(AcceptWorkerResultOutcome::DurabilityUnconfirmed { task, detail })
         }
-        Ok(()) if !published => refused(
+        Ok(false) => refused(
             "The Task changed while the decision was being recorded, so nothing was recorded.",
         ),
-        Ok(()) => {
+        Ok(true) => {
+            // The write is confirmed durable. The acknowledgement that lets
+            // review start is earned only if the branch still sits on the
+            // accepted commit. SlashIt's own Git changes are serialized by the
+            // lease held here; a Git writer outside SlashIt is not, so this is
+            // a point-in-time read. If the tip has moved, the Task goes straight
+            // back to recovery rather than waiting for the next poll.
+            let current = state
+                .task
+                .tasks
+                .read()
+                .await
+                .get(&task_id)
+                .cloned()
+                .ok_or("Task not found")?;
+            if !branch_still_at(state, &current, &request.tip).await {
+                let _ = crate::queue::executor::TaskExecutor::record_recovery_required(
+                    &state.task.tasks,
+                    &state.storage,
+                    task_id,
+                    Some(request.run),
+                    None,
+                    "The branch moved away from the commit you accepted while the decision was \
+                     being recorded. Inspect the current tip and decide again.",
+                )
+                .await;
+                return refused(
+                    "The decision was recorded, but the branch moved away from the commit you \
+                     approved before review could start. The Task is back in recovery; inspect \
+                     the current tip and decide again.",
+                );
+            }
             let mut tasks = state.task.tasks.write().await;
             let task = tasks.get_mut(&task_id).ok_or("Task not found")?;
-            // The write is confirmed durable. The acknowledgement is earned
-            // only if the branch still sits on the accepted commit; otherwise
-            // it stays unset and the executor re-validates before review.
-            if branch_still_at(state, &task.clone(), &request.tip).await {
-                task.worker_handoff_confirmed = true;
-            }
+            task.worker_handoff_confirmed = true;
             Ok(AcceptWorkerResultOutcome::Accepted { task: task.clone() })
         }
     }
@@ -771,7 +816,7 @@ mod tests {
                 .map(|t| format!("{t:?}"))
                 .unwrap_or_default();
             format!(
-                "{}\n{}\n{}\n{}\n{stamp}",
+                "{}\n{}\n{}\n{}\n{stamp}\n{}",
                 git(&self.repo, &["for-each-ref"]),
                 git(&self.repo, &["worktree", "list", "--porcelain"]),
                 git(&self.checkout, &["rev-parse", "HEAD"]),
@@ -779,7 +824,49 @@ mod tests {
                     &self.checkout,
                     &["status", "--porcelain=v1", "--untracked-files=all"]
                 ),
+                self.board_files(),
             )
+        }
+
+        /// Every file SlashIt persisted for this fixture, by identity: path,
+        /// inode (an atomic replacement changes it), mtime and bytes. Equal
+        /// snapshots mean no board file was rewritten.
+        fn board_files(&self) -> String {
+            use std::os::unix::fs::MetadataExt;
+            fn walk(dir: &Path, out: &mut Vec<String>) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else if let (Ok(meta), Ok(bytes)) =
+                        (std::fs::metadata(&path), std::fs::read(&path))
+                    {
+                        out.push(format!(
+                            "{} ino={} mtime={}.{} {:x}",
+                            path.display(),
+                            meta.ino(),
+                            meta.mtime(),
+                            meta.mtime_nsec(),
+                            md5_like(&bytes)
+                        ));
+                    }
+                }
+            }
+            fn md5_like(bytes: &[u8]) -> u64 {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                hasher.finish()
+            }
+            let mut out = Vec::new();
+            for root in ["config", "data"] {
+                walk(&self._tmp.path().join(root), &mut out);
+            }
+            out.sort();
+            out.join("\n")
         }
 
         fn commit_in_checkout(&self, name: &str) -> String {
@@ -928,6 +1015,12 @@ mod tests {
         assert_eq!(after.status, before_task.status);
         assert_eq!(after.worker_handoff, before_task.worker_handoff);
         assert_eq!(after.activity, before_task.activity);
+        assert_eq!(after.updated_at, before_task.updated_at);
+        assert_eq!(
+            serde_json::to_string(&after).unwrap(),
+            serde_json::to_string(before_task).unwrap(),
+            "the Task is byte-identical in memory"
+        );
         assert_eq!(fx.repo_state(), before_repo);
     }
 
@@ -1348,8 +1441,10 @@ mod tests {
     async fn a_task_that_moved_out_of_recovery_or_already_ended_the_run_is_refused() {
         let fx = fixture().await;
         fx.edit(|t| t.status = TaskStatus::HumanReview).await;
+        let (before, repo_state) = (fx.task().await, fx.repo_state());
         let reason = refusal(accept_result(&fx.state, fx.request(Uuid::new_v4())).await);
         assert!(reason.contains("lifecycle state"), "{reason}");
+        assert_untouched(&fx, &before, &repo_state).await;
 
         fx.edit(|t| {
             t.status = TaskStatus::Error;
@@ -1526,5 +1621,375 @@ mod tests {
             WorkerHandoffStage::ResolvedToAiReview { commit: newer }
         );
         assert_eq!(completions(&task), 1, "completions stay once-only");
+    }
+
+    // ---- Refusal, barrier and review-admission regressions ----------------
+
+    /// Hold a read guard on the Task board, start `decision`, and wait until
+    /// it is queued for the write lock. No timing: a queued writer makes
+    /// `try_read` fail, and that is the condition awaited. `at_barrier` runs
+    /// with the decision parked between validation and persistence.
+    async fn decide_with_barrier<T>(
+        fx: &Fx,
+        decision: AcceptWorkerResultRequest,
+        at_barrier: impl FnOnce() -> T,
+    ) -> Result<AcceptWorkerResultOutcome, String> {
+        let guard = fx.state.task.tasks.read().await;
+        let accept = accept_result(&fx.state, decision);
+        let driver = async {
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                while fx.state.task.tasks.try_read().is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the decision never reached persistence");
+            at_barrier();
+            drop(guard);
+        };
+        let (outcome, ()) = tokio::join!(accept, driver);
+        outcome
+    }
+
+    #[tokio::test]
+    async fn a_tip_that_moves_between_validation_and_persistence_is_never_reviewed() {
+        let fx = fixture().await;
+        let agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
+        let approved = fx.tip.clone();
+
+        let mut moved = String::new();
+        let outcome = decide_with_barrier(&fx, fx.request(Uuid::new_v4()), || {
+            moved = fx.commit_in_checkout("late.txt");
+        })
+        .await
+        .unwrap();
+
+        let AcceptWorkerResultOutcome::Refused { reason } = outcome else {
+            panic!("a decision on a tip that moved is not an acceptance: {outcome:?}");
+        };
+        assert!(reason.contains("moved away"), "{reason}");
+        assert_ne!(moved, approved);
+
+        // The exact approved commit was never replaced by the new tip, and the
+        // moved branch and checkout were left exactly as the writer made them.
+        let task = fx.task().await;
+        assert_eq!(task.status, TaskStatus::Error);
+        let handoff = task.worker_handoff.clone().unwrap();
+        assert!(matches!(
+            &handoff.stage,
+            WorkerHandoffStage::RecoveryRequired { observed_commit: Some(c), .. } if *c == approved
+        ));
+        assert_eq!(handoff.acceptance.unwrap().commit, approved);
+        assert!(!task.worker_handoff_confirmed);
+        assert_eq!(
+            git(
+                &fx.repo,
+                &["rev-parse", &format!("refs/heads/{}", fx.branch)]
+            ),
+            moved
+        );
+        assert_eq!(git(&fx.checkout, &["rev-parse", "HEAD"]), moved);
+        assert_eq!(
+            git(&fx.checkout, &["status", "--porcelain=v1"]),
+            "",
+            "the checkout was not touched"
+        );
+        assert!(matches!(
+            fx.on_disk().worker_handoff.unwrap().stage,
+            WorkerHandoffStage::RecoveryRequired { .. }
+        ));
+
+        fx.state.executor.get().unwrap().poll_once_for_test().await;
+        assert_eq!(fx.task().await.status, TaskStatus::Error);
+        assert!(
+            !agent.invocations().contains("claude"),
+            "neither review nor a coding Worker was launched"
+        );
+        assert_eq!(completions(&fx.task().await), 1);
+    }
+
+    #[tokio::test]
+    async fn a_tip_that_moves_after_acceptance_is_caught_before_review_is_admitted() {
+        let fx = fixture().await;
+        let agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
+        let accepted = fx.tip.clone();
+        let outcome = accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            AcceptWorkerResultOutcome::Accepted { .. }
+        ));
+        assert!(
+            fx.task().await.worker_handoff_confirmed,
+            "the acknowledgement was earned while the tip still matched"
+        );
+
+        // An outside Git writer moves the branch after the acknowledgement.
+        let moved = fx.commit_in_checkout("outside.txt");
+        fx.state.executor.get().unwrap().poll_once_for_test().await;
+
+        let task = fx.task().await;
+        assert_eq!(task.status, TaskStatus::Error, "review was not admitted");
+        assert!(matches!(
+            &task.worker_handoff.as_ref().unwrap().stage,
+            WorkerHandoffStage::RecoveryRequired { observed_commit: Some(c), .. } if *c == accepted
+        ));
+        assert!(!task
+            .activity
+            .iter()
+            .any(|e| matches!(e.kind, ActivityKind::AiReviewStarted { .. })));
+        assert!(!agent.invocations().contains("claude"));
+        assert_eq!(
+            git(
+                &fx.repo,
+                &["rev-parse", &format!("refs/heads/{}", fx.branch)]
+            ),
+            moved,
+            "the outside writer's commit is preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_admission_accepts_the_exact_commit_and_changes_nothing() {
+        let fx = fixture().await;
+        accept_result(&fx.state, fx.request(Uuid::new_v4()))
+            .await
+            .unwrap();
+        let (task, repo_state) = (fx.task().await, fx.repo_state());
+
+        let verifies = fx
+            .state
+            .executor
+            .get()
+            .unwrap()
+            .worker_commit_still_verifies(fx.task_id)
+            .await;
+
+        assert!(verifies);
+        assert_untouched(&fx, &task, &repo_state).await;
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_write_repeated_has_no_second_write() {
+        let fx = fixture().await;
+        let id = Uuid::new_v4();
+        let outcome = {
+            let _fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+            accept_result(&fx.state, fx.request(id)).await.unwrap()
+        };
+        assert!(matches!(
+            outcome,
+            AcceptWorkerResultOutcome::DurabilityUnconfirmed { .. }
+        ));
+        let (task, repo_state) = (fx.task().await, fx.repo_state());
+
+        let again = accept_result(&fx.state, fx.request(id)).await.unwrap();
+
+        assert!(
+            matches!(again, AcceptWorkerResultOutcome::AlreadyApplied { .. }),
+            "{again:?}"
+        );
+        assert_untouched(&fx, &task, &repo_state).await;
+        assert!(
+            !fx.task().await.worker_handoff_confirmed,
+            "repeating the request does not earn the acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_or_stale_decision_never_launches_a_coding_worker() {
+        let fx = fixture().await;
+        let agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
+        let mut stale = fx.request(Uuid::new_v4());
+        stale.run = 9;
+        refusal(accept_result(&fx.state, stale).await);
+        let (task, repo_state) = (fx.task().await, fx.repo_state());
+
+        fx.state.executor.get().unwrap().poll_once_for_test().await;
+
+        assert!(!agent.invocations().contains("claude"));
+        assert!(!fx.task().await.is_ready_to_execute());
+        assert_untouched(&fx, &task, &repo_state).await;
+    }
+
+    #[tokio::test]
+    async fn a_new_human_acceptance_after_failed_revalidation_is_current_and_consistent() {
+        let fx = fixture().await;
+        let agent = crate::test_helpers::FakeProgram::install("claude", "exit 1").await;
+        let executor = fx.state.executor.get().unwrap().clone();
+        let first = fx.tip.clone();
+        let first_decision = Uuid::new_v4();
+        accept_result(&fx.state, fx.request(first_decision))
+            .await
+            .unwrap();
+
+        // Restart, then the branch moves: the acceptance stops verifying.
+        let reloaded = fx.on_disk();
+        fx.state
+            .task
+            .tasks
+            .write()
+            .await
+            .insert(fx.task_id, reloaded);
+        let second = fx.commit_in_checkout("after.txt");
+        executor.reconcile_committed_worker_handoffs().await;
+
+        let recovering = fx.task().await;
+        assert_eq!(recovering.status, TaskStatus::Error);
+        assert!(!recovering.is_ready_to_execute(), "never a coding Worker");
+        assert!(matches!(
+            &recovering.worker_handoff.as_ref().unwrap().stage,
+            WorkerHandoffStage::RecoveryRequired { observed_commit: Some(c), .. } if *c == first
+        ));
+        assert!(!recovering.worker_handoff_confirmed);
+        let evidence = worker_recovery_evidence(&fx.state, fx.task_id)
+            .await
+            .unwrap();
+        assert_eq!(evidence.stage, "recovery_required");
+        assert_eq!(evidence.branch_tip.as_deref(), Some(second.as_str()));
+        assert!(evidence.eligible, "{:?}", evidence.refusals);
+        // Repeated evaluation and a poll change nothing and launch nothing.
+        let (settled, repo_state) = (fx.task().await, fx.repo_state());
+        executor.poll_once_for_test().await;
+        executor.reconcile_committed_worker_handoffs().await;
+        assert_untouched(&fx, &settled, &repo_state).await;
+
+        // The old decision is not silently treated as current.
+        let mut replay = fx.request(first_decision);
+        replay.observed_commit = Some(first.clone());
+        let reason = refusal(accept_result(&fx.state, replay).await);
+        assert!(reason.contains("returned to recovery"), "{reason}");
+        assert_untouched(&fx, &settled, &repo_state).await;
+
+        // A new decision binds the correct run and the new tip.
+        let new_decision = Uuid::new_v4();
+        let mut request = fx.request(new_decision);
+        request.observed_commit = Some(first);
+        request.tip = second.clone();
+        let outcome = accept_result(&fx.state, request).await.unwrap();
+        let AcceptWorkerResultOutcome::Accepted { task } = outcome else {
+            panic!("{outcome:?}");
+        };
+        let handoff = task.worker_handoff.clone().unwrap();
+        assert_eq!(handoff.run, Some(1));
+        assert_eq!(
+            handoff.stage,
+            WorkerHandoffStage::ResolvedToAiReview {
+                commit: second.clone()
+            }
+        );
+        let acceptance = handoff.acceptance.unwrap();
+        assert_eq!(acceptance.decision_id, new_decision);
+        assert_eq!(acceptance.commit, second);
+        assert_eq!(completions(&task), 1, "no duplicate RunCompleted");
+        assert_eq!(
+            task.activity
+                .iter()
+                .filter(|e| matches!(e.kind, ActivityKind::RecoveryRequired { .. }))
+                .count(),
+            1,
+            "recovery is a once-only timeline milestone per run"
+        );
+        assert!(!task.is_ready_to_execute());
+
+        // Restart again: still deterministic, still one completion.
+        fx.state
+            .task
+            .tasks
+            .write()
+            .await
+            .insert(fx.task_id, fx.on_disk());
+        executor.reconcile_committed_worker_handoffs().await;
+        let restarted = fx.task().await;
+        assert!(restarted.worker_handoff_confirmed);
+        assert_eq!(restarted.status, TaskStatus::AiReview);
+        assert_eq!(completions(&restarted), 1);
+        let (again, repo_state) = (fx.task().await, fx.repo_state());
+        executor.reconcile_committed_worker_handoffs().await;
+        assert_untouched(&fx, &again, &repo_state).await;
+        assert!(!agent.invocations().contains("claude"));
+    }
+
+    /// The lock-time predicate is a pure compare-and-set: whichever fact moved
+    /// after the preliminary read, it answers `false` and leaves the Task
+    /// byte-identical, so the caller's conditional write has nothing to write.
+    #[tokio::test]
+    async fn the_final_compare_and_set_changes_nothing_when_any_fact_moved() {
+        let fx = fixture().await;
+        let request = fx.request(Uuid::new_v4());
+        let decision = WorkerResultAcceptance {
+            decision_id: request.decision_id,
+            commit: request.tip.clone(),
+            decided_at: chrono::Utc::now(),
+        };
+        let base = fx.task().await;
+        let recorded_id = request.decision_id;
+        type Change = Box<dyn Fn(&mut Task)>;
+        let moved: Vec<(&str, Change)> = vec![
+            ("status", Box::new(|t| t.status = TaskStatus::HumanReview)),
+            ("branch", Box::new(|t| t.branch_name = Some("other".into()))),
+            ("checkout", Box::new(|t| t.worktree_path = None)),
+            (
+                "pr",
+                Box::new(|t| t.pr_url = Some("https://x.invalid/1".into())),
+            ),
+            ("cleanup", Box::new(|t| t.cleanup_in_flight = true)),
+            (
+                "run",
+                Box::new(|t| t.worker_handoff.as_mut().unwrap().run = Some(2)),
+            ),
+            (
+                "repository",
+                Box::new(|t| t.worker_handoff.as_mut().unwrap().repository_id = None),
+            ),
+            (
+                "observed",
+                Box::new(|t| {
+                    t.worker_handoff.as_mut().unwrap().stage =
+                        WorkerHandoffStage::RecoveryRequired {
+                            reason: "r".into(),
+                            observed_commit: Some("a".repeat(40)),
+                        }
+                }),
+            ),
+            (
+                "stage",
+                Box::new(|t| {
+                    t.worker_handoff.as_mut().unwrap().stage =
+                        WorkerHandoffStage::ResolvedToAiReview {
+                            commit: "a".repeat(40),
+                        }
+                }),
+            ),
+            (
+                "same decision already recorded",
+                Box::new(move |t| {
+                    t.worker_handoff.as_mut().unwrap().acceptance = Some(WorkerResultAcceptance {
+                        decision_id: recorded_id,
+                        commit: "a".repeat(40),
+                        decided_at: chrono::Utc::now(),
+                    })
+                }),
+            ),
+        ];
+        for (field, change) in moved {
+            let mut task = base.clone();
+            change(&mut task);
+            let before = serde_json::to_string(&task).unwrap();
+            assert!(
+                !apply_acceptance(&mut task, &request, &decision, chrono::Utc::now()),
+                "{field}"
+            );
+            assert_eq!(serde_json::to_string(&task).unwrap(), before, "{field}");
+        }
+        let mut task = base.clone();
+        assert!(apply_acceptance(
+            &mut task,
+            &request,
+            &decision,
+            chrono::Utc::now()
+        ));
+        assert_eq!(task.status, TaskStatus::AiReview);
     }
 }

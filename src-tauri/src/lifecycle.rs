@@ -467,9 +467,30 @@ pub async fn record_if_changed(
     task_id: Uuid,
     revise: Revise<'_>,
 ) -> Result<bool, String> {
+    record_typed_if_changed(tasks, storage, task_id, revise)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// [`record_if_changed`] with the board's publication state retained as typed
+/// data, for a decision that must tell "refused, nothing written" apart from
+/// "published but not confirmed durable".
+///
+/// `revise` runs under the same write guard the save commits with, so a
+/// compare-and-set predicate inside it cannot be invalidated between the check
+/// and the write. When it answers `false` the board, the file and `updated_at`
+/// are untouched.
+pub async fn record_typed_if_changed(
+    tasks: &Tasks,
+    storage: &Storage,
+    task_id: Uuid,
+    revise: Revise<'_>,
+) -> Result<bool, RecordWriteError> {
     let mut tasks_w = tasks.write().await;
     let Some(project_id) = tasks_w.get(&task_id).map(|t| t.project_id) else {
-        return Err(format!("task {task_id} is no longer on the board"));
+        return Err(RecordWriteError::NotPublished(format!(
+            "task {task_id} is no longer on the board"
+        )));
     };
 
     let mut staged = stage_project(&tasks_w, project_id);
@@ -480,7 +501,7 @@ pub async fn record_if_changed(
         task.updated_at = chrono::Utc::now();
     }
 
-    publish(&mut tasks_w, storage, project_id, staged).map(|()| true)
+    publish_typed(&mut tasks_w, storage, project_id, staged).map(|()| true)
 }
 
 /// Amend a task's own fields durably, or say there is no such task.
@@ -2309,6 +2330,80 @@ mod tests {
             after.status,
             TaskStatus::InProgress,
             "including the status it implied"
+        );
+    }
+
+    /// A decision that finds the task no longer as it was shown makes no
+    /// change, so it must not be a write: no file, no `updated_at`, and no
+    /// failure even when the file could not be written at all.
+    #[tokio::test]
+    async fn a_conditional_record_that_declines_writes_nothing_and_reports_no_failure() {
+        let world = world(true);
+        let (id, sibling_id) = seed(&world, TaskStatus::InProgress, None).await;
+        let before = (world.task(id).await, world.persisted(id));
+        let before_sibling = world.persisted(sibling_id);
+
+        let decline = |_: &mut HashMap<Uuid, Task>| false;
+        let outcome = record_typed_if_changed(&world.tasks, &world.storage, id, &decline).await;
+
+        assert_eq!(outcome, Ok(false));
+        let after = world.task(id).await;
+        assert_eq!(after.updated_at, before.0.updated_at);
+        assert_eq!(
+            serde_json::to_string(&after).unwrap(),
+            serde_json::to_string(&before.0).unwrap()
+        );
+        assert_eq!(world.persisted(id).updated_at, before.1.updated_at);
+        assert_eq!(
+            world.persisted(sibling_id).updated_at,
+            before_sibling.updated_at
+        );
+
+        // With the file unwritable, a decline is still not a failure: nothing
+        // was attempted, so there is nothing to refuse.
+        world.block_persistence();
+        assert_eq!(
+            record_typed_if_changed(&world.tasks, &world.storage, id, &decline).await,
+            Ok(false),
+            "a write was attempted although nothing changed"
+        );
+    }
+
+    /// The typed result survives the conditional path: a save the file
+    /// refused is `NotPublished` and leaves the board exactly as it was.
+    #[tokio::test]
+    async fn a_conditional_record_keeps_the_typed_write_result() {
+        let world = world(true);
+        let (id, _) = seed(&world, TaskStatus::InProgress, None).await;
+        let before = world.task(id).await;
+
+        let note = |staged: &mut HashMap<Uuid, Task>| {
+            let Some(task) = staged.get_mut(&id) else {
+                return false;
+            };
+            task.pr_url = Some("https://example.invalid/pr/1".to_string());
+            true
+        };
+        assert_eq!(
+            record_typed_if_changed(&world.tasks, &world.storage, id, &note).await,
+            Ok(true)
+        );
+        assert!(world.task(id).await.updated_at > before.updated_at);
+        assert_eq!(
+            world.persisted(id).pr_url.as_deref(),
+            Some("https://example.invalid/pr/1")
+        );
+
+        let settled = world.task(id).await;
+        world.block_persistence();
+        let failure = record_typed_if_changed(&world.tasks, &world.storage, id, &note).await;
+        assert!(
+            matches!(failure, Err(RecordWriteError::NotPublished(_))),
+            "{failure:?}"
+        );
+        assert_eq!(
+            serde_json::to_string(&world.task(id).await).unwrap(),
+            serde_json::to_string(&settled).unwrap()
         );
     }
 

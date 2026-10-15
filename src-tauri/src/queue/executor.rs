@@ -1651,6 +1651,13 @@ impl TaskExecutor {
             || self.pr_helper_handles.lock().unwrap().contains_key(&task_id)
     }
 
+    /// One poller pass, for tests that drive review admission from outside
+    /// this module.
+    #[cfg(test)]
+    pub(crate) async fn poll_once_for_test(&self) {
+        self.check_and_execute().await;
+    }
+
     async fn check_and_execute(&self) {
         // Closed admission means shutdown has begun. Nothing below may start
         // an owner, and the reconciliations are the poller's own work, not
@@ -4501,6 +4508,67 @@ impl TaskExecutor {
         }
     }
 
+    /// Re-prove the exact Worker commit before the first AI Review of its
+    /// result. A failure puts the Task back into recovery with the checkout
+    /// and references untouched; it never starts a provider or moves Git.
+    /// The caller holds the Task's lifecycle lease.
+    pub(crate) async fn worker_commit_still_verifies(&self, task_id: Uuid) -> bool {
+        let Some(task) = self.tasks.read().await.get(&task_id).cloned() else {
+            return false;
+        };
+        let Some(handoff) = task.worker_handoff.as_ref() else {
+            return true;
+        };
+        let crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { commit } = &handoff.stage
+        else {
+            return true;
+        };
+        if task.review_admitted_for_current_result() {
+            return true;
+        }
+        let repository_path = match self.projects.read().await.get(&task.project_id) {
+            Some(project) => match project.repository_id {
+                Some(id) => self
+                    .repositories
+                    .read()
+                    .await
+                    .get(&id)
+                    .map(|r| r.local_path.clone()),
+                None => None,
+            },
+            None => None,
+        };
+        let verdict = match (
+            repository_path.as_deref(),
+            task.worktree_path.as_deref(),
+            handoff.branch.as_deref(),
+        ) {
+            (Some(repo), Some(checkout), Some(branch)) => {
+                Self::validate_worker_checkout(repo, checkout, branch, commit).await
+            }
+            _ => Err(
+                "The repository, Task Checkout or branch needed to verify the Worker commit \
+                      is unavailable; work was preserved."
+                    .to_string(),
+            ),
+        };
+        match verdict {
+            Ok(()) => true,
+            Err(reason) => {
+                let _ = Self::record_recovery_required(
+                    &self.tasks,
+                    &self.storage,
+                    task_id,
+                    handoff.run,
+                    None,
+                    &reason,
+                )
+                .await;
+                false
+            }
+        }
+    }
+
     async fn spawn_review(&self, task_id: Uuid) {
         let Ok(_process_admission) = self.process_admission.enter() else {
             return;
@@ -4546,6 +4614,15 @@ impl TaskExecutor {
             .get(&task_id)
             .is_some_and(|t| t.republish_pending_refusal().is_some())
         {
+            return;
+        }
+
+        // The first review of a Worker result runs only on the exact commit
+        // that was recorded for it. Everything SlashIt itself changes is
+        // serialized by the lease held here; a Git writer outside SlashIt is
+        // not, so this is a point-in-time proof taken immediately before the
+        // review is registered, not a lock on the repository.
+        if !self.worker_commit_still_verifies(task_id).await {
             return;
         }
 
@@ -5657,7 +5734,7 @@ impl TaskExecutor {
 
     /// Keep an uncertain outcome on the Task itself and in its activity, with
     /// the exact commit when SlashIt observed one. This is not RunFailed.
-    async fn record_recovery_required(
+    pub(crate) async fn record_recovery_required(
         tasks: &Tasks,
         storage: &crate::config::Storage,
         task_id: Uuid,
