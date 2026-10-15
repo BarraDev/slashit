@@ -14,11 +14,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::config::paths::AppPaths;
 use crate::config::Storage;
+use crate::config::paths::AppPaths;
 use crate::domain::{self, Task};
 use crate::pty::PtyState;
-use crate::{commands, config, lifecycle, storage_accounting, worktree, AppState};
+use crate::{AppState, commands, config, lifecycle, storage_accounting, worktree};
 
 /// What hydration found and did, for the caller to log.
 ///
@@ -265,7 +265,9 @@ pub async fn build_state_with_paths(
                             .storage
                             .clear_project_conversation_deletion_pending(project_id)
                         {
-                            eprintln!("Warning: Failed to clear uncommitted Project deletion record for {project_id}: {error}");
+                            eprintln!(
+                                "Warning: Failed to clear uncommitted Project deletion record for {project_id}: {error}"
+                            );
                             report.project_conversation_cleanup_failures.push(format!(
                                 "{project_id}: could not clear uncommitted deletion marker: {error}"
                             ));
@@ -280,7 +282,9 @@ pub async fn build_state_with_paths(
                                     .clear_project_conversation_deletion_pending(project_id)
                             });
                         if let Err(error) = result {
-                            eprintln!("Warning: Project Conversation cleanup remains pending for {project_id}: {error}");
+                            eprintln!(
+                                "Warning: Project Conversation cleanup remains pending for {project_id}: {error}"
+                            );
                             report
                                 .project_conversation_cleanup_failures
                                 .push(format!("{project_id}: {error}"));
@@ -319,7 +323,9 @@ pub async fn build_state_with_paths(
                             .storage
                             .clear_project_tasks_deletion_pending(project_id)
                         {
-                            eprintln!("Warning: Failed to clear uncommitted Project Task deletion record for {project_id}: {error}");
+                            eprintln!(
+                                "Warning: Failed to clear uncommitted Project Task deletion record for {project_id}: {error}"
+                            );
                             report.project_tasks_cleanup_failures.push(format!(
                                 "{project_id}: could not clear uncommitted deletion marker: {error}"
                             ));
@@ -334,7 +340,9 @@ pub async fn build_state_with_paths(
                                     .clear_project_tasks_deletion_pending(project_id)
                             });
                         if let Err(error) = result {
-                            eprintln!("Warning: Project Task cleanup remains pending for {project_id}: {error}");
+                            eprintln!(
+                                "Warning: Project Task cleanup remains pending for {project_id}: {error}"
+                            );
                             report
                                 .project_tasks_cleanup_failures
                                 .push(format!("{project_id}: {error}"));
@@ -400,7 +408,10 @@ pub async fn build_state_with_paths(
                 !matches!(
                     &handoff.stage,
                     domain::task::WorkerHandoffStage::ResolvedToAiReview { .. }
-                ) || !task.worker_handoff_confirmed
+                ) || matches!(
+                    task.status,
+                    domain::TaskStatus::InProgress | domain::TaskStatus::AiReview
+                )
             }) {
                 continue;
             }
@@ -776,12 +787,20 @@ fn migrate_task(task: &mut Task) -> bool {
             Some(domain::task::WorkerHandoffStage::CommittedAwaitingReview { .. }) => {}
             Some(domain::task::WorkerHandoffStage::RecoveryRequired { .. }) => {}
             Some(domain::task::WorkerHandoffStage::Started) => {
-                mark_worker_recovery_required(task, run, "The Worker start was recorded, but its provider and Git outcome were not durably recorded. The Task Checkout was preserved; inspect it before any new attempt.");
+                mark_worker_recovery_required(
+                    task,
+                    run,
+                    "The Worker start was recorded, but its provider and Git outcome were not durably recorded. The Task Checkout was preserved; inspect it before any new attempt.",
+                );
                 changed = true;
             }
             Some(domain::task::WorkerHandoffStage::ResolvedToAiReview { .. }) => {}
             None if run.is_some() || task.phase == domain::TaskPhase::Coding => {
-                mark_worker_recovery_required(task, run, "This older interrupted Worker has no exact per-run branch HEAD or commit evidence. Its changes cannot be attributed safely; inspect the preserved Task Checkout.");
+                mark_worker_recovery_required(
+                    task,
+                    run,
+                    "This older interrupted Worker has no exact per-run branch HEAD or commit evidence. Its changes cannot be attributed safely; inspect the preserved Task Checkout.",
+                );
                 changed = true;
             }
             None => {
@@ -943,9 +962,11 @@ mod tests {
             pointer.exists() && document.exists(),
             "nothing is deleted on an unconfirmed absence"
         );
-        assert!(paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
         assert!(
             report
                 .project_conversation_cleanup_failures
@@ -958,9 +979,11 @@ mod tests {
         // The next start confirms the configuration, then finishes.
         let (_state, _report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert!(!pointer.exists() && !document.exists());
-        assert!(!paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            !paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
     }
 
     /// On a filesystem that cannot synchronize a directory the configuration is
@@ -990,9 +1013,11 @@ mod tests {
                 pointer.exists() && document.exists(),
                 "nothing is deleted on an unprovable absence"
             );
-            assert!(paths
-                .pending_project_conversation_deletion_file(project_id)
-                .exists());
+            assert!(
+                paths
+                    .pending_project_conversation_deletion_file(project_id)
+                    .exists()
+            );
             assert!(
                 report
                     .project_conversation_cleanup_failures
@@ -1025,17 +1050,21 @@ mod tests {
         let (first_state, first_report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert_eq!(first_report.projects, 0);
         assert_eq!(first_report.project_conversation_cleanup_failures.len(), 1);
-        assert!(!first_state
-            .project
-            .projects
-            .read()
-            .await
-            .contains_key(&project_id));
+        assert!(
+            !first_state
+                .project
+                .projects
+                .read()
+                .await
+                .contains_key(&project_id)
+        );
         assert!(pointer.exists());
         assert!(document.exists());
-        assert!(paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
 
         // Repair the unreadable document, then a later restart retries and
         // finishes the same deletion.
@@ -1044,17 +1073,21 @@ mod tests {
 
         assert_eq!(report.projects, 0);
         assert!(report.project_conversation_cleanup_failures.is_empty());
-        assert!(!state
-            .project
-            .projects
-            .read()
-            .await
-            .contains_key(&project_id));
+        assert!(
+            !state
+                .project
+                .projects
+                .read()
+                .await
+                .contains_key(&project_id)
+        );
         assert!(!pointer.exists());
         assert!(!document.exists());
-        assert!(!paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            !paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1089,23 +1122,29 @@ mod tests {
             report.project_tasks_cleanup_failures
         );
         assert!(!routed.exists());
-        assert!(!state
-            .project
-            .projects
-            .read()
-            .await
-            .contains_key(&project_id));
-        assert!(!paths
-            .pending_project_tasks_deletion_file(project_id)
-            .exists());
+        assert!(
+            !state
+                .project
+                .projects
+                .read()
+                .await
+                .contains_key(&project_id)
+        );
+        assert!(
+            !paths
+                .pending_project_tasks_deletion_file(project_id)
+                .exists()
+        );
         // The legacy candidate that never existed was a no-op.
         let (second, report) = build_state_with_paths(paths.clone()).await.unwrap();
         assert!(report.project_tasks_cleanup_failures.is_empty());
-        assert!(!second
-            .storage
-            .paths()
-            .pending_project_tasks_deletion_file(project_id)
-            .exists());
+        assert!(
+            !second
+                .storage
+                .paths()
+                .pending_project_tasks_deletion_file(project_id)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1134,9 +1173,11 @@ mod tests {
             board[0].exists(),
             "an uncommitted deletion must not delete Task records"
         );
-        assert!(!paths
-            .pending_project_tasks_deletion_file(project_id)
-            .exists());
+        assert!(
+            !paths
+                .pending_project_tasks_deletion_file(project_id)
+                .exists()
+        );
         assert!(!state.project.projects.read().await.is_empty());
     }
 
@@ -1194,9 +1235,11 @@ mod tests {
 
         assert!(pointer.exists());
         assert!(document.exists());
-        assert!(paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1221,9 +1264,11 @@ mod tests {
 
         assert!(pointer.exists());
         assert!(document.exists());
-        assert!(paths
-            .pending_project_conversation_deletion_file(project_id)
-            .exists());
+        assert!(
+            paths
+                .pending_project_conversation_deletion_file(project_id)
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1653,7 +1698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_adopts_a_worktree_registered_at_a_non_conventional_path() {
+    async fn startup_adopts_a_moved_resolved_task_checkout_after_lifecycle_progress() {
         // Regression guard: a worktree git still has registered for a task's
         // branch, but at a path that matches neither of SlashIt's own
         // managed/legacy conventions (e.g. one Worktrunk placed under its own
@@ -1714,8 +1759,29 @@ mod tests {
 
         let mut task = crate::test_helpers::create_test_task("A task");
         task.project_id = project.id;
-        task.status = domain::TaskStatus::InProgress;
+        task.status = domain::TaskStatus::HumanReview;
+        task.phase = domain::TaskPhase::Complete;
         task.branch_name = Some(branch.to_string());
+        let commit = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&unconventional_worktree)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        task.worker_handoff = Some(domain::task::WorkerHandoff {
+            task_id: task.id,
+            project_id: project.id,
+            repository_id: Some(repository.id),
+            run: Some(1),
+            branch: Some(branch.to_string()),
+            start_head: Some(commit.clone()),
+            stage: domain::task::WorkerHandoffStage::ResolvedToAiReview { commit },
+        });
         // Recorded location no longer exists -- the trigger for adoption.
         task.worktree_path = Some(
             tmp.path()
@@ -2626,11 +2692,13 @@ mod tests {
         // The detached registration is now merely prunable, and acquisition
         // still leaves it for the user (see the next test); once they prune
         // it, the checkout is acquired again.
-        assert!(state
-            .worktree_manager
-            .reattach(&repo, "task-abcd1234")
-            .await
-            .is_err());
+        assert!(
+            state
+                .worktree_manager
+                .reattach(&repo, "task-abcd1234")
+                .await
+                .is_err()
+        );
         run_git(std::path::Path::new(&repo), &["worktree", "prune"]);
         let again = state
             .worktree_manager
@@ -2705,9 +2773,11 @@ mod tests {
         let (state, _) = build_state_with_paths(paths.clone())
             .await
             .expect("hydration");
-        assert!(notice_of(&state, task_id)
-            .await
-            .is_some_and(|m| m.contains(reason)));
+        assert!(
+            notice_of(&state, task_id)
+                .await
+                .is_some_and(|m| m.contains(reason))
+        );
         drop(state);
         std::fs::create_dir_all(&checkout).unwrap();
         let (state, _) = build_state_with_paths(paths).await.expect("hydration");
@@ -2724,9 +2794,11 @@ mod tests {
         let (state, _) = build_state_with_paths(paths.clone())
             .await
             .expect("hydration");
-        assert!(notice_of(&state, task_id)
-            .await
-            .is_some_and(|m| m.contains(reason)));
+        assert!(
+            notice_of(&state, task_id)
+                .await
+                .is_some_and(|m| m.contains(reason))
+        );
         drop(state);
         let repo_dir = std::path::Path::new(&repo);
         run_git(repo_dir, &["worktree", "unlock", &checkout]);

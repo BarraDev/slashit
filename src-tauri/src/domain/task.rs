@@ -368,6 +368,36 @@ pub const INTEGRATION_UNFINISHED_REFUSAL: &str =
     "An integration is unfinished. Resume or Discard it before moving this Task.";
 
 impl Task {
+    /// Whether a resolved Worker handoff was followed by a durable human
+    /// request for another implementation run. This does not apply to an
+    /// interrupted or ambiguous handoff: only a later decision in the current
+    /// Human Review arrival can supersede an already completed run.
+    pub fn resolved_worker_handoff_was_superseded(&self) -> bool {
+        let Some(handoff) = self.worker_handoff.as_ref() else {
+            return false;
+        };
+        let Some(run) = handoff.run else {
+            return false;
+        };
+        if !matches!(handoff.stage, WorkerHandoffStage::ResolvedToAiReview { .. }) {
+            return false;
+        }
+
+        let Some(completed_at) = self.activity.iter().find_map(|entry| {
+            matches!(entry.kind, ActivityKind::RunCompleted { run: completed } if completed == run)
+                .then_some(entry.at)
+        }) else {
+            return false;
+        };
+
+        self.human_review
+            .current_decision()
+            .is_some_and(|decision| {
+                decision.decision == HumanReviewDecision::ChangesRequested
+                    && decision.decided_at >= completed_at
+            })
+    }
+
     /// Why ordinary Queue/status commands may not bypass recovery.
     pub fn worker_recovery_refusal(&self) -> Option<String> {
         self.worker_handoff
@@ -376,7 +406,16 @@ impl Task {
                 WorkerHandoffStage::Started
                 | WorkerHandoffStage::CommittedAwaitingReview { .. }
                 | WorkerHandoffStage::RecoveryRequired { .. } => true,
-                WorkerHandoffStage::ResolvedToAiReview { .. } => !self.worker_handoff_confirmed,
+                // A persisted later lifecycle state is itself evidence that
+                // the already resolved handoff was followed by another
+                // durable Task transition. Startup must not roll HumanReview,
+                // Done or PRCreated back into recovery merely because the
+                // process-local durability acknowledgement is absent.
+                WorkerHandoffStage::ResolvedToAiReview { .. } => {
+                    !self.resolved_worker_handoff_was_superseded()
+                        && !self.worker_handoff_confirmed
+                        && matches!(self.status, TaskStatus::InProgress | TaskStatus::AiReview)
+                }
             })
             .map(|_| "This Task has unresolved Worker recovery evidence. Inspect and preserve its Task Checkout before any new attempt.".to_string())
     }
@@ -545,7 +584,8 @@ impl Task {
                 matches!(
                     &handoff.stage,
                     WorkerHandoffStage::ResolvedToAiReview { .. }
-                ) && self.worker_handoff_confirmed
+                ) && (self.worker_handoff_confirmed
+                    || self.resolved_worker_handoff_was_superseded())
             })
     }
 
@@ -1760,6 +1800,65 @@ mod tests {
                 "lifecycle retry/cleanup must be held too"
             );
         }
+    }
+
+    #[test]
+    fn only_a_later_current_changes_request_supersedes_a_resolved_handoff() {
+        let mut task = startable_task();
+        let completed_at = chrono::Utc::now();
+        task.worker_handoff = Some(WorkerHandoff {
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: Some("task/example".into()),
+            start_head: Some("a".repeat(40)),
+            stage: WorkerHandoffStage::ResolvedToAiReview {
+                commit: "b".repeat(40),
+            },
+        });
+        task.record_activity_at(completed_at, ActivityKind::RunCompleted { run: 1 });
+        task.human_review.record_arrival();
+        task.human_review.push(
+            HumanReviewDecision::ChangesRequested,
+            Some("please revise".into()),
+            completed_at + chrono::Duration::seconds(1),
+        );
+
+        assert!(task.resolved_worker_handoff_was_superseded());
+        assert!(task.worker_recovery_refusal().is_none());
+        assert!(task.is_ready_to_execute());
+    }
+
+    #[test]
+    fn an_older_changes_request_does_not_supersede_a_later_resolved_handoff() {
+        let mut task = startable_task();
+        let prior_decision_at = chrono::Utc::now();
+        task.worker_handoff = Some(WorkerHandoff {
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: Some("task/example".into()),
+            start_head: Some("a".repeat(40)),
+            stage: WorkerHandoffStage::ResolvedToAiReview {
+                commit: "b".repeat(40),
+            },
+        });
+        task.human_review.record_arrival();
+        task.human_review.push(
+            HumanReviewDecision::ChangesRequested,
+            Some("please revise".into()),
+            prior_decision_at,
+        );
+        task.record_activity_at(
+            prior_decision_at + chrono::Duration::seconds(1),
+            ActivityKind::RunCompleted { run: 1 },
+        );
+
+        assert!(!task.resolved_worker_handoff_was_superseded());
+        assert!(task.worker_recovery_refusal().is_some());
+        assert!(!task.is_ready_to_execute());
     }
 
     /// A board written by a build that predates `cleanup_in_flight` loads with

@@ -6,11 +6,11 @@ use crate::domain::{
     TaskPhase, TaskStatus,
 };
 use crate::events::{EventSink, SharedEventSink};
+use crate::queue::QueueManager;
 use crate::queue::admission::{Admission, AdmissionPermit};
 use crate::queue::prompt::{build_fix_prompt, build_review_prompt, build_task_prompt};
 use crate::queue::start_guard::StartGuard;
 use crate::queue::tool_activity::RunTools;
-use crate::queue::QueueManager;
 use crate::worktree::{CheckoutCommit, WorktreeInfo, WorktreeManager};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -36,7 +36,10 @@ impl std::fmt::Display for RunStartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(message) => f.write_str(message),
-            Self::Record(write, consequence) => write!(f, "The Task Worker start could not be recorded and the Worker was not launched ({write}); {consequence}"),
+            Self::Record(write, consequence) => write!(
+                f,
+                "The Task Worker start could not be recorded and the Worker was not launched ({write}); {consequence}"
+            ),
         }
     }
 }
@@ -121,8 +124,7 @@ fn review_verdict(run: &AgentRun) -> ReviewVerdict {
 /// path, so only a task record written by hand or by a much older version
 /// can lack it, and committing to whatever the checkout has out could put
 /// the work on a branch the task never names.
-const NO_TASK_BRANCH: &str =
-    "this task records no branch, so SlashIt cannot tell which branch its work belongs on, and \
+const NO_TASK_BRANCH: &str = "this task records no branch, so SlashIt cannot tell which branch its work belongs on, and \
      nothing was committed";
 
 /// What a fix-agent run means for the review's signoff.
@@ -1688,24 +1690,28 @@ impl TaskExecutor {
     /// joined the provider process; this is the process-completion proof and
     /// does not depend on an in-memory handle map surviving restart.
     async fn reconcile_committed_worker_handoffs(&self) {
-        let candidates: Vec<Uuid> = {
-            let tasks = self.tasks.read().await;
-            tasks
-                .values()
-                .filter(|task| {
-                    task.worker_handoff.as_ref().is_some_and(|handoff| {
+        let candidates: Vec<Uuid> =
+            {
+                let tasks = self.tasks.read().await;
+                tasks
+                    .values()
+                    .filter(|task| {
+                        task.worker_handoff.as_ref().is_some_and(|handoff| {
                         matches!(
                             &handoff.stage,
                             crate::domain::task::WorkerHandoffStage::CommittedAwaitingReview { .. }
-                        ) || matches!(
+                        ) && matches!(task.status, TaskStatus::InProgress | TaskStatus::AiReview)
+                            || matches!(
                             &handoff.stage,
                             crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { .. }
-                        ) && !task.worker_handoff_confirmed
+                        ) && !task.resolved_worker_handoff_was_superseded()
+                            && !task.worker_handoff_confirmed
+                            && matches!(task.status, TaskStatus::InProgress | TaskStatus::AiReview)
                     })
-                })
-                .map(|task| task.id)
-                .collect()
-        };
+                    })
+                    .map(|task| task.id)
+                    .collect()
+            };
 
         for task_id in candidates {
             let Some(_lease) = self.lifecycle.try_acquire(task_id).await else {
@@ -2329,7 +2335,9 @@ impl TaskExecutor {
                         t.error_message = Some(if republish_pending {
                             crate::lifecycle::merged_while_republish_pending_message()
                         } else {
-                            format!("The pull request is merged, but the task was not finished: {reason}")
+                            format!(
+                                "The pull request is merged, but the task was not finished: {reason}"
+                            )
                         });
                     }
                 };
@@ -2865,7 +2873,9 @@ impl TaskExecutor {
         }
         let actual_branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
         if actual_branch != expected_branch {
-            return Err(format!("Task Checkout is on branch {actual_branch}, expected {expected_branch}; refusing Worker launch"));
+            return Err(format!(
+                "Task Checkout is on branch {actual_branch}, expected {expected_branch}; refusing Worker launch"
+            ));
         }
         let head = tokio::process::Command::new("git")
             .args(["rev-parse", "--verify", "HEAD^{commit}"])
@@ -2977,6 +2987,9 @@ impl TaskExecutor {
                 },
                 StartRequest::Direct => {
                     let task = task.ok_or("Task not found")?;
+                    if let Some(refusal) = task.worker_recovery_refusal() {
+                        return Err(refusal);
+                    }
                     if task.status != TaskStatus::InProgress && task.status != TaskStatus::Queue {
                         return Err(format!(
                             "Task in {:?}, expected InProgress or Queue",
@@ -3464,7 +3477,7 @@ impl TaskExecutor {
                                 tools: take_run_tools(&run_tools, task_id),
                                 timeline_reason: (full_msg != err_msg).then(|| err_msg.clone()),
                             };
-                            Self::set_task_error_static(&tasks, &storage, &events, task_id, &full_msg, Some(ended)).await;
+                            Self::set_task_error_static_with_provider_exit(&tasks, &storage, &events, task_id, &full_msg, Some(ended), true).await;
                             ending = Some(AgentEvent::Error {
                                 task_id: task_id.to_string(),
                                 message: full_msg,
@@ -5503,6 +5516,25 @@ impl TaskExecutor {
         msg: &str,
         ended: Option<RunEnd>,
     ) {
+        Self::set_task_error_static_with_provider_exit(
+            tasks, storage, events, task_id, msg, ended, false,
+        )
+        .await;
+    }
+
+    /// Record a terminal provider failure separately from an interruption or
+    /// a failed Git/evidence boundary. Only `runner.wait()`'s terminal error
+    /// uses `provider_exited_without_commit`: that process is joined and the
+    /// Git commit operation was not entered.
+    async fn set_task_error_static_with_provider_exit(
+        tasks: &Tasks,
+        storage: &crate::config::Storage,
+        events: &SharedEventSink,
+        task_id: Uuid,
+        msg: &str,
+        ended: Option<RunEnd>,
+        provider_exited_without_commit: bool,
+    ) {
         let msg_owned = msg.to_string();
         let (run, tools, timeline_reason) = match ended {
             Some(RunEnd {
@@ -5529,20 +5561,37 @@ impl TaskExecutor {
                     "The Worker ended without exact provider and Git completion evidence. The Task Checkout was preserved for inspection.",
                     350,
                 );
-                let recovery_required = if let Some(handoff) =
-                    t.worker_handoff.as_mut().filter(|handoff| {
+                let recovery_required = if !provider_exited_without_commit {
+                    if let Some(handoff) = t.worker_handoff.as_mut().filter(|handoff| {
                         handoff.run == run
                             && matches!(
                                 handoff.stage,
                                 crate::domain::task::WorkerHandoffStage::Started
                             )
                     }) {
-                    handoff.stage = crate::domain::task::WorkerHandoffStage::RecoveryRequired {
-                        reason: recovery_reason.clone(),
-                        observed_commit: None,
-                    };
-                    true
+                        handoff.stage = crate::domain::task::WorkerHandoffStage::RecoveryRequired {
+                            reason: recovery_reason.clone(),
+                            observed_commit: None,
+                        };
+                        true
+                    } else {
+                        false
+                    }
                 } else {
+                    // `runner.wait()` returned a terminal provider failure; this
+                    // path did not call Git commit. Keep the same Task Checkout
+                    // for the user's ordinary retry, and retain RunFailed as the
+                    // durable explanation. If that write is not published, the
+                    // prior Started record remains and startup still quarantines it.
+                    if t.worker_handoff.as_ref().is_some_and(|handoff| {
+                        handoff.run == run
+                            && matches!(
+                                handoff.stage,
+                                crate::domain::task::WorkerHandoffStage::Started
+                            )
+                    }) {
+                        t.worker_handoff = None;
+                    }
                     false
                 };
                 if recovery_required {
@@ -6594,11 +6643,13 @@ mod tests {
         )
         .await;
         let failed = on_disk_task(&executor, project_id, id);
-        assert!(failed
-            .error_message
-            .as_deref()
-            .unwrap()
-            .contains("THE AGENT SAID THIS"));
+        assert!(
+            failed
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("THE AGENT SAID THIS")
+        );
         assert_eq!(
             failed.activity.last().map(|e| &e.kind),
             Some(&ActivityKind::RunFailed {
@@ -6741,8 +6792,8 @@ mod tests {
     /// nothing to re-apply, and a restart that finds the record lost simply
     /// observes the same pull request again.
     #[tokio::test]
-    async fn a_closed_pr_observation_the_board_adopted_but_could_not_confirm_is_reported_as_recorded(
-    ) {
+    async fn a_closed_pr_observation_the_board_adopted_but_could_not_confirm_is_reported_as_recorded()
+     {
         let recording = Arc::new(crate::events::RecordingEventSink::new());
         let (executor, _temps) = test_executor_with_events(recording.clone());
         let (id, project_id) = task_with_open_pr(&executor, None).await;
@@ -7454,9 +7505,11 @@ mod tests {
         drop(lease);
         let removed = removal.await.expect("removal succeeds").expect("task");
         assert!(removed.external_refs.is_empty());
-        assert!(on_disk_task(&executor, project_id, id)
-            .external_refs
-            .is_empty());
+        assert!(
+            on_disk_task(&executor, project_id, id)
+                .external_refs
+                .is_empty()
+        );
     }
 
     /// Completion wins, run to the end: the merge is latched under the lease,
@@ -7552,10 +7605,12 @@ mod tests {
             .expect("out of range is not an error")
             .expect("task");
         assert_eq!(unchanged.external_refs.len(), 1);
-        assert!(remove_ref(&executor, Uuid::new_v4(), 0)
-            .await
-            .expect("unknown id")
-            .is_none());
+        assert!(
+            remove_ref(&executor, Uuid::new_v4(), 0)
+                .await
+                .expect("unknown id")
+                .is_none()
+        );
     }
 
     /// A failed write leaves the reference where it was, in memory too.
@@ -9863,8 +9918,8 @@ mod tests {
     /// local base: the dependent task starts from that base and receives
     /// the approved work, and not the commit the dependency added after it.
     #[tokio::test]
-    async fn a_task_depending_on_one_integrated_locally_starts_from_the_base_with_exactly_the_approved_work(
-    ) {
+    async fn a_task_depending_on_one_integrated_locally_starts_from_the_base_with_exactly_the_approved_work()
+     {
         let (executor, temps) = test_executor();
         let (repo, task_id, dependency_id) =
             stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-local01").await;
@@ -10085,8 +10140,8 @@ mod tests {
     /// The same Done task with no pull request and no local completion is
     /// still taken as delivered to `main`, branch or not.
     #[tokio::test]
-    async fn a_done_dependency_without_a_pull_request_or_local_completion_starts_from_the_default_base(
-    ) {
+    async fn a_done_dependency_without_a_pull_request_or_local_completion_starts_from_the_default_base()
+     {
         let (executor, temps) = test_executor();
         let (repo, task_id, _) =
             stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-deadbeef").await;
@@ -10315,6 +10370,38 @@ mod tests {
             ),
             commit
         );
+
+        // A later durable lifecycle write supersedes the process-only
+        // confirmation bit. Restarting after Human Review must neither regress
+        // the Task nor turn its completed Worker handoff into RecoveryRequired.
+        let advance = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(task) = staged.get_mut(&task_id) {
+                task.status = TaskStatus::HumanReview;
+                task.phase = TaskPhase::Complete;
+            }
+        };
+        crate::lifecycle::record_typed(&executor.tasks, &executor.storage, task_id, &advance)
+            .await
+            .expect("persist downstream lifecycle progress");
+        let restarted = persisted_task(&executor, project_id, task_id);
+        assert!(!restarted.worker_handoff_confirmed);
+        executor.tasks.write().await.insert(task_id, restarted);
+        executor.reconcile_committed_worker_handoffs().await;
+        executor.reconcile_committed_worker_handoffs().await;
+        let downstream = executor.tasks.read().await[&task_id].clone();
+        assert_eq!(downstream.status, TaskStatus::HumanReview);
+        assert!(matches!(
+            downstream.worker_handoff.as_ref().unwrap().stage,
+            crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { .. }
+        ));
+        assert!(downstream.worker_recovery_refusal().is_none());
+        assert!(
+            !downstream
+                .activity
+                .iter()
+                .any(|entry| matches!(entry.kind, ActivityKind::RecoveryRequired { .. }))
+        );
+        assert!(!executor.is_task_running(task_id).await);
     }
 
     #[tokio::test]
@@ -12910,8 +12997,8 @@ VERDICT: APPROVED"
                 /// task title and report success, while the fix stayed
                 /// uncommitted.
                 #[tokio::test(flavor = "multi_thread")]
-                async fn review_fixes_in_a_checkout_nested_in_a_jj_repository_leave_that_repository_alone(
-                ) {
+                async fn review_fixes_in_a_checkout_nested_in_a_jj_repository_leave_that_repository_alone()
+                 {
                     let _path_guard = PATH_LOCK.lock().await;
                     if !installed_jj() {
                         eprintln!("skipped: no jj is installed");
@@ -13015,8 +13102,16 @@ VERDICT: APPROVED"
                 /// leaving the checkout somewhere other than on the task
                 /// branch, with what the refusal must name.
                 const OFF_BRANCH: [(&str, &str, &str); 3] = [
-                    ("detached HEAD", "git checkout -q --detach", "not the task branch"),
-                    ("another branch", "git checkout -q -b elsewhere", "not the task branch"),
+                    (
+                        "detached HEAD",
+                        "git checkout -q --detach",
+                        "not the task branch",
+                    ),
+                    (
+                        "another branch",
+                        "git checkout -q -b elsewhere",
+                        "not the task branch",
+                    ),
                     (
                         "a conflicted rebase",
                         "git checkout -q -b conflicting main && printf 'other\\n' > agent_change.txt \\
@@ -13865,16 +13960,20 @@ VERDICT: APPROVED"
             let other_id = other.id;
             executor.tasks.write().await.insert(other_id, other);
             executor.spawn_review(other_id).await;
-            assert!(executor
-                .reviewing_handles
-                .read()
-                .await
-                .contains_key(&other_id));
-            assert!(!executor
-                .reviewing_handles
-                .read()
-                .await
-                .contains_key(&blocked_id));
+            assert!(
+                executor
+                    .reviewing_handles
+                    .read()
+                    .await
+                    .contains_key(&other_id)
+            );
+            assert!(
+                !executor
+                    .reviewing_handles
+                    .read()
+                    .await
+                    .contains_key(&blocked_id)
+            );
             let pid = wait_for_pidfile(&mock).await;
             assert!(
                 pid_is_alive(pid),
@@ -14787,10 +14886,12 @@ VERDICT: APPROVED"
             }
         }
 
-        /// A provider failure without exact Git completion proof is held for
-        /// inspection; a normal retry cannot replay possible external work.
+        /// A joined provider failure before the Git commit boundary is a known
+        /// failed run. It retains the same checkout and allows the existing
+        /// explicit Retry action; only an unconfirmed lifecycle/Git outcome is
+        /// held as RecoveryRequired.
         #[tokio::test]
-        async fn a_failed_run_without_commit_evidence_cannot_be_retried() {
+        async fn a_terminal_provider_failure_is_retryable_without_losing_its_checkout() {
             let w = world(Class::Created).await;
             git_in(&w.repo, &["config", "user.email", "t@example.com"]);
             git_in(&w.repo, &["config", "user.name", "T"]);
@@ -14811,23 +14912,102 @@ VERDICT: APPROVED"
                 matches!(&failed[..], [
                     ActivityKind::RunStarted { run: 1, .. },
                     ActivityKind::RunFailed { run: Some(1), reason },
-                    ActivityKind::RecoveryRequired { run: Some(1), .. },
                 ] if reason.contains("the model is unavailable")),
                 "{failed:?}"
             );
 
-            assert!(w.on_disk().worker_recovery_refusal().is_some());
-            let retry = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert!(w.on_disk().worker_handoff.is_none());
+            assert!(w.on_disk().worker_recovery_refusal().is_none());
+            assert_eq!(w.on_disk().status, TaskStatus::Error);
+            assert!(matches!(failed.as_slice(), [
+                ActivityKind::RunStarted { run: 1, .. },
+                ActivityKind::RunFailed { run: Some(1), reason },
+            ] if reason.contains("the model is unavailable")));
+            assert!(
+                w.on_disk().worktree_path.is_some(),
+                "the failed run's Task Checkout remains attached"
+            );
+
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let task = tasks.get_mut(&w.task_id).unwrap();
+                task.status = TaskStatus::InProgress;
+                task.phase = TaskPhase::Idle;
+                let board: Vec<_> = tasks
+                    .values()
+                    .filter(|task| task.project_id == w.project_id)
+                    .cloned()
+                    .collect();
+                w.executor
+                    .storage
+                    .save_project_tasks(w.project_id, &board)
+                    .expect("persist the explicit retry decision");
+            }
+            let _agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                "cat >/dev/null; printf 'retry work\\n' > retry-output.txt; printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'",
+            )
+            .await;
             assert_eq!(
-                retry,
-                Ok(false),
-                "retry must refuse uncertain prior Worker effects"
+                w.executor.spawn_task_execution(w.task_id, None).await,
+                Ok(true)
+            );
+            assert_eq!(settled(&w).await.status, TaskStatus::AiReview);
+            assert_eq!(
+                kinds(&w.on_disk())
+                    .iter()
+                    .filter(|kind| matches!(kind, ActivityKind::RunStarted { .. }))
+                    .count(),
+                2
+            );
+        }
+
+        #[tokio::test]
+        async fn direct_execution_cannot_bypass_a_persisted_started_handoff() {
+            let w = world(Class::Created).await;
+            {
+                let mut tasks = w.executor.tasks.write().await;
+                let task = tasks.get_mut(&w.task_id).unwrap();
+                task.status = TaskStatus::InProgress;
+                task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                    task_id: w.task_id,
+                    project_id: w.project_id,
+                    repository_id: None,
+                    run: Some(1),
+                    branch: Some(WorktreeManager::branch_for_task(w.task_id)),
+                    start_head: Some(w.main_tip.clone()),
+                    stage: crate::domain::task::WorkerHandoffStage::Started,
+                });
+                let board: Vec<_> = tasks
+                    .values()
+                    .filter(|task| task.project_id == w.project_id)
+                    .cloned()
+                    .collect();
+                w.executor
+                    .storage
+                    .save_project_tasks(w.project_id, &board)
+                    .expect("persist the interrupted start");
+            }
+            let before = w.on_disk();
+            let error = w
+                .executor
+                .execute_task(w.task_id)
+                .await
+                .expect_err("direct execution must honor the recovery gate");
+            assert!(
+                error.contains("unresolved Worker recovery evidence"),
+                "{error}"
             );
             assert_eq!(
-                kinds(&w.on_disk()),
-                failed,
-                "a rejected retry changes no history"
+                w.executor.tasks.read().await[&w.task_id].status,
+                TaskStatus::InProgress
             );
+            assert_eq!(
+                kinds(&w.executor.tasks.read().await[&w.task_id]),
+                kinds(&before),
+                "refusal must not mutate Task history"
+            );
+            assert!(!w.executor.is_task_running(w.task_id).await);
         }
 
         /// Every run's end on the timeline has its start there too.
@@ -14869,10 +15049,12 @@ VERDICT: APPROVED"
             let (memory, disk) = (w.in_memory().await, w.on_disk());
             assert_eq!(memory.activity, disk.activity);
             assert_eq!((&memory.status, &memory.phase), (&disk.status, &disk.phase));
-            assert!(!memory
-                .activity
-                .iter()
-                .any(|e| matches!(e.kind, ActivityKind::RunStarted { .. })));
+            assert!(
+                !memory
+                    .activity
+                    .iter()
+                    .any(|e| matches!(e.kind, ActivityKind::RunStarted { .. }))
+            );
             assert!(w.executor.run_tools.lock().unwrap().is_empty());
             drop(unwritable);
             drop(agent);
@@ -15978,9 +16160,10 @@ VERDICT: APPROVED"
             assert_eq!(run.status, None);
             let live = executor.live_runs().await;
             assert_eq!(live.len(), 3);
-            assert!(live
-                .iter()
-                .all(|r| r.task_id != queued_id && r.status == AgentStatus::Running));
+            assert!(
+                live.iter()
+                    .all(|r| r.task_id != queued_id && r.status == AgentStatus::Running)
+            );
         }
 
         // matrix 2, 9
