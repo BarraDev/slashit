@@ -655,7 +655,7 @@ pub struct Supervision {
 /// server never lets its handlers be dropped: if it dies, they are handed to
 /// this value, which the supervisor keeps, and [`HandlerRescue::join`] lets
 /// every one of them run to completion. A handler is one request, bounded by
-/// the request timeout and the operation it runs; it is never cancelled.
+/// the operation it runs; it is never cancelled.
 #[derive(Clone, Default)]
 pub struct HandlerRescue(Arc<std::sync::Mutex<Option<tokio::task::JoinSet<()>>>>);
 
@@ -667,7 +667,6 @@ impl HandlerRescue {
         let Some(mut handlers) = rescued else {
             return;
         };
-        let mut reported = false;
         loop {
             match tokio::time::timeout(POLLER_STOP_REPORT, handlers.join_next()).await {
                 Ok(None) => return,
@@ -675,14 +674,10 @@ impl HandlerRescue {
                 Ok(Some(Err(error))) => {
                     eprintln!("[ipc] a connection handler failed during shutdown: {error}")
                 }
-                Err(_) if !reported => {
-                    reported = true;
-                    eprintln!(
-                        "[ipc] a connection handler has not returned after {POLLER_STOP_REPORT:?}; \
-                         still holding local ownership"
-                    );
-                }
-                Err(_) => {}
+                Err(_) => eprintln!(
+                    "[ipc] a connection handler has not returned after {POLLER_STOP_REPORT:?}; \
+                     still holding local ownership"
+                ),
             }
         }
     }
@@ -2009,8 +2004,10 @@ pub(crate) mod tests {
 
     // --- a handler's blocking git run, after the server task dies -----------
 
+    #[cfg(unix)]
     const GIT_CHILD_ROOT: &str = "SLASHIT_HELD_GIT_ROOT";
 
+    #[cfg(unix)]
     async fn wait_for_path(path: &std::path::Path) {
         tokio::time::timeout(Duration::from_secs(120), async {
             while !path.exists() {
@@ -2113,6 +2110,10 @@ pub(crate) mod tests {
 
         wait_for_path(&root.join("release")).await;
         quiesced.await.expect("quiescence completes");
+        // As the supervisor does the moment it is quiescent, so that the
+        // parent's refusal above is the supervisor's doing and not this
+        // variable's.
+        drop(ownership);
 
         // The handler was not cancelled: it finished the delete it had begun.
         let slashit_ipc::framing::Frame::Line(line) = request.await.unwrap().expect("answered") else {
@@ -2123,7 +2124,6 @@ pub(crate) mod tests {
         assert!(!std::path::Path::new(&checkout).exists(), "the checkout is gone");
         assert!(!ctx.tasks.read().await.contains_key(&task_id));
         std::fs::write(root.join("quiesced"), b"").unwrap();
-        drop(ownership);
     }
 
     /// A handler that has started a `git` run is waiting on a blocking call.

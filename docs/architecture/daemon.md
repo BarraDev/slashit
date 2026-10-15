@@ -162,8 +162,8 @@ waiting on a blocking call, and aborting the task stops only the wait: the `git`
 process would finish by itself, possibly after the endpoint was released. The
 server therefore hands its live handlers to the supervisor (`HandlerRescue`)
 when it dies instead of dropping them, and the supervisor joins them. A handler
-serves one request and is bounded by the request timeout and the operation it
-runs; one that does not return keeps the instance alive and holding ownership,
+serves one request and is bounded by the operation it runs; one that does not
+return keeps the instance alive and holding ownership,
 as every other part of the drain does.
 
 On Windows the updater plugin's install step launches the installer and then
