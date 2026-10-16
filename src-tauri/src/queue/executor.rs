@@ -25,6 +25,9 @@ struct RunStart {
     working_dir: String,
     /// The run's number, as its recorded [`ActivityKind::RunStarted`] has it.
     run: u32,
+    /// The Task's provider lease, held until the provider is spawned with it.
+    /// `None` where the platform has no lease.
+    lease: Option<crate::agents::provider_lease::ProviderLease>,
 }
 
 #[derive(Debug)]
@@ -3394,6 +3397,21 @@ impl TaskExecutor {
                 "The Task Project's registered repository does not match the acquired Task Checkout; the Worker was not launched.".into(),
             ));
         }
+        // Taken before the Started write, so that a Started record can never exist
+        // without the lease a provider would hold. A crash after this point and
+        // before the spawn leaves an unlocked lease with no group, which a later
+        // attempt can prove absent. A refusal below drops it unused.
+        let lease = match crate::agents::provider_lease::acquire(&self.provider_lease_path(task_id)) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                return Err(RunStartError::Refused(format!(
+                    "The Task's provider lease could not be taken; the Worker was not launched: {error}"
+                )));
+            }
+        };
         let run = std::sync::atomic::AtomicU32::new(0);
         let consumed = std::sync::atomic::AtomicBool::new(false);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
@@ -3463,6 +3481,7 @@ impl TaskExecutor {
             Ok(()) => Ok(RunStart {
                 working_dir: acquired.info.path,
                 run: run.load(std::sync::atomic::Ordering::Relaxed),
+                lease,
             }),
             Err(error) => {
                 let published = matches!(
@@ -3615,6 +3634,15 @@ impl TaskExecutor {
     /// The Task-side checks of a new attempt, made under the lease. The Git
     /// checks follow once the checkout is known, in
     /// [`Self::confirm_new_attempt_checkout`].
+    /// The Task's provider lease file, under the application data directory.
+    pub(crate) fn provider_lease_path(&self, task_id: Uuid) -> std::path::PathBuf {
+        self.storage
+            .paths()
+            .data_dir()
+            .join("provider-leases")
+            .join(format!("{task_id}.lock"))
+    }
+
     fn new_attempt_gate(
         task: &Task,
         decision_id: Uuid,
@@ -3759,6 +3787,15 @@ impl TaskExecutor {
                 StartRequest::NewAttempt { decision_id } => {
                     let task = task.ok_or("Task not found")?;
                     authorized = Some(Self::new_attempt_gate(task, decision_id)?);
+                    // A provider of the interrupted run may still be editing this
+                    // checkout. Only a proof of absence admits the new attempt.
+                    if let Err(reason) = crate::agents::provider_lease::prove_absent(
+                        &self.provider_lease_path(task_id),
+                    ) {
+                        return Err(format!(
+                            "{reason} Nothing was recorded or launched. Inspect the Task Checkout before any new attempt."
+                        ));
+                    }
                     // Promotion to In Progress is part of the one record that
                     // starts the run, so no separate write is made here.
                     false
@@ -3958,7 +3995,11 @@ impl TaskExecutor {
                     .to_string(),
             });
         }
-        let RunStart { working_dir, run } = match self
+        let RunStart {
+            working_dir,
+            run,
+            lease,
+        } = match self
             .record_run_start_for(task_id, &repo_path, acquired, authorized.as_ref())
             .await
         {
@@ -4114,7 +4155,7 @@ impl TaskExecutor {
             });
 
             // Start Claude runner
-            let runner = match ClaudeRunner::start(ClaudeRunConfig {
+            let runner = match ClaudeRunner::start_leased(ClaudeRunConfig {
                 prompt,
                 working_dir: claude_cwd.clone(),
                 // `permission_mode: None` passes --dangerously-skip-permissions.
@@ -4138,7 +4179,7 @@ impl TaskExecutor {
                 append_system_prompt: None,
                 disable_mcp: false,
                 additional_dirs: claude_add_dirs.clone(),
-            })
+            }, lease)
             .await
             {
                 Ok(r) => r,

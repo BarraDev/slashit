@@ -755,6 +755,14 @@ mod tests {
             .storage
             .save_project_tasks(project_id, &[task])
             .unwrap();
+        // The interrupted run's lease, free: its provider was never spawned.
+        let lease = state
+            .storage
+            .paths()
+            .data_dir()
+            .join("provider-leases")
+            .join(format!("{task_id}.lock"));
+        drop(crate::agents::provider_lease::acquire(&lease).unwrap());
 
         let fx = Fx {
             _tmp: tmp,
@@ -1209,6 +1217,250 @@ mod tests {
         );
         assert_eq!(agent.invocations(), "");
         assert!(!executor.is_task_running(fx.task_id).await);
+    }
+
+    /// Builds the state a restarted process has: a new `AppState` over the same
+    /// directories, through the production startup path. Only the paths carry over.
+    async fn restart(fx: &Fx) -> (crate::AppState, std::sync::Arc<crate::queue::TaskExecutor>) {
+        // The fixture inserts its Project and Repository in memory only. The app
+        // keeps both in the configuration, so persist them before the reload.
+        let mut config = fx.state.storage.load_config().unwrap_or_default();
+        config.projects = fx
+            .state
+            .project
+            .projects
+            .read()
+            .await
+            .iter()
+            .map(|(id, project)| (id.to_string(), project.clone()))
+            .collect();
+        config.repositories = fx
+            .state
+            .repository
+            .repositories
+            .read()
+            .await
+            .iter()
+            .map(|(id, repository)| (id.to_string(), repository.clone()))
+            .collect();
+        fx.state.storage.save_config(&config).unwrap();
+        let paths = std::sync::Arc::new(fx.state.storage.paths().clone());
+        let (state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
+        let executor = attach_test_executor(&state);
+        executor.poll_once_for_test().await;
+        (state, executor)
+    }
+
+    async fn task_in(state: &crate::AppState, task_id: Uuid) -> Task {
+        state.task.tasks.read().await[&task_id].clone()
+    }
+
+    /// Waits until no provider holds the lease and its group is empty.
+    async fn wait_until_absent(executor: &crate::queue::TaskExecutor, task_id: Uuid) {
+        let path = executor.provider_lease_path(task_id);
+        for _ in 0..500 {
+            if crate::agents::provider_lease::prove_absent(&path).is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the provider never let go of the Task Checkout");
+    }
+
+    /// A process that holds the Task's lease the way a provider does, so the
+    /// next process meets it as a live provider it cannot see.
+    #[cfg(unix)]
+    fn orphan_provider(executor: &crate::queue::TaskExecutor, task_id: Uuid, script: &str) -> tokio::process::Child {
+        let lease = crate::agents::provider_lease::acquire(&executor.provider_lease_path(task_id))
+            .unwrap()
+            .expect("a lease on unix");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        lease.inherit_into(&mut command);
+        let child = command.spawn().expect("spawn the orphan");
+        lease.record_group(child.id().unwrap()).unwrap();
+        child
+    }
+
+    /// The authorization was persisted, and the process was lost before any run
+    /// started. The next process must not honour it: no run starts, no provider
+    /// launches, and the checkout and its Git references stay as they were.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reload_from_disk_drops_the_authorization_and_launches_nothing() {
+        let fx = fixture().await;
+        let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
+        let id = Uuid::new_v4();
+        fx.write("dirty.txt", "work the person has not committed");
+        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        assert_eq!(
+            fx.on_disk().new_attempt.as_ref().map(|d| d.decision_id),
+            Some(id),
+            "the authorization reached the disk"
+        );
+        let before = fx.repo_state();
+
+        let (state, executor) = restart(&fx).await;
+
+        assert!(
+            task_in(&state, fx.task_id).await.new_attempt.is_none(),
+            "the reloaded process does not hold the authorization"
+        );
+        let reason = executor.start_new_attempt(fx.task_id, id).await.unwrap_err();
+        assert!(!reason.is_empty());
+        assert_eq!(agent.invocations(), "", "nothing launches after a reload");
+        assert_eq!(fx.repo_state(), before, "checkout and Git references are preserved");
+        assert_eq!(
+            std::fs::read_to_string(fx.checkout.join("dirty.txt")).unwrap(),
+            "work the person has not committed"
+        );
+    }
+
+    /// The lost process started run 2 and its provider kept running. The next
+    /// process holds run 2 for a person and launches nothing. A new attempt is
+    /// refused while the provider holds the checkout. Once it has exited, a
+    /// fresh human decision starts exactly one run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_uncertain_start_reloaded_from_disk_waits_for_its_provider_and_then_recovers() {
+        let fx = fixture().await;
+        let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
+        let started_head = fx.head();
+        // The Started record the lost process wrote before it spawned the provider.
+        fx.edit(|t| {
+            t.status = TaskStatus::InProgress;
+            t.error_message = None;
+            t.record_activity(ActivityKind::RunStarted {
+                run: 2,
+                addressing_feedback: false,
+            });
+            t.worker_handoff = Some(WorkerHandoff {
+                task_id: t.id,
+                project_id: t.project_id,
+                repository_id: Some(fx.repository_id),
+                run: Some(2),
+                branch: t.branch_name.clone(),
+                start_head: Some(started_head.clone()),
+                acceptance: None,
+                stage: WorkerHandoffStage::Started,
+            });
+        })
+        .await;
+        let id = Uuid::new_v4();
+        let executor_before = fx.state.executor.get().unwrap().clone();
+        let mut orphan = orphan_provider(&executor_before, fx.task_id, "sleep 4");
+        let before = fx.repo_state();
+
+        let (state, executor) = restart(&fx).await;
+
+        let task = task_in(&state, fx.task_id).await;
+        assert!(
+            matches!(
+                task.worker_handoff.as_ref().map(|h| &h.stage),
+                Some(WorkerHandoffStage::RecoveryRequired { .. })
+            ),
+            "the uncertain Started run is recoverable: {:?}",
+            task.worker_handoff
+        );
+        assert_eq!(task.worker_handoff.as_ref().and_then(|h| h.run), Some(2));
+        assert_eq!(agent.invocations(), "", "no provider is launched by the reload");
+
+        // The decision binds the recovery the reloaded process reconciled, for run 2.
+        let recovery_reason = match &task.worker_handoff.as_ref().unwrap().stage {
+            WorkerHandoffStage::RecoveryRequired { reason, .. } => reason.clone(),
+            other => panic!("{other:?}"),
+        };
+        let mut request = fx.request(id).await;
+        request.run = 2;
+        request.stage = "recovery_required".into();
+        request.recovery_reason = recovery_reason;
+        let outcome = record_decision(&state, request).await.unwrap();
+        assert!(
+            matches!(outcome, AuthorizeNewAttemptOutcome::Authorized { .. }),
+            "{outcome:?}"
+        );
+        let reason = executor.start_new_attempt(fx.task_id, id).await.unwrap_err();
+        assert!(reason.contains("still holds"), "{reason}");
+        assert_eq!(agent.invocations(), "", "the held checkout launches nothing");
+        assert_eq!(fx.repo_state(), before, "checkout and Git references are preserved");
+
+        let _ = orphan.wait().await;
+        wait_until_absent(&executor, fx.task_id).await;
+        executor.start_new_attempt(fx.task_id, id).await.unwrap();
+        assert!(agent_invoked(&agent).await);
+        let started = task_in(&state, fx.task_id).await;
+        assert_eq!(started.worker_handoff.as_ref().and_then(|h| h.run), Some(3));
+        assert_eq!(agent.invocations().matches("claude").count(), 1, "exactly one new run");
+        executor.stop_task(fx.task_id).await.unwrap();
+    }
+
+    /// The start is published but not durable, and the hold that should follow
+    /// it fails the same way. Memory and disk both then show run 2 under a
+    /// recovery hold, with no authorization left. A reload keeps that recovery,
+    /// and nothing launches. (A hold that fails before it is published cannot be
+    /// staged here: the fault injector arms one failure at a time.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_published_start_whose_hold_also_fails_is_recovered_after_reload() {
+        let fx = fixture().await;
+        let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
+        let id = Uuid::new_v4();
+        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        let executor = fx.state.executor.get().unwrap().clone();
+
+        let refused = {
+            // The board probe passes. The start's sync and the hold's sync both fail.
+            let _fault = fault::fail_every_after(Stage::SyncDirectory, std::io::ErrorKind::Other, 1);
+            executor.start_new_attempt(fx.task_id, id).await
+        };
+
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(agent.invocations(), "", "nothing launches on an unconfirmed start");
+        for (source, task) in [("memory", fx.task().await), ("disk", fx.on_disk())] {
+            assert!(
+                matches!(
+                    task.worker_handoff.as_ref().map(|h| &h.stage),
+                    Some(WorkerHandoffStage::RecoveryRequired { reason, .. })
+                        if reason.contains("unconfirmed")
+                ),
+                "{source}: {:?}",
+                task.worker_handoff
+            );
+            assert_eq!(task.worker_handoff.as_ref().and_then(|h| h.run), Some(2), "{source}");
+            assert_eq!(new_attempt_runs(&task), 1, "{source}: run 2 was recorded once");
+            assert!(task.new_attempt.is_none(), "{source}: the authorization was consumed");
+        }
+        assert!(
+            crate::agents::provider_lease::prove_absent(&executor.provider_lease_path(fx.task_id))
+                .is_ok(),
+            "no provider was spawned, so none can be running"
+        );
+
+        let (state, _) = restart(&fx).await;
+
+        let reloaded = task_in(&state, fx.task_id).await;
+        assert!(
+            matches!(
+                reloaded.worker_handoff.as_ref().map(|h| &h.stage),
+                Some(WorkerHandoffStage::RecoveryRequired { .. })
+            ),
+            "{:?}",
+            reloaded.worker_handoff
+        );
+        assert!(
+            matches!(
+                fx.on_disk().worker_handoff.as_ref().map(|h| &h.stage),
+                Some(WorkerHandoffStage::RecoveryRequired { .. })
+            ),
+            "the reloaded recovery reached the disk"
+        );
+        assert_eq!(agent.invocations(), "");
     }
 
     /// A decision that was persisted by an earlier process, and so is not

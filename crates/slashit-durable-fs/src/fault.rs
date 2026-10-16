@@ -59,6 +59,15 @@ pub fn fail_after(stage: Stage, kind: io::ErrorKind, skip: u32) -> FaultGuard {
     FaultGuard(())
 }
 
+/// [`fail_after`] that stays armed: the first `skip` writes reaching `stage`
+/// succeed, and every write after them fails. A test uses it to fail an
+/// operation's publishing write and the write that should follow it alike.
+#[must_use = "the fault is disarmed as soon as the guard is dropped"]
+pub fn fail_every_after(stage: Stage, kind: io::ErrorKind, skip: u32) -> FaultGuard {
+    ARMED.with(|a| *a.borrow_mut() = Some(Armed { skip, every: true, ..Armed::new(stage, kind) }));
+    FaultGuard(())
+}
+
 /// Like [`fail_at`], but the fault stays armed until the guard is dropped:
 /// every write on this thread that reaches `stage` fails, which is what a
 /// filesystem that cannot perform that step looks like.

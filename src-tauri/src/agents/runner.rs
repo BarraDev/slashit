@@ -1,3 +1,4 @@
+use super::provider_lease::ProviderLease;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -463,6 +464,16 @@ impl ClaudeRunner {
         Self::start_program("claude", config).await
     }
 
+    /// [`Self::start`] for a Worker run on a Task Checkout. The provider inherits
+    /// `lease`, so a later attempt can tell whether it is still running. See
+    /// [`super::provider_lease`].
+    pub async fn start_leased(
+        config: ClaudeRunConfig,
+        lease: Option<ProviderLease>,
+    ) -> Result<Self, String> {
+        Self::start_leased_program("claude", config, lease).await
+    }
+
     /// Start `program` with the Claude Code CLI argument set.
     ///
     /// Split out from [`start`] only so the tests can point the runner at a
@@ -479,6 +490,15 @@ impl ClaudeRunner {
     async fn start_program(
         program: impl AsRef<std::ffi::OsStr>,
         config: ClaudeRunConfig,
+    ) -> Result<Self, String> {
+        Self::start_leased_program(program, config, None).await
+    }
+
+    /// [`Self::start_program`] with the provider's lease, if it has one.
+    async fn start_leased_program(
+        program: impl AsRef<std::ffi::OsStr>,
+        config: ClaudeRunConfig,
+        lease: Option<ProviderLease>,
     ) -> Result<Self, String> {
         let mut cmd = Command::new(program);
 
@@ -517,9 +537,25 @@ impl ClaudeRunner {
         // nothing pointing at it.
         cmd.kill_on_drop(true);
 
+        if let Some(lease) = &lease {
+            lease.inherit_into(&mut cmd);
+        }
+
         let mut child = cmd.spawn()
             .map_err(|e| format!("Failed to spawn claude: {}. Is claude CLI installed?", e))?;
         eprintln!("[claude-runner] spawned pid={:?}", child.id());
+
+        // Recorded before anything else can run. A run whose group cannot be
+        // recorded is not kept: the child is dropped and ended with it, so no
+        // provider runs that a later attempt could not account for.
+        if let Some(lease) = lease {
+            let pid = child
+                .id()
+                .ok_or_else(|| "The provider exited before its process could be recorded.".to_string())?;
+            lease
+                .record_group(pid)
+                .map_err(|e| format!("The provider's lease could not be recorded: {e}"))?;
+        }
 
         // Take stdout here, while the child is still ours alone, and hand it
         // straight to the reader. Draining stdout then depends on nothing but
