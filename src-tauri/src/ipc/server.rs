@@ -1370,6 +1370,19 @@ pub(crate) mod tests {
         }
     }
 
+    /// Waits until connecting to `endpoint` is refused. Only `ConnectionRefused`
+    /// shows a closed listener: any other failure to connect says nothing about
+    /// whether it still accepts, so it fails the test instead of passing it.
+    async fn until_connection_refused(endpoint: &Endpoint) {
+        loop {
+            match transport::connect(endpoint).await {
+                Ok(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
+                Err(error) => panic!("connecting failed for a reason other than refusal: {error}"),
+            }
+        }
+    }
+
     /// Acquire the endpoint after a release, tolerating the instant in which a
     /// concurrently forking test still holds a copy of the lease descriptor
     /// between `fork` and `exec`. A lease that is genuinely held never clears.
@@ -1534,11 +1547,7 @@ pub(crate) mod tests {
         // in LISTEN while any copy of its descriptor exists, and another test's
         // fork can hold one between fork and exec, so a connect can still be
         // queued for a moment after the listener is dropped.
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while transport::connect(&tcp).await.is_ok() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
+        tokio::time::timeout(Duration::from_secs(10), until_connection_refused(&tcp))
         .await
         .expect("the surviving TCP listener is closed with the rest of the instance");
         drop(rig.ownership.take());
@@ -1554,11 +1563,7 @@ pub(crate) mod tests {
 
         rig.tcp_fault.as_ref().unwrap().fail();
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while transport::connect(&tcp).await.is_ok() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
+        tokio::time::timeout(Duration::from_secs(10), until_connection_refused(&tcp))
         .await
         .expect("the failed optional listener is closed, so its clients are refused");
         assert!(!rig.server_finished(), "TCP is optional: the server carries on");

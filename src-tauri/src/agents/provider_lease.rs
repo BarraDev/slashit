@@ -131,12 +131,7 @@ mod imp {
         /// show a group that survived its leader. Used before a new lease is
         /// handed out, so that a mark or a live group is never overwritten.
         pub fn prove_record_absent(&self) -> Result<(), String> {
-            let mut file = &self.file;
-            let mut recorded = String::new();
-            file.seek(SeekFrom::Start(0))
-                .and_then(|_| file.read_to_string(&mut recorded))
-                .map_err(|error| format!("The provider lease cannot be read: {error}"))?;
-            judge_record(&recorded)
+            judge_record(&read_record(&self.file)?)
         }
 
         /// Clears the spawn mark after the spawn itself failed. No child exists in
@@ -179,6 +174,18 @@ mod imp {
         file.sync_all()
     }
 
+    /// The whole record, read from the start through `file` itself. Every
+    /// judgment of a record goes through the descriptor whose lock backs it, so
+    /// the lock and the record can never belong to different files.
+    fn read_record(file: &std::fs::File) -> Result<String, String> {
+        let mut file = file;
+        let mut recorded = String::new();
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.read_to_string(&mut recorded))
+            .map_err(|error| format!("The provider lease cannot be read: {error}"))?;
+        Ok(recorded)
+    }
+
     /// `Ok` when no provider of the Task can still be running. `Err` gives the
     /// reason, for the person, when absence cannot be shown.
     pub fn prove_absent(path: &Path) -> Result<(), String> {
@@ -206,9 +213,9 @@ mod imp {
             }
             Err(error) => return Err(format!("The provider lease cannot be checked: {error}")),
         }
-        let recorded = std::fs::read_to_string(path)
-            .map_err(|error| format!("The provider lease cannot be read: {error}"))?;
-        judge_record(&recorded)
+        // Read through the descriptor that holds the lock, not through the path,
+        // which could name a different file by now.
+        judge_record(&read_record(&file)?)
     }
 
     /// Whether the record already on disk forbids a start. Read-only and takes
@@ -393,6 +400,19 @@ mod tests {
         panic!("absence was never proven: {:?}", prove_absent(path));
     }
 
+    /// Waits until no process is left in `group`. A killed member stays a zombie
+    /// until its parent or init reaps it, and a group with a zombie in it still
+    /// exists, so one reading right after the kill is not a fair test.
+    async fn wait_until_group_gone(group: i32) {
+        for _ in 0..500 {
+            if unsafe { libc::killpg(group, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the process group {group} was never emptied");
+    }
+
     /// Waits until the lock is free, whatever the record says. A fork in another
     /// test thread can briefly hold a copy of the lease descriptor until its
     /// exec, so a single reading right after an exit is not a fair test of the
@@ -439,6 +459,127 @@ mod tests {
         read()
     }
 
+    #[cfg(target_os = "linux")]
+    /// What the leader of a provider's group does in the survivor tests: close its
+    /// copy of the lease, leave a sleeping descendant in the group, and exit.
+    ///
+    /// It runs under `bash`, not `sh`: a descriptor numbered 10 or above can only
+    /// be closed by name there (`exec {fd}>&-`), while dash, which is `sh` on
+    /// Debian and Ubuntu, reads `exec 15>&-` as a command called `15` and exits
+    /// with status 127. The lease is found by what it points at, so no other
+    /// descriptor is touched. The leader exits 4 if it found no lease to close and
+    /// 3 if one is still open after closing, so a setup that did not happen cannot
+    /// look like one that did.
+    const LEADER_LEAVING_A_SURVIVOR: &str = r#"
+lease=$1; pidfile=$2; closed=0
+for f in /proc/$$/fd/*; do
+  [ "$(readlink "$f")" = "$lease" ] || continue
+  fd=${f##*/}
+  exec {fd}>&-
+  closed=1
+done
+[ "$closed" = 1 ] || exit 4
+for f in /proc/$$/fd/*; do
+  [ "$(readlink "$f")" = "$lease" ] && exit 3
+done
+sleep 30 &
+echo $! > "$pidfile"
+exit 0
+"#;
+
+    #[cfg(target_os = "linux")]
+    /// A descendant left behind in its leader's process group, ended on drop so a
+    /// failed assertion cannot leave a sleeper running.
+    struct Survivor {
+        group: i32,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Survivor {
+        fn end(&self) {
+            unsafe { libc::killpg(self.group, libc::SIGKILL) };
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Survivor {
+        fn drop(&mut self) {
+            self.end();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Spawns the leader of [`LEADER_LEAVING_A_SURVIVOR`] with the lease inherited,
+    /// in a process group of its own. The caller records the group if the test
+    /// needs it, and drops its own copy of the lease.
+    fn spawn_leader_leaving_a_survivor(
+        lease: &ProviderLease,
+        path: &std::path::Path,
+        pidfile: &std::path::Path,
+    ) -> tokio::process::Child {
+        let mut command = tokio::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg(LEADER_LEAVING_A_SURVIVOR)
+            .arg("bash")
+            .arg(std::fs::canonicalize(path).expect("lease path"))
+            .arg(pidfile)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        lease.inherit_into(&mut command);
+        command.spawn().expect("spawn bash for the leader")
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Waits for the leader and proves the setup the survivor tests rely on: the
+    /// leader succeeded, its sleeping descendant is alive in the leader's group,
+    /// the group exists, and the descendant holds no descriptor on the lease.
+    async fn await_survivor(
+        mut child: tokio::process::Child,
+        path: &std::path::Path,
+        pidfile: &std::path::Path,
+    ) -> Survivor {
+        let group = child.id().expect("leader pid") as i32;
+        let status = child.wait().await.expect("wait for the leader");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the leader did not set up its survivor (3: lease still open, 4: no lease found, 127: command missing)"
+        );
+        let descendant: i32 = std::fs::read_to_string(pidfile)
+            .expect("the leader records its descendant")
+            .trim()
+            .parse()
+            .expect("descendant pid");
+        let survivor = Survivor { group };
+
+        let status_file = std::fs::read_to_string(format!("/proc/{descendant}/status"))
+            .expect("the descendant is running");
+        assert!(
+            !status_file.lines().any(|line| line.starts_with("State:\tZ")),
+            "the descendant is already a zombie: {status_file}"
+        );
+        assert_eq!(
+            unsafe { libc::getpgid(descendant) },
+            group,
+            "the descendant is in the leader's group"
+        );
+        assert_eq!(unsafe { libc::killpg(group, 0) }, 0, "the group exists");
+
+        let lease = std::fs::canonicalize(path).expect("lease path");
+        for entry in std::fs::read_dir(format!("/proc/{descendant}/fd")).expect("descendant fds") {
+            let target = std::fs::read_link(entry.expect("fd entry").path());
+            assert_ne!(
+                target.ok().as_deref(),
+                Some(lease.as_path()),
+                "the descendant still holds the lease"
+            );
+        }
+        survivor
+    }
+
     /// Spawns a shell that holds the lease, as a provider does.
     fn spawn_holder(lease: ProviderLease, script: &str) -> tokio::process::Child {
         let mut command = tokio::process::Command::new("sh");
@@ -479,27 +620,31 @@ mod tests {
         wait_until_proven_absent(&path).await;
     }
 
-    /// Linux only: the script enumerates its descriptors through `/proc`.
+    /// Linux only: the leader finds its descriptors through `/proc`.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_descendant_that_closes_the_lease_is_still_seen_through_its_group() {
         let dir = tempfile::tempdir().unwrap();
         let path = lease_path(&dir);
+        let pidfile = dir.path().join("descendant.pid");
         let lease = acquire(&path).unwrap().expect("unix lease");
-        // The leader closes every descriptor above stdio, then leaves a sleeping
-        // descendant behind in its own group and exits. The lock is free by then.
-        let script = "for f in /proc/$$/fd/*; do n=${f##*/}; if [ \"$n\" -gt 2 ]; then eval \"exec $n>&-\"; fi; done; sleep 30 & exit 0";
-        let mut child = spawn_holder(lease, script);
-        let pid = child.id().unwrap() as i32;
-        let _ = child.wait().await;
+        let child = spawn_leader_leaving_a_survivor(&lease, &path, &pidfile);
+        lease.record_group(child.id().unwrap()).expect("record group");
+        drop(lease);
+        let survivor = await_survivor(child, &path, &pidfile).await;
 
-        // Lock free, but the group still has a live member.
+        // The lock is free, since nothing holds the lease, but the group still has
+        // a live member: the provider is seen only through its group.
+        wait_until_lock_free(&path).await;
         let result = settled(|| prove_absent(&path)).await;
-        unsafe { libc::killpg(pid, libc::SIGKILL) };
         assert!(
             matches!(&result, Err(reason) if reason.contains("process group")),
             "{result:?}"
         );
+
+        // Once the group is empty, the same record admits.
+        survivor.end();
+        wait_until_proven_absent(&path).await;
     }
 
     #[tokio::test]
@@ -552,7 +697,7 @@ mod tests {
 
         let _ = child.wait().await;
         // The group was ended by the failed record, so nothing is left to account for.
-        assert_eq!(unsafe { libc::killpg(pid as i32, 0) }, -1);
+        wait_until_group_gone(pid as i32).await;
         // The mark was not replaced, so the failed record does not read as absence.
         wait_until_lock_free(&path).await;
         assert!(matches!(settled(|| prove_absent(&path)).await, Err(reason) if reason.contains("may have started")));
@@ -591,40 +736,59 @@ mod tests {
         assert!(matches!(settled(|| prove_absent(&path)).await, Err(reason) if reason.contains("may have started")));
     }
 
-    /// Linux only: the script enumerates its descriptors through `/proc`.
+    /// Linux only: the leader finds its descriptors through `/proc`.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_crash_between_the_spawn_and_the_group_record_is_not_read_as_absence() {
         let dir = tempfile::tempdir().unwrap();
         let path = lease_path(&dir);
+        let pidfile = dir.path().join("descendant.pid");
         let lease = acquire(&path).unwrap().expect("unix lease");
         lease.mark_spawning().unwrap();
         // The provider is spawned with the lease, and SlashIt "dies" before the
         // group is recorded. The leader closes the lease, leaves a sleeping
         // descendant in its group, and exits, so the lock is free while that
         // descendant is still running.
-        let script = "for f in /proc/$$/fd/*; do n=${f##*/}; if [ \"$n\" -gt 2 ]; then eval \"exec $n>&-\"; fi; done; sleep 30 & exit 0";
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg(script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        lease.inherit_into(&mut command);
-        let mut child = command.spawn().expect("spawn");
+        let child = spawn_leader_leaving_a_survivor(&lease, &path, &pidfile);
         drop(lease);
-        let pid = child.id().unwrap() as i32;
-        let _ = child.wait().await;
+        let survivor = await_survivor(child, &path, &pidfile).await;
 
-        // The leader and the lease are gone; only the descendant is left.
         wait_until_lock_free(&path).await;
         let result = settled(|| prove_absent(&path)).await;
-        unsafe { libc::killpg(pid, libc::SIGKILL) };
         assert!(
             matches!(&result, Err(reason) if reason.contains("may have started")),
             "{result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "spawning\n");
+
+        // The mark, not the group, is what refuses: it still refuses once the
+        // descendant is gone.
+        survivor.end();
+        wait_until_group_gone(survivor.group).await;
+        let result = settled(|| prove_absent(&path)).await;
+        assert!(
+            matches!(&result, Err(reason) if reason.contains("may have started")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_record_is_judged_through_the_locked_descriptor_not_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        let lease = acquire(&path).unwrap().expect("unix lease");
+        lease.mark_spawning().unwrap();
+
+        // The path now names a different, empty file. Reading it by path would
+        // find no mark and report absence; the locked descriptor still has it.
+        let other = dir.path().join("other.lock");
+        std::fs::write(&other, b"").unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+
+        assert!(
+            matches!(lease.prove_record_absent(), Err(reason) if reason.contains("may have started")),
+            "the mark in the locked file must refuse"
         );
     }
 
@@ -649,29 +813,36 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "spawning\n");
     }
 
-    /// Linux only: the script enumerates its descriptors through `/proc`.
+    /// Linux only: the leader finds its descriptors through `/proc`.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_launch_is_refused_when_its_record_shows_a_group_still_running() {
         let dir = tempfile::tempdir().unwrap();
         let path = lease_path(&dir);
+        let pidfile = dir.path().join("descendant.pid");
         let lease = acquire(&path).unwrap().expect("unix lease");
         // The leader closes its lease, leaves a sleeping descendant in its group,
         // and exits. The lock is free, and the group was recorded.
-        let script = "for f in /proc/$$/fd/*; do n=${f##*/}; if [ \"$n\" -gt 2 ]; then eval \"exec $n>&-\"; fi; done; sleep 30 & exit 0";
-        let mut child = spawn_holder(lease, script);
+        let child = spawn_leader_leaving_a_survivor(&lease, &path, &pidfile);
         let pid = child.id().unwrap() as i32;
-        let _ = child.wait().await;
+        lease.record_group(pid as u32).expect("record group");
+        drop(lease);
+        let survivor = await_survivor(child, &path, &pidfile).await;
         wait_until_lock_free(&path).await;
 
         let refused = acquire_proven_when_lock_free(&path).await;
         let recorded = std::fs::read_to_string(&path).unwrap();
-        unsafe { libc::killpg(pid, libc::SIGKILL) };
         assert!(
             matches!(&refused, Err(reason) if reason.contains("process group")),
             "{refused:?}"
         );
         assert_eq!(recorded, format!("{pid}\n"), "the recorded group is not overwritten");
+
+        // The group is what refused: once it is empty, the same record admits.
+        survivor.end();
+        wait_until_proven_absent(&path).await;
+        let admitted = acquire_proven_when_lock_free(&path).await;
+        assert!(matches!(&admitted, Ok(Some(_))), "{admitted:?}");
     }
 
     #[tokio::test]

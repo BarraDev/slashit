@@ -101,7 +101,11 @@ pub(crate) fn board_can_confirm(
     match storage.board_directory_sync(project_id) {
         Ok(slashit_durable_fs::DirectorySync::Synced) => Ok(()),
         Ok(slashit_durable_fs::DirectorySync::Unsupported) => Err(BOARD_NOT_SYNCABLE.into()),
-        Err(error) => Err(format!("{BOARD_NOT_SYNCABLE} ({error:#})")),
+        Err(error) => Err(format!(
+            "SlashIt could not synchronize the directory that holds the Task board, so it \
+             cannot confirm that a new attempt survives a power loss. Nothing was started: \
+             {error:#}"
+        )),
     }
 }
 

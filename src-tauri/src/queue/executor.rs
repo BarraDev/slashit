@@ -3686,14 +3686,14 @@ impl TaskExecutor {
         Ok(())
     }
 
-    /// The Task-side checks of a new attempt, made under the lease. The Git
-    /// checks follow once the checkout is known, in
-    /// [`Self::confirm_new_attempt_checkout`].
     /// The Task's provider lease file, under the application data directory.
     pub(crate) fn provider_lease_path(&self, task_id: Uuid) -> std::path::PathBuf {
         task_provider_lease_path(&self.storage, task_id)
     }
 
+    /// The Task-side checks of a new attempt, made under the lease. The Git
+    /// checks follow once the checkout is known, in
+    /// [`Self::confirm_new_attempt_checkout`].
     fn new_attempt_gate(
         task: &Task,
         decision_id: Uuid,
