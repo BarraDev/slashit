@@ -497,6 +497,8 @@ pub fn run() {
             get_approval_status,
             get_worker_recovery_evidence,
             accept_worker_result,
+            authorize_new_attempt,
+            start_new_attempt,
             get_integration_preview,
             integrate_task_locally,
             complete_and_integrate_task,

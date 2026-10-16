@@ -126,6 +126,12 @@ pub enum Kind {
         run: Option<u32>,
         reason: String,
     },
+    /// A person authorized a new coding attempt on the checkout of the
+    /// recovered run `run`. The attempt's own start is a separate `RunStarted`
+    /// entry, so the decision and the launch can each be seen on their own.
+    NewAttemptAuthorized {
+        run: u32,
+    },
     /// The run failed, or with `run: None`, the task failed before a run
     /// could start.
     RunFailed {
@@ -251,6 +257,7 @@ impl Kind {
             | Self::ToolsOmitted { .. }
             | Self::RunFailed { run: None, .. }
             | Self::RecoveryRequired { run: None, .. }
+            | Self::NewAttemptAuthorized { .. }
             | Self::Stopped { .. }
             | Self::Interrupted { .. }
             | Self::DeliveryFailed { .. } => return None,
@@ -646,6 +653,7 @@ impl Item<'_> {
             Row::Recorded(kind) => match kind {
                 Kind::Moved { .. } => "moved",
                 Kind::RunStarted { .. } => "run_started",
+                Kind::NewAttemptAuthorized { .. } => "new_attempt_authorized",
                 Kind::ToolUsed { .. } => "tool_used",
                 Kind::ToolsOmitted { .. } => "tools_omitted",
                 Kind::RunCompleted { .. } => "run_completed",
@@ -711,6 +719,7 @@ fn kind_title(kind: &Kind) -> String {
         }
         Kind::RunCompleted { .. } => "Coding finished".to_string(),
         Kind::RecoveryRequired { .. } => "Worker recovery required".to_string(),
+        Kind::NewAttemptAuthorized { .. } => "New attempt authorized".to_string(),
         Kind::RunFailed { run: Some(_), .. } => "Coding failed".to_string(),
         Kind::RunFailed { run: None, .. } => "Could not start".to_string(),
         Kind::Stopped { from } => format!("Stopped during {}", from.label()),

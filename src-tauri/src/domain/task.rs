@@ -294,8 +294,14 @@ pub struct WorkerHandoff {
 
 /// A person's authorization to start a new coding attempt on the checkout of a
 /// run whose recovery is required. It binds exactly what the person inspected:
-/// the run, the branch and its tip, the checkout, the commit observed, and the
-/// fingerprint of the uncommitted work that the attempt will build on.
+/// the run, the recovery reason, the branch and its tip, the checkout, the
+/// commit observed, and the fingerprint of the uncommitted work that the
+/// attempt will build on.
+///
+/// The recovery reason stands in for a revision number. Recovery is recorded
+/// once per run in the activity log, so a second return to recovery for the
+/// same run leaves no new entry to point at. Any change that Git can show, and
+/// any change to the reason, makes the launch refuse.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NewAttemptDecision {
     /// Client-generated identity of the decision, for idempotent retries.
@@ -303,6 +309,8 @@ pub struct NewAttemptDecision {
     /// The recovered run this decision is for. A decision for any other run is
     /// stale.
     pub for_run: u32,
+    /// The recovery reason the person was shown.
+    pub recovery_reason: String,
     pub branch: String,
     pub checkout_path: String,
     /// The commit the recovery evidence had observed, or `None` if it had
@@ -518,7 +526,8 @@ impl Task {
     /// Only the new-attempt admission may consult this. It does not lift
     /// [`Self::worker_recovery_refusal`] for any other request. The decision
     /// must be confirmed by a durable write in this process, be for the run the
-    /// Task still has in recovery, and name the same branch.
+    /// Task still has in recovery with the same reason and observed commit, and
+    /// name the same branch. Git facts are checked by the admission itself.
     pub fn new_attempt_admits(&self) -> bool {
         let Some(decision) = self.new_attempt.as_ref() else {
             return false;
@@ -529,7 +538,15 @@ impl Task {
         let Some(handoff) = self.worker_handoff.as_ref() else {
             return false;
         };
-        matches!(handoff.stage, WorkerHandoffStage::RecoveryRequired { .. })
+        let WorkerHandoffStage::RecoveryRequired {
+            reason,
+            observed_commit,
+        } = &handoff.stage
+        else {
+            return false;
+        };
+        *reason == decision.recovery_reason
+            && *observed_commit == decision.observed_commit
             && handoff.run == Some(decision.for_run)
             && handoff.branch.as_deref() == Some(decision.branch.as_str())
     }
@@ -1899,6 +1916,7 @@ mod tests {
         let decision = NewAttemptDecision {
             decision_id: Uuid::new_v4(),
             for_run: run,
+            recovery_reason: "interrupted".into(),
             branch: "task/example".into(),
             checkout_path: "/checkouts/example".into(),
             observed_commit: None,

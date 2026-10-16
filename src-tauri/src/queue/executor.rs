@@ -1,6 +1,7 @@
 use crate::agents::runner::{ClaudeEvent, ClaudeRunConfig, ClaudeRunner, ToolAccess};
 use crate::domain::task::ActivityKind;
 use crate::domain::task::ExternalRef;
+use crate::domain::task::NewAttemptDecision;
 use crate::domain::{
     AgentExecution, AgentLogEntry, AgentStatus, BranchOrigin, LogLevel, QaSignoff, QaStatus, Task,
     TaskPhase, TaskStatus,
@@ -957,6 +958,11 @@ enum StartRequest {
     /// A person asking for a `Queue` or `InProgress` task to start now. A
     /// task not already waiting to run is moved there as part of the start.
     Direct,
+    /// A person's new attempt on a recovered run, admitted only for the
+    /// authorization `decision_id` that is confirmed in this process and still
+    /// matches the recovery evidence. It is the only request that may pass
+    /// [`Task::worker_recovery_refusal`], and it does so for that one decision.
+    NewAttempt { decision_id: Uuid },
 }
 
 /// Emit an `AgentEvent` through any sink.
@@ -3296,11 +3302,27 @@ impl TaskExecutor {
     /// board, its checkout is one the published board references, and taking
     /// it back would delete recorded state. The message says what was kept,
     /// if anything.
+    #[cfg(test)]
     async fn record_run_start(
         &self,
         task_id: Uuid,
         repo_path: &str,
         acquired: Acquired,
+    ) -> Result<RunStart, RunStartError> {
+        self.record_run_start_for(task_id, repo_path, acquired, None)
+            .await
+    }
+
+    /// [`Self::record_run_start`] for a run that may be a new attempt. For one,
+    /// the authorization is consumed in the same board write that records the
+    /// run's start, and only if the Task still matches it. Otherwise nothing is
+    /// written and the checkout is left as it was.
+    async fn record_run_start_for(
+        &self,
+        task_id: Uuid,
+        repo_path: &str,
+        acquired: Acquired,
+        new_attempt: Option<&NewAttemptDecision>,
     ) -> Result<RunStart, RunStartError> {
         let (branch, start_head) =
             match Self::checkout_branch_head(&acquired.info.path, &acquired.info.branch).await {
@@ -3316,6 +3338,16 @@ impl TaskExecutor {
                     return Err(RunStartError::Refused(message));
                 }
             };
+        if let Some(decision) = new_attempt {
+            if start_head != decision.expected_head {
+                self.worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                return Err(RunStartError::Refused(
+                    "The branch HEAD changed before the new attempt could start. Nothing was recorded or launched; inspect the Task again.".into(),
+                ));
+            }
+        }
         let project_id = self
             .tasks
             .read()
@@ -3363,8 +3395,27 @@ impl TaskExecutor {
             ));
         }
         let run = std::sync::atomic::AtomicU32::new(0);
+        let consumed = std::sync::atomic::AtomicBool::new(false);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
+                if let Some(decision) = new_attempt {
+                    // Only the decision the person made may start this run, and
+                    // only while the Task still records exactly that recovery.
+                    let still_authorized = t.new_attempt_admits()
+                        && t.new_attempt.as_ref().map(|d| d.decision_id)
+                            == Some(decision.decision_id)
+                        && t.next_run() == decision.for_run + 1;
+                    if !still_authorized {
+                        return;
+                    }
+                    QueueManager::apply_promotion(t);
+                    // Consumed by this same record: the start cannot be recorded
+                    // without the authorization ending, and the authorization
+                    // cannot end without the run starting.
+                    t.new_attempt = None;
+                    t.new_attempt_confirmed = false;
+                    consumed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 t.worktree_path = Some(acquired.info.path.clone());
                 t.branch_name = Some(acquired.info.branch.clone());
                 if let Some(base_commit) = &acquired.base_commit {
@@ -3396,6 +3447,17 @@ impl TaskExecutor {
             }
         };
         match crate::lifecycle::record_typed(&self.tasks, &self.storage, task_id, &amend).await {
+            // The write was made, but the new attempt's authorization was not
+            // consumed by it, so nothing started. The checkout is released only if
+            // SlashIt created it in this call.
+            Ok(()) if new_attempt.is_some() && !consumed.load(std::sync::atomic::Ordering::Relaxed) => {
+                self.worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                Err(RunStartError::Refused(
+                    "The authorization for this new attempt no longer matches the Task. Nothing was recorded or launched; inspect the Task again.".into(),
+                ))
+            }
             // `record` fails for a task that is not on the board, so a
             // successful write always ran the amend on it.
             Ok(()) => Ok(RunStart {
@@ -3517,6 +3579,109 @@ impl TaskExecutor {
             .await
     }
 
+    /// Starts the new attempt that a person authorized as `decision_id` on
+    /// `task_id`'s recovered run. It shares [`Self::execute_task`]'s admission,
+    /// capacity and lease; only the request differs, so the authorization is the
+    /// one thing that can lift the recovery refusal.
+    pub async fn start_new_attempt(&self, task_id: Uuid, decision_id: Uuid) -> Result<(), String> {
+        let _process_admission = self.process_admission.enter()?;
+        self.start_guard
+            .check()
+            .await
+            .map_err(|block| block.to_string())?;
+        self.reconcile_admission().await;
+        let lease = self.lifecycle.acquire(task_id).await?;
+        if !self
+            .start_execution_under_lease(
+                &lease,
+                task_id,
+                StartRequest::NewAttempt { decision_id },
+                None,
+            )
+            .await?
+        {
+            return Err(format!(
+                "task {task_id} could not start its new attempt right now. Nothing was recorded \
+                 or launched; try again in a moment."
+            ));
+        }
+        Ok(())
+    }
+
+    /// The Task-side checks of a new attempt, made under the lease. The Git
+    /// checks follow once the checkout is known, in
+    /// [`Self::confirm_new_attempt_checkout`].
+    fn new_attempt_gate(
+        task: &Task,
+        decision_id: Uuid,
+    ) -> Result<crate::domain::task::NewAttemptDecision, String> {
+        if !matches!(task.status, TaskStatus::Error | TaskStatus::Backlog) {
+            return Err(format!(
+                "A new attempt needs the Task in Error or Backlog, but it is in {:?}.",
+                task.status
+            ));
+        }
+        if task.cleanup_in_flight {
+            return Err(
+                "This task has a worktree cleanup that was interrupted and not yet resolved; it \
+                 needs attention before a new attempt."
+                    .to_string(),
+            );
+        }
+        let decision = task
+            .new_attempt
+            .as_ref()
+            .ok_or("No new attempt is authorized for this Task.")?;
+        if decision.decision_id != decision_id {
+            return Err(
+                "This authorization was replaced by a later decision. Decide again.".to_string(),
+            );
+        }
+        if !task.new_attempt_confirmed {
+            return Err(
+                "This authorization is not confirmed in this session. Decide again.".to_string(),
+            );
+        }
+        if !task.new_attempt_admits() {
+            return Err(
+                "The recovery evidence changed after you authorized this attempt. Inspect the \
+                 Task again and decide again."
+                    .to_string(),
+            );
+        }
+        Ok(decision.clone())
+    }
+
+    /// Reads the checkout a new attempt would build on, and refuses unless it
+    /// is exactly the checkout `decision` was made on.
+    async fn confirm_new_attempt_checkout(
+        &self,
+        task_id: Uuid,
+        repo_path: &str,
+        decision: &crate::domain::task::NewAttemptDecision,
+    ) -> Result<(), String> {
+        let (project_id, recorded_path) = {
+            let tasks = self.tasks.read().await;
+            let task = tasks.get(&task_id).ok_or("Task not found")?;
+            (task.project_id, task.worktree_path.clone())
+        };
+        crate::worktree::new_attempt::board_can_confirm(&self.storage, project_id)?;
+        if recorded_path.as_deref() != Some(decision.checkout_path.as_str()) {
+            return Err(
+                "The Task Checkout is no longer the one you inspected. Nothing was started; \
+                 inspect the Task again."
+                    .to_string(),
+            );
+        }
+        let inspection = crate::worktree::new_attempt::inspect(
+            repo_path,
+            &decision.checkout_path,
+            &decision.branch,
+        )
+        .await?;
+        crate::worktree::new_attempt::confirm(decision, &inspection)
+    }
+
     /// The one place a task execution is decided, under the lease, so no
     /// other lifecycle transition can land between the answer and the start
     /// it allowed. A live owner, the task's own state, the unrecorded-worktree
@@ -3537,11 +3702,15 @@ impl TaskExecutor {
         if self.is_task_running(task_id).await {
             return match request {
                 StartRequest::Pending => Ok(false),
-                StartRequest::Direct => {
+                StartRequest::Direct | StartRequest::NewAttempt { .. } => {
                     Err(format!("task {task_id} already has an agent working on it"))
                 }
             };
         }
+
+        // The authorized decision, when this is a new attempt. Read under the
+        // lease below, and used again for the Git checks before anything is written.
+        let mut authorized: Option<NewAttemptDecision> = None;
 
         // Re-read under the lease. Whatever the caller saw before waiting
         // for it may no longer be true, and a task that has since been
@@ -3556,7 +3725,7 @@ impl TaskExecutor {
             if let Some(refusal) = task.and_then(Task::republish_pending_refusal) {
                 return match request {
                     StartRequest::Pending => Ok(false),
-                    StartRequest::Direct => Err(refusal),
+                    StartRequest::Direct | StartRequest::NewAttempt { .. } => Err(refusal),
                 };
             }
             match request {
@@ -3564,6 +3733,13 @@ impl TaskExecutor {
                     Some(task) if Self::is_pending(task) => false,
                     _ => return Ok(false),
                 },
+                StartRequest::NewAttempt { decision_id } => {
+                    let task = task.ok_or("Task not found")?;
+                    authorized = Some(Self::new_attempt_gate(task, decision_id)?);
+                    // Promotion to In Progress is part of the one record that
+                    // starts the run, so no separate write is made here.
+                    false
+                }
                 StartRequest::Direct => {
                     let task = task.ok_or("Task not found")?;
                     if let Some(refusal) = task.worker_recovery_refusal() {
@@ -3677,6 +3853,14 @@ impl TaskExecutor {
             }
         };
 
+        // A new attempt starts only on the checkout the person inspected. This
+        // reads before anything is attached or written, so a mismatch leaves the
+        // Task exactly as it was.
+        if let Some(decision) = authorized.as_ref() {
+            self.confirm_new_attempt_checkout(task_id, &repo_path, decision)
+                .await?;
+        }
+
         let (existing_branch, acquired) = self.acquire_task_worktree(task_id, &repo_path).await;
 
         let acquired = match acquired {
@@ -3704,6 +3888,29 @@ impl TaskExecutor {
             }
         };
 
+        if let Some(decision) = authorized.as_ref() {
+            // Attaching must have reused the inspected checkout, never created one.
+            // Read again now, after the attach, and undo only what this call created.
+            let reused = acquired.created_at.is_none()
+                && acquired.info.path == decision.checkout_path;
+            let checked = if reused {
+                crate::worktree::new_attempt::inspect(
+                    &repo_path,
+                    &decision.checkout_path,
+                    &decision.branch,
+                )
+                .await
+                .and_then(|inspection| crate::worktree::new_attempt::confirm(decision, &inspection))
+            } else {
+                Err("The attached checkout is not the one you inspected. Nothing was started; inspect the Task again.".into())
+            };
+            if let Err(refusal) = checked {
+                self.worktree_manager
+                    .release_unrecorded(&repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                return Err(refusal);
+            }
+        }
         self.events.agent_event(AgentEvent::Log {
             task_id: task_id.to_string(),
             level: LogLevel::Info,
@@ -3718,8 +3925,10 @@ impl TaskExecutor {
                     .to_string(),
             });
         }
-        let RunStart { working_dir, run } =
-            match self.record_run_start(task_id, &repo_path, acquired).await {
+        let RunStart { working_dir, run } = match self
+            .record_run_start_for(task_id, &repo_path, acquired, authorized.as_ref())
+            .await
+        {
                 Ok(start) => {
                     self.unrecorded_backoff_lock().remove(&task_id);
                     start

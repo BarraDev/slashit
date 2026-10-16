@@ -144,7 +144,7 @@ async fn git_read(dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-async fn commit_at(dir: &Path, rev: &str) -> Option<String> {
+pub(crate) async fn commit_at(dir: &Path, rev: &str) -> Option<String> {
     git_read(
         dir,
         &[

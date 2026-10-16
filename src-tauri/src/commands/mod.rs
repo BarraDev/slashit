@@ -51,6 +51,8 @@ pub use queue::*;
 pub use qa::*;
 pub use human_review::*;
 pub use worker_recovery::{accept_worker_result, get_worker_recovery_evidence};
+pub mod worker_new_attempt;
+pub use worker_new_attempt::{authorize_new_attempt, start_new_attempt};
 pub use integration::*;
 pub use attention::get_attention_summary;
 pub use storage_usage::{get_new_work_pause, get_storage_usage, refresh_storage_usage};
