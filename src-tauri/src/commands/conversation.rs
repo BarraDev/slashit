@@ -1560,6 +1560,11 @@ mod tests {
             let repo = tmp.path().join("repo");
             std::fs::create_dir_all(&repo).unwrap();
             git(&repo, &["init", "-q", "-b", "main"]);
+            // The Worker's commit runs the production commit helper, which takes
+            // its identity from Git config. Set it on this disposable repository,
+            // which the linked Task Checkout shares, so no global identity is needed.
+            git(&repo, &["config", "user.name", "t"]);
+            git(&repo, &["config", "user.email", "t@example.com"]);
             std::fs::write(repo.join("a.txt"), "a\n").unwrap();
             std::fs::write(repo.join("gone.txt"), "gone\n").unwrap();
             git(&repo, &["add", "."]);
@@ -1804,6 +1809,11 @@ mod tests {
             assert_ne!(git(&fx.checkout, &["rev-parse", "HEAD"]), head);
             assert_eq!(git(&fx.checkout, &["status", "--porcelain"]), "");
             assert_eq!(git(&fx.checkout, &["show", "--name-only", "--format=", "HEAD"]), "worker-output.txt");
+            assert_eq!(
+                git(&fx.checkout, &["log", "-1", "--format=%an <%ae>|%cn <%ce>", "HEAD"]),
+                "t <t@example.com>|t <t@example.com>",
+                "the Worker's commit uses the fixture's identity"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
