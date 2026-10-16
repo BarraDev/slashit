@@ -423,6 +423,22 @@ mod tests {
         panic!("the lock was never released: {:?}", acquire_proven(path));
     }
 
+    /// Repeats a reading past the transient "still holds". A fork in another test
+    /// thread can hold a copy of the lease descriptor, and so its lock, until its
+    /// exec. That is a refusal, never an admission, so a test about the rule for
+    /// a free lock settles the reading before judging it. Any other answer is
+    /// returned as it is.
+    async fn settled<T>(mut read: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+        for _ in 0..500 {
+            match read() {
+                Err(reason) if reason.contains("still holds") => {}
+                other => return other,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        read()
+    }
+
     /// Spawns a shell that holds the lease, as a provider does.
     fn spawn_holder(lease: ProviderLease, script: &str) -> tokio::process::Child {
         let mut command = tokio::process::Command::new("sh");
@@ -478,7 +494,7 @@ mod tests {
         let _ = child.wait().await;
 
         // Lock free, but the group still has a live member.
-        let result = prove_absent(&path);
+        let result = settled(|| prove_absent(&path)).await;
         unsafe { libc::killpg(pid, libc::SIGKILL) };
         assert!(
             matches!(&result, Err(reason) if reason.contains("process group")),
@@ -493,7 +509,7 @@ mod tests {
         let lease = acquire(&path).unwrap().expect("unix lease");
         let mut child = spawn_holder(lease, "exit 0");
         let _ = child.wait().await;
-        assert_eq!(prove_absent(&path), Ok(()));
+        assert_eq!(settled(|| prove_absent(&path)).await, Ok(()));
     }
 
     #[tokio::test]
@@ -507,7 +523,7 @@ mod tests {
         unsafe { libc::killpg(pid, libc::SIGKILL) };
         let _ = child.wait().await;
         wait_until_proven_absent(&path).await;
-        assert!(acquire(&path).unwrap().is_some());
+        assert!(settled(|| acquire(&path).map_err(|error| error.to_string())).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -539,7 +555,7 @@ mod tests {
         assert_eq!(unsafe { libc::killpg(pid as i32, 0) }, -1);
         // The mark was not replaced, so the failed record does not read as absence.
         wait_until_lock_free(&path).await;
-        assert!(matches!(prove_absent(&path), Err(reason) if reason.contains("may have started")));
+        assert!(matches!(settled(|| prove_absent(&path)).await, Err(reason) if reason.contains("may have started")));
     }
 
     #[tokio::test]
@@ -552,7 +568,7 @@ mod tests {
         lease.mark_spawning().unwrap();
         drop(lease);
         wait_until_lock_free(&path).await;
-        assert!(matches!(prove_absent(&path), Err(reason) if reason.contains("may have started")));
+        assert!(matches!(settled(|| prove_absent(&path)).await, Err(reason) if reason.contains("may have started")));
     }
 
     #[tokio::test]
@@ -572,7 +588,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = lease_path(&dir);
         std::fs::write(&path, b"12x\n").unwrap();
-        assert!(matches!(prove_absent(&path), Err(reason) if reason.contains("may have started")));
+        assert!(matches!(settled(|| prove_absent(&path)).await, Err(reason) if reason.contains("may have started")));
     }
 
     /// Linux only: the script enumerates its descriptors through `/proc`.
@@ -604,7 +620,7 @@ mod tests {
 
         // The leader and the lease are gone; only the descendant is left.
         wait_until_lock_free(&path).await;
-        let result = prove_absent(&path);
+        let result = settled(|| prove_absent(&path)).await;
         unsafe { libc::killpg(pid, libc::SIGKILL) };
         assert!(
             matches!(&result, Err(reason) if reason.contains("may have started")),
@@ -694,7 +710,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = lease_path(&dir);
         drop(acquire(&path).unwrap().expect("unix lease"));
-        assert_eq!(prove_absent_for_start(&path, false), Ok(()));
+        assert_eq!(settled(|| prove_absent_for_start(&path, false)).await, Ok(()));
     }
 }
 
