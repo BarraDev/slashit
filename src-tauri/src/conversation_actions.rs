@@ -27,7 +27,11 @@
 //!   Task. No title matching is involved.
 //! - `MoveTask` is compare-and-set on the status the Human saw. A Task already
 //!   at the approved status records success; any other status is refused.
-//! - `EnqueueTask` is compare-and-set on `Backlog`. A Task already in Queue is
+//! - `EnqueueTask` is compare-and-set on `Backlog` and on the coding input the
+//!   Human saw (`queue::prompt::task_input_digest`, recorded with the
+//!   proposal): a Task edited since is refused, not queued. A proposal saved
+//!   before the input was recorded has none and keeps the status-only check.
+//!   A Task already in Queue is
 //!   recorded as found queued, not as queued by this approval: the record
 //!   cannot tell a retry that follows a crash from an unrelated enqueue. A
 //!   Task that has moved on to any other column is refused.
@@ -129,7 +133,10 @@ pub fn record_proposal(
             if target.project_id != project_id {
                 return Err("Coordinator proposed a Task from another Project".into());
             }
-            (text, TaskMutation::enqueue_task(target)?)
+            (
+                text,
+                TaskMutation::enqueue_task(target, crate::queue::prompt::task_input_digest(target))?,
+            )
         }
         CoordinatorOutput::Reply { .. }
         | CoordinatorOutput::DelegateToTask { .. }
@@ -321,8 +328,8 @@ async fn execute(scope: &Scope<'_>, mutation: &TaskMutation) -> Result<Execution
         TaskMutation::MoveTask { target_task_id, from, to, .. } => {
             move_task(scope, *target_task_id, from, to).await
         }
-        TaskMutation::EnqueueTask { target_task_id, from, .. } => {
-            enqueue_task(scope, *target_task_id, from).await
+        TaskMutation::EnqueueTask { target_task_id, from, input, .. } => {
+            enqueue_task(scope, *target_task_id, from, input.as_ref().map(|i| i.digest.as_str())).await
         }
     }
 }
@@ -440,6 +447,7 @@ async fn enqueue_task(
     scope: &Scope<'_>,
     task_id: Uuid,
     from: &TaskStatus,
+    approved_input: Option<&str>,
 ) -> Result<Execution, String> {
     // Re-validated here rather than trusted from the persisted proposal.
     if *from != TaskStatus::Backlog {
@@ -447,13 +455,22 @@ async fn enqueue_task(
     }
     let _lease = scope.locks.acquire(task_id).await?;
     Ok(
-        match lifecycle::enqueue_leased(scope.tasks, scope.storage, scope.project_id, task_id, from).await? {
+        match lifecycle::enqueue_leased(
+            scope.tasks, scope.storage, scope.project_id, task_id, from, approved_input,
+        )
+        .await?
+        {
             EnqueueVerdict::Queued(title) => Execution::Applied { task_id, title },
             EnqueueVerdict::AlreadyQueued(title) => Execution::AlreadyQueued { task_id, title },
             EnqueueVerdict::Moved(status) => Execution::Refused(format!(
                 "The Task is now in {status:?} instead of Backlog; nothing was changed. \
                  Check it on the board."
             )),
+            EnqueueVerdict::InputChanged => Execution::Refused(
+                "The Task was edited after this was proposed, so it would run something other than what \
+                 you approved; nothing was changed. Ask the Coordinator to propose queueing it again."
+                    .into(),
+            ),
             EnqueueVerdict::Missing => Execution::Refused("The Task no longer exists".into()),
             EnqueueVerdict::OtherProject => Execution::Refused("The Task belongs to another Project".into()),
             EnqueueVerdict::Blocked(reason) => Execution::Refused(format!("{reason}; nothing was changed")),
@@ -1535,6 +1552,7 @@ mod tests {
             target_task_id: task.id,
             target_task_title: task.title.clone(),
             from: TaskStatus::Error,
+            input: None,
         };
         place(&world, task.id, TaskStatus::Error).await;
         decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
@@ -1655,4 +1673,138 @@ mod tests {
         );
     }
 
+    async fn edit_in_store(world: &World, task_id: Uuid, edit: impl Fn(&mut Task) + Send + Sync + 'static) {
+        lifecycle::commit_task(&world.tasks, &world.storage, task_id, &move |staged: &mut HashMap<Uuid, Task>| {
+            edit(staged.get_mut(&task_id).unwrap());
+        })
+        .await
+        .unwrap();
+    }
+
+    fn recorded_input(conversation: &Conversation, id: Uuid) -> Option<crate::domain::conversation::ExecutionInput> {
+        match &conversation.project_action(id).unwrap().mutation {
+            TaskMutation::EnqueueTask { input, .. } => input.clone(),
+            other => panic!("not an enqueue: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_enqueue_proposal_records_the_exact_input_and_an_unchanged_task_is_queued() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Bind me").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &enqueue_json(task.id)).await.unwrap();
+
+        let input = recorded_input(&conversation, id).expect("a new proposal always records its input");
+        assert_eq!(input.digest, crate::queue::prompt::task_input_digest(&task));
+        assert_eq!(input.description.as_deref(), Some("original"));
+        assert!(conversation.project_action(id).unwrap().mutation.summary().contains("original"));
+
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+        assert_eq!(snapshot_of(&world, task.id).await.status, TaskStatus::Queue);
+        assert!(matches!(
+            conversation.project_action(id).unwrap().outcome,
+            Some(ProjectActionOutcome::Applied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_task_edited_after_the_proposal_is_refused_and_nothing_is_queued() {
+        type Edit = (&'static str, fn(&mut Task));
+        let edits: [Edit; 4] = [
+            ("description", |t| t.description = Some("something else entirely".into())),
+            ("title", |t| t.title = "Renamed".into()),
+            ("subtasks", |t| t.subtasks.push(crate::domain::task::Subtask { id: Uuid::new_v4(), title: "also delete the tests".into(), completed: false })),
+            ("description removed", |t| t.description = None),
+        ];
+        for (what, edit) in edits {
+            let world = World::new();
+            let task = world.seed_task(world.project_id, "Edited").await;
+            let mut conversation = world.conversation();
+            let id = world.propose(&mut conversation, &enqueue_json(task.id)).await.unwrap();
+            edit_in_store(&world, task.id, edit).await;
+
+            decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+            let after = snapshot_of(&world, task.id).await;
+            assert_eq!(after.status, TaskStatus::Backlog, "{what}: an edited Task must not be queued");
+            assert_eq!(moves(&after), 0, "{what}: no move may be recorded");
+            assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Refused, "{what}");
+            let Some(ProjectActionOutcome::Refused { reason }) = &conversation.project_action(id).unwrap().outcome else {
+                panic!("{what}: expected a refusal");
+            };
+            assert!(reason.contains("edited after this was proposed"), "{what}: {reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approval_retried_after_an_edit_is_refused_rather_than_run_as_edited() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Retry then edit").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &enqueue_json(task.id)).await.unwrap();
+        world.block_task_persistence();
+        assert!(decide(&world.scope(), &mut conversation, id, Decision::Approve).await.is_err());
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Approved);
+        world.unblock_task_persistence();
+
+        edit_in_store(&world, task.id, |t| t.description = Some("a different job".into())).await;
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        assert_eq!(snapshot_of(&world, task.id).await.status, TaskStatus::Backlog);
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Refused);
+    }
+
+    #[tokio::test]
+    async fn an_edit_of_something_the_prompt_ignores_does_not_block_a_queue() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Position only").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &enqueue_json(task.id)).await.unwrap();
+        edit_in_store(&world, task.id, |t| t.position += 7).await;
+
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+        assert_eq!(snapshot_of(&world, task.id).await.status, TaskStatus::Queue);
+    }
+
+    #[tokio::test]
+    async fn a_proposal_saved_before_the_input_was_recorded_still_reads_and_keeps_its_old_check() {
+        let id = Uuid::new_v4();
+        let legacy: TaskMutation = serde_json::from_value(serde_json::json!({
+            "kind": "enqueue_task", "target_task_id": id, "target_task_title": "Old", "from": "backlog"
+        }))
+        .expect("an enqueue saved before the input field existed must stay readable");
+        assert!(matches!(&legacy, TaskMutation::EnqueueTask { input: None, .. }));
+        let rewritten = serde_json::to_value(&legacy).unwrap();
+        assert!(rewritten.get("input").is_none(), "an absent input is not written back as null");
+
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Legacy").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &enqueue_json(task.id)).await.unwrap();
+        conversation.project_actions[0].mutation = TaskMutation::EnqueueTask {
+            target_task_id: task.id,
+            target_task_title: task.title.clone(),
+            from: TaskStatus::Backlog,
+            input: None,
+        };
+        edit_in_store(&world, task.id, |t| t.description = Some("edited".into())).await;
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+        assert_eq!(snapshot_of(&world, task.id).await.status, TaskStatus::Queue, "status-only, as it was approved");
+    }
+
+    #[tokio::test]
+    async fn a_task_already_queued_is_still_reported_as_found_not_as_queued_by_this_approval() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Queued elsewhere").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &enqueue_json(task.id)).await.unwrap();
+        place(&world, task.id, TaskStatus::Queue).await;
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+        assert!(matches!(
+            conversation.project_action(id).unwrap().outcome,
+            Some(ProjectActionOutcome::AlreadyQueued { .. })
+        ));
+    }
 }
+

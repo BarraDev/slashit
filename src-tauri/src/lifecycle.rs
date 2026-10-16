@@ -715,6 +715,9 @@ pub enum EnqueueVerdict {
     AlreadyQueued(String),
     /// The Task is in another column than the caller saw; nothing was changed.
     Moved(TaskStatus),
+    /// The Task's coding input is no longer the one the caller approved;
+    /// nothing was changed.
+    InputChanged,
     Missing,
     OtherProject,
     /// The Task cannot be run until something else is resolved, so queueing it
@@ -736,12 +739,19 @@ pub enum EnqueueVerdict {
 /// move between them. The caller holds the Task's lifecycle lease. No owner is
 /// ended: a Task that is not in Queue or beyond has none, and any other
 /// `seen_in` is the caller's responsibility to refuse.
+///
+/// `approved_input`, when given, is the `task_input_digest` a person approved.
+/// It is compared in the same write, so a Task edited since is refused as
+/// [`EnqueueVerdict::InputChanged`] instead of being queued with input nobody
+/// approved. The board passes none: a person starting a Task there is looking
+/// at its current definition.
 pub async fn enqueue_leased(
     tasks: &Tasks,
     storage: &Storage,
     project_id: Uuid,
     task_id: Uuid,
     seen_in: &TaskStatus,
+    approved_input: Option<&str>,
 ) -> Result<EnqueueVerdict, String> {
     let verdict = std::sync::Mutex::new(EnqueueVerdict::Missing);
     let revise = |staged: &mut HashMap<Uuid, Task>| -> bool {
@@ -752,6 +762,11 @@ pub async fn enqueue_leased(
                 (EnqueueVerdict::AlreadyQueued(task.title.clone()), false)
             }
             Some(task) if task.status != *seen_in => (EnqueueVerdict::Moved(task.status.clone()), false),
+            Some(task)
+                if approved_input.is_some_and(|digest| crate::queue::prompt::task_input_digest(task) != digest) =>
+            {
+                (EnqueueVerdict::InputChanged, false)
+            }
             Some(task) if task.cleanup_in_flight => (
                 EnqueueVerdict::Blocked(
                     "An earlier cleanup of this Task's checkout is unfinished, so it cannot run yet".into(),

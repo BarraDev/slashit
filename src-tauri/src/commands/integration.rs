@@ -2493,6 +2493,7 @@ mod tests {
                 b.project_id,
                 b.task_id,
                 &TaskStatus::Done,
+                None,
             )
             .await
             .unwrap();

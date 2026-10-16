@@ -12,6 +12,8 @@ pub const TASK_TITLE_LIMIT: usize = 200;
 pub const TASK_DESCRIPTION_LIMIT: usize = 8_000;
 pub const PROJECTION_MESSAGE_COUNT: usize = 16;
 pub const TASK_INDEX_LIMIT: usize = 40;
+/// How much of a Task's description an approval card carries.
+pub const INPUT_PREVIEW_LIMIT: usize = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -155,11 +157,46 @@ pub enum TaskMutation {
     /// queues a Task that still holds it. It never starts anything: the
     /// scheduler admits queued Tasks, and the executor creates or reattaches
     /// the Task Checkout.
+    ///
+    /// `input` names the exact coding input the Human approved. Approval only
+    /// queues a Task whose input still matches it, so a Task edited after the
+    /// proposal is refused rather than queued as something nobody approved.
+    /// The binding ends at the Queue transition: a Task edited while it waits
+    /// in Queue runs as edited, as it does for any front door.
+    /// Proposals saved before this field existed carry none and keep the
+    /// status-only check they were approved under.
     EnqueueTask {
         target_task_id: Uuid,
         target_task_title: String,
         from: TaskStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<ExecutionInput>,
     },
+}
+
+/// What a queued Task would be told to do, as the Human saw it when approving.
+///
+/// `digest` is the binding (see `queue::prompt::task_input_digest`);
+/// `description` is only what the approval card shows, bounded for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionInput {
+    pub digest: String,
+    pub description: Option<String>,
+    pub subtask_count: usize,
+}
+
+impl ExecutionInput {
+    pub fn observe(task: &Task, digest: String) -> Self {
+        Self {
+            digest,
+            description: task
+                .description
+                .as_deref()
+                .filter(|text| !text.is_empty())
+                .map(|text| text.chars().take(INPUT_PREVIEW_LIMIT).collect()),
+            subtask_count: task.subtasks.len(),
+        }
+    }
 }
 
 impl TaskMutation {
@@ -244,7 +281,7 @@ impl TaskMutation {
     }
 
     /// Propose queueing `target`, if it is a Backlog Task that can run.
-    pub fn enqueue_task(target: &Task) -> Result<Self, String> {
+    pub fn enqueue_task(target: &Task, input_digest: String) -> Result<Self, String> {
         if target.status != TaskStatus::Backlog {
             return Err(format!(
                 "The Coordinator can only queue a Backlog Task, and this one is in {:?}",
@@ -258,6 +295,7 @@ impl TaskMutation {
             target_task_id: target.id,
             target_task_title: target.title.chars().take(TASK_TITLE_LIMIT).collect(),
             from: target.status.clone(),
+            input: Some(ExecutionInput::observe(target, input_digest)),
         })
     }
 
@@ -276,9 +314,16 @@ impl TaskMutation {
                 "Move Task {target_task_id} ({target_task_title:?}) from {from:?} to {to:?}; \
                  no work is started"
             ),
-            Self::EnqueueTask { target_task_id, target_task_title, from } => format!(
-                "Queue Task {target_task_id} ({target_task_title:?}) from {from:?}; SlashIt's \
-                 scheduler decides when it starts and the executor prepares its checkout"
+            Self::EnqueueTask { target_task_id, target_task_title, from, input } => format!(
+                "Queue Task {target_task_id} ({target_task_title:?}) from {from:?}{}; SlashIt's \
+                 scheduler decides when it starts and the executor prepares its checkout",
+                input.as_ref().map_or(String::new(), |input| format!(
+                    ", to run exactly its current definition ({}){}",
+                    input.digest.chars().take(12).collect::<String>(),
+                    input.description.as_ref().map_or(String::new(), |d| format!(
+                        ": {}", d.chars().take(600).collect::<String>()
+                    ))
+                ))
             ),
         };
         text.chars().take(1500).collect()
