@@ -83,14 +83,27 @@ mod imp {
             }
         }
 
-        /// Records the provider's process group, which is its pid, then releases
-        /// SlashIt's own hold. The provider keeps the lock.
-        pub fn record_group(self, pid: u32) -> io::Result<()> {
+        /// Records the provider's process group, which is its pid. The caller then
+        /// drops the lease, which releases SlashIt's own hold; the provider keeps
+        /// the lock.
+        ///
+        /// When the record cannot be written, the provider may already be running
+        /// with its group unrecorded. The group is ended while this lease still
+        /// holds the lock, because an empty record would otherwise be read as "no
+        /// provider was spawned" once the lock is free.
+        pub fn record_group(&self, pid: u32) -> io::Result<()> {
             let mut file = &self.file;
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            file.write_all(format!("{pid}\n").as_bytes())?;
-            file.sync_all()
+            let written = file
+                .set_len(0)
+                .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+                .and_then(|()| file.write_all(format!("{pid}\n").as_bytes()))
+                .and_then(|()| file.sync_all());
+            if written.is_err() {
+                // Safety: the group is the provider's own, made by `process_group(0)`
+                // at spawn, so its id is the pid. SIGKILL reaches every member.
+                unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+            }
+            written
         }
     }
 
@@ -167,7 +180,7 @@ mod imp {
     impl ProviderLease {
         pub fn inherit_into(&self, _command: &mut tokio::process::Command) {}
 
-        pub fn record_group(self, _pid: u32) -> io::Result<()> {
+        pub fn record_group(&self, _pid: u32) -> io::Result<()> {
             Ok(())
         }
     }
@@ -246,6 +259,8 @@ mod tests {
         wait_until_proven_absent(&path).await;
     }
 
+    /// Linux only: the script enumerates its descriptors through `/proc`.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_descendant_that_closes_the_lease_is_still_seen_through_its_group() {
         let dir = tempfile::tempdir().unwrap();
@@ -289,5 +304,32 @@ mod tests {
         let _ = child.wait().await;
         wait_until_proven_absent(&path).await;
         assert!(acquire(&path).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_group_whose_record_cannot_be_written_is_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        std::fs::write(&path, b"").unwrap();
+        // A read-only descriptor makes the record write fail, as a full disk would.
+        let read_only = ProviderLease {
+            file: std::fs::File::open(&path).unwrap(),
+        };
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn");
+        let pid = child.id().expect("pid");
+
+        assert!(read_only.record_group(pid).is_err());
+
+        let _ = child.wait().await;
+        // The group was ended by the failed record, so nothing is left to account for.
+        assert_eq!(unsafe { libc::killpg(pid as i32, 0) }, -1);
     }
 }

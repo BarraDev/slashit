@@ -546,7 +546,8 @@ impl ClaudeRunner {
         eprintln!("[claude-runner] spawned pid={:?}", child.id());
 
         // Recorded before anything else can run. A run whose group cannot be
-        // recorded is not kept: the child is dropped and ended with it, so no
+        // recorded is not kept: `record_group` ends the provider's whole group
+        // while the lock is still held, and the child is dropped with it, so no
         // provider runs that a later attempt could not account for.
         if let Some(lease) = lease {
             let pid = child
@@ -554,7 +555,7 @@ impl ClaudeRunner {
                 .ok_or_else(|| "The provider exited before its process could be recorded.".to_string())?;
             lease
                 .record_group(pid)
-                .map_err(|e| format!("The provider's lease could not be recorded: {e}"))?;
+                .map_err(|e| format!("The provider's lease could not be recorded, so the provider was ended: {e}"))?;
         }
 
         // Take stdout here, while the child is still ours alone, and hand it

@@ -3496,12 +3496,20 @@ impl TaskExecutor {
                         0 => new_attempt.map(|decision| decision.for_run),
                         started => Some(started),
                     };
-                    let _ = Self::record_recovery_required(
+                    let hold = Self::record_recovery_required(
                         &self.tasks, &self.storage, task_id, held_run, None,
                         "The run-start record is visible but its durability is unconfirmed. The Worker was not launched; inspect this Task before continuing.",
                     ).await;
+                    // A hold that is not published leaves the board showing the
+                    // start. The caller is told, because the file is the authority.
+                    let hold_note = match hold {
+                        Ok(()) => String::new(),
+                        Err(error) => format!(
+                            " The recovery hold could not be recorded either ({error}), so the board may keep showing this run as started until the next successful save or a restart."
+                        ),
+                    };
                     format!(
-                        "the checkout at {} was preserved because its board record is visible",
+                        "the checkout at {} was preserved because its board record is visible{hold_note}",
                         acquired.info.path
                     )
                 } else {

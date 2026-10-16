@@ -1313,7 +1313,7 @@ mod tests {
             "the reloaded process does not hold the authorization"
         );
         let reason = executor.start_new_attempt(fx.task_id, id).await.unwrap_err();
-        assert!(!reason.is_empty());
+        assert_eq!(reason, "No new attempt is authorized for this Task.");
         assert_eq!(agent.invocations(), "", "nothing launches after a reload");
         assert_eq!(fx.repo_state(), before, "checkout and Git references are preserved");
         assert_eq!(
@@ -1403,8 +1403,8 @@ mod tests {
     /// The start is published but not durable, and the hold that should follow
     /// it fails the same way. Memory and disk both then show run 2 under a
     /// recovery hold, with no authorization left. A reload keeps that recovery,
-    /// and nothing launches. (A hold that fails before it is published cannot be
-    /// staged here: the fault injector arms one failure at a time.)
+    /// and nothing launches. The hold that fails before publication is the
+    /// sibling case, [`a_start_whose_hold_is_not_published_stays_visible_and_recovers_after_reload`].
     #[cfg(unix)]
     #[tokio::test]
     async fn a_published_start_whose_hold_also_fails_is_recovered_after_reload() {
@@ -1459,6 +1459,67 @@ mod tests {
                 Some(WorkerHandoffStage::RecoveryRequired { .. })
             ),
             "the reloaded recovery reached the disk"
+        );
+        assert_eq!(agent.invocations(), "");
+    }
+
+    /// The start is published but not durable, and the hold that should follow
+    /// it fails before it is published. The file still holds the start record,
+    /// and so does memory, because a write that is not published changes
+    /// neither. Nothing launches, the uncertainty is reported to the caller, and
+    /// a reload turns the start into recovery.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_whose_hold_is_not_published_stays_visible_and_recovers_after_reload() {
+        let fx = fixture().await;
+        let agent = FakeProgram::install("claude", "cat >/dev/null; sleep 20").await;
+        let id = Uuid::new_v4();
+        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        let executor = fx.state.executor.get().unwrap().clone();
+
+        let refused = {
+            // The first directory sync is the board probe, which passes. The
+            // start's directory sync (the second) then fails after its replacement
+            // is visible. The hold's replacement fails, so the hold is not
+            // published at all.
+            let _fault = fault::fail_in_order(&[
+                (Stage::SyncDirectory, std::io::ErrorKind::Other, 1),
+                (Stage::Replace, std::io::ErrorKind::Other, 0),
+            ]);
+            executor.start_new_attempt(fx.task_id, id).await
+        };
+
+        let reason = refused.unwrap_err();
+        assert!(reason.contains("not confirmed durable"), "{reason}");
+        assert!(reason.contains("recovery hold could not be recorded"), "{reason}");
+        assert_eq!(agent.invocations(), "", "nothing launches on an unconfirmed start");
+        // A fork in another test can hold a copy of the lease descriptor until its
+        // exec, so absence is awaited rather than read once.
+        wait_until_absent(&executor, fx.task_id).await;
+        for (source, task) in [("memory", fx.task().await), ("disk", fx.on_disk())] {
+            assert!(
+                matches!(
+                    task.worker_handoff.as_ref().map(|h| &h.stage),
+                    Some(WorkerHandoffStage::Started)
+                ),
+                "{source}: {:?}",
+                task.worker_handoff
+            );
+            assert_eq!(task.worker_handoff.as_ref().and_then(|h| h.run), Some(2), "{source}");
+            assert_eq!(new_attempt_runs(&task), 1, "{source}: run 2 was recorded once");
+            assert!(task.new_attempt.is_none(), "{source}: the authorization was consumed");
+        }
+
+        let (state, _) = restart(&fx).await;
+
+        let reloaded = task_in(&state, fx.task_id).await;
+        assert!(
+            matches!(
+                reloaded.worker_handoff.as_ref().map(|h| &h.stage),
+                Some(WorkerHandoffStage::RecoveryRequired { .. })
+            ),
+            "{:?}",
+            reloaded.worker_handoff
         );
         assert_eq!(agent.invocations(), "");
     }
