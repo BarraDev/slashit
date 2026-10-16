@@ -771,6 +771,12 @@ pub async fn act_on_project_conversation(
     // before Running is recorded. A provider still holding the checkout refuses
     // the Worker here, and the Action stays approved.
     let provider_lease = crate::queue::acquire_task_provider_lease(&state.storage, target.id)?;
+    // Only now can nothing else write the checkout: the Task is exclusively
+    // ours and no earlier provider still holds its lease. The Worker's result
+    // is committed as everything in the checkout, so edits that were already
+    // there would be committed as this request's work. Refuse before Running
+    // is recorded; the approval is kept for a retry.
+    refuse_uncommitted_checkout(&target.title, &checkout).await?;
     {
         let _guard = lock.lock().await;
         project_after_lock(&state.project.projects, project_id).await?;
@@ -868,6 +874,27 @@ pub async fn act_on_project_conversation(
         (conversation, None)
     };
     Ok(snapshot(&state, conversation, continuation_error).await)
+}
+
+/// Refuse to start a Worker in a Task Checkout that already has uncommitted
+/// changes, tracked or untracked. Read-only: nothing is staged, reset, cleaned
+/// or stashed, and the Human decides what the changes are. A Git failure
+/// refuses too, since the state is then unknown.
+///
+/// This covers content that existed before the Worker started. It does not
+/// establish who owns an edit made in the checkout while the Worker runs.
+async fn refuse_uncommitted_checkout(task_title: &str, checkout: &str) -> Result<(), String> {
+    let title: String = task_title.chars().take(80).collect();
+    match crate::worktree::uncommitted_path_count(checkout).await {
+        Ok(0) => Ok(()),
+        Ok(count) => Err(format!(
+            "The Worker was not started. The Task Checkout for \"{title}\" at {checkout} already has uncommitted changes ({count} path{}). SlashIt left them untouched. Review and resolve them there (commit them or discard them yourself), then retry the approved action; it is still approved.",
+            if count == 1 { "" } else { "s" },
+        )),
+        Err(error) => Err(format!(
+            "The Worker was not started. SlashIt could not read the state of the Task Checkout for \"{title}\" at {checkout}, so it cannot tell whether it has uncommitted changes ({error}). Nothing was changed. Fix the checkout, then retry the approved action; it is still approved."
+        )),
+    }
 }
 
 fn can_reject(status: ActionStatus) -> bool {
@@ -1467,6 +1494,410 @@ mod tests {
                 WorkerHandoffStage::RecoveryRequired { .. }
             ));
             assert_eq!(kept.status, TaskStatus::Error);
+        }
+    }
+
+    /// A Worker is launched into a Task Checkout only when it has no
+    /// uncommitted changes, because the Worker's result is committed as
+    /// everything in the checkout. A refusal leaves the checkout, the
+    /// approval and the history as they were.
+    #[cfg(unix)]
+    mod dirty_checkout {
+        use super::*;
+        use crate::commands::gui_admission::GuiMutation;
+        use crate::domain::{Repository, TaskStatus};
+        use tauri::Manager;
+
+        const RESULT_EVENT: &str =
+            r#"printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'"#;
+
+        fn git(dir: &std::path::Path, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        struct Fx {
+            _tmp: tempfile::TempDir,
+            app: tauri::App<tauri::test::MockRuntime>,
+            repo: std::path::PathBuf,
+            checkout: std::path::PathBuf,
+            project_id: Uuid,
+            task_id: Uuid,
+        }
+
+        /// A fake `claude` that, in the Task Checkout only, writes
+        /// `worker-output.txt`, and then runs `finish`.
+        fn worker_body(checkout: &std::path::Path, finish: &str) -> String {
+            format!(
+                "cat >/dev/null\nif [ \"$PWD\" = \"{0}\" ]; then echo worker > worker-output.txt; echo run >> \"{1}\"; fi\n{finish}\n",
+                checkout.display(),
+                checkout.parent().unwrap().join("worker-runs.log").display()
+            )
+        }
+
+        fn checkout_path_of(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+            tmp.path().join("checkout")
+        }
+
+        async fn fixture(tmp: tempfile::TempDir) -> Fx {
+            let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+                tmp.path().join("config"),
+                tmp.path().join("data"),
+                tmp.path().join("cache"),
+                tmp.path().join("runtime"),
+            ));
+            let (state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
+            crate::test_helpers::attach_test_executor(&state);
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git(&repo, &["init", "-q", "-b", "main"]);
+            std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+            std::fs::write(repo.join("gone.txt"), "gone\n").unwrap();
+            git(&repo, &["add", "."]);
+            git(&repo, &["commit", "-q", "-m", "init"]);
+            let checkout = checkout_path_of(&tmp);
+            git(&repo, &["worktree", "add", "-q", "-b", "task-branch", checkout.to_str().unwrap()]);
+
+            let repository_id = Uuid::new_v4();
+            state.repository.repositories.write().await.insert(
+                repository_id,
+                Repository {
+                    id: repository_id,
+                    local_path: repo.to_str().unwrap().to_string(),
+                    remote_url: None,
+                    remote_type: None,
+                    created_at: chrono::Utc::now(),
+                },
+            );
+            let project_id = Uuid::new_v4();
+            state.project.projects.write().await.insert(
+                project_id,
+                crate::domain::Project {
+                    id: project_id,
+                    name: "p".into(),
+                    repository_id: Some(repository_id),
+                    scope: Default::default(),
+                    state_location: crate::config::paths::StateLocation::External,
+                    base: None,
+                    agent_type: crate::domain::project::AgentType::ClaudeCode,
+                    agent_config: crate::domain::project::AgentConfig {
+                        agent_type: crate::domain::project::AgentType::ClaudeCode,
+                        command: "claude".into(),
+                        args: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                        model: None,
+                        api_key: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                },
+            );
+            let mut task = board_task(project_id, TaskStatus::Error);
+            task.worktree_path = Some(checkout.to_str().unwrap().to_string());
+            task.branch_name = Some("task-branch".into());
+            let task_id = task.id;
+            state.task.tasks.write().await.insert(task_id, task.clone());
+            state.storage.save_project_tasks(project_id, &[task]).unwrap();
+            state.storage.create_primary_conversation(project_id).unwrap();
+            let app = tauri::test::mock_app();
+            app.manage(state);
+            Fx { _tmp: tmp, app, repo, checkout, project_id, task_id }
+        }
+
+        impl Fx {
+            fn state(&self) -> &crate::AppState {
+                self.app.state::<crate::AppState>().inner()
+            }
+
+            /// Persist one new, undecided action for the Task and return its id.
+            fn propose(&self, request: &str) -> Uuid {
+                let mut conversation =
+                    self.state().storage.load_primary_conversation(self.project_id).unwrap().unwrap();
+                let id = Uuid::new_v4();
+                conversation.actions.push(TaskAction {
+                    id,
+                    target_task_id: self.task_id,
+                    target_task_title: "Task".into(),
+                    request: request.into(),
+                    explanation: "why".into(),
+                    approved_request: None,
+                    status: ActionStatus::Proposed,
+                    worker_result: None,
+                    coordinator_replied: false,
+                    created_at: chrono::Utc::now(),
+                });
+                self.state().storage.save_conversation(&conversation).unwrap();
+                id
+            }
+
+            fn conversation(&self) -> Conversation {
+                self.state().storage.load_primary_conversation(self.project_id).unwrap().unwrap()
+            }
+
+            fn status_of(&self, id: Uuid) -> ActionStatus {
+                self.conversation().actions.iter().find(|a| a.id == id).unwrap().status
+            }
+
+            async fn approve(&self, id: Uuid) -> Result<(), String> {
+                let current = self.conversation();
+                super::super::act_on_project_conversation(
+                    GuiMutation::untracked(),
+                    self.app.state(),
+                    self.project_id.to_string(),
+                    current.id.to_string(),
+                    current.revision,
+                    id.to_string(),
+                    super::super::HumanAction::Approve { request: None },
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            }
+
+            fn worker_started(&self) -> usize {
+                self.conversation().entries.iter().filter(|e| matches!(e.kind, EntryKind::WorkerStarted { .. })).count()
+            }
+
+            fn human_approvals(&self) -> usize {
+                self.conversation()
+                    .entries
+                    .iter()
+                    .filter(|e| matches!(e.kind, EntryKind::ActionDecision { approved: true, .. }))
+                    .count()
+            }
+
+            /// What the Human does to resolve the checkout.
+            fn resolve_by_hand(&self) {
+                git(&self.checkout, &["reset", "-q", "--hard"]);
+                git(&self.checkout, &["clean", "-q", "-fd"]);
+            }
+
+            /// How many times the provider ran inside the Task Checkout, which
+            /// is where only a Worker runs.
+            fn worker_invocations(&self, _fake: &crate::test_helpers::FakeProgram) -> usize {
+                std::fs::read_to_string(self.checkout.parent().unwrap().join("worker-runs.log"))
+                    .map(|log| log.lines().count())
+                    .unwrap_or(0)
+            }
+        }
+
+        fn dirty_tracked(c: &std::path::Path) {
+            std::fs::write(c.join("a.txt"), "edited by an earlier run\n").unwrap();
+        }
+        fn dirty_untracked(c: &std::path::Path) {
+            std::fs::write(c.join("leftover.txt"), "stray\n").unwrap();
+        }
+        fn dirty_staged(c: &std::path::Path) {
+            std::fs::write(c.join("a.txt"), "staged edit\n").unwrap();
+            git(c, &["add", "a.txt"]);
+        }
+        fn dirty_deleted(c: &std::path::Path) {
+            std::fs::remove_file(c.join("gone.txt")).unwrap();
+        }
+
+        /// Refuse, preserve everything, then launch after the Human resolves it.
+        async fn refuses_then_runs_after_resolution(make_dirty: fn(&std::path::Path)) {
+            let tmp = tempfile::tempdir().unwrap();
+            let fake = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &worker_body(&checkout_path_of(&tmp), RESULT_EVENT),
+            )
+            .await;
+            let fx = fixture(tmp).await;
+            let head = git(&fx.checkout, &["rev-parse", "HEAD"]);
+            make_dirty(&fx.checkout);
+            let status_before = git(&fx.checkout, &["status", "--porcelain=v1", "--untracked-files=all"]);
+            let index_before = git(&fx.checkout, &["diff", "--cached"]);
+            let files_before = (
+                std::fs::read(fx.checkout.join("a.txt")).ok(),
+                std::fs::read(fx.checkout.join("gone.txt")).ok(),
+                std::fs::read(fx.checkout.join("leftover.txt")).ok(),
+            );
+            let action = fx.propose("change a.txt");
+
+            let refusal = fx.approve(action).await.expect_err("a dirty checkout refuses the Worker");
+            assert!(refusal.contains("The Worker was not started"), "{refusal}");
+            assert!(refusal.contains("uncommitted changes"), "{refusal}");
+            assert!(refusal.contains("left them untouched"), "{refusal}");
+            assert!(refusal.contains("still approved"), "{refusal}");
+            assert!(refusal.contains(fx.checkout.to_str().unwrap()), "names the checkout: {refusal}");
+            assert!(refusal.len() < 800, "bounded");
+            assert!(!refusal.contains("safe to discard"), "{refusal}");
+
+            assert!(fake.invocations().is_empty(), "no provider launched: {}", fake.invocations());
+            assert_eq!(fx.worker_started(), 0, "no WorkerStarted");
+            assert_eq!(fx.status_of(action), ActionStatus::Approved, "approval is durable, not Running");
+            assert_eq!(fx.human_approvals(), 1, "one Human decision");
+            assert!(!fx.state().executor.get().unwrap().is_task_running(fx.task_id).await);
+            assert_eq!(git(&fx.checkout, &["status", "--porcelain=v1", "--untracked-files=all"]), status_before);
+            assert_eq!(git(&fx.checkout, &["diff", "--cached"]), index_before);
+            assert_eq!(git(&fx.checkout, &["rev-parse", "HEAD"]), head);
+            assert_eq!(
+                (
+                    std::fs::read(fx.checkout.join("a.txt")).ok(),
+                    std::fs::read(fx.checkout.join("gone.txt")).ok(),
+                    std::fs::read(fx.checkout.join("leftover.txt")).ok(),
+                ),
+                files_before,
+                "no file changed"
+            );
+
+            // The Human resolves the checkout and retries the same approval.
+            fx.resolve_by_hand();
+            fx.approve(action).await.expect("the retry starts the Worker");
+            assert_eq!(fx.worker_invocations(&fake), 1);
+            assert_eq!(fx.worker_started(), 1);
+            assert_eq!(fx.human_approvals(), 1, "retry adds no second decision");
+            assert_eq!(fx.status_of(action), ActionStatus::Returned);
+            assert_eq!(
+                git(&fx.checkout, &["show", "--name-only", "--format=", "HEAD"]),
+                "worker-output.txt",
+                "the commit holds only the Worker's change"
+            );
+            drop(fx.repo);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_tracked_modification_refuses_the_worker() {
+            refuses_then_runs_after_resolution(dirty_tracked).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_untracked_file_refuses_the_worker() {
+            refuses_then_runs_after_resolution(dirty_untracked).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_staged_only_change_refuses_the_worker() {
+            refuses_then_runs_after_resolution(dirty_staged).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_deleted_tracked_file_refuses_the_worker() {
+            refuses_then_runs_after_resolution(dirty_deleted).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_clean_checkout_starts_the_worker_and_commits_only_its_change() {
+            let tmp = tempfile::tempdir().unwrap();
+            let fake = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &worker_body(&checkout_path_of(&tmp), RESULT_EVENT),
+            )
+            .await;
+            let fx = fixture(tmp).await;
+            let head = git(&fx.checkout, &["rev-parse", "HEAD"]);
+            let action = fx.propose("change a.txt");
+            fx.approve(action).await.expect("clean checkout runs the Worker");
+            assert_eq!(fx.worker_invocations(&fake), 1);
+            assert_eq!(fx.worker_started(), 1);
+            assert_eq!(fx.status_of(action), ActionStatus::Returned);
+            assert_ne!(git(&fx.checkout, &["rev-parse", "HEAD"]), head);
+            assert_eq!(git(&fx.checkout, &["status", "--porcelain"]), "");
+            assert_eq!(git(&fx.checkout, &["show", "--name-only", "--format=", "HEAD"]), "worker-output.txt");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn edits_left_by_a_failed_worker_refuse_the_next_approved_request() {
+            let tmp = tempfile::tempdir().unwrap();
+            let fake = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &worker_body(&checkout_path_of(&tmp), "exit 1"),
+            )
+            .await;
+            let fx = fixture(tmp).await;
+            let first = fx.propose("first request");
+            fx.approve(first).await.expect("the failure is recorded, not returned as an error");
+            assert_eq!(fx.status_of(first), ActionStatus::Failed);
+            assert_eq!(fx.worker_invocations(&fake), 1);
+            assert_eq!(
+                std::fs::read_to_string(fx.checkout.join("worker-output.txt")).unwrap(),
+                "worker\n",
+                "the failed Worker left its edit"
+            );
+
+            let second = fx.propose("second request");
+            let refusal = fx.approve(second).await.expect_err("leftovers refuse the second request");
+            assert!(refusal.contains("The Worker was not started"), "{refusal}");
+            assert_eq!(fx.worker_invocations(&fake), 1, "no second provider launch");
+            assert_eq!(fx.status_of(second), ActionStatus::Approved);
+            assert_eq!(fx.worker_started(), 1, "only the first Worker started");
+            assert_eq!(
+                std::fs::read_to_string(fx.checkout.join("worker-output.txt")).unwrap(),
+                "worker\n",
+                "SlashIt did not remove the leftover"
+            );
+            assert_eq!(git(&fx.checkout, &["status", "--porcelain"]), "?? worker-output.txt");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_held_provider_lease_still_refuses_before_any_state_changes() {
+            let tmp = tempfile::tempdir().unwrap();
+            let fake = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &worker_body(&checkout_path_of(&tmp), RESULT_EVENT),
+            )
+            .await;
+            let fx = fixture(tmp).await;
+            let lease_path = crate::queue::task_provider_lease_path(&fx.state().storage, fx.task_id);
+            let held = crate::agents::provider_lease::acquire(&lease_path).unwrap();
+            let action = fx.propose("change a.txt");
+            let refusal = fx.approve(action).await.expect_err("an earlier provider holds the checkout");
+            assert!(refusal.contains("provider lease"), "{refusal}");
+            assert!(fake.invocations().is_empty());
+            assert_eq!(fx.worker_started(), 0);
+            assert_eq!(fx.status_of(action), ActionStatus::Approved);
+
+            // The lease is checked first: a dirty checkout does not change the answer.
+            dirty_untracked(&fx.checkout);
+            let refusal = fx.approve(action).await.expect_err("still held");
+            assert!(refusal.contains("provider lease"), "{refusal}");
+            drop(held);
+            fx.resolve_by_hand();
+            fx.approve(action).await.expect("released lease and clean checkout run the Worker");
+            assert_eq!(fx.worker_invocations(&fake), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_corrupt_checkout_index_launches_nothing() {
+            // Checkout validation reads the status first and refuses here, so this
+            // proves the end-to-end outcome. The guard's own Git-failure branch is
+            // proved by the_guard_itself_reports_a_failed_status_read_as_not_started.
+            let tmp = tempfile::tempdir().unwrap();
+            let fake = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &worker_body(&checkout_path_of(&tmp), RESULT_EVENT),
+            )
+            .await;
+            let fx = fixture(tmp).await;
+            let git_dir = git(&fx.checkout, &["rev-parse", "--absolute-git-dir"]);
+            std::fs::write(std::path::Path::new(&git_dir).join("index"), b"not an index").unwrap();
+            let action = fx.propose("change a.txt");
+            fx.approve(action).await.expect_err("an unreadable checkout is never treated as clean");
+            assert!(fake.invocations().is_empty());
+            assert_eq!(fx.worker_started(), 0);
+            assert_eq!(fx.status_of(action), ActionStatus::Approved);
+            drop(fx.repo);
+        }
+
+        #[tokio::test]
+        async fn the_guard_itself_reports_a_failed_status_read_as_not_started() {
+            let missing = std::env::temp_dir().join(format!("slashit-no-such-checkout-{}", Uuid::new_v4()));
+            let refusal = super::super::refuse_uncommitted_checkout("Task", missing.to_str().unwrap())
+                .await
+                .expect_err("a status that cannot be read refuses");
+            assert!(refusal.contains("The Worker was not started"), "{refusal}");
+            assert!(refusal.contains("could not read the state"), "{refusal}");
+            assert!(refusal.contains("Nothing was changed"), "{refusal}");
         }
     }
 }

@@ -95,6 +95,30 @@ async fn commit(
     Ok(Some(commit))
 }
 
+/// How many paths in the checkout at `working_dir` differ from `HEAD` or the
+/// index in Git's own account: modified, staged, deleted, renamed, unmerged
+/// and untracked files, with untracked files listed individually. Ignored
+/// files are not counted, as Git does not count them.
+///
+/// Read-only: `--no-optional-locks` keeps `status` from refreshing the index,
+/// and nothing is staged, reset, cleaned or stashed. Any Git failure is an
+/// error, never "clean", so a caller that gates a launch on this refuses when
+/// the state cannot be read.
+pub async fn uncommitted_path_count(working_dir: &str) -> Result<usize, String> {
+    let output = tokio::process::Command::new("git")
+        .args(["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"])
+        .current_dir(working_dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if !output.status.success() {
+        return Err(explain(&output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().filter(|line| !line.trim().is_empty()).count())
+}
+
 /// Prove Git registers `working_dir` under the Project repository on the Task's branch.
 pub async fn validate_registered_task_checkout(repository: &str, working_dir: &str, branch: &str) -> Result<(), String> {
     refuse_unless_on_task_branch(working_dir, branch).await?;

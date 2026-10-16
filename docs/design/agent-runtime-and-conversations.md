@@ -54,6 +54,16 @@ selected bounded dependencies. It excludes the full Conversation, unrelated
 Tasks, and provider transcripts. The Coordinator is read-only, so it does not
 share mutation of the Task Checkout.
 
+After the Task's provider lease is taken and before the Worker is recorded as
+started, SlashIt reads the Task Checkout's Git status. Any uncommitted change,
+tracked, staged, deleted or untracked, refuses the start, as does a status that
+cannot be read. The approved action stays approved, the checkout is not
+touched, and the Human resolves it and retries. The Worker's result is
+committed as everything in the checkout, so edits that were already there would
+otherwise be recorded as the new request's work. This protects against
+pre-existing dirty content only. It does not establish who owns an edit made in
+the checkout while the Worker runs, and ignored files are not considered.
+
 The Worker result is saved as Conversation-owned evidence. SlashIt then starts
 a fresh read-only Coordinator Run with the selected context and that result
 marked as untrusted evidence. The Coordinator replies in the same Conversation,
