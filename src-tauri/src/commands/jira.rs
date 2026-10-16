@@ -211,6 +211,7 @@ pub async fn import_jira_issues(
             worker_handoff_confirmed: false,
             new_attempt: None,
             new_attempt_confirmed: false,
+            approved_execution: None,
             created_at: now,
             updated_at: now,
         };

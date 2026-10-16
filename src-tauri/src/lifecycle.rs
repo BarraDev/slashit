@@ -704,6 +704,14 @@ pub(crate) fn renumber_column(
     }
 }
 
+/// The Human approval a Queue transition is made under: the project action and
+/// the coding input (`task_input_digest`) the Human saw.
+#[derive(Debug, Clone, Copy)]
+pub struct InputApproval<'a> {
+    pub id: Uuid,
+    pub digest: &'a str,
+}
+
 /// What [`enqueue_leased`] found, and did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueVerdict {
@@ -740,18 +748,20 @@ pub enum EnqueueVerdict {
 /// ended: a Task that is not in Queue or beyond has none, and any other
 /// `seen_in` is the caller's responsibility to refuse.
 ///
-/// `approved_input`, when given, is the `task_input_digest` a person approved.
-/// It is compared in the same write, so a Task edited since is refused as
+/// `approval`, when given, names the `task_input_digest` a person approved. It
+/// is compared in the same write, so a Task edited since is refused as
 /// [`EnqueueVerdict::InputChanged`] instead of being queued with input nobody
-/// approved. The board passes none: a person starting a Task there is looking
-/// at its current definition.
+/// approved; when queued, the Task records it as its `approved_execution`, which
+/// the executor checks again before the run starts. The board passes none: a
+/// person starting a Task there is looking at its current definition, and the
+/// Task is left with no binding.
 pub async fn enqueue_leased(
     tasks: &Tasks,
     storage: &Storage,
     project_id: Uuid,
     task_id: Uuid,
     seen_in: &TaskStatus,
-    approved_input: Option<&str>,
+    approval: Option<InputApproval<'_>>,
 ) -> Result<EnqueueVerdict, String> {
     let verdict = std::sync::Mutex::new(EnqueueVerdict::Missing);
     let revise = |staged: &mut HashMap<Uuid, Task>| -> bool {
@@ -763,7 +773,7 @@ pub async fn enqueue_leased(
             }
             Some(task) if task.status != *seen_in => (EnqueueVerdict::Moved(task.status.clone()), false),
             Some(task)
-                if approved_input.is_some_and(|digest| crate::queue::prompt::task_input_digest(task) != digest) =>
+                if approval.as_ref().is_some_and(|a| crate::queue::prompt::task_input_digest(task) != a.digest) =>
             {
                 (EnqueueVerdict::InputChanged, false)
             }
@@ -798,6 +808,14 @@ pub async fn enqueue_leased(
                 {
                     task.reset_execution_state();
                 }
+                // After the move, which ends any earlier binding. The binding
+                // is for the run this Queue transition leads to, in this same
+                // write; a Task queued without an approval has none.
+                task.approved_execution = approval.as_ref().map(|a| crate::domain::task::ApprovedExecution {
+                    approval_id: a.id,
+                    digest: a.digest.to_string(),
+                    for_run: task.next_run(),
+                });
                 let title = task.title.clone();
                 renumber_column(staged, project_id, task_id, &TaskStatus::Queue, 0);
                 (EnqueueVerdict::Queued(title), true)

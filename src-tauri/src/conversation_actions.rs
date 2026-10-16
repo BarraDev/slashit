@@ -205,7 +205,7 @@ pub async fn decide(
         .mutation
         .clone();
     let mut candidate = conversation.clone();
-    match execute(scope, &mutation).await? {
+    match execute(scope, action_id, &mutation).await? {
         Execution::Applied { task_id, title } => {
             set_status(
                 &mut candidate,
@@ -276,7 +276,7 @@ enum Execution {
 
 /// Step 2 of the protocol. `Err` is transient (the Task store could not
 /// persist); `Refused` is a definitive answer for the current state.
-async fn execute(scope: &Scope<'_>, mutation: &TaskMutation) -> Result<Execution, String> {
+async fn execute(scope: &Scope<'_>, action_id: Uuid, mutation: &TaskMutation) -> Result<Execution, String> {
     match mutation {
         TaskMutation::CreateTask { task_id, title, description, priority, category } => {
             let project = scope
@@ -329,7 +329,7 @@ async fn execute(scope: &Scope<'_>, mutation: &TaskMutation) -> Result<Execution
             move_task(scope, *target_task_id, from, to).await
         }
         TaskMutation::EnqueueTask { target_task_id, from, input, .. } => {
-            enqueue_task(scope, *target_task_id, from, input.as_ref().map(|i| i.digest.as_str())).await
+            enqueue_task(scope, *target_task_id, from, input.as_ref().map(|i| (action_id, i.digest.as_str()))).await
         }
     }
 }
@@ -447,7 +447,7 @@ async fn enqueue_task(
     scope: &Scope<'_>,
     task_id: Uuid,
     from: &TaskStatus,
-    approved_input: Option<&str>,
+    approval: Option<(Uuid, &str)>,
 ) -> Result<Execution, String> {
     // Re-validated here rather than trusted from the persisted proposal.
     if *from != TaskStatus::Backlog {
@@ -456,7 +456,8 @@ async fn enqueue_task(
     let _lease = scope.locks.acquire(task_id).await?;
     Ok(
         match lifecycle::enqueue_leased(
-            scope.tasks, scope.storage, scope.project_id, task_id, from, approved_input,
+            scope.tasks, scope.storage, scope.project_id, task_id, from,
+            approval.map(|(id, digest)| lifecycle::InputApproval { id, digest }),
         )
         .await?
         {
@@ -827,7 +828,7 @@ mod tests {
         conversation.project_actions[0].status = ProjectActionStatus::Approved;
         conversation.push(Role::Human, EntryKind::ProjectActionDecision { action_id: id, approved: true });
         world.storage.save_conversation(&conversation).unwrap();
-        execute(&world.scope(), &conversation.project_actions[0].mutation.clone()).await.unwrap();
+        execute(&world.scope(), conversation.project_actions[0].id, &conversation.project_actions[0].mutation.clone()).await.unwrap();
         assert_eq!(world.tasks.read().await.len(), 1);
 
         let mut restarted = world.storage.load_primary_conversation(world.project_id).unwrap().unwrap();
@@ -866,7 +867,7 @@ mod tests {
         conversation.project_actions[0].status = ProjectActionStatus::Approved;
         conversation.push(Role::Human, EntryKind::ProjectActionDecision { action_id: id, approved: true });
         world.storage.save_conversation(&conversation).unwrap();
-        execute(&world.scope(), &conversation.project_actions[0].mutation.clone()).await.unwrap();
+        execute(&world.scope(), conversation.project_actions[0].id, &conversation.project_actions[0].mutation.clone()).await.unwrap();
         // Step 3 fails: only the final Conversation save is blocked.
         let durable = block_conversation_persistence(&world, &conversation);
 
@@ -1317,7 +1318,7 @@ mod tests {
         conversation.project_actions[0].status = ProjectActionStatus::Approved;
         conversation.push(Role::Human, EntryKind::ProjectActionDecision { action_id: id, approved: true });
         world.storage.save_conversation(&conversation).unwrap();
-        execute(&world.scope(), &conversation.project_actions[0].mutation.clone()).await.unwrap();
+        execute(&world.scope(), conversation.project_actions[0].id, &conversation.project_actions[0].mutation.clone()).await.unwrap();
         let moved = moves(&world.tasks.read().await[&task.id]);
 
         decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
@@ -1791,6 +1792,48 @@ mod tests {
         edit_in_store(&world, task.id, |t| t.description = Some("edited".into())).await;
         decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
         assert_eq!(snapshot_of(&world, task.id).await.status, TaskStatus::Queue, "status-only, as it was approved");
+    }
+
+    #[tokio::test]
+    async fn an_approved_queue_binds_the_task_to_its_approval_and_next_run() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Bound").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &enqueue_json(task.id)).await.unwrap();
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+        let queued = snapshot_of(&world, task.id).await;
+        let binding = queued.approved_execution.clone().expect("bound");
+        assert_eq!(binding.approval_id, id);
+        assert_eq!(binding.digest, crate::queue::prompt::task_input_digest(&queued));
+        assert_eq!(binding.for_run, queued.next_run());
+    }
+
+    #[tokio::test]
+    async fn a_task_found_queued_or_moved_is_not_bound_and_a_move_ends_a_binding() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Found").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &enqueue_json(task.id)).await.unwrap();
+        place(&world, task.id, TaskStatus::Queue).await;
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+        assert_eq!(snapshot_of(&world, task.id).await.approved_execution, None);
+
+        let mut t = snapshot_of(&world, task.id).await;
+        t.approved_execution = Some(crate::domain::task::ApprovedExecution { approval_id: id, digest: "d".into(), for_run: 1 });
+        let from = t.status.clone();
+        t.status = TaskStatus::Backlog;
+        t.record_move(&from);
+        assert_eq!(t.approved_execution, None, "retry, drag or manual enqueue supersede the binding");
+    }
+
+    #[test]
+    fn a_task_saved_before_the_binding_existed_still_reads_and_is_not_rewritten_with_one() {
+        let task = crate::test_helpers::create_test_task("Legacy");
+        let mut value = serde_json::to_value(&task).unwrap();
+        assert!(value.get("approved_execution").is_none());
+        value.as_object_mut().unwrap().remove("approved_execution");
+        let back: Task = serde_json::from_value(value).unwrap();
+        assert_eq!(back.approved_execution, None);
     }
 
     #[tokio::test]

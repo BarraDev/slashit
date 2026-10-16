@@ -632,6 +632,7 @@ pub fn create_test_task(title: &str) -> Task {
         worker_handoff_confirmed: false,
         new_attempt: None,
         new_attempt_confirmed: false,
+        approved_execution: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

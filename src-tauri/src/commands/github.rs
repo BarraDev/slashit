@@ -263,6 +263,7 @@ pub async fn create_task_from_issue(
         worker_handoff_confirmed: false,
         new_attempt: None,
         new_attempt_confirmed: false,
+        approved_execution: None,
         created_at: now,
         updated_at: now,
     };
@@ -376,6 +377,7 @@ pub async fn import_github_issues(
             worker_handoff_confirmed: false,
             new_attempt: None,
             new_attempt_confirmed: false,
+            approved_execution: None,
             created_at: now,
             updated_at: now,
         };

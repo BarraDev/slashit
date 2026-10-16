@@ -122,6 +122,29 @@ pub fn task_input_digest(task: &Task) -> String {
     hex::encode(Sha256::digest(build_task_prompt(task, None).as_bytes()))
 }
 
+/// What a Task's `approved_execution` says about the input it is about to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovedInputCheck {
+    /// No Human approved this Task's input; it runs as an ordinary Task. Never
+    /// read as an authorization for anything.
+    Unbound,
+    /// The Task still holds exactly the input that was approved.
+    Matches,
+    /// The Task was changed after approval. It must not start.
+    Differs,
+    /// The binding was made for another run. It authorizes nothing here.
+    Superseded,
+}
+
+pub fn check_approved_input(task: &Task) -> ApprovedInputCheck {
+    match &task.approved_execution {
+        None => ApprovedInputCheck::Unbound,
+        Some(b) if b.for_run != task.next_run() => ApprovedInputCheck::Superseded,
+        Some(b) if b.digest == task_input_digest(task) => ApprovedInputCheck::Matches,
+        Some(_) => ApprovedInputCheck::Differs,
+    }
+}
+
 /// `feedback` with any line that would read as one of the fence lines
 /// quoted, so the text cannot close its own section early.
 fn unfenced(feedback: &str) -> String {
