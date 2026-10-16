@@ -1,4 +1,5 @@
 mod branch;
+pub mod checkout_fingerprint;
 mod commit;
 mod default_base;
 pub mod delivery;
