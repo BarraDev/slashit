@@ -3,10 +3,13 @@
 //! Authorizing a new attempt and launching it both read the same facts here,
 //! and [`confirm`] compares them with the decision the person made. Nothing in
 //! this module writes to the checkout or to the repository. What it proves is
-//! true at the moment it reads; a Git writer outside SlashIt is not stopped by
-//! the lifecycle lease, so the launch repeats the read immediately before it
-//! starts the provider.
+//! true at the moment it reads. A Git or file writer outside SlashIt is not
+//! stopped by the lifecycle lease. The launch repeats the read after the
+//! checkout is attached and before the run is recorded, but the uncommitted work
+//! can still change between that read and the provider's first action. The
+//! contract records this as a point-in-time limitation.
 
+use std::fs;
 use std::path::Path;
 
 use crate::domain::task::NewAttemptDecision;
@@ -65,6 +68,21 @@ pub(crate) async fn inspect(
         dirty_fingerprint: fingerprint.digest,
         dirty_paths: fingerprint.dirty_paths,
     })
+}
+
+/// The identity of the checkout's own `.git` entry, which a replaced or
+/// re-created checkout cannot keep. `None` when it cannot be read.
+pub(crate) fn git_entry_identity(checkout: &str) -> Option<String> {
+    let meta = fs::metadata(Path::new(checkout).join(".git")).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!("{}:{}", meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        meta.created().ok().map(|created| format!("{created:?}"))
+    }
 }
 
 /// Why a new attempt is refused when the board's directory cannot be synchronized.

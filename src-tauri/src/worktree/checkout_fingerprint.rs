@@ -162,10 +162,13 @@ pub async fn fingerprint_with(
 
     // A detached HEAD makes `symbolic-ref` fail. HEAD resolved above, so this
     // is the only reason it fails here.
-    let branch_ref = git(&dir, &["symbolic-ref", "-q", "HEAD"])
-        .await
-        .ok()
-        .map(|out| String::from_utf8_lossy(&out).trim().to_string());
+    // `-q` exits 1 with no message for a detached HEAD, which is a valid state.
+    // Any other failure is refused rather than read as detached.
+    let branch_ref = match git(&dir, &["symbolic-ref", "-q", "HEAD"]).await {
+        Ok(out) => Some(String::from_utf8_lossy(&out).trim().to_string()),
+        Err(FingerprintError::Git(message)) if message.is_empty() => None,
+        Err(other) => return Err(other),
+    };
 
     for marker in IN_PROGRESS_MARKERS {
         let out = git(&dir, &["rev-parse", "--git-path", marker]).await?;
@@ -292,6 +295,22 @@ fn describe_worktree(
     digest: &mut Sha256,
 ) -> Result<(), FingerprintError> {
     let full = checkout.join(path);
+    // A parent directory that is a link would move the read outside the
+    // checkout, so the path is refused before anything is read.
+    let mut parent = checkout.to_path_buf();
+    let mut parts = Path::new(path).components().peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        parent.push(part);
+        if fs::symlink_metadata(&parent).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(FingerprintError::Unsupported {
+                path: path.to_string(),
+                reason: "a parent directory is a symbolic link",
+            });
+        }
+    }
     let unreadable = |e: std::io::Error| FingerprintError::Unreadable {
         path: path.to_string(),
         reason: e.to_string(),
@@ -476,6 +495,23 @@ mod tests {
         write(&repo, "a.txt", b"staged\n");
         let staged_and_clean = fingerprint(&repo.path).await.expect("fingerprint");
         assert_ne!(staged_then_edited.digest, staged_and_clean.digest);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tracked_path_under_a_directory_replaced_by_a_link_is_refused() {
+        let repo = repo();
+        fs::create_dir(repo.path.join("vendor")).expect("dir");
+        write(&repo, "vendor/lib.txt", b"inside");
+        git_in(&repo, &["add", "vendor/lib.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "vendor"]);
+        let outside = repo.path.parent().expect("parent").join("outside");
+        fs::create_dir(&outside).expect("outside dir");
+        fs::write(outside.join("lib.txt"), b"outside").expect("outside file");
+        fs::remove_dir_all(repo.path.join("vendor")).expect("remove dir");
+        std::os::unix::fs::symlink(&outside, repo.path.join("vendor")).expect("symlink");
+        let err = fingerprint(&repo.path).await.expect_err("refused");
+        assert!(matches!(err, FingerprintError::Unsupported { .. }), "{err:?}");
     }
 
     #[tokio::test]

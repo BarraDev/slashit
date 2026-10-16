@@ -3473,8 +3473,12 @@ impl TaskExecutor {
                     // The visible board now owns the checkout. Persist an
                     // explicit hold where possible; never launch from an
                     // unconfirmed start record.
+                    let held_run = match run.load(std::sync::atomic::Ordering::Relaxed) {
+                        0 => new_attempt.map(|decision| decision.for_run),
+                        started => Some(started),
+                    };
                     let _ = Self::record_recovery_required(
-                        &self.tasks, &self.storage, task_id, Some(run.load(std::sync::atomic::Ordering::Relaxed)), None,
+                        &self.tasks, &self.storage, task_id, held_run, None,
                         "The run-start record is visible but its durability is unconfirmed. The Worker was not launched; inspect this Task before continuing.",
                     ).await;
                     format!(
@@ -3628,6 +3632,12 @@ impl TaskExecutor {
                     .to_string(),
             );
         }
+        if task.local_integration.is_some() || task.pr_url.is_some() {
+            return Err(
+                "This task has a local integration or pull request in progress; it cannot start a new attempt."
+                    .to_string(),
+            );
+        }
         let decision = task
             .new_attempt
             .as_ref()
@@ -3660,12 +3670,22 @@ impl TaskExecutor {
         repo_path: &str,
         decision: &crate::domain::task::NewAttemptDecision,
     ) -> Result<(), String> {
-        let (project_id, recorded_path) = {
+        let (project_id, recorded_path, recorded_branch) = {
             let tasks = self.tasks.read().await;
             let task = tasks.get(&task_id).ok_or("Task not found")?;
-            (task.project_id, task.worktree_path.clone())
+            (
+                task.project_id,
+                task.worktree_path.clone(),
+                task.branch_name.clone(),
+            )
         };
         crate::worktree::new_attempt::board_can_confirm(&self.storage, project_id)?;
+        if recorded_branch.as_deref() != Some(decision.branch.as_str()) {
+            return Err(
+                "The Task's branch differs from the one you inspected. Nothing was started; inspect the Task again."
+                    .to_string(),
+            );
+        }
         if recorded_path.as_deref() != Some(decision.checkout_path.as_str()) {
             return Err(
                 "The Task Checkout is no longer the one you inspected. Nothing was started; \
@@ -3711,6 +3731,9 @@ impl TaskExecutor {
         // The authorized decision, when this is a new attempt. Read under the
         // lease below, and used again for the Git checks before anything is written.
         let mut authorized: Option<NewAttemptDecision> = None;
+        // The identity of the checkout's `.git` entry before attaching. A checkout
+        // that was removed and re-created in between is not the one that was confirmed.
+        let mut checkout_before: Option<String> = None;
 
         // Re-read under the lease. Whatever the caller saw before waiting
         // for it may no longer be true, and a task that has since been
@@ -3840,15 +3863,19 @@ impl TaskExecutor {
                     task_id: task_id.to_string(),
                     message: format!("Cannot resolve working directory: {}", e),
                 });
-                Self::set_task_error_static(
-                    &self.tasks,
-                    &self.storage,
-                    &self.events,
-                    task_id,
-                    &e,
-                    None,
-                )
-                .await;
+                // A refused new attempt changes nothing on the Task: its recovery
+                // stays the record of what happened.
+                if authorized.is_none() {
+                    Self::set_task_error_static(
+                        &self.tasks,
+                        &self.storage,
+                        &self.events,
+                        task_id,
+                        &e,
+                        None,
+                    )
+                    .await;
+                }
                 return Err(format!("Cannot resolve working directory: {e}"));
             }
         };
@@ -3859,6 +3886,7 @@ impl TaskExecutor {
         if let Some(decision) = authorized.as_ref() {
             self.confirm_new_attempt_checkout(task_id, &repo_path, decision)
                 .await?;
+            checkout_before = crate::worktree::new_attempt::git_entry_identity(&decision.checkout_path);
         }
 
         let (existing_branch, acquired) = self.acquire_task_worktree(task_id, &repo_path).await;
@@ -3875,15 +3903,17 @@ impl TaskExecutor {
                     task_id: task_id.to_string(),
                     message: message.clone(),
                 });
-                Self::set_task_error_static(
-                    &self.tasks,
-                    &self.storage,
-                    &self.events,
-                    task_id,
-                    &message,
-                    None,
-                )
-                .await;
+                if authorized.is_none() {
+                    Self::set_task_error_static(
+                        &self.tasks,
+                        &self.storage,
+                        &self.events,
+                        task_id,
+                        &message,
+                        None,
+                    )
+                    .await;
+                }
                 return Err(message);
             }
         };
@@ -3892,7 +3922,10 @@ impl TaskExecutor {
             // Attaching must have reused the inspected checkout, never created one.
             // Read again now, after the attach, and undo only what this call created.
             let reused = acquired.created_at.is_none()
-                && acquired.info.path == decision.checkout_path;
+                && acquired.info.path == decision.checkout_path
+                && checkout_before.is_some()
+                && crate::worktree::new_attempt::git_entry_identity(&decision.checkout_path)
+                    == checkout_before;
             let checked = if reused {
                 crate::worktree::new_attempt::inspect(
                     &repo_path,
@@ -3959,6 +3992,27 @@ impl TaskExecutor {
                     return Err(message);
                 }
             };
+
+        // The uncommitted work was last read before the run-start write. Read it
+        // again before the provider starts. A change now is recorded as recovery
+        // of this run, so nothing is launched on work the person did not inspect.
+        if let Some(decision) = authorized.as_ref() {
+            if let Err(changed) = self
+                .confirm_new_attempt_checkout(task_id, &repo_path, decision)
+                .await
+            {
+                let _ = Self::record_recovery_required(
+                    &self.tasks,
+                    &self.storage,
+                    task_id,
+                    Some(run),
+                    None,
+                    "The uncommitted work changed after the new attempt was recorded and before its provider started. The Task Checkout was preserved; inspect it before any new attempt.",
+                )
+                .await;
+                return Err(changed);
+            }
+        }
 
         let (prompt, task_model) = {
             let tasks = self.tasks.read().await;
@@ -6694,7 +6748,19 @@ impl TaskExecutor {
                     "The Worker ended without exact provider and Git completion evidence. The Task Checkout was preserved for inspection.",
                     350,
                 );
-                let recovery_required = if !provider_exited_without_commit {
+                // A run that a person authorized as a new attempt keeps its recovery
+                // when its provider fails: its checkout holds the prior run's work too,
+                // so an ordinary retry must not be offered.
+                let authorized_new_attempt = run.is_some_and(|run| {
+                    run > 1
+                        && t.activity.iter().any(|entry| {
+                            matches!(
+                                entry.kind,
+                                ActivityKind::NewAttemptAuthorized { run: authorized } if authorized == run - 1
+                            )
+                        })
+                });
+                let recovery_required = if !provider_exited_without_commit || authorized_new_attempt {
                     if let Some(handoff) = t.worker_handoff.as_mut().filter(|handoff| {
                         handoff.run == run
                             && matches!(

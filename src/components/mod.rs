@@ -15,6 +15,7 @@ pub mod task_drawer;
 pub mod task_live;
 pub mod task_review;
 pub mod worker_recovery;
+pub mod new_attempt;
 pub mod close_without_merge_dialog;
 pub mod workspace_panel;
 pub mod agent_panel;

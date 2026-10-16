@@ -65,6 +65,139 @@ pub enum AuthorizeNewAttemptOutcome {
     DurabilityUnconfirmed { task: Task, detail: String },
 }
 
+/// What a person would be deciding on, read now. It is informational:
+/// authorizing reads everything again and refuses if anything differs.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NewAttemptEvidence {
+    pub task_id: Uuid,
+    pub project_id: Uuid,
+    pub repository_id: Option<Uuid>,
+    pub run: Option<u32>,
+    pub recovery_reason: Option<String>,
+    pub observed_commit: Option<String>,
+    pub branch: Option<String>,
+    pub checkout: Option<String>,
+    /// The branch tip, which is also the checkout's HEAD.
+    pub expected_head: Option<String>,
+    pub dirty_fingerprint: Option<String>,
+    /// The uncommitted paths. The new attempt's commit will include them.
+    pub dirty_paths: Vec<String>,
+    pub eligible: bool,
+    /// Why a new attempt cannot be authorized now; empty when `eligible`.
+    pub refusals: Vec<String>,
+}
+
+/// Reads what [`record_decision`] would bind, without recording anything.
+pub(crate) async fn new_attempt_evidence(
+    state: &crate::AppState,
+    task_id: Uuid,
+) -> Result<NewAttemptEvidence, String> {
+    let task = state
+        .task
+        .tasks
+        .read()
+        .await
+        .get(&task_id)
+        .cloned()
+        .ok_or("Task not found")?;
+    let mut evidence = NewAttemptEvidence {
+        task_id,
+        project_id: task.project_id,
+        repository_id: None,
+        run: None,
+        recovery_reason: None,
+        observed_commit: None,
+        branch: task.branch_name.clone(),
+        checkout: task.worktree_path.clone(),
+        expected_head: None,
+        dirty_fingerprint: None,
+        dirty_paths: Vec::new(),
+        eligible: false,
+        refusals: Vec::new(),
+    };
+    let Some(handoff) = task.worker_handoff.as_ref() else {
+        evidence
+            .refusals
+            .push("This Task has no Worker recovery evidence.".into());
+        return Ok(evidence);
+    };
+    evidence.repository_id = handoff.repository_id;
+    evidence.run = handoff.run;
+    let WorkerHandoffStage::RecoveryRequired {
+        reason,
+        observed_commit,
+    } = &handoff.stage
+    else {
+        evidence
+            .refusals
+            .push("This Worker is not waiting for a recovery decision.".into());
+        return Ok(evidence);
+    };
+    evidence.recovery_reason = Some(reason.clone());
+    evidence.observed_commit = observed_commit.clone();
+
+    let (Some(run), Some(repository_id), Some(branch), Some(checkout)) = (
+        handoff.run,
+        handoff.repository_id,
+        task.branch_name.clone(),
+        task.worktree_path.clone(),
+    ) else {
+        evidence
+            .refusals
+            .push("The recovery record is incomplete, so a new attempt cannot be checked.".into());
+        return Ok(evidence);
+    };
+    let repo = match crate::commands::integration::repo_path_of(state, task.project_id).await {
+        Ok(repo) => repo,
+        Err(message) => {
+            evidence.refusals.push(message);
+            return Ok(evidence);
+        }
+    };
+    let inspection = match crate::worktree::new_attempt::inspect(&repo, &checkout, &branch).await {
+        Ok(inspection) => inspection,
+        Err(message) => {
+            evidence.refusals.push(message);
+            return Ok(evidence);
+        }
+    };
+    evidence.expected_head = Some(inspection.head.clone());
+    evidence.dirty_fingerprint = Some(inspection.dirty_fingerprint.clone());
+    evidence.dirty_paths = inspection.dirty_paths.clone();
+
+    // The same checks the authorization makes, with a placeholder id: nothing
+    // is recorded here, so the id is not used.
+    let request = AuthorizeNewAttemptRequest {
+        decision_id: Uuid::nil(),
+        task_id,
+        project_id: task.project_id,
+        repository_id,
+        run,
+        stage: "recovery_required".into(),
+        recovery_reason: reason.clone(),
+        observed_commit: observed_commit.clone(),
+        branch,
+        checkout,
+        expected_head: inspection.head,
+        dirty_fingerprint: inspection.dirty_fingerprint,
+    };
+    match prepare(state, &task, &request).await {
+        Ok(_) => evidence.eligible = true,
+        Err(reasons) => evidence.refusals = reasons,
+    }
+    Ok(evidence)
+}
+
+/// Read-only: what a new attempt would be decided on for `task_id`.
+#[tauri::command]
+pub async fn get_new_attempt_evidence(
+    state: tauri::State<'_, crate::AppState>,
+    task_id: String,
+) -> Result<NewAttemptEvidence, String> {
+    let task_id = Uuid::parse_str(&task_id).map_err(|e| e.to_string())?;
+    new_attempt_evidence(&state, task_id).await
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StartNewAttemptRequest {
     pub task_id: Uuid,
@@ -1156,5 +1289,78 @@ mod tests {
         assert!(reason.contains("cannot synchronize"), "{reason}");
         assert_eq!(fx.board().await, before);
         assert_eq!(agent.invocations(), "");
+    }
+
+    /// A provider that fails on its own during a new attempt leaves the Task
+    /// in recovery. The checkout still holds the prior run's work, so an
+    /// ordinary retry must not be offered.
+    #[tokio::test]
+    async fn a_failing_new_attempt_provider_stays_in_recovery() {
+        let fx = fixture().await;
+        let _agent = FakeProgram::install("claude", "cat >/dev/null; exit 1").await;
+        let id = Uuid::new_v4();
+        record_decision(&fx.state, fx.request(id).await).await.unwrap();
+        let executor = fx.state.executor.get().unwrap().clone();
+        executor.start_new_attempt(fx.task_id, id).await.unwrap();
+
+        let mut failed = None;
+        for _ in 0..200 {
+            let task = fx.task().await;
+            if task
+                .activity
+                .iter()
+                .any(|e| matches!(e.kind, ActivityKind::RunFailed { run: Some(2), .. }))
+            {
+                failed = Some(task);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let task = failed.expect("the failed new-attempt run was recorded");
+
+        let handoff = task.worker_handoff.as_ref().expect("the handoff is kept");
+        assert!(
+            matches!(handoff.stage, WorkerHandoffStage::RecoveryRequired { .. }),
+            "{:?}",
+            handoff.stage
+        );
+        assert_eq!(handoff.run, Some(2));
+        assert!(task.worker_recovery_refusal().is_some());
+    }
+
+    /// The snapshot the person decides on reports the same facts the
+    /// authorization binds, and changes nothing.
+    #[tokio::test]
+    async fn the_evidence_read_is_eligible_with_its_dirty_paths_and_changes_nothing() {
+        let fx = fixture().await;
+        fx.write("notes.txt", "a person's note");
+        let before = fx.board().await;
+        let repo_before = fx.repo_state();
+
+        let evidence = new_attempt_evidence(&fx.state, fx.task_id).await.unwrap();
+
+        assert!(evidence.eligible, "{:?}", evidence.refusals);
+        assert_eq!(evidence.run, Some(1));
+        assert_eq!(evidence.expected_head.as_deref(), Some(fx.head().as_str()));
+        assert_eq!(evidence.dirty_paths, vec!["notes.txt"]);
+        assert!(evidence.dirty_fingerprint.as_deref().is_some_and(|d| d.starts_with("sha256:")));
+        assert_eq!(fx.board().await, before);
+        assert_eq!(fx.repo_state(), repo_before);
+    }
+
+    #[tokio::test]
+    async fn the_evidence_read_refuses_a_task_that_is_not_waiting_for_recovery() {
+        let fx = fixture().await;
+        fx.edit(|t| t.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::Started)
+            .await;
+
+        let evidence = new_attempt_evidence(&fx.state, fx.task_id).await.unwrap();
+
+        assert!(!evidence.eligible);
+        assert!(
+            evidence.refusals.iter().any(|r| r.contains("not waiting")),
+            "{:?}",
+            evidence.refusals
+        );
     }
 }

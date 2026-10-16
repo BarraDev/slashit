@@ -468,6 +468,7 @@ pub fn TaskDrawer(
                         </section>
                     })}
                     <crate::components::worker_recovery::WorkerRecoveryPanel task_id=task_id task=task apply_task=apply_task />
+                    <crate::components::new_attempt::NewAttemptPanel task_id=task_id task=task apply_task=apply_task />
                     {move || previous_error.get().filter(|_| !run.with(|r| r.live)).map(|message| view! {
                         <section data-testid="task-drawer-previous-error" class="rounded-lg border border-white/10 bg-white/[0.03] p-3 space-y-2">
                             <h3 class="text-xs font-semibold uppercase tracking-wide text-white/50">"Last attempt failed"</h3>
