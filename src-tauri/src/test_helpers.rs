@@ -623,6 +623,8 @@ pub fn create_test_task(title: &str) -> Task {
         activity: Vec::new(),
         worker_handoff: None,
         worker_handoff_confirmed: false,
+        new_attempt: None,
+        new_attempt_confirmed: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

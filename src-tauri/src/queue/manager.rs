@@ -197,6 +197,8 @@ mod tests {
                 activity: Vec::new(),
                 worker_handoff: None,
                 worker_handoff_confirmed: false,
+                new_attempt: None,
+                new_attempt_confirmed: false,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };

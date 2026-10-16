@@ -254,6 +254,18 @@ pub struct Task {
     #[serde(skip)]
     pub worker_handoff_confirmed: bool,
 
+    /// A person's authorization to start a new coding attempt after the
+    /// recovery of an interrupted run. It is persisted so a restart can see
+    /// it, but it authorizes nothing until `new_attempt_confirmed` is set in
+    /// this process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_attempt: Option<NewAttemptDecision>,
+
+    /// Current-process durability acknowledgement for `new_attempt` only. It is
+    /// never serialized, so a persisted decision is unconfirmed after restart.
+    #[serde(skip)]
+    pub new_attempt_confirmed: bool,
+
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -278,6 +290,35 @@ pub struct WorkerHandoff {
     /// ordinal and stage, never by remembering old decisions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance: Option<WorkerResultAcceptance>,
+}
+
+/// A person's authorization to start a new coding attempt on the checkout of a
+/// run whose recovery is required. It binds exactly what the person inspected:
+/// the run, the branch and its tip, the checkout, the commit observed, and the
+/// fingerprint of the uncommitted work that the attempt will build on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NewAttemptDecision {
+    /// Client-generated identity of the decision, for idempotent retries.
+    pub decision_id: Uuid,
+    /// The recovered run this decision is for. A decision for any other run is
+    /// stale.
+    pub for_run: u32,
+    pub branch: String,
+    pub checkout_path: String,
+    /// The commit the recovery evidence had observed, or `None` if it had
+    /// observed none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_commit: Option<String>,
+    /// The branch tip when the person inspected the checkout.
+    pub expected_head: String,
+    /// Fingerprint of the uncommitted work, computed at inspection. Launch
+    /// recomputes it and refuses on any difference.
+    pub dirty_fingerprint: String,
+    /// The uncommitted paths the person was shown, which the attempt's commit
+    /// will include.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirty_paths: Vec<String>,
+    pub authorized_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// A person's acceptance of one exact existing commit as the result of an
@@ -471,6 +512,28 @@ impl Task {
             .map(|_| "This Task has unresolved Worker recovery evidence. Inspect and preserve its Task Checkout before any new attempt.".to_string())
     }
 
+    /// Whether the persisted new-attempt decision authorizes one launch of a
+    /// Worker on this Task's recovered run.
+    ///
+    /// Only the new-attempt admission may consult this. It does not lift
+    /// [`Self::worker_recovery_refusal`] for any other request. The decision
+    /// must be confirmed by a durable write in this process, be for the run the
+    /// Task still has in recovery, and name the same branch.
+    pub fn new_attempt_admits(&self) -> bool {
+        let Some(decision) = self.new_attempt.as_ref() else {
+            return false;
+        };
+        if !self.new_attempt_confirmed {
+            return false;
+        }
+        let Some(handoff) = self.worker_handoff.as_ref() else {
+            return false;
+        };
+        matches!(handoff.stage, WorkerHandoffStage::RecoveryRequired { .. })
+            && handoff.run == Some(decision.for_run)
+            && handoff.branch.as_deref() == Some(decision.branch.as_str())
+    }
+
     /// Why this task may not change status right now, or `None`.
     ///
     /// A pending [`Self::local_integration`] is a persisted Git operation
@@ -584,6 +647,8 @@ impl Task {
             activity: Vec::new(),
             worker_handoff: None,
             worker_handoff_confirmed: false,
+            new_attempt: None,
+            new_attempt_confirmed: false,
             created_at: now,
             updated_at: now,
         }
@@ -1814,6 +1879,76 @@ mod tests {
             serde_json::from_value(old_json).expect("old JSON/IPC Task remains compatible");
         assert!(from_json.worker_handoff.is_none());
         assert!(!from_json.worker_handoff_confirmed);
+    }
+
+    fn recovered_task_with_decision(run: u32) -> (Task, NewAttemptDecision) {
+        let mut task = startable_task();
+        task.worker_handoff = Some(WorkerHandoff {
+            task_id: task.id,
+            project_id: task.project_id,
+            repository_id: None,
+            run: Some(run),
+            branch: Some("task/example".into()),
+            start_head: Some("a".repeat(40)),
+            acceptance: None,
+            stage: WorkerHandoffStage::RecoveryRequired {
+                reason: "interrupted".into(),
+                observed_commit: None,
+            },
+        });
+        let decision = NewAttemptDecision {
+            decision_id: Uuid::new_v4(),
+            for_run: run,
+            branch: "task/example".into(),
+            checkout_path: "/checkouts/example".into(),
+            observed_commit: None,
+            expected_head: "a".repeat(40),
+            dirty_fingerprint: "sha256:0".into(),
+            dirty_paths: Vec::new(),
+            authorized_at: chrono::Utc::now(),
+        };
+        task.new_attempt = Some(decision.clone());
+        (task, decision)
+    }
+
+    #[test]
+    fn a_new_attempt_decision_admits_only_when_confirmed_for_the_recovered_run() {
+        let (mut task, _) = recovered_task_with_decision(2);
+        assert!(!task.new_attempt_admits(), "an unconfirmed decision never admits");
+        task.new_attempt_confirmed = true;
+        assert!(task.new_attempt_admits());
+        task.new_attempt.as_mut().unwrap().for_run = 1;
+        assert!(!task.new_attempt_admits(), "a decision for an earlier run is stale");
+    }
+
+    #[test]
+    fn a_new_attempt_decision_admits_nothing_once_the_recovery_is_no_longer_required() {
+        let (mut task, _) = recovered_task_with_decision(1);
+        task.new_attempt_confirmed = true;
+        task.worker_handoff.as_mut().unwrap().stage = WorkerHandoffStage::Started;
+        assert!(!task.new_attempt_admits());
+    }
+
+    #[test]
+    fn a_decision_is_persisted_but_its_confirmation_never_is() {
+        let (mut task, _) = recovered_task_with_decision(1);
+        task.new_attempt_confirmed = true;
+        let json = serde_json::to_value(&task).expect("Task IPC JSON");
+        assert!(json.get("new_attempt").is_some());
+        assert!(json.get("new_attempt_confirmed").is_none());
+        let back: Task = serde_json::from_value(json).expect("round trip");
+        assert!(back.new_attempt.is_some());
+        assert!(!back.new_attempt_confirmed);
+        assert!(!back.new_attempt_admits());
+    }
+
+    #[test]
+    fn tasks_without_a_new_attempt_decision_load_and_serialize_none() {
+        let from_toml: Task =
+            toml::from_str(LEGACY_TASK_TOML).expect("old Task TOML remains compatible");
+        assert!(from_toml.new_attempt.is_none());
+        let json = serde_json::to_value(&from_toml).expect("Task IPC JSON");
+        assert!(json.get("new_attempt").is_none());
     }
 
     #[test]

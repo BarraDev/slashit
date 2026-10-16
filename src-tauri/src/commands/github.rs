@@ -261,6 +261,8 @@ pub async fn create_task_from_issue(
         activity: Vec::new(),
         worker_handoff: None,
         worker_handoff_confirmed: false,
+        new_attempt: None,
+        new_attempt_confirmed: false,
         created_at: now,
         updated_at: now,
     };
@@ -372,6 +374,8 @@ pub async fn import_github_issues(
             activity: Vec::new(),
             worker_handoff: None,
             worker_handoff_confirmed: false,
+            new_attempt: None,
+            new_attempt_confirmed: false,
             created_at: now,
             updated_at: now,
         };
