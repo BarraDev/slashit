@@ -24,15 +24,32 @@
 //! died in between, or the record write failed), so it is never read as
 //! absence: the Task needs a person to inspect its checkout.
 //!
-//! Windows: no equivalent is implemented. [`acquire`] returns no lease and
-//! [`prove_absent`] refuses, so a new attempt there is refused, and the first
-//! attempt of a Task still runs as before.
+//! Windows: no equivalent is implemented, and nothing here claims that a
+//! surviving provider can be ruled out. [`acquire`] returns no lease, so
+//! ordinary first attempts and retries (Direct and Pending, with or without a
+//! checkout) are admitted and promoted exactly as before; their other guards
+//! (lifecycle, checkout, concurrency, recovery) apply unchanged. Only
+//! [`prove_absent`] refuses there, so the explicit new attempt stays
+//! unsupported.
 //!
-//! Limits, stated rather than hidden: a descendant that closes the descriptor
-//! and then leaves its process group (`setsid`) is not seen. A Task that ran
-//! before this module existed has no lease file. Its first start is admitted
-//! only when its record shows no checkout and no run; any other Task without a
-//! lease is refused until a person has checked its Task Checkout.
+//! Limits, stated rather than hidden:
+//!
+//! - A descendant that closes the descriptor and then leaves its process group
+//!   (`setsid`) is not seen.
+//! - On Unix, a Task whose record shows a checkout or a run but that has no
+//!   lease file is refused until a person has checked its Task Checkout. That
+//!   includes a checkout attached by hand before any run, which carries no mark
+//!   that tells it from a legacy run.
+//! - Legacy Tasks are not covered by the lease guarantees. An older build could
+//!   lose its checkout or run record after a failed save and still have
+//!   launched a provider, and a missing historical record cannot show that no
+//!   provider ever existed. Such a Task is not claimed crash-safe. Only runs
+//!   made with a lease get the guarantees above.
+//! - A queued Task whose lease record shows a live group or a spawn mark is
+//!   left queued (see `queue::start_lease_admits`). That check reads the
+//!   record without a lock, so a provider that holds the lock but has not yet
+//!   recorded its group can still be promoted. Its start is then refused, so
+//!   the guarantee holds, but it can briefly occupy a slot.
 
 /// An exclusive lock on a Task's lease file, held by the caller until the
 /// provider has been spawned.
@@ -194,6 +211,17 @@ mod imp {
         judge_record(&recorded)
     }
 
+    /// Whether the record already on disk forbids a start. Read-only and takes
+    /// no lock, so it cannot make a real launch's `acquire` fail. It is for
+    /// deciding whether to promote a queued Task, never for admitting a launch:
+    /// the start itself still proves absence under the lock.
+    pub fn record_forbids_start(path: &Path) -> bool {
+        match std::fs::read_to_string(path) {
+            Ok(recorded) => judge_record(&recorded).is_err(),
+            Err(_) => true,
+        }
+    }
+
     /// Judges a record. Called only when the lock is known to be free, or held
     /// by the caller, which is the case for [`ProviderLease::prove_record_absent`].
     fn judge_record(recorded: &str) -> Result<(), String> {
@@ -268,6 +296,11 @@ mod imp {
         }
     }
 
+    /// No lease exists here, so no record can forbid a start.
+    pub fn record_forbids_start(_path: &Path) -> bool {
+        false
+    }
+
     /// Absence cannot be shown on this platform, so a new attempt is refused.
     pub fn prove_absent(_path: &Path) -> Result<(), String> {
         Err(
@@ -277,7 +310,20 @@ mod imp {
     }
 }
 
-pub use imp::{acquire, prove_absent};
+pub use imp::{acquire, prove_absent, record_forbids_start};
+
+/// Whether this platform creates provider leases at all.
+pub const PLATFORM_HAS_LEASES: bool = cfg!(unix);
+
+/// Whether a Task with no lease file may start or be promoted. A Task that has
+/// never checked out has no provider behind it. Where leases exist, any other
+/// Task is refused, because a missing lease proves nothing. Where they do not
+/// (Windows), no lease file can ever be missing for a reason, so the Task's
+/// ordinary guards decide and this one does not: absence cannot be proven there,
+/// and nothing is claimed.
+pub const fn missing_lease_admits(never_checked_out: bool, platform_has_leases: bool) -> bool {
+    never_checked_out || !platform_has_leases
+}
 
 /// Takes the lease for a launch that may write the checkout, and only when the
 /// record shows no provider left running. The record is judged under the lock
@@ -297,19 +343,24 @@ pub fn acquire_proven(path: &std::path::Path) -> Result<Option<ProviderLease>, S
 pub const UNLEASED_CHECKOUT_REFUSAL: &str =
     "This Task has a recorded checkout or run, but no provider lease exists for it, so SlashIt cannot show that no provider from an earlier run is still active.";
 
-/// [`prove_absent`] for a start that is not a new attempt. A missing lease file
-/// is not evidence of absence. It is admitted only when `never_checked_out` says
-/// the Task's own record shows no checkout and no run (see
-/// [`crate::domain::Task::never_checked_out`]), so no provider can have been
+/// [`prove_absent`] for a start that is not a new attempt. Where leases exist, a
+/// missing lease file is not evidence of absence. It is admitted only when
+/// `never_checked_out` says the Task's own record shows no checkout and no run
+/// (see [`crate::domain::Task::never_checked_out`]), so no provider can have been
 /// launched for it. Any other Task without a lease is refused. A lease file that
 /// exists must prove absence, including on a crash that left a spawn mark.
+/// Without leases (Windows) the start is not gated here; see
+/// [`missing_lease_admits`].
 pub fn prove_absent_for_start(
     path: &std::path::Path,
     never_checked_out: bool,
 ) -> Result<(), String> {
+    if !PLATFORM_HAS_LEASES {
+        return Ok(());
+    }
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if never_checked_out {
+            if missing_lease_admits(never_checked_out, PLATFORM_HAS_LEASES) {
                 Ok(())
             } else {
                 Err(UNLEASED_CHECKOUT_REFUSAL.to_string())
@@ -647,8 +698,8 @@ mod tests {
     }
 }
 
-/// Platform-neutral: the admission rule is the same on Windows, where no lease
-/// file is ever created.
+/// Platform-neutral. The Windows branch is exercised through the pure rule,
+/// because no lease file is ever created there.
 #[cfg(test)]
 mod admission_on_every_platform {
     use super::*;
@@ -658,15 +709,44 @@ mod admission_on_every_platform {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("task.lock");
         assert_eq!(prove_absent_for_start(&path, true), Ok(()));
+        assert!(missing_lease_admits(true, true));
+        assert!(missing_lease_admits(true, false));
     }
 
     #[test]
-    fn a_task_with_a_recorded_checkout_is_refused_without_a_lease_on_every_platform() {
+    fn where_leases_exist_a_checked_out_task_without_a_lease_is_refused() {
+        assert!(!missing_lease_admits(false, true));
+    }
+
+    #[test]
+    fn where_no_lease_can_exist_a_checked_out_task_is_not_gated_by_the_missing_lease() {
+        assert!(missing_lease_admits(false, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn this_platform_refuses_a_checked_out_task_without_a_lease() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("task.lock");
         assert_eq!(
             prove_absent_for_start(&path, false),
             Err(UNLEASED_CHECKOUT_REFUSAL.to_string())
         );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn this_platform_starts_a_checked_out_task_without_a_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task.lock");
+        assert_eq!(prove_absent_for_start(&path, false), Ok(()));
+        assert!(!record_forbids_start(&path));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn a_new_attempt_is_never_provable_on_this_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(prove_absent(&dir.path().join("task.lock")).is_err());
     }
 }

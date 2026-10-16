@@ -405,14 +405,24 @@ pub(crate) fn task_provider_lease_path(storage: &crate::config::Storage, task_id
         .join(format!("{task_id}.lock"))
 }
 
-/// Whether a Task that is still queued may be promoted without a provider lease
-/// on disk. It may when it has never checked out, or when its lease file exists:
-/// whether that lease proves absence is decided when the Task starts. Any other
-/// Task would be refused at its start after taking a parallel slot, so it stays
-/// in the queue until a person checks its Task Checkout.
+/// Whether a queued Task may be promoted without taking a parallel slot it
+/// could not use. Where leases exist, a Task with no lease file needs
+/// `never_checked_out`, and one whose lease record already shows a live group or
+/// an unrecorded launch is left queued, because its start would be refused. The
+/// record is read without a lock, so this never competes with a launch; it only
+/// avoids parking a Task InProgress. The start itself still proves absence.
+/// Without leases (Windows) every otherwise eligible Task is promoted.
 pub(crate) fn start_lease_admits(storage: &crate::config::Storage, task: &Task) -> bool {
-    task.never_checked_out()
-        || std::fs::symlink_metadata(task_provider_lease_path(storage, task.id)).is_ok()
+    use crate::agents::provider_lease::{
+        missing_lease_admits, record_forbids_start, PLATFORM_HAS_LEASES,
+    };
+    let path = task_provider_lease_path(storage, task.id);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            missing_lease_admits(task.never_checked_out(), PLATFORM_HAS_LEASES)
+        }
+        _ => !record_forbids_start(&path),
+    }
 }
 
 /// Takes a Task's provider lease for a launch that edits its checkout outside
@@ -17251,6 +17261,7 @@ VERDICT: APPROVED"
         /// A missing lease file does not show that an earlier provider is gone.
         /// A Task with a recorded checkout is refused on a direct start, and
         /// nothing is recorded or moved.
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_direct_start_of_a_checked_out_task_without_a_lease_is_refused() {
             let w = world(NORMAL, TaskStatus::Queue, false).await;
@@ -17283,6 +17294,7 @@ VERDICT: APPROVED"
 
         /// A recorded run is evidence of a launch even when the checkout fields
         /// are absent, so it refuses a start with no lease file too.
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_direct_start_of_a_task_with_a_recorded_run_is_refused_without_a_lease() {
             let w = world(NORMAL, TaskStatus::Queue, false).await;
@@ -17341,6 +17353,7 @@ VERDICT: APPROVED"
 
         /// A provider that still holds the lease refuses every start, whether
         /// or not the Task has checked out before.
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_direct_start_is_refused_while_a_provider_still_holds_the_lease() {
             let w = world(NORMAL, TaskStatus::Queue, false).await;
@@ -17367,6 +17380,7 @@ VERDICT: APPROVED"
         /// A poller pass declines a checked-out Task that has no lease, and
         /// writes nothing. It is not lost: once its lease shows absence, a later
         /// pass admits it.
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_pending_start_of_a_checked_out_task_without_a_lease_is_declined_and_reevaluated() {
             let w = world(NORMAL, TaskStatus::InProgress, false).await;
@@ -17406,6 +17420,7 @@ VERDICT: APPROVED"
         /// A checked-out Task with no lease is not auto-promoted, so it does not
         /// take a parallel slot that its refused start would hold while nothing
         /// runs. It stays queued, and nothing is written.
+        #[cfg(unix)]
         #[tokio::test]
         async fn a_checked_out_queued_task_without_a_lease_is_not_auto_promoted() {
             let w = world(NORMAL, TaskStatus::Queue, false).await;
@@ -17423,6 +17438,140 @@ VERDICT: APPROVED"
             assert_eq!(w.task().await.status, TaskStatus::Queue);
             assert_eq!(w.records().await, before, "nothing written");
             assert_eq!(w.events_saying("Auto-promoted from queue"), 0);
+        }
+
+        /// A queued, checked-out Task whose lease record shows a provider group
+        /// that is still running would be refused at its start, so it is not
+        /// promoted to hold a parallel slot.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_queued_task_whose_lease_shows_a_live_group_is_not_auto_promoted() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+            let lease_path = w.executor.provider_lease_path(w.task_id);
+            std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+            // This test process's own group is certainly running.
+            let live_group = unsafe { libc::getpgrp() };
+            std::fs::write(&lease_path, format!("{live_group}\n")).unwrap();
+            let before = w.records().await;
+
+            w.executor.check_and_execute().await;
+
+            assert_eq!(w.task().await.status, TaskStatus::Queue);
+            assert_eq!(w.records().await, before, "nothing written");
+            assert_eq!(w.events_saying("Auto-promoted from queue"), 0);
+            assert_eq!(std::fs::read(&lease_path).unwrap(), format!("{live_group}\n").into_bytes());
+        }
+
+        /// An unrecorded launch leaves a spawn mark; it forbids a start, so it
+        /// forbids promotion too, and the mark is kept.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_queued_task_with_a_spawn_mark_is_not_auto_promoted() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            let lease_path = w.executor.provider_lease_path(w.task_id);
+            std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+            std::fs::write(&lease_path, b"spawning\n").unwrap();
+
+            w.executor.check_and_execute().await;
+
+            assert_eq!(w.task().await.status, TaskStatus::Queue);
+            assert_eq!(w.events_saying("Auto-promoted from queue"), 0);
+            assert_eq!(std::fs::read(&lease_path).unwrap(), b"spawning\n");
+        }
+
+        /// A checked-out Task whose lease shows no provider is promoted: the
+        /// lease proves absence, and the start will confirm it.
+        #[tokio::test]
+        async fn a_queued_checked_out_task_with_an_empty_lease_is_auto_promoted() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+            let lease_path = w.executor.provider_lease_path(w.task_id);
+            std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+            std::fs::write(&lease_path, b"").unwrap();
+
+            w.executor.check_and_execute().await;
+
+            assert_eq!(w.events_saying("Auto-promoted from queue"), 1);
+        }
+
+        /// Windows has no provider lease. An ordinary retry of a Task that has a
+        /// checkout is not gated by the missing lease, so it reaches the checkout
+        /// exactly as it did before leases existed.
+        #[cfg(not(unix))]
+        #[tokio::test]
+        async fn a_direct_retry_of_a_checked_out_task_is_admitted_without_a_lease() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+
+            let _ = w.executor.execute_task(w.task_id).await;
+
+            assert_eq!(
+                w.events_saying("No worktree could be attached"),
+                1,
+                "{:?}",
+                w.agent_events()
+            );
+        }
+
+        /// The poller starts a checked-out Task on Windows as it always did.
+        #[cfg(not(unix))]
+        #[tokio::test]
+        async fn a_pending_start_of_a_checked_out_task_is_admitted_without_a_lease() {
+            let w = world(NORMAL, TaskStatus::InProgress, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+
+            let _ = w.executor.spawn_task_execution(w.task_id, None).await;
+
+            assert_eq!(
+                w.events_saying("No worktree could be attached"),
+                1,
+                "{:?}",
+                w.agent_events()
+            );
+        }
+
+        /// An eligible queued Task with a checkout is promoted on Windows; the
+        /// missing lease must not hold it in the queue.
+        #[cfg(not(unix))]
+        #[tokio::test]
+        async fn a_queued_checked_out_task_is_auto_promoted_without_a_lease() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+
+            w.executor.check_and_execute().await;
+
+            assert_eq!(w.events_saying("Auto-promoted from queue"), 1);
         }
 
         /// Disk space running out while a direct start is underway: the check
