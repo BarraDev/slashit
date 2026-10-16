@@ -1530,10 +1530,17 @@ pub(crate) mod tests {
         let error = rig.finish().await.expect_err("fail closed");
         assert!(error.to_string().contains("mandatory local IPC listener"), "{error}");
         assert!(!rig.executor.is_accepting_work());
-        assert!(
-            transport::connect(&tcp).await.is_err(),
-            "the surviving TCP listener is closed with the rest of the instance"
-        );
+        // Refusal is awaited, not read at one instant. The kernel keeps a socket
+        // in LISTEN while any copy of its descriptor exists, and another test's
+        // fork can hold one between fork and exec, so a connect can still be
+        // queued for a moment after the listener is dropped.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while transport::connect(&tcp).await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the surviving TCP listener is closed with the rest of the instance");
         drop(rig.ownership.take());
         acquire_after_release(|| rig.second_instance()).await;
     }
