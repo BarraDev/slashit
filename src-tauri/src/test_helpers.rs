@@ -516,11 +516,20 @@ pub fn plenty_of_disk() -> std::sync::Arc<crate::queue::start_guard::StartGuard>
 /// exactly this executor via `state.executor.get()`, the same as it would in
 /// the running app.
 pub fn attach_test_executor(state: &crate::AppState) -> std::sync::Arc<crate::queue::TaskExecutor> {
+    let executor = build_test_executor(state);
+    let _ = state.executor.set(executor.clone());
+    executor
+}
+
+/// An executor over `state` that is not installed in it. A second one models
+/// the process that starts after a restart: it has no memory of the runs the
+/// first one started.
+pub fn build_test_executor(state: &crate::AppState) -> std::sync::Arc<crate::queue::TaskExecutor> {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    let executor = Arc::new(crate::queue::TaskExecutor::new(
+    Arc::new(crate::queue::TaskExecutor::new(
         crate::queue::executor::TaskExecutorConfig {
             tasks: state.task.tasks.clone(),
             queue_manager: state.queue.manager.clone(),
@@ -536,9 +545,7 @@ pub fn attach_test_executor(state: &crate::AppState) -> std::sync::Arc<crate::qu
             start_guard: state.start_guard.clone(),
             pr_statuses: state.pr_statuses.clone(),
         },
-    ));
-    let _ = state.executor.set(executor.clone());
-    executor
+    ))
 }
 
 /// Same as [`attach_test_executor`], for an [`IpcContext`] rather than an
@@ -623,6 +630,8 @@ pub fn create_test_task(title: &str) -> Task {
         activity: Vec::new(),
         worker_handoff: None,
         worker_handoff_confirmed: false,
+        new_attempt: None,
+        new_attempt_confirmed: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

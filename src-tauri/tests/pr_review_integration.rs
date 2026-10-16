@@ -150,6 +150,11 @@ impl MockEnv {
         self.working_dir.display().to_string()
     }
 
+    /// The Task's provider lease for this environment, in its temporary directory.
+    fn provider_lease_path(&self) -> std::path::PathBuf {
+        self._tmp.path().join("provider-lease.lock")
+    }
+
     /// Make one fix as an agent would, commit it and push it to `origin`:
     /// the commit and the recorded effect a delivered item carries.
     fn deliver_fix(&self, file: &str) -> (String, slashit_ui_lib::domain::task::FixEffect) {
@@ -292,7 +297,7 @@ async fn dry_run_invokes_claude_only_no_gh_no_push() {
     };
 
     let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
             .await
             .expect("dry-run apply succeeds");
 
@@ -357,7 +362,7 @@ async fn full_apply_with_auto_reply_calls_gh_per_fix_item() {
     };
 
     let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
             .await
             .expect("full apply succeeds");
     // Real applies (dry_run=false) must persist on the plan so the next modal
@@ -627,7 +632,7 @@ async fn a_non_collaborator_fix_is_applied_only_after_the_user_approves_it() {
 
     let opts = AddressPrReviewOptions { auto_push: true, auto_reply: true, dry_run: false };
     let err = address_pr_review_inner(
-        task.clone(), env.working_dir_str(), merged.clone(), opts.clone(), no_progress(), never_cancelled(),
+        task.clone(), env.working_dir_str(), merged.clone(), opts.clone(), no_progress(), never_cancelled(), env.provider_lease_path(),
     )
     .await
     .expect_err("nothing is approved yet");
@@ -640,7 +645,7 @@ async fn a_non_collaborator_fix_is_applied_only_after_the_user_approves_it() {
     approved.items[0].approved = true;
     let opts = AddressPrReviewOptions { auto_push: true, ..opts };
     let (result, _) = address_pr_review_inner(
-        task, env.working_dir_str(), approved, opts, no_progress(), never_cancelled(),
+        task, env.working_dir_str(), approved, opts, no_progress(), never_cancelled(), env.provider_lease_path(),
     )
     .await
     .expect("the approved fix is applied");
@@ -683,7 +688,7 @@ async fn empty_approved_set_returns_error_and_does_not_call_claude() {
         dry_run: false,
     };
 
-    let err = address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
+    let err = address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
         .await
         .expect_err("should error when no items are approved");
     assert!(err.contains("No approved fix items"), "got: {err}");
@@ -800,7 +805,7 @@ async fn per_item_apply_invokes_claude_per_fix_and_emits_progress_events() {
         captured_clone.lock().unwrap().push(ev);
     });
 
-    let (result, _plan) = address_pr_review_inner(task, env.working_dir_str(), plan, opts, sink, never_cancelled())
+    let (result, _plan) = address_pr_review_inner(task, env.working_dir_str(), plan, opts, sink, never_cancelled(), env.provider_lease_path())
         .await
         .expect("two-fix apply succeeds");
 
@@ -859,7 +864,7 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
 
     // Round 1
     let (round1, plan_after_round1) =
-        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts.clone(), no_progress(), never_cancelled())
+        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts.clone(), no_progress(), never_cancelled(), env.provider_lease_path())
             .await
             .expect("round 1 succeeds");
     assert_eq!(round1.fixed_ids, vec![301, 302]);
@@ -877,7 +882,7 @@ async fn rerunning_apply_skips_already_done_items_and_runs_claude_only_for_pendi
 
     // Round 2 — same task, the now-stamped plan
     let (round2, plan_after_round2) =
-        address_pr_review_inner(task, env.working_dir_str(), plan_after_round1, opts, no_progress(), never_cancelled())
+        address_pr_review_inner(task, env.working_dir_str(), plan_after_round1, opts, no_progress(), never_cancelled(), env.provider_lease_path())
             .await
             .expect("round 2 succeeds");
     assert_eq!(env.claude_invocations(), claude_calls_round1,
@@ -925,7 +930,7 @@ async fn rerunning_apply_with_only_replies_pending_skips_claude() {
     };
 
     let (result, updated_plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
             .await
             .expect("recovery apply succeeds");
 
@@ -1070,7 +1075,7 @@ async fn an_unpushed_fix_gets_no_reply_from_apply_or_sync() {
     let opts = AddressPrReviewOptions { auto_push: false, auto_reply: true, dry_run: false };
 
     let (result, mut plan) =
-        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
+        address_pr_review_inner(task.clone(), env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
             .await
             .expect("full apply succeeds");
     assert_eq!(result.fixed_ids, vec![101]);
@@ -1275,7 +1280,7 @@ async fn apply_reruns_the_fix_for_a_comment_edited_after_the_apply_that_fixed_it
     let opts = AddressPrReviewOptions { auto_push: false, auto_reply: false, dry_run: false };
 
     let (result, _plan) =
-        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled())
+        address_pr_review_inner(task, env.working_dir_str(), plan, opts, no_progress(), never_cancelled(), env.provider_lease_path())
             .await
             .expect("apply succeeds");
 

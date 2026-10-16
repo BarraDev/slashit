@@ -209,6 +209,8 @@ pub async fn import_jira_issues(
             activity: Vec::new(),
             worker_handoff: None,
             worker_handoff_confirmed: false,
+            new_attempt: None,
+            new_attempt_confirmed: false,
             created_at: now,
             updated_at: now,
         };

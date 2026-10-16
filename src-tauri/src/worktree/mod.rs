@@ -1,8 +1,10 @@
 mod branch;
+pub mod checkout_fingerprint;
 mod commit;
 mod default_base;
 pub mod delivery;
 mod diff;
+pub mod new_attempt;
 pub mod integration;
 mod manager;
 mod orphans;

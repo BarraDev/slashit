@@ -944,17 +944,17 @@ async fn fail_and_retry_in_the_drawer(
 
     // Re-queued through the existing lifecycle: out of Error, the failure
     // cleared by the product's own reset, and the attempt's work kept for the
-    // next run to continue from.
+    // next run to continue from. The click returns once the event is dispatched,
+    // before the Retry command has reached the backend, so the Task still reads
+    // "error" for a moment. Error is therefore not a status to settle on: a Retry
+    // that never takes effect ends in the deadline, naming the status last seen.
     let requeued = await_status(
         driver,
         &project_id,
         &task_id,
-        &["queue", "in_progress", "ai_review", "human_review", "error"],
+        &["queue", "in_progress", "ai_review", "human_review"],
     )
     .await?;
-    if status_of(&requeued) == Some("error") {
-        bail!("pressing Retry left the task in error");
-    }
     await_absent_from_drawer(driver, DRAWER_RETRY, "Retry, once the task is queued again").await?;
     let kept_branch = requeued.get("branch_name").and_then(Value::as_str);
     if kept_branch != Some(failed_branch.as_str()) {

@@ -765,6 +765,14 @@ async fn repository_paths_by_project(state: &AppState) -> HashMap<uuid::Uuid, St
 fn migrate_task(task: &mut Task) -> bool {
     let mut changed = false;
 
+    // A new-attempt decision is confirmed only by a durable write made in the
+    // process that holds it. One loaded from disk never authorizes a launch, so
+    // startup drops it and the person decides again. If this write does not
+    // persist, the decision stays inert: its confirmation is never stored.
+    if task.new_attempt.take().is_some() {
+        changed = true;
+    }
+
     // Model names used to be pinned to a specific Claude release. They are now
     // resolved at run time, so an old pin would request a model that no longer
     // exists.
@@ -1660,6 +1668,29 @@ mod tests {
         assert_eq!(task.phase_progress, 0);
         assert_eq!(task.overall_progress, 0);
         assert!(task.error_message.is_none());
+    }
+
+    /// A decision read from disk was confirmed by a process that has ended, so
+    /// startup drops it and the person decides again. A clean task is untouched.
+    #[test]
+    fn a_new_attempt_decision_loaded_from_disk_is_dropped_at_startup() {
+        let mut task = task_with(domain::TaskStatus::Error, domain::TaskPhase::Idle, "default");
+        task.new_attempt = Some(domain::task::NewAttemptDecision {
+            decision_id: uuid::Uuid::new_v4(),
+            for_run: 1,
+            recovery_reason: "interrupted".into(),
+            branch: "task/example".into(),
+            checkout_path: "/checkouts/example".into(),
+            observed_commit: None,
+            expected_head: "a".repeat(40),
+            dirty_fingerprint: "sha256:0".into(),
+            dirty_paths: Vec::new(),
+            authorized_at: chrono::Utc::now(),
+        });
+
+        assert!(migrate_task(&mut task));
+        assert!(task.new_attempt.is_none());
+        assert!(!migrate_task(&mut task));
     }
 
     #[test]

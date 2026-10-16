@@ -649,3 +649,254 @@ fn mutate_task_record(
     }
     bail!("no persisted Task record for {task_id}")
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recovered_worker_starts_a_new_attempt_only_after_a_person_confirms() {
+    let context = TestContext::new("worker_recovery_new_attempt").expect("harness setup");
+    let result = new_attempt_journey(&context).await;
+    context.finish(result);
+}
+
+async fn new_attempt_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+    let agent = FakeAgent::install(&root)?;
+    let block_dir = agent.block_agent_runs()?;
+    context.set_child_env("PATH", agent.path_value());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
+    context.set_child_env(fake_agent::WRITE_FILE_VAR, "preserved-uncommitted.txt");
+    context.set_child_env(fake_agent::BLOCK_DIR_VAR, block_dir.as_os_str());
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+    let closed = Ok(());
+
+    // An interrupted Worker: its provider is stopped mid-run with uncommitted
+    // output in the Task Checkout. The run's outcome is unknown.
+    let session = context.start_session("new-attempt-interrupted").await?;
+    let (project_id, task_id, title, worktree, branch, first_pid) = async {
+        let project_id = register_project(session.driver(), &repository).await?;
+        let (task_id, title) =
+            create_task(session.driver(), &project_id, "New attempt", &[]).await?;
+        ui::invoke(
+            session.driver(),
+            "update_task_status",
+            json!({ "taskId": task_id, "status": "in_progress" }),
+        )
+        .await?;
+        let _ = await_status(session.driver(), &project_id, &task_id, &["in_progress"]).await?;
+        for _ in 0..EXECUTION_DEADLINE.as_secs() {
+            if !agent.blocked_pids()?.is_empty() {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        if agent.blocked_pids()?.is_empty() {
+            bail!("the fake Worker never reached its deterministic blocked point");
+        }
+        let provider_pid = agent.blocked_pids()?[0];
+        let listed = ui::invoke(
+            session.driver(),
+            "list_tasks",
+            json!({ "projectId": project_id }),
+        )
+        .await?;
+        let found = find_task(&listed, &task_id).context("interrupted Task disappeared")?;
+        let worktree = found
+            .get("worktree_path")
+            .and_then(Value::as_str)
+            .context("Task Checkout was not recorded")?
+            .to_string();
+        let branch = branch_name_of(&found)?;
+        Ok::<_, anyhow::Error>((project_id, task_id, title, worktree, branch, provider_pid))
+    }
+    .await?;
+    ui::invoke(
+        session.driver(),
+        "stop_task_execution",
+        json!({ "taskId": task_id }),
+    )
+    .await?;
+    let stopped_at = Instant::now();
+    while agent.is_running(first_pid) && stopped_at.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(POLL).await;
+    }
+    if agent.is_running(first_pid) {
+        bail!("the product's Stop returned but fake provider {first_pid} remained alive");
+    }
+    context
+        .close_session(session, "new-attempt-interrupted", &closed)
+        .await?;
+    let before_tip = repository
+        .branch_tip(&branch)?
+        .context("Task branch disappeared on shutdown")?;
+
+    // The decision is made in the drawer, from what it shows. Nothing starts
+    // until the person confirms the exact attempt.
+    let session = context.start_session("new-attempt-decision").await?;
+    let task = await_status(
+        session.driver(),
+        &project_id,
+        &task_id,
+        &["backlog", "error", "in_progress"],
+    )
+    .await?;
+    let stage = task
+        .get("worker_handoff")
+        .and_then(|handoff| handoff.get("stage"))
+        .and_then(|stage| stage.get("state"))
+        .and_then(Value::as_str);
+    if stage != Some("recovery_required") {
+        bail!("the interrupted Worker was not held for recovery: {task}");
+    }
+    super::open_drawer(session.driver(), &task_id, &title).await?;
+    let shown = ui::visible(
+        session.driver(),
+        "[data-testid=\"new-attempt-evidence\"]",
+    )
+    .await?
+    .prop("textContent")
+    .await?
+    .unwrap_or_default();
+    for fact in ["Interrupted run: 1", &branch, &worktree] {
+        if !shown.contains(fact) {
+            bail!("the new-attempt evidence omits {fact:?}: {shown}");
+        }
+    }
+    let dirty = ui::visible(session.driver(), "[data-testid=\"new-attempt-dirty\"]")
+        .await?
+        .prop("textContent")
+        .await?
+        .unwrap_or_default();
+    if !dirty.contains("preserved-uncommitted.txt") {
+        bail!("the uncommitted work the attempt would commit is not shown: {dirty}");
+    }
+    let effects = ui::visible(session.driver(), "[data-testid=\"new-attempt-effects\"]")
+        .await?
+        .prop("textContent")
+        .await?
+        .unwrap_or_default();
+    for warning in ["git add -A", "shell commands"] {
+        if !effects.contains(warning) {
+            bail!("the effects of starting omit {warning:?}: {effects}");
+        }
+    }
+    if coding_runs(&agent)? != 1 {
+        bail!("reading the evidence started a Worker");
+    }
+
+    // Confirmation is explicit: the confirmation opens, its acknowledgement is
+    // required, and only then does the start button act.
+    driver_click(session.driver(), "[data-testid=\"new-attempt-review\"]").await?;
+    ui::visible(session.driver(), "[data-testid=\"new-attempt-confirm\"]").await?;
+    driver_click(session.driver(), "[data-testid=\"new-attempt-acknowledge\"]").await?;
+    driver_click(session.driver(), "[data-testid=\"new-attempt-start\"]").await?;
+
+    let launched_at = Instant::now();
+    let second_pid = loop {
+        if let Some(pid) = agent.blocked_pids()?.into_iter().find(|pid| *pid != first_pid) {
+            break pid;
+        }
+        if launched_at.elapsed() > EXECUTION_DEADLINE {
+            bail!("the new attempt never launched its provider");
+        }
+        tokio::time::sleep(POLL).await;
+    };
+    let record = read_task_record(&root, &task_id)?;
+    if record.get("new_attempt").is_some() {
+        bail!("the authorization was not consumed by the start that launched");
+    }
+    let activity = record
+        .get("activity")
+        .and_then(toml::Value::as_array)
+        .context("activity timeline is missing")?;
+    let kinds: Vec<&str> = activity
+        .iter()
+        .filter_map(|entry| entry.get("kind")?.get("type")?.as_str())
+        .collect();
+    let runs_started_2 = activity
+        .iter()
+        .filter(|entry| {
+            entry.get("kind").and_then(|k| k.get("type")).and_then(toml::Value::as_str)
+                == Some("run_started")
+                && entry.get("kind").and_then(|k| k.get("run")).and_then(toml::Value::as_integer)
+                    == Some(2)
+        })
+        .count();
+    if runs_started_2 != 1 || !kinds.contains(&"new_attempt_authorized") {
+        bail!("the timeline does not show one authorization and one new run: {kinds:?}");
+    }
+    if repository.branch_tip(&branch)?.as_deref() != Some(before_tip.as_str()) {
+        bail!("starting the new attempt changed the branch tip");
+    }
+    if std::fs::read_to_string(Path::new(&worktree).join("preserved-uncommitted.txt"))
+        .ok()
+        .as_deref()
+        != Some(fake_agent::WORK_CONTENT)
+    {
+        bail!("starting the new attempt changed the preserved checkout");
+    }
+    if coding_runs(&agent)? != 2 {
+        bail!("the new attempt did not launch exactly one new Worker");
+    }
+
+    ui::invoke(
+        session.driver(),
+        "stop_task_execution",
+        json!({ "taskId": task_id }),
+    )
+    .await?;
+    let stopped_at = Instant::now();
+    while agent.is_running(second_pid) && stopped_at.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(POLL).await;
+    }
+    if agent.is_running(second_pid) {
+        bail!("the product's Stop returned but the new attempt's provider remained alive");
+    }
+    context
+        .close_session(session, "new-attempt-decision", &closed)
+        .await?;
+
+    // A restart after the new run was stopped holds it for a person again and
+    // launches nothing: the decision was consumed, and a new one is required.
+    let session = context.start_session("new-attempt-restart").await?;
+    let task = await_status(
+        session.driver(),
+        &project_id,
+        &task_id,
+        &["backlog", "error", "in_progress"],
+    )
+    .await?;
+    let handoff = task
+        .get("worker_handoff")
+        .context("the new attempt's handoff disappeared")?;
+    if handoff.get("run").and_then(Value::as_u64) != Some(2)
+        || handoff
+            .get("stage")
+            .and_then(|stage| stage.get("state"))
+            .and_then(Value::as_str)
+            != Some("recovery_required")
+    {
+        bail!("the stopped new attempt was not held for recovery after restart: {handoff}");
+    }
+    if coding_runs(&agent)? != 2 {
+        bail!("restart launched a Worker that was not authorized");
+    }
+    super::open_drawer(session.driver(), &task_id, &title).await?;
+    ui::visible(session.driver(), "[data-testid=\"new-attempt-panel\"]").await?;
+    context
+        .close_session(session, "new-attempt-restart", &closed)
+        .await
+}
+
+/// The coding runs the fake provider has seen: runs that carried a prompt and
+/// the Bash tool, as the ordinary coding Worker does.
+fn coding_runs(agent: &FakeAgent) -> Result<usize> {
+    Ok(agent_runs(agent)?
+        .iter()
+        .filter(|run| {
+            run.prompt.is_some()
+                && run
+                    .flag("--allowedTools")
+                    .is_some_and(|tools| tools.to_string_lossy().contains("Bash"))
+        })
+        .count())
+}

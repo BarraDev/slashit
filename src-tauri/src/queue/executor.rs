@@ -1,6 +1,7 @@
 use crate::agents::runner::{ClaudeEvent, ClaudeRunConfig, ClaudeRunner, ToolAccess};
 use crate::domain::task::ActivityKind;
 use crate::domain::task::ExternalRef;
+use crate::domain::task::NewAttemptDecision;
 use crate::domain::{
     AgentExecution, AgentLogEntry, AgentStatus, BranchOrigin, LogLevel, QaSignoff, QaStatus, Task,
     TaskPhase, TaskStatus,
@@ -24,6 +25,9 @@ struct RunStart {
     working_dir: String,
     /// The run's number, as its recorded [`ActivityKind::RunStarted`] has it.
     run: u32,
+    /// The Task's provider lease, held until the provider is spawned with it.
+    /// `None` where the platform has no lease.
+    lease: Option<crate::agents::provider_lease::ProviderLease>,
 }
 
 #[derive(Debug)]
@@ -388,6 +392,51 @@ enum FixOutcome {
     Cancelled,
     /// The run could not start, exited non-zero, or reported an error.
     Failed(String),
+}
+
+/// The lease file of a Task: one lock per Task, shared by every launch that can
+/// edit its checkout (Task Worker, review fix agent, PR apply helper and
+/// Conversation Worker), so that they contend for the same lock.
+pub(crate) fn task_provider_lease_path(storage: &crate::config::Storage, task_id: Uuid) -> std::path::PathBuf {
+    storage
+        .paths()
+        .data_dir()
+        .join("provider-leases")
+        .join(format!("{task_id}.lock"))
+}
+
+/// Whether a queued Task may be promoted without taking a parallel slot it
+/// could not use. Where leases exist, a Task with no lease file needs
+/// `never_checked_out`, and one whose lease record already shows a live group or
+/// an unrecorded launch is left queued, because its start would be refused. The
+/// record is read without a lock, so this never competes with a launch; it only
+/// avoids parking a Task InProgress. The start itself still proves absence.
+/// Without leases (Windows) every otherwise eligible Task is promoted.
+pub(crate) fn start_lease_admits(storage: &crate::config::Storage, task: &Task) -> bool {
+    use crate::agents::provider_lease::{
+        missing_lease_admits, record_forbids_start, PLATFORM_HAS_LEASES,
+    };
+    let path = task_provider_lease_path(storage, task.id);
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            missing_lease_admits(task.never_checked_out(), PLATFORM_HAS_LEASES)
+        }
+        _ => !record_forbids_start(&path),
+    }
+}
+
+/// Takes a Task's provider lease for a launch that edits its checkout outside
+/// the Task Worker path. `Ok(None)` only on a platform without leases, where the
+/// launch runs as it did before. Refused while another provider still holds the
+/// lock, so nothing is launched into a checkout a provider may still be writing.
+pub(crate) fn acquire_task_provider_lease(
+    storage: &crate::config::Storage,
+    task_id: Uuid,
+) -> Result<Option<crate::agents::provider_lease::ProviderLease>, String> {
+    crate::agents::provider_lease::acquire_proven(&task_provider_lease_path(storage, task_id))
+        .map_err(|error| {
+            format!("The Task's provider lease could not be taken; nothing was launched: {error}")
+        })
 }
 
 /// The outcome of a fix-agent run. Only a successful run applied fixes: one
@@ -957,6 +1006,11 @@ enum StartRequest {
     /// A person asking for a `Queue` or `InProgress` task to start now. A
     /// task not already waiting to run is moved there as part of the start.
     Direct,
+    /// A person's new attempt on a recovered run, admitted only for the
+    /// authorization `decision_id` that is confirmed in this process and still
+    /// matches the recovery evidence. It is the only request that may pass
+    /// [`Task::worker_recovery_refusal`], and it does so for that one decision.
+    NewAttempt { decision_id: Uuid },
 }
 
 /// Emit an `AgentEvent` through any sink.
@@ -2063,7 +2117,9 @@ impl TaskExecutor {
                 };
 
                 let manager = self.queue_manager.read().await;
-                let select = |tasks: &HashMap<Uuid, Task>| manager.select_promotable(tasks);
+                let select = |tasks: &HashMap<Uuid, Task>| {
+                    manager.select_promotable(tasks, |task| start_lease_admits(&self.storage, task))
+                };
                 let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {
                     if let Some(task) = staged.get_mut(&task_id) {
                         QueueManager::apply_promotion(task);
@@ -3296,11 +3352,27 @@ impl TaskExecutor {
     /// board, its checkout is one the published board references, and taking
     /// it back would delete recorded state. The message says what was kept,
     /// if anything.
+    #[cfg(test)]
     async fn record_run_start(
         &self,
         task_id: Uuid,
         repo_path: &str,
         acquired: Acquired,
+    ) -> Result<RunStart, RunStartError> {
+        self.record_run_start_for(task_id, repo_path, acquired, None)
+            .await
+    }
+
+    /// [`Self::record_run_start`] for a run that may be a new attempt. For one,
+    /// the authorization is consumed in the same board write that records the
+    /// run's start, and only if the Task still matches it. Otherwise nothing is
+    /// written and the checkout is left as it was.
+    async fn record_run_start_for(
+        &self,
+        task_id: Uuid,
+        repo_path: &str,
+        acquired: Acquired,
+        new_attempt: Option<&NewAttemptDecision>,
     ) -> Result<RunStart, RunStartError> {
         let (branch, start_head) =
             match Self::checkout_branch_head(&acquired.info.path, &acquired.info.branch).await {
@@ -3316,6 +3388,16 @@ impl TaskExecutor {
                     return Err(RunStartError::Refused(message));
                 }
             };
+        if let Some(decision) = new_attempt {
+            if start_head != decision.expected_head {
+                self.worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                return Err(RunStartError::Refused(
+                    "The branch HEAD changed before the new attempt could start. Nothing was recorded or launched; inspect the Task again.".into(),
+                ));
+            }
+        }
         let project_id = self
             .tasks
             .read()
@@ -3362,9 +3444,43 @@ impl TaskExecutor {
                 "The Task Project's registered repository does not match the acquired Task Checkout; the Worker was not launched.".into(),
             ));
         }
+        // Taken before the Started write, so that a Started record can never exist
+        // without the lease a provider would hold. A crash after the spawn mark is
+        // written leaves that mark, which a later attempt cannot prove absent: it
+        // needs a person to inspect the checkout. A refusal below drops it unused.
+        let lease = match crate::agents::provider_lease::acquire_proven(&self.provider_lease_path(task_id)) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                return Err(RunStartError::Refused(format!(
+                    "The Task's provider lease could not be taken; the Worker was not launched: {error}"
+                )));
+            }
+        };
         let run = std::sync::atomic::AtomicU32::new(0);
+        let consumed = std::sync::atomic::AtomicBool::new(false);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
+                if let Some(decision) = new_attempt {
+                    // Only the decision the person made may start this run, and
+                    // only while the Task still records exactly that recovery.
+                    let still_authorized = t.new_attempt_admits()
+                        && t.new_attempt.as_ref().map(|d| d.decision_id)
+                            == Some(decision.decision_id)
+                        && t.next_run() == decision.for_run + 1;
+                    if !still_authorized {
+                        return;
+                    }
+                    QueueManager::apply_promotion(t);
+                    // Consumed by this same record: the start cannot be recorded
+                    // without the authorization ending, and the authorization
+                    // cannot end without the run starting.
+                    t.new_attempt = None;
+                    t.new_attempt_confirmed = false;
+                    consumed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 t.worktree_path = Some(acquired.info.path.clone());
                 t.branch_name = Some(acquired.info.branch.clone());
                 if let Some(base_commit) = &acquired.base_commit {
@@ -3396,11 +3512,23 @@ impl TaskExecutor {
             }
         };
         match crate::lifecycle::record_typed(&self.tasks, &self.storage, task_id, &amend).await {
+            // The write was made, but the new attempt's authorization was not
+            // consumed by it, so nothing started. The checkout is released only if
+            // SlashIt created it in this call.
+            Ok(()) if new_attempt.is_some() && !consumed.load(std::sync::atomic::Ordering::Relaxed) => {
+                self.worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                Err(RunStartError::Refused(
+                    "The authorization for this new attempt no longer matches the Task. Nothing was recorded or launched; inspect the Task again.".into(),
+                ))
+            }
             // `record` fails for a task that is not on the board, so a
             // successful write always ran the amend on it.
             Ok(()) => Ok(RunStart {
                 working_dir: acquired.info.path,
                 run: run.load(std::sync::atomic::Ordering::Relaxed),
+                lease,
             }),
             Err(error) => {
                 let published = matches!(
@@ -3411,12 +3539,24 @@ impl TaskExecutor {
                     // The visible board now owns the checkout. Persist an
                     // explicit hold where possible; never launch from an
                     // unconfirmed start record.
-                    let _ = Self::record_recovery_required(
-                        &self.tasks, &self.storage, task_id, Some(run.load(std::sync::atomic::Ordering::Relaxed)), None,
+                    let held_run = match run.load(std::sync::atomic::Ordering::Relaxed) {
+                        0 => new_attempt.map(|decision| decision.for_run),
+                        started => Some(started),
+                    };
+                    let hold = Self::record_recovery_required(
+                        &self.tasks, &self.storage, task_id, held_run, None,
                         "The run-start record is visible but its durability is unconfirmed. The Worker was not launched; inspect this Task before continuing.",
                     ).await;
+                    // A hold that is not published leaves the board showing the
+                    // start. The caller is told, because the file is the authority.
+                    let hold_note = match hold {
+                        Ok(()) => String::new(),
+                        Err(error) => format!(
+                            " The recovery hold could not be recorded either ({error}), so the board may keep showing this run as started until the next successful save or a restart."
+                        ),
+                    };
                     format!(
-                        "the checkout at {} was preserved because its board record is visible",
+                        "the checkout at {} was preserved because its board record is visible{hold_note}",
                         acquired.info.path
                     )
                 } else {
@@ -3517,6 +3657,130 @@ impl TaskExecutor {
             .await
     }
 
+    /// Starts the new attempt that a person authorized as `decision_id` on
+    /// `task_id`'s recovered run. It shares [`Self::execute_task`]'s admission,
+    /// capacity and lease; only the request differs, so the authorization is the
+    /// one thing that can lift the recovery refusal.
+    pub async fn start_new_attempt(&self, task_id: Uuid, decision_id: Uuid) -> Result<(), String> {
+        let _process_admission = self.process_admission.enter()?;
+        self.start_guard
+            .check()
+            .await
+            .map_err(|block| block.to_string())?;
+        self.reconcile_admission().await;
+        let lease = self.lifecycle.acquire(task_id).await?;
+        if !self
+            .start_execution_under_lease(
+                &lease,
+                task_id,
+                StartRequest::NewAttempt { decision_id },
+                None,
+            )
+            .await?
+        {
+            return Err(format!(
+                "task {task_id} could not start its new attempt right now. Nothing was recorded \
+                 or launched; try again in a moment."
+            ));
+        }
+        Ok(())
+    }
+
+    /// The Task's provider lease file, under the application data directory.
+    pub(crate) fn provider_lease_path(&self, task_id: Uuid) -> std::path::PathBuf {
+        task_provider_lease_path(&self.storage, task_id)
+    }
+
+    /// The Task-side checks of a new attempt, made under the lease. The Git
+    /// checks follow once the checkout is known, in
+    /// [`Self::confirm_new_attempt_checkout`].
+    fn new_attempt_gate(
+        task: &Task,
+        decision_id: Uuid,
+    ) -> Result<crate::domain::task::NewAttemptDecision, String> {
+        if !matches!(task.status, TaskStatus::Error | TaskStatus::Backlog) {
+            return Err(format!(
+                "A new attempt needs the Task in Error or Backlog, but it is in {:?}.",
+                task.status
+            ));
+        }
+        if task.cleanup_in_flight {
+            return Err(
+                "This task has a worktree cleanup that was interrupted and not yet resolved; it \
+                 needs attention before a new attempt."
+                    .to_string(),
+            );
+        }
+        if task.local_integration.is_some() || task.pr_url.is_some() {
+            return Err(
+                "This task has a local integration or pull request in progress; it cannot start a new attempt."
+                    .to_string(),
+            );
+        }
+        let decision = task
+            .new_attempt
+            .as_ref()
+            .ok_or("No new attempt is authorized for this Task.")?;
+        if decision.decision_id != decision_id {
+            return Err(
+                "This authorization was replaced by a later decision. Decide again.".to_string(),
+            );
+        }
+        if !task.new_attempt_confirmed {
+            return Err(
+                "This authorization is not confirmed in this session. Decide again.".to_string(),
+            );
+        }
+        if !task.new_attempt_admits() {
+            return Err(
+                "The recovery evidence changed after you authorized this attempt. Inspect the \
+                 Task again and decide again."
+                    .to_string(),
+            );
+        }
+        Ok(decision.clone())
+    }
+
+    /// Reads the checkout a new attempt would build on, and refuses unless it
+    /// is exactly the checkout `decision` was made on.
+    async fn confirm_new_attempt_checkout(
+        &self,
+        task_id: Uuid,
+        repo_path: &str,
+        decision: &crate::domain::task::NewAttemptDecision,
+    ) -> Result<(), String> {
+        let (project_id, recorded_path, recorded_branch) = {
+            let tasks = self.tasks.read().await;
+            let task = tasks.get(&task_id).ok_or("Task not found")?;
+            (
+                task.project_id,
+                task.worktree_path.clone(),
+                task.branch_name.clone(),
+            )
+        };
+        crate::worktree::new_attempt::board_can_confirm(&self.storage, project_id)?;
+        if recorded_branch.as_deref() != Some(decision.branch.as_str()) {
+            return Err(
+                "The Task's branch differs from the one you inspected. Nothing was started; inspect the Task again."
+                    .to_string(),
+            );
+        }
+        if recorded_path.as_deref() != Some(decision.checkout_path.as_str()) {
+            return Err(
+                "The Task Checkout is no longer the one you inspected. Nothing was started; \
+                 inspect the Task again."
+                    .to_string(),
+            );
+        }
+        let inspection = crate::worktree::new_attempt::inspect(
+            repo_path,
+            &decision.checkout_path,
+            &decision.branch,
+        )
+        .await?;
+        crate::worktree::new_attempt::confirm(decision, &inspection)
+    }
+
     /// The one place a task execution is decided, under the lease, so no
     /// other lifecycle transition can land between the answer and the start
     /// it allowed. A live owner, the task's own state, the unrecorded-worktree
@@ -3537,11 +3801,18 @@ impl TaskExecutor {
         if self.is_task_running(task_id).await {
             return match request {
                 StartRequest::Pending => Ok(false),
-                StartRequest::Direct => {
+                StartRequest::Direct | StartRequest::NewAttempt { .. } => {
                     Err(format!("task {task_id} already has an agent working on it"))
                 }
             };
         }
+
+        // The authorized decision, when this is a new attempt. Read under the
+        // lease below, and used again for the Git checks before anything is written.
+        let mut authorized: Option<NewAttemptDecision> = None;
+        // The identity of the checkout's `.git` entry before attaching. A checkout
+        // that was removed and re-created in between is not the one that was confirmed.
+        let mut checkout_before: Option<String> = None;
 
         // Re-read under the lease. Whatever the caller saw before waiting
         // for it may no longer be true, and a task that has since been
@@ -3556,7 +3827,7 @@ impl TaskExecutor {
             if let Some(refusal) = task.and_then(Task::republish_pending_refusal) {
                 return match request {
                     StartRequest::Pending => Ok(false),
-                    StartRequest::Direct => Err(refusal),
+                    StartRequest::Direct | StartRequest::NewAttempt { .. } => Err(refusal),
                 };
             }
             match request {
@@ -3564,6 +3835,22 @@ impl TaskExecutor {
                     Some(task) if Self::is_pending(task) => false,
                     _ => return Ok(false),
                 },
+                StartRequest::NewAttempt { decision_id } => {
+                    let task = task.ok_or("Task not found")?;
+                    authorized = Some(Self::new_attempt_gate(task, decision_id)?);
+                    // A provider of the interrupted run may still be editing this
+                    // checkout. Only a proof of absence admits the new attempt.
+                    if let Err(reason) = crate::agents::provider_lease::prove_absent(
+                        &self.provider_lease_path(task_id),
+                    ) {
+                        return Err(format!(
+                            "{reason} Nothing was recorded or launched. Inspect the Task Checkout before any new attempt."
+                        ));
+                    }
+                    // Promotion to In Progress is part of the one record that
+                    // starts the run, so no separate write is made here.
+                    false
+                }
                 StartRequest::Direct => {
                     let task = task.ok_or("Task not found")?;
                     if let Some(refusal) = task.worker_recovery_refusal() {
@@ -3591,6 +3878,33 @@ impl TaskExecutor {
             }
         };
         self.refuse_while_unrecorded_backoff(task_id)?;
+
+        // Every start that is not a new attempt is refused while a provider that
+        // may still be writing this checkout has no proof of absence. The lock
+        // alone does not cover this: a provider whose group was never recorded
+        // can leave a free lock behind, and the lease taken below would then
+        // replace the only evidence of it. Read-only, so it runs before any write.
+        if !matches!(request, StartRequest::NewAttempt { .. }) {
+            // Read under the lifecycle lease, so no run can record a checkout
+            // between this reading and the check that uses it.
+            let never_checked_out = self
+                .tasks
+                .read()
+                .await
+                .get(&task_id)
+                .is_some_and(Task::never_checked_out);
+            if let Err(reason) = crate::agents::provider_lease::prove_absent_for_start(
+                &self.provider_lease_path(task_id),
+                never_checked_out,
+            ) {
+                return match request {
+                    StartRequest::Pending => Ok(false),
+                    StartRequest::Direct | StartRequest::NewAttempt { .. } => Err(format!(
+                        "{reason} Nothing was recorded or launched. Inspect the Task Checkout before starting it again."
+                    )),
+                };
+            }
+        }
 
         // Disk space, before capacity and before anything below writes the
         // task, creates a checkout, a branch or an agent. A refusal changes
@@ -3664,18 +3978,31 @@ impl TaskExecutor {
                     task_id: task_id.to_string(),
                     message: format!("Cannot resolve working directory: {}", e),
                 });
-                Self::set_task_error_static(
-                    &self.tasks,
-                    &self.storage,
-                    &self.events,
-                    task_id,
-                    &e,
-                    None,
-                )
-                .await;
+                // A refused new attempt changes nothing on the Task: its recovery
+                // stays the record of what happened.
+                if authorized.is_none() {
+                    Self::set_task_error_static(
+                        &self.tasks,
+                        &self.storage,
+                        &self.events,
+                        task_id,
+                        &e,
+                        None,
+                    )
+                    .await;
+                }
                 return Err(format!("Cannot resolve working directory: {e}"));
             }
         };
+
+        // A new attempt starts only on the checkout the person inspected. This
+        // reads before anything is attached or written, so a mismatch leaves the
+        // Task exactly as it was.
+        if let Some(decision) = authorized.as_ref() {
+            self.confirm_new_attempt_checkout(task_id, &repo_path, decision)
+                .await?;
+            checkout_before = crate::worktree::new_attempt::git_entry_identity(&decision.checkout_path);
+        }
 
         let (existing_branch, acquired) = self.acquire_task_worktree(task_id, &repo_path).await;
 
@@ -3691,19 +4018,47 @@ impl TaskExecutor {
                     task_id: task_id.to_string(),
                     message: message.clone(),
                 });
-                Self::set_task_error_static(
-                    &self.tasks,
-                    &self.storage,
-                    &self.events,
-                    task_id,
-                    &message,
-                    None,
-                )
-                .await;
+                if authorized.is_none() {
+                    Self::set_task_error_static(
+                        &self.tasks,
+                        &self.storage,
+                        &self.events,
+                        task_id,
+                        &message,
+                        None,
+                    )
+                    .await;
+                }
                 return Err(message);
             }
         };
 
+        if let Some(decision) = authorized.as_ref() {
+            // Attaching must have reused the inspected checkout, never created one.
+            // Read again now, after the attach, and undo only what this call created.
+            let reused = acquired.created_at.is_none()
+                && acquired.info.path == decision.checkout_path
+                && checkout_before.is_some()
+                && crate::worktree::new_attempt::git_entry_identity(&decision.checkout_path)
+                    == checkout_before;
+            let checked = if reused {
+                crate::worktree::new_attempt::inspect(
+                    &repo_path,
+                    &decision.checkout_path,
+                    &decision.branch,
+                )
+                .await
+                .and_then(|inspection| crate::worktree::new_attempt::confirm(decision, &inspection))
+            } else {
+                Err("The attached checkout is not the one you inspected. Nothing was started; inspect the Task again.".into())
+            };
+            if let Err(refusal) = checked {
+                self.worktree_manager
+                    .release_unrecorded(&repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                return Err(refusal);
+            }
+        }
         self.events.agent_event(AgentEvent::Log {
             task_id: task_id.to_string(),
             level: LogLevel::Info,
@@ -3718,8 +4073,14 @@ impl TaskExecutor {
                     .to_string(),
             });
         }
-        let RunStart { working_dir, run } =
-            match self.record_run_start(task_id, &repo_path, acquired).await {
+        let RunStart {
+            working_dir,
+            run,
+            lease,
+        } = match self
+            .record_run_start_for(task_id, &repo_path, acquired, authorized.as_ref())
+            .await
+        {
                 Ok(start) => {
                     self.unrecorded_backoff_lock().remove(&task_id);
                     start
@@ -3750,6 +4111,27 @@ impl TaskExecutor {
                     return Err(message);
                 }
             };
+
+        // The uncommitted work was last read before the run-start write. Read it
+        // again before the provider starts. A change now is recorded as recovery
+        // of this run, so nothing is launched on work the person did not inspect.
+        if let Some(decision) = authorized.as_ref() {
+            if let Err(changed) = self
+                .confirm_new_attempt_checkout(task_id, &repo_path, decision)
+                .await
+            {
+                let _ = Self::record_recovery_required(
+                    &self.tasks,
+                    &self.storage,
+                    task_id,
+                    Some(run),
+                    None,
+                    "The uncommitted work changed after the new attempt was recorded and before its provider started. The Task Checkout was preserved; inspect it before any new attempt.",
+                )
+                .await;
+                return Err(changed);
+            }
+        }
 
         let (prompt, task_model) = {
             let tasks = self.tasks.read().await;
@@ -3851,7 +4233,7 @@ impl TaskExecutor {
             });
 
             // Start Claude runner
-            let runner = match ClaudeRunner::start(ClaudeRunConfig {
+            let runner = match ClaudeRunner::start_leased(ClaudeRunConfig {
                 prompt,
                 working_dir: claude_cwd.clone(),
                 // `permission_mode: None` passes --dangerously-skip-permissions.
@@ -3875,7 +4257,7 @@ impl TaskExecutor {
                 append_system_prompt: None,
                 disable_mcp: false,
                 additional_dirs: claude_add_dirs.clone(),
-            })
+            }, lease)
             .await
             {
                 Ok(r) => r,
@@ -4783,7 +5165,7 @@ impl TaskExecutor {
     /// completion, or kill it and return early if `cancelled` fires first.
     ///
     /// This is the one place a `ClaudeRunner` spawned inside a review/fix
-    /// flow is owned: `ClaudeRunner::start` is never itself raced against
+    /// flow is owned: `ClaudeRunner::start_leased` is never itself raced against
     /// cancellation (an outer `select!` around a future still mid-spawn is
     /// exactly the unsafe shape that can drop a just-spawned child with
     /// nothing left pointing at it), so a cancellation arriving before this
@@ -4791,18 +5173,23 @@ impl TaskExecutor {
     /// is met with this function's own `kill()` before it returns -- never a
     /// caller racing the whole call from outside.
     ///
+    /// `lease` is the Task's provider lease for a run that can edit the
+    /// checkout; the run inherits it, so a later launch is refused while the run
+    /// lives. A read-only run passes `None`.
+    ///
     /// `Ok(Some(run))` is a completed run, successful or not (see
     /// [`AgentRun::success`]); `Ok(None)` is a graceful decline (cancelled
     /// before start, or cancelled during `wait()` and killed); `Err` is a
     /// real failure to start.
     async fn run_cancellable_agent(
         config: ClaudeRunConfig,
+        lease: Option<crate::agents::provider_lease::ProviderLease>,
         cancelled: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<Option<AgentRun>, String> {
         if *cancelled.borrow() {
             return Ok(None);
         }
-        let runner = ClaudeRunner::start(config).await?;
+        let runner = ClaudeRunner::start_leased(config, lease).await?;
         tokio::select! {
             biased;
             result = runner.wait() => {
@@ -5457,6 +5844,7 @@ impl TaskExecutor {
                         disable_mcp: true,
                         additional_dirs: Vec::new(),
                     },
+                    None,
                     &mut cancelled_for_claude,
                 )
                 .await
@@ -5612,36 +6000,46 @@ impl TaskExecutor {
                 };
 
                 let fix_started = chrono::Utc::now();
-                let fix_run = Self::run_cancellable_agent(
-                    ClaudeRunConfig {
-                        prompt: fix_prompt,
-                        working_dir: working_dir.clone(),
-                        // An approval list under --dangerously-skip-permissions:
-                        // the fix agent still has the full default tool set,
-                        // Bash included.
-                        tools: ToolAccess::Full {
-                            auto_approve: vec![
-                                "Read".to_string(),
-                                "Edit".to_string(),
-                                "Write".to_string(),
-                                "Glob".to_string(),
-                                "Grep".to_string(),
-                            ],
-                            permission_mode: None,
-                        },
-                        max_turns: Some(20),
-                        max_budget_usd: None,
-                        session_id: Some(Uuid::new_v4().to_string()),
-                        resume_session: None,
-                        model: None,
-                        system_prompt: None,
-                        append_system_prompt: None,
-                        disable_mcp: false,
-                        additional_dirs: Vec::new(),
-                    },
-                    &mut cancelled,
-                )
-                .await;
+                // The fix agent edits the checkout, so it takes the Task's lease
+                // first. A Worker, PR helper or Conversation Worker that still
+                // holds the checkout refuses it here, and the fix counts as not
+                // started.
+                let fix_run = match acquire_task_provider_lease(&storage, task_id) {
+                    Err(error) => Err(error),
+                    Ok(fix_lease) => {
+                        Self::run_cancellable_agent(
+                            ClaudeRunConfig {
+                                prompt: fix_prompt,
+                                working_dir: working_dir.clone(),
+                                // An approval list under --dangerously-skip-permissions:
+                                // the fix agent still has the full default tool set,
+                                // Bash included.
+                                tools: ToolAccess::Full {
+                                    auto_approve: vec![
+                                        "Read".to_string(),
+                                        "Edit".to_string(),
+                                        "Write".to_string(),
+                                        "Glob".to_string(),
+                                        "Grep".to_string(),
+                                    ],
+                                    permission_mode: None,
+                                },
+                                max_turns: Some(20),
+                                max_budget_usd: None,
+                                session_id: Some(Uuid::new_v4().to_string()),
+                                resume_session: None,
+                                model: None,
+                                system_prompt: None,
+                                append_system_prompt: None,
+                                disable_mcp: false,
+                                additional_dirs: Vec::new(),
+                            },
+                            fix_lease,
+                            &mut cancelled,
+                        )
+                        .await
+                    }
+                };
 
                 // Whether the fix agent changed any file, when it succeeded.
                 let mut fix_changed_nothing = false;
@@ -6485,7 +6883,19 @@ impl TaskExecutor {
                     "The Worker ended without exact provider and Git completion evidence. The Task Checkout was preserved for inspection.",
                     350,
                 );
-                let recovery_required = if !provider_exited_without_commit {
+                // A run that a person authorized as a new attempt keeps its recovery
+                // when its provider fails: its checkout holds the prior run's work too,
+                // so an ordinary retry must not be offered.
+                let authorized_new_attempt = run.is_some_and(|run| {
+                    run > 1
+                        && t.activity.iter().any(|entry| {
+                            matches!(
+                                entry.kind,
+                                ActivityKind::NewAttemptAuthorized { run: authorized } if authorized == run - 1
+                            )
+                        })
+                });
+                let recovery_required = if !provider_exited_without_commit || authorized_new_attempt {
                     if let Some(handoff) = t.worker_handoff.as_mut().filter(|handoff| {
                         handoff.run == run
                             && matches!(
@@ -10515,6 +10925,11 @@ mod tests {
         task.phase = TaskPhase::Idle;
         task.branch_name = Some("-Bvictim".to_string());
         let task_id = task.id;
+        // Recorded by an earlier run whose provider has exited, so the lease
+        // proves absence and the branch check is what refuses this start.
+        let lease_path = executor.provider_lease_path(task_id);
+        std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+        std::fs::write(&lease_path, b"").unwrap();
         executor.tasks.write().await.insert(task_id, task);
 
         executor
@@ -15548,6 +15963,11 @@ VERDICT: APPROVED"
                         task.branch_name = Some(branch.clone());
                         task.base_commit = Some(main_tip.clone());
                         task.branch_origin = Some(on_main());
+                        // The branch was recorded by a run whose provider has
+                        // exited: its lease is there and its record shows no group.
+                        let lease_path = executor.provider_lease_path(task_id);
+                        std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+                        std::fs::write(&lease_path, b"").unwrap();
                         if class == Class::ReattachedRegistered {
                             git_in(&repo, &["worktree", "add", "-q", "--", elsewhere, &branch]);
                         }
@@ -16795,6 +17215,363 @@ VERDICT: APPROVED"
             );
             assert_eq!(worktree_count(&w.repo), 1);
             assert!(w.executor.running_handles.read().await.is_empty());
+        }
+
+        /// A provider from an earlier run that was launched but never had its
+        /// group recorded blocks a direct start too. The lock is free, so the
+        /// lock alone would admit it; the spawn mark is what refuses it, and the
+        /// mark is left in place for a person to resolve.
+        #[tokio::test]
+        async fn a_direct_start_is_refused_while_an_unrecorded_provider_may_remain() {
+            let w = world(NORMAL, TaskStatus::Queue, true).await;
+            let before = w.records().await;
+            let lease_path = w.executor.provider_lease_path(w.task_id);
+            std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+            std::fs::write(&lease_path, b"spawning\n").unwrap();
+
+            let refused = w.executor.execute_task(w.task_id).await;
+
+            assert!(
+                refused.as_ref().is_err_and(|m| m.contains("may have started")),
+                "{refused:?}"
+            );
+            assert_eq!(w.records().await, before, "nothing recorded");
+            assert_eq!(worktree_count(&w.repo), 1, "no checkout created");
+            assert!(w.executor.running_handles.read().await.is_empty());
+            assert_eq!(std::fs::read(&lease_path).unwrap(), b"spawning\n");
+        }
+
+        /// A Task that has never checked out starts its first attempt with no
+        /// lease file: the start gets past the lease check and reaches the
+        /// checkout, which this fixture cannot provide.
+        #[tokio::test]
+        async fn a_first_direct_start_with_no_lease_file_is_admitted() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+
+            let _ = w.executor.execute_task(w.task_id).await;
+
+            assert_eq!(
+                w.events_saying("No worktree could be attached"),
+                1,
+                "{:?}",
+                w.agent_events()
+            );
+        }
+
+        /// A missing lease file does not show that an earlier provider is gone.
+        /// A Task with a recorded checkout is refused on a direct start, and
+        /// nothing is recorded or moved.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_direct_start_of_a_checked_out_task_without_a_lease_is_refused() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+            let before = w.records().await;
+
+            let refused = w.executor.execute_task(w.task_id).await;
+
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|m| m.contains("no provider lease exists")),
+                "{refused:?}"
+            );
+            assert_eq!(w.records().await, before, "nothing recorded or moved");
+            assert_eq!(
+                w.events_saying("No worktree could be attached"),
+                0,
+                "{:?}",
+                w.agent_events()
+            );
+            assert!(w.executor.running_handles.read().await.is_empty());
+        }
+
+        /// A recorded run is evidence of a launch even when the checkout fields
+        /// are absent, so it refuses a start with no lease file too.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_direct_start_of_a_task_with_a_recorded_run_is_refused_without_a_lease() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .record_activity(ActivityKind::RunStarted {
+                    run: 1,
+                    addressing_feedback: false,
+                });
+
+            let refused = w.executor.execute_task(w.task_id).await;
+
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|m| m.contains("no provider lease exists")),
+                "{refused:?}"
+            );
+            assert_eq!(
+                w.events_saying("No worktree could be attached"),
+                0,
+                "{:?}",
+                w.agent_events()
+            );
+        }
+
+        /// A checked-out Task whose lease file shows no provider is admitted:
+        /// the lease, not the absence of one, is what proves absence.
+        #[tokio::test]
+        async fn a_direct_start_of_a_checked_out_task_is_admitted_when_its_lease_proves_absence() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+            let lease_path = w.executor.provider_lease_path(w.task_id);
+            std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+            std::fs::write(&lease_path, b"").unwrap();
+
+            let _ = w.executor.execute_task(w.task_id).await;
+
+            assert_eq!(
+                w.events_saying("No worktree could be attached"),
+                1,
+                "{:?}",
+                w.agent_events()
+            );
+        }
+
+        /// A provider that still holds the lease refuses every start, whether
+        /// or not the Task has checked out before.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_direct_start_is_refused_while_a_provider_still_holds_the_lease() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            let lease_path = w.executor.provider_lease_path(w.task_id);
+            std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+            let _held = crate::agents::provider_lease::acquire(&lease_path)
+                .unwrap()
+                .expect("unix lease");
+
+            let refused = w.executor.execute_task(w.task_id).await;
+
+            assert!(
+                refused.as_ref().is_err_and(|m| m.contains("still holds")),
+                "{refused:?}"
+            );
+            assert_eq!(
+                w.events_saying("No worktree could be attached"),
+                0,
+                "{:?}",
+                w.agent_events()
+            );
+        }
+
+        /// A poller pass declines a checked-out Task that has no lease, and
+        /// writes nothing. It is not lost: once its lease shows absence, a later
+        /// pass admits it.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_pending_start_of_a_checked_out_task_without_a_lease_is_declined_and_reevaluated() {
+            let w = world(NORMAL, TaskStatus::InProgress, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+            let before = w.records().await;
+
+            let declined = w.executor.spawn_task_execution(w.task_id, None).await;
+
+            assert_eq!(declined, Ok(false));
+            assert_eq!(w.records().await, before, "nothing written");
+            assert_eq!(
+                w.events_saying("No worktree could be attached"),
+                0,
+                "{:?}",
+                w.agent_events()
+            );
+            assert!(w.executor.running_handles.read().await.is_empty());
+
+            let lease_path = w.executor.provider_lease_path(w.task_id);
+            std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+            std::fs::write(&lease_path, b"").unwrap();
+            let _ = w.executor.spawn_task_execution(w.task_id, None).await;
+            assert_eq!(
+                w.events_saying("No worktree could be attached"),
+                1,
+                "{:?}",
+                w.agent_events()
+            );
+        }
+
+        /// A checked-out Task with no lease is not auto-promoted, so it does not
+        /// take a parallel slot that its refused start would hold while nothing
+        /// runs. It stays queued, and nothing is written.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_checked_out_queued_task_without_a_lease_is_not_auto_promoted() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+            let before = w.records().await;
+
+            w.executor.check_and_execute().await;
+
+            assert_eq!(w.task().await.status, TaskStatus::Queue);
+            assert_eq!(w.records().await, before, "nothing written");
+            assert_eq!(w.events_saying("Auto-promoted from queue"), 0);
+        }
+
+        /// A queued, checked-out Task whose lease record shows a provider group
+        /// that is still running would be refused at its start, so it is not
+        /// promoted to hold a parallel slot.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_queued_task_whose_lease_shows_a_live_group_is_not_auto_promoted() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+            let lease_path = w.executor.provider_lease_path(w.task_id);
+            std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+            // This test process's own group is certainly running.
+            let live_group = unsafe { libc::getpgrp() };
+            std::fs::write(&lease_path, format!("{live_group}\n")).unwrap();
+            let before = w.records().await;
+
+            w.executor.check_and_execute().await;
+
+            assert_eq!(w.task().await.status, TaskStatus::Queue);
+            assert_eq!(w.records().await, before, "nothing written");
+            assert_eq!(w.events_saying("Auto-promoted from queue"), 0);
+            assert_eq!(std::fs::read(&lease_path).unwrap(), format!("{live_group}\n").into_bytes());
+        }
+
+        /// An unrecorded launch leaves a spawn mark; it forbids a start, so it
+        /// forbids promotion too, and the mark is kept.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_queued_task_with_a_spawn_mark_is_not_auto_promoted() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            let lease_path = w.executor.provider_lease_path(w.task_id);
+            std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+            std::fs::write(&lease_path, b"spawning\n").unwrap();
+
+            w.executor.check_and_execute().await;
+
+            assert_eq!(w.task().await.status, TaskStatus::Queue);
+            assert_eq!(w.events_saying("Auto-promoted from queue"), 0);
+            assert_eq!(std::fs::read(&lease_path).unwrap(), b"spawning\n");
+        }
+
+        /// A checked-out Task whose lease shows no provider is promoted: the
+        /// lease proves absence, and the start will confirm it.
+        #[tokio::test]
+        async fn a_queued_checked_out_task_with_an_empty_lease_is_auto_promoted() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+            let lease_path = w.executor.provider_lease_path(w.task_id);
+            std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+            std::fs::write(&lease_path, b"").unwrap();
+
+            w.executor.check_and_execute().await;
+
+            assert_eq!(w.events_saying("Auto-promoted from queue"), 1);
+        }
+
+        /// Windows has no provider lease. An ordinary retry of a Task that has a
+        /// checkout is not gated by the missing lease, so it reaches the checkout
+        /// exactly as it did before leases existed.
+        #[cfg(not(unix))]
+        #[tokio::test]
+        async fn a_direct_retry_of_a_checked_out_task_is_admitted_without_a_lease() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+
+            let _ = w.executor.execute_task(w.task_id).await;
+
+            assert_eq!(
+                w.events_saying("No worktree could be attached"),
+                1,
+                "{:?}",
+                w.agent_events()
+            );
+        }
+
+        /// The poller starts a checked-out Task on Windows as it always did.
+        #[cfg(not(unix))]
+        #[tokio::test]
+        async fn a_pending_start_of_a_checked_out_task_is_admitted_without_a_lease() {
+            let w = world(NORMAL, TaskStatus::InProgress, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+
+            let _ = w.executor.spawn_task_execution(w.task_id, None).await;
+
+            assert_eq!(
+                w.events_saying("No worktree could be attached"),
+                1,
+                "{:?}",
+                w.agent_events()
+            );
+        }
+
+        /// An eligible queued Task with a checkout is promoted on Windows; the
+        /// missing lease must not hold it in the queue.
+        #[cfg(not(unix))]
+        #[tokio::test]
+        async fn a_queued_checked_out_task_is_auto_promoted_without_a_lease() {
+            let w = world(NORMAL, TaskStatus::Queue, false).await;
+            w.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&w.task_id)
+                .unwrap()
+                .branch_name = Some("task-earlier".into());
+
+            w.executor.check_and_execute().await;
+
+            assert_eq!(w.events_saying("Auto-promoted from queue"), 1);
         }
 
         /// Disk space running out while a direct start is underway: the check

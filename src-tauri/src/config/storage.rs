@@ -1339,6 +1339,18 @@ impl Storage {
         }
     }
 
+    /// Whether the directory that holds this project's board can be
+    /// synchronized here. `Unsupported` means a board write can succeed without
+    /// surviving a power loss, so a caller that must not lose the write checks
+    /// this first. It flushes the directory's entries and changes no content.
+    pub fn board_directory_sync(&self, project_id: Uuid) -> Result<slashit_durable_fs::DirectorySync> {
+        let path = self.tasks_path(project_id);
+        let dir = path
+            .parent()
+            .context("the tasks file has no containing directory")?;
+        slashit_durable_fs::sync_directory(dir).context("Failed to synchronize the tasks directory")
+    }
+
     /// Save tasks for a specific project.
     ///
     /// Writes to the project's current state directory and then retires the
