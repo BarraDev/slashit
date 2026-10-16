@@ -151,6 +151,13 @@ struct UnsettledAdmission {
     run: Option<u32>,
     /// The Worker commit the marker was recorded for.
     commit: String,
+    /// The person's acceptance this settlement was created under, as its
+    /// decision id and decision time, or `None` when no decision had been
+    /// recorded. Any newer decision has a different id or time, even for the
+    /// same run and commit, so it withdraws this settlement's authority. The
+    /// time is what separates a replay of a superseded id, which is accepted
+    /// again with a new time.
+    acceptance: Option<(Uuid, chrono::DateTime<chrono::Utc>)>,
     /// Retries of the recovery record that failed so far. A count, not a log:
     /// the schedule is what it implies.
     failed_retries: u32,
@@ -180,6 +187,16 @@ fn admission_settlement_needed(task: &Task, pending: &UnsettledAdmission) -> boo
     let Some(handoff) = task.worker_handoff.as_ref() else {
         return false;
     };
+    // Authority belongs to the acceptance the settlement was created under. A
+    // newer decision, even for the same run and commit, supersedes it.
+    if handoff
+        .acceptance
+        .as_ref()
+        .map(|a| (a.decision_id, a.decided_at))
+        != pending.acceptance
+    {
+        return false;
+    }
     match &handoff.stage {
         crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { commit } => {
             task.status == TaskStatus::AiReview
@@ -5014,6 +5031,10 @@ impl TaskExecutor {
                     Some(UnsettledAdmission {
                         run: handoff.run,
                         commit: commit.clone(),
+                        acceptance: handoff
+                            .acceptance
+                            .as_ref()
+                            .map(|a| (a.decision_id, a.decided_at)),
                         failed_retries: 0,
                         retry_at: std::time::Instant::now(),
                     })
@@ -14722,6 +14743,7 @@ VERDICT: APPROVED"
                     UnsettledAdmission {
                         run: Some(1),
                         commit: base_commit.clone(),
+                        acceptance: None,
                         failed_retries: 0,
                         // Not due in this test: the hold must decline without a write.
                         retry_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
@@ -18793,6 +18815,256 @@ VERDICT: APPROVED"
                 WorkerHandoffStage::RecoveryRequired { reason, .. } if reason == "decided by a person"
             ));
             assert_eq!(recovery_records(&memory), 0, "the settlement wrote nothing");
+            assert_memory_follows_file(&executor, project, id).await;
+        }
+
+        /// Stage the acceptance a person's decision publishes, as
+        /// `accept_result` does: the Task returns to AI Review on the commit
+        /// with the decision recorded and the acknowledgement withdrawn.
+        async fn accept_again(
+            executor: &TaskExecutor,
+            id: Uuid,
+            decision_id: Uuid,
+            commit_id: &str,
+            decided_at: chrono::DateTime<chrono::Utc>,
+        ) -> Result<(), crate::lifecycle::RecordWriteError> {
+            let commit_id = commit_id.to_string();
+            let accept = move |staged: &mut HashMap<Uuid, Task>| {
+                if let Some(task) = staged.get_mut(&id) {
+                    task.status = TaskStatus::AiReview;
+                    task.phase = TaskPhase::QaReview;
+                    task.worker_handoff_confirmed = false;
+                    if let Some(handoff) = task.worker_handoff.as_mut() {
+                        handoff.stage = WorkerHandoffStage::ResolvedToAiReview {
+                            commit: commit_id.clone(),
+                        };
+                        handoff.acceptance = Some(crate::domain::task::WorkerResultAcceptance {
+                            decision_id,
+                            commit: commit_id.clone(),
+                            observed_commit: None,
+                            decided_at,
+                        });
+                    }
+                }
+            };
+            crate::lifecycle::record_typed(&executor.tasks, &executor.storage, id, &accept).await
+        }
+
+        /// A held settlement for run 1 and commit C whose RecoveryRequired write
+        /// is visible but not confirmed durable.
+        async fn held_settlement_for_commit(executor: &TaskExecutor) -> (Uuid, Uuid) {
+            let (id, project) = resolved(executor).await;
+            let at = publish_marker(executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            executor.settle_unconfirmed_review_admission(id, 1, at).await;
+            drop(fault);
+            assert!(held(executor, id).is_some(), "setup: settlement held");
+            (id, project)
+        }
+
+        fn later() -> chrono::DateTime<chrono::Utc> {
+            chrono::Utc::now() + chrono::Duration::seconds(1)
+        }
+
+        fn accepted_decision(task: &Task) -> Option<Uuid> {
+            task.worker_handoff
+                .as_ref()?
+                .acceptance
+                .as_ref()
+                .map(|a| a.decision_id)
+        }
+
+        /// RED. Same run, same commit: a person's newer acceptance D2 is
+        /// published but not confirmed durable, and the stale settlement for
+        /// that commit must not overwrite it with RecoveryRequired.
+        #[tokio::test]
+        async fn a_stale_settlement_does_not_overwrite_a_newer_same_commit_acceptance() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = held_settlement_for_commit(&executor).await;
+
+            let decision = Uuid::new_v4();
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            let outcome = accept_again(&executor, id, decision, &commit(), later()).await;
+            drop(fault);
+            assert!(
+                matches!(
+                    outcome,
+                    Err(crate::lifecycle::RecordWriteError::PublishedNotDurable(_))
+                ),
+                "{outcome:?}"
+            );
+
+            retry_due_now(&executor, id);
+            executor.spawn_review(id).await;
+
+            assert!(executor.reviewing_handles.read().await.is_empty());
+            assert!(held(&executor, id).is_none(), "the stale hold is released");
+            let memory = executor.tasks.read().await[&id].clone();
+            assert_eq!(accepted_decision(&memory), Some(decision));
+            assert!(matches!(
+                memory.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::ResolvedToAiReview { .. }
+            ));
+            assert!(!memory.worker_handoff_confirmed);
+            assert_memory_follows_file(&executor, project, id).await;
+            assert_eq!(accepted_decision(&on_disk_task(&executor, project, id)), Some(decision));
+        }
+
+        /// B. Same run, same commit, and the newer acceptance D2 is durable.
+        /// The stale settlement is still released without overwriting it, and
+        /// the pass neither writes nor starts a reviewer.
+        #[tokio::test]
+        async fn a_stale_settlement_does_not_overwrite_a_durable_same_commit_acceptance() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = held_settlement_for_commit(&executor).await;
+
+            let decision = Uuid::new_v4();
+            accept_again(&executor, id, decision, &commit(), later())
+                .await
+                .expect("the newer acceptance publishes durably");
+
+            retry_due_now(&executor, id);
+            assert!(
+                executor.review_admission_unconfirmed(id).await,
+                "the released pass does not fall through to a review"
+            );
+
+            assert!(held(&executor, id).is_none());
+            let memory = executor.tasks.read().await[&id].clone();
+            assert_eq!(memory.status, TaskStatus::AiReview);
+            assert!(matches!(
+                memory.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::ResolvedToAiReview { .. }
+            ));
+            assert_eq!(accepted_decision(&memory), Some(decision));
+            assert!(!memory.worker_handoff_confirmed, "durable is not confirmed");
+            assert_memory_follows_file(&executor, project, id).await;
+        }
+
+        /// D. A newer acceptance of a different commit: the stale settlement
+        /// for commit C cannot overwrite it either.
+        #[tokio::test]
+        async fn a_stale_settlement_does_not_overwrite_a_newer_acceptance_of_another_commit() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = held_settlement_for_commit(&executor).await;
+
+            let decision = Uuid::new_v4();
+            let other = "d".repeat(40);
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            let _ = accept_again(&executor, id, decision, &other, later()).await;
+            drop(fault);
+
+            retry_due_now(&executor, id);
+            executor.spawn_review(id).await;
+
+            assert!(held(&executor, id).is_none());
+            assert!(executor.reviewing_handles.read().await.is_empty());
+            let memory = executor.tasks.read().await[&id].clone();
+            assert_eq!(accepted_decision(&memory), Some(decision));
+            assert_memory_follows_file(&executor, project, id).await;
+        }
+
+        /// C. The acceptance the settlement was created under is still the
+        /// current one, so its retry runs normally and confirms the record.
+        #[tokio::test]
+        async fn a_settlement_under_the_current_acceptance_still_retries_to_confirmation() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let decision = Uuid::new_v4();
+            let attach = move |staged: &mut HashMap<Uuid, Task>| {
+                if let Some(handoff) = staged.get_mut(&id).and_then(|t| t.worker_handoff.as_mut()) {
+                    handoff.acceptance = Some(crate::domain::task::WorkerResultAcceptance {
+                        decision_id: decision,
+                        commit: commit(),
+                        observed_commit: None,
+                        decided_at: chrono::Utc::now(),
+                    });
+                }
+            };
+            crate::lifecycle::record_typed(&executor.tasks, &executor.storage, id, &attach)
+                .await
+                .expect("setup: the acceptance publishes");
+            let at = publish_marker(&executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            executor.settle_unconfirmed_review_admission(id, 1, at).await;
+            drop(fault);
+            assert_eq!(
+                held(&executor, id).unwrap().acceptance.map(|(d, _)| d),
+                Some(decision)
+            );
+
+            retry_due_now(&executor, id);
+            assert!(executor.review_admission_unconfirmed(id).await);
+
+            assert!(held(&executor, id).is_none(), "the retry confirmed the record");
+            let memory = executor.tasks.read().await[&id].clone();
+            assert!(matches!(
+                &memory.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::RecoveryRequired { reason, .. }
+                    if reason == ADMISSION_SETTLEMENT_REASON
+            ));
+            assert_eq!(accepted_decision(&memory), Some(decision));
+            assert_memory_follows_file(&executor, project, id).await;
+        }
+
+        /// E2. A superseded decision id replayed with identical content is
+        /// accepted again as a new decision, with a new decision time. The hold
+        /// captured under the first acceptance must not match the replay.
+        #[tokio::test]
+        async fn a_replayed_superseded_decision_id_is_not_the_held_acceptance() {
+            let (executor, _temps) = test_executor();
+            let (id, project) = resolved(&executor).await;
+            let base = chrono::Utc::now();
+            let first = Uuid::new_v4();
+            accept_again(&executor, id, first, &commit(), base + chrono::Duration::seconds(1))
+                .await
+                .expect("setup: the first acceptance publishes");
+
+            let at = publish_marker(&executor, id).await;
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            executor.settle_unconfirmed_review_admission(id, 1, at).await;
+            drop(fault);
+            assert!(held(&executor, id).is_some(), "setup: settlement held");
+
+            // A newer decision supersedes the first, then the first is replayed.
+            let second = Uuid::new_v4();
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            let _ = accept_again(&executor, id, second, &commit(), base + chrono::Duration::seconds(2))
+                .await;
+            drop(fault);
+            accept_again(&executor, id, first, &commit(), base + chrono::Duration::seconds(3))
+                .await
+                .expect("the replay publishes");
+
+            retry_due_now(&executor, id);
+            assert!(executor.review_admission_unconfirmed(id).await);
+
+            assert!(held(&executor, id).is_none(), "the replay is a different acceptance");
+            let memory = executor.tasks.read().await[&id].clone();
+            assert_eq!(memory.status, TaskStatus::AiReview);
+            assert!(matches!(
+                memory.worker_handoff.as_ref().unwrap().stage,
+                WorkerHandoffStage::ResolvedToAiReview { .. }
+            ));
+            assert_eq!(accepted_decision(&memory), Some(first));
             assert_memory_follows_file(&executor, project, id).await;
         }
 
