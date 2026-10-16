@@ -244,7 +244,11 @@ pub async fn promote_next_task(
     // work is paused for disk space; the task stays queued.
     state.start_guard.check().await.map_err(|block| block.to_string())?;
     let manager = state.queue.manager.read().await;
-    let select = |tasks: &HashMap<Uuid, Task>| manager.select_promotable(tasks);
+    let select = |tasks: &HashMap<Uuid, Task>| {
+        manager.select_promotable(tasks, |task| {
+            crate::queue::start_lease_admits(&state.storage, task)
+        })
+    };
     let amend = |staged: &mut HashMap<Uuid, Task>, task_id: Uuid| {
         if let Some(task) = staged.get_mut(&task_id) {
             QueueManager::apply_promotion(task);

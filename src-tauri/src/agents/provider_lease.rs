@@ -14,7 +14,8 @@
 //! the provider has exited. The provider's process group is recorded beside it
 //! as a second check, because a descendant that closed the inherited
 //! descriptor would not hold the lock. A new attempt is admitted only when the
-//! lock is free and that group is empty.
+//! lock is free and that group is empty. A missing lease file is never read as
+//! absence: see [`prove_absent_for_start`].
 //!
 //! The record has three states. Empty means no provider was spawned. A pid is
 //! the provider's group. The spawn mark is written before every spawn and
@@ -28,9 +29,10 @@
 //! attempt of a Task still runs as before.
 //!
 //! Limits, stated rather than hidden: a descendant that closes the descriptor
-//! and then leaves its process group (`setsid`) is not seen. Lease files written
-//! before this module existed have no lease, so their runs are never proven
-//! absent and need a manual check.
+//! and then leaves its process group (`setsid`) is not seen. A Task that ran
+//! before this module existed has no lease file. Its first start is admitted
+//! only when its record shows no checkout and no run; any other Task without a
+//! lease is refused until a person has checked its Task Checkout.
 
 /// An exclusive lock on a Task's lease file, held by the caller until the
 /// provider has been spawned.
@@ -289,13 +291,30 @@ pub fn acquire_proven(path: &std::path::Path) -> Result<Option<ProviderLease>, S
     Ok(lease)
 }
 
-/// [`prove_absent`] for a start that is not a new attempt. A Task whose checkout
-/// has no lease file has never run a provider, so there is nothing to prove, and
-/// its first attempt starts as before. Every other lease file must prove absence,
-/// including on a crash that left a spawn mark.
-pub fn prove_absent_unless_never_leased(path: &std::path::Path) -> Result<(), String> {
+/// The refusal for a Task with a recorded checkout or run and no lease file.
+/// Nothing shows whether a provider from that run is still active, and a
+/// missing lease never shows it.
+pub const UNLEASED_CHECKOUT_REFUSAL: &str =
+    "This Task has a recorded checkout or run, but no provider lease exists for it, so SlashIt cannot show that no provider from an earlier run is still active.";
+
+/// [`prove_absent`] for a start that is not a new attempt. A missing lease file
+/// is not evidence of absence. It is admitted only when `never_checked_out` says
+/// the Task's own record shows no checkout and no run (see
+/// [`crate::domain::Task::never_checked_out`]), so no provider can have been
+/// launched for it. Any other Task without a lease is refused. A lease file that
+/// exists must prove absence, including on a crash that left a spawn mark.
+pub fn prove_absent_for_start(
+    path: &std::path::Path,
+    never_checked_out: bool,
+) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if never_checked_out {
+                Ok(())
+            } else {
+                Err(UNLEASED_CHECKOUT_REFUSAL.to_string())
+            }
+        }
         _ => prove_absent(path),
     }
 }
@@ -600,14 +619,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_task_that_has_never_been_leased_is_admitted_without_proof() {
+    async fn a_missing_lease_is_admitted_only_for_a_task_that_never_checked_out() {
         let dir = tempfile::tempdir().unwrap();
         let path = lease_path(&dir);
-        assert_eq!(prove_absent_unless_never_leased(&path), Ok(()));
+        assert_eq!(prove_absent_for_start(&path, true), Ok(()));
+        assert_eq!(
+            prove_absent_for_start(&path, false),
+            Err(UNLEASED_CHECKOUT_REFUSAL.to_string()),
+            "a missing lease is not evidence that an earlier provider is absent"
+        );
 
         let lease = acquire(&path).unwrap().expect("unix lease");
         lease.mark_spawning().unwrap();
         drop(lease);
-        assert!(prove_absent_unless_never_leased(&path).is_err());
+        assert!(
+            prove_absent_for_start(&path, true).is_err(),
+            "a lease file that exists is judged by its record, whatever the Task says"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lease_with_an_empty_record_and_a_free_lock_proves_absence_for_a_checked_out_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        drop(acquire(&path).unwrap().expect("unix lease"));
+        assert_eq!(prove_absent_for_start(&path, false), Ok(()));
+    }
+}
+
+/// Platform-neutral: the admission rule is the same on Windows, where no lease
+/// file is ever created.
+#[cfg(test)]
+mod admission_on_every_platform {
+    use super::*;
+
+    #[test]
+    fn a_task_that_never_checked_out_starts_its_first_attempt_without_a_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task.lock");
+        assert_eq!(prove_absent_for_start(&path, true), Ok(()));
+    }
+
+    #[test]
+    fn a_task_with_a_recorded_checkout_is_refused_without_a_lease_on_every_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task.lock");
+        assert_eq!(
+            prove_absent_for_start(&path, false),
+            Err(UNLEASED_CHECKOUT_REFUSAL.to_string())
+        );
     }
 }

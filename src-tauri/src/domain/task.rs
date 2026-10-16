@@ -498,6 +498,27 @@ impl Task {
         })
     }
 
+    /// Whether this Task's own record shows that no coding provider has ever
+    /// been launched for it, so a start may proceed without a provider lease.
+    ///
+    /// Every launch needs a Task Checkout, and a Worker run records its
+    /// checkout (`worktree_path`, `branch_name`), its handoff and its
+    /// `RunStarted` entry in the one durable write that precedes the launch.
+    /// So a record with none of them has no provider behind it. This is
+    /// evidence only for a record that has them to show: a Task written by a
+    /// build before the activity log, or a checkout attached by hand before any
+    /// run, cannot be told apart from a Task that ran, and is not "never
+    /// launched". Callers treat `false` as uncertain, never as a run.
+    pub fn never_checked_out(&self) -> bool {
+        self.worktree_path.is_none()
+            && self.branch_name.is_none()
+            && self.worker_handoff.is_none()
+            && !self
+                .activity
+                .iter()
+                .any(|entry| matches!(entry.kind, ActivityKind::RunStarted { .. }))
+    }
+
     /// Why ordinary Queue/status commands may not bypass recovery.
     pub fn worker_recovery_refusal(&self) -> Option<String> {
         self.worker_handoff
@@ -1792,6 +1813,57 @@ mod tests {
         task.phase = TaskPhase::Idle;
         task.cleanup_in_flight = false;
         task
+    }
+
+    #[test]
+    fn a_task_with_no_checkout_and_no_run_has_never_checked_out() {
+        let task = startable_task();
+        assert!(task.never_checked_out());
+    }
+
+    /// Each of these is evidence of a run, or of a checkout that a run could
+    /// have used, so none of them proves that no provider was launched.
+    #[test]
+    fn any_recorded_checkout_run_or_handoff_means_the_task_has_checked_out() {
+        let mut with_path = startable_task();
+        with_path.worktree_path = Some("/checkouts/task".into());
+        assert!(!with_path.never_checked_out());
+
+        let mut with_branch = startable_task();
+        with_branch.branch_name = Some("task-branch".into());
+        assert!(!with_branch.never_checked_out());
+
+        let mut with_run = startable_task();
+        with_run.record_activity(ActivityKind::RunStarted {
+            run: 1,
+            addressing_feedback: false,
+        });
+        assert!(!with_run.never_checked_out());
+
+        let mut with_handoff = startable_task();
+        with_handoff.worker_handoff = Some(WorkerHandoff {
+            task_id: with_handoff.id,
+            project_id: with_handoff.project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            stage: WorkerHandoffStage::Started,
+            acceptance: None,
+        });
+        assert!(!with_handoff.never_checked_out());
+    }
+
+    /// A move says nothing about a provider, so it does not by itself make the
+    /// Task checked out.
+    #[test]
+    fn a_move_alone_leaves_the_task_never_checked_out() {
+        let mut task = startable_task();
+        task.record_activity(ActivityKind::Moved {
+            from: slashit_activity::Column::Backlog,
+            to: slashit_activity::Column::Queue,
+        });
+        assert!(task.never_checked_out());
     }
 
     #[test]

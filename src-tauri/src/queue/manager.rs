@@ -51,7 +51,11 @@ impl QueueManager {
     /// both select the same task before either one's write lands. This is
     /// why the signature takes the map directly rather than reading
     /// `self.tasks` itself.
-    pub(crate) fn select_promotable(&self, tasks: &HashMap<Uuid, Task>) -> Option<Uuid> {
+    pub(crate) fn select_promotable(
+        &self,
+        tasks: &HashMap<Uuid, Task>,
+        lease_admits: impl Fn(&Task) -> bool,
+    ) -> Option<Uuid> {
         let in_progress_count = tasks
             .values()
             .filter(|t| t.status == TaskStatus::InProgress)
@@ -75,6 +79,10 @@ impl QueueManager {
             // start for it, so promoting it would park it InProgress holding
             // one of the parallel-limit slots while nothing runs.
             .filter(|t| t.republish_pending_refusal().is_none())
+            // And a task that has checked out with no provider lease on disk:
+            // its start is refused for want of proof that no earlier provider
+            // is still running, so promoting it would park it the same way.
+            .filter(|t| lease_admits(t))
             .collect();
 
         if self.config.fifo_ordering {
@@ -248,7 +256,7 @@ mod tests {
     /// and field-reset semantics, not durability.
     async fn promote(manager: &QueueManager, tasks: &Tasks) -> Option<Uuid> {
         let mut store = tasks.write().await;
-        let task_id = manager.select_promotable(&store)?;
+        let task_id = manager.select_promotable(&store, |_| true)?;
         let task = store
             .get_mut(&task_id)
             .expect("selected id must be in the map");
@@ -323,6 +331,23 @@ mod tests {
         assert_eq!(promoted.phase_progress, 0);
         assert_eq!(promoted.overall_progress, 0);
         assert!(promoted.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_promote_next_task_skips_a_task_whose_lease_would_refuse_it() {
+        // A task that has checked out and has no lease would be refused at its
+        // start. Promoting it would hold a parallel slot while nothing runs, so
+        // the next queued task is selected instead.
+        let refused = create_test_task_with_status("Refused", TaskStatus::Queue);
+        let fresh = create_test_task_with_status("Fresh", TaskStatus::Queue);
+        let fresh_id = fresh.id;
+        let tasks = make_tasks_map(vec![refused, fresh]);
+        let manager = make_manager(tasks.clone(), 3);
+        let store = tasks.read().await;
+
+        let selected = manager.select_promotable(&store, |task| task.title != "Refused");
+
+        assert_eq!(selected, Some(fresh_id));
     }
 
     #[tokio::test]

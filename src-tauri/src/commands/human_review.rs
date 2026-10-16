@@ -812,6 +812,10 @@ mod tests {
         let (_tmp, mut state) = test_state().await;
         state.start_guard = disk.guard();
         let (project_id, task_id) = seed_in_review(&state).await;
+        // The reviewed run's provider has exited: its lease is there and shows no group.
+        let lease_path = crate::queue::task_provider_lease_path(&state.storage, task_id);
+        std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+        std::fs::write(&lease_path, b"").unwrap();
 
         let task = request_changes(&state, task_id, "Also count lines.").await.expect("recorded while paused");
         assert_eq!(task.status, TaskStatus::Queue);
