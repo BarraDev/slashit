@@ -16,6 +16,13 @@
 //! descriptor would not hold the lock. A new attempt is admitted only when the
 //! lock is free and that group is empty.
 //!
+//! The record has three states. Empty means no provider was spawned. A pid is
+//! the provider's group. The spawn mark is written before every spawn and
+//! replaced by the pid once the group is recorded. A spawn mark that survives
+//! means a spawn may have happened without its group being recorded (SlashIt
+//! died in between, or the record write failed), so it is never read as
+//! absence: the Task needs a person to inspect its checkout.
+//!
 //! Windows: no equivalent is implemented. [`acquire`] returns no lease and
 //! [`prove_absent`] refuses, so a new attempt there is refused, and the first
 //! attempt of a Task still runs as before.
@@ -36,7 +43,7 @@ pub struct ProviderLease {
 #[cfg(unix)]
 mod imp {
     use super::ProviderLease;
-    use std::io::{self, Seek, SeekFrom, Write};
+    use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
@@ -83,21 +90,53 @@ mod imp {
             }
         }
 
+        /// A lease whose record writes fail, as on a full disk. Test-only.
+        #[cfg(test)]
+        pub fn read_only_for_test(path: &Path) -> io::Result<ProviderLease> {
+            Ok(ProviderLease {
+                file: std::fs::File::open(path)?,
+            })
+        }
+
+        /// Records that a provider is about to be spawned. Called before the spawn,
+        /// and an error here means nothing is spawned. A crash between the spawn
+        /// and [`Self::record_group`] then leaves this mark, which is evidence that
+        /// something may be running, instead of an empty record that reads as
+        /// "no provider was spawned".
+        pub fn mark_spawning(&self) -> io::Result<()> {
+            write_record(&self.file, SPAWNING)
+        }
+
+        /// Judges the record while this lease holds the lock. Holding the lock
+        /// means no provider that holds it can be running, so only the record can
+        /// show a group that survived its leader. Used before a new lease is
+        /// handed out, so that a mark or a live group is never overwritten.
+        pub fn prove_record_absent(&self) -> Result<(), String> {
+            let mut file = &self.file;
+            let mut recorded = String::new();
+            file.seek(SeekFrom::Start(0))
+                .and_then(|_| file.read_to_string(&mut recorded))
+                .map_err(|error| format!("The provider lease cannot be read: {error}"))?;
+            judge_record(&recorded)
+        }
+
+        /// Clears the spawn mark after the spawn itself failed. No child exists in
+        /// that case, so the record is empty again. If the clear cannot be written,
+        /// the mark stays and blocks absence, which is the fail-closed outcome.
+        pub fn clear_spawn_mark(&self) -> io::Result<()> {
+            write_record(&self.file, "")
+        }
+
         /// Records the provider's process group, which is its pid. The caller then
         /// drops the lease, which releases SlashIt's own hold; the provider keeps
         /// the lock.
         ///
         /// When the record cannot be written, the provider may already be running
         /// with its group unrecorded. The group is ended while this lease still
-        /// holds the lock, because an empty record would otherwise be read as "no
-        /// provider was spawned" once the lock is free.
+        /// holds the lock. The spawn mark, or a partly written record, is left in
+        /// place, so the Task is never read as absent.
         pub fn record_group(&self, pid: u32) -> io::Result<()> {
-            let mut file = &self.file;
-            let written = file
-                .set_len(0)
-                .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
-                .and_then(|()| file.write_all(format!("{pid}\n").as_bytes()))
-                .and_then(|()| file.sync_all());
+            let written = write_record(&self.file, &format!("{pid}\n"));
             if written.is_err() {
                 // Safety: the group is the provider's own, made by `process_group(0)`
                 // at spawn, so its id is the pid. SIGKILL reaches every member.
@@ -105,6 +144,20 @@ mod imp {
             }
             written
         }
+    }
+
+    /// The record written before a spawn. It is not a pid, so no group can be
+    /// checked against it, and [`prove_absent`] refuses it.
+    const SPAWNING: &str = "spawning\n";
+
+    /// Replaces the record in place and never truncates it first. A failed write
+    /// can then leave the old mark or a partial pid, and neither reads as absence.
+    fn write_record(file: &std::fs::File, contents: &str) -> io::Result<()> {
+        let mut file = file;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(contents.as_bytes())?;
+        file.set_len(contents.len() as u64)?;
+        file.sync_all()
     }
 
     /// `Ok` when no provider of the Task can still be running. `Err` gives the
@@ -134,10 +187,26 @@ mod imp {
             }
             Err(error) => return Err(format!("The provider lease cannot be checked: {error}")),
         }
-        let recorded = std::fs::read_to_string(path).unwrap_or_default();
-        let Some(pid) = recorded.trim().parse::<i32>().ok() else {
-            // The lock is free and no group was recorded: no provider was spawned.
+        let recorded = std::fs::read_to_string(path)
+            .map_err(|error| format!("The provider lease cannot be read: {error}"))?;
+        judge_record(&recorded)
+    }
+
+    /// Judges a record. Called only when the lock is known to be free, or held
+    /// by the caller, which is the case for [`ProviderLease::prove_record_absent`].
+    fn judge_record(recorded: &str) -> Result<(), String> {
+        if recorded.trim().is_empty() {
+            // Nothing was recorded: no provider was spawned.
             return Ok(());
+        }
+        let Some(pid) = recorded.trim().parse::<i32>().ok() else {
+            // A spawn mark, or a record that a failed write left partly written. A
+            // provider may have been started and its group never recorded, so this is
+            // not evidence of absence.
+            return Err(
+                "A coding provider launch in this Task Checkout was not recorded, so it may have started. Inspect the Task Checkout before any new attempt."
+                    .to_string(),
+            );
         };
         // Safety: signal 0 only tests whether the group exists.
         if unsafe { libc::killpg(pid, 0) } == 0 {
@@ -183,6 +252,18 @@ mod imp {
         pub fn record_group(&self, _pid: u32) -> io::Result<()> {
             Ok(())
         }
+
+        pub fn mark_spawning(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        pub fn clear_spawn_mark(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        pub fn prove_record_absent(&self) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     /// Absence cannot be shown on this platform, so a new attempt is refused.
@@ -195,6 +276,29 @@ mod imp {
 }
 
 pub use imp::{acquire, prove_absent};
+
+/// Takes the lease for a launch that may write the checkout, and only when the
+/// record shows no provider left running. The record is judged under the lock
+/// just taken, so no mark or live group is overwritten by the new launch.
+/// `Ok(None)` only on a platform without leases.
+pub fn acquire_proven(path: &std::path::Path) -> Result<Option<ProviderLease>, String> {
+    let lease = acquire(path).map_err(|error| error.to_string())?;
+    if let Some(lease) = &lease {
+        lease.prove_record_absent()?;
+    }
+    Ok(lease)
+}
+
+/// [`prove_absent`] for a start that is not a new attempt. A Task whose checkout
+/// has no lease file has never run a provider, so there is nothing to prove, and
+/// its first attempt starts as before. Every other lease file must prove absence,
+/// including on a crash that left a spawn mark.
+pub fn prove_absent_unless_never_leased(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => prove_absent(path),
+    }
+}
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -217,6 +321,36 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("absence was never proven: {:?}", prove_absent(path));
+    }
+
+    /// Waits until the lock is free, whatever the record says. A fork in another
+    /// test thread can briefly hold a copy of the lease descriptor until its
+    /// exec, so a single reading right after an exit is not a fair test of the
+    /// rule about the record.
+    async fn wait_until_lock_free(path: &std::path::Path) {
+        for _ in 0..500 {
+            match prove_absent(path) {
+                Err(reason) if reason.contains("still holds") => {}
+                _ => return,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the lock was never released: {:?}", prove_absent(path));
+    }
+
+    /// [`acquire_proven`], retried past the transient "still holds" that a fork in
+    /// another test thread can cause. Any other answer is the test's answer.
+    async fn acquire_proven_when_lock_free(
+        path: &std::path::Path,
+    ) -> Result<Option<ProviderLease>, String> {
+        for _ in 0..500 {
+            match acquire_proven(path) {
+                Err(reason) if reason.contains("still holds") => {}
+                other => return other,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the lock was never released: {:?}", acquire_proven(path));
     }
 
     /// Spawns a shell that holds the lease, as a provider does.
@@ -310,7 +444,9 @@ mod tests {
     async fn a_group_whose_record_cannot_be_written_is_ended() {
         let dir = tempfile::tempdir().unwrap();
         let path = lease_path(&dir);
-        std::fs::write(&path, b"").unwrap();
+        let lease = acquire(&path).unwrap().expect("unix lease");
+        lease.mark_spawning().unwrap();
+        drop(lease);
         // A read-only descriptor makes the record write fail, as a full disk would.
         let read_only = ProviderLease {
             file: std::fs::File::open(&path).unwrap(),
@@ -331,5 +467,147 @@ mod tests {
         let _ = child.wait().await;
         // The group was ended by the failed record, so nothing is left to account for.
         assert_eq!(unsafe { libc::killpg(pid as i32, 0) }, -1);
+        // The mark was not replaced, so the failed record does not read as absence.
+        wait_until_lock_free(&path).await;
+        assert!(matches!(prove_absent(&path), Err(reason) if reason.contains("may have started")));
+    }
+
+    #[tokio::test]
+    async fn a_spawn_mark_without_a_recorded_group_is_never_proven_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        let lease = acquire(&path).unwrap().expect("unix lease");
+        // SlashIt died after the mark and before any spawn, so the lock is free
+        // and no group exists. The mark still refuses absence.
+        lease.mark_spawning().unwrap();
+        drop(lease);
+        wait_until_lock_free(&path).await;
+        assert!(matches!(prove_absent(&path), Err(reason) if reason.contains("may have started")));
+    }
+
+    #[tokio::test]
+    async fn a_spawn_mark_cleared_after_a_failed_spawn_is_proven_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        let lease = acquire(&path).unwrap().expect("unix lease");
+        lease.mark_spawning().unwrap();
+        // The spawn itself failed, so no child exists and the record is empty again.
+        lease.clear_spawn_mark().unwrap();
+        drop(lease);
+        wait_until_proven_absent(&path).await;
+    }
+
+    #[tokio::test]
+    async fn a_partly_written_record_is_never_proven_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        std::fs::write(&path, b"12x\n").unwrap();
+        assert!(matches!(prove_absent(&path), Err(reason) if reason.contains("may have started")));
+    }
+
+    /// Linux only: the script enumerates its descriptors through `/proc`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_crash_between_the_spawn_and_the_group_record_is_not_read_as_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        let lease = acquire(&path).unwrap().expect("unix lease");
+        lease.mark_spawning().unwrap();
+        // The provider is spawned with the lease, and SlashIt "dies" before the
+        // group is recorded. The leader closes the lease, leaves a sleeping
+        // descendant in its group, and exits, so the lock is free while that
+        // descendant is still running.
+        let script = "for f in /proc/$$/fd/*; do n=${f##*/}; if [ \"$n\" -gt 2 ]; then eval \"exec $n>&-\"; fi; done; sleep 30 & exit 0";
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        lease.inherit_into(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        drop(lease);
+        let pid = child.id().unwrap() as i32;
+        let _ = child.wait().await;
+
+        // The leader and the lease are gone; only the descendant is left.
+        wait_until_lock_free(&path).await;
+        let result = prove_absent(&path);
+        unsafe { libc::killpg(pid, libc::SIGKILL) };
+        assert!(
+            matches!(&result, Err(reason) if reason.contains("may have started")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_is_admitted_when_nothing_is_recorded_or_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        assert!(acquire_proven_when_lock_free(&path).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_launch_is_refused_while_a_spawn_mark_remains_and_keeps_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        let lease = acquire(&path).unwrap().expect("unix lease");
+        lease.mark_spawning().unwrap();
+        drop(lease);
+        wait_until_lock_free(&path).await;
+
+        let refused = acquire_proven_when_lock_free(&path).await;
+        assert!(matches!(&refused, Err(reason) if reason.contains("may have started")), "{refused:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "spawning\n");
+    }
+
+    /// Linux only: the script enumerates its descriptors through `/proc`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_launch_is_refused_when_its_record_shows_a_group_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        let lease = acquire(&path).unwrap().expect("unix lease");
+        // The leader closes its lease, leaves a sleeping descendant in its group,
+        // and exits. The lock is free, and the group was recorded.
+        let script = "for f in /proc/$$/fd/*; do n=${f##*/}; if [ \"$n\" -gt 2 ]; then eval \"exec $n>&-\"; fi; done; sleep 30 & exit 0";
+        let mut child = spawn_holder(lease, script);
+        let pid = child.id().unwrap() as i32;
+        let _ = child.wait().await;
+        wait_until_lock_free(&path).await;
+
+        let refused = acquire_proven_when_lock_free(&path).await;
+        let recorded = std::fs::read_to_string(&path).unwrap();
+        unsafe { libc::killpg(pid, libc::SIGKILL) };
+        assert!(
+            matches!(&refused, Err(reason) if reason.contains("process group")),
+            "{refused:?}"
+        );
+        assert_eq!(recorded, format!("{pid}\n"), "the recorded group is not overwritten");
+    }
+
+    #[tokio::test]
+    async fn a_completed_provider_with_a_marked_and_recorded_group_releases_eligibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        let lease = acquire(&path).unwrap().expect("unix lease");
+        lease.mark_spawning().unwrap();
+        let mut child = spawn_holder(lease, "exit 0");
+        let _ = child.wait().await;
+        wait_until_proven_absent(&path).await;
+    }
+
+    #[tokio::test]
+    async fn only_a_task_that_has_never_been_leased_is_admitted_without_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = lease_path(&dir);
+        assert_eq!(prove_absent_unless_never_leased(&path), Ok(()));
+
+        let lease = acquire(&path).unwrap().expect("unix lease");
+        lease.mark_spawning().unwrap();
+        drop(lease);
+        assert!(prove_absent_unless_never_leased(&path).is_err());
     }
 }

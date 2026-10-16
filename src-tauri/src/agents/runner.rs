@@ -459,13 +459,10 @@ impl Drop for ClaudeRunner {
 }
 
 impl ClaudeRunner {
-    /// Start a Claude Code CLI run with the given config.
-    pub async fn start(config: ClaudeRunConfig) -> Result<Self, String> {
-        Self::start_program("claude", config).await
-    }
-
-    /// [`Self::start`] for a Worker run on a Task Checkout. The provider inherits
-    /// `lease`, so a later attempt can tell whether it is still running. See
+    /// Start a Claude Code CLI run with the given config. Every run that can
+    /// edit a Task Checkout passes its provider lease, so a later launch can
+    /// tell whether this provider is still running. `lease` is `None` for a
+    /// read-only run, and on platforms without leases. See
     /// [`super::provider_lease`].
     pub async fn start_leased(
         config: ClaudeRunConfig,
@@ -474,11 +471,11 @@ impl ClaudeRunner {
         Self::start_leased_program("claude", config, lease).await
     }
 
-    /// Start `program` with the Claude Code CLI argument set.
+    /// Start `program` with the Claude Code CLI argument set, with no lease.
     ///
-    /// Split out from [`start`] only so the tests can point the runner at a
+    /// Test-only: production always starts `"claude"` through
+    /// [`Self::start_leased`]. The tests use it to point the runner at a
     /// stand-in process that follows the same stdin/stdout/exit contract.
-    /// Production has exactly one caller and it passes `"claude"`.
     ///
     /// The prompt goes to the child's stdin (see [`claude_args`] for why).
     /// The CLI reads stdin to EOF before it starts, so a separate task writes
@@ -487,6 +484,7 @@ impl ClaudeRunner {
     /// never wait on a child that is itself waiting for room to write its
     /// output. The writer starts at spawn, and it has to: a CLI that sees no
     /// stdin data within its first few seconds gives up on stdin.
+    #[cfg(all(test, unix))]
     async fn start_program(
         program: impl AsRef<std::ffi::OsStr>,
         config: ClaudeRunConfig,
@@ -539,10 +537,25 @@ impl ClaudeRunner {
 
         if let Some(lease) = &lease {
             lease.inherit_into(&mut cmd);
+            // Before the spawn: a crash between the spawn and the group record
+            // must leave evidence that a provider may be running. A mark that
+            // cannot be written means nothing is spawned.
+            lease.mark_spawning().map_err(|e| {
+                format!("The provider's lease could not be marked before launch, so the provider was not started: {e}")
+            })?;
         }
 
-        let mut child = cmd.spawn()
-            .map_err(|e| format!("Failed to spawn claude: {}. Is claude CLI installed?", e))?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // No child exists, so the mark no longer describes a provider. If
+                // it cannot be cleared it stays, which blocks absence.
+                if let Some(lease) = &lease {
+                    let _ = lease.clear_spawn_mark();
+                }
+                return Err(format!("Failed to spawn claude: {}. Is claude CLI installed?", e));
+            }
+        };
         eprintln!("[claude-runner] spawned pid={:?}", child.id());
 
         // Recorded before anything else can run. A run whose group cannot be
@@ -1136,6 +1149,79 @@ async fn parse_claude_event(
         }
 
         _ => None,
+    }
+}
+
+/// What a provider launch does with its lease before and after the spawn.
+#[cfg(all(test, unix))]
+mod lease_launch_tests {
+    use super::*;
+    use crate::agents::provider_lease::{acquire, prove_absent};
+
+    fn config() -> ClaudeRunConfig {
+        ClaudeRunConfig {
+            prompt: "do the thing".to_string(),
+            working_dir: ".".to_string(),
+            tools: ToolAccess::Full {
+                auto_approve: vec!["Read".to_string(), "Edit".to_string()],
+                permission_mode: None,
+            },
+            max_turns: Some(3),
+            max_budget_usd: None,
+            session_id: None,
+            resume_session: None,
+            model: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            disable_mcp: true,
+            additional_dirs: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_whose_spawn_mark_cannot_be_written_is_not_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task.lock");
+        std::fs::write(&path, b"").unwrap();
+        // A read-only lease makes the spawn mark fail, as a full disk would.
+        let lease = ProviderLease::read_only_for_test(&path).unwrap();
+
+        let error = match ClaudeRunner::start_leased_program("/nonexistent/claude", config(), Some(lease)).await {
+            Ok(_) => panic!("a provider must not start when its mark cannot be written"),
+            Err(error) => error,
+        };
+        // The mark comes before the spawn, so this message proves nothing was spawned.
+        assert!(error.contains("could not be marked before launch"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_spawn_clears_its_mark_so_absence_can_be_proven() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task.lock");
+        let lease = acquire(&path).unwrap().expect("unix lease");
+
+        let error = match ClaudeRunner::start_leased_program(
+            dir.path().join("no-such-claude"),
+            config(),
+            Some(lease),
+        )
+        .await
+        {
+            Ok(_) => panic!("a missing program must not start"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Failed to spawn claude"), "{error}");
+        // A fork in another test thread can briefly hold a copy of the lease
+        // descriptor until its exec, so absence is awaited, not read once.
+        let mut proven = prove_absent(&path);
+        for _ in 0..500 {
+            if proven.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            proven = prove_absent(&path);
+        }
+        assert_eq!(proven, Ok(()));
     }
 }
 
@@ -2418,7 +2504,7 @@ mod tests {
                 disable_mcp: true,
                 additional_dirs: Vec::new(),
             };
-            let runner = ClaudeRunner::start(config).await.expect("claude should start");
+            let runner = ClaudeRunner::start_leased(config, None).await.expect("claude should start");
             let result = tokio::time::timeout(Duration::from_secs(120), runner.wait())
                 .await
                 .unwrap_or_else(|_| panic!("{label}: the real CLI did not finish"));

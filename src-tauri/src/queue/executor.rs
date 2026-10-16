@@ -394,6 +394,31 @@ enum FixOutcome {
     Failed(String),
 }
 
+/// The lease file of a Task: one lock per Task, shared by every launch that can
+/// edit its checkout (Task Worker, review fix agent, PR apply helper and
+/// Conversation Worker), so that they contend for the same lock.
+pub(crate) fn task_provider_lease_path(storage: &crate::config::Storage, task_id: Uuid) -> std::path::PathBuf {
+    storage
+        .paths()
+        .data_dir()
+        .join("provider-leases")
+        .join(format!("{task_id}.lock"))
+}
+
+/// Takes a Task's provider lease for a launch that edits its checkout outside
+/// the Task Worker path. `Ok(None)` only on a platform without leases, where the
+/// launch runs as it did before. Refused while another provider still holds the
+/// lock, so nothing is launched into a checkout a provider may still be writing.
+pub(crate) fn acquire_task_provider_lease(
+    storage: &crate::config::Storage,
+    task_id: Uuid,
+) -> Result<Option<crate::agents::provider_lease::ProviderLease>, String> {
+    crate::agents::provider_lease::acquire_proven(&task_provider_lease_path(storage, task_id))
+        .map_err(|error| {
+            format!("The Task's provider lease could not be taken; nothing was launched: {error}")
+        })
+}
+
 /// The outcome of a fix-agent run. Only a successful run applied fixes: one
 /// that exited non-zero or reported an error failed, like one that never
 /// started.
@@ -3398,10 +3423,10 @@ impl TaskExecutor {
             ));
         }
         // Taken before the Started write, so that a Started record can never exist
-        // without the lease a provider would hold. A crash after this point and
-        // before the spawn leaves an unlocked lease with no group, which a later
-        // attempt can prove absent. A refusal below drops it unused.
-        let lease = match crate::agents::provider_lease::acquire(&self.provider_lease_path(task_id)) {
+        // without the lease a provider would hold. A crash after the spawn mark is
+        // written leaves that mark, which a later attempt cannot prove absent: it
+        // needs a person to inspect the checkout. A refusal below drops it unused.
+        let lease = match crate::agents::provider_lease::acquire_proven(&self.provider_lease_path(task_id)) {
             Ok(lease) => lease,
             Err(error) => {
                 self.worktree_manager
@@ -3644,11 +3669,7 @@ impl TaskExecutor {
     /// [`Self::confirm_new_attempt_checkout`].
     /// The Task's provider lease file, under the application data directory.
     pub(crate) fn provider_lease_path(&self, task_id: Uuid) -> std::path::PathBuf {
-        self.storage
-            .paths()
-            .data_dir()
-            .join("provider-leases")
-            .join(format!("{task_id}.lock"))
+        task_provider_lease_path(&self.storage, task_id)
     }
 
     fn new_attempt_gate(
@@ -3835,6 +3856,24 @@ impl TaskExecutor {
             }
         };
         self.refuse_while_unrecorded_backoff(task_id)?;
+
+        // Every start that is not a new attempt is refused while a provider that
+        // may still be writing this checkout has no proof of absence. The lock
+        // alone does not cover this: a provider whose group was never recorded
+        // can leave a free lock behind, and the lease taken below would then
+        // replace the only evidence of it. Read-only, so it runs before any write.
+        if !matches!(request, StartRequest::NewAttempt { .. }) {
+            if let Err(reason) = crate::agents::provider_lease::prove_absent_unless_never_leased(
+                &self.provider_lease_path(task_id),
+            ) {
+                return match request {
+                    StartRequest::Pending => Ok(false),
+                    StartRequest::Direct | StartRequest::NewAttempt { .. } => Err(format!(
+                        "{reason} Nothing was recorded or launched. Inspect the Task Checkout before starting it again."
+                    )),
+                };
+            }
+        }
 
         // Disk space, before capacity and before anything below writes the
         // task, creates a checkout, a branch or an agent. A refusal changes
@@ -5095,7 +5134,7 @@ impl TaskExecutor {
     /// completion, or kill it and return early if `cancelled` fires first.
     ///
     /// This is the one place a `ClaudeRunner` spawned inside a review/fix
-    /// flow is owned: `ClaudeRunner::start` is never itself raced against
+    /// flow is owned: `ClaudeRunner::start_leased` is never itself raced against
     /// cancellation (an outer `select!` around a future still mid-spawn is
     /// exactly the unsafe shape that can drop a just-spawned child with
     /// nothing left pointing at it), so a cancellation arriving before this
@@ -5103,18 +5142,23 @@ impl TaskExecutor {
     /// is met with this function's own `kill()` before it returns -- never a
     /// caller racing the whole call from outside.
     ///
+    /// `lease` is the Task's provider lease for a run that can edit the
+    /// checkout; the run inherits it, so a later launch is refused while the run
+    /// lives. A read-only run passes `None`.
+    ///
     /// `Ok(Some(run))` is a completed run, successful or not (see
     /// [`AgentRun::success`]); `Ok(None)` is a graceful decline (cancelled
     /// before start, or cancelled during `wait()` and killed); `Err` is a
     /// real failure to start.
     async fn run_cancellable_agent(
         config: ClaudeRunConfig,
+        lease: Option<crate::agents::provider_lease::ProviderLease>,
         cancelled: &mut tokio::sync::watch::Receiver<bool>,
     ) -> Result<Option<AgentRun>, String> {
         if *cancelled.borrow() {
             return Ok(None);
         }
-        let runner = ClaudeRunner::start(config).await?;
+        let runner = ClaudeRunner::start_leased(config, lease).await?;
         tokio::select! {
             biased;
             result = runner.wait() => {
@@ -5769,6 +5813,7 @@ impl TaskExecutor {
                         disable_mcp: true,
                         additional_dirs: Vec::new(),
                     },
+                    None,
                     &mut cancelled_for_claude,
                 )
                 .await
@@ -5924,36 +5969,46 @@ impl TaskExecutor {
                 };
 
                 let fix_started = chrono::Utc::now();
-                let fix_run = Self::run_cancellable_agent(
-                    ClaudeRunConfig {
-                        prompt: fix_prompt,
-                        working_dir: working_dir.clone(),
-                        // An approval list under --dangerously-skip-permissions:
-                        // the fix agent still has the full default tool set,
-                        // Bash included.
-                        tools: ToolAccess::Full {
-                            auto_approve: vec![
-                                "Read".to_string(),
-                                "Edit".to_string(),
-                                "Write".to_string(),
-                                "Glob".to_string(),
-                                "Grep".to_string(),
-                            ],
-                            permission_mode: None,
-                        },
-                        max_turns: Some(20),
-                        max_budget_usd: None,
-                        session_id: Some(Uuid::new_v4().to_string()),
-                        resume_session: None,
-                        model: None,
-                        system_prompt: None,
-                        append_system_prompt: None,
-                        disable_mcp: false,
-                        additional_dirs: Vec::new(),
-                    },
-                    &mut cancelled,
-                )
-                .await;
+                // The fix agent edits the checkout, so it takes the Task's lease
+                // first. A Worker, PR helper or Conversation Worker that still
+                // holds the checkout refuses it here, and the fix counts as not
+                // started.
+                let fix_run = match acquire_task_provider_lease(&storage, task_id) {
+                    Err(error) => Err(error),
+                    Ok(fix_lease) => {
+                        Self::run_cancellable_agent(
+                            ClaudeRunConfig {
+                                prompt: fix_prompt,
+                                working_dir: working_dir.clone(),
+                                // An approval list under --dangerously-skip-permissions:
+                                // the fix agent still has the full default tool set,
+                                // Bash included.
+                                tools: ToolAccess::Full {
+                                    auto_approve: vec![
+                                        "Read".to_string(),
+                                        "Edit".to_string(),
+                                        "Write".to_string(),
+                                        "Glob".to_string(),
+                                        "Grep".to_string(),
+                                    ],
+                                    permission_mode: None,
+                                },
+                                max_turns: Some(20),
+                                max_budget_usd: None,
+                                session_id: Some(Uuid::new_v4().to_string()),
+                                resume_session: None,
+                                model: None,
+                                system_prompt: None,
+                                append_system_prompt: None,
+                                disable_mcp: false,
+                                additional_dirs: Vec::new(),
+                            },
+                            fix_lease,
+                            &mut cancelled,
+                        )
+                        .await
+                    }
+                };
 
                 // Whether the fix agent changed any file, when it succeeded.
                 let mut fix_changed_nothing = false;
@@ -17119,6 +17174,30 @@ VERDICT: APPROVED"
             );
             assert_eq!(worktree_count(&w.repo), 1);
             assert!(w.executor.running_handles.read().await.is_empty());
+        }
+
+        /// A provider from an earlier run that was launched but never had its
+        /// group recorded blocks a direct start too. The lock is free, so the
+        /// lock alone would admit it; the spawn mark is what refuses it, and the
+        /// mark is left in place for a person to resolve.
+        #[tokio::test]
+        async fn a_direct_start_is_refused_while_an_unrecorded_provider_may_remain() {
+            let w = world(NORMAL, TaskStatus::Queue, true).await;
+            let before = w.records().await;
+            let lease_path = w.executor.provider_lease_path(w.task_id);
+            std::fs::create_dir_all(lease_path.parent().unwrap()).unwrap();
+            std::fs::write(&lease_path, b"spawning\n").unwrap();
+
+            let refused = w.executor.execute_task(w.task_id).await;
+
+            assert!(
+                refused.as_ref().is_err_and(|m| m.contains("may have started")),
+                "{refused:?}"
+            );
+            assert_eq!(w.records().await, before, "nothing recorded");
+            assert_eq!(worktree_count(&w.repo), 1, "no checkout created");
+            assert!(w.executor.running_handles.read().await.is_empty());
+            assert_eq!(std::fs::read(&lease_path).unwrap(), b"spawning\n");
         }
 
         /// Disk space running out while a direct start is underway: the check

@@ -477,7 +477,7 @@ async fn coordinator_turn(
                 // One lease spans the whole turn, so the Conversation stays
                 // live between reads and a Stop cannot fall into a gap.
                 match lease {
-                    Some(lease) => Ok(run_with_lease(lease, config, None).await),
+                    Some(lease) => Ok(run_with_lease(lease, config, None, None).await),
                     None => run_with_cancellation(executor, conversation_id, config, true, None).await,
                 }
             }
@@ -523,19 +523,22 @@ async fn run_with_cancellation(
     let lease = executor
         .begin_project_run(conversation_id, reserve_capacity)
         .await?;
-    Ok(run_with_lease(lease, config, task_cancel).await)
+    Ok(run_with_lease(lease, config, task_cancel, None).await)
 }
 
+/// Runs one provider for a Project Run. `provider_lease` is the Task Checkout's
+/// lease for a Worker that can edit it, and `None` for a read-only run.
 async fn run_with_lease(
     lease: crate::queue::ProjectRunLease,
     config: ClaudeRunConfig,
     task_cancel: Option<watch::Receiver<bool>>,
+    provider_lease: Option<crate::agents::provider_lease::ProviderLease>,
 ) -> (Result<String, String>, crate::queue::ProjectRunLease) {
     let mut cancel_rx = lease.cancel_receiver();
     let result = async {
         if *cancel_rx.borrow() { return Err("Run stopped".into()); }
         if task_cancel.as_ref().is_some_and(|receiver| *receiver.borrow()) { return Err("Task Worker stopped".into()); }
-        let runner = ClaudeRunner::start(config).await?;
+        let runner = ClaudeRunner::start_leased(config, provider_lease).await?;
         tokio::select! {
             result = runner.wait() => {
                 result?;
@@ -764,6 +767,10 @@ pub async fn act_on_project_conversation(
     // see the Approved state or this executor-owned Run; they cannot mistake a
     // not-yet-registered Worker for a process lost to restart.
     let run_lease = executor.begin_project_run(conversation_id, false).await?;
+    // The Worker edits the Task Checkout, so it takes the Task's provider lease
+    // before Running is recorded. A provider still holding the checkout refuses
+    // the Worker here, and the Action stays approved.
+    let provider_lease = crate::queue::acquire_task_provider_lease(&state.storage, target.id)?;
     {
         let _guard = lock.lock().await;
         project_after_lock(&state.project.projects, project_id).await?;
@@ -789,8 +796,13 @@ pub async fn act_on_project_conversation(
             .save_conversation(&conversation)
             .map_err(|error| error.to_string())?;
     }
-    let (result, run_lease) =
-        run_with_lease(run_lease, worker_config, Some(lease.cancel_receiver())).await;
+    let (result, run_lease) = run_with_lease(
+        run_lease,
+        worker_config,
+        Some(lease.cancel_receiver()),
+        provider_lease,
+    )
+    .await;
     // Preserve the exact approved request; the Worker projection intentionally
     // excludes coordinator messages and all unrelated Tasks.
     let commit_result = if result.is_ok() {

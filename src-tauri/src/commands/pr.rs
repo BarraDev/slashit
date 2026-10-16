@@ -954,7 +954,7 @@ pub async fn triage_pr_comments(
         }
         let prompt = build_review_analysis_prompt(task, pr_url, &batch, &new_prompt_nonce());
         let raw_output =
-            run_claude_pr_helper(prompt, working_dir.to_string(), false, cancel_rx.clone()).await?;
+            run_claude_pr_helper(prompt, working_dir.to_string(), false, cancel_rx.clone(), None).await?;
         eprintln!("[pr-review] triage of {label}: {} chars", raw_output.len());
         if raw_output.trim().is_empty() {
             return Err(format!(
@@ -1172,7 +1172,7 @@ pub async fn discuss_pr_review_questions_inner(
             .collect();
         let prompt = build_discuss_prompt(&task, &plan.pr_url, &batch, &group, &new_prompt_nonce());
         let raw_output =
-            run_claude_pr_helper(prompt, working_dir.clone(), false, cancel_rx.clone()).await?;
+            run_claude_pr_helper(prompt, working_dir.clone(), false, cancel_rx.clone(), None).await?;
         eprintln!("[pr-review] discuss of {label}: {} chars", raw_output.len());
         if raw_output.trim().is_empty() {
             return Err(format!("Discuss helper finished without producing output for {label}."));
@@ -1286,8 +1286,17 @@ pub async fn address_pr_review(
     let purpose =
         if options.dry_run { PrHelperPurpose::Inspection } else { PrHelperPurpose::Editing };
     let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid, purpose).await?;
-    let (result, updated_plan) =
-        address_pr_review_inner(task, working_dir, plan, options, progress, cancel_rx).await?;
+    let provider_lease_path = crate::queue::task_provider_lease_path(&state.storage, task_uuid);
+    let (result, updated_plan) = address_pr_review_inner(
+        task,
+        working_dir,
+        plan,
+        options,
+        progress,
+        cancel_rx,
+        provider_lease_path,
+    )
+    .await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
     Ok(result)
 }
@@ -1308,6 +1317,9 @@ pub async fn address_pr_review(
 /// the pull request -- committed and, when a push was needed, pushed too --
 /// which this function only knows once the commit and push above have both
 /// resolved; see the reply delivery pass near the end (#79).
+/// `provider_lease_path` is the Task's provider lease. Each apply helper, which
+/// can edit the checkout, takes it before it starts, so no other provider can
+/// run in the checkout meanwhile.
 pub async fn address_pr_review_inner(
     task: Task,
     working_dir: String,
@@ -1315,6 +1327,7 @@ pub async fn address_pr_review_inner(
     options: AddressPrReviewOptions,
     progress: ProgressSink,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
+    provider_lease_path: std::path::PathBuf,
 ) -> Result<(PrReviewApplyResult, PrReviewPlan), String> {
     let pr_url = pr_url_for_task(&task)?;
     let task_id_str = task.id.to_string();
@@ -1402,7 +1415,7 @@ pub async fn address_pr_review_inner(
         if options.dry_run {
             let single = vec![&item];
             let prompt = build_review_fix_prompt(&task, &pr_url, &updated_plan.comments, &single, true);
-            match run_claude_pr_helper(prompt, working_dir.clone(), false, cancel_rx.clone()).await {
+            match run_claude_pr_helper(prompt, working_dir.clone(), false, cancel_rx.clone(), None).await {
                 Ok(summary) => {
                     if let Some(id) = item.comment_id { fixed_ids.push(id); }
                     per_item_summaries.push(format!(
@@ -1466,7 +1479,17 @@ pub async fn address_pr_review_inner(
             // the agent's own outcome is not second-guessed.
             let before = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
             let mut effect: Option<crate::domain::task::FixEffect> = None;
-            let outcome = run_claude_pr_helper(prompt, working_dir.clone(), true, cancel_rx.clone()).await;
+            // The apply helper edits the checkout, so each run takes the Task's lease
+            // first. A provider still holding it refuses this item, which then fails
+            // like any other helper that did not start.
+            let outcome = match crate::agents::provider_lease::acquire_proven(&provider_lease_path) {
+                Ok(lease) => {
+                    run_claude_pr_helper(prompt, working_dir.clone(), true, cancel_rx.clone(), lease).await
+                }
+                Err(error) => Err(format!(
+                    "The Task's provider lease could not be taken; nothing was launched: {error}"
+                )),
+            };
             if outcome.is_ok() {
                 let after = crate::worktree::delivery::checkout_snapshot(&working_dir).await;
                 if let (Ok(before_tree), Ok(after_tree)) = (before, after) {
@@ -3157,11 +3180,15 @@ fn pr_helper_run_config(
 /// success/`result_error` verdict) is unchanged from before this unit —
 /// still read from the runner's raw stdout/stderr/exit-status accessors
 /// rather than a second subprocess capture.
+///
+/// `lease` is the Task's provider lease for a helper that can edit the
+/// checkout, and `None` for a read-only one (see [`pr_helper_run_config`]).
 async fn run_claude_pr_helper(
     prompt: String,
     working_dir: String,
     can_edit: bool,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    lease: Option<crate::agents::provider_lease::ProviderLease>,
 ) -> Result<String, String> {
 
     eprintln!(
@@ -3175,10 +3202,10 @@ async fn run_claude_pr_helper(
 
     let config = pr_helper_run_config(prompt, working_dir, can_edit);
 
-    let runner = crate::agents::runner::ClaudeRunner::start(config).await
+    let runner = crate::agents::runner::ClaudeRunner::start_leased(config, lease).await
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
 
-    // Never raced against `ClaudeRunner::start` itself -- only `wait()`, for
+    // Never raced against `ClaudeRunner::start_leased` itself -- only `wait()`, for
     // the same reason `run_cancellable_agent`'s own doc gives: an outer
     // `select!` around a future still mid-spawn could drop a just-spawned
     // child with nothing left pointing at it.
@@ -12241,7 +12268,7 @@ mod tests {
             /// `stream-json` init line (so `ClaudeRunner`'s reader has
             /// something to parse), then backgrounds a real `sleep 300` and
             /// waits on it -- a genuine leader-plus-descendant process tree in
-            /// the same process group (`ClaudeRunner::start` sets
+            /// the same process group (`ClaudeRunner::start_leased` sets
             /// `process_group(0)` on the command before spawning it), for
             /// proving `kill()`'s `killpg` reaches the descendant too, not
             /// just the direct child. Never produces a terminal `result`
@@ -12469,6 +12496,7 @@ mod tests {
                         std::env::temp_dir().display().to_string(),
                         true,
                         cancel_rx,
+                        None,
                     )
                     .await
                 });
@@ -12559,6 +12587,7 @@ mod tests {
                         tmp.path().display().to_string(),
                         can_edit,
                         tokio::sync::watch::channel(false).1,
+                        None,
                     )
                     .await
                     .expect_err("an answer to a prompt claude never read is not a success");
@@ -12603,6 +12632,7 @@ mod tests {
                         std::env::temp_dir().display().to_string(),
                         true,
                         cancel_rx,
+                        None,
                     )
                     .await
                 });
@@ -14200,8 +14230,10 @@ mod tests {
                     let mut plan = plan;
                     plan.backfill_lifecycle_from_last_apply();
                     let (_lease, cancel_rx) = begin_pr_helper(&state_for_task, task_uuid, crate::queue::PrHelperPurpose::Editing).await?;
-                    let (result, updated_plan) =
-                        address_pr_review_inner(task, working_dir, plan, options, progress, cancel_rx).await?;
+                    let provider_lease_path = crate::queue::task_provider_lease_path(&state_for_task.storage, task_uuid);
+                    let (result, updated_plan) = address_pr_review_inner(
+                        task, working_dir, plan, options, progress, cancel_rx, provider_lease_path,
+                    ).await?;
                     save_review_plan_on_task(
                         &state_for_task.task.tasks,
                         &state_for_task.storage,
@@ -14648,6 +14680,7 @@ mod tests {
 
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 let working_dir = repo.checkout.to_str().unwrap().to_string();
+                let lease_dir = tempfile::tempdir().unwrap();
                 let apply = tokio::spawn(test_programs::scope(
                     [("jj", tools.fake_jj.clone())],
                     address_pr_review_inner(
@@ -14657,6 +14690,7 @@ mod tests {
                         options,
                         no_progress(),
                         cancel_rx,
+                        lease_dir.path().join("task.lock"),
                     ),
                 ));
 
@@ -14866,6 +14900,7 @@ mod tests {
                 plan.backfill_lifecycle_from_last_apply();
                 let options = AddressPrReviewOptions { auto_push: true, auto_reply, dry_run: false };
                 let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                let lease_dir = tempfile::tempdir().unwrap();
                 test_programs::scope(
                     [("jj", jj)],
                     address_pr_review_inner(
@@ -14875,6 +14910,7 @@ mod tests {
                         options,
                         no_progress(),
                         cancel_rx,
+                        lease_dir.path().join("task.lock"),
                     ),
                 )
                 .await
@@ -15249,6 +15285,7 @@ mod tests {
                 let (task, plan) = task_with_one_fix(&state, &repo, &worktree).await;
                 let options = AddressPrReviewOptions { auto_push: true, auto_reply: false, dry_run: false };
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                let lease_dir = tempfile::tempdir().unwrap();
                 let apply = tokio::spawn(test_programs::scope(
                     [("jj", tmp.path().join("no-such-jj"))],
                     address_pr_review_inner(
@@ -15258,6 +15295,7 @@ mod tests {
                         options,
                         no_progress(),
                         cancel_rx,
+                        lease_dir.path().join("task.lock"),
                     ),
                 ));
 
@@ -15301,6 +15339,7 @@ mod tests {
                 let options = AddressPrReviewOptions { auto_push: true, auto_reply: false, dry_run: false };
                 let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 cancel_tx.send(true).unwrap();
+                let lease_dir = tempfile::tempdir().unwrap();
                 let (result, plan) = test_programs::scope(
                     [("jj", no_jj)],
                     address_pr_review_inner(
@@ -15310,6 +15349,7 @@ mod tests {
                         options,
                         no_progress(),
                         cancel_rx,
+                        lease_dir.path().join("task.lock"),
                     ),
                 )
                 .await
@@ -15636,6 +15676,7 @@ mod tests {
                 plan.backfill_lifecycle_from_last_apply();
                 let options = AddressPrReviewOptions { auto_push: false, auto_reply, dry_run: false };
                 let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                let lease_dir = tempfile::tempdir().unwrap();
                 test_programs::scope(
                     [("jj", jj)],
                     address_pr_review_inner(
@@ -15645,6 +15686,7 @@ mod tests {
                         options,
                         no_progress(),
                         cancel_rx,
+                        lease_dir.path().join("task.lock"),
                     ),
                 )
                 .await
@@ -15772,6 +15814,7 @@ mod tests {
                 plan.backfill_lifecycle_from_last_apply();
                 let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                 let options = AddressPrReviewOptions { auto_push: true, auto_reply: true, dry_run: false };
+                let lease_dir = tempfile::tempdir().unwrap();
                 let (second, plan) = test_programs::scope(
                     [("jj", no_jj)],
                     address_pr_review_inner(
@@ -15781,6 +15824,7 @@ mod tests {
                         options,
                         sink,
                         cancel_rx,
+                        lease_dir.path().join("task.lock"),
                     ),
                 )
                 .await
