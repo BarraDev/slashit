@@ -6,6 +6,7 @@ use crate::domain::task::{
 };
 use crate::commands::task::Tasks;
 use crate::config::Storage;
+use crate::queue::PrHelperPurpose;
 use crate::worktree::checked_task_branch;
 use crate::agents::runner::truncate_one_line;
 use tokio::io::AsyncWriteExt;
@@ -893,7 +894,9 @@ pub async fn analyze_pr_comments(
         });
     }
 
-    let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid).await?;
+    // Triage runs `ToolAccess::ReadOnly` (see `run_claude_pr_helper(.., false, ..)`).
+    let (_lease, cancel_rx) =
+        begin_pr_helper(&state, task_uuid, PrHelperPurpose::Inspection).await?;
     let (mut items, raw_output) =
         triage_pr_comments(&task, &pr_url, &working_dir, &comments, cancel_rx).await?;
     eprintln!("[pr-review] parsed {} items", items.len());
@@ -1114,7 +1117,9 @@ pub async fn discuss_pr_review_questions(
         tasks.get(&task_uuid).cloned().ok_or("Task not found")?
     };
 
-    let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid).await?;
+    // Discuss runs `ToolAccess::ReadOnly` (see `run_claude_pr_helper(.., false, ..)`).
+    let (_lease, cancel_rx) =
+        begin_pr_helper(&state, task_uuid, PrHelperPurpose::Inspection).await?;
     let merged = discuss_pr_review_questions_inner(task, working_dir, plan, cancel_rx).await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, merged.clone()).await?;
     Ok(merged)
@@ -1276,7 +1281,11 @@ pub async fn address_pr_review(
     // the prior last_apply so the apply loop respects what's already on disk.
     let mut plan = plan;
     plan.backfill_lifecycle_from_last_apply();
-    let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid).await?;
+    // A dry run is the same flag that makes every provider call below
+    // read-only and skips the commit, push and replies; anything else can edit.
+    let purpose =
+        if options.dry_run { PrHelperPurpose::Inspection } else { PrHelperPurpose::Editing };
+    let (_lease, cancel_rx) = begin_pr_helper(&state, task_uuid, purpose).await?;
     let (result, updated_plan) =
         address_pr_review_inner(task, working_dir, plan, options, progress, cancel_rx).await?;
     save_review_plan_on_task(&state.task.tasks, &state.storage, task_uuid, updated_plan).await?;
@@ -3264,18 +3273,38 @@ async fn run_claude_pr_helper(
 async fn begin_pr_helper(
     state: &crate::AppState,
     task_id: Uuid,
+    purpose: crate::queue::PrHelperPurpose,
 ) -> Result<(Option<crate::queue::PrHelperLease>, tokio::sync::watch::Receiver<bool>), String> {
     refuse_while_republish_pending(state, task_id).await?;
     match state.executor.get() {
         Some(executor) => {
             let lease = executor
-                .try_begin_pr_helper(task_id)
+                .try_begin_pr_helper(task_id, purpose)
                 .await
                 .map_err(|refusal| refusal.to_string())?;
             let cancel_rx = lease.cancel_receiver();
             Ok((Some(lease), cancel_rx))
         }
-        None => Ok((None, tokio::sync::watch::channel(false).1)),
+        None => {
+            // Nothing can own the task without an executor, but unresolved
+            // Worker recovery evidence does not depend on one: a provider that
+            // can edit the checkout is still refused, under the same lifecycle
+            // lease the executor's own admission uses.
+            if purpose == crate::queue::PrHelperPurpose::Editing {
+                let _lease = state.task_lifecycle_locks.acquire(task_id).await?;
+                if let Some(refusal) = state
+                    .task
+                    .tasks
+                    .read()
+                    .await
+                    .get(&task_id)
+                    .and_then(Task::worker_recovery_refusal)
+                {
+                    return Err(refusal);
+                }
+            }
+            Ok((None, tokio::sync::watch::channel(false).1))
+        }
     }
 }
 
@@ -3311,6 +3340,14 @@ async fn reserve_task_for_pr_side_effect(
     // push or pull request exists.
     if let Some(refusal) =
         state.task.tasks.read().await.get(&task_id).and_then(Task::integration_unfinished_refusal)
+    {
+        return Err(refusal);
+    }
+    // A push or pull request would publish a branch whose Worker commit a
+    // person has not yet inspected. Decided under the lease, before any owner
+    // is ended or any side effect begins.
+    if let Some(refusal) =
+        state.task.tasks.read().await.get(&task_id).and_then(Task::worker_recovery_refusal)
     {
         return Err(refusal);
     }
@@ -11950,7 +11987,7 @@ mod tests {
 
                     let create = create_pr_inner(&p.state, &id).await.expect_err("create");
                     assert!(create.contains("unfinished"), "{create}");
-                    let helper = begin_pr_helper(&p.state, p.task_id).await.err().expect("helper");
+                    let helper = begin_pr_helper(&p.state, p.task_id, crate::queue::PrHelperPurpose::Editing).await.err().expect("helper");
                     assert!(helper.contains("unfinished"), "{helper}");
                     let reserve = reserve_task_for_pr_side_effect(&p.state, p.task_id).await.err().expect("reserve");
                     assert!(reserve.contains("unfinished"), "{reserve}");
@@ -11960,14 +11997,14 @@ mod tests {
 
                     // Another task is not affected.
                     let other = seed_task(&p.state, p.landed.repo.checkout.to_str().unwrap(), Some("task-other"), TaskStatus::Done).await;
-                    assert!(begin_pr_helper(&p.state, other).await.is_ok());
+                    assert!(begin_pr_helper(&p.state, other, crate::queue::PrHelperPurpose::Editing).await.is_ok());
                     assert!(reserve_task_for_pr_side_effect(&p.state, other).await.is_ok());
 
                     // Reading, Resume and Discard stay available.
                     assert!(matches!(p.status().await.unwrap(), Some(RepublishStatus::Interrupted { .. })));
                     p.restack().await.unwrap();
                     assert_restacked(&p, "resumed after the guards refused").await;
-                    assert!(begin_pr_helper(&p.state, p.task_id).await.is_ok(), "no longer pending");
+                    assert!(begin_pr_helper(&p.state, p.task_id, crate::queue::PrHelperPurpose::Editing).await.is_ok(), "no longer pending");
                 }
 
                 /// A rebase the crash left stopped keeps the branch ref where it
@@ -12343,7 +12380,7 @@ mod tests {
                     .register_fake_running_execution_holding_permit_for_test(holder_task)
                     .await;
 
-                let refusal = expect_refusal(executor.try_begin_pr_helper(helper_task).await);
+                let refusal = expect_refusal(executor.try_begin_pr_helper(helper_task, crate::queue::PrHelperPurpose::Editing).await);
                 assert_eq!(refusal, crate::queue::PrHelperRefusal::NoCapacity);
 
                 // End the execution owner (the same mechanism a lifecycle
@@ -12361,7 +12398,7 @@ mod tests {
                 );
 
                 let lease = executor
-                    .try_begin_pr_helper(helper_task)
+                    .try_begin_pr_helper(helper_task, crate::queue::PrHelperPurpose::Editing)
                     .await
                     .expect("capacity must be free once the execution's permit is released");
                 drop(lease);
@@ -12378,16 +12415,16 @@ mod tests {
                 let task_id = Uuid::new_v4();
 
                 let first = executor
-                    .try_begin_pr_helper(task_id)
+                    .try_begin_pr_helper(task_id, crate::queue::PrHelperPurpose::Editing)
                     .await
                     .expect("first flow must be admitted");
 
-                let refusal = expect_refusal(executor.try_begin_pr_helper(task_id).await);
+                let refusal = expect_refusal(executor.try_begin_pr_helper(task_id, crate::queue::PrHelperPurpose::Editing).await);
                 assert_eq!(refusal, crate::queue::PrHelperRefusal::TaskAlreadyOwned);
 
                 drop(first);
                 let second = executor
-                    .try_begin_pr_helper(task_id)
+                    .try_begin_pr_helper(task_id, crate::queue::PrHelperPurpose::Editing)
                     .await
                     .expect("once the first flow ends, a new one for the same task must be admitted");
                 drop(second);
@@ -12415,7 +12452,7 @@ mod tests {
                 let task_id = Uuid::new_v4();
 
                 let lease = executor
-                    .try_begin_pr_helper(task_id)
+                    .try_begin_pr_helper(task_id, crate::queue::PrHelperPurpose::Editing)
                     .await
                     .expect("first PR-helper flow for this task must be admitted");
                 let cancel_rx = lease.cancel_receiver();
@@ -12447,7 +12484,7 @@ mod tests {
                     crate::config::queue::QueueConfig { parallel_task_limit: 1, ..Default::default() },
                 ).await;
                 assert_eq!(
-                    expect_refusal(executor.try_begin_pr_helper(Uuid::new_v4()).await),
+                    expect_refusal(executor.try_begin_pr_helper(Uuid::new_v4(), crate::queue::PrHelperPurpose::Editing).await),
                     crate::queue::PrHelperRefusal::NoCapacity,
                     "capacity must be held while the PR helper is alive"
                 );
@@ -12471,7 +12508,7 @@ mod tests {
                 );
 
                 assert!(
-                    executor.try_begin_pr_helper(Uuid::new_v4()).await.is_ok(),
+                    executor.try_begin_pr_helper(Uuid::new_v4(), crate::queue::PrHelperPurpose::Editing).await.is_ok(),
                     "capacity must be free again once the cancelled helper's cleanup finished"
                 );
             }
@@ -12555,7 +12592,7 @@ mod tests {
                 let task_id = Uuid::new_v4();
 
                 let first = executor
-                    .try_begin_pr_helper(task_id)
+                    .try_begin_pr_helper(task_id, crate::queue::PrHelperPurpose::Editing)
                     .await
                     .expect("first flow must be admitted");
                 let cancel_rx = first.cancel_receiver();
@@ -12571,7 +12608,7 @@ mod tests {
                 });
                 wait_for_pid(|| mock.leader_pid()).await;
 
-                let refusal = expect_refusal(executor.try_begin_pr_helper(task_id).await);
+                let refusal = expect_refusal(executor.try_begin_pr_helper(task_id, crate::queue::PrHelperPurpose::Editing).await);
                 assert_eq!(refusal, crate::queue::PrHelperRefusal::TaskAlreadyOwned);
 
                 let running: Option<&dyn crate::lifecycle::ExecutionOwnership> =
@@ -14162,7 +14199,7 @@ mod tests {
                     };
                     let mut plan = plan;
                     plan.backfill_lifecycle_from_last_apply();
-                    let (_lease, cancel_rx) = begin_pr_helper(&state_for_task, task_uuid).await?;
+                    let (_lease, cancel_rx) = begin_pr_helper(&state_for_task, task_uuid, crate::queue::PrHelperPurpose::Editing).await?;
                     let (result, updated_plan) =
                         address_pr_review_inner(task, working_dir, plan, options, progress, cancel_rx).await?;
                     save_review_plan_on_task(
@@ -16467,7 +16504,7 @@ mod tests {
                     "execution must see the task as owned while its PR is being opened"
                 );
                 assert_eq!(
-                    expect_refusal(executor.try_begin_pr_helper(task_id).await),
+                    expect_refusal(executor.try_begin_pr_helper(task_id, crate::queue::PrHelperPurpose::Editing).await),
                     crate::queue::PrHelperRefusal::TaskAlreadyOwned,
                     "a PR helper must not start while the PR operation owns the task"
                 );
@@ -16503,7 +16540,7 @@ mod tests {
                 );
                 drop(
                     executor
-                        .try_begin_pr_helper(task_id)
+                        .try_begin_pr_helper(task_id, crate::queue::PrHelperPurpose::Editing)
                         .await
                         .expect("a PR helper may start once the PR operation has settled"),
                 );
@@ -16698,5 +16735,83 @@ mod relink {
             })
             .collect();
         assert_eq!(states, [Some("OPEN")], "one reference, open again");
+    }
+}
+
+#[cfg(test)]
+mod recovery_admission_tests {
+    use super::*;
+    use crate::domain::task::{WorkerHandoff, WorkerHandoffStage};
+
+    async fn recovery_state(
+        with_executor: bool,
+    ) -> (tempfile::TempDir, crate::AppState, Uuid) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+            tmp.path().join("config"),
+            tmp.path().join("data"),
+            tmp.path().join("cache"),
+            tmp.path().join("runtime"),
+        ));
+        let (state, _) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state");
+        if with_executor {
+            crate::test_helpers::attach_test_executor(&state);
+        }
+        let project_id = Uuid::new_v4();
+        let mut task = crate::test_helpers::create_test_task_full(
+            "held",
+            project_id,
+            TaskStatus::Error,
+            0,
+        );
+        task.worker_handoff = Some(WorkerHandoff {
+            task_id: task.id,
+            project_id,
+            repository_id: None,
+            run: Some(1),
+            branch: Some("task".into()),
+            start_head: None,
+            acceptance: None,
+            stage: WorkerHandoffStage::RecoveryRequired {
+                reason: "interrupted".into(),
+                observed_commit: None,
+            },
+        });
+        let id = task.id;
+        state.task.tasks.write().await.insert(id, task.clone());
+        state.storage.save_project_tasks(project_id, &[task]).expect("seed");
+        (tmp, state, id)
+    }
+
+    /// Editing is refused with and without an executor; inspection is not.
+    #[tokio::test]
+    async fn only_an_editing_helper_is_refused_for_a_recovery_task() {
+        for with_executor in [true, false] {
+            let (_tmp, state, id) = recovery_state(with_executor).await;
+            let refusal = begin_pr_helper(&state, id, PrHelperPurpose::Editing)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("executor={with_executor}: editing must be refused"));
+            assert!(refusal.contains("unresolved Worker recovery"), "{refusal}");
+            let (lease, _cancel) = begin_pr_helper(&state, id, PrHelperPurpose::Inspection)
+                .await
+                .unwrap_or_else(|e| panic!("executor={with_executor}: read-only stays open: {e}"));
+            assert_eq!(lease.is_some(), with_executor);
+            drop(lease);
+            // Publishing the branch is refused too, before any owner is ended.
+            let reserve = reserve_task_for_pr_side_effect(&state, id)
+                .await
+                .err()
+                .expect("a PR side effect is refused for a recovery Task");
+            assert!(reserve.contains("unresolved Worker recovery"), "{reserve}");
+            let task = state.task.tasks.read().await[&id].clone();
+            assert_eq!(task.status, TaskStatus::Error);
+            assert!(matches!(
+                task.worker_handoff.unwrap().stage,
+                WorkerHandoffStage::RecoveryRequired { .. }
+            ));
+        }
     }
 }

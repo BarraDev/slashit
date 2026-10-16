@@ -272,6 +272,27 @@ pub struct WorkerHandoff {
     #[serde(default)]
     pub start_head: Option<String>,
     pub stage: WorkerHandoffStage,
+    /// The one human decision that resolved this run's recovery, if any. It
+    /// lives and dies with the handoff of the run it resolved: the next run
+    /// replaces the whole record, and a stale run is refused by its run
+    /// ordinal and stage, never by remembering old decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<WorkerResultAcceptance>,
+}
+
+/// A person's acceptance of one exact existing commit as the result of an
+/// interrupted coding run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerResultAcceptance {
+    /// Client-generated identity of the decision, for idempotent retries.
+    pub decision_id: Uuid,
+    pub commit: String,
+    /// The commit the recovery evidence had observed when the person decided,
+    /// or `None` if it had observed none. Part of the decision's identity: a
+    /// retry that names a different observation is a different request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_commit: Option<String>,
+    pub decided_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -396,6 +417,36 @@ impl Task {
                 decision.decision == HumanReviewDecision::ChangesRequested
                     && decision.decided_at >= completed_at
             })
+    }
+
+    /// Whether an AI Review has already been admitted for the current Worker
+    /// run's result. Review admission requires the branch to sit exactly on the
+    /// handoff commit only before the first review of a result: a later review
+    /// of the same result legitimately sees the fix agent's own commits.
+    ///
+    /// This is a record that an admission decision was made, nothing more. It
+    /// does not prove the checkout is still safe or that a reviewer ever
+    /// started, so callers still verify the checkout once it exists.
+    pub fn review_admitted_for_current_result(&self) -> bool {
+        let Some(handoff) = self.worker_handoff.as_ref() else {
+            return false;
+        };
+        let Some(run) = handoff.run else {
+            return false;
+        };
+        let completed_at = self.activity.iter().find_map(|entry| {
+            matches!(entry.kind, ActivityKind::RunCompleted { run: r } if r == run)
+                .then_some(entry.at)
+        });
+        let anchor = match (completed_at, handoff.acceptance.as_ref()) {
+            (Some(done), Some(accepted)) => done.max(accepted.decided_at),
+            (Some(done), None) => done,
+            (None, Some(accepted)) => accepted.decided_at,
+            (None, None) => return false,
+        };
+        self.activity.iter().any(|entry| {
+            matches!(entry.kind, ActivityKind::AiReviewStarted { .. }) && entry.at >= anchor
+        })
     }
 
     /// Why ordinary Queue/status commands may not bypass recovery.
@@ -1775,6 +1826,7 @@ mod tests {
             run: Some(1),
             branch: Some("task/example".into()),
             start_head: Some("a".repeat(40)),
+            acceptance: None,
             stage: WorkerHandoffStage::RecoveryRequired {
                 reason: "exact commit unknown".into(),
                 observed_commit: None,
@@ -1813,6 +1865,7 @@ mod tests {
             run: Some(1),
             branch: Some("task/example".into()),
             start_head: Some("a".repeat(40)),
+            acceptance: None,
             stage: WorkerHandoffStage::ResolvedToAiReview {
                 commit: "b".repeat(40),
             },
@@ -1841,6 +1894,7 @@ mod tests {
             run: Some(1),
             branch: Some("task/example".into()),
             start_head: Some("a".repeat(40)),
+            acceptance: None,
             stage: WorkerHandoffStage::ResolvedToAiReview {
                 commit: "b".repeat(40),
             },

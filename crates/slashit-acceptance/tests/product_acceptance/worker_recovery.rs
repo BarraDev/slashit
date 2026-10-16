@@ -323,10 +323,19 @@ async fn ambiguous_handoff_journey(context: &TestContext) -> Result<()> {
         "[data-testid=\"task-drawer-tab-changes\"]",
     )
     .await?;
-    let changes = ui::visible(session.driver(), "[data-testid=\"task-drawer-changes\"]").await?;
-    let changes_text = changes.prop("textContent").await?.unwrap_or_default();
-    if !changes_text.contains("preserved-uncommitted.txt") {
-        bail!("the preserved checkout is not inspectable in Changes: {changes_text}");
+    // The pane is visible while its diff is still loading; wait for the file.
+    let started = Instant::now();
+    loop {
+        let changes =
+            ui::visible(session.driver(), "[data-testid=\"task-drawer-changes\"]").await?;
+        let changes_text = changes.prop("textContent").await?.unwrap_or_default();
+        if changes_text.contains("preserved-uncommitted.txt") {
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(15) {
+            bail!("the preserved checkout is not inspectable in Changes: {changes_text}");
+        }
+        tokio::time::sleep(POLL).await;
     }
 
     if ui::invoke(
@@ -389,6 +398,209 @@ async fn ambiguous_handoff_journey(context: &TestContext) -> Result<()> {
     context
         .close_session(session, "recovery-required", &closed)
         .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_workers_exact_commit_can_be_accepted_into_ai_review() {
+    let context = TestContext::new("worker_recovery_accept").expect("harness setup");
+    let result = accept_result_journey(&context).await;
+    context.finish(result);
+}
+
+/// A real Worker commits, the durable record is rewound to the exact state
+/// an interrupted run leaves, and the person accepts that commit
+/// through the real drawer. No coding Worker is launched by the decision.
+async fn accept_result_journey(context: &TestContext) -> Result<()> {
+    let root = context.state().path().to_path_buf();
+    let agent = FakeAgent::install(&root)?;
+    context.set_child_env("PATH", agent.path_value());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir());
+    context.set_child_env(fake_agent::WRITE_FILE_VAR, "accepted-proof.txt");
+    start_on_the_legacy_auto_placement(&context.state().config_file())?;
+    let repository = GitFixture::create(&root.join("fixture-repo"))?;
+
+    let session = context.start_session("accept-worker").await?;
+    let (project_id, task_id, title, branch, commit) = async {
+        let project_id = register_project(session.driver(), &repository).await?;
+        let (task_id, title) =
+            create_task(session.driver(), &project_id, "Accept the result", &[]).await?;
+        run_to_review(session.driver(), &project_id, &task_id, &title).await?;
+        let listed = ui::invoke(
+            session.driver(),
+            "list_tasks",
+            json!({ "projectId": project_id }),
+        )
+        .await?;
+        let found = find_task(&listed, &task_id).context("task disappeared")?;
+        let branch = branch_name_of(&found)?;
+        let commit = repository
+            .branch_tip(&branch)?
+            .context("the Worker branch has no tip")?;
+        Ok::<_, anyhow::Error>((project_id, task_id, title, branch, commit))
+    }
+    .await?;
+    ui::invoke(
+        session.driver(),
+        "stop_task_execution",
+        json!({ "taskId": task_id }),
+    )
+    .await?;
+    let closed = Ok(());
+    context
+        .close_session(session, "accept-worker", &closed)
+        .await?;
+
+    // Rewind to the state an interrupted run leaves: Error, RecoveryRequired
+    // with the run's start HEAD, and no completion on the timeline.
+    mutate_task_record(&root, &task_id, |record| {
+        record.insert("status".into(), toml::Value::String("error".into()));
+        record.insert("phase".into(), toml::Value::String("idle".into()));
+        record.insert(
+            "error_message".into(),
+            toml::Value::String("The Worker was interrupted.".into()),
+        );
+        let handoff = record
+            .get_mut("worker_handoff")
+            .and_then(toml::Value::as_table_mut)
+            .context("real Worker run did not persist handoff evidence")?;
+        let mut stage = toml::map::Map::new();
+        stage.insert(
+            "state".into(),
+            toml::Value::String("recovery_required".into()),
+        );
+        stage.insert(
+            "reason".into(),
+            toml::Value::String("The Worker was interrupted.".into()),
+        );
+        handoff.insert("stage".into(), toml::Value::Table(stage));
+        if let Some(activity) = record
+            .get_mut("activity")
+            .and_then(toml::Value::as_array_mut)
+        {
+            activity.retain(|entry| {
+                let kind = entry
+                    .get("kind")
+                    .and_then(|kind| kind.get("type"))
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or_default();
+                !(kind == "run_completed"
+                    || kind == "ready_for_review"
+                    || kind.starts_with("ai_review")
+                    || kind.starts_with("ai_fix")
+                    || kind == "recovery_required")
+            });
+        }
+        Ok(())
+    })?;
+
+    let session = context.start_session("accept-decision").await?;
+    let task = await_status(session.driver(), &project_id, &task_id, &["error"]).await?;
+    if task
+        .get("worker_handoff")
+        .and_then(|h| h.get("stage"))
+        .and_then(|s| s.get("state"))
+        .and_then(Value::as_str)
+        != Some("recovery_required")
+    {
+        bail!("startup did not keep the Task in recovery: {task}");
+    }
+    super::open_drawer(session.driver(), &task_id, &title).await?;
+    let uncertain = ui::visible(
+        session.driver(),
+        "[data-testid=\"worker-recovery-uncertain\"]",
+    )
+    .await?
+    .prop("textContent")
+    .await?
+    .unwrap_or_default();
+    if !uncertain.contains("may have survived the application crash") {
+        bail!("the possibly orphaned provider is not disclosed: {uncertain}");
+    }
+    let confirmed = ui::visible(
+        session.driver(),
+        "[data-testid=\"worker-recovery-confirmed\"]",
+    )
+    .await?
+    .prop("textContent")
+    .await?
+    .unwrap_or_default();
+    if !confirmed.contains(&commit) {
+        bail!("the exact tip {commit} is not shown as confirmed: {confirmed}");
+    }
+    ui::assert_absent(session.driver(), "[data-testid=\"task-drawer-retry\"]").await?;
+    ui::assert_absent(session.driver(), "[data-testid=\"task-drawer-start\"]").await?;
+    driver_click(session.driver(), "[data-testid=\"worker-recovery-review\"]").await?;
+    let shown = ui::visible(
+        session.driver(),
+        "[data-testid=\"worker-recovery-confirm-commit\"]",
+    )
+    .await?
+    .prop("textContent")
+    .await?
+    .unwrap_or_default();
+    if shown.trim() != commit {
+        bail!("the confirmation names {shown:?}, not the inspected tip {commit}");
+    }
+    driver_click(session.driver(), "[data-testid=\"worker-recovery-accept\"]").await?;
+
+    // The Task starts in `error`, so only the destination can be awaited.
+    let task = await_status(session.driver(), &project_id, &task_id, &["human_review"]).await?;
+    if status_of(&task) != Some("human_review") {
+        bail!("the accepted commit did not reach AI Review and Human Review: {task}");
+    }
+    assert_accepted_record(&root, &task_id, &commit)?;
+    context
+        .close_session(session, "accept-decision", &closed)
+        .await?;
+
+    let session = context.start_session("accept-restart").await?;
+    let task = await_status(
+        session.driver(),
+        &project_id,
+        &task_id,
+        &["human_review", "error"],
+    )
+    .await?;
+    if status_of(&task) != Some("human_review") {
+        bail!("restart regressed the accepted Task: {task}");
+    }
+    assert_accepted_record(&root, &task_id, &commit)?;
+    let coding = agent_runs(&agent)?
+        .iter()
+        .filter(|run| {
+            run.prompt.is_some()
+                && run
+                    .flag("--allowedTools")
+                    .is_some_and(|tools| tools.to_string_lossy().contains("Bash"))
+        })
+        .count();
+    if coding != 1 {
+        bail!("accepting launched {coding} coding Workers; expected only the original one");
+    }
+    if repository.branch_tip(&branch)?.as_deref() != Some(commit.as_str()) {
+        bail!("accepting moved the Task branch");
+    }
+    context
+        .close_session(session, "accept-restart", &closed)
+        .await
+}
+
+fn assert_accepted_record(root: &Path, task_id: &str, commit: &str) -> Result<()> {
+    assert_recovered_record(root, task_id, commit)?;
+    let record = read_task_record(root, task_id)?;
+    let acceptance = record
+        .get("worker_handoff")
+        .and_then(|handoff| handoff.get("acceptance"))
+        .context("the human decision was not recorded")?;
+    if acceptance.get("commit").and_then(toml::Value::as_str) != Some(commit)
+        || acceptance
+            .get("decision_id")
+            .and_then(toml::Value::as_str)
+            .is_none()
+    {
+        bail!("the recorded decision does not name the accepted commit: {acceptance}");
+    }
+    Ok(())
 }
 
 async fn driver_click(driver: &WebDriver, selector: &str) -> Result<()> {

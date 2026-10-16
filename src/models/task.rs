@@ -223,6 +223,20 @@ pub struct WorkerHandoff {
     #[serde(default)]
     pub start_head: Option<String>,
     pub stage: WorkerHandoffStage,
+    /// Mirrors the backend field: the human decision that resolved this
+    /// run's recovery. Kept so a task round-trips through the frontend whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<WorkerResultAcceptance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerResultAcceptance {
+    pub decision_id: Uuid,
+    pub commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_commit: Option<String>,
+    pub decided_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

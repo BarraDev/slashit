@@ -873,6 +873,7 @@ fn mark_worker_recovery_required(task: &mut Task, run: Option<u32>, reason: &str
             run,
             branch: task.branch_name.clone(),
             start_head: None,
+            acceptance: None,
             stage: domain::task::WorkerHandoffStage::RecoveryRequired {
                 reason: reason.to_string(),
                 observed_commit: observed_commit.clone(),
@@ -883,6 +884,7 @@ fn mark_worker_recovery_required(task: &mut Task, run: Option<u32>, reason: &str
         reason: reason.to_string(),
         observed_commit,
     };
+    task.worker_handoff_confirmed = false;
     task.status = domain::TaskStatus::Error;
     task.phase = domain::TaskPhase::Idle;
     task.phase_progress = 0;
@@ -1618,6 +1620,7 @@ mod tests {
             run: Some(run),
             branch: Some("task/example".into()),
             start_head: Some("a".repeat(40)),
+            acceptance: None,
             stage: domain::task::WorkerHandoffStage::CommittedAwaitingReview {
                 commit: "b".repeat(40),
             },
@@ -1780,6 +1783,7 @@ mod tests {
             run: Some(1),
             branch: Some(branch.to_string()),
             start_head: Some(commit.clone()),
+            acceptance: None,
             stage: domain::task::WorkerHandoffStage::ResolvedToAiReview { commit },
         });
         // Recorded location no longer exists -- the trigger for adoption.
