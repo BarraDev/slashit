@@ -1,96 +1,9 @@
+//! Task diffs. The legacy JJ IPC commands that lived here were removed: JJ
+//! workspaces have no ownership model in SlashIt, so the status read and the
+//! mutating commands were disabled. Task diffs read the Git worktree only.
+
 use crate::commands::gui_admission::GuiMutation;
-use crate::jj::JjManager;
-use std::sync::Arc;
-use std::path::PathBuf;
 use uuid::Uuid;
-
-#[derive(Clone)]
-pub struct JjState {
-    jj_manager: Arc<JjManager>,
-}
-
-impl JjState {
-    pub fn new() -> Self {
-        Self {
-            jj_manager: Arc::new(JjManager::new()),
-        }
-    }
-}
-
-impl Default for JjState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[tauri::command]
-pub async fn new_change(
-    _gui: GuiMutation,
-    state: tauri::State<'_, crate::AppState>,
-    workspace_path: String,
-    description: String,
-) -> Result<String, String> {
-    state
-        .jj
-        .jj_manager
-        .new_change(PathBuf::from(&workspace_path).as_path(), &description)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn describe_change(
-    _gui: GuiMutation,
-    state: tauri::State<'_, crate::AppState>,
-    workspace_path: String,
-    change_id: String,
-    description: String,
-) -> Result<(), String> {
-    state
-        .jj
-        .jj_manager
-        .describe_change(PathBuf::from(&workspace_path).as_path(), &change_id, &description)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn abandon_change(
-    _gui: GuiMutation,
-    state: tauri::State<'_, crate::AppState>,
-    workspace_path: String,
-    change_id: String,
-) -> Result<(), String> {
-    state
-        .jj
-        .jj_manager
-        .abandon_change(PathBuf::from(&workspace_path).as_path(), &change_id)
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn jj_get_workspace_status(
-    _gui: GuiMutation,
-    state: tauri::State<'_, crate::AppState>,
-    workspace_path: String,
-) -> Result<crate::jj::JjStatus, String> {
-    state
-        .jj
-        .jj_manager
-        .get_status(PathBuf::from(&workspace_path).as_path())
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn git_export(
-    _gui: GuiMutation,
-    state: tauri::State<'_, crate::AppState>,
-    workspace_path: String,
-) -> Result<(), String> {
-    state
-        .jj
-        .jj_manager
-        .git_export(PathBuf::from(&workspace_path).as_path())
-        .map_err(|e| e.to_string())
-}
 
 /// A task with no worktree has no diff of its own.
 ///
@@ -165,34 +78,15 @@ mod tests {
     #[test]
     fn commands_ask_for_the_state_the_app_actually_manages() {
         // `run()` calls `.manage()` exactly once, with `AppState`. Tauri looks
-        // `State<T>` up by `TypeId` in that map, so a command asking for
-        // `State<JjState>` — a type that only ever exists as a *field* of
-        // `AppState` — is rejected at invoke time with "state not managed for
-        // field ... You must call `.manage()` before using this command".
-        // `jj_get_workspace_status` backs the JjStatus component, so the panel
-        // could never load.
+        // `State<T>` up by `TypeId` in that map, so a command asking for a
+        // sub-state type that only exists as a *field* of `AppState` is
+        // rejected at invoke time. Reverting either command's signature to such
+        // a type stops this file compiling.
         //
         // The helper is deliberately never awaited: `tauri::State` wraps a
         // private field and cannot be constructed outside a running app, so the
-        // type check *is* the assertion. Reverting any signature to the
-        // sub-state stops this file compiling.
-        async fn binds_to_app_state(
-            state: tauri::State<'_, crate::AppState>,
-            workspace_path: String,
-            change_id: String,
-            description: String,
-        ) {
-            let _ = new_change(GuiMutation::untracked(), state.clone(), workspace_path.clone(), description.clone()).await;
-            let _ = describe_change(GuiMutation::untracked(), 
-                state.clone(),
-                workspace_path.clone(),
-                change_id.clone(),
-                description,
-            )
-            .await;
-            let _ = abandon_change(GuiMutation::untracked(), state.clone(), workspace_path.clone(), change_id.clone()).await;
-            let _ = jj_get_workspace_status(GuiMutation::untracked(), state.clone(), workspace_path.clone()).await;
-            let _ = git_export(GuiMutation::untracked(), state.clone(), workspace_path).await;
+        // type check *is* the assertion.
+        async fn binds_to_app_state(state: tauri::State<'_, crate::AppState>, change_id: String) {
             let _ = get_task_diff(GuiMutation::untracked(), state.clone(), change_id.clone()).await;
             let _ = get_task_diff_stat(GuiMutation::untracked(), state, change_id).await;
         }

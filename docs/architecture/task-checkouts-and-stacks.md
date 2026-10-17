@@ -170,9 +170,9 @@ what, and no `gh` extension is required.
 
 Core behavior needs only `git`. In a repository colocated with Jujutsu, `jj`
 is used if it is installed, for Jujutsu-specific operations such as
-initializing a colocated repository (`worktree::vcs_init`), the `jj` view and
-commands (`jj/`), exporting to Git before a push, and a trunk fallback when
-choosing the default base. Work in a Task Checkout is committed with `git`.
+initializing a colocated repository (`worktree::vcs_init`), the `jj` commands
+that PR delivery runs (`commands/pr.rs`), exporting to Git before a push, and
+a trunk fallback when choosing the default base. Work in a Task Checkout is committed with `git`.
 When `jj` is missing, those paths are skipped or the Git path is used, and Task
 Checkouts, commits and restacks work as in a plain Git repository. A Jujutsu
 repository that is not colocated with Git cannot get a Task Checkout (see

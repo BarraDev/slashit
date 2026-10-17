@@ -360,7 +360,7 @@ The procedure is in [development-workflow.md](../development-workflow.md).
 | Local delivery and integration | `commands/human_review.rs`, `commands/integration.rs`, `worktree::integration`, `domain::LocalIntegration` (`Task.local_integration`) |
 | Workspace root as agent context | `TaskExecutor::resolve_workspace_launch` in `queue/executor.rs` |
 | Task Checkout lifecycle | `lifecycle.rs` |
-| Jujutsu integration | `jj/`, `commands/jj.rs` |
+| Jujutsu integration | `commands/pr.rs` (PR delivery); `worktree` (default base, colocated init) |
 
 ## Former names and compatibility
 

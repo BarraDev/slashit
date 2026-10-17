@@ -237,8 +237,8 @@ probe "fully qualified path from the wrong crate" 1 '`slashit_ui_lib::endpoint::
   'edit "s/slashit_ipc::endpoint::runtime_dir/slashit_ui_lib::endpoint::runtime_dir/" src-tauri/src/AGENTS.md'
 probe "same name only in an unrelated crate" 1 "$stale" \
   "$gone; printf 'pub struct ClaudeRunner;\n' >>crates/slashit-cli/src/main.rs; printf 'pub struct ClaudeRunner;\n' >>src/app.rs"
-probe "root AGENTS.md resolves across every crate" 1 '\[G\] AGENTS.md:[0-9]+: `JjStatus` is ambiguous in any crate' \
-  'say AGENTS.md "See @JjStatus@."'
+probe "root AGENTS.md resolves across every crate" 1 '\[G\] AGENTS.md:[0-9]+: `ProbeName` is ambiguous in any crate' \
+  'printf "pub struct ProbeName;\n" >>src-tauri/src/lib.rs; printf "pub struct ProbeName;\n" >>crates/slashit-ipc/src/lib.rs; say AGENTS.md "See @ProbeName@."'
 probe "doc comments are not definitions" 1 "$stale" \
   "$gone; printf '/// pub struct ClaudeRunner;\n//! pub struct ClaudeRunner {}\n' >>$runner"
 probe "line and nested block comments are not definitions" 1 "$stale" \
@@ -282,17 +282,17 @@ probe "wildcard external entry" 2 'external entries are exact names or paths' \
   'edit "s/^external = \[/external = [\"tauri::*\", /" docs/agent-docs.toml'
 probe "unknown [citations] key" 2 'unknown key "externals"' \
   'edit "s/^external = /externals = /" docs/agent-docs.toml'
-probe "documented command renamed in code" 1 '\[G\] src-tauri/src/jj/AGENTS.md:[0-9]+: Tauri command `git_export` is listed under "Tauri Commands Exposed" but is not registered' \
-  'edit "s/^            git_export,$/            git_export_all,/" src-tauri/src/lib.rs; edit "s/fn git_export(/fn git_export_all(/" src-tauri/src/commands/jj.rs'
-probe "command defined but no longer registered" 1 'Tauri command `abandon_change` is listed' \
-  'edit "/^            abandon_change,$/d" src-tauri/src/lib.rs'
-probe "registration commented out or mentioned elsewhere" 1 'Tauri command `abandon_change` is listed' \
-  'edit "s|^            abandon_change,$|            // abandon_change,|" src-tauri/src/lib.rs; printf "fn uses() { let _ = commands::jj::abandon_change; }\n" >>src-tauri/src/lib.rs'
+probe "documented command renamed in code" 1 '\[G\] src-tauri/src/AGENTS.md:[0-9]+: Tauri command `greet` is listed under "Tauri Commands Exposed" but is not registered' \
+  'say src-tauri/src/AGENTS.md "## Tauri Commands Exposed"; say src-tauri/src/AGENTS.md ""; say src-tauri/src/AGENTS.md "- @greet@ - test"; edit "s/^            greet,$/            greet_all,/" src-tauri/src/lib.rs'
+probe "command defined but no longer registered" 1 'Tauri command `greet` is listed' \
+  'say src-tauri/src/AGENTS.md "## Tauri Commands Exposed"; say src-tauri/src/AGENTS.md ""; say src-tauri/src/AGENTS.md "- @greet@ - test"; edit "/^            greet,$/d" src-tauri/src/lib.rs'
+probe "registration commented out or mentioned elsewhere" 1 'Tauri command `greet` is listed' \
+  'say src-tauri/src/AGENTS.md "## Tauri Commands Exposed"; say src-tauri/src/AGENTS.md ""; say src-tauri/src/AGENTS.md "- @greet@ - test"; edit "s|^            greet,$|            // greet,|" src-tauri/src/lib.rs; printf "fn uses() { let _ = commands::jj::get_task_diff_stat; }\n" >>src-tauri/src/lib.rs'
 probe "unrelated command unregistered" 0 'agent-docs: OK' 'edit "/^            greet,$/d" src-tauri/src/lib.rs'
 probe "handler list reformatted" 0 'agent-docs: OK' \
-  'edit "/^            describe_change,$/d" src-tauri/src/lib.rs; edit "s/^            new_change,$/            new_change, commands::jj::describe_change,/" src-tauri/src/lib.rs'
+  'edit "/^            get_task_diff,$/d" src-tauri/src/lib.rs; edit "s/^            get_task_diff_stat,$/            get_task_diff_stat, get_task_diff,/" src-tauri/src/lib.rs'
 probe "second generate_handler! list" 2 'expected one tauri::generate_handler!\[...\] in src-tauri/src/lib.rs, found 2' \
-  'printf "fn more() { tauri::generate_handler![greet]; }\n" >>src-tauri/src/lib.rs'
+  'say src-tauri/src/AGENTS.md "## Tauri Commands Exposed"; say src-tauri/src/AGENTS.md ""; say src-tauri/src/AGENTS.md "- @greet@ - test"; printf "fn more() { tauri::generate_handler![greet]; }\n" >>src-tauri/src/lib.rs'
 probe "a cfg(test) item is not a production definition" 1 '`ClaudeRunner` names only agents::runner::ClaudeRunner .*compiled only under cfg\(test\)' \
   "$gone; printf '#[cfg(test)]\npub struct ClaudeRunner;\n' >>$runner"
 probe "a method in a cfg(test) impl is not a production definition" 1 '`AppState::events\(\)` names only AppState::events .*cfg\(test\)' \
@@ -303,8 +303,8 @@ probe "a cfg(any(test, ...)) item is a definition" 0 'agent-docs: OK' \
   "$gone; printf '#[cfg(any(test, feature = \"x\"))]\npub struct ClaudeRunner;\n' >>$runner"
 probe "a cfg(test) module loaded through #[path] is not a definition" 1 "$stale" \
   "$gone; printf '#[cfg(test)]\n#[path = \"runner_fixtures.rs\"]\nmod fixtures;\n' >>$runner; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/runner_fixtures.rs"
-probe "a file no crate root reaches is not a definition" 1 '`JjManager` names nothing defined' \
-  'edit "/^mod jj;$/d" src-tauri/src/lib.rs'
+probe "a file no crate root reaches is not a definition" 1 '`ProbeOrphan` names nothing defined' \
+  'printf "pub struct ProbeOrphan;\n" >src-tauri/src/probe_orphan.rs; say src-tauri/src/AGENTS.md "See @ProbeOrphan@."'
 probe "a lib.rs or mod.rs no crate root declares is not a definition" 1 "$stale" \
   "$gone; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/lib.rs; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/mod.rs"
 nested_main="$gone; printf 'pub mod main;\n' >>src-tauri/src/agents/mod.rs; printf 'pub struct ClaudeRunner;\n' >src-tauri/src/agents/main.rs"
@@ -312,8 +312,8 @@ probe "a nested main.rs is a module named main" 0 'agent-docs: OK' \
   "$nested_main; edit 's/^\(- \*\*runner\.rs\*\* - .\)ClaudeRunner/\1main::ClaudeRunner/' src-tauri/src/agents/AGENTS.md"
 probe "a nested main.rs does not name its parent module" 1 '`agents::ClaudeRunner` names nothing defined .*\(agents::main::ClaudeRunner\)' \
   "$nested_main; edit 's/^\(- \*\*runner\.rs\*\* - .\)ClaudeRunner/\1agents::ClaudeRunner/' src-tauri/src/agents/AGENTS.md"
-probe "a binary is not part of the library crate" 1 '`JjStatus` names nothing defined' \
-  'edit "s/^pub struct JjStatus {/pub struct JjState {/" src-tauri/src/jj/manager.rs; printf "struct JjStatus;\n" >>src-tauri/src/bin/slashitd.rs'
+probe "a binary is not part of the library crate" 1 '`ProbeBin` names nothing defined' \
+  'printf "pub struct ProbeBin;\n" >>src-tauri/src/bin/slashitd.rs; say src-tauri/src/AGENTS.md "See @ProbeBin@."'
 probe "a moved item still re-exported under its old path" 1 '`roles::AgentRole` names nothing defined .*items named AgentRole: .*agents::kinds::AgentRole.*re-exports do not count' \
   'edit "s/^pub enum AgentRole {/pub enum AgentRoleOld {/" src-tauri/src/agents/roles.rs; printf "pub use super::kinds::AgentRole;\n" >>src-tauri/src/agents/roles.rs; printf "pub mod kinds;\n" >>src-tauri/src/agents/mod.rs; printf "pub enum AgentRole {}\n" >src-tauri/src/agents/kinds.rs'
 probe "a name inside generic arguments is checked" 1 '\[G\] src-tauri/src/AGENTS.md:[0-9]+: `RoadmapState` names nothing defined' \
@@ -330,10 +330,10 @@ probe "external name SlashIt now defines suggests the full path" 1 '`TypeId` is 
   'printf "enum Key {\n    TypeId,\n    Name,\n}\n" >>src-tauri/src/queue/mod.rs'
 probe "ambiguity hint lists every qualified form" 1 '`ClaudeRunner` is ambiguous.*qualify the citation as one of `runner::ClaudeRunner`, `pool::ClaudeRunner`' \
   'printf "pub struct ClaudeRunner;\n" >src-tauri/src/queue/pool.rs; printf "mod pool;\n" >>src-tauri/src/queue/mod.rs'
-probe "commands heading in another case, with a subsection" 1 'Tauri command `abandon_change` is listed' \
-  'edit "s/^## Tauri Commands Exposed$/## Tauri commands exposed/" src-tauri/src/jj/AGENTS.md; edit "s/^- \`abandon_change\`/### Mutating\n\n- \`abandon_change\`/" src-tauri/src/jj/AGENTS.md; edit "/^            abandon_change,$/d" src-tauri/src/lib.rs'
+probe "commands heading in another case, with a subsection" 1 'Tauri command `greet` is listed' \
+  'say src-tauri/src/AGENTS.md "## Tauri commands exposed"; say src-tauri/src/AGENTS.md ""; say src-tauri/src/AGENTS.md "### Mutating"; say src-tauri/src/AGENTS.md ""; say src-tauri/src/AGENTS.md "- @greet@ - test"; edit "/^            greet,$/d" src-tauri/src/lib.rs'
 probe "prose in the commands section is not a command" 0 'agent-docs: OK' \
-  'say src-tauri/src/jj/AGENTS.md "These run @jj@ as a subprocess."; edit "/^## Pattern$/d" src-tauri/src/jj/AGENTS.md'
+  'say src-tauri/src/AGENTS.md "## Tauri Commands Exposed"; say src-tauri/src/AGENTS.md ""; say src-tauri/src/AGENTS.md "- @greet@ - test"; say src-tauri/src/AGENTS.md "These run @jj@ as a subprocess."'
 probe "workspace and dotted-table path dependencies keep their scope" 0 'agent-docs: OK' \
   'printf "\n[workspace.dependencies]\nslashit-ipc = { path = \"crates/slashit-ipc\" }\n" >>Cargo.toml; edit "s|^slashit-ipc = { path = \"../crates/slashit-ipc\" }$|slashit-ipc = { workspace = true }|" src-tauri/Cargo.toml; grep -q "workspace = true" src-tauri/Cargo.toml; edit "s|^slashit-ipc = { path = \"../slashit-ipc\" }$|[dependencies.slashit-ipc]\npath = \"../slashit-ipc\"|" crates/slashit-cli/Cargo.toml; grep -q "^\[dependencies.slashit-ipc\]" crates/slashit-cli/Cargo.toml'
 
