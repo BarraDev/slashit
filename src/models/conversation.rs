@@ -27,7 +27,7 @@ pub enum FieldChange { Title { from: String, to: String }, Description { from: O
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskMutation { CreateTask { task_id: Uuid, title: String, description: Option<String>, priority: String, category: String }, EditTask { target_task_id: Uuid, target_task_title: String, changes: Vec<FieldChange> }, MoveTask { target_task_id: Uuid, target_task_title: String, from: String, to: String }, EnqueueTask { target_task_id: Uuid, target_task_title: String, from: String, #[serde(default)] input: Option<ExecutionInput> }, ExecuteRequest { target_task_id: Uuid, target_task_title: String, from: String, request: String, input: ExecutionInput } }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionInput { pub digest: String, pub description: Option<String>, pub subtask_count: usize }
+pub struct ExecutionInput { pub digest: String, pub description: Option<String>, pub subtask_count: usize, #[serde(default)] pub model: Option<String> }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ProjectActionOutcome { Applied { task_id: Uuid, title: String }, AlreadyQueued { task_id: Uuid, title: String }, Refused { reason: String } }

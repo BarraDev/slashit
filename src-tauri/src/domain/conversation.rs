@@ -198,6 +198,11 @@ pub struct ExecutionInput {
     pub digest: String,
     pub description: Option<String>,
     pub subtask_count: usize,
+    /// The Task's model configuration as the Human saw it: a configured
+    /// identifier, or an empty or `"default"` value for provider default. `None`
+    /// for a proposal recorded before the model was shown.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl ExecutionInput {
@@ -210,7 +215,20 @@ impl ExecutionInput {
                 .filter(|text| !text.is_empty())
                 .map(|text| text.chars().take(INPUT_PREVIEW_LIMIT).collect()),
             subtask_count: task.subtasks.len(),
+            model: Some(task.model.clone()),
         }
+    }
+}
+
+/// How a Task's model configuration is described to the Human. An empty or
+/// `"default"` value selects the provider default, which the provider resolves
+/// at execution time; any other value is the configured identifier. The launch
+/// applies the same rule (`queue::executor`), so the wording matches what runs.
+pub fn model_policy_phrase(model: Option<&str>) -> String {
+    match model {
+        None => "model not recorded for this proposal".into(),
+        Some("" | "default") => "provider default, selected at execution time".into(),
+        Some(model) => format!("model {model}"),
     }
 }
 
@@ -375,9 +393,10 @@ impl TaskMutation {
             ),
             Self::ExecuteRequest { target_task_id, target_task_title, from, request, input } => format!(
                 "Queue Task {target_task_id} ({target_task_title:?}) from {from:?} for one run with an \
-                 additional request, on its current definition ({}): {}; the Task description is not \
+                 additional request, on its current definition ({}; {}): {}; the Task description is not \
                  changed, and SlashIt's scheduler decides when it starts",
                 input.digest.chars().take(12).collect::<String>(),
+                model_policy_phrase(input.model.as_deref()),
                 request.chars().take(600).collect::<String>()
             ),
         };

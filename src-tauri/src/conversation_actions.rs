@@ -2134,5 +2134,63 @@ mod tests {
             "an ordinary approval keeps its existing digest"
         );
     }
+
+    #[test]
+    fn the_approval_records_the_model_policy_and_a_change_of_policy_fails_closed() {
+        use crate::domain::task::ApprovedExecution;
+        use crate::domain::conversation::model_policy_phrase;
+
+        let mut explicit = crate::test_helpers::create_test_task("Model policy");
+        explicit.model = "claude-opus-4-0-20250514".into();
+        let mutation = TaskMutation::execute_request(&explicit, "extra").unwrap();
+        let TaskMutation::ExecuteRequest { input, .. } = &mutation else {
+            panic!("expected an ExecuteRequest proposal");
+        };
+        assert_eq!(input.model.as_deref(), Some("claude-opus-4-0-20250514"));
+        assert_eq!(model_policy_phrase(input.model.as_deref()), "model claude-opus-4-0-20250514");
+
+        let mut provider_default = explicit.clone();
+        provider_default.model = "default".into();
+        let TaskMutation::ExecuteRequest { input, .. } = TaskMutation::execute_request(&provider_default, "extra").unwrap() else {
+            panic!("expected an ExecuteRequest proposal");
+        };
+        assert_eq!(model_policy_phrase(input.model.as_deref()), "provider default, selected at execution time");
+        assert_eq!(model_policy_phrase(None), "model not recorded for this proposal");
+
+        // The Human approved the explicit model. Switching the Task to provider
+        // default after approval must not start the run with the approved input.
+        let mut approved = explicit.clone();
+        approved.approved_execution = Some(ApprovedExecution {
+            approval_id: uuid::Uuid::new_v4(),
+            digest: crate::queue::prompt::approved_input_digest(&explicit, Some("extra")),
+            for_run: explicit.next_run(),
+            request: Some("extra".into()),
+        });
+        assert_eq!(crate::queue::prompt::check_approved_input(&approved), crate::queue::prompt::ApprovedInputCheck::Matches);
+        let mut switched = approved.clone();
+        switched.model = "default".into();
+        assert_eq!(crate::queue::prompt::check_approved_input(&switched), crate::queue::prompt::ApprovedInputCheck::Differs);
+
+        // The reverse direction: approved as provider default, then pinned.
+        let mut approved_default = provider_default.clone();
+        approved_default.approved_execution = Some(ApprovedExecution {
+            approval_id: uuid::Uuid::new_v4(),
+            digest: crate::queue::prompt::approved_input_digest(&provider_default, Some("extra")),
+            for_run: provider_default.next_run(),
+            request: Some("extra".into()),
+        });
+        let mut pinned = approved_default.clone();
+        pinned.model = "claude-opus-4-0-20250514".into();
+        assert_eq!(crate::queue::prompt::check_approved_input(&pinned), crate::queue::prompt::ApprovedInputCheck::Differs);
+
+        // Empty and "default" are the same policy, but the raw-model digest
+        // treats them as different. That refuses a start and never authorizes one.
+        let mut empty = provider_default.clone();
+        empty.model = String::new();
+        assert_ne!(
+            crate::queue::prompt::approved_input_digest(&provider_default, Some("extra")),
+            crate::queue::prompt::approved_input_digest(&empty, Some("extra")),
+        );
+    }
 }
 
