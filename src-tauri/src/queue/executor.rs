@@ -20868,7 +20868,11 @@ VERDICT: APPROVED"
             let repo = temps[0].path().join("repository");
             std::fs::create_dir_all(&repo).unwrap();
             git_in(&repo, &["init", "-q", "-b", "main"]);
-            git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
+            // The base already holds a parent Task's work, which is not this
+            // Task's own.
+            std::fs::write(repo.join("parent.txt"), "parent work\n").unwrap();
+            git_in(&repo, &["add", "parent.txt"]);
+            git_in(&repo, &["commit", "-q", "-m", "first"]);
             let base = git_in(&repo, &["rev-parse", "main"]);
 
             let project_id = Uuid::new_v4();
@@ -20894,7 +20898,9 @@ VERDICT: APPROVED"
                 &repo,
                 &["worktree", "add", "-q", "-b", &branch, checkout.to_str().unwrap(), "main"],
             );
-            git_in(&checkout, &["commit", "-q", "--allow-empty", "-m", "prior run"]);
+            std::fs::write(checkout.join("a.txt"), "commit A\n").unwrap();
+            git_in(&checkout, &["add", "a.txt"]);
+            git_in(&checkout, &["commit", "-q", "-m", "prior run"]);
             task.worktree_path = Some(checkout.to_string_lossy().into_owned());
             task.branch_name = Some(branch);
             task.base_commit = Some(base.clone());
@@ -21156,6 +21162,240 @@ VERDICT: APPROVED"
                 });
             assert!(!matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
             assert_eq!(fx.task().await.status, TaskStatus::Backlog);
+        }
+
+        /// A completed run whose result a later Human Review "changes
+        /// requested" decision superseded: the one resolved handoff a proposal
+        /// accepts. Approval, acquisition and the run start must accept it too.
+        async fn supersede_the_last_run(fx: &Reuse) {
+            let mut tasks = fx.executor.tasks.write().await;
+            let task = tasks.get_mut(&fx.task_id).unwrap();
+            let completed_at = chrono::Utc::now();
+            task.record_activity_at(
+                completed_at - chrono::Duration::seconds(2),
+                ActivityKind::RunStarted { run: 1, addressing_feedback: false },
+            );
+            task.record_activity_at(completed_at, ActivityKind::RunCompleted { run: 1 });
+            task.worker_handoff = Some(crate::domain::task::WorkerHandoff {
+                task_id: fx.task_id,
+                project_id: fx.project_id,
+                repository_id: None,
+                run: Some(1),
+                branch: None,
+                start_head: None,
+                acceptance: None,
+                stage: crate::domain::task::WorkerHandoffStage::ResolvedToAiReview {
+                    commit: git_in(&fx.checkout, &["rev-parse", "HEAD"]),
+                },
+            });
+            task.human_review.record_arrival();
+            task.human_review.push(
+                crate::domain::task::HumanReviewDecision::ChangesRequested,
+                Some("please revise".into()),
+                completed_at + chrono::Duration::seconds(1),
+            );
+        }
+
+        #[tokio::test]
+        async fn a_superseded_resolved_handoff_is_proposed_approved_and_started_consistently() {
+            let fx = reuse_fixture().await;
+            supersede_the_last_run(&fx).await;
+            let evidence = fx.evidence().await;
+            assert_eq!(evidence.run, 2, "the run after the superseded one");
+
+            assert!(matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
+            let (_, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            let start = fx
+                .executor
+                .record_run_start(fx.task_id, &fx.repo, acquired.expect("the checkout is reused"))
+                .await
+                .unwrap_or_else(|e| panic!("a proposed request must be startable: {e}"));
+            assert_eq!(start.run, 2);
+            assert_eq!(start.working_dir, evidence.checkout_path);
+        }
+
+        #[tokio::test]
+        async fn an_unsuperseded_resolved_handoff_is_refused_at_every_stage() {
+            let fx = reuse_fixture().await;
+            supersede_the_last_run(&fx).await;
+            // The decision predates the completed run, so it supersedes nothing.
+            fx.executor.tasks.write().await.get_mut(&fx.task_id).unwrap().human_review = Default::default();
+            let task = fx.task().await;
+            assert!(task.existing_checkout_refusal().is_some(), "proposal");
+            let evidence = fx.evidence().await;
+            assert!(!matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)), "approval");
+            assert_eq!(fx.task().await.status, TaskStatus::Backlog);
+        }
+
+        /// The canonical Task diff keeps the Task's base across a reused
+        /// checkout: commits A (earlier run) and B (the approved run) are both
+        /// the Task's, and the parent work in the base is not.
+        #[tokio::test]
+        async fn the_task_diff_spans_both_runs_from_the_unchanged_base() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            assert!(matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
+            let (_, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            fx.executor
+                .record_run_start(fx.task_id, &fx.repo, acquired.unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("the run is not recorded: {e}"));
+            // The approved run's own work.
+            std::fs::write(fx.checkout.join("b.txt"), "commit B\n").unwrap();
+            git_in(&fx.checkout, &["add", "b.txt"]);
+            git_in(&fx.checkout, &["commit", "-q", "-m", "approved run"]);
+
+            let task = fx.task().await;
+            assert_eq!(task.base_commit.as_deref(), Some(fx.base.as_str()), "the base was not advanced to A");
+            assert_ne!(task.base_commit.as_deref(), Some(evidence.head.as_str()));
+            let diff = crate::worktree::task_diff(&evidence.checkout_path, task.base_commit.as_deref())
+                .await
+                .expect("the canonical diff");
+            assert!(diff.patch.contains("a.txt"), "commit A is the Task's: {}", diff.stat);
+            assert!(diff.patch.contains("b.txt"), "commit B is the Task's: {}", diff.stat);
+            assert!(!diff.patch.contains("parent.txt"), "parent work is not attributed: {}", diff.stat);
+
+            // A Task without a recorded base has no diff, rather than a guessed one.
+            assert_eq!(
+                crate::worktree::task_diff(&evidence.checkout_path, None).await,
+                Err(crate::worktree::TaskDiffError::UnknownBoundary)
+            );
+        }
+
+        /// A failure before the approved Task write is published queues
+        /// nothing and binds nothing; the same approval is then the retry.
+        #[tokio::test]
+        async fn an_approval_that_fails_before_publication_queues_nothing_and_can_be_retried() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            let task = fx.task().await;
+            let digest = crate::queue::prompt::approved_input_digest(&task, Some(REQUEST));
+            let approval_id = Uuid::new_v4();
+            let approve = || {
+                crate::lifecycle::enqueue_leased(
+                    &fx.executor.tasks,
+                    &fx.executor.storage,
+                    fx.project_id,
+                    fx.task_id,
+                    &TaskStatus::Backlog,
+                    Some(InputApproval {
+                        id: approval_id,
+                        digest: &digest,
+                        request: Some(REQUEST),
+                        checkout: Some(&evidence),
+                    }),
+                )
+            };
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::CreateTemp,
+                std::io::ErrorKind::Other,
+            );
+            assert!(approve().await.is_err(), "the write failed");
+            drop(fault);
+            let memory = fx.task().await;
+            assert_eq!((memory.status, memory.approved_execution), (TaskStatus::Backlog, None));
+            let disk = on_disk_task(&fx.executor, fx.project_id, fx.task_id);
+            assert_eq!((disk.status, disk.approved_execution), (TaskStatus::Backlog, None));
+            assert!(fx.checkout.exists());
+
+            assert!(matches!(approve().await.unwrap(), EnqueueVerdict::Queued(_)), "the retry");
+        }
+
+        /// A Task write the file accepted but could not confirm is published:
+        /// the retry observes it and neither queues nor binds a second time,
+        /// and the run still starts once.
+        #[tokio::test]
+        async fn a_published_but_unconfirmed_approval_is_observed_by_the_retry_and_runs_once() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            let task = fx.task().await;
+            let digest = crate::queue::prompt::approved_input_digest(&task, Some(REQUEST));
+            let approval_id = Uuid::new_v4();
+            let approve = || {
+                crate::lifecycle::enqueue_leased(
+                    &fx.executor.tasks,
+                    &fx.executor.storage,
+                    fx.project_id,
+                    fx.task_id,
+                    &TaskStatus::Backlog,
+                    Some(InputApproval {
+                        id: approval_id,
+                        digest: &digest,
+                        request: Some(REQUEST),
+                        checkout: Some(&evidence),
+                    }),
+                )
+            };
+            let fault = slashit_durable_fs::fault::fail_every(
+                slashit_durable_fs::Stage::SyncDirectory,
+                std::io::ErrorKind::Other,
+            );
+            let first = approve().await;
+            drop(fault);
+            let published = on_disk_task(&fx.executor, fx.project_id, fx.task_id);
+            assert_eq!(published.status, TaskStatus::Queue, "the file replaced the board: {first:?}");
+            assert_eq!(published.approved_execution.as_ref().and_then(|b| b.checkout.clone()), Some(evidence.clone()));
+
+            let retry = approve().await;
+            assert!(!matches!(retry, Ok(EnqueueVerdict::Queued(_))), "a second queueing: {retry:?}");
+            let (_, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            fx.executor
+                .record_run_start(fx.task_id, &fx.repo, acquired.expect("the bound checkout"))
+                .await
+                .unwrap_or_else(|e| panic!("the run is not recorded: {e}"));
+            assert_eq!(fx.task().await.executed_approvals.len(), 1);
+        }
+
+        /// After a restart that reloads the board, a repeated approval of a
+        /// run already recorded as started is blocked: no second run is
+        /// queued, so no second provider is launched.
+        #[tokio::test]
+        async fn a_restart_after_the_recorded_run_start_never_launches_a_second_run() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            let task = fx.task().await;
+            let digest = crate::queue::prompt::approved_input_digest(&task, Some(REQUEST));
+            let approval_id = Uuid::new_v4();
+            let approval = || InputApproval {
+                id: approval_id,
+                digest: &digest,
+                request: Some(REQUEST),
+                checkout: Some(&evidence),
+            };
+            let enqueue = |approval| {
+                crate::lifecycle::enqueue_leased(
+                    &fx.executor.tasks,
+                    &fx.executor.storage,
+                    fx.project_id,
+                    fx.task_id,
+                    &TaskStatus::Backlog,
+                    Some(approval),
+                )
+            };
+            assert!(matches!(enqueue(approval()).await.unwrap(), EnqueueVerdict::Queued(_)));
+            let (_, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            fx.executor
+                .record_run_start(fx.task_id, &fx.repo, acquired.unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("the run is not recorded: {e}"));
+
+            // Restart: memory is replaced by what the board holds, and the
+            // run's start is among it.
+            let mut reloaded = fx.executor.storage.load_project_tasks(fx.project_id).unwrap();
+            let mut tasks = fx.executor.tasks.write().await;
+            tasks.clear();
+            tasks.extend(reloaded.drain(..).map(|t| (t.id, t)));
+            drop(tasks);
+            let after = fx.task().await;
+            assert_eq!(after.executed_approvals.len(), 1);
+            assert_eq!(after.approved_execution, None);
+
+            let again = enqueue(approval()).await.unwrap();
+            assert!(!matches!(again, EnqueueVerdict::Queued(_)), "{again:?}");
+            let still = fx.task().await;
+            assert_eq!(still.approved_execution, None, "the repeat bound nothing");
+            assert_eq!(still.executed_approvals.len(), 1);
+            assert_eq!(still.next_run(), 2, "no further run start was recorded");
         }
 
         #[tokio::test]

@@ -765,12 +765,36 @@ impl WorktreeManager {
     /// `canonicalize` resolves symlinks so a `..`-relative or symlink-aliased
     /// path still compares equal. A path that cannot be canonicalized is
     /// compared as it is.
-    fn is_primary_checkout(candidate: &Path, repo_path: &str, porcelain: &str) -> bool {
+    pub(crate) fn is_primary_checkout(candidate: &Path, repo_path: &str, porcelain: &str) -> bool {
         let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
         let candidate = canonical(candidate);
         std::iter::once(repo_path)
             .chain(Self::main_worktree(porcelain))
             .any(|primary| canonical(Path::new(primary)) == candidate)
+    }
+
+    /// Refuses `checkout` when it is the user's own checkout of `repo_path`
+    /// (see [`Self::is_primary_checkout`]), reading git's registrations
+    /// without changing anything. A listing git cannot produce refuses too:
+    /// whether the checkout is the user's own is then unknown.
+    pub(crate) async fn refuse_primary_checkout(repo_path: &str, checkout: &str) -> Result<(), String> {
+        let output = super::registry_lock::output(git_program(), repo_path, &["worktree", "list", "--porcelain", "-z"])
+            .await
+            .map_err(|e| format!("Git's checkout registrations could not be read: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Git's checkout registrations could not be read: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let porcelain = String::from_utf8_lossy(&output.stdout);
+        if Self::is_primary_checkout(Path::new(checkout), repo_path, &porcelain) {
+            return Err(format!(
+                "{checkout} is the repository's own checkout, not a Task Checkout, so no coding run may start \
+                 there. Nothing was changed."
+            ));
+        }
+        Ok(())
     }
 
     /// The main worktree's path: the first record git lists.

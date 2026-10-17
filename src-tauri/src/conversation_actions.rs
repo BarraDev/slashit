@@ -111,6 +111,10 @@ pub async fn inspect_existing_checkout(repo_path: &str, task: &Task) -> Result<E
         .map_err(|e| format!("The repository could not be resolved: {e}"))?
         .to_string_lossy()
         .into_owned();
+    // The user's own checkout is never a Task Checkout, even when the Task's
+    // record names it, its branch is checked out there, or the path is a
+    // symlink to it. `reattach` refuses the same classification.
+    WorktreeManager::refuse_primary_checkout(&repository_path, checkout).await?;
     let inspection = crate::worktree::new_attempt::inspect(&repository_path, checkout, branch).await?;
     if !inspection.dirty_paths.is_empty() {
         return Err(
@@ -829,6 +833,60 @@ mod existing_checkout_tests {
         task.branch_name = Some("main".into());
         let err = inspect_existing_checkout(&foreign.repo, &task).await.unwrap_err();
         assert!(err.contains("own branch"), "{err}");
+    }
+
+    /// The user's own checkout is never a Task Checkout, whatever the Task's
+    /// record says: here its branch is checked out in the primary checkout, and
+    /// the record names that checkout, directly or through a symlink.
+    #[tokio::test]
+    async fn the_primary_checkout_and_its_symlink_alias_are_refused_and_left_untouched() {
+        let fx = fixture();
+        let repo = Path::new(&fx.repo);
+        let branch = fx.task.branch_name.clone().unwrap();
+        git(repo, &["worktree", "remove", fx.checkout.to_str().unwrap()]);
+        git(repo, &["checkout", "-q", &branch]);
+        std::fs::write(repo.join("wip.txt"), "uncommitted\n").unwrap();
+        let alias = fx.dir.path().join("alias");
+        std::os::unix::fs::symlink(repo, &alias).unwrap();
+        let head = git(repo, &["rev-parse", "HEAD"]);
+
+        for path in [repo.to_path_buf(), alias.clone(), repo.join("..").join("repo")] {
+            let mut task = fx.task.clone();
+            task.worktree_path = Some(path.to_string_lossy().into_owned());
+            let err = inspect_existing_checkout(&fx.repo, &task).await.unwrap_err();
+            assert!(err.contains("repository's own checkout"), "{path:?}: {err}");
+            // The same refusal when the Project itself is reached through the alias.
+            let err = inspect_existing_checkout(alias.to_str().unwrap(), &task).await.unwrap_err();
+            assert!(err.contains("repository's own checkout"), "{path:?} via alias: {err}");
+        }
+        assert_eq!(git(repo, &["rev-parse", "HEAD"]), head, "the branch did not move");
+        assert_eq!(git(repo, &["symbolic-ref", "--short", "HEAD"]), branch);
+        assert_eq!(std::fs::read_to_string(repo.join("wip.txt")).unwrap(), "uncommitted\n");
+    }
+
+    /// A Project whose repository path is itself a linked worktree is
+    /// supported: the Task Checkout is a different linked worktree, and the
+    /// main checkout it was linked from is still not one.
+    #[tokio::test]
+    async fn a_linked_worktree_project_reuses_a_separate_task_checkout_only() {
+        let fx = fixture();
+        let main_repo = Path::new(&fx.repo);
+        let project_checkout = fx.dir.path().join("project-worktree");
+        git(main_repo, &["worktree", "add", "-q", "-b", "project-branch", project_checkout.to_str().unwrap(), "main"]);
+        let project = project_checkout.to_string_lossy().into_owned();
+
+        let evidence = inspect_existing_checkout(&project, &fx.task).await.unwrap();
+        assert_eq!(evidence.checkout_path, fx.task.worktree_path.clone().unwrap());
+
+        let mut as_project = fx.task.clone();
+        as_project.worktree_path = Some(project.clone());
+        assert!(inspect_existing_checkout(&project, &as_project).await.is_err(), "the Project's own path");
+        let mut as_main = fx.task.clone();
+        git(main_repo, &["worktree", "remove", fx.checkout.to_str().unwrap()]);
+        git(main_repo, &["checkout", "-q", as_main.branch_name.as_deref().unwrap()]);
+        as_main.worktree_path = Some(fx.repo.clone());
+        let err = inspect_existing_checkout(&project, &as_main).await.unwrap_err();
+        assert!(err.contains("repository's own checkout"), "{err}");
     }
 
     #[tokio::test]
