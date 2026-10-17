@@ -794,6 +794,15 @@ impl Task {
             | ActivityKind::AiReviewSkipped { reason, .. }
             | ActivityKind::AiFixFailed { reason, .. }
             | ActivityKind::DeliveryFailed { reason } => *reason = without_home_dir(reason),
+            ActivityKind::RunResult { result, .. } => match result {
+                slashit_activity::RunResult::Available { text }
+                | slashit_activity::RunResult::Truncated { text, .. } => {
+                    *text = without_home_dir(text)
+                }
+                slashit_activity::RunResult::Unavailable { reason } => {
+                    *reason = without_home_dir(reason)
+                }
+            },
             _ => {}
         }
         slashit_activity::record(&mut self.activity, at, kind)
@@ -1865,6 +1874,32 @@ mod tests {
         assert_eq!(review.entries[0].approved_tip.as_deref(), Some(a.as_str()));
         assert_eq!(review.approved_tip(), Some(b.as_str()));
         assert!(review.is_approved());
+    }
+
+    /// A run's result is agent text, so a home directory in it is written as
+    /// `~`, as it is for a failure reason.
+    #[test]
+    fn a_run_result_has_the_home_directory_written_as_tilde() {
+        let Some(home) = dirs::home_dir().and_then(|h| h.into_os_string().into_string().ok())
+        else {
+            return;
+        };
+        let mut task = startable_task();
+        let answer = format!("Updated {home}/Repo/x/src/foo.rs");
+        task.record_activity(ActivityKind::RunResult {
+            run: 1,
+            result: slashit_activity::RunResult::from_provider(Ok(answer)),
+        });
+        let stored = task.activity.last().unwrap().kind.clone();
+        assert_eq!(
+            stored,
+            ActivityKind::RunResult {
+                run: 1,
+                result: slashit_activity::RunResult::Available {
+                    text: "Updated ~/Repo/x/src/foo.rs".into()
+                },
+            }
+        );
     }
 
     /// A task the poller may start: `InProgress`, idle phase, no cleanup

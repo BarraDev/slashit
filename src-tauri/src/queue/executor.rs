@@ -2451,6 +2451,17 @@ impl TaskExecutor {
                     current.overall_progress = 80;
                     current.error_message = None;
                     current.record_activity(ActivityKind::RunCompleted { run });
+                    if matches!(
+                        handoff_stage,
+                        crate::domain::task::WorkerHandoffStage::CommittedAwaitingReview { .. }
+                    ) {
+                        current.record_activity(ActivityKind::RunResult {
+                            run,
+                            result: slashit_activity::RunResult::Unavailable {
+                                reason: Self::RESULT_NOT_KEPT_REASON.to_string(),
+                            },
+                        });
+                    }
                     if let Some(evidence) = current.worker_handoff.as_mut() {
                         evidence.stage =
                             crate::domain::task::WorkerHandoffStage::ResolvedToAiReview {
@@ -4449,6 +4460,12 @@ impl TaskExecutor {
                     }
                     match result {
                         Ok(_) => 'finished: {
+                            // The provider's final result, read only now that
+                            // its wait has succeeded. It is kept with the run's
+                            // end, and only once the commit is recognized.
+                            let result = slashit_activity::RunResult::from_provider(
+                                runner.final_result_text().await,
+                            );
                             // A run whose work could not be committed has
                             // not finished its task: it fails the same way a
                             // failed run does, and is not reviewed.
@@ -4487,7 +4504,7 @@ impl TaskExecutor {
                             // only once it is on disk.
                             let tools = take_run_tools(&run_tools, task_id);
                             ending = Some(
-                                match Self::record_run_completed(&tasks, &storage, task_id, run, tools.as_ref()).await {
+                                match Self::record_run_completed(&tasks, &storage, task_id, run, tools.as_ref(), &result).await {
                                     Ok(()) => {
                                         let completed = "Agent completed — moving to AI review".to_string();
                                         record_output(&logs, execution_id, LogLevel::Info, completed.clone()).await;
@@ -6723,18 +6740,27 @@ impl TaskExecutor {
         }
     }
 
+    /// Why a committed run's result is unavailable when SlashIt recovers its
+    /// work without it. The result was not recorded, whatever the cause: the
+    /// write that would have kept it did not complete, or the process stopped
+    /// first. Recovery never runs the Worker again to get it back. The reason
+    /// makes no claim about which of those happened.
+    pub(crate) const RESULT_NOT_KEPT_REASON: &'static str = "SlashIt did not record this Worker's final result. The committed work was preserved, and the Worker was not run again to recover the result.";
+
     /// Move a task whose run finished and whose work is committed on to AI
     /// review, durably before the board can show it: the status, the review
     /// phase, the run's tool calls and its [`ActivityKind::RunCompleted`] are
     /// one write. `Err` means the write either published the new board and
     /// could not confirm it durable, or published nothing; `tools` is still
-    /// the caller's to record on the task either way.
+    /// the caller's to record on the task either way. `result` is recorded in
+    /// the same write, as the run's [`ActivityKind::RunResult`].
     async fn record_run_completed(
         tasks: &Tasks,
         storage: &crate::config::Storage,
         task_id: Uuid,
         run: u32,
         tools: Option<&RunTools>,
+        result: &slashit_activity::RunResult,
     ) -> Result<(), crate::lifecycle::RecordWriteError> {
         let transitioned = std::sync::atomic::AtomicBool::new(false);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
@@ -6757,6 +6783,10 @@ impl TaskExecutor {
                     tools.apply_to(t);
                 }
                 t.record_activity(ActivityKind::RunCompleted { run });
+                t.record_activity(ActivityKind::RunResult {
+                    run,
+                    result: result.clone(),
+                });
                 if let Some(handoff) = t
                     .worker_handoff
                     .as_mut()
@@ -8037,6 +8067,7 @@ mod tests {
             id,
             1,
             Some(&tools),
+            &slashit_activity::RunResult::from_provider(Ok("done".into())),
         )
         .await;
 
@@ -10136,10 +10167,16 @@ mod tests {
             slashit_durable_fs::Stage::SyncDirectory,
             std::io::ErrorKind::Other,
         );
-        let error =
-            TaskExecutor::record_run_completed(&executor.tasks, &executor.storage, id, 1, None)
-                .await
-                .expect_err("the caller is told the durability is unconfirmed");
+        let error = TaskExecutor::record_run_completed(
+            &executor.tasks,
+            &executor.storage,
+            id,
+            1,
+            None,
+            &slashit_activity::RunResult::from_provider(Ok("done".into())),
+        )
+        .await
+        .expect_err("the caller is told the durability is unconfirmed");
         drop(fault);
 
         assert!(
@@ -11842,6 +11879,19 @@ mod tests {
                 .count(),
             1
         );
+        // The provider's result was lost with the process that stopped. It is
+        // recorded as unavailable, once, and the Worker is not run again.
+        let unavailable_results = after
+            .activity
+            .iter()
+            .filter(|entry| {
+                matches!(&entry.kind, ActivityKind::RunResult {
+                    run,
+                    result: slashit_activity::RunResult::Unavailable { reason },
+                } if *run == start.run && reason == TaskExecutor::RESULT_NOT_KEPT_REASON)
+            })
+            .count();
+        assert_eq!(unavailable_results, 1, "{:?}", after.activity);
         assert!(
             !executor.is_task_running(task_id).await,
             "reconciliation must not launch an implementation Worker"
@@ -16675,6 +16725,12 @@ VERDICT: APPROVED"
                         count: 1
                     },
                     ActivityKind::RunCompleted { run: 1 },
+                    ActivityKind::RunResult {
+                        run: 1,
+                        result: slashit_activity::RunResult::Available {
+                            text: "done".into(),
+                        },
+                    },
                 ]
             );
             let written = serde_json::to_string(&on_disk.activity).unwrap();
@@ -16690,6 +16746,84 @@ VERDICT: APPROVED"
                     "{leaked} reached the timeline: {written}"
                 );
             }
+        }
+
+        /// A run whose provider finishes without a final result text still
+        /// goes to AI Review. Its result is recorded as unavailable, and the
+        /// run is not a failure.
+        #[tokio::test]
+        async fn a_run_without_a_final_result_is_recorded_as_unavailable() {
+            let w = world(Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
+            let _agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                "cat >/dev/null; printf 'work\\n' > agent_work.txt; \
+                 printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'",
+            )
+            .await;
+
+            assert_eq!(
+                w.executor.spawn_task_execution(w.task_id, None).await,
+                Ok(true)
+            );
+            let task = settled(&w).await;
+            assert_eq!(task.status, TaskStatus::AiReview, "{:?}", task.error_message);
+
+            let recorded = kinds(&w.on_disk());
+            assert_eq!(recorded.last(), task.activity.last().map(|e| &e.kind));
+            assert_eq!(
+                recorded[recorded.len() - 2],
+                ActivityKind::RunCompleted { run: 1 }
+            );
+            assert!(
+                matches!(
+                    recorded.last(),
+                    Some(ActivityKind::RunResult {
+                        run: 1,
+                        result: slashit_activity::RunResult::Unavailable { reason },
+                    }) if reason.contains("textual semantic output")
+                ),
+                "{recorded:?}"
+            );
+        }
+
+        /// A final result longer than the storage limit is cut before it is
+        /// written, and the run is recorded as truncated.
+        #[tokio::test]
+        async fn an_overlong_final_result_is_truncated_before_it_is_written() {
+            let w = world(Class::Created).await;
+            git_in(&w.repo, &["config", "user.email", "t@example.com"]);
+            git_in(&w.repo, &["config", "user.name", "T"]);
+            let long = "a".repeat(5_000);
+            let _agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &format!(
+                    "cat >/dev/null; printf 'work\\n' > agent_work.txt; \
+                     printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{long}\"}}'"
+                ),
+            )
+            .await;
+
+            assert_eq!(
+                w.executor.spawn_task_execution(w.task_id, None).await,
+                Ok(true)
+            );
+            let task = settled(&w).await;
+            assert_eq!(task.status, TaskStatus::AiReview, "{:?}", task.error_message);
+
+            let on_disk = w.on_disk();
+            assert_eq!(on_disk.activity, task.activity);
+            assert_eq!(
+                on_disk.activity.last().map(|e| &e.kind),
+                Some(&ActivityKind::RunResult {
+                    run: 1,
+                    result: slashit_activity::RunResult::Truncated {
+                        text: "a".repeat(slashit_activity::MAX_RESULT_CHARS),
+                        original_chars: 5_000,
+                    },
+                })
+            );
         }
 
         /// A joined provider failure before the Git commit boundary is a known
@@ -16725,6 +16859,13 @@ VERDICT: APPROVED"
             assert!(w.on_disk().worker_handoff.is_none());
             assert!(w.on_disk().worker_recovery_refusal().is_none());
             assert_eq!(w.on_disk().status, TaskStatus::Error);
+            assert!(
+                !w.on_disk()
+                    .activity
+                    .iter()
+                    .any(|e| matches!(e.kind, ActivityKind::RunResult { .. })),
+                "a failed run records no result"
+            );
             assert!(matches!(failed.as_slice(), [
                 ActivityKind::RunStarted { run: 1, .. },
                 ActivityKind::RunFailed { run: Some(1), reason },
@@ -16887,6 +17028,12 @@ VERDICT: APPROVED"
                         addressing_feedback: false
                     },
                     ActivityKind::RunCompleted { run: 1 },
+                    ActivityKind::RunResult {
+                        run: 1,
+                        result: slashit_activity::RunResult::Available {
+                            text: "done".into(),
+                        },
+                    },
                 ]
             );
             every_end_has_its_start(&recorded);

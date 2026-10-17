@@ -573,6 +573,17 @@ fn apply_acceptance(
     current.overall_progress = 80;
     current.error_message = None;
     current.record_activity_at(now, ActivityKind::RunCompleted { run: expected.run });
+    // The run was interrupted, so its provider result was never kept. A person
+    // accepting its commit does not make that result available.
+    current.record_activity_at(
+        now,
+        ActivityKind::RunResult {
+            run: expected.run,
+            result: slashit_activity::RunResult::Unavailable {
+                reason: crate::queue::executor::TaskExecutor::RESULT_NOT_KEPT_REASON.to_string(),
+            },
+        },
+    );
     if let Some(handoff) = current.worker_handoff.as_mut() {
         handoff.stage = WorkerHandoffStage::ResolvedToAiReview {
             commit: expected.tip.clone(),

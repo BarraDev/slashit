@@ -44,6 +44,10 @@ pub const DEPENDENCIES_SHOWN: usize = 20;
 pub const ACTIVITY_DEFAULT_LIMIT: usize = 15;
 pub const ACTIVITY_MAX_LIMIT: usize = 30;
 pub const ACTIVITY_DETAIL_CHARS: usize = 300;
+/// The most characters of one run's semantic result an activity read shows.
+pub const RESULT_CHARS_SHOWN: usize = 1_000;
+/// How many of the newest run results in an activity read show their text.
+pub const RESULTS_SHOWN: usize = 3;
 pub const PULL_REQUESTS_SHOWN: usize = 5;
 pub const CHECK_NAME_CHARS: usize = 120;
 pub const PROJECT_NAME_CHARS: usize = 200;
@@ -171,16 +175,26 @@ fn inspect_task_activity(
     let timeline = slashit_activity::timeline(task.created_at, [], &task.activity);
     let milestones: Vec<_> = timeline.iter().filter(|item| !item.is_tool()).collect();
     let skipped = milestones.len().saturating_sub(limit);
-    let events: Vec<Value> = milestones
+    let window: Vec<_> = milestones.into_iter().skip(skipped).collect();
+    // Only the newest results in the window carry their text, so one read stays
+    // within a fixed budget however many runs the Task has.
+    let results_in_window = window.iter().filter(|item| item.run_result().is_some()).count();
+    let mut results_seen = 0;
+    let events: Vec<Value> = window
         .into_iter()
-        .skip(skipped)
         .map(|item| {
-            json!({
+            let mut event = json!({
                 "at": item.at,
                 "event": item.kind_name(),
                 "title": item.title(),
                 "detail": item.detail().map(|detail| clip(&detail, ACTIVITY_DETAIL_CHARS).0),
-            })
+            });
+            if let Some((run, result)) = item.run_result() {
+                let show_text = results_seen + RESULTS_SHOWN >= results_in_window;
+                results_seen += 1;
+                event["result"] = run_result_view(run, result, show_text);
+            }
+            event
         })
         .collect();
     json!({
@@ -190,6 +204,33 @@ fn inspect_task_activity(
         "events_returned": events.len(),
         "earlier_events_omitted": skipped,
         "events": events,
+    })
+}
+
+/// One run's semantic result, as an activity read reports it. `outcome` says
+/// whether the provider gave an answer at all; `text_omitted` means it did but
+/// this read leaves its text out to stay within budget.
+fn run_result_view(run: u32, result: &slashit_activity::RunResult, show_text: bool) -> Value {
+    use slashit_activity::RunResult;
+    let (outcome, stored, original_chars, reason) = match result {
+        RunResult::Available { text } => ("available", Some(text.as_str()), None, None),
+        RunResult::Truncated {
+            text,
+            original_chars,
+        } => ("truncated", Some(text.as_str()), Some(*original_chars), None),
+        RunResult::Unavailable { reason } => ("unavailable", None, None, Some(reason.as_str())),
+    };
+    let shown = stored
+        .filter(|_| show_text)
+        .map(|text| clip(text, RESULT_CHARS_SHOWN));
+    json!({
+        "run": run,
+        "outcome": outcome,
+        "text": shown.as_ref().map(|(text, _)| text),
+        "text_clipped": shown.as_ref().is_some_and(|(_, clipped)| *clipped),
+        "text_omitted": stored.is_some() && !show_text,
+        "original_chars": original_chars,
+        "reason": reason,
     })
 }
 
@@ -574,6 +615,66 @@ mod tests {
         let last = capped["events"].as_array().unwrap().last().unwrap();
         assert_eq!(last["title"], format!("Coding started (attempt {})", ACTIVITY_MAX_LIMIT + 10));
         assert_eq!(read(&activity(id, Some(2)), project, &tasks).unwrap()["events_returned"], 2);
+    }
+
+    #[test]
+    fn activity_shows_each_run_result_under_its_run_with_bounded_text() {
+        let project = Uuid::new_v4();
+        let mut subject = task(project, "Subject", TaskStatus::HumanReview, 0);
+        for run in 1..=4u32 {
+            let length = if run == 4 { 5_000 } else { 2_000 };
+            let answer = format!("answer {run} {}", "y".repeat(length));
+            subject.record_activity(Kind::RunStarted { run, addressing_feedback: false });
+            subject.record_activity(Kind::RunCompleted { run });
+            subject.record_activity(Kind::RunResult {
+                run,
+                result: slashit_activity::RunResult::from_provider(Ok(answer)),
+            });
+        }
+        subject.record_activity(Kind::RunStarted { run: 5, addressing_feedback: false });
+        subject.record_activity(Kind::RunCompleted { run: 5 });
+        subject.record_activity(Kind::RunResult {
+            run: 5,
+            result: slashit_activity::RunResult::from_provider(Err(
+                "the provider gave no final result".into(),
+            )),
+        });
+        let id = subject.id;
+        let tasks = store(vec![subject]);
+        let result = read(&activity(id, Some(30)), project, &tasks).unwrap();
+        let views: Vec<Value> = result["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["event"] == "run_result")
+            .map(|event| event["result"].clone())
+            .collect();
+        assert_eq!(views.len(), 5);
+        for (view, run) in views.iter().zip(1..) {
+            assert_eq!(view["run"], run);
+        }
+
+        // Only the newest RESULTS_SHOWN results carry their text.
+        assert_eq!(views[0]["outcome"], "available");
+        assert_eq!(views[0]["text"], Value::Null);
+        assert_eq!(views[0]["text_omitted"], true);
+        assert_eq!(views[1]["text"], Value::Null);
+        assert_eq!(views[2]["text_omitted"], false);
+        assert!(views[2]["text"].as_str().unwrap().starts_with("answer 3 "));
+
+        // A result the storage limit cut is reported as truncated, and its text
+        // is clipped for the read.
+        assert_eq!(views[3]["outcome"], "truncated");
+        assert_eq!(views[3]["text"].as_str().unwrap().chars().count(), RESULT_CHARS_SHOWN);
+        assert_eq!(views[3]["text_clipped"], true);
+        assert_eq!(views[3]["original_chars"], 5_009);
+
+        // No answer is unavailable, with its reason and no text.
+        assert_eq!(views[4]["outcome"], "unavailable");
+        assert_eq!(views[4]["text"], Value::Null);
+        assert_eq!(views[4]["text_omitted"], false);
+        assert!(views[4]["reason"].as_str().unwrap().contains("no final result"));
+        assert!(!views[4].to_string().contains("yyy"), "{}", views[4]);
     }
 
     #[test]

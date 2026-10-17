@@ -45,6 +45,11 @@ pub const MAX_REASON_CHARS: usize = 300;
 /// The longest detail a tool call keeps, in characters.
 pub const MAX_DETAIL_CHARS: usize = 120;
 
+/// The longest semantic result a run keeps, in characters, after redaction.
+/// A provider answer longer than this is cut and recorded as
+/// [`RunResult::Truncated`].
+pub const MAX_RESULT_CHARS: usize = 4_000;
+
 /// A task's column, as the timeline names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +89,71 @@ pub struct Entry {
     pub kind: Kind,
 }
 
+/// The semantic answer a coding run's provider gave as its final result, as
+/// the run's timeline keeps it. Only the provider's own final result text
+/// qualifies; streamed messages, tool calls and transcripts never do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RunResult {
+    /// The provider's final result, redacted, within [`MAX_RESULT_CHARS`].
+    /// Whitespace runs, line breaks included, are kept as single spaces.
+    Available { text: String },
+    /// The provider's final result exceeded [`MAX_RESULT_CHARS`]. `text` is
+    /// its redacted start; `original_chars` is the full length it had.
+    Truncated { text: String, original_chars: u32 },
+    /// The run had no authoritative result: the provider finished without
+    /// one, or the run's outcome was recovered without it. This is not a
+    /// failure of the run's work.
+    Unavailable { reason: String },
+}
+
+impl RunResult {
+    /// The result of a run from its provider's final answer. `Err` is why
+    /// there was none. The text is redacted and bounded here, so nothing
+    /// longer than [`MAX_RESULT_CHARS`] is ever stored.
+    pub fn from_provider(answer: Result<String, String>) -> Self {
+        match answer {
+            Ok(text) => {
+                let original = text.chars().count();
+                Self::stored(&text, (original > MAX_RESULT_CHARS).then_some(original))
+            }
+            Err(reason) => Self::Unavailable {
+                reason: one_line(&reason, MAX_REASON_CHARS),
+            },
+        }
+    }
+
+    /// Redacted text within the storage limit. `truncated_from` is the length
+    /// the authoritative text had when it was longer than the limit.
+    fn stored(text: &str, truncated_from: Option<usize>) -> Self {
+        let redacted = redact(text);
+        let redacted_chars = redacted.chars().count();
+        match truncated_from {
+            None if redacted_chars <= MAX_RESULT_CHARS => Self::Available { text: redacted },
+            _ => Self::Truncated {
+                text: redacted.chars().take(MAX_RESULT_CHARS).collect::<String>().trim_end().to_string(),
+                original_chars: u32::try_from(truncated_from.unwrap_or(redacted_chars))
+                    .unwrap_or(u32::MAX),
+            },
+        }
+    }
+
+    /// This result, redacted and bounded as [`Self::from_provider`] bounds
+    /// one. Applied to every result on its way into the timeline.
+    fn sanitized(&self) -> Self {
+        match self {
+            Self::Available { text } => Self::stored(text, None),
+            Self::Truncated {
+                text,
+                original_chars,
+            } => Self::stored(text, Some(usize::try_from(*original_chars).unwrap_or(usize::MAX))),
+            Self::Unavailable { reason } => Self::Unavailable {
+                reason: one_line(reason, MAX_REASON_CHARS),
+            },
+        }
+    }
+}
+
 /// What happened. `run` numbers a task's coding runs and `review` its AI
 /// reviews, each starting at 1, so a retry or a second review cycle reads as
 /// a new one rather than a repeat of the last.
@@ -120,6 +190,14 @@ pub enum Kind {
     /// The run finished and its work was committed.
     RunCompleted {
         run: u32,
+    },
+    /// What the provider said as its final result for run `run`. Recorded in
+    /// the same lifecycle write as that run's [`Kind::RunCompleted`], and
+    /// only for a run that completed; a run recorded before this kind existed
+    /// has none.
+    RunResult {
+        run: u32,
+        result: RunResult,
     },
     /// A coding Worker outcome could not be safely attributed or transitioned.
     RecoveryRequired {
@@ -233,6 +311,7 @@ impl Kind {
     fn identity(&self) -> Option<Identity<'_>> {
         Some(match self {
             Self::RunStarted { run, .. } => Identity::RunStarted(*run),
+            Self::RunResult { run, .. } => Identity::RunResult(*run),
             Self::RunCompleted { run } | Self::RunFailed { run: Some(run), .. } => {
                 Identity::RunEnded(*run)
             }
@@ -273,6 +352,7 @@ impl Kind {
 enum Identity<'a> {
     RunStarted(u32),
     RunEnded(u32),
+    RunResult(u32),
     RecoveryRequired(u32),
     ReviewStarted(u32),
     ReviewVerdict(u32),
@@ -410,6 +490,7 @@ fn sanitize_text(kind: &mut Kind) {
             ..
         } => *detail = sanitize(detail, MAX_DETAIL_CHARS),
         Kind::PrLinked { url, .. } => *url = redact(url),
+        Kind::RunResult { result, .. } => *result = result.sanitized(),
         _ => {}
     }
 }
@@ -441,6 +522,7 @@ pub fn next_run(entries: &[Entry]) -> u32 {
         .filter_map(|e| match e.kind {
             Kind::RunStarted { run, .. }
             | Kind::RunCompleted { run }
+            | Kind::RunResult { run, .. }
             | Kind::RunFailed { run: Some(run), .. }
             | Kind::ToolUsed { run, .. }
             | Kind::ToolsOmitted { run, .. } => Some(run),
@@ -631,6 +713,14 @@ impl Item<'_> {
         matches!(self.row, Row::Recorded(kind) if kind.is_tool())
     }
 
+    /// The run and the semantic result it recorded, when this row is one.
+    pub fn run_result(&self) -> Option<(u32, &RunResult)> {
+        match self.row {
+            Row::Recorded(Kind::RunResult { run, result }) => Some((*run, result)),
+            _ => None,
+        }
+    }
+
     /// A key that names this row and no other in the task's timeline, and
     /// stays the same as more rows are added.
     pub fn key(&self) -> String {
@@ -657,6 +747,7 @@ impl Item<'_> {
                 Kind::ToolUsed { .. } => "tool_used",
                 Kind::ToolsOmitted { .. } => "tools_omitted",
                 Kind::RunCompleted { .. } => "run_completed",
+                Kind::RunResult { .. } => "run_result",
                 Kind::RecoveryRequired { .. } => "recovery_required",
                 Kind::RunFailed { .. } => "run_failed",
                 Kind::Stopped { .. } => "stopped",
@@ -718,6 +809,11 @@ fn kind_title(kind: &Kind) -> String {
             )
         }
         Kind::RunCompleted { .. } => "Coding finished".to_string(),
+        Kind::RunResult {
+            run,
+            result: RunResult::Unavailable { .. },
+        } => nth("Coding result unavailable", *run),
+        Kind::RunResult { run, .. } => nth("Coding result recorded", *run),
         Kind::RecoveryRequired { .. } => "Worker recovery required".to_string(),
         Kind::NewAttemptAuthorized { .. } => "New attempt authorized".to_string(),
         Kind::RunFailed { run: Some(_), .. } => "Coding failed".to_string(),
