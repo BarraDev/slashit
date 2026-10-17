@@ -633,6 +633,7 @@ pub fn create_test_task(title: &str) -> Task {
         new_attempt: None,
         new_attempt_confirmed: false,
         approved_execution: None,
+        executed_approvals: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

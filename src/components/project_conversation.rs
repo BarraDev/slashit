@@ -76,6 +76,17 @@ fn mutation_view(mutation: &ConversationTaskMutation) -> MutationView {
             rows.push(("Effect".to_string(), "Only queues the Task, and only if its definition is unchanged at the moment you approve. SlashIt's scheduler starts it when capacity allows, and the Task prepares its own checkout then".to_string()));
             MutationView { heading: "Queue Task", title: target_task_title.clone(), rows }
         }
+        ConversationTaskMutation::ExecuteRequest { target_task_id, target_task_title, from, request, input } => MutationView {
+            heading: "Queue Task with a request",
+            title: target_task_title.clone(),
+            rows: vec![
+                ("Task ID".to_string(), target_task_id.to_string()),
+                ("Status".to_string(), format!("{} → queue", words(from))),
+                ("Request".to_string(), request.clone()),
+                ("Input".to_string(), input.digest.chars().take(12).collect()),
+                ("Effect".to_string(), "Queues one run with exactly this request, and only if the Task is unchanged at the moment you approve. The Task description is not changed. SlashIt's scheduler starts it when capacity allows, and the Task prepares its own checkout then".to_string()),
+            ],
+        },
         ConversationTaskMutation::MoveTask { target_task_id, target_task_title, from, to } => MutationView {
             heading: "Move Task",
             title: target_task_title.clone(),
@@ -116,6 +127,7 @@ fn project_action_event_text(kind: &ConversationEntryKind, actions: &[Conversati
             ConversationTaskMutation::CreateTask { title, .. } => format!("Task created in Backlog: {title} (Task {task_id})"),
             ConversationTaskMutation::EditTask { target_task_title, .. } => format!("Task updated: {target_task_title} (Task {task_id})"),
             ConversationTaskMutation::MoveTask { target_task_title, to, .. } => format!("Task moved to {}: {target_task_title} (Task {task_id})", words(to)),
+            ConversationTaskMutation::ExecuteRequest { target_task_title, .. } => format!("Task queued with an additional request: {target_task_title} (Task {task_id})"),
             ConversationTaskMutation::EnqueueTask { target_task_title, .. } => match action.outcome {
                 Some(ConversationProjectActionOutcome::AlreadyQueued { .. }) => format!("Task was already in the queue: {target_task_title} (Task {task_id}); SlashIt cannot tell whether this approval queued it"),
                 _ => format!("Task queued: {target_task_title} (Task {task_id})"),

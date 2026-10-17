@@ -140,6 +140,15 @@ pub fn record_proposal(
                 TaskMutation::enqueue_task(target, crate::queue::prompt::task_input_digest(target))?,
             )
         }
+        CoordinatorOutput::ExecuteRequest { text, target_task_id, request } => {
+            let target = tasks
+                .get(&target_task_id)
+                .ok_or("Coordinator proposed an unknown Task")?;
+            if target.project_id != project_id {
+                return Err("Coordinator proposed a Task from another Project".into());
+            }
+            (text, TaskMutation::execute_request(target, &request)?)
+        }
         CoordinatorOutput::Reply { .. }
         | CoordinatorOutput::DelegateToTask { .. }
         | CoordinatorOutput::InspectTask { .. }
@@ -334,7 +343,23 @@ async fn execute(scope: &Scope<'_>, action_id: Uuid, mutation: &TaskMutation) ->
             // A proposal saved before the input was recorded never showed the Human
             // what would run, so approving it cannot authorize queueing: the empty
             // digest matches no Task, and the write refuses it atomically.
-            enqueue_task(scope, *target_task_id, from, Some((action_id, input.as_ref().map_or("", |i| i.digest.as_str())))).await
+            enqueue_task(scope, *target_task_id, from, lifecycle::InputApproval {
+                id: action_id,
+                digest: input.as_ref().map_or("", |i| i.digest.as_str()),
+                request: None,
+            })
+            .await
+        }
+        // The request and the digest the Human saw travel together. The Task
+        // is compared with `approved_input_digest(task, Some(request))`, so an
+        // edit to the Task or a change to the request fails the comparison.
+        TaskMutation::ExecuteRequest { target_task_id, from, request, input, .. } => {
+            enqueue_task(scope, *target_task_id, from, lifecycle::InputApproval {
+                id: action_id,
+                digest: input.digest.as_str(),
+                request: Some(request.as_str()),
+            })
+            .await
         }
     }
 }
@@ -452,7 +477,7 @@ async fn enqueue_task(
     scope: &Scope<'_>,
     task_id: Uuid,
     from: &TaskStatus,
-    approval: Option<(Uuid, &str)>,
+    approval: lifecycle::InputApproval<'_>,
 ) -> Result<Execution, String> {
     // Re-validated here rather than trusted from the persisted proposal.
     if *from != TaskStatus::Backlog {
@@ -461,8 +486,7 @@ async fn enqueue_task(
     let _lease = scope.locks.acquire(task_id).await?;
     Ok(
         match lifecycle::enqueue_leased(
-            scope.tasks, scope.storage, scope.project_id, task_id, from,
-            approval.map(|(id, digest)| lifecycle::InputApproval { id, digest }),
+            scope.tasks, scope.storage, scope.project_id, task_id, from, Some(approval),
         )
         .await?
         {
@@ -1828,7 +1852,7 @@ mod tests {
         assert_eq!(snapshot_of(&world, task.id).await.approved_execution, None);
 
         let mut t = snapshot_of(&world, task.id).await;
-        t.approved_execution = Some(crate::domain::task::ApprovedExecution { approval_id: id, digest: "d".into(), for_run: 1 });
+        t.approved_execution = Some(crate::domain::task::ApprovedExecution { approval_id: id, digest: "d".into(), for_run: 1, request: None });
         let from = t.status.clone();
         t.status = TaskStatus::Backlog;
         t.record_move(&from);
@@ -1857,6 +1881,140 @@ mod tests {
             conversation.project_action(id).unwrap().outcome,
             Some(ProjectActionOutcome::AlreadyQueued { .. })
         ));
+    }
+
+    fn execute_request_json(task_id: Uuid, request: &str) -> String {
+        serde_json::json!({
+            "type": "execute_request",
+            "text": "Ready for one more pass",
+            "target_task_id": task_id,
+            "request": request,
+        })
+        .to_string()
+    }
+
+    /// The binding a queued request carries, read from the stored Task.
+    fn binding_of(task: &Task) -> Option<crate::domain::task::ApprovedExecution> {
+        task.approved_execution.clone()
+    }
+
+    #[tokio::test]
+    async fn an_approved_request_queues_the_task_once_with_the_request_bound_and_its_description_unchanged() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Extend").await;
+        let request = "Also add a changelog entry";
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &execute_request_json(task.id, request)).await.unwrap();
+
+        let ProjectAction { mutation: TaskMutation::ExecuteRequest { request: proposed, input, .. }, .. } =
+            conversation.project_action(id).unwrap().clone()
+        else {
+            panic!("expected an ExecuteRequest proposal");
+        };
+        assert_eq!(proposed, request);
+        assert_eq!(input.digest, crate::queue::prompt::approved_input_digest(&task, Some(request)));
+
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        let queued = snapshot_of(&world, task.id).await;
+        assert_eq!(queued.status, TaskStatus::Queue);
+        assert_eq!(queued.description.as_deref(), Some("original"), "the description is never overwritten");
+        let binding = binding_of(&queued).expect("bound");
+        assert_eq!(binding.approval_id, id);
+        assert_eq!(binding.request.as_deref(), Some(request));
+        assert_eq!(binding.digest, input.digest);
+        assert_eq!(moves(&queued), 1, "a repeated approval queues nothing a second time");
+        assert!(matches!(
+            conversation.project_action(id).unwrap().outcome,
+            Some(ProjectActionOutcome::Applied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_additional_request_is_refused_for_any_state_but_backlog_and_for_a_task_that_holds_a_checkout() {
+        let world = World::new();
+        let mut conversation = world.conversation();
+        for status in [TaskStatus::Queue, TaskStatus::Error, TaskStatus::HumanReview, TaskStatus::Done] {
+            let task = world.seed_task(world.project_id, "Not backlog").await;
+            place(&world, task.id, status.clone()).await;
+            let err = world.propose(&mut conversation, &execute_request_json(task.id, "more")).await.unwrap_err();
+            assert!(err.contains("Backlog"), "{status:?}: {err}");
+        }
+
+        let task = world.seed_task(world.project_id, "Has a checkout").await;
+        edit_in_store(&world, task.id, |t| t.worktree_path = Some("/checkouts/has-one".into())).await;
+        let err = world.propose(&mut conversation, &execute_request_json(task.id, "more")).await.unwrap_err();
+        assert!(err.contains("Task Checkout"), "{err}");
+        assert!(conversation.project_actions.is_empty(), "no proposal is recorded for a refused request");
+    }
+
+    #[tokio::test]
+    async fn an_edited_task_or_a_request_altered_after_proposal_is_refused_and_nothing_is_queued() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Edited after").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &execute_request_json(task.id, "more")).await.unwrap();
+        edit_in_store(&world, task.id, |t| t.description = Some("something else".into())).await;
+
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        let after = snapshot_of(&world, task.id).await;
+        assert_eq!(after.status, TaskStatus::Backlog);
+        assert_eq!(after.approved_execution, None);
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_the_run_consumed_the_approval_does_not_queue_the_request_again() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Run once").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &execute_request_json(task.id, "more")).await.unwrap();
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        // A run started under this approval, then the Task was moved back to
+        // Backlog. The approval record was persisted as still Approved.
+        edit_in_store(&world, task.id, move |t| {
+            t.status = TaskStatus::Backlog;
+            t.approved_execution = None;
+            t.executed_approvals.push(crate::domain::task::ExecutedApproval {
+                approval_id: id,
+                run: 1,
+                digest: crate::queue::prompt::approved_input_digest(t, Some("more")),
+            });
+        })
+        .await;
+        conversation.project_actions[0].status = ProjectActionStatus::Approved;
+        conversation.project_actions[0].outcome = None;
+
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        let after = snapshot_of(&world, task.id).await;
+        assert_eq!(after.status, TaskStatus::Backlog, "a consumed approval never queues again");
+        assert_eq!(after.approved_execution, None);
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Refused);
+    }
+
+    #[test]
+    fn an_additional_request_is_validated_and_its_digest_follows_the_request_and_the_model() {
+        let task = crate::test_helpers::create_test_task("Digest");
+        let id = task.id;
+        assert!(Conversation::parse_output(&execute_request_json(id, "   ")).is_err());
+        assert!(Conversation::parse_output(&execute_request_json(id, &"x".repeat(4_001))).is_err());
+        assert!(Conversation::parse_output(&execute_request_json(id, "one more pass")).is_ok());
+
+        let base = crate::queue::prompt::approved_input_digest(&task, Some("a"));
+        assert_ne!(base, crate::queue::prompt::approved_input_digest(&task, Some("b")));
+        assert_ne!(base, crate::queue::prompt::approved_input_digest(&task, None));
+        let mut other_model = task.clone();
+        other_model.model = "opus".into();
+        assert_ne!(base, crate::queue::prompt::approved_input_digest(&other_model, Some("a")));
+        assert_eq!(
+            crate::queue::prompt::approved_input_digest(&task, None),
+            crate::queue::prompt::task_input_digest(&task),
+            "an ordinary approval keeps its existing digest"
+        );
     }
 }
 

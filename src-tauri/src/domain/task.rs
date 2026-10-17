@@ -274,6 +274,13 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_execution: Option<ApprovedExecution>,
 
+    /// One entry per run whose start consumed an approval binding, written in
+    /// the same write that records that start. It outlives the binding, so the
+    /// Task can still say which approval authorized each run. Absent in Tasks
+    /// saved before it existed, which authorized nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executed_approvals: Vec<ExecutedApproval>,
+
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -296,6 +303,20 @@ pub struct ApprovedExecution {
     pub digest: String,
     /// The number of the run this approval may start.
     pub for_run: u32,
+    /// The additional coding request the Human approved, verbatim, when the
+    /// approval was an `ExecuteRequest`. Absent for an ordinary queue approval,
+    /// whose input is the Task definition alone. It is part of `digest`, so a
+    /// request altered after approval fails the comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+}
+
+/// Durable evidence that one run was started under one approval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutedApproval {
+    pub approval_id: Uuid,
+    pub run: u32,
+    pub digest: String,
 }
 
 /// Task-owned evidence that binds one coding run to its exact branch state.
@@ -716,6 +737,7 @@ impl Task {
             new_attempt: None,
             new_attempt_confirmed: false,
             approved_execution: None,
+            executed_approvals: Vec::new(),
             created_at: now,
             updated_at: now,
         }

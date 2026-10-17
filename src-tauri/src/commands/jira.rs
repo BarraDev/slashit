@@ -212,6 +212,7 @@ pub async fn import_jira_issues(
             new_attempt: None,
             new_attempt_confirmed: false,
             approved_execution: None,
+            executed_approvals: Vec::new(),
             created_at: now,
             updated_at: now,
         };

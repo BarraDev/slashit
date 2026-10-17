@@ -264,6 +264,7 @@ pub async fn create_task_from_issue(
         new_attempt: None,
         new_attempt_confirmed: false,
         approved_execution: None,
+        executed_approvals: Vec::new(),
         created_at: now,
         updated_at: now,
     };
@@ -378,6 +379,7 @@ pub async fn import_github_issues(
             new_attempt: None,
             new_attempt_confirmed: false,
             approved_execution: None,
+            executed_approvals: Vec::new(),
             created_at: now,
             updated_at: now,
         };

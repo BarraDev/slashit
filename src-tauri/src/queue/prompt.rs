@@ -122,6 +122,40 @@ pub fn task_input_digest(task: &Task) -> String {
     hex::encode(Sha256::digest(build_task_prompt(task, None).as_bytes()))
 }
 
+/// The fingerprint of the input an approval names. With no additional request
+/// it is exactly [`task_input_digest`], so existing queue approvals keep their
+/// meaning. With a request it also covers the request text verbatim and the
+/// Task's effective model, which the run's launch uses, so an approval for one
+/// request or model cannot authorize another.
+pub fn approved_input_digest(task: &Task, approved_request: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let Some(request) = approved_request else {
+        return task_input_digest(task);
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(build_task_prompt(task, None).as_bytes());
+    hasher.update(b"\x1fmodel=");
+    hasher.update(task.model.as_bytes());
+    hasher.update(b"\x1frequest=");
+    hasher.update(request.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// The coding prompt for one run: the Task's own prompt, plus the additional
+/// request a person approved for this run, when there is one. The request is
+/// appended to the same builder's output rather than rendered by a second one.
+pub fn build_run_prompt(task: &Task, project_path: Option<&str>, approved_request: Option<&str>) -> String {
+    let mut prompt = build_task_prompt(task, project_path);
+    if let Some(request) = approved_request {
+        prompt.push_str(
+            "\n\n## Approved Additional Request\nA person approved this request for this run. It is in addition \
+             to the Task above, and it is carried out in this Task Checkout:\n",
+        );
+        prompt.push_str(request);
+    }
+    prompt
+}
+
 /// What a Task's `approved_execution` says about the input it is about to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovedInputCheck {
@@ -140,7 +174,7 @@ pub fn check_approved_input(task: &Task) -> ApprovedInputCheck {
     match &task.approved_execution {
         None => ApprovedInputCheck::Unbound,
         Some(b) if b.for_run != task.next_run() => ApprovedInputCheck::Superseded,
-        Some(b) if b.digest == task_input_digest(task) => ApprovedInputCheck::Matches,
+        Some(b) if b.digest == approved_input_digest(task, b.request.as_deref()) => ApprovedInputCheck::Matches,
         Some(_) => ApprovedInputCheck::Differs,
     }
 }
@@ -255,6 +289,40 @@ mod tests {
         moved.position += 3;
         moved.status = crate::domain::TaskStatus::Queue;
         assert_eq!(base, task_input_digest(&moved), "board position and column are not input");
+    }
+
+    #[test]
+    fn a_run_prompt_without_a_request_is_the_task_prompt_and_with_one_carries_it_once() {
+        let task = crate::test_helpers::create_test_task("Run prompt");
+        assert_eq!(build_run_prompt(&task, None, None), build_task_prompt(&task, None));
+        let run = build_run_prompt(&task, None, Some("Also add a changelog entry"));
+        assert!(run.starts_with(&build_task_prompt(&task, None)));
+        assert_eq!(run.matches("Also add a changelog entry").count(), 1);
+        assert!(run.contains("## Approved Additional Request"));
+    }
+
+    #[test]
+    fn a_binding_authorizes_its_request_only_while_the_task_and_the_request_are_unchanged() {
+        let mut task = crate::test_helpers::create_test_task("Bound request");
+        task.approved_execution = Some(crate::domain::task::ApprovedExecution {
+            approval_id: uuid::Uuid::new_v4(),
+            digest: approved_input_digest(&task, Some("extra")),
+            for_run: task.next_run(),
+            request: Some("extra".into()),
+        });
+        assert_eq!(check_approved_input(&task), ApprovedInputCheck::Matches);
+
+        let mut altered = task.clone();
+        altered.approved_execution.as_mut().unwrap().request = Some("something else".into());
+        assert_eq!(check_approved_input(&altered), ApprovedInputCheck::Differs);
+
+        let mut edited = task.clone();
+        edited.description = Some("changed".into());
+        assert_eq!(check_approved_input(&edited), ApprovedInputCheck::Differs);
+
+        let mut stale = task.clone();
+        stale.approved_execution.as_mut().unwrap().for_run += 1;
+        assert_eq!(check_approved_input(&stale), ApprovedInputCheck::Superseded);
     }
 
     #[test]

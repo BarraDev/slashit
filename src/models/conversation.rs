@@ -25,7 +25,7 @@ pub enum ProjectActionStatus { Proposed, Approved, Applied, Rejected, Refused }
 pub enum FieldChange { Title { from: String, to: String }, Description { from: Option<String>, to: String }, Priority { from: String, to: String }, Category { from: String, to: String } }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TaskMutation { CreateTask { task_id: Uuid, title: String, description: Option<String>, priority: String, category: String }, EditTask { target_task_id: Uuid, target_task_title: String, changes: Vec<FieldChange> }, MoveTask { target_task_id: Uuid, target_task_title: String, from: String, to: String }, EnqueueTask { target_task_id: Uuid, target_task_title: String, from: String, #[serde(default)] input: Option<ExecutionInput> } }
+pub enum TaskMutation { CreateTask { task_id: Uuid, title: String, description: Option<String>, priority: String, category: String }, EditTask { target_task_id: Uuid, target_task_title: String, changes: Vec<FieldChange> }, MoveTask { target_task_id: Uuid, target_task_title: String, from: String, to: String }, EnqueueTask { target_task_id: Uuid, target_task_title: String, from: String, #[serde(default)] input: Option<ExecutionInput> }, ExecuteRequest { target_task_id: Uuid, target_task_title: String, from: String, request: String, input: ExecutionInput } }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionInput { pub digest: String, pub description: Option<String>, pub subtask_count: usize }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
