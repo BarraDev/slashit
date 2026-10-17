@@ -710,6 +710,9 @@ pub(crate) fn renumber_column(
 pub struct InputApproval<'a> {
     pub id: Uuid,
     pub digest: &'a str,
+    /// The additional request the Human approved, when the approval is an
+    /// `ExecuteRequest`; `None` for an ordinary queue approval.
+    pub request: Option<&'a str>,
 }
 
 /// What [`enqueue_leased`] found, and did.
@@ -773,9 +776,32 @@ pub async fn enqueue_leased(
             }
             Some(task) if task.status != *seen_in => (EnqueueVerdict::Moved(task.status.clone()), false),
             Some(task)
-                if approval.as_ref().is_some_and(|a| crate::queue::prompt::task_input_digest(task) != a.digest) =>
+                if approval
+                    .as_ref()
+                    .is_some_and(|a| crate::queue::prompt::approved_input_digest(task, a.request) != a.digest) =>
             {
                 (EnqueueVerdict::InputChanged, false)
+            }
+            // An additional request runs in a new Task Checkout only. A Task
+            // that already holds one, or a Worker handoff, is refused: whether
+            // its checkout is safe for this run is not established here.
+            Some(task)
+                if approval.as_ref().is_some_and(|a| a.request.is_some())
+                    && (task.worktree_path.is_some() || task.branch_name.is_some() || task.worker_handoff.is_some()) =>
+            {
+                (
+                    EnqueueVerdict::Blocked(
+                        "This Task already has a Task Checkout, so an additional request cannot run it yet".into(),
+                    ),
+                    false,
+                )
+            }
+            // Repeating an approval must never repeat its run. A run that
+            // started under this approval is recorded, and outlives the binding.
+            Some(task)
+                if approval.as_ref().is_some_and(|a| task.executed_approvals.iter().any(|e| e.approval_id == a.id)) =>
+            {
+                (EnqueueVerdict::Blocked("This approval already started a run of this Task".into()), false)
             }
             Some(task) if task.cleanup_in_flight => (
                 EnqueueVerdict::Blocked(
@@ -815,6 +841,7 @@ pub async fn enqueue_leased(
                     approval_id: a.id,
                     digest: a.digest.to_string(),
                     for_run: task.next_run(),
+                    request: a.request.map(str::to_string),
                 });
                 let title = task.title.clone();
                 renumber_column(staged, project_id, task_id, &TaskStatus::Queue, 0);

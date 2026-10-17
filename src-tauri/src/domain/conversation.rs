@@ -14,6 +14,8 @@ pub const PROJECTION_MESSAGE_COUNT: usize = 16;
 pub const TASK_INDEX_LIMIT: usize = 40;
 /// How much of a Task's description an approval card carries.
 pub const INPUT_PREVIEW_LIMIT: usize = 2_000;
+/// The most an approved additional coding request may carry, in bytes.
+pub const ADDITIONAL_REQUEST_LIMIT: usize = 4_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -172,6 +174,19 @@ pub enum TaskMutation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input: Option<ExecutionInput>,
     },
+    /// Queue a Backlog Task that has no Task Checkout, for one run with one
+    /// additional coding request. The Task description is not changed. `input`
+    /// is required: its digest covers the Task input, the effective model and
+    /// `request` (`queue::prompt::approved_input_digest`), so approval names
+    /// exactly what the provider will receive. Like `EnqueueTask`, approval only
+    /// queues the Task; admission, checkout and the launch stay with the executor.
+    ExecuteRequest {
+        target_task_id: Uuid,
+        target_task_title: String,
+        from: TaskStatus,
+        request: String,
+        input: ExecutionInput,
+    },
 }
 
 /// What a queued Task would be told to do, as the Human saw it when approving.
@@ -183,6 +198,11 @@ pub struct ExecutionInput {
     pub digest: String,
     pub description: Option<String>,
     pub subtask_count: usize,
+    /// The Task's model configuration as the Human saw it: a configured
+    /// identifier, or an empty or `"default"` value for provider default. `None`
+    /// for a proposal recorded before the model was shown.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl ExecutionInput {
@@ -195,7 +215,20 @@ impl ExecutionInput {
                 .filter(|text| !text.is_empty())
                 .map(|text| text.chars().take(INPUT_PREVIEW_LIMIT).collect()),
             subtask_count: task.subtasks.len(),
+            model: Some(task.model.clone()),
         }
+    }
+}
+
+/// How a Task's model configuration is described to the Human. An empty or
+/// `"default"` value selects the provider default, which the provider resolves
+/// at execution time; any other value is the configured identifier. The launch
+/// applies the same rule (`queue::executor`), so the wording matches what runs.
+pub fn model_policy_phrase(model: Option<&str>) -> String {
+    match model {
+        None => "model not recorded for this proposal".into(),
+        Some("" | "default") => "provider default, selected at execution time".into(),
+        Some(model) => format!("model {model}"),
     }
 }
 
@@ -299,6 +332,39 @@ impl TaskMutation {
         })
     }
 
+    /// Propose one additional coding request for a Backlog Task. Refused here
+    /// for any other state, for a Task that already holds a Task Checkout or a
+    /// Worker handoff, and while an earlier checkout operation is unfinished.
+    /// Approval re-checks all of it.
+    pub fn execute_request(target: &Task, request: &str) -> Result<Self, String> {
+        let request = validate_request(request)?;
+        if target.status != TaskStatus::Backlog {
+            return Err(format!(
+                "An additional request can only be run for a Backlog Task, and this one is in {:?}. \
+                 Propose a new Task for distinct work.",
+                target.status
+            ));
+        }
+        if target.worktree_path.is_some() || target.branch_name.is_some() || target.worker_handoff.is_some() {
+            return Err(
+                "This Task already has a Task Checkout, so an additional request cannot be approved for it yet. \
+                 Propose a new Task for distinct work."
+                    .into(),
+            );
+        }
+        if target.cleanup_in_flight || target.republish_pending_refusal().is_some() {
+            return Err("This Task cannot run until an unfinished checkout operation is resolved".into());
+        }
+        let digest = crate::queue::prompt::approved_input_digest(target, Some(&request));
+        Ok(Self::ExecuteRequest {
+            target_task_id: target.id,
+            target_task_title: target.title.chars().take(TASK_TITLE_LIMIT).collect(),
+            from: target.status.clone(),
+            request,
+            input: ExecutionInput::observe(target, digest),
+        })
+    }
+
     pub fn summary(&self) -> String {
         let text = match self {
             Self::CreateTask { title, description, priority, category, .. } => format!(
@@ -324,6 +390,14 @@ impl TaskMutation {
                         ": {}", d.chars().take(600).collect::<String>()
                     ))
                 ))
+            ),
+            Self::ExecuteRequest { target_task_id, target_task_title, from, request, input } => format!(
+                "Queue Task {target_task_id} ({target_task_title:?}) from {from:?} for one run with an \
+                 additional request, on its current definition ({}; {}): {}; the Task description is not \
+                 changed, and SlashIt's scheduler decides when it starts",
+                input.digest.chars().take(12).collect::<String>(),
+                model_policy_phrase(input.model.as_deref()),
+                request.chars().take(600).collect::<String>()
             ),
         };
         text.chars().take(1500).collect()
@@ -389,6 +463,14 @@ fn validate_title(value: &str) -> Result<String, String> {
         return Err(format!("Task title must contain 1–{TASK_TITLE_LIMIT} characters"));
     }
     Ok(title.to_owned())
+}
+
+fn validate_request(value: &str) -> Result<String, String> {
+    let request = value.trim();
+    if request.is_empty() || request.len() > ADDITIONAL_REQUEST_LIMIT {
+        return Err(format!("Additional request must contain 1–{ADDITIONAL_REQUEST_LIMIT} bytes"));
+    }
+    Ok(request.to_owned())
 }
 
 fn validate_description(value: &str) -> Result<String, String> {
@@ -504,6 +586,14 @@ pub enum CoordinatorOutput {
         text: String,
         target_task_id: Uuid,
     },
+    /// Proposal to run a Backlog Task once more with one additional coding
+    /// request. Only a Task without a Task Checkout qualifies; distinct new
+    /// work is a new Task. The description is not changed.
+    ExecuteRequest {
+        text: String,
+        target_task_id: Uuid,
+        request: String,
+    },
     /// Read-only: answered by SlashIt from current state, never a proposal.
     InspectTask {
         target_task_id: Uuid,
@@ -606,6 +696,10 @@ impl Conversation {
                 description.as_deref().map(validate_description).transpose()?;
             }
             CoordinatorOutput::MoveTask { text, .. } | CoordinatorOutput::EnqueueTask { text, .. } => Self::validate_text(text)?,
+            CoordinatorOutput::ExecuteRequest { text, request, .. } => {
+                Self::validate_text(text)?;
+                validate_request(request)?;
+            }
             CoordinatorOutput::InspectTask { .. }
             | CoordinatorOutput::InspectTaskPullRequest { .. }
             | CoordinatorOutput::InspectProject {} => {}

@@ -38,6 +38,18 @@ fn words(value: &str) -> String {
     value.replace('_', " ")
 }
 
+/// The model policy an approval binds to. An explicit identifier is shown as
+/// configured. An empty or `"default"` model means the provider chooses at
+/// execution time, so the card does not name a concrete model it cannot know.
+fn model_row(model: Option<&str>) -> (String, String) {
+    let value = match model {
+        None => "Not recorded for this proposal".to_string(),
+        Some("" | "default") => "Provider default — selected at execution time; the concrete model may change.".to_string(),
+        Some(model) => model.to_string(),
+    };
+    ("Model".to_string(), value)
+}
+
 fn mutation_view(mutation: &ConversationTaskMutation) -> MutationView {
     match mutation {
         ConversationTaskMutation::CreateTask { title, description, priority, category, .. } => {
@@ -76,6 +88,18 @@ fn mutation_view(mutation: &ConversationTaskMutation) -> MutationView {
             rows.push(("Effect".to_string(), "Only queues the Task, and only if its definition is unchanged at the moment you approve. SlashIt's scheduler starts it when capacity allows, and the Task prepares its own checkout then".to_string()));
             MutationView { heading: "Queue Task", title: target_task_title.clone(), rows }
         }
+        ConversationTaskMutation::ExecuteRequest { target_task_id, target_task_title, from, request, input } => MutationView {
+            heading: "Queue Task with a request",
+            title: target_task_title.clone(),
+            rows: vec![
+                ("Task ID".to_string(), target_task_id.to_string()),
+                ("Status".to_string(), format!("{} → queue", words(from))),
+                ("Request".to_string(), request.clone()),
+                model_row(input.model.as_deref()),
+                ("Input".to_string(), input.digest.chars().take(12).collect()),
+                ("Effect".to_string(), "Queues one run with exactly this request, and only if the Task is unchanged at the moment you approve. The Task description is not changed. SlashIt's scheduler starts it when capacity allows, and the Task prepares its own checkout then".to_string()),
+            ],
+        },
         ConversationTaskMutation::MoveTask { target_task_id, target_task_title, from, to } => MutationView {
             heading: "Move Task",
             title: target_task_title.clone(),
@@ -116,6 +140,7 @@ fn project_action_event_text(kind: &ConversationEntryKind, actions: &[Conversati
             ConversationTaskMutation::CreateTask { title, .. } => format!("Task created in Backlog: {title} (Task {task_id})"),
             ConversationTaskMutation::EditTask { target_task_title, .. } => format!("Task updated: {target_task_title} (Task {task_id})"),
             ConversationTaskMutation::MoveTask { target_task_title, to, .. } => format!("Task moved to {}: {target_task_title} (Task {task_id})", words(to)),
+            ConversationTaskMutation::ExecuteRequest { target_task_title, .. } => format!("Task queued with an additional request: {target_task_title} (Task {task_id})"),
             ConversationTaskMutation::EnqueueTask { target_task_title, .. } => match action.outcome {
                 Some(ConversationProjectActionOutcome::AlreadyQueued { .. }) => format!("Task was already in the queue: {target_task_title} (Task {task_id}); SlashIt cannot tell whether this approval queued it"),
                 _ => format!("Task queued: {target_task_title} (Task {task_id})"),
@@ -536,7 +561,7 @@ mod tests {
         use crate::models::conversation::ExecutionInput;
         let mutation = ConversationTaskMutation::EnqueueTask {
             target_task_id: Uuid::new_v4(), target_task_title: "Build it".into(), from: "backlog".into(),
-            input: Some(ExecutionInput { digest: "0123456789abcdef".into(), description: Some("Add a word counter".into()), subtask_count: 2 }),
+            input: Some(ExecutionInput { digest: "0123456789abcdef".into(), description: Some("Add a word counter".into()), subtask_count: 2, model: Some("opus".into()) }),
         };
         let view = mutation_view(&mutation);
         assert!(view.rows.iter().any(|(name, value)| name == "Will run" && value == "Add a word counter"));
@@ -545,6 +570,39 @@ mod tests {
         // A proposal saved before the input was recorded still deserializes.
         let legacy: ConversationTaskMutation = serde_json::from_value(serde_json::json!({"kind":"enqueue_task","target_task_id":Uuid::new_v4(),"target_task_title":"Old","from":"backlog"})).unwrap();
         assert!(matches!(legacy, ConversationTaskMutation::EnqueueTask { input: None, .. }));
+    }
+
+    fn execute_request_rows(model: Option<&str>) -> Vec<(String, String)> {
+        use crate::models::conversation::ExecutionInput;
+        let mutation = ConversationTaskMutation::ExecuteRequest {
+            target_task_id: Uuid::new_v4(), target_task_title: "Build it".into(), from: "backlog".into(), request: "Add a changelog entry".into(),
+            input: ExecutionInput { digest: "0123456789abcdef".into(), description: None, subtask_count: 0, model: model.map(str::to_string) },
+        };
+        mutation_view(&mutation).rows
+    }
+
+    fn model_value(rows: &[(String, String)]) -> String {
+        rows.iter().find(|(name, _)| name == "Model").map(|(_, value)| value.clone()).expect("the card shows a Model row")
+    }
+
+    #[test]
+    fn an_execute_request_card_shows_an_explicit_model_as_configured() {
+        assert_eq!(model_value(&execute_request_rows(Some("claude-opus-4-0-20250514"))), "claude-opus-4-0-20250514");
+    }
+
+    #[test]
+    fn an_execute_request_card_discloses_provider_default_selection_without_naming_a_model() {
+        for model in [Some(""), Some("default")] {
+            let value = model_value(&execute_request_rows(model));
+            assert_eq!(value, "Provider default — selected at execution time; the concrete model may change.");
+        }
+    }
+
+    #[test]
+    fn an_execute_request_card_does_not_claim_a_model_for_a_proposal_that_never_recorded_one() {
+        let rows = execute_request_rows(None);
+        assert_eq!(model_value(&rows), "Not recorded for this proposal");
+        assert!(!rows.iter().any(|(_, value)| value.contains("Provider default")));
     }
 
     #[test]
