@@ -654,8 +654,9 @@ pub enum CoordinatorOutput {
         target_task_id: Uuid,
     },
     /// Proposal to run a Backlog Task once more with one additional coding
-    /// request. Only a Task without a Task Checkout qualifies; distinct new
-    /// work is a new Task. The description is not changed.
+    /// request. A Backlog Task qualifies with no Task Checkout, or with its own
+    /// existing Task Checkout that SlashIt has inspected and found eligible.
+    /// Distinct new work is a new Task. The description is not changed.
     ExecuteRequest {
         text: String,
         target_task_id: Uuid,
