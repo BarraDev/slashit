@@ -449,6 +449,7 @@ mod enqueue_parity {
             project_id,
             by_lifecycle,
             &TaskStatus::Backlog,
+            None,
         )
         .await
         .expect("lifecycle enqueue");

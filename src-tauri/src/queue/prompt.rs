@@ -110,6 +110,41 @@ pub fn build_task_prompt(task: &Task, project_path: Option<&str>) -> String {
     parts.join("\n")
 }
 
+/// A fingerprint of everything the coding prompt says about `task`, so an
+/// approval can name the exact input a run would receive. It is derived from
+/// [`build_task_prompt`] itself (without the checkout path, which is the
+/// executor's choice, not the Task's definition), so a field the prompt starts
+/// to carry is covered without a second list to keep in step. The prompt's
+/// wording is part of the hash, so changing it makes a pending, unapproved
+/// proposal refuse safely and need a new proposal.
+pub fn task_input_digest(task: &Task) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(build_task_prompt(task, None).as_bytes()))
+}
+
+/// What a Task's `approved_execution` says about the input it is about to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovedInputCheck {
+    /// No Human approved this Task's input; it runs as an ordinary Task. Never
+    /// read as an authorization for anything.
+    Unbound,
+    /// The Task still holds exactly the input that was approved.
+    Matches,
+    /// The Task was changed after approval. It must not start.
+    Differs,
+    /// The binding was made for another run. It authorizes nothing here.
+    Superseded,
+}
+
+pub fn check_approved_input(task: &Task) -> ApprovedInputCheck {
+    match &task.approved_execution {
+        None => ApprovedInputCheck::Unbound,
+        Some(b) if b.for_run != task.next_run() => ApprovedInputCheck::Superseded,
+        Some(b) if b.digest == task_input_digest(task) => ApprovedInputCheck::Matches,
+        Some(_) => ApprovedInputCheck::Differs,
+    }
+}
+
 /// `feedback` with any line that would read as one of the fence lines
 /// quoted, so the text cannot close its own section early.
 fn unfenced(feedback: &str) -> String {
@@ -200,6 +235,26 @@ mod tests {
         assert!(prompt.contains("# Task: Implement login page"));
         assert!(prompt.contains("Category: Feature"));
         assert!(prompt.contains("Priority: Medium"));
+    }
+
+    #[test]
+    fn the_input_digest_follows_what_the_prompt_says_and_nothing_else() {
+        let task = create_test_task("Digest me");
+        let base = task_input_digest(&task);
+        assert_eq!(base, task_input_digest(&task.clone()), "stable for an unchanged Task");
+
+        let mut described = task.clone();
+        described.description = Some("do something".to_string());
+        assert_ne!(base, task_input_digest(&described));
+
+        let mut renamed = task.clone();
+        renamed.title = "Different".to_string();
+        assert_ne!(base, task_input_digest(&renamed));
+
+        let mut moved = task.clone();
+        moved.position += 3;
+        moved.status = crate::domain::TaskStatus::Queue;
+        assert_eq!(base, task_input_digest(&moved), "board position and column are not input");
     }
 
     #[test]

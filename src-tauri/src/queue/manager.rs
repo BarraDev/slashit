@@ -207,6 +207,7 @@ mod tests {
                 worker_handoff_confirmed: false,
                 new_attempt: None,
                 new_attempt_confirmed: false,
+                approved_execution: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };

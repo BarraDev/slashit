@@ -61,15 +61,21 @@ fn mutation_view(mutation: &ConversationTaskMutation) -> MutationView {
             }));
             MutationView { heading: "Edit Task", title: target_task_title.clone(), rows }
         }
-        ConversationTaskMutation::EnqueueTask { target_task_id, target_task_title, from } => MutationView {
-            heading: "Queue Task",
-            title: target_task_title.clone(),
-            rows: vec![
+        ConversationTaskMutation::EnqueueTask { target_task_id, target_task_title, from, input } => {
+            let mut rows = vec![
                 ("Task ID".to_string(), target_task_id.to_string()),
                 ("Status".to_string(), format!("{} → queue", words(from))),
-                ("Effect".to_string(), "Only queues the Task. SlashIt's scheduler starts it when capacity allows, and the Task prepares its own checkout then".to_string()),
-            ],
-        },
+            ];
+            if let Some(input) = input {
+                rows.push(("Will run".to_string(), input.description.clone().unwrap_or_else(|| "(no description)".to_string())));
+                if input.subtask_count > 0 {
+                    rows.push(("Subtasks".to_string(), input.subtask_count.to_string()));
+                }
+                rows.push(("Input".to_string(), input.digest.chars().take(12).collect()));
+            }
+            rows.push(("Effect".to_string(), "Only queues the Task, and only if its definition is unchanged at the moment you approve. SlashIt's scheduler starts it when capacity allows, and the Task prepares its own checkout then".to_string()));
+            MutationView { heading: "Queue Task", title: target_task_title.clone(), rows }
+        }
         ConversationTaskMutation::MoveTask { target_task_id, target_task_title, from, to } => MutationView {
             heading: "Move Task",
             title: target_task_title.clone(),
@@ -526,10 +532,26 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_proposal_shows_the_input_it_binds_the_approval_to() {
+        use crate::models::conversation::ExecutionInput;
+        let mutation = ConversationTaskMutation::EnqueueTask {
+            target_task_id: Uuid::new_v4(), target_task_title: "Build it".into(), from: "backlog".into(),
+            input: Some(ExecutionInput { digest: "0123456789abcdef".into(), description: Some("Add a word counter".into()), subtask_count: 2 }),
+        };
+        let view = mutation_view(&mutation);
+        assert!(view.rows.iter().any(|(name, value)| name == "Will run" && value == "Add a word counter"));
+        assert!(view.rows.iter().any(|(name, value)| name == "Subtasks" && value == "2"));
+        assert!(view.rows.iter().any(|(name, value)| name == "Input" && value == "0123456789ab"));
+        // A proposal saved before the input was recorded still deserializes.
+        let legacy: ConversationTaskMutation = serde_json::from_value(serde_json::json!({"kind":"enqueue_task","target_task_id":Uuid::new_v4(),"target_task_title":"Old","from":"backlog"})).unwrap();
+        assert!(matches!(legacy, ConversationTaskMutation::EnqueueTask { input: None, .. }));
+    }
+
+    #[test]
     fn a_queue_proposal_says_it_only_queues_and_a_found_task_is_not_claimed() {
         let task_id = Uuid::new_v4();
         let mut action = ConversationProjectAction { id: Uuid::new_v4(), explanation: "why".into(), status: ConversationProjectActionStatus::Applied,
-            mutation: ConversationTaskMutation::EnqueueTask { target_task_id: task_id, target_task_title: "Build it".into(), from: "backlog".into() },
+            mutation: ConversationTaskMutation::EnqueueTask { target_task_id: task_id, target_task_title: "Build it".into(), from: "backlog".into(), input: None },
             outcome: Some(ConversationProjectActionOutcome::Applied { task_id, title: "Build it".into() }), created_at: String::new() };
         let view = mutation_view(&action.mutation);
         assert_eq!(view.heading, "Queue Task");
