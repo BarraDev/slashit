@@ -746,7 +746,7 @@ async fn cached_porcelain(
 }
 
 /// Map each project to the filesystem path of the repository backing it.
-async fn repository_paths_by_project(state: &AppState) -> HashMap<uuid::Uuid, String> {
+pub(crate) async fn repository_paths_by_project(state: &AppState) -> HashMap<uuid::Uuid, String> {
     let projects = state.project.projects.read().await;
     let repositories = state.repository.repositories.read().await;
     projects

@@ -88,18 +88,27 @@ fn mutation_view(mutation: &ConversationTaskMutation) -> MutationView {
             rows.push(("Effect".to_string(), "Only queues the Task, and only if its definition is unchanged at the moment you approve. SlashIt's scheduler starts it when capacity allows, and the Task prepares its own checkout then".to_string()));
             MutationView { heading: "Queue Task", title: target_task_title.clone(), rows }
         }
-        ConversationTaskMutation::ExecuteRequest { target_task_id, target_task_title, from, request, input } => MutationView {
-            heading: "Queue Task with a request",
-            title: target_task_title.clone(),
-            rows: vec![
+        ConversationTaskMutation::ExecuteRequest { target_task_id, target_task_title, from, request, input, checkout } => {
+            let mut rows = vec![
                 ("Task ID".to_string(), target_task_id.to_string()),
                 ("Status".to_string(), format!("{} → queue", words(from))),
                 ("Request".to_string(), request.clone()),
                 model_row(input.model.as_deref()),
                 ("Input".to_string(), input.digest.chars().take(12).collect()),
-                ("Effect".to_string(), "Queues one run with exactly this request, and only if the Task is unchanged at the moment you approve. The Task description is not changed. SlashIt's scheduler starts it when capacity allows, and the Task prepares its own checkout then".to_string()),
-            ],
-        },
+            ];
+            if let Some(checkout) = checkout {
+                rows.push(("Checkout".to_string(), checkout.checkout_path.clone()));
+                rows.push(("Branch".to_string(), checkout.branch.clone()));
+                rows.push(("Head".to_string(), checkout.head.clone()));
+                rows.push(("Base".to_string(), checkout.base_commit.clone()));
+            }
+            rows.push(("Effect".to_string(), if checkout.is_some() {
+                "Queues one run in this Task's existing checkout with exactly this request, and only if the checkout and branch are unchanged at the moment you approve. Earlier commits are kept and stay in the Task diff. The Task description is not changed.".to_string()
+            } else {
+                "Queues one run with exactly this request, and only if the Task is unchanged at the moment you approve. The Task description is not changed. SlashIt's scheduler starts it when capacity allows, and the Task prepares its own checkout then".to_string()
+            }));
+            MutationView { heading: "Queue Task with a request", title: target_task_title.clone(), rows }
+        }
         ConversationTaskMutation::MoveTask { target_task_id, target_task_title, from, to } => MutationView {
             heading: "Move Task",
             title: target_task_title.clone(),
@@ -577,8 +586,27 @@ mod tests {
         let mutation = ConversationTaskMutation::ExecuteRequest {
             target_task_id: Uuid::new_v4(), target_task_title: "Build it".into(), from: "backlog".into(), request: "Add a changelog entry".into(),
             input: ExecutionInput { digest: "0123456789abcdef".into(), description: None, subtask_count: 0, model: model.map(str::to_string) },
+            checkout: None,
         };
         mutation_view(&mutation).rows
+    }
+
+    #[test]
+    fn an_execute_request_card_shows_the_checkout_it_reuses() {
+        use crate::models::conversation::{ExecutionInput, ExistingCheckout};
+        let mutation = ConversationTaskMutation::ExecuteRequest {
+            target_task_id: Uuid::new_v4(), target_task_title: "Build it".into(), from: "backlog".into(), request: "Add a changelog entry".into(),
+            input: ExecutionInput { digest: "0123456789abcdef".into(), description: None, subtask_count: 0, model: None },
+            checkout: Some(ExistingCheckout {
+                checkout_path: "/work/checkout".into(), branch: "slashit/task-1".into(), head: "aaaa1111".into(), base_commit: "bbbb2222".into(),
+            }),
+        };
+        let rows = mutation_view(&mutation).rows;
+        let value = |name: &str| rows.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+        assert_eq!(value("Branch").as_deref(), Some("slashit/task-1"));
+        assert_eq!(value("Head").as_deref(), Some("aaaa1111"));
+        assert_eq!(value("Base").as_deref(), Some("bbbb2222"));
+        assert!(value("Effect").unwrap().contains("existing checkout"));
     }
 
     fn model_value(rows: &[(String, String)]) -> String {

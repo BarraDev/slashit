@@ -439,8 +439,9 @@ pub async fn send_project_message(
             | CoordinatorOutput::EnqueueTask { .. }
             | CoordinatorOutput::ExecuteRequest { .. }
         ) => {
+            let checkout = proposal_checkout(&state, project_id, &output).await?;
             let tasks = state.task.tasks.read().await;
-            conversation_actions::record_proposal(&mut updated, project_id, output, &tasks)?;
+            conversation_actions::record_proposal(&mut updated, project_id, output, &tasks, checkout)?;
         }
         CoordinatorOutput::InspectTask { .. }
         | CoordinatorOutput::ListTasks { .. }
@@ -947,6 +948,32 @@ fn record_human_approval(
     Ok((request, already_approved))
 }
 
+/// The Task Checkout evidence an `ExecuteRequest` proposal needs, read from Git
+/// now. `None` for every other output, and for a Task that holds no checkout.
+/// A Task that holds one is inspected, and a refusal is returned as its reason.
+async fn proposal_checkout(
+    state: &AppState,
+    project_id: Uuid,
+    output: &CoordinatorOutput,
+) -> Result<Option<crate::domain::conversation::ExistingCheckoutEvidence>, String> {
+    let CoordinatorOutput::ExecuteRequest { target_task_id, .. } = output else {
+        return Ok(None);
+    };
+    let Some(task) = state.task.tasks.read().await.get(target_task_id).cloned() else {
+        return Ok(None);
+    };
+    if task.project_id != project_id
+        || (task.worktree_path.is_none() && task.branch_name.is_none() && task.worker_handoff.is_none())
+    {
+        return Ok(None);
+    }
+    let repo_path = crate::app_core::repository_paths_by_project(state)
+        .await
+        .remove(&project_id)
+        .ok_or("This Project has no repository to inspect its Task Checkout in")?;
+    conversation_actions::inspect_existing_checkout(&repo_path, &task).await.map(Some)
+}
+
 /// Record a follow-up's Project-action proposal, or the reason it was refused.
 ///
 /// `record_proposal` only reads the in-memory Task set and validates, writing
@@ -962,8 +989,12 @@ fn record_followup_proposal(
     project_id: Uuid,
     output: CoordinatorOutput,
     tasks: &std::collections::HashMap<Uuid, crate::domain::Task>,
+    checkout: Result<Option<crate::domain::conversation::ExistingCheckoutEvidence>, String>,
 ) {
-    if let Err(reason) = conversation_actions::record_proposal(conversation, project_id, output, tasks) {
+    let recorded = checkout.and_then(|checkout| {
+        conversation_actions::record_proposal(conversation, project_id, output, tasks, checkout)
+    });
+    if let Err(reason) = recorded {
         conversation.push(
             Role::Coordinator,
             EntryKind::RunFailed {
@@ -1094,8 +1125,9 @@ async fn continue_from_worker_result_locked(
             | CoordinatorOutput::EnqueueTask { .. }
             | CoordinatorOutput::ExecuteRequest { .. }
         ) => {
+            let checkout = proposal_checkout(state, project_id, &output).await;
             let tasks = state.task.tasks.read().await;
-            record_followup_proposal(&mut conversation, project_id, output, &tasks);
+            record_followup_proposal(&mut conversation, project_id, output, &tasks, checkout);
         }
         CoordinatorOutput::InspectTask { .. }
         | CoordinatorOutput::ListTasks { .. }
@@ -1281,7 +1313,7 @@ mod tests {
         for json in proposals {
             let mut conversation = Conversation::new(project_id);
             let output = Conversation::parse_output(&json).unwrap();
-            record_followup_proposal(&mut conversation, project_id, output, &tasks);
+            record_followup_proposal(&mut conversation, project_id, output, &tasks, Ok(None));
             assert!(conversation.project_actions.is_empty(), "{json}");
             assert!(conversation.actions.is_empty(), "{json}");
             assert_eq!(refusals(&conversation), 1, "{json}");
@@ -1298,7 +1330,7 @@ mod tests {
         let json = format!(r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#, queued.id);
         let mut conversation = Conversation::new(project_id);
 
-        record_followup_proposal(&mut conversation, project_id, Conversation::parse_output(&json).unwrap(), &tasks);
+        record_followup_proposal(&mut conversation, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
 
         assert_eq!(conversation.project_actions.len(), 1);
         assert_eq!(conversation.project_actions[0].status, crate::domain::conversation::ProjectActionStatus::Proposed);
@@ -1318,7 +1350,7 @@ mod tests {
         // keeps the saved Conversation, which carries neither the proposal nor
         // the reply mark, so the follow-up stays retryable.
         let mut attempt = saved.clone();
-        record_followup_proposal(&mut attempt, project_id, Conversation::parse_output(&json).unwrap(), &tasks);
+        record_followup_proposal(&mut attempt, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
         assert_eq!(attempt.project_actions.len(), 1);
         assert!(preserve_saved_conversation(
             saved.clone(),
@@ -1328,7 +1360,7 @@ mod tests {
         assert!(saved.project_actions.is_empty(), "a failed save publishes nothing");
 
         let mut retry = saved;
-        record_followup_proposal(&mut retry, project_id, Conversation::parse_output(&json).unwrap(), &tasks);
+        record_followup_proposal(&mut retry, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
         assert_eq!(retry.project_actions.len(), 1, "exactly one proposal after the retry");
     }
 

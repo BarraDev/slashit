@@ -590,6 +590,52 @@ impl Task {
             .map(|_| "This Task has unresolved Worker recovery evidence. Inspect and preserve its Task Checkout before any new attempt.".to_string())
     }
 
+    /// Why this Task's existing Task Checkout cannot carry an additional coding
+    /// request, or `None` when the Task's own records allow reuse.
+    ///
+    /// Reuse needs a Backlog Task with no pending recovery, cleanup, restack or
+    /// integration. Its Worker handoff must be absent or settled: a started,
+    /// committed-awaiting-review or recovery-required handoff is refused, and a
+    /// resolved one is accepted only when a later durable Human Review decision
+    /// superseded it. A resolved stage alone is not enough. Checkout identity,
+    /// branch and HEAD are checked against Git by the caller, not here.
+    pub fn existing_checkout_refusal(&self) -> Option<String> {
+        if self.status != TaskStatus::Backlog {
+            return Some("An additional request can only reuse the checkout of a Backlog Task".into());
+        }
+        if self.new_attempt.is_some() {
+            return Some("A new attempt for this Task's recovered run is pending, so its checkout cannot be reused".into());
+        }
+        if self.cleanup_in_flight {
+            return Some("An earlier cleanup of this Task's checkout is unfinished, so it cannot be reused".into());
+        }
+        if self.republish_pending_refusal().is_some() || self.integration_unfinished_refusal().is_some() {
+            return Some("A checkout operation on this Task is unfinished, so its checkout cannot be reused".into());
+        }
+        match self.worker_handoff.as_ref().map(|handoff| &handoff.stage) {
+            None => None,
+            Some(WorkerHandoffStage::Started) => {
+                Some("This Task's last coding run never recorded its outcome, so its checkout cannot be reused".into())
+            }
+            Some(WorkerHandoffStage::CommittedAwaitingReview { .. }) => Some(
+                "This Task's last coding run is awaiting review, so its checkout cannot be reused".into(),
+            ),
+            Some(WorkerHandoffStage::RecoveryRequired { .. }) => Some(
+                "This Task's last coding run was interrupted and needs recovery, so its checkout cannot be reused".into(),
+            ),
+            Some(WorkerHandoffStage::ResolvedToAiReview { .. }) => {
+                if self.resolved_worker_handoff_was_superseded() {
+                    None
+                } else {
+                    Some(
+                        "This Task's last coding run is not yet shown to be settled, so its checkout cannot be reused"
+                            .into(),
+                    )
+                }
+            }
+        }
+    }
+
     /// Whether the persisted new-attempt decision authorizes one launch of a
     /// Worker on this Task's recovered run.
     ///
