@@ -161,10 +161,10 @@ pub enum TaskMutation {
     /// `input` names the exact coding input the Human approved. Approval only
     /// queues a Task whose input still matches it, so a Task edited after the
     /// proposal is refused rather than queued as something nobody approved.
-    /// The binding ends at the Queue transition: a Task edited while it waits
-    /// in Queue runs as edited, as it does for any front door.
-    /// Proposals saved before this field existed carry none and keep the
-    /// status-only check they were approved under.
+    /// Approval also records the input on the Task, and the executor checks it
+    /// again before the run starts (see `Task::approved_execution`).
+    /// Proposals saved before this field existed carry none; they stay readable
+    /// but cannot queue a Task, because the Human never saw its input.
     EnqueueTask {
         target_task_id: Uuid,
         target_task_title: String,

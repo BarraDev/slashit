@@ -29,9 +29,11 @@
 //!   at the approved status records success; any other status is refused.
 //! - `EnqueueTask` is compare-and-set on `Backlog` and on the coding input the
 //!   Human saw (`queue::prompt::task_input_digest`, recorded with the
-//!   proposal): a Task edited since is refused, not queued. A proposal saved
-//!   before the input was recorded has none and keeps the status-only check.
-//!   A Task already in Queue is
+//!   proposal): a Task edited since is refused, not queued, and a queued Task
+//!   carries that input to the executor, which checks it again before the run
+//!   starts. A proposal saved before the input was recorded never showed the
+//!   Human what would run, so approving it is refused and must be proposed
+//!   again. A Task already in Queue is
 //!   recorded as found queued, not as queued by this approval: the record
 //!   cannot tell a retry that follows a crash from an unrelated enqueue. A
 //!   Task that has moved on to any other column is refused.
@@ -329,7 +331,10 @@ async fn execute(scope: &Scope<'_>, action_id: Uuid, mutation: &TaskMutation) ->
             move_task(scope, *target_task_id, from, to).await
         }
         TaskMutation::EnqueueTask { target_task_id, from, input, .. } => {
-            enqueue_task(scope, *target_task_id, from, input.as_ref().map(|i| (action_id, i.digest.as_str()))).await
+            // A proposal saved before the input was recorded never showed the Human
+            // what would run, so approving it cannot authorize queueing: the empty
+            // digest matches no Task, and the write refuses it atomically.
+            enqueue_task(scope, *target_task_id, from, Some((action_id, input.as_ref().map_or("", |i| i.digest.as_str())))).await
         }
     }
 }
@@ -468,8 +473,9 @@ async fn enqueue_task(
                  Check it on the board."
             )),
             EnqueueVerdict::InputChanged => Execution::Refused(
-                "The Task was edited after this was proposed, so it would run something other than what \
-                 you approved; nothing was changed. Ask the Coordinator to propose queueing it again."
+                "This request does not name the exact Task input you approved, or the Task was edited after \
+                 it was proposed, so it could run something other than what you approved; nothing was \
+                 changed. Ask the Coordinator to propose queueing it again."
                     .into(),
             ),
             EnqueueVerdict::Missing => Execution::Refused("The Task no longer exists".into()),
@@ -1734,7 +1740,7 @@ mod tests {
             let Some(ProjectActionOutcome::Refused { reason }) = &conversation.project_action(id).unwrap().outcome else {
                 panic!("{what}: expected a refusal");
             };
-            assert!(reason.contains("edited after this was proposed"), "{what}: {reason}");
+            assert!(reason.contains("edited after it was proposed"), "{what}: {reason}");
         }
     }
 
@@ -1769,7 +1775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_proposal_saved_before_the_input_was_recorded_still_reads_and_keeps_its_old_check() {
+    async fn a_proposal_saved_before_the_input_was_recorded_still_reads_but_cannot_queue_a_task() {
         let id = Uuid::new_v4();
         let legacy: TaskMutation = serde_json::from_value(serde_json::json!({
             "kind": "enqueue_task", "target_task_id": id, "target_task_title": "Old", "from": "backlog"
@@ -1791,7 +1797,10 @@ mod tests {
         };
         edit_in_store(&world, task.id, |t| t.description = Some("edited".into())).await;
         decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
-        assert_eq!(snapshot_of(&world, task.id).await.status, TaskStatus::Queue, "status-only, as it was approved");
+        let after = snapshot_of(&world, task.id).await;
+        assert_eq!(after.status, TaskStatus::Backlog, "an approval that never named the input cannot queue it");
+        assert_eq!(after.approved_execution, None);
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Refused);
     }
 
     #[tokio::test]

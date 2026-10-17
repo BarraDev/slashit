@@ -3487,8 +3487,6 @@ impl TaskExecutor {
                 let model = if t.model.is_empty() || t.model == "default" { None } else { Some(t.model.clone()) };
                 *launch_input.lock().unwrap_or_else(|p| p.into_inner()) =
                     Some((build_task_prompt(t, Some(acquired.info.path.as_str())), model));
-                // One approval admits one run: ended with the start it admits.
-                t.approved_execution = None;
                 if let Some(decision) = new_attempt {
                     // Only the decision the person made may start this run, and
                     // only while the Task still records exactly that recovery.
@@ -3507,6 +3505,9 @@ impl TaskExecutor {
                     t.new_attempt_confirmed = false;
                     consumed.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                // One approval admits one run: ended with the start it admits,
+                // and only by a write that records that start.
+                t.approved_execution = None;
                 t.worktree_path = Some(acquired.info.path.clone());
                 t.branch_name = Some(acquired.info.branch.clone());
                 if let Some(base_commit) = &acquired.base_commit {
@@ -16346,6 +16347,30 @@ VERDICT: APPROVED"
             let start = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired.expect("checkout")).await.expect("start");
             w.executor.tasks.write().await.get_mut(&w.task_id).unwrap().description = Some("prompt B".into());
             assert!(start.prompt.contains("prompt A") && !start.prompt.contains("prompt B"));
+        }
+
+        #[tokio::test]
+        async fn a_refused_new_attempt_start_does_not_spend_an_unrelated_binding() {
+            let w = world(Class::Created).await;
+            approve_current_input(&w, 1).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let (_, head) = TaskExecutor::checkout_branch_head(&acquired.info.path, &acquired.info.branch).await.unwrap();
+            let decision = NewAttemptDecision {
+                decision_id: Uuid::new_v4(),
+                for_run: 1,
+                recovery_reason: "r".into(),
+                branch: acquired.info.branch.clone(),
+                checkout_path: acquired.info.path.clone(),
+                observed_commit: None,
+                expected_head: head,
+                dirty_fingerprint: String::new(),
+                dirty_paths: Vec::new(),
+                authorized_at: chrono::Utc::now(),
+            };
+            let result = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, Some(&decision)).await;
+            assert!(result.is_err(), "no recorded recovery authorizes this attempt");
+            assert!(w.on_disk().approved_execution.is_some() || w.in_memory().await.approved_execution.is_some());
         }
 
         #[tokio::test]
