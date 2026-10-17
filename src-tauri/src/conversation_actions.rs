@@ -354,12 +354,32 @@ async fn execute(scope: &Scope<'_>, action_id: Uuid, mutation: &TaskMutation) ->
         // is compared with `approved_input_digest(task, Some(request))`, so an
         // edit to the Task or a change to the request fails the comparison.
         TaskMutation::ExecuteRequest { target_task_id, from, request, input, .. } => {
-            enqueue_task(scope, *target_task_id, from, lifecycle::InputApproval {
+            match enqueue_task(scope, *target_task_id, from, lifecycle::InputApproval {
                 id: action_id,
                 digest: input.digest.as_str(),
                 request: Some(request.as_str()),
             })
-            .await
+            .await?
+            {
+                // A retry finds the Task queued by this approval itself, bound
+                // to it or already run under it: that is Applied. Anything else
+                // queued the Task without this request, so reporting it as
+                // applied would claim a run that will not carry the text.
+                Execution::AlreadyQueued { task_id, title } => {
+                    let carries_this_request = scope.tasks.read().await.get(&task_id).is_some_and(|task| {
+                        task.approved_execution.as_ref().is_some_and(|b| b.approval_id == action_id)
+                            || task.executed_approvals.iter().any(|e| e.approval_id == action_id)
+                    });
+                    Ok(if carries_this_request {
+                        Execution::Applied { task_id, title }
+                    } else {
+                        Execution::Refused(
+                            "The Task is already queued, so the additional request was not attached".into(),
+                        )
+                    })
+                }
+                other => Ok(other),
+            }
         }
     }
 }
@@ -1992,6 +2012,104 @@ mod tests {
 
         let after = snapshot_of(&world, task.id).await;
         assert_eq!(after.status, TaskStatus::Backlog, "a consumed approval never queues again");
+        assert_eq!(after.approved_execution, None);
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_failed_task_write_leaves_an_execute_request_retryable_and_the_task_unbound() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Retry the request").await;
+        let mut conversation = world.conversation();
+        let request = "Also add a changelog entry";
+        let id = world.propose(&mut conversation, &execute_request_json(task.id, request)).await.unwrap();
+        world.block_task_persistence();
+
+        assert!(decide(&world.scope(), &mut conversation, id, Decision::Approve).await.is_err());
+        let failed = snapshot_of(&world, task.id).await;
+        assert_eq!(failed.status, TaskStatus::Backlog, "a failed save must not show the queue move");
+        assert_eq!(failed.approved_execution, None, "a failed save must not show the binding");
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Approved);
+
+        world.unblock_task_persistence();
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        let queued = snapshot_of(&world, task.id).await;
+        assert_eq!(queued.status, TaskStatus::Queue);
+        assert_eq!(binding_of(&queued).map(|b| (b.approval_id, b.request)), Some((id, Some(request.into()))));
+        assert_eq!(moves(&queued), 1);
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Applied);
+    }
+
+    /// The Task write reached the file but its directory sync failed. The
+    /// approval was already durable, so the retry must find the queued Task
+    /// and its binding, and must not queue or bind it a second time.
+    #[tokio::test]
+    async fn a_published_but_not_durable_execute_request_is_not_queued_again_by_a_retry() {
+        use slashit_durable_fs::{fault, Stage};
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Durability unknown").await;
+        let mut conversation = world.conversation();
+        let request = "Also add a changelog entry";
+        let id = world.propose(&mut conversation, &execute_request_json(task.id, request)).await.unwrap();
+        // Step 1 of the protocol, as a crash after it would leave it.
+        conversation.project_actions[0].status = ProjectActionStatus::Approved;
+
+        let fault = fault::fail_at(Stage::SyncDirectory, std::io::ErrorKind::Other);
+        assert!(decide(&world.scope(), &mut conversation, id, Decision::Approve).await.is_err());
+        drop(fault);
+
+        let published = snapshot_of(&world, task.id).await;
+        assert_eq!(published.status, TaskStatus::Queue, "the write is in place");
+        assert_eq!(binding_of(&published).map(|b| b.approval_id), Some(id));
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Approved);
+
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        let after = snapshot_of(&world, task.id).await;
+        assert_eq!(moves(&after), moves(&published), "the retry must not move the Task again");
+        assert_eq!(after.updated_at, published.updated_at, "the retry must not rewrite the Task");
+        assert_eq!(binding_of(&after).map(|b| (b.approval_id, b.request)), Some((id, Some(request.into()))));
+        assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Applied);
+    }
+
+    /// Another front door queues the Task between the proposal and the
+    /// approval. The request cannot be attached to that run, so the approval
+    /// must be refused, not recorded as applied.
+    #[tokio::test]
+    async fn a_task_queued_elsewhere_refuses_the_request_instead_of_applying_it() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Queued first").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &execute_request_json(task.id, "more")).await.unwrap();
+        place(&world, task.id, TaskStatus::Queue).await;
+        let before = snapshot_of(&world, task.id).await;
+
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        let after = snapshot_of(&world, task.id).await;
+        assert_eq!(after.approved_execution, None, "no request is attached to the queued Task");
+        assert_eq!(moves(&after), moves(&before));
+        let action = conversation.project_action(id).unwrap();
+        assert_eq!(action.status, ProjectActionStatus::Refused);
+        assert!(matches!(action.outcome, Some(ProjectActionOutcome::Refused { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_request_altered_after_proposal_is_refused_and_nothing_is_queued() {
+        let world = World::new();
+        let task = world.seed_task(world.project_id, "Request swapped").await;
+        let mut conversation = world.conversation();
+        let id = world.propose(&mut conversation, &execute_request_json(task.id, "the approved text")).await.unwrap();
+        let TaskMutation::ExecuteRequest { request, .. } = &mut conversation.project_actions[0].mutation else {
+            panic!("expected an ExecuteRequest proposal");
+        };
+        *request = "a different text".into();
+
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        let after = snapshot_of(&world, task.id).await;
+        assert_eq!(after.status, TaskStatus::Backlog);
         assert_eq!(after.approved_execution, None);
         assert_eq!(conversation.project_action(id).unwrap().status, ProjectActionStatus::Refused);
     }
