@@ -178,7 +178,10 @@ fn inspect_task_activity(
     let window: Vec<_> = milestones.into_iter().skip(skipped).collect();
     // Only the newest results in the window carry their text, so one read stays
     // within a fixed budget however many runs the Task has.
-    let results_in_window = window.iter().filter(|item| item.run_result().is_some()).count();
+    let results_in_window = window
+        .iter()
+        .filter(|item| item.run_result().is_some())
+        .count();
     let mut results_seen = 0;
     let events: Vec<Value> = window
         .into_iter()
@@ -217,7 +220,12 @@ fn run_result_view(run: u32, result: &slashit_activity::RunResult, show_text: bo
         RunResult::Truncated {
             text,
             original_chars,
-        } => ("truncated", Some(text.as_str()), Some(*original_chars), None),
+        } => (
+            "truncated",
+            Some(text.as_str()),
+            Some(*original_chars),
+            None,
+        ),
         RunResult::Unavailable { reason } => ("unavailable", None, None, Some(reason.as_str())),
     };
     let shown = stored
@@ -624,14 +632,20 @@ mod tests {
         for run in 1..=4u32 {
             let length = if run == 4 { 5_000 } else { 2_000 };
             let answer = format!("answer {run} {}", "y".repeat(length));
-            subject.record_activity(Kind::RunStarted { run, addressing_feedback: false });
+            subject.record_activity(Kind::RunStarted {
+                run,
+                addressing_feedback: false,
+            });
             subject.record_activity(Kind::RunCompleted { run });
             subject.record_activity(Kind::RunResult {
                 run,
                 result: slashit_activity::RunResult::from_provider(Ok(answer)),
             });
         }
-        subject.record_activity(Kind::RunStarted { run: 5, addressing_feedback: false });
+        subject.record_activity(Kind::RunStarted {
+            run: 5,
+            addressing_feedback: false,
+        });
         subject.record_activity(Kind::RunCompleted { run: 5 });
         subject.record_activity(Kind::RunResult {
             run: 5,
@@ -665,7 +679,10 @@ mod tests {
         // A result the storage limit cut is reported as truncated, and its text
         // is clipped for the read.
         assert_eq!(views[3]["outcome"], "truncated");
-        assert_eq!(views[3]["text"].as_str().unwrap().chars().count(), RESULT_CHARS_SHOWN);
+        assert_eq!(
+            views[3]["text"].as_str().unwrap().chars().count(),
+            RESULT_CHARS_SHOWN
+        );
         assert_eq!(views[3]["text_clipped"], true);
         assert_eq!(views[3]["original_chars"], 5_009);
 
@@ -673,7 +690,10 @@ mod tests {
         assert_eq!(views[4]["outcome"], "unavailable");
         assert_eq!(views[4]["text"], Value::Null);
         assert_eq!(views[4]["text_omitted"], false);
-        assert!(views[4]["reason"].as_str().unwrap().contains("no final result"));
+        assert!(views[4]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no final result"));
         assert!(!views[4].to_string().contains("yyy"), "{}", views[4]);
     }
 

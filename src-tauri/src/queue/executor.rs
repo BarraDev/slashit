@@ -11940,6 +11940,106 @@ mod tests {
         assert!(!executor.is_task_running(task_id).await);
     }
 
+    /// Reconciliation of a committed handoff must never replace a result that
+    /// is already durable for the same run with `Unavailable`. The run's
+    /// identity keeps the first result, so the kept answer is what the
+    /// timeline shows after recovery.
+    #[tokio::test]
+    async fn reconciliation_keeps_a_durable_result_for_the_same_run() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, _) = stacked_task_fixture(
+            &executor,
+            &temps,
+            TaskStatus::InProgress,
+            None,
+            "task-deadbeef",
+        )
+        .await;
+        executor
+            .tasks
+            .write()
+            .await
+            .get_mut(&task_id)
+            .unwrap()
+            .dependencies
+            .clear();
+        git_in(&repo, &["config", "user.email", "test@example.com"]);
+        git_in(&repo, &["config", "user.name", "Test"]);
+        publish_default_base(&repo);
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+        let start = executor
+            .record_run_start(task_id, repo.to_str().unwrap(), acquired.expect("checkout"))
+            .await
+            .expect("durable start");
+        std::fs::write(
+            std::path::Path::new(&start.working_dir).join("kept-result-proof.txt"),
+            "committed worker output",
+        )
+        .expect("write worker output");
+        let commit = TaskExecutor::commit_changes(
+            &executor.tasks,
+            task_id,
+            &start.working_dir,
+            &executor.events,
+        )
+        .await
+        .expect("commit worker output");
+        TaskExecutor::record_committed_handoff(
+            &executor.tasks,
+            &executor.storage,
+            task_id,
+            start.run,
+            &commit,
+        )
+        .await
+        .expect("durable exact commit evidence");
+
+        // A durable result for this run, written alongside its completion while
+        // the handoff still awaits review. Its text must survive reconciliation.
+        let project_id = executor.tasks.read().await[&task_id].project_id;
+        let mut seeded = executor.tasks.read().await[&task_id].clone();
+        seeded.record_activity(ActivityKind::RunCompleted { run: start.run });
+        seeded.record_activity(ActivityKind::RunResult {
+            run: start.run,
+            result: slashit_activity::RunResult::Available {
+                text: "durable answer".into(),
+            },
+        });
+        executor
+            .storage
+            .save_project_tasks(project_id, std::slice::from_ref(&seeded))
+            .expect("persist the durable result");
+        executor.tasks.write().await.insert(task_id, seeded);
+
+        executor.reconcile_committed_worker_handoffs().await;
+        executor.reconcile_committed_worker_handoffs().await;
+
+        let kept = |task: &Task| {
+            task.activity
+                .iter()
+                .filter_map(|entry| match &entry.kind {
+                    ActivityKind::RunResult { run, result } if *run == start.run => {
+                        Some(result.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![slashit_activity::RunResult::Available {
+            text: "durable answer".into(),
+        }];
+        let after = executor.tasks.read().await[&task_id].clone();
+        assert_eq!(after.status, TaskStatus::AiReview);
+        assert_eq!(kept(&after), expected, "{:?}", after.activity);
+        assert_eq!(
+            kept(&persisted_task(&executor, project_id, task_id)),
+            expected
+        );
+        assert!(!executor.is_task_running(task_id).await);
+    }
+
     #[tokio::test]
     async fn a_branch_moved_after_commit_evidence_is_held_without_cleanup_or_completion() {
         let (executor, temps) = test_executor();
@@ -16768,7 +16868,12 @@ VERDICT: APPROVED"
                 Ok(true)
             );
             let task = settled(&w).await;
-            assert_eq!(task.status, TaskStatus::AiReview, "{:?}", task.error_message);
+            assert_eq!(
+                task.status,
+                TaskStatus::AiReview,
+                "{:?}",
+                task.error_message
+            );
 
             let recorded = kinds(&w.on_disk());
             assert_eq!(recorded.last(), task.activity.last().map(|e| &e.kind));
@@ -16810,7 +16915,12 @@ VERDICT: APPROVED"
                 Ok(true)
             );
             let task = settled(&w).await;
-            assert_eq!(task.status, TaskStatus::AiReview, "{:?}", task.error_message);
+            assert_eq!(
+                task.status,
+                TaskStatus::AiReview,
+                "{:?}",
+                task.error_message
+            );
 
             let on_disk = w.on_disk();
             assert_eq!(on_disk.activity, task.activity);

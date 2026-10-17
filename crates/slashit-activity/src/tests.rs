@@ -506,27 +506,65 @@ fn a_provider_answer_is_redacted_and_bounded_before_it_is_stored() {
     // Storing a truncated result again changes nothing: the limit holds and
     // the original length is kept.
     let mut entries = Vec::new();
-    record(&mut entries, t(1), Kind::RunResult { run: 1, result: long.clone() });
-    assert_eq!(entries[0].kind, Kind::RunResult { run: 1, result: long });
+    record(
+        &mut entries,
+        t(1),
+        Kind::RunResult {
+            run: 1,
+            result: long.clone(),
+        },
+    );
+    assert_eq!(
+        entries[0].kind,
+        Kind::RunResult {
+            run: 1,
+            result: long
+        }
+    );
 }
 
 #[test]
 fn a_result_is_recorded_once_per_run_and_read_back_by_run() {
     let mut entries = Vec::new();
-    let answer = RunResult::Available { text: "first answer".into() };
-    assert!(record(&mut entries, t(1), Kind::RunResult { run: 1, result: answer.clone() }));
+    let answer = RunResult::Available {
+        text: "first answer".into(),
+    };
+    assert!(record(
+        &mut entries,
+        t(1),
+        Kind::RunResult {
+            run: 1,
+            result: answer.clone()
+        }
+    ));
     assert!(!record(
         &mut entries,
         t(2),
-        Kind::RunResult { run: 1, result: RunResult::Unavailable { reason: "later".into() } },
+        Kind::RunResult {
+            run: 1,
+            result: RunResult::Unavailable {
+                reason: "later".into()
+            }
+        },
     ));
     assert!(record(
         &mut entries,
         t(3),
-        Kind::RunResult { run: 2, result: RunResult::Unavailable { reason: "second run".into() } },
+        Kind::RunResult {
+            run: 2,
+            result: RunResult::Unavailable {
+                reason: "second run".into()
+            }
+        },
     ));
     assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].kind, Kind::RunResult { run: 1, result: answer });
+    assert_eq!(
+        entries[0].kind,
+        Kind::RunResult {
+            run: 1,
+            result: answer
+        }
+    );
     assert_eq!(next_run(&entries), 3);
 }
 
@@ -538,13 +576,23 @@ fn a_result_serializes_with_its_outcome_and_reads_back() {
     }
     let stored = Stored {
         activity: vec![
-            Entry { seq: 1, at: t(1), kind: Kind::RunResult { run: 1, result: RunResult::Available { text: "ok".into() } } },
+            Entry {
+                seq: 1,
+                at: t(1),
+                kind: Kind::RunResult {
+                    run: 1,
+                    result: RunResult::Available { text: "ok".into() },
+                },
+            },
             Entry {
                 seq: 2,
                 at: t(2),
                 kind: Kind::RunResult {
                     run: 2,
-                    result: RunResult::Truncated { text: "cut".into(), original_chars: 9_000 },
+                    result: RunResult::Truncated {
+                        text: "cut".into(),
+                        original_chars: 9_000,
+                    },
                 },
             },
             Entry {
@@ -552,13 +600,19 @@ fn a_result_serializes_with_its_outcome_and_reads_back() {
                 at: t(3),
                 kind: Kind::RunResult {
                     run: 3,
-                    result: RunResult::Unavailable { reason: "no answer".into() },
+                    result: RunResult::Unavailable {
+                        reason: "no answer".into(),
+                    },
                 },
             },
         ],
     };
     let toml_text = toml::to_string(&stored).unwrap();
-    assert_eq!(toml::from_str::<Stored>(&toml_text).unwrap(), stored, "{toml_text}");
+    assert_eq!(
+        toml::from_str::<Stored>(&toml_text).unwrap(),
+        stored,
+        "{toml_text}"
+    );
     let json_text = serde_json::to_string(&stored).unwrap();
     assert_eq!(serde_json::from_str::<Stored>(&json_text).unwrap(), stored);
 }
@@ -569,7 +623,12 @@ fn a_result_row_names_its_run_and_its_outcome() {
     record(
         &mut entries,
         t(1),
-        Kind::RunResult { run: 1, result: RunResult::Unavailable { reason: "none".into() } },
+        Kind::RunResult {
+            run: 1,
+            result: RunResult::Unavailable {
+                reason: "none".into(),
+            },
+        },
     );
     let timeline = timeline(t(0), [], &entries);
     let row = timeline.last().unwrap();

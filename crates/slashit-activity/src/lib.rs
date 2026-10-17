@@ -131,7 +131,12 @@ impl RunResult {
         match truncated_from {
             None if redacted_chars <= MAX_RESULT_CHARS => Self::Available { text: redacted },
             _ => Self::Truncated {
-                text: redacted.chars().take(MAX_RESULT_CHARS).collect::<String>().trim_end().to_string(),
+                text: redacted
+                    .chars()
+                    .take(MAX_RESULT_CHARS)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string(),
                 original_chars: u32::try_from(truncated_from.unwrap_or(redacted_chars))
                     .unwrap_or(u32::MAX),
             },
@@ -146,7 +151,10 @@ impl RunResult {
             Self::Truncated {
                 text,
                 original_chars,
-            } => Self::stored(text, Some(usize::try_from(*original_chars).unwrap_or(usize::MAX))),
+            } => Self::stored(
+                text,
+                Some(usize::try_from(*original_chars).unwrap_or(usize::MAX)),
+            ),
             Self::Unavailable { reason } => Self::Unavailable {
                 reason: one_line(reason, MAX_REASON_CHARS),
             },
