@@ -40,14 +40,20 @@ enum RunStartError {
     Refused(String),
     Record(crate::lifecycle::RecordWriteError, String),
     /// The Task changed after a Human approved its input; it was failed closed.
-    StaleApproval,
+    /// The checkout taken for the attempt is released first when this call
+    /// created it, and the outcome of that cleanup travels with the refusal:
+    /// `None` when no checkout was taken.
+    StaleApproval(Option<String>),
 }
 
 impl std::fmt::Display for RunStartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(message) => f.write_str(message),
-            Self::StaleApproval => f.write_str(crate::domain::task::STALE_APPROVAL_REASON),
+            Self::StaleApproval(None) => f.write_str(crate::domain::task::STALE_APPROVAL_REASON),
+            Self::StaleApproval(Some(cleanup)) => {
+                write!(f, "{} {cleanup}", crate::domain::task::STALE_APPROVAL_REASON)
+            }
             Self::Record(write, consequence) => write!(
                 f,
                 "The Task Worker start could not be recorded and the Worker was not launched ({write}); {consequence}"
@@ -3542,10 +3548,12 @@ impl TaskExecutor {
             // The Task no longer holds what was approved. Nothing was started;
             // a checkout this call created is taken back.
             Ok(()) if stale.load(std::sync::atomic::Ordering::Relaxed) => {
-                self.worktree_manager
+                let cleanup = self
+                    .worktree_manager
                     .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
                     .await;
-                Err(RunStartError::StaleApproval)
+                let cleanup = self.note_stale_cleanup(task_id, cleanup).await;
+                Err(RunStartError::StaleApproval(Some(cleanup)))
             }
             // The write was made, but the new attempt's authorization was not
             // consumed by it, so nothing started. The checkout is released only if
@@ -3850,11 +3858,31 @@ impl TaskExecutor {
             .await
             .map_err(|e| format!("task {task_id} was not started, but refusing its changed input could not be recorded: {e}"))?;
         if refused.load(std::sync::atomic::Ordering::Relaxed) {
-            let message = RunStartError::StaleApproval.to_string();
+            let message = RunStartError::StaleApproval(None).to_string();
             self.events.agent_event(AgentEvent::Error { task_id: task_id.to_string(), message: message.clone() });
             return Err(message);
         }
         Ok(())
+    }
+
+    /// Record on the Task what the cleanup of a stale refusal left behind, so
+    /// it survives a restart, and return the text the refusal reports. When that
+    /// write fails or the Task no longer shows the refusal, the text says so,
+    /// rather than leaving the outcome recorded nowhere.
+    async fn note_stale_cleanup(&self, task_id: Uuid, outcome: String) -> String {
+        let noted = std::sync::atomic::AtomicBool::new(false);
+        let amend = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
+                noted.store(t.note_stale_cleanup(&outcome), std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        match crate::lifecycle::record(&self.tasks, &self.storage, task_id, &amend).await {
+            Ok(()) if noted.load(std::sync::atomic::Ordering::Relaxed) => outcome,
+            Ok(()) => format!(
+                "{outcome} The Task no longer shows this refusal, so the outcome was not recorded on it."
+            ),
+            Err(e) => format!("{outcome} The outcome could not be recorded on the Task: {e}."),
+        }
     }
 
     /// The one place a task execution is decided, under the lease, so no
@@ -4174,7 +4202,7 @@ impl TaskExecutor {
                     });
                     // Failed closed on the Task: it is no longer waiting, so no
                     // backoff is needed to keep the scheduler off it.
-                    if matches!(error, RunStartError::StaleApproval) {
+                    if matches!(error, RunStartError::StaleApproval(_)) {
                         return Err(message);
                     }
                     // A failed handoff write must not be overwritten by an
@@ -16331,10 +16359,79 @@ VERDICT: APPROVED"
             edit_description(&w, "prompt B").await;
 
             let refused = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await;
-            assert!(matches!(refused, Err(RunStartError::StaleApproval)), "{refused:?}");
+            assert!(matches!(refused, Err(RunStartError::StaleApproval(Some(_)))), "{refused:?}");
             for task in [w.in_memory().await, w.on_disk()] {
                 assert_eq!(task.status, TaskStatus::Error);
                 assert_eq!(run_starts(&task), 0);
+            }
+        }
+
+        /// The stale refusal of a checkout this call created reports that it
+        /// was taken back, on the Task and in the error, and nothing starts.
+        #[tokio::test]
+        async fn a_stale_refusal_reports_a_checkout_that_was_taken_back() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let (agent, _out) = prompt_capturing_agent(&w).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let worktree = acquired.info.path.clone();
+            edit_description(&w, "prompt B").await;
+
+            let refused = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await;
+            let Err(RunStartError::StaleApproval(Some(cleanup))) = refused else { panic!("{refused:?}") };
+            assert!(cleanup.contains("was removed again"), "{cleanup}");
+            assert!(!cleanup.contains("could not be recorded"), "{cleanup}");
+            assert!(!std::path::Path::new(&worktree).exists(), "the created checkout is gone");
+            assert_eq!(agent.invocations(), "", "no provider launch");
+
+            let reported = RunStartError::StaleApproval(Some(cleanup.clone())).to_string();
+            w.restart().await;
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.status, TaskStatus::Error);
+                assert_eq!(task.error_message.as_deref(), Some(reported.as_str()));
+                assert_eq!(run_starts(&task), 0, "no RunStarted");
+                assert!(task.activity.iter().any(|e| matches!(
+                    &e.kind,
+                    ActivityKind::RunFailed { run: None, reason } if *reason == cleanup
+                )));
+            }
+        }
+
+        /// A checkout that cleanup cannot prove it removed is kept, and the
+        /// refusal, the Task and the restart all say where it is and why.
+        #[tokio::test]
+        async fn a_stale_refusal_keeps_a_checkout_cleanup_could_not_take_back_and_says_so() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let (agent, _out) = prompt_capturing_agent(&w).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let worktree = acquired.info.path.clone();
+            let branch = acquired.info.branch.clone();
+            // Work committed in the checkout moves its HEAD past the commit the
+            // branch was created at, so cleanup cannot prove the checkout is
+            // untouched and must keep it.
+            git_in(std::path::Path::new(&worktree), &["commit", "-q", "--allow-empty", "-m", "work nobody recorded"]);
+            edit_description(&w, "prompt B").await;
+
+            let refused = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await;
+            let Err(RunStartError::StaleApproval(Some(cleanup))) = refused else { panic!("{refused:?}") };
+            assert!(cleanup.contains("kept"), "{cleanup}");
+            assert!(cleanup.contains(&worktree), "the retained checkout is named: {cleanup}");
+            assert!(std::path::Path::new(&worktree).is_dir(), "the checkout is still there");
+            git_in(&w.repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
+            assert_eq!(agent.invocations(), "", "no provider launch");
+
+            let reported = RunStartError::StaleApproval(Some(cleanup.clone())).to_string();
+            w.restart().await;
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.status, TaskStatus::Error);
+                assert_eq!(task.error_message.as_deref(), Some(reported.as_str()));
+                assert_eq!(run_starts(&task), 0, "no RunStarted");
+                assert_eq!(task.worktree_path, None, "no run-start recorded the checkout");
             }
         }
 

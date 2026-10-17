@@ -818,6 +818,21 @@ impl Task {
         self.approved_execution = None;
     }
 
+    /// Add what became of the checkout taken for a stale refusal, once cleanup
+    /// has run. The Task must still be the one `fail_stale_approval` left
+    /// (failed closed, with the stale reason and nothing else), so a Task moved
+    /// meanwhile is not rewritten. Returns whether the outcome was recorded.
+    pub fn note_stale_cleanup(&mut self, outcome: &str) -> bool {
+        if self.status != TaskStatus::Error
+            || self.error_message.as_deref() != Some(STALE_APPROVAL_REASON)
+        {
+            return false;
+        }
+        self.error_message = Some(format!("{STALE_APPROVAL_REASON} {outcome}"));
+        self.record_activity(ActivityKind::RunFailed { run: None, reason: outcome.to_string() });
+        true
+    }
+
     /// Record that the task moved from `from` to its current status, when
     /// that is a move at all.
     pub fn record_move(&mut self, from: &TaskStatus) {
