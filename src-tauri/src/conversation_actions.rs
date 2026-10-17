@@ -846,18 +846,25 @@ mod existing_checkout_tests {
         git(repo, &["worktree", "remove", fx.checkout.to_str().unwrap()]);
         git(repo, &["checkout", "-q", &branch]);
         std::fs::write(repo.join("wip.txt"), "uncommitted\n").unwrap();
-        let alias = fx.dir.path().join("alias");
-        std::os::unix::fs::symlink(repo, &alias).unwrap();
         let head = git(repo, &["rev-parse", "HEAD"]);
 
-        for path in [repo.to_path_buf(), alias.clone(), repo.join("..").join("repo")] {
+        for path in [repo.to_path_buf(), repo.join("..").join("repo")] {
             let mut task = fx.task.clone();
             task.worktree_path = Some(path.to_string_lossy().into_owned());
             let err = inspect_existing_checkout(&fx.repo, &task).await.unwrap_err();
             assert!(err.contains("repository's own checkout"), "{path:?}: {err}");
+        }
+        #[cfg(unix)]
+        {
+            let alias = fx.dir.path().join("alias");
+            std::os::unix::fs::symlink(repo, &alias).unwrap();
+            let mut task = fx.task.clone();
+            task.worktree_path = Some(alias.to_string_lossy().into_owned());
+            let err = inspect_existing_checkout(&fx.repo, &task).await.unwrap_err();
+            assert!(err.contains("repository's own checkout"), "{alias:?}: {err}");
             // The same refusal when the Project itself is reached through the alias.
             let err = inspect_existing_checkout(alias.to_str().unwrap(), &task).await.unwrap_err();
-            assert!(err.contains("repository's own checkout"), "{path:?} via alias: {err}");
+            assert!(err.contains("repository's own checkout"), "{alias:?} via alias: {err}");
         }
         assert_eq!(git(repo, &["rev-parse", "HEAD"]), head, "the branch did not move");
         assert_eq!(git(repo, &["symbolic-ref", "--short", "HEAD"]), branch);
@@ -887,6 +894,50 @@ mod existing_checkout_tests {
         as_main.worktree_path = Some(fx.repo.clone());
         let err = inspect_existing_checkout(&project, &as_main).await.unwrap_err();
         assert!(err.contains("repository's own checkout"), "{err}");
+    }
+
+    /// The Project's own linked worktree is never a Task Checkout, however the
+    /// Project path reaches it: its root, a subdirectory of the root, or an
+    /// alias of either. Git lists the main checkout first, so the Project's
+    /// own root is found only by asking the Project for its top level.
+    #[tokio::test]
+    async fn the_project_linked_worktree_root_is_refused_from_every_project_path() {
+        let fx = fixture();
+        let main_repo = Path::new(&fx.repo);
+        let branch = fx.task.branch_name.clone().unwrap();
+        let project_root = fx.dir.path().join("project-worktree");
+        git(main_repo, &["worktree", "add", "-q", "-b", "project-branch", project_root.to_str().unwrap(), "main"]);
+        let subdir = project_root.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        // The Task's own branch moves into the Project's linked worktree.
+        git(main_repo, &["worktree", "remove", fx.checkout.to_str().unwrap()]);
+        git(&project_root, &["checkout", "-q", &branch]);
+
+        let mut task = fx.task.clone();
+        task.worktree_path = Some(project_root.to_string_lossy().into_owned());
+        let projects = [project_root.clone(), subdir.clone(), subdir.join("..")];
+        let subdir_alias = fx.dir.path().join("subdir-alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&subdir, &subdir_alias).unwrap();
+        for project in projects.iter().chain(cfg!(unix).then_some(&subdir_alias)) {
+            let err = inspect_existing_checkout(project.to_str().unwrap(), &task).await.unwrap_err();
+            assert!(err.contains("repository's own checkout"), "{}: {err}", project.display());
+        }
+
+        // Refusal leaves staged and untracked work, and the branch, exactly as they were.
+        std::fs::write(project_root.join("staged.txt"), "staged\n").unwrap();
+        git(&project_root, &["add", "staged.txt"]);
+        std::fs::write(project_root.join("untracked.txt"), "untracked\n").unwrap();
+        let head = git(&project_root, &["rev-parse", "HEAD"]);
+        for project in projects.iter().chain(cfg!(unix).then_some(&subdir_alias)) {
+            let err = inspect_existing_checkout(project.to_str().unwrap(), &task).await.unwrap_err();
+            assert!(err.contains("repository's own checkout"), "{}: {err}", project.display());
+        }
+
+        assert_eq!(git(&project_root, &["rev-parse", "HEAD"]), head, "HEAD did not move");
+        assert_eq!(git(&project_root, &["symbolic-ref", "--short", "HEAD"]), branch);
+        assert_eq!(std::fs::read_to_string(project_root.join("staged.txt")).unwrap(), "staged\n");
+        assert_eq!(std::fs::read_to_string(project_root.join("untracked.txt")).unwrap(), "untracked\n");
     }
 
     #[tokio::test]
