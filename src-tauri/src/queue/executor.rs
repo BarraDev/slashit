@@ -28,18 +28,32 @@ struct RunStart {
     /// The Task's provider lease, held until the provider is spawned with it.
     /// `None` where the platform has no lease.
     lease: Option<crate::agents::provider_lease::ProviderLease>,
+    /// The prompt and model the provider is launched with. Both are taken from
+    /// the very Task snapshot the start record was written from (and any
+    /// approved input was compared against), never re-read afterwards.
+    prompt: String,
+    model: Option<String>,
 }
 
 #[derive(Debug)]
 enum RunStartError {
     Refused(String),
     Record(crate::lifecycle::RecordWriteError, String),
+    /// The Task changed after a Human approved its input; it was failed closed.
+    /// The checkout taken for the attempt is released first when this call
+    /// created it, and the outcome of that cleanup travels with the refusal:
+    /// `None` when no checkout was taken.
+    StaleApproval(Option<String>),
 }
 
 impl std::fmt::Display for RunStartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(message) => f.write_str(message),
+            Self::StaleApproval(None) => f.write_str(crate::domain::task::STALE_APPROVAL_REASON),
+            Self::StaleApproval(Some(cleanup)) => {
+                write!(f, "{} {cleanup}", crate::domain::task::STALE_APPROVAL_REASON)
+            }
             Self::Record(write, consequence) => write!(
                 f,
                 "The Task Worker start could not be recorded and the Worker was not launched ({write}); {consequence}"
@@ -3461,8 +3475,24 @@ impl TaskExecutor {
         };
         let run = std::sync::atomic::AtomicU32::new(0);
         let consumed = std::sync::atomic::AtomicBool::new(false);
+        let stale = std::sync::atomic::AtomicBool::new(false);
+        let launch_input: std::sync::Mutex<Option<(String, Option<String>)>> = std::sync::Mutex::new(None);
         let amend = |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
+                // The one comparison of an approved input with the Task that
+                // will run, in the write that starts the run. A difference
+                // fails the Task closed here instead of recording a start.
+                if crate::queue::prompt::check_approved_input(t)
+                    == crate::queue::prompt::ApprovedInputCheck::Differs
+                {
+                    t.fail_stale_approval();
+                    stale.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                // What is handed to the provider is built from this snapshot.
+                let model = if t.model.is_empty() || t.model == "default" { None } else { Some(t.model.clone()) };
+                *launch_input.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some((build_task_prompt(t, Some(acquired.info.path.as_str())), model));
                 if let Some(decision) = new_attempt {
                     // Only the decision the person made may start this run, and
                     // only while the Task still records exactly that recovery.
@@ -3481,6 +3511,9 @@ impl TaskExecutor {
                     t.new_attempt_confirmed = false;
                     consumed.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                // One approval admits one run: ended with the start it admits,
+                // and only by a write that records that start.
+                t.approved_execution = None;
                 t.worktree_path = Some(acquired.info.path.clone());
                 t.branch_name = Some(acquired.info.branch.clone());
                 if let Some(base_commit) = &acquired.base_commit {
@@ -3512,6 +3545,16 @@ impl TaskExecutor {
             }
         };
         match crate::lifecycle::record_typed(&self.tasks, &self.storage, task_id, &amend).await {
+            // The Task no longer holds what was approved. Nothing was started;
+            // a checkout this call created is taken back.
+            Ok(()) if stale.load(std::sync::atomic::Ordering::Relaxed) => {
+                let cleanup = self
+                    .worktree_manager
+                    .release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref())
+                    .await;
+                let cleanup = self.note_stale_cleanup(task_id, cleanup).await;
+                Err(RunStartError::StaleApproval(Some(cleanup)))
+            }
             // The write was made, but the new attempt's authorization was not
             // consumed by it, so nothing started. The checkout is released only if
             // SlashIt created it in this call.
@@ -3525,11 +3568,19 @@ impl TaskExecutor {
             }
             // `record` fails for a task that is not on the board, so a
             // successful write always ran the amend on it.
-            Ok(()) => Ok(RunStart {
-                working_dir: acquired.info.path,
-                run: run.load(std::sync::atomic::Ordering::Relaxed),
-                lease,
-            }),
+            Ok(()) => {
+                let (prompt, model) = launch_input
+                    .into_inner()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .expect("a recorded start always captured its launch input");
+                Ok(RunStart {
+                    working_dir: acquired.info.path,
+                    run: run.load(std::sync::atomic::Ordering::Relaxed),
+                    lease,
+                    prompt,
+                    model,
+                })
+            }
             Err(error) => {
                 let published = matches!(
                     error,
@@ -3781,6 +3832,59 @@ impl TaskExecutor {
         crate::worktree::new_attempt::confirm(decision, &inspection)
     }
 
+    /// Fails a Task closed when it no longer holds the input a Human approved
+    /// for its run. Checked and written in one board write, so an edit landing
+    /// meanwhile is judged by that write, not by an earlier reading.
+    async fn refuse_stale_approval(&self, task_id: Uuid) -> Result<(), String> {
+        let refused = std::sync::atomic::AtomicBool::new(false);
+        let amend = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
+                if matches!(t.status, TaskStatus::Queue | TaskStatus::InProgress)
+                    && crate::queue::prompt::check_approved_input(t)
+                        == crate::queue::prompt::ApprovedInputCheck::Differs
+                {
+                    t.fail_stale_approval();
+                    refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        };
+        let unchanged = self.tasks.read().await.get(&task_id).is_none_or(|t| {
+            crate::queue::prompt::check_approved_input(t) != crate::queue::prompt::ApprovedInputCheck::Differs
+        });
+        if unchanged {
+            return Ok(());
+        }
+        crate::lifecycle::record(&self.tasks, &self.storage, task_id, &amend)
+            .await
+            .map_err(|e| format!("task {task_id} was not started, but refusing its changed input could not be recorded: {e}"))?;
+        if refused.load(std::sync::atomic::Ordering::Relaxed) {
+            let message = RunStartError::StaleApproval(None).to_string();
+            self.events.agent_event(AgentEvent::Error { task_id: task_id.to_string(), message: message.clone() });
+            return Err(message);
+        }
+        Ok(())
+    }
+
+    /// Record on the Task what the cleanup of a stale refusal left behind, so
+    /// it survives a restart, and return the text the refusal reports. When that
+    /// write fails or the Task no longer shows the refusal, the text says so,
+    /// rather than leaving the outcome recorded nowhere.
+    async fn note_stale_cleanup(&self, task_id: Uuid, outcome: String) -> String {
+        let noted = std::sync::atomic::AtomicBool::new(false);
+        let amend = |staged: &mut HashMap<Uuid, Task>| {
+            if let Some(t) = staged.get_mut(&task_id) {
+                noted.store(t.note_stale_cleanup(&outcome), std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        match crate::lifecycle::record(&self.tasks, &self.storage, task_id, &amend).await {
+            Ok(()) if noted.load(std::sync::atomic::Ordering::Relaxed) => outcome,
+            Ok(()) => format!(
+                "{outcome} The Task no longer shows this refusal, so the outcome was not recorded on it."
+            ),
+            Err(e) => format!("{outcome} The outcome could not be recorded on the Task: {e}."),
+        }
+    }
+
     /// The one place a task execution is decided, under the lease, so no
     /// other lifecycle transition can land between the answer and the start
     /// it allowed. A live owner, the task's own state, the unrecorded-worktree
@@ -3877,6 +3981,9 @@ impl TaskExecutor {
                 }
             }
         };
+        // An approved input that no longer matches is refused before a
+        // checkout is attached. The write that records the start compares again.
+        self.refuse_stale_approval(task_id).await?;
         self.refuse_while_unrecorded_backoff(task_id)?;
 
         // Every start that is not a new attempt is refused while a provider that
@@ -4077,6 +4184,8 @@ impl TaskExecutor {
             working_dir,
             run,
             lease,
+            prompt,
+            model: task_model,
         } = match self
             .record_run_start_for(task_id, &repo_path, acquired, authorized.as_ref())
             .await
@@ -4091,6 +4200,11 @@ impl TaskExecutor {
                         task_id: task_id.to_string(),
                         message: message.clone(),
                     });
+                    // Failed closed on the Task: it is no longer waiting, so no
+                    // backoff is needed to keep the scheduler off it.
+                    if matches!(error, RunStartError::StaleApproval(_)) {
+                        return Err(message);
+                    }
                     // A failed handoff write must not be overwritten by an
                     // ordinary run failure. A published-uncertain write was
                     // already converted to RecoveryRequired by record_run_start;
@@ -4132,22 +4246,6 @@ impl TaskExecutor {
                 return Err(changed);
             }
         }
-
-        let (prompt, task_model) = {
-            let tasks = self.tasks.read().await;
-            match tasks.get(&task_id) {
-                Some(t) => {
-                    let model = if t.model.is_empty() || t.model == "default" {
-                        None
-                    } else {
-                        Some(t.model.clone())
-                    };
-                    (build_task_prompt(t, Some(working_dir.as_str())), model)
-                }
-                // Deleted while its worktree was being attached.
-                None => return Ok(false),
-            }
-        };
 
         self.run_tools
             .lock()
@@ -16158,6 +16256,272 @@ VERDICT: APPROVED"
                 recorded.branch_name,
                 Some(WorktreeManager::branch_for_task(w.task_id))
             );
+        }
+
+        /// Binds the Task to the input it holds now, durably, as a Coordinator
+        /// approval of its queue request would, for the run it would start.
+        async fn approve_current_input(w: &World, for_run: u32) {
+            let digest = crate::queue::prompt::task_input_digest(&w.in_memory().await);
+            let id = w.task_id;
+            crate::lifecycle::commit_task(&w.executor.tasks, &w.executor.storage, id, &move |staged: &mut HashMap<Uuid, Task>| {
+                staged.get_mut(&id).unwrap().approved_execution =
+                    Some(crate::domain::task::ApprovedExecution {
+                        approval_id: Uuid::new_v4(),
+                        digest: digest.clone(),
+                        for_run,
+                    });
+            })
+            .await
+            .unwrap();
+        }
+
+        async fn edit_description(w: &World, text: &'static str) {
+            let id = w.task_id;
+            crate::lifecycle::commit_task(&w.executor.tasks, &w.executor.storage, id, &move |staged: &mut HashMap<Uuid, Task>| {
+                staged.get_mut(&id).unwrap().description = Some(text.into());
+            })
+            .await
+            .unwrap();
+        }
+
+        fn run_starts(task: &Task) -> usize {
+            task.activity.iter().filter(|e| matches!(e.kind, ActivityKind::RunStarted { .. })).count()
+        }
+
+        /// A stand-in agent that keeps the prompt it was given.
+        async fn prompt_capturing_agent(w: &World) -> (crate::test_helpers::FakeProgram, std::path::PathBuf) {
+            let out = w.temps[0].path().join("prompt.txt");
+            let agent = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &format!("cat > {out:?}; sleep 20"),
+            )
+            .await;
+            (agent, out)
+        }
+
+        #[tokio::test]
+        async fn an_approved_input_runs_as_approved_and_the_approval_is_spent_by_that_start() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let (agent, out) = prompt_capturing_agent(&w).await;
+
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            assert!(agent_invoked(&agent).await);
+            let mut seen = String::new();
+            for _ in 0..100 {
+                seen = std::fs::read_to_string(&out).unwrap_or_default();
+                if !seen.is_empty() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            w.end_run().await;
+
+            assert!(seen.contains("prompt A"), "{seen}");
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.approved_execution, None, "one approval admits one run");
+                assert_eq!(run_starts(&task), 1);
+            }
+            assert_eq!(agent.invocations().matches("claude").count(), 1, "launched exactly once");
+        }
+
+        #[tokio::test]
+        async fn a_task_edited_while_queued_is_refused_before_anything_starts_and_stays_refused() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            edit_description(&w, "prompt B").await;
+            let before_refs = refs_of(&w.repo);
+            let (agent, _out) = prompt_capturing_agent(&w).await;
+
+            let refused = w.executor.spawn_task_execution(w.task_id, None).await.expect_err("refused");
+            assert!(refused.contains("edited after its queue request was approved"), "{refused}");
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(false), "not retried");
+
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.status, TaskStatus::Error);
+                assert_eq!(task.approved_execution, None);
+                assert_eq!(task.description.as_deref(), Some("prompt B"), "the Task data is kept");
+                assert_eq!(run_starts(&task), 0, "no RunStarted");
+                assert!(task.worker_handoff.is_none() || matches!(task.worker_handoff.as_ref().unwrap().stage, crate::domain::task::WorkerHandoffStage::ResolvedToAiReview { .. }));
+                assert_eq!(task.error_message.as_deref(), Some(crate::domain::task::STALE_APPROVAL_REASON));
+            }
+            assert_eq!(agent.invocations(), "", "no provider launch");
+            assert_eq!(refs_of(&w.repo), before_refs, "no branch created");
+        }
+
+        #[tokio::test]
+        async fn an_edit_between_the_early_check_and_the_start_record_is_caught_by_the_record() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            edit_description(&w, "prompt B").await;
+
+            let refused = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await;
+            assert!(matches!(refused, Err(RunStartError::StaleApproval(Some(_)))), "{refused:?}");
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.status, TaskStatus::Error);
+                assert_eq!(run_starts(&task), 0);
+            }
+        }
+
+        /// The stale refusal of a checkout this call created reports that it
+        /// was taken back, on the Task and in the error, and nothing starts.
+        #[tokio::test]
+        async fn a_stale_refusal_reports_a_checkout_that_was_taken_back() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let (agent, _out) = prompt_capturing_agent(&w).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let worktree = acquired.info.path.clone();
+            edit_description(&w, "prompt B").await;
+
+            let refused = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await;
+            let Err(RunStartError::StaleApproval(Some(cleanup))) = refused else { panic!("{refused:?}") };
+            assert!(cleanup.contains("was removed again"), "{cleanup}");
+            assert!(!cleanup.contains("could not be recorded"), "{cleanup}");
+            assert!(!std::path::Path::new(&worktree).exists(), "the created checkout is gone");
+            assert_eq!(agent.invocations(), "", "no provider launch");
+
+            let reported = RunStartError::StaleApproval(Some(cleanup.clone())).to_string();
+            w.restart().await;
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.status, TaskStatus::Error);
+                assert_eq!(task.error_message.as_deref(), Some(reported.as_str()));
+                assert_eq!(run_starts(&task), 0, "no RunStarted");
+                assert!(task.activity.iter().any(|e| matches!(
+                    &e.kind,
+                    ActivityKind::RunFailed { run: None, reason } if *reason == cleanup
+                )));
+            }
+        }
+
+        /// A checkout that cleanup cannot prove it removed is kept, and the
+        /// refusal, the Task and the restart all say where it is and why.
+        #[tokio::test]
+        async fn a_stale_refusal_keeps_a_checkout_cleanup_could_not_take_back_and_says_so() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let (agent, _out) = prompt_capturing_agent(&w).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let worktree = acquired.info.path.clone();
+            let branch = acquired.info.branch.clone();
+            // Work committed in the checkout moves its HEAD past the commit the
+            // branch was created at, so cleanup cannot prove the checkout is
+            // untouched and must keep it.
+            git_in(std::path::Path::new(&worktree), &["commit", "-q", "--allow-empty", "-m", "work nobody recorded"]);
+            edit_description(&w, "prompt B").await;
+
+            let refused = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired).await;
+            let Err(RunStartError::StaleApproval(Some(cleanup))) = refused else { panic!("{refused:?}") };
+            assert!(cleanup.contains("kept"), "{cleanup}");
+            assert!(cleanup.contains(&worktree), "the retained checkout is named: {cleanup}");
+            assert!(std::path::Path::new(&worktree).is_dir(), "the checkout is still there");
+            git_in(&w.repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
+            assert_eq!(agent.invocations(), "", "no provider launch");
+
+            let reported = RunStartError::StaleApproval(Some(cleanup.clone())).to_string();
+            w.restart().await;
+            for task in [w.in_memory().await, w.on_disk()] {
+                assert_eq!(task.status, TaskStatus::Error);
+                assert_eq!(task.error_message.as_deref(), Some(reported.as_str()));
+                assert_eq!(run_starts(&task), 0, "no RunStarted");
+                assert_eq!(task.worktree_path, None, "no run-start recorded the checkout");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_prompt_handed_to_the_provider_is_the_snapshot_the_start_was_recorded_from() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let start = w.executor.record_run_start(w.task_id, w.repo.to_str().unwrap(), acquired.expect("checkout")).await.expect("start");
+            w.executor.tasks.write().await.get_mut(&w.task_id).unwrap().description = Some("prompt B".into());
+            assert!(start.prompt.contains("prompt A") && !start.prompt.contains("prompt B"));
+        }
+
+        #[tokio::test]
+        async fn a_refused_new_attempt_start_does_not_spend_an_unrelated_binding() {
+            let w = world(Class::Created).await;
+            approve_current_input(&w, 1).await;
+            let (_, acquired) = w.executor.acquire_task_worktree(w.task_id, w.repo.to_str().unwrap()).await;
+            let acquired = acquired.expect("checkout");
+            let (_, head) = TaskExecutor::checkout_branch_head(&acquired.info.path, &acquired.info.branch).await.unwrap();
+            let decision = NewAttemptDecision {
+                decision_id: Uuid::new_v4(),
+                for_run: 1,
+                recovery_reason: "r".into(),
+                branch: acquired.info.branch.clone(),
+                checkout_path: acquired.info.path.clone(),
+                observed_commit: None,
+                expected_head: head,
+                dirty_fingerprint: String::new(),
+                dirty_paths: Vec::new(),
+                authorized_at: chrono::Utc::now(),
+            };
+            let result = w.executor.record_run_start_for(w.task_id, w.repo.to_str().unwrap(), acquired, Some(&decision)).await;
+            assert!(result.is_err(), "no recorded recovery authorizes this attempt");
+            assert!(w.on_disk().approved_execution.is_some() || w.in_memory().await.approved_execution.is_some());
+        }
+
+        #[tokio::test]
+        async fn an_approval_survives_a_restart_and_still_refuses_an_edited_task() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            approve_current_input(&w, 1).await;
+            edit_description(&w, "prompt B").await;
+            w.restart().await;
+            assert!(w.in_memory().await.approved_execution.is_some(), "persisted");
+            let _agent = fake_agent().await;
+            assert!(w.executor.spawn_task_execution(w.task_id, None).await.is_err());
+            assert_eq!(w.on_disk().status, TaskStatus::Error);
+        }
+
+        #[tokio::test]
+        async fn a_task_with_no_binding_and_a_binding_for_another_run_both_run_as_ordinary_tasks() {
+            for bound_for in [None, Some(7)] {
+                let w = world(Class::Created).await;
+                edit_description(&w, "ordinary").await;
+                if let Some(run) = bound_for {
+                    approve_current_input(&w, run).await;
+                    edit_description(&w, "edited after a stale binding").await;
+                }
+                let (agent, _out) = prompt_capturing_agent(&w).await;
+                assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true), "{bound_for:?}");
+                assert!(agent_invoked(&agent).await);
+                w.end_run().await;
+                assert_eq!(w.on_disk().approved_execution, None, "{bound_for:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_refused_task_is_recovered_by_a_new_approval_of_its_current_input() {
+            let w = world(Class::Created).await;
+            approve_current_input(&w, 1).await;
+            edit_description(&w, "prompt B").await;
+            let _agent = fake_agent().await;
+            assert!(w.executor.spawn_task_execution(w.task_id, None).await.is_err());
+
+            let id = w.task_id;
+            let project = w.project_id;
+            let digest = crate::queue::prompt::task_input_digest(&w.in_memory().await);
+            let _lease = w.executor.lifecycle.acquire(id).await.unwrap();
+            let moved = crate::lifecycle::enqueue_leased(
+                &w.executor.tasks, &w.executor.storage, project, id, &TaskStatus::Error,
+                Some(crate::lifecycle::InputApproval { id: Uuid::new_v4(), digest: &digest }),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(moved, crate::lifecycle::EnqueueVerdict::Queued(_)), "{moved:?}");
+            let task = w.on_disk();
+            assert_eq!(task.status, TaskStatus::Queue);
+            assert_eq!(task.approved_execution.as_ref().map(|b| (b.digest.as_str(), b.for_run)), Some((digest.as_str(), 1)));
         }
 
         /// An agent run that succeeded but whose work could not be

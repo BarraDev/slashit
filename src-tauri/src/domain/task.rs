@@ -266,8 +266,36 @@ pub struct Task {
     #[serde(skip)]
     pub new_attempt_confirmed: bool,
 
+    /// The coding input a Human approved when the Project Coordinator queued
+    /// this Task, bound to the one run that approval may start. The executor
+    /// compares it with the Task in the same write that records the run's
+    /// start; see [`ApprovedExecution`]. A Task queued any other way has none,
+    /// and its absence authorizes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_execution: Option<ApprovedExecution>,
+
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Shown on a Task that was refused because it changed after its input was approved.
+pub const STALE_APPROVAL_REASON: &str = "This Task was edited after its queue request was approved, so it was not started and nothing was changed. Review it, then move it to Backlog and ask the Coordinator to queue it again, or start it from the board.";
+
+/// The coding input a Human approved for one run of a Task.
+///
+/// Written in the same write that queues the Task on a Coordinator approval,
+/// and ended by the first of: the write that records the run it admits, a
+/// failed comparison (which fails the Task closed), or any move of the Task
+/// ([`Task::record_move`]). It is scoped to the run `for_run`; a binding left
+/// over from another attempt is dropped rather than honored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovedExecution {
+    /// The Project action whose approval created this binding.
+    pub approval_id: Uuid,
+    /// `queue::prompt::task_input_digest` of the input the Human approved.
+    pub digest: String,
+    /// The number of the run this approval may start.
+    pub for_run: u32,
 }
 
 /// Task-owned evidence that binds one coding run to its exact branch state.
@@ -687,6 +715,7 @@ impl Task {
             worker_handoff_confirmed: false,
             new_attempt: None,
             new_attempt_confirmed: false,
+            approved_execution: None,
             created_at: now,
             updated_at: now,
         }
@@ -770,10 +799,47 @@ impl Task {
         slashit_activity::record(&mut self.activity, at, kind)
     }
 
+    /// Fail the Task closed because its coding input is no longer the one a
+    /// Human approved. The Task keeps all its data; it leaves the queue (so the
+    /// scheduler does not try it again) and shows as failed with the reason. A
+    /// person recovers it by moving it back to Backlog, or starting it from the
+    /// board, which looks at its current definition; a Coordinator request to
+    /// queue it again is a new approval and a new binding.
+    pub fn fail_stale_approval(&mut self) {
+        let reason = STALE_APPROVAL_REASON;
+        let from = self.status.clone();
+        self.status = TaskStatus::Error;
+        self.phase = TaskPhase::Failed;
+        self.worker_handoff_confirmed = false;
+        self.error_message = Some(reason.to_string());
+        self.record_activity(ActivityKind::RunFailed { run: None, reason: reason.to_string() });
+        self.record_move(&from);
+        // `record_move` ends the binding only when the column changed.
+        self.approved_execution = None;
+    }
+
+    /// Add what became of the checkout taken for a stale refusal, once cleanup
+    /// has run. The Task must still be the one `fail_stale_approval` left
+    /// (failed closed, with the stale reason and nothing else), so a Task moved
+    /// meanwhile is not rewritten. Returns whether the outcome was recorded.
+    pub fn note_stale_cleanup(&mut self, outcome: &str) -> bool {
+        if self.status != TaskStatus::Error
+            || self.error_message.as_deref() != Some(STALE_APPROVAL_REASON)
+        {
+            return false;
+        }
+        self.error_message = Some(format!("{STALE_APPROVAL_REASON} {outcome}"));
+        self.record_activity(ActivityKind::RunFailed { run: None, reason: outcome.to_string() });
+        true
+    }
+
     /// Record that the task moved from `from` to its current status, when
     /// that is a move at all.
     pub fn record_move(&mut self, from: &TaskStatus) {
         if *from != self.status {
+            // A move is a new decision about the Task, so an earlier approval
+            // of its input no longer speaks for it.
+            self.approved_execution = None;
             let kind = ActivityKind::Moved {
                 from: from.column(),
                 to: self.status.column(),
