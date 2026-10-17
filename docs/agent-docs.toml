@@ -48,7 +48,6 @@ test_only = ["RecordingEventSink"]
 "src-tauri/src/config" = "covered-by:src-tauri/src/AGENTS.md"
 "src-tauri/src/domain" = "documented"
 "src-tauri/src/ipc" = "covered-by:src-tauri/src/AGENTS.md"
-"src-tauri/src/jj" = "documented"
 "src-tauri/src/pty" = "covered-by:src-tauri/src/AGENTS.md"
 "src-tauri/src/queue" = "covered-by:src-tauri/src/AGENTS.md"
 "src-tauri/src/session" = "covered-by:src-tauri/src/AGENTS.md"

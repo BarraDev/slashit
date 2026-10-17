@@ -153,7 +153,6 @@ pub async fn build_state_with_paths(
         conversation: commands::conversation::ConversationState::new(),
         agent: commands::agent::AgentState::new(),
         session: commands::session::SessionState::new(),
-        jj: commands::jj::JjState::new(),
         queue: queue_state,
         roadmap: commands::roadmap::RoadmapState::new(),
         file: commands::file::FileState::new(),

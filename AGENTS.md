@@ -243,7 +243,6 @@ This project has additional `AGENTS.md` files in subdirectories with module-spec
 - `src-tauri/src/AGENTS.md` -- Backend (Tauri v2) overview
 - `src-tauri/src/domain/AGENTS.md` -- Domain models conventions
 - `src-tauri/src/agents/AGENTS.md` -- Claude Code agent execution
-- `src-tauri/src/jj/AGENTS.md` -- Jujutsu integration
 
 Each is also exposed as a `CLAUDE.md` stub containing only `@AGENTS.md`.
 `docs/agent-docs.toml` maps every other module directory to the parent

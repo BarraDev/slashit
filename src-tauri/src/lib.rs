@@ -3,7 +3,6 @@ pub mod commands;
 
 pub mod test_helpers;
 mod acp;
-mod jj;
 mod agents;
 pub mod config;
 mod session;
@@ -48,7 +47,6 @@ pub struct AppState {
     pub conversation: commands::conversation::ConversationState,
     pub agent: commands::agent::AgentState,
     pub session: commands::session::SessionState,
-    pub jj: commands::jj::JjState,
     pub queue: commands::queue::QueueState,
     pub roadmap: commands::roadmap::RoadmapState,
     pub file: commands::file::FileState,
@@ -472,11 +470,6 @@ pub fn run() {
             send_message,
             get_session_history,
             list_sessions,
-            new_change,
-            describe_change,
-            abandon_change,
-            jj_get_workspace_status,
-            git_export,
             get_task_diff,
             get_task_diff_stat,
             get_queue_config,
