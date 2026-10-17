@@ -3491,16 +3491,18 @@ impl TaskExecutor {
         let amend = |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
                 // The one comparison of an approved input with the Task that
-                // will run, in the write that starts the run. A difference
-                // fails the Task closed here instead of recording a start.
+                // will run, in the write that starts the run. A binding that
+                // differs or was made for another run fails the Task closed
+                // here instead of recording a start: an approved request must
+                // never be dropped while the Task runs without it.
                 let check = crate::queue::prompt::check_approved_input(t);
-                if check == crate::queue::prompt::ApprovedInputCheck::Differs {
+                if check.refuses_start() {
                     t.fail_stale_approval();
                     stale.store(true, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
                 // Only a binding that matches this run authorizes its request.
-                // Anything else runs as the Task alone.
+                // An unbound Task runs as an ordinary Task.
                 let approved = (check == crate::queue::prompt::ApprovedInputCheck::Matches)
                     .then(|| t.approved_execution.clone())
                     .flatten();
@@ -3870,17 +3872,19 @@ impl TaskExecutor {
         let amend = |staged: &mut HashMap<Uuid, Task>| {
             if let Some(t) = staged.get_mut(&task_id) {
                 if matches!(t.status, TaskStatus::Queue | TaskStatus::InProgress)
-                    && crate::queue::prompt::check_approved_input(t)
-                        == crate::queue::prompt::ApprovedInputCheck::Differs
+                    && crate::queue::prompt::check_approved_input(t).refuses_start()
                 {
                     t.fail_stale_approval();
                     refused.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         };
-        let unchanged = self.tasks.read().await.get(&task_id).is_none_or(|t| {
-            crate::queue::prompt::check_approved_input(t) != crate::queue::prompt::ApprovedInputCheck::Differs
-        });
+        let unchanged = self
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .is_none_or(|t| !crate::queue::prompt::check_approved_input(t).refuses_start());
         if unchanged {
             return Ok(());
         }
@@ -16654,20 +16658,14 @@ VERDICT: APPROVED"
         }
 
         #[tokio::test]
-        async fn a_task_with_no_binding_and_a_binding_for_another_run_both_run_as_ordinary_tasks() {
-            for bound_for in [None, Some(7)] {
-                let w = world(Class::Created).await;
-                edit_description(&w, "ordinary").await;
-                if let Some(run) = bound_for {
-                    approve_current_input(&w, run).await;
-                    edit_description(&w, "edited after a stale binding").await;
-                }
-                let (agent, _out) = prompt_capturing_agent(&w).await;
-                assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true), "{bound_for:?}");
-                assert!(agent_invoked(&agent).await);
-                w.end_run().await;
-                assert_eq!(w.on_disk().approved_execution, None, "{bound_for:?}");
-            }
+        async fn a_task_with_no_binding_runs_as_an_ordinary_task() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "ordinary").await;
+            let (agent, _out) = prompt_capturing_agent(&w).await;
+            assert_eq!(w.executor.spawn_task_execution(w.task_id, None).await, Ok(true));
+            assert!(agent_invoked(&agent).await);
+            w.end_run().await;
+            assert_eq!(w.on_disk().approved_execution, None);
         }
 
         /// Binds the Task to an additional request. The digest names
@@ -16730,6 +16728,22 @@ VERDICT: APPROVED"
             let w = world(Class::Created).await;
             edit_description(&w, "prompt A").await;
             bind_request(&w, Uuid::new_v4(), "approved text", 1, "altered text").await;
+            let (agent, _out) = prompt_capturing_agent(&w).await;
+
+            let refused = w.executor.spawn_task_execution(w.task_id, None).await.expect_err("refused");
+            assert!(refused.contains("edited after its queue request was approved"), "{refused}");
+            assert_eq!(w.on_disk().status, TaskStatus::Error);
+            assert_eq!(run_starts(&w.on_disk()), 0, "no RunStarted");
+            assert_eq!(agent.invocations(), "", "no provider launch");
+        }
+
+        /// A binding made for another run must not start a run in its place:
+        /// the approved request would be dropped while the Task runs without it.
+        #[tokio::test]
+        async fn an_approved_request_for_another_run_fails_closed_instead_of_running_without_it() {
+            let w = world(Class::Created).await;
+            edit_description(&w, "prompt A").await;
+            bind_request(&w, Uuid::new_v4(), "Also add a changelog entry", 2, "Also add a changelog entry").await;
             let (agent, _out) = prompt_capturing_agent(&w).await;
 
             let refused = w.executor.spawn_task_execution(w.task_id, None).await.expect_err("refused");
