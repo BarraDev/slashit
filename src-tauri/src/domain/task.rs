@@ -309,6 +309,12 @@ pub struct ApprovedExecution {
     /// request altered after approval fails the comparison.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<String>,
+    /// The existing Task Checkout the approved request runs in, as the Human
+    /// was shown it and as approval re-read it. Present only for an approved
+    /// request that reuses a checkout. Absent in every older binding, which
+    /// therefore never authorizes reuse of a checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<crate::domain::conversation::ExistingCheckoutEvidence>,
 }
 
 /// Durable evidence that one run was started under one approval.
@@ -317,6 +323,9 @@ pub struct ExecutedApproval {
     pub approval_id: Uuid,
     pub run: u32,
     pub digest: String,
+    /// The existing Task Checkout this run reused, when the approval named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<crate::domain::conversation::ExistingCheckoutEvidence>,
 }
 
 /// Task-owned evidence that binds one coding run to its exact branch state.
@@ -603,6 +612,14 @@ impl Task {
         if self.status != TaskStatus::Backlog {
             return Some("An additional request can only reuse the checkout of a Backlog Task".into());
         }
+        self.settled_checkout_refusal()
+    }
+
+    /// [`Self::existing_checkout_refusal`] without its Backlog condition: the
+    /// checks that still apply once an approved request is Queued and about to
+    /// start. The Task's own records must show no pending recovery, cleanup,
+    /// restack, integration or unsettled Worker handoff.
+    pub fn settled_checkout_refusal(&self) -> Option<String> {
         if self.new_attempt.is_some() {
             return Some("A new attempt for this Task's recovered run is pending, so its checkout cannot be reused".into());
         }

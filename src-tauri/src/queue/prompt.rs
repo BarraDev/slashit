@@ -378,6 +378,7 @@ mod tests {
             digest: approved_input_digest(&task, Some("extra")),
             for_run: task.next_run(),
             request: Some("extra".into()),
+            checkout: None,
         });
         assert_eq!(check_approved_input(&task), ApprovedInputCheck::Matches);
 
@@ -458,6 +459,7 @@ mod tests {
             digest: approved_input_digest(&task, Some("extra")),
             for_run: task.next_run() + 1,
             request: Some("extra".into()),
+            checkout: None,
         });
         assert_eq!(check_approved_input(&task), ApprovedInputCheck::Superseded);
         assert!(check_approved_input(&task).refuses_start());

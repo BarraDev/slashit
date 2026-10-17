@@ -3078,6 +3078,22 @@ impl TaskExecutor {
             return (existing_branch, Err(refused));
         }
 
+        // A run approved as an additional request on this Task's existing
+        // checkout runs in that checkout and no other. The approval's evidence
+        // is compared with Git here; nothing is created, reset, cleaned or
+        // re-attached in its place. See `acquire_approved_checkout`.
+        let approved_checkout = {
+            let tasks_r = self.tasks.read().await;
+            tasks_r
+                .get(&task_id)
+                .and_then(|t| t.approved_execution.as_ref())
+                .and_then(|binding| binding.checkout.clone())
+        };
+        if let Some(evidence) = approved_checkout {
+            let acquired = self.acquire_approved_checkout(task_id, repo_path, &evidence).await;
+            return (Some(evidence.branch.clone()), acquired);
+        }
+
         // Check dependencies for stacked branching (only for new branches).
         // Stack when the dependency has a branch that hasn't been merged to main yet.
         // If merged, base on main normally (the code is already there).
@@ -3301,6 +3317,57 @@ impl TaskExecutor {
         (existing_branch, acquired)
     }
 
+    /// Acquires the existing Task Checkout an approved additional request was
+    /// approved to run in, and nothing else.
+    ///
+    /// The checkout is the one the Human inspected, which approval recorded in
+    /// `evidence`. It is re-read here, under the Task's lifecycle lease, and any
+    /// difference refuses the run: the path, Git registration and identity,
+    /// branch, HEAD, base commit, cleanliness, unsettled Worker state and run
+    /// number. Nothing is created, reset, cleaned or re-attached in its place.
+    ///
+    /// The result carries no `created_at`, so a failure after this point leaves
+    /// the checkout where it is. The read is point-in-time: a Git or file writer
+    /// outside SlashIt is not stopped by the lease.
+    async fn acquire_approved_checkout(
+        &self,
+        task_id: Uuid,
+        repo_path: &str,
+        evidence: &crate::domain::conversation::ExistingCheckoutEvidence,
+    ) -> AcquiredWorktree {
+        let task = self
+            .tasks
+            .read()
+            .await
+            .get(&task_id)
+            .cloned()
+            .ok_or("The Task disappeared before its approved Task Checkout was checked")?;
+        let binding_for_this_run = task
+            .approved_execution
+            .as_ref()
+            .is_some_and(|binding| binding.for_run == task.next_run() && binding.checkout.as_ref() == Some(evidence));
+        if !binding_for_this_run {
+            return Err("The approval for this additional request no longer names this run, so nothing was started".into());
+        }
+        let registered = std::fs::canonicalize(repo_path)
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|e| format!("The repository could not be resolved: {e}"))?;
+        if registered != evidence.repository_path {
+            return Err("The approved Task Checkout is not in this Task's repository, so nothing was started".into());
+        }
+        crate::conversation_actions::verify_checkout_unchanged(&task, evidence).await?;
+        Ok(Acquired {
+            info: WorktreeInfo {
+                path: evidence.checkout_path.clone(),
+                branch: evidence.branch.clone(),
+            },
+            what_happened: "Reused the approved Task Checkout",
+            base_commit: None,
+            origin: None,
+            created_at: None,
+        })
+    }
+
     /// Whether `task_id`'s first dependency was completed locally, has its
     /// currently approved work integrated into a local branch, and the base a
     /// new task would start from holds that work.
@@ -3506,6 +3573,20 @@ impl TaskExecutor {
                 let approved = (check == crate::queue::prompt::ApprovedInputCheck::Matches)
                     .then(|| t.approved_execution.clone())
                     .flatten();
+                // A run approved to reuse a checkout starts only while the Task
+                // still names that checkout, branch and path, as acquired. A
+                // difference fails the Task closed, and nothing is recorded.
+                if let Some(evidence) = approved.as_ref().and_then(|binding| binding.checkout.as_ref()) {
+                    let same_checkout = t.worktree_path.as_deref() == Some(evidence.checkout_path.as_str())
+                        && t.branch_name.as_deref() == Some(evidence.branch.as_str())
+                        && acquired.info.path == evidence.checkout_path
+                        && start_head == evidence.head;
+                    if !same_checkout {
+                        t.fail_stale_approval();
+                        stale.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                }
                 // What is handed to the provider is built from this snapshot.
                 let model = if t.model.is_empty() || t.model == "default" { None } else { Some(t.model.clone()) };
                 *launch_input.lock().unwrap_or_else(|p| p.into_inner()) = Some((
@@ -3555,6 +3636,7 @@ impl TaskExecutor {
                         approval_id: binding.approval_id,
                         run: next,
                         digest: binding.digest,
+                        checkout: binding.checkout,
                     });
                 }
                 let addressing_feedback = !t.human_review.pending_feedback().is_empty();
@@ -16443,6 +16525,7 @@ VERDICT: APPROVED"
                         digest: digest.clone(),
                         for_run,
                         request: None,
+                        checkout: None,
                     });
             })
             .await
@@ -16682,6 +16765,7 @@ VERDICT: APPROVED"
                         digest: digest.clone(),
                         for_run,
                         request: Some(carried.clone()),
+                        checkout: None,
                     });
             })
             .await
@@ -16767,7 +16851,7 @@ VERDICT: APPROVED"
             let _lease = w.executor.lifecycle.acquire(id).await.unwrap();
             let moved = crate::lifecycle::enqueue_leased(
                 &w.executor.tasks, &w.executor.storage, project, id, &TaskStatus::Error,
-                Some(crate::lifecycle::InputApproval { id: Uuid::new_v4(), digest: &digest, request: None }),
+                Some(crate::lifecycle::InputApproval { id: Uuid::new_v4(), digest: &digest, request: None, checkout: None }),
             )
             .await
             .unwrap();
@@ -20753,6 +20837,353 @@ VERDICT: APPROVED"
                 pending.failed_retries > after_first,
                 "the due retries were attempted"
             );
+        }
+    }
+
+    /// An approved additional request on a Task's existing Task Checkout, from
+    /// approval through acquisition to the recorded run, against real Git
+    /// repositories with the executor's own admission and record paths.
+    mod existing_checkout_runs {
+        use super::*;
+        use crate::domain::conversation::ExistingCheckoutEvidence;
+        use crate::lifecycle::{EnqueueVerdict, InputApproval};
+
+        const REQUEST: &str = "add a regression test";
+
+        struct Reuse {
+            executor: Arc<TaskExecutor>,
+            temps: Vec<tempfile::TempDir>,
+            repo: String,
+            checkout: std::path::PathBuf,
+            task_id: Uuid,
+            project_id: Uuid,
+            base: String,
+        }
+
+        /// A repository whose Backlog Task holds one prior run's commit on its
+        /// own branch, in a checkout registered to that branch. The Task's
+        /// `base_commit` is `main`, as its first start recorded it.
+        async fn reuse_fixture() -> Reuse {
+            let (executor, temps) = test_executor();
+            let repo = temps[0].path().join("repository");
+            std::fs::create_dir_all(&repo).unwrap();
+            git_in(&repo, &["init", "-q", "-b", "main"]);
+            git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
+            let base = git_in(&repo, &["rev-parse", "main"]);
+
+            let project_id = Uuid::new_v4();
+            let repository_id = Uuid::new_v4();
+            executor.repositories.write().await.insert(
+                repository_id,
+                crate::domain::Repository {
+                    id: repository_id,
+                    local_path: repo.to_string_lossy().to_string(),
+                    remote_url: None,
+                    remote_type: None,
+                    created_at: chrono::Utc::now(),
+                },
+            );
+            let mut project = test_project(project_id, ProjectScope::Standalone);
+            project.repository_id = Some(repository_id);
+            executor.projects.write().await.insert(project_id, project);
+
+            let mut task = create_test_task_full("Reuse", project_id, TaskStatus::Backlog, 0);
+            let branch = WorktreeManager::branch_for_task(task.id);
+            let checkout = temps[0].path().join("checkout");
+            git_in(
+                &repo,
+                &["worktree", "add", "-q", "-b", &branch, checkout.to_str().unwrap(), "main"],
+            );
+            git_in(&checkout, &["commit", "-q", "--allow-empty", "-m", "prior run"]);
+            task.worktree_path = Some(checkout.to_string_lossy().into_owned());
+            task.branch_name = Some(branch);
+            task.base_commit = Some(base.clone());
+            let task_id = task.id;
+            executor.tasks.write().await.insert(task_id, task);
+            let board: Vec<Task> = executor
+                .tasks
+                .read()
+                .await
+                .values()
+                .filter(|t| t.project_id == project_id)
+                .cloned()
+                .collect();
+            executor
+                .storage
+                .save_project_tasks(project_id, &board)
+                .expect("seed the board");
+
+            Reuse {
+                executor,
+                temps,
+                repo: repo.to_string_lossy().into_owned(),
+                checkout,
+                task_id,
+                project_id,
+                base,
+            }
+        }
+
+        impl Reuse {
+            async fn task(&self) -> Task {
+                self.executor.tasks.read().await[&self.task_id].clone()
+            }
+
+            async fn evidence(&self) -> ExistingCheckoutEvidence {
+                let task = self.task().await;
+                crate::conversation_actions::inspect_existing_checkout(&self.repo, &task)
+                    .await
+                    .expect("the clean checkout is inspected")
+            }
+
+            /// Approves `evidence` as the Coordinator's approval would, under
+            /// the Task's lifecycle lease.
+            async fn approve(&self, evidence: Option<&ExistingCheckoutEvidence>) -> EnqueueVerdict {
+                let task = self.task().await;
+                let digest = crate::queue::prompt::approved_input_digest(&task, Some(REQUEST));
+                crate::lifecycle::enqueue_leased(
+                    &self.executor.tasks,
+                    &self.executor.storage,
+                    self.project_id,
+                    self.task_id,
+                    &TaskStatus::Backlog,
+                    Some(InputApproval {
+                        id: Uuid::new_v4(),
+                        digest: &digest,
+                        request: Some(REQUEST),
+                        checkout: evidence,
+                    }),
+                )
+                .await
+                .expect("the approval is written")
+            }
+
+            fn head(&self) -> String {
+                git_in(&self.checkout, &["rev-parse", "HEAD"])
+            }
+        }
+
+        fn refusal(acquired: AcquiredWorktree) -> String {
+            match acquired {
+                Err(refusal) => refusal,
+                Ok(_) => panic!("the checkout was reused although it differs from the approval"),
+            }
+        }
+
+        #[tokio::test]
+        async fn approved_request_runs_in_the_exact_checkout_and_keeps_the_task_base() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            let head = fx.head();
+            assert!(matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
+            let queued = fx.task().await;
+            assert_eq!(queued.status, TaskStatus::Queue);
+            assert_eq!(
+                queued.approved_execution.as_ref().and_then(|b| b.checkout.clone()),
+                Some(evidence.clone())
+            );
+
+            let (existing, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            let acquired = acquired.expect("the approved checkout is reused");
+            assert_eq!(existing.as_deref(), Some(evidence.branch.as_str()));
+            assert_eq!(acquired.info.path, evidence.checkout_path);
+            assert_eq!(acquired.base_commit, None, "no new starting commit");
+            assert_eq!(acquired.created_at, None, "nothing this call created");
+
+            let start = fx
+                .executor
+                .record_run_start(fx.task_id, &fx.repo, acquired)
+                .await
+                .unwrap_or_else(|e| panic!("the run is not recorded: {e}"));
+            assert_eq!(start.run, 1);
+            assert_eq!(start.working_dir, evidence.checkout_path);
+            assert!(start.prompt.contains(REQUEST), "the approved request reaches the prompt");
+
+            let recorded = fx.task().await;
+            assert_eq!(recorded.approved_execution, None, "one approval admits one run");
+            assert_eq!(recorded.base_commit.as_deref(), Some(fx.base.as_str()), "the Task base is kept");
+            assert_eq!(recorded.worktree_path.as_deref(), Some(evidence.checkout_path.as_str()));
+            let executed = recorded.executed_approvals.last().expect("the run is evidenced");
+            assert_eq!((executed.run, executed.checkout.clone()), (1, Some(evidence.clone())));
+            assert_eq!(
+                recorded.worker_handoff.as_ref().and_then(|h| h.start_head.clone()),
+                Some(head.clone()),
+                "the prior run's commit is where the new run starts"
+            );
+            assert_eq!(fx.head(), head, "the checkout was not moved by the start");
+            git_in(&fx.checkout, &["merge-base", "--is-ancestor", &fx.base, &head]);
+            drop(start);
+            drop(fx.temps);
+        }
+
+        #[tokio::test]
+        async fn a_head_moved_after_approval_refuses_and_keeps_the_checkout() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            assert!(matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
+            git_in(&fx.checkout, &["commit", "-q", "--allow-empty", "-m", "moved after approval"]);
+            let moved = fx.head();
+
+            let (_, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            assert!(refusal(acquired).contains("changed"));
+            assert_eq!(fx.head(), moved, "the moved checkout is left as it is");
+            assert!(fx.checkout.exists());
+        }
+
+        #[tokio::test]
+        async fn a_checkout_removed_before_execution_is_refused_and_not_recreated() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            assert!(matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
+            std::fs::remove_dir_all(&fx.checkout).unwrap();
+
+            let (_, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            refusal(acquired);
+            assert!(!fx.checkout.exists(), "no checkout is recreated in its place");
+        }
+
+        #[tokio::test]
+        async fn uncommitted_work_after_approval_refuses_and_is_left_in_place() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            assert!(matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
+            std::fs::write(fx.checkout.join("untracked.txt"), "keep me\n").unwrap();
+
+            let (_, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            assert!(refusal(acquired).contains("uncommitted"));
+            assert!(fx.checkout.join("untracked.txt").exists());
+        }
+
+        #[tokio::test]
+        async fn a_branch_switched_after_approval_refuses_and_is_left_in_place() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            assert!(matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
+            git_in(&fx.checkout, &["checkout", "-q", "-B", "elsewhere"]);
+
+            let (_, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            refusal(acquired);
+            assert!(fx.checkout.exists());
+            assert_eq!(git_in(&fx.checkout, &["rev-parse", "--abbrev-ref", "HEAD"]), "elsewhere");
+        }
+
+        #[tokio::test]
+        async fn a_task_input_changed_after_approval_fails_closed_without_a_run() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            assert!(matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
+            fx.executor
+                .tasks
+                .write()
+                .await
+                .get_mut(&fx.task_id)
+                .unwrap()
+                .description = Some("edited after approval".into());
+
+            let (_, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            let acquired = acquired.expect("the checkout itself is unchanged");
+            let outcome = fx.executor.record_run_start(fx.task_id, &fx.repo, acquired).await;
+            assert!(matches!(outcome, Err(RunStartError::StaleApproval(_))), "the start is refused");
+            let failed = fx.task().await;
+            assert_eq!(failed.status, TaskStatus::Error);
+            assert!(failed.executed_approvals.is_empty());
+            assert!(fx.checkout.exists());
+            assert_eq!(failed.base_commit.as_deref(), Some(fx.base.as_str()));
+        }
+
+        #[tokio::test]
+        async fn a_repeated_approval_never_starts_a_second_run() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            let task = fx.task().await;
+            let digest = crate::queue::prompt::approved_input_digest(&task, Some(REQUEST));
+            let approval_id = Uuid::new_v4();
+            let approve_again = || async {
+                crate::lifecycle::enqueue_leased(
+                    &fx.executor.tasks,
+                    &fx.executor.storage,
+                    fx.project_id,
+                    fx.task_id,
+                    &TaskStatus::Backlog,
+                    Some(InputApproval {
+                        id: approval_id,
+                        digest: &digest,
+                        request: Some(REQUEST),
+                        checkout: Some(&evidence),
+                    }),
+                )
+                .await
+                .unwrap()
+            };
+            assert!(matches!(approve_again().await, EnqueueVerdict::Queued(_)));
+            let (_, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            let start = fx
+                .executor
+                .record_run_start(fx.task_id, &fx.repo, acquired.unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("the run is not recorded: {e}"));
+            drop(start);
+
+            assert!(!matches!(approve_again().await, EnqueueVerdict::Queued(_)), "a second run");
+            let recorded = fx.task().await;
+            assert_eq!(recorded.executed_approvals.len(), 1);
+            assert_eq!(recorded.approved_execution, None);
+        }
+
+        #[tokio::test]
+        async fn a_request_without_checkout_evidence_never_reuses_a_held_checkout() {
+            let fx = reuse_fixture().await;
+            assert!(!matches!(fx.approve(None).await, EnqueueVerdict::Queued(_)));
+            let task = fx.task().await;
+            assert_eq!(task.status, TaskStatus::Backlog);
+            assert_eq!(task.approved_execution, None);
+        }
+
+        #[tokio::test]
+        async fn an_unsettled_worker_handoff_blocks_the_reuse() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            fx.executor.tasks.write().await.get_mut(&fx.task_id).unwrap().worker_handoff =
+                Some(crate::domain::task::WorkerHandoff {
+                    task_id: fx.task_id,
+                    project_id: fx.project_id,
+                    repository_id: None,
+                    run: Some(1),
+                    branch: None,
+                    start_head: None,
+                    acceptance: None,
+                    stage: crate::domain::task::WorkerHandoffStage::Started,
+                });
+            assert!(!matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
+            assert_eq!(fx.task().await.status, TaskStatus::Backlog);
+        }
+
+        #[tokio::test]
+        async fn a_saved_binding_keeps_its_checkout_across_a_restart() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            assert!(matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
+            let queued = fx.task().await;
+            let on_disk = on_disk_task(&fx.executor, fx.project_id, fx.task_id);
+            assert_eq!(on_disk.approved_execution, queued.approved_execution, "the binding is durable");
+        }
+
+        #[tokio::test]
+        async fn a_commit_landing_between_acquisition_and_the_start_write_fails_closed() {
+            let fx = reuse_fixture().await;
+            let evidence = fx.evidence().await;
+            assert!(matches!(fx.approve(Some(&evidence)).await, EnqueueVerdict::Queued(_)));
+            let (_, acquired) = fx.executor.acquire_task_worktree(fx.task_id, &fx.repo).await;
+            let acquired = acquired.expect("the approved checkout is reused");
+            git_in(&fx.checkout, &["commit", "-q", "--allow-empty", "-m", "landed late"]);
+            let late = fx.head();
+
+            let outcome = fx.executor.record_run_start(fx.task_id, &fx.repo, acquired).await;
+            assert!(matches!(outcome, Err(RunStartError::StaleApproval(_))), "the start is refused");
+            assert_eq!(fx.head(), late, "the checkout is left as it is");
+            let failed = fx.task().await;
+            assert!(failed.executed_approvals.is_empty());
+            assert_eq!(failed.base_commit.as_deref(), Some(fx.base.as_str()));
         }
     }
 }

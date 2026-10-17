@@ -143,9 +143,26 @@ pub async fn inspect_existing_checkout(repo_path: &str, task: &Task) -> Result<E
 }
 
 /// Re-reads the checkout a proposal named and refuses any difference from what
-/// the Human was shown. Called before an approval queues anything.
+/// the Human was shown. Called under the Task's lifecycle lease before an
+/// approval queues anything.
 pub async fn recheck_existing_checkout(task: &Task, shown: &ExistingCheckoutEvidence) -> Result<(), String> {
     if let Some(reason) = task.existing_checkout_refusal() {
+        return Err(reason);
+    }
+    verify_checkout_unchanged(task, shown).await
+}
+
+/// Re-reads the checkout that approved evidence names and refuses any
+/// difference from it. Approval reaches it through [`recheck_existing_checkout`]
+/// and the executor calls it again after the Task is Queued, before the run is
+/// recorded. The Task is no longer Backlog by then, so only its settled state
+/// is checked here.
+///
+/// The read is point-in-time. Holding the Task's lifecycle lease stops SlashIt
+/// from changing the Task meanwhile; it cannot stop a Git or file writer
+/// outside SlashIt.
+pub async fn verify_checkout_unchanged(task: &Task, shown: &ExistingCheckoutEvidence) -> Result<(), String> {
+    if let Some(reason) = task.settled_checkout_refusal() {
         return Err(reason);
     }
     let now = inspect_existing_checkout(&shown.repository_path, task).await?;
@@ -436,6 +453,7 @@ async fn execute(scope: &Scope<'_>, action_id: Uuid, mutation: &TaskMutation) ->
                 id: action_id,
                 digest: input.as_ref().map_or("", |i| i.digest.as_str()),
                 request: None,
+                checkout: None,
             })
             .await
         }
@@ -443,25 +461,15 @@ async fn execute(scope: &Scope<'_>, action_id: Uuid, mutation: &TaskMutation) ->
         // is compared with `approved_input_digest(task, Some(request))`, so an
         // edit to the Task or a change to the request fails the comparison.
         TaskMutation::ExecuteRequest { target_task_id, from, request, input, checkout, .. } => {
-            // A request that reuses a checkout is rechecked against Git before
-            // anything is queued. A Task no longer in Backlog is left to the
-            // queue below, which answers a retry of this same approval.
-            if let Some(shown) = checkout {
-                let task = scope.tasks.read().await.get(target_task_id).cloned();
-                match task {
-                    None => return Ok(Execution::Refused("The Task no longer exists".into())),
-                    Some(task) if task.status == TaskStatus::Backlog => {
-                        if let Err(reason) = recheck_existing_checkout(&task, shown).await {
-                            return Ok(Execution::Refused(reason));
-                        }
-                    }
-                    Some(_) => {}
-                }
-            }
+            // A request that reuses a checkout is rechecked against Git under
+            // the Task's lifecycle lease inside `enqueue_task`, never before
+            // it. A Task no longer in Backlog is left to the queue there, which
+            // answers a retry of this same approval.
             match enqueue_task(scope, *target_task_id, from, lifecycle::InputApproval {
                 id: action_id,
                 digest: input.digest.as_str(),
                 request: Some(request.as_str()),
+                checkout: checkout.as_deref(),
             })
             .await?
             {
@@ -608,6 +616,21 @@ async fn enqueue_task(
         return Ok(Execution::Refused("The Coordinator can only queue a Backlog Task".into()));
     }
     let _lease = scope.locks.acquire(task_id).await?;
+    // Git is read only once the lease is held, so the observation is made for
+    // the write that follows it. A Task no longer in Backlog is left to the
+    // queue below, which answers a retry of this same approval.
+    if let Some(shown) = approval.checkout {
+        let task = scope.tasks.read().await.get(&task_id).cloned();
+        match task {
+            None => return Ok(Execution::Refused("The Task no longer exists".into())),
+            Some(task) if task.status == TaskStatus::Backlog => {
+                if let Err(reason) = recheck_existing_checkout(&task, shown).await {
+                    return Ok(Execution::Refused(reason));
+                }
+            }
+            Some(_) => {}
+        }
+    }
     Ok(
         match lifecycle::enqueue_leased(
             scope.tasks, scope.storage, scope.project_id, task_id, from, Some(approval),
@@ -715,17 +738,17 @@ mod existing_checkout_tests {
         git(dir, &["rev-parse", "HEAD"])
     }
 
-    struct Fixture {
-        dir: tempfile::TempDir,
-        repo: String,
-        checkout: std::path::PathBuf,
-        task: Task,
-        base: String,
+    pub(super) struct Fixture {
+        pub(super) dir: tempfile::TempDir,
+        pub(super) repo: String,
+        pub(super) checkout: std::path::PathBuf,
+        pub(super) task: Task,
+        pub(super) base: String,
     }
 
     /// A repository with `main`, and a Backlog Task whose own branch has one
     /// prior run's commit in its checkout. Its `base_commit` is `main`.
-    fn fixture() -> Fixture {
+    pub(super) fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -857,6 +880,18 @@ mod existing_checkout_tests {
         let TaskMutation::ExecuteRequest { checkout, .. } = &accepted else { unreachable!() };
         assert_eq!(checkout.as_deref(), Some(&evidence));
         assert!(accepted.summary().contains("reusing its Task Checkout on branch"));
+    }
+
+    #[test]
+    fn a_binding_saved_before_checkout_evidence_existed_reuses_nothing() {
+        let json = serde_json::json!({
+            "approval_id": Uuid::new_v4(),
+            "digest": "d",
+            "for_run": 1,
+            "request": "extra"
+        });
+        let old: crate::domain::task::ApprovedExecution = serde_json::from_value(json).unwrap();
+        assert_eq!(old.checkout, None, "absent evidence never authorizes reuse");
     }
 
     #[test]
@@ -1092,6 +1127,38 @@ mod tests {
         ] {
             assert!(Conversation::parse_output(&bad).is_err(), "accepted: {bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_approved_request_queues_in_the_exact_checkout_the_human_was_shown() {
+        let fx = super::existing_checkout_tests::fixture();
+        let world = World::new();
+        let mut task = fx.task.clone();
+        task.project_id = world.project_id;
+        world.tasks.write().await.insert(task.id, task.clone());
+        let board: Vec<Task> = world.tasks.read().await.values().cloned().collect();
+        world.storage.save_project_tasks(world.project_id, &board).unwrap();
+
+        let evidence = super::inspect_existing_checkout(&fx.repo, &task).await.unwrap();
+        let output = CoordinatorOutput::ExecuteRequest {
+            text: "Run it again".into(),
+            target_task_id: task.id,
+            request: "add a test".into(),
+        };
+        let mut conversation = world.conversation();
+        {
+            let tasks = world.tasks.read().await;
+            record_proposal(&mut conversation, world.project_id, output, &tasks, Some(evidence.clone())).unwrap();
+        }
+        let id = conversation.project_actions.last().unwrap().id;
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        let queued = world.tasks.read().await[&task.id].clone();
+        assert_eq!(queued.status, TaskStatus::Queue);
+        assert_eq!(queued.worktree_path.as_deref(), Some(evidence.checkout_path.as_str()));
+        assert_eq!(queued.base_commit.as_deref(), Some(fx.base.as_str()), "the Task base is not reset to HEAD");
+        assert_eq!(queued.approved_execution.and_then(|b| b.checkout), Some(evidence));
+        assert!(fx.checkout.join("prior.txt").exists(), "earlier commits stay in the checkout");
     }
 
     #[tokio::test]
@@ -2190,7 +2257,7 @@ mod tests {
         assert_eq!(snapshot_of(&world, task.id).await.approved_execution, None);
 
         let mut t = snapshot_of(&world, task.id).await;
-        t.approved_execution = Some(crate::domain::task::ApprovedExecution { approval_id: id, digest: "d".into(), for_run: 1, request: None });
+        t.approved_execution = Some(crate::domain::task::ApprovedExecution { approval_id: id, digest: "d".into(), for_run: 1, request: None, checkout: None });
         let from = t.status.clone();
         t.status = TaskStatus::Backlog;
         t.record_move(&from);
@@ -2320,6 +2387,7 @@ mod tests {
                 approval_id: id,
                 run: 1,
                 digest: crate::queue::prompt::approved_input_digest(t, Some("more")),
+                checkout: None,
             });
         })
         .await;
@@ -2483,6 +2551,7 @@ mod tests {
             digest: crate::queue::prompt::approved_input_digest(&explicit, Some("extra")),
             for_run: explicit.next_run(),
             request: Some("extra".into()),
+            checkout: None,
         });
         assert_eq!(crate::queue::prompt::check_approved_input(&approved), crate::queue::prompt::ApprovedInputCheck::Matches);
         let mut switched = approved.clone();
@@ -2496,6 +2565,7 @@ mod tests {
             digest: crate::queue::prompt::approved_input_digest(&provider_default, Some("extra")),
             for_run: provider_default.next_run(),
             request: Some("extra".into()),
+            checkout: None,
         });
         let mut pinned = approved_default.clone();
         pinned.model = "claude-opus-4-0-20250514".into();
