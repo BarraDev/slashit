@@ -704,6 +704,24 @@ pub(crate) fn renumber_column(
     }
 }
 
+/// Whether `task` already holds a Task Checkout or a Worker handoff. Any of
+/// them means a checkout exists or was started, so none is created for a run.
+fn task_holds_checkout(task: &Task) -> bool {
+    task.worktree_path.is_some() || task.branch_name.is_some() || task.worker_handoff.is_some()
+}
+
+/// Whether `evidence` names the checkout `task` holds for the run it would
+/// start: the same Task and Project, the recorded checkout and branch, the
+/// Task's own base commit, and the run `next_run` would number.
+fn reuse_is_for_this_task(task: &Task, evidence: &crate::domain::conversation::ExistingCheckoutEvidence) -> bool {
+    evidence.task_id == task.id
+        && evidence.project_id == task.project_id
+        && task.worktree_path.as_deref() == Some(evidence.checkout_path.as_str())
+        && task.branch_name.as_deref() == Some(evidence.branch.as_str())
+        && task.base_commit.as_deref() == Some(evidence.base_commit.as_str())
+        && evidence.run == task.next_run()
+}
+
 /// The Human approval a Queue transition is made under: the project action and
 /// the coding input (`task_input_digest`) the Human saw.
 #[derive(Debug, Clone, Copy)]
@@ -713,6 +731,9 @@ pub struct InputApproval<'a> {
     /// The additional request the Human approved, when the approval is an
     /// `ExecuteRequest`; `None` for an ordinary queue approval.
     pub request: Option<&'a str>,
+    /// The existing Task Checkout the approved request reuses. Required when
+    /// the Task already holds a checkout, and refused without a request.
+    pub checkout: Option<&'a crate::domain::conversation::ExistingCheckoutEvidence>,
 }
 
 /// What [`enqueue_leased`] found, and did.
@@ -782,26 +803,57 @@ pub async fn enqueue_leased(
             {
                 (EnqueueVerdict::InputChanged, false)
             }
-            // An additional request runs in a new Task Checkout only. A Task
-            // that already holds one, or a Worker handoff, is refused: whether
-            // its checkout is safe for this run is not established here.
-            Some(task)
-                if approval.as_ref().is_some_and(|a| a.request.is_some())
-                    && (task.worktree_path.is_some() || task.branch_name.is_some() || task.worker_handoff.is_some()) =>
-            {
-                (
-                    EnqueueVerdict::Blocked(
-                        "This Task already has a Task Checkout, so an additional request cannot run it yet".into(),
-                    ),
-                    false,
-                )
-            }
             // Repeating an approval must never repeat its run. A run that
             // started under this approval is recorded, and outlives the binding.
             Some(task)
                 if approval.as_ref().is_some_and(|a| task.executed_approvals.iter().any(|e| e.approval_id == a.id)) =>
             {
                 (EnqueueVerdict::Blocked("This approval already started a run of this Task".into()), false)
+            }
+            // A checkout is named only by an approved request, and only when it
+            // is the Task's own checkout as the Human saw it. An approval
+            // without a request, a request without its evidence (including
+            // one proposed before evidence existed), and evidence for another
+            // Task, checkout, branch, base or run are all refused here.
+            Some(_)
+                if approval.as_ref().is_some_and(|a| a.checkout.is_some() && a.request.is_none()) =>
+            {
+                (EnqueueVerdict::Blocked("A Task Checkout can only be reused by an additional request".into()), false)
+            }
+            Some(task)
+                if approval.as_ref().is_some_and(|a| a.checkout.is_some()) && !task_holds_checkout(task) =>
+            {
+                (
+                    EnqueueVerdict::Blocked(
+                        "This Task has no Task Checkout to reuse, so the request cannot name one".into(),
+                    ),
+                    false,
+                )
+            }
+            Some(task)
+                if approval.as_ref().is_some_and(|a| a.request.is_some())
+                    && task_holds_checkout(task)
+                    && task.settled_checkout_refusal().is_some() =>
+            {
+                (
+                    EnqueueVerdict::Blocked(task.settled_checkout_refusal().unwrap_or_default()),
+                    false,
+                )
+            }
+            Some(task)
+                if approval.as_ref().is_some_and(|a| a.request.is_some())
+                    && task_holds_checkout(task)
+                    && !approval
+                        .as_ref()
+                        .and_then(|a| a.checkout)
+                        .is_some_and(|evidence| reuse_is_for_this_task(task, evidence)) =>
+            {
+                (
+                    EnqueueVerdict::Blocked(
+                        "This Task already has a Task Checkout, and the approved request does not name it, so it cannot run there".into(),
+                    ),
+                    false,
+                )
             }
             Some(task) if task.cleanup_in_flight => (
                 EnqueueVerdict::Blocked(
@@ -842,6 +894,7 @@ pub async fn enqueue_leased(
                     digest: a.digest.to_string(),
                     for_run: task.next_run(),
                     request: a.request.map(str::to_string),
+                    checkout: a.checkout.cloned(),
                 });
                 let title = task.title.clone();
                 renumber_column(staged, project_id, task_id, &TaskStatus::Queue, 0);

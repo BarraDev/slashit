@@ -529,6 +529,14 @@ pub fn carries_locked_registration_notice(message: &str) -> bool {
     message.contains(LOCKED_REGISTRATION)
 }
 
+/// Whether two checkout paths name the same directory. Each is canonicalized
+/// when it exists, so a symlink or `..`-relative alias compares equal; one that
+/// cannot be canonicalized is compared as it is.
+fn same_path(a: &str, b: &str) -> bool {
+    let canonical = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
+    canonical(a) == canonical(b)
+}
+
 impl WorktreeManager {
     pub fn new(paths: Arc<AppPaths>) -> Self {
         println!(
@@ -765,12 +773,63 @@ impl WorktreeManager {
     /// `canonicalize` resolves symlinks so a `..`-relative or symlink-aliased
     /// path still compares equal. A path that cannot be canonicalized is
     /// compared as it is.
-    fn is_primary_checkout(candidate: &Path, repo_path: &str, porcelain: &str) -> bool {
+    pub(crate) fn is_primary_checkout(candidate: &Path, repo_path: &str, porcelain: &str) -> bool {
         let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
         let candidate = canonical(candidate);
         std::iter::once(repo_path)
             .chain(Self::main_worktree(porcelain))
             .any(|primary| canonical(Path::new(primary)) == candidate)
+    }
+
+    /// Refuses `checkout` when it is the user's own checkout of `repo_path`
+    /// (see [`Self::is_primary_checkout`]), reading git's registrations
+    /// without changing anything. A listing git cannot produce refuses too:
+    /// whether the checkout is the user's own is then unknown.
+    pub(crate) async fn refuse_primary_checkout(repo_path: &str, checkout: &str) -> Result<(), String> {
+        let output = super::registry_lock::output(git_program(), repo_path, &["worktree", "list", "--porcelain", "-z"])
+            .await
+            .map_err(|e| format!("Git's checkout registrations could not be read: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Git's checkout registrations could not be read: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let porcelain = String::from_utf8_lossy(&output.stdout);
+        let project_root = Self::project_checkout_root(repo_path).await?;
+        if Self::is_primary_checkout(Path::new(checkout), repo_path, &porcelain) || same_path(checkout, &project_root) {
+            return Err(format!(
+                "{checkout} is the repository's own checkout, not a Task Checkout, so no coding run may start \
+                 there. Nothing was changed."
+            ));
+        }
+        Ok(())
+    }
+
+    /// The top level of the checkout `repo_path` lies in, as git reports it.
+    ///
+    /// When the Project path is a subdirectory of a linked worktree, that
+    /// worktree's root is the Project's own checkout, and git's first listed
+    /// record is the main checkout, so neither the Project path nor the
+    /// listing names it. A failed lookup refuses: the checkout's identity is
+    /// then unknown.
+    async fn project_checkout_root(repo_path: &str) -> Result<String, String> {
+        let output = super::registry_lock::output(git_program(), repo_path, &["rev-parse", "--show-toplevel"])
+            .await
+            .map_err(|e| format!("The Project's own checkout could not be identified: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "The Project's own checkout could not be identified: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let root = String::from_utf8(output.stdout)
+            .map_err(|_| "The Project's own checkout could not be identified: git's output is not UTF-8".to_string())?;
+        let root = root.trim_end_matches(['\r', '\n']);
+        if root.is_empty() {
+            return Err("The Project's own checkout could not be identified: git reported no checkout root".into());
+        }
+        Ok(root.to_string())
     }
 
     /// The main worktree's path: the first record git lists.
@@ -801,6 +860,16 @@ impl WorktreeManager {
             .adopt_existing(repo_path, branch, &porcelain)
             .or_else(|| Self::adopt_any_registered(repo_path, branch, &porcelain))
         {
+            // The Project's own linked worktree root is not a Task's to adopt,
+            // even when the Project path reaches it only through a subdirectory.
+            let project_root = Self::project_checkout_root(repo_path).await?;
+            if same_path(&adopted, &project_root) {
+                return Err(format!(
+                    "branch {branch} is checked out in {adopted}, which is the repository's own \
+                     checkout, not one SlashIt gives a task. Check out another branch there, \
+                     then start the task again."
+                ));
+            }
             return Ok(Some(adopted));
         }
         // What git holds for the branch, and at the managed path the new
@@ -6917,6 +6986,29 @@ branch refs/heads/some-other-branch
             std::fs::canonicalize(&custom).unwrap()
         );
         assert_eq!(registered_worktrees(repo_path), before, "nothing new is created");
+    }
+
+    /// A Project path inside a linked worktree never adopts that worktree's
+    /// root for a Task: the branch registered there is refused, and nothing
+    /// is changed.
+    #[tokio::test]
+    async fn reattach_refuses_the_project_linked_worktree_root_reached_through_a_subdirectory() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let project_root = tmp.root().join("project-worktree");
+        run_git(repo_path, &["worktree", "add", "-q", "-b", "project-branch", project_root.to_str().unwrap()]);
+        let subdir = project_root.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        run_git(project_root.to_str().unwrap(), &["checkout", "-q", "-b", "task-c0ffee11"]);
+        let before = registered_worktrees(repo_path);
+
+        let mgr = test_manager();
+        let Err(err) = mgr.reattach(subdir.to_str().unwrap(), "task-c0ffee11").await else {
+            panic!("the Project's own linked worktree is never adopted");
+        };
+
+        assert!(err.contains("repository's own checkout"), "{err}");
+        assert_eq!(registered_worktrees(repo_path), before, "nothing is changed");
     }
 
     /// The same worktree is adopted when a task that never recorded its

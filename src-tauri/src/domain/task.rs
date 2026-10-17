@@ -309,6 +309,12 @@ pub struct ApprovedExecution {
     /// request altered after approval fails the comparison.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<String>,
+    /// The existing Task Checkout the approved request runs in, as the Human
+    /// was shown it and as approval re-read it. Present only for an approved
+    /// request that reuses a checkout. Absent in every older binding, which
+    /// therefore never authorizes reuse of a checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<crate::domain::conversation::ExistingCheckoutEvidence>,
 }
 
 /// Durable evidence that one run was started under one approval.
@@ -317,6 +323,9 @@ pub struct ExecutedApproval {
     pub approval_id: Uuid,
     pub run: u32,
     pub digest: String,
+    /// The existing Task Checkout this run reused, when the approval named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<crate::domain::conversation::ExistingCheckoutEvidence>,
 }
 
 /// Task-owned evidence that binds one coding run to its exact branch state.
@@ -588,6 +597,60 @@ impl Task {
                 }
             })
             .map(|_| "This Task has unresolved Worker recovery evidence. Inspect and preserve its Task Checkout before any new attempt.".to_string())
+    }
+
+    /// Why this Task's existing Task Checkout cannot carry an additional coding
+    /// request, or `None` when the Task's own records allow reuse.
+    ///
+    /// Reuse needs a Backlog Task with no pending recovery, cleanup, restack or
+    /// integration. Its Worker handoff must be absent or settled: a started,
+    /// committed-awaiting-review or recovery-required handoff is refused, and a
+    /// resolved one is accepted only when a later durable Human Review decision
+    /// superseded it. A resolved stage alone is not enough. Checkout identity,
+    /// branch and HEAD are checked against Git by the caller, not here.
+    pub fn existing_checkout_refusal(&self) -> Option<String> {
+        if self.status != TaskStatus::Backlog {
+            return Some("An additional request can only reuse the checkout of a Backlog Task".into());
+        }
+        self.settled_checkout_refusal()
+    }
+
+    /// [`Self::existing_checkout_refusal`] without its Backlog condition: the
+    /// checks that still apply once an approved request is Queued and about to
+    /// start. The Task's own records must show no pending recovery, cleanup,
+    /// restack, integration or unsettled Worker handoff.
+    pub fn settled_checkout_refusal(&self) -> Option<String> {
+        if self.new_attempt.is_some() {
+            return Some("A new attempt for this Task's recovered run is pending, so its checkout cannot be reused".into());
+        }
+        if self.cleanup_in_flight {
+            return Some("An earlier cleanup of this Task's checkout is unfinished, so it cannot be reused".into());
+        }
+        if self.republish_pending_refusal().is_some() || self.integration_unfinished_refusal().is_some() {
+            return Some("A checkout operation on this Task is unfinished, so its checkout cannot be reused".into());
+        }
+        match self.worker_handoff.as_ref().map(|handoff| &handoff.stage) {
+            None => None,
+            Some(WorkerHandoffStage::Started) => {
+                Some("This Task's last coding run never recorded its outcome, so its checkout cannot be reused".into())
+            }
+            Some(WorkerHandoffStage::CommittedAwaitingReview { .. }) => Some(
+                "This Task's last coding run is awaiting review, so its checkout cannot be reused".into(),
+            ),
+            Some(WorkerHandoffStage::RecoveryRequired { .. }) => Some(
+                "This Task's last coding run was interrupted and needs recovery, so its checkout cannot be reused".into(),
+            ),
+            Some(WorkerHandoffStage::ResolvedToAiReview { .. }) => {
+                if self.resolved_worker_handoff_was_superseded() {
+                    None
+                } else {
+                    Some(
+                        "This Task's last coding run is not yet shown to be settled, so its checkout cannot be reused"
+                            .into(),
+                    )
+                }
+            }
+        }
     }
 
     /// Whether the persisted new-attempt decision authorizes one launch of a

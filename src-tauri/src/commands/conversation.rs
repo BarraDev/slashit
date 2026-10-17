@@ -17,7 +17,7 @@ const COORDINATOR_SYSTEM_PROMPT: &str = "You are the Project Coordinator. Discus
 /// The structured-output contract both Coordinator prompts state. Every
 /// non-reply type is only a proposal: SlashIt applies nothing without a
 /// separate, explicit Human decision.
-const OUTPUT_SCHEMAS: &str = r#"Ordinary response: {"type":"reply","text":"..."}. Delegation: {"type":"delegate_to_task","text":"explanation","target_task_id":"UUID","request":"bounded request"}. Create a Backlog Task: {"type":"create_task","text":"why","title":"...","description":"optional","priority":"urgent|high|medium|low (optional)","category":"feature|bug_fix|refactoring|documentation|security|performance|ui_ux|infrastructure|testing (optional)"}. Edit a Task: {"type":"edit_task","text":"why","target_task_id":"UUID","title":"optional","description":"optional","priority":"optional","category":"optional"} with only the fields to change; edit priority or category to reprioritize or reclassify. Return a Queued or failed (error) Task to the Backlog: {"type":"move_task","text":"why","target_task_id":"UUID","to":"backlog"}; no other move is available to you. Put a Backlog Task in the queue: {"type":"enqueue_task","text":"why","target_task_id":"UUID"}; only a Backlog Task can be queued, and you cannot start it or choose when it runs: SlashIt's scheduler admits queued Tasks when capacity allows and the Task's own executor prepares its checkout. Run a Backlog Task once more with one additional coding request: {"type":"execute_request","text":"why","target_task_id":"UUID","request":"the additional coding work, bounded"}; only a Backlog Task without a Task Checkout qualifies, its description is not changed, and a person must approve the exact request text before SlashIt queues it. For distinct work, propose a new Task instead of reopening a finished one. Creating, editing, moving or queueing a Task never starts work by itself. Read-only lookups SlashIt answers immediately from current state, so ask instead of guessing; they change nothing and are not proposals: {"type":"inspect_task","target_task_id":"UUID"} returns one Task's details; {"type":"list_tasks","status":"backlog|queue|in_progress|ai_review|human_review|done|pr_created|error (optional)","limit":10} where limit is an optional integer 1-20 returns a page of Tasks with a total and a truncated flag; {"type":"inspect_task_activity","target_task_id":"UUID","limit":15} where limit is an optional integer 1-30 returns that Task's most recent activity milestones, oldest first; a run_result milestone's result gives its run, an outcome of available, truncated or unavailable (unavailable means the provider gave no final answer, not that the work failed), and text for only the newest few results; {"type":"inspect_task_pull_request","target_task_id":"UUID"} returns the Task's pull requests with their last known state, checks and review status, which may be missing or stale; {"type":"inspect_project"} returns this Project's name, Workspace, default base branch and Task counts per status. At most 3 lookups per turn, then answer."#;
+const OUTPUT_SCHEMAS: &str = r#"Ordinary response: {"type":"reply","text":"..."}. Delegation: {"type":"delegate_to_task","text":"explanation","target_task_id":"UUID","request":"bounded request"}. Create a Backlog Task: {"type":"create_task","text":"why","title":"...","description":"optional","priority":"urgent|high|medium|low (optional)","category":"feature|bug_fix|refactoring|documentation|security|performance|ui_ux|infrastructure|testing (optional)"}. Edit a Task: {"type":"edit_task","text":"why","target_task_id":"UUID","title":"optional","description":"optional","priority":"optional","category":"optional"} with only the fields to change; edit priority or category to reprioritize or reclassify. Return a Queued or failed (error) Task to the Backlog: {"type":"move_task","text":"why","target_task_id":"UUID","to":"backlog"}; no other move is available to you. Put a Backlog Task in the queue: {"type":"enqueue_task","text":"why","target_task_id":"UUID"}; only a Backlog Task can be queued, and you cannot start it or choose when it runs: SlashIt's scheduler admits queued Tasks when capacity allows and the Task's own executor prepares its checkout. Run a Backlog Task once more with one additional coding request: {"type":"execute_request","text":"why","target_task_id":"UUID","request":"the additional coding work, bounded"}; a Backlog Task qualifies when it has no Task Checkout, or when it holds its own existing Task Checkout that SlashIt inspects and finds eligible (its own branch, settled state, no uncommitted work); do not assume a checkout is safe merely because it exists, since SlashIt makes the authoritative check. Its description is not changed, and a person must approve the exact request text and execution input before SlashIt queues it; approval queues the Task and does not start the Worker. For distinct work, propose a new Task instead of reopening a finished one. Creating, editing, moving or queueing a Task never starts work by itself. Read-only lookups SlashIt answers immediately from current state, so ask instead of guessing; they change nothing and are not proposals: {"type":"inspect_task","target_task_id":"UUID"} returns one Task's details; {"type":"list_tasks","status":"backlog|queue|in_progress|ai_review|human_review|done|pr_created|error (optional)","limit":10} where limit is an optional integer 1-20 returns a page of Tasks with a total and a truncated flag; {"type":"inspect_task_activity","target_task_id":"UUID","limit":15} where limit is an optional integer 1-30 returns that Task's most recent activity milestones, oldest first; a run_result milestone's result gives its run, an outcome of available, truncated or unavailable (unavailable means the provider gave no final answer, not that the work failed), and text for only the newest few results; {"type":"inspect_task_pull_request","target_task_id":"UUID"} returns the Task's pull requests with their last known state, checks and review status, which may be missing or stale; {"type":"inspect_project"} returns this Project's name, Workspace, default base branch and Task counts per status. At most 3 lookups per turn, then answer."#;
 
 struct CoordinatorWorkingDirectory {
     path: String,
@@ -439,8 +439,9 @@ pub async fn send_project_message(
             | CoordinatorOutput::EnqueueTask { .. }
             | CoordinatorOutput::ExecuteRequest { .. }
         ) => {
+            let checkout = proposal_checkout(&state, project_id, &output).await?;
             let tasks = state.task.tasks.read().await;
-            conversation_actions::record_proposal(&mut updated, project_id, output, &tasks)?;
+            conversation_actions::record_proposal(&mut updated, project_id, output, &tasks, checkout)?;
         }
         CoordinatorOutput::InspectTask { .. }
         | CoordinatorOutput::ListTasks { .. }
@@ -947,6 +948,32 @@ fn record_human_approval(
     Ok((request, already_approved))
 }
 
+/// The Task Checkout evidence an `ExecuteRequest` proposal needs, read from Git
+/// now. `None` for every other output, and for a Task that holds no checkout.
+/// A Task that holds one is inspected, and a refusal is returned as its reason.
+async fn proposal_checkout(
+    state: &AppState,
+    project_id: Uuid,
+    output: &CoordinatorOutput,
+) -> Result<Option<crate::domain::conversation::ExistingCheckoutEvidence>, String> {
+    let CoordinatorOutput::ExecuteRequest { target_task_id, .. } = output else {
+        return Ok(None);
+    };
+    let Some(task) = state.task.tasks.read().await.get(target_task_id).cloned() else {
+        return Ok(None);
+    };
+    if task.project_id != project_id
+        || (task.worktree_path.is_none() && task.branch_name.is_none() && task.worker_handoff.is_none())
+    {
+        return Ok(None);
+    }
+    let repo_path = crate::app_core::repository_paths_by_project(state)
+        .await
+        .remove(&project_id)
+        .ok_or("This Project has no repository to inspect its Task Checkout in")?;
+    conversation_actions::inspect_existing_checkout(&repo_path, &task).await.map(Some)
+}
+
 /// Record a follow-up's Project-action proposal, or the reason it was refused.
 ///
 /// `record_proposal` only reads the in-memory Task set and validates, writing
@@ -962,8 +989,12 @@ fn record_followup_proposal(
     project_id: Uuid,
     output: CoordinatorOutput,
     tasks: &std::collections::HashMap<Uuid, crate::domain::Task>,
+    checkout: Result<Option<crate::domain::conversation::ExistingCheckoutEvidence>, String>,
 ) {
-    if let Err(reason) = conversation_actions::record_proposal(conversation, project_id, output, tasks) {
+    let recorded = checkout.and_then(|checkout| {
+        conversation_actions::record_proposal(conversation, project_id, output, tasks, checkout)
+    });
+    if let Err(reason) = recorded {
         conversation.push(
             Role::Coordinator,
             EntryKind::RunFailed {
@@ -1094,8 +1125,9 @@ async fn continue_from_worker_result_locked(
             | CoordinatorOutput::EnqueueTask { .. }
             | CoordinatorOutput::ExecuteRequest { .. }
         ) => {
+            let checkout = proposal_checkout(state, project_id, &output).await;
             let tasks = state.task.tasks.read().await;
-            record_followup_proposal(&mut conversation, project_id, output, &tasks);
+            record_followup_proposal(&mut conversation, project_id, output, &tasks, checkout);
         }
         CoordinatorOutput::InspectTask { .. }
         | CoordinatorOutput::ListTasks { .. }
@@ -1158,6 +1190,16 @@ mod tests {
         assert!(super::COORDINATOR_SYSTEM_PROMPT.contains("applies only to the one proposal it answers"));
         assert!(super::COORDINATOR_SYSTEM_PROMPT.contains("treat it as a new request and propose it again"));
         assert!(super::COORDINATOR_SYSTEM_PROMPT.contains("Never start work"));
+    }
+
+    #[test]
+    fn execute_request_instructions_describe_both_eligible_checkout_states() {
+        // Both the ordinary and the Worker-result follow-up prompts format this
+        // constant, so one check covers each.
+        assert!(super::OUTPUT_SCHEMAS.contains("a Backlog Task qualifies when it has no Task Checkout"));
+        assert!(super::OUTPUT_SCHEMAS.contains("its own existing Task Checkout that SlashIt inspects and finds eligible"));
+        assert!(super::OUTPUT_SCHEMAS.contains("do not assume a checkout is safe merely because it exists"));
+        assert!(super::OUTPUT_SCHEMAS.contains("approval queues the Task and does not start the Worker"));
     }
 
     #[test]
@@ -1281,7 +1323,7 @@ mod tests {
         for json in proposals {
             let mut conversation = Conversation::new(project_id);
             let output = Conversation::parse_output(&json).unwrap();
-            record_followup_proposal(&mut conversation, project_id, output, &tasks);
+            record_followup_proposal(&mut conversation, project_id, output, &tasks, Ok(None));
             assert!(conversation.project_actions.is_empty(), "{json}");
             assert!(conversation.actions.is_empty(), "{json}");
             assert_eq!(refusals(&conversation), 1, "{json}");
@@ -1298,7 +1340,7 @@ mod tests {
         let json = format!(r#"{{"type":"move_task","text":"x","target_task_id":"{}","to":"backlog"}}"#, queued.id);
         let mut conversation = Conversation::new(project_id);
 
-        record_followup_proposal(&mut conversation, project_id, Conversation::parse_output(&json).unwrap(), &tasks);
+        record_followup_proposal(&mut conversation, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
 
         assert_eq!(conversation.project_actions.len(), 1);
         assert_eq!(conversation.project_actions[0].status, crate::domain::conversation::ProjectActionStatus::Proposed);
@@ -1318,7 +1360,7 @@ mod tests {
         // keeps the saved Conversation, which carries neither the proposal nor
         // the reply mark, so the follow-up stays retryable.
         let mut attempt = saved.clone();
-        record_followup_proposal(&mut attempt, project_id, Conversation::parse_output(&json).unwrap(), &tasks);
+        record_followup_proposal(&mut attempt, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
         assert_eq!(attempt.project_actions.len(), 1);
         assert!(preserve_saved_conversation(
             saved.clone(),
@@ -1328,7 +1370,7 @@ mod tests {
         assert!(saved.project_actions.is_empty(), "a failed save publishes nothing");
 
         let mut retry = saved;
-        record_followup_proposal(&mut retry, project_id, Conversation::parse_output(&json).unwrap(), &tasks);
+        record_followup_proposal(&mut retry, project_id, Conversation::parse_output(&json).unwrap(), &tasks, Ok(None));
         assert_eq!(retry.project_actions.len(), 1, "exactly one proposal after the retry");
     }
 

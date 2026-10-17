@@ -56,13 +56,14 @@ use uuid::Uuid;
 
 use crate::config::Storage;
 use crate::domain::conversation::{
-    Conversation, CoordinatorOutput, EntryKind, FieldChange, ProjectAction, ProjectActionOutcome,
-    ProjectActionStatus, Role, TaskMutation, coordinator_may_move,
+    Conversation, CoordinatorOutput, EntryKind, ExistingCheckoutEvidence, FieldChange, ProjectAction,
+    ProjectActionOutcome, ProjectActionStatus, Role, TaskMutation, coordinator_may_move,
 };
 use crate::domain::{NewTask, Project, Task, TaskStatus};
 use crate::lifecycle::{
     self, EnqueueVerdict, ProjectLifecycleGate, StatusTransitionEffect, TaskLifecycleLocks, Tasks,
 };
+use crate::worktree::WorktreeManager;
 
 /// Everything an approved operation touches. `project_id` is the scope the
 /// Conversation belongs to; every Task target is validated against it here
@@ -85,6 +86,114 @@ pub enum Decision {
     Reject,
 }
 
+/// Reads the Task Checkout of `task` in the repository at `repo_path`, for an
+/// additional request that would reuse it.
+///
+/// Only the Task's own checkout qualifies: its recorded path, its own branch,
+/// registered to that branch, on a commit that descends from the Task's
+/// `base_commit`, with no uncommitted work. Each refusal says why. The read is
+/// point-in-time; approval and the run start read it again.
+pub async fn inspect_existing_checkout(repo_path: &str, task: &Task) -> Result<ExistingCheckoutEvidence, String> {
+    let (Some(checkout), Some(branch)) = (task.worktree_path.as_deref(), task.branch_name.as_deref()) else {
+        return Err("This Task has no complete Task Checkout to reuse".into());
+    };
+    let Some(base) = task.base_commit.clone() else {
+        return Err(
+            "This Task's checkout has no recorded base commit, so its Task diff cannot be established \
+             and it cannot be reused. Propose a new Task for distinct work."
+                .into(),
+        );
+    };
+    if branch != WorktreeManager::branch_for_task(task.id) {
+        return Err("The recorded checkout is not on this Task's own branch, so it cannot be reused".into());
+    }
+    let repository_path = std::fs::canonicalize(repo_path)
+        .map_err(|e| format!("The repository could not be resolved: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+    // The user's own checkout is never a Task Checkout, even when the Task's
+    // record names it, its branch is checked out there, or the path is a
+    // symlink to it. `reattach` refuses the same classification.
+    WorktreeManager::refuse_primary_checkout(&repository_path, checkout).await?;
+    let inspection = crate::worktree::new_attempt::inspect(&repository_path, checkout, branch).await?;
+    if !inspection.dirty_paths.is_empty() {
+        return Err(
+            "This Task's checkout has uncommitted changes. Commit or discard them before an additional \
+             request can reuse it."
+                .into(),
+        );
+    }
+    let descends = crate::worktree::restack::is_ancestor(
+        std::path::Path::new(&repository_path),
+        &base,
+        &inspection.head,
+    )
+    .await?;
+    if !descends {
+        return Err("The checkout's commit does not descend from this Task's recorded base commit".into());
+    }
+    Ok(ExistingCheckoutEvidence {
+        project_id: task.project_id,
+        task_id: task.id,
+        repository_path,
+        checkout_path: checkout.to_string(),
+        git_entry_identity: crate::worktree::new_attempt::git_entry_identity(checkout),
+        branch: branch.to_string(),
+        branch_ref: format!("refs/heads/{branch}"),
+        head: inspection.head,
+        base_commit: base,
+        run: task.next_run(),
+    })
+}
+
+/// Re-reads the checkout a proposal named and refuses any difference from what
+/// the Human was shown. Called under the Task's lifecycle lease before an
+/// approval queues anything.
+pub async fn recheck_existing_checkout(task: &Task, shown: &ExistingCheckoutEvidence) -> Result<(), String> {
+    if let Some(reason) = task.existing_checkout_refusal() {
+        return Err(reason);
+    }
+    verify_checkout_unchanged(task, shown).await
+}
+
+/// Re-reads the checkout that approved evidence names and refuses any
+/// difference from it. Approval reaches it through [`recheck_existing_checkout`]
+/// and the executor calls it again after the Task is Queued, before the run is
+/// recorded. The Task is no longer Backlog by then, so only its settled state
+/// is checked here.
+///
+/// The read is point-in-time. Holding the Task's lifecycle lease stops SlashIt
+/// from changing the Task meanwhile; it cannot stop a Git or file writer
+/// outside SlashIt.
+pub async fn verify_checkout_unchanged(task: &Task, shown: &ExistingCheckoutEvidence) -> Result<(), String> {
+    if let Some(reason) = task.settled_checkout_refusal() {
+        return Err(reason);
+    }
+    let now = inspect_existing_checkout(&shown.repository_path, task).await?;
+    let same_identity = match (&shown.git_entry_identity, &now.git_entry_identity) {
+        (Some(before), Some(after)) => before == after,
+        _ => false,
+    };
+    if now.project_id != shown.project_id
+        || now.task_id != shown.task_id
+        || now.repository_path != shown.repository_path
+        || now.checkout_path != shown.checkout_path
+        || !same_identity
+        || now.branch != shown.branch
+        || now.branch_ref != shown.branch_ref
+        || now.head != shown.head
+        || now.base_commit != shown.base_commit
+        || now.run != shown.run
+    {
+        return Err(
+            "The Task's checkout or branch changed after this request was proposed, so nothing was started. \
+             Propose the request again to review the current checkout."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Record a provider's CreateTask/EditTask output as a pending proposal.
 /// Anything else is a programming error: Reply and DelegateToTask are not
 /// Project actions.
@@ -93,6 +202,7 @@ pub fn record_proposal(
     project_id: Uuid,
     output: CoordinatorOutput,
     tasks: &HashMap<Uuid, Task>,
+    checkout: Option<ExistingCheckoutEvidence>,
 ) -> Result<(), String> {
     let (explanation, mutation) = match output {
         CoordinatorOutput::CreateTask { text, title, description, priority, category } => (
@@ -147,7 +257,7 @@ pub fn record_proposal(
             if target.project_id != project_id {
                 return Err("Coordinator proposed a Task from another Project".into());
             }
-            (text, TaskMutation::execute_request(target, &request)?)
+            (text, TaskMutation::execute_request(target, &request, checkout)?)
         }
         CoordinatorOutput::Reply { .. }
         | CoordinatorOutput::DelegateToTask { .. }
@@ -347,17 +457,23 @@ async fn execute(scope: &Scope<'_>, action_id: Uuid, mutation: &TaskMutation) ->
                 id: action_id,
                 digest: input.as_ref().map_or("", |i| i.digest.as_str()),
                 request: None,
+                checkout: None,
             })
             .await
         }
         // The request and the digest the Human saw travel together. The Task
         // is compared with `approved_input_digest(task, Some(request))`, so an
         // edit to the Task or a change to the request fails the comparison.
-        TaskMutation::ExecuteRequest { target_task_id, from, request, input, .. } => {
+        TaskMutation::ExecuteRequest { target_task_id, from, request, input, checkout, .. } => {
+            // A request that reuses a checkout is rechecked against Git under
+            // the Task's lifecycle lease inside `enqueue_task`, never before
+            // it. A Task no longer in Backlog is left to the queue there, which
+            // answers a retry of this same approval.
             match enqueue_task(scope, *target_task_id, from, lifecycle::InputApproval {
                 id: action_id,
                 digest: input.digest.as_str(),
                 request: Some(request.as_str()),
+                checkout: checkout.as_deref(),
             })
             .await?
             {
@@ -504,6 +620,21 @@ async fn enqueue_task(
         return Ok(Execution::Refused("The Coordinator can only queue a Backlog Task".into()));
     }
     let _lease = scope.locks.acquire(task_id).await?;
+    // Git is read only once the lease is held, so the observation is made for
+    // the write that follows it. A Task no longer in Backlog is left to the
+    // queue below, which answers a retry of this same approval.
+    if let Some(shown) = approval.checkout {
+        let task = scope.tasks.read().await.get(&task_id).cloned();
+        match task {
+            None => return Ok(Execution::Refused("The Task no longer exists".into())),
+            Some(task) if task.status == TaskStatus::Backlog => {
+                if let Err(reason) = recheck_existing_checkout(&task, shown).await {
+                    return Ok(Execution::Refused(reason));
+                }
+            }
+            Some(_) => {}
+        }
+    }
     Ok(
         match lifecycle::enqueue_leased(
             scope.tasks, scope.storage, scope.project_id, task_id, from, Some(approval),
@@ -585,6 +716,337 @@ async fn edit_task(
             "The Task changed after this edit was proposed; nothing was changed".into(),
         ),
     })
+}
+
+/// Additional requests that reuse a Task's existing checkout, proved against
+/// disposable Git repositories with real `git worktree` checkouts.
+#[cfg(test)]
+mod existing_checkout_tests {
+    use super::*;
+    use crate::domain::conversation::{Conversation, CoordinatorOutput};
+    use crate::domain::task::{WorkerHandoff, WorkerHandoffStage};
+    use crate::test_helpers::create_test_task_with_status;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn commit_file(dir: &Path, name: &str, body: &str, message: &str) -> String {
+        std::fs::write(dir.join(name), body).unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", message]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    pub(super) struct Fixture {
+        pub(super) dir: tempfile::TempDir,
+        pub(super) repo: String,
+        pub(super) checkout: std::path::PathBuf,
+        pub(super) task: Task,
+        pub(super) base: String,
+    }
+
+    /// A repository with `main`, and a Backlog Task whose own branch has one
+    /// prior run's commit in its checkout. Its `base_commit` is `main`.
+    pub(super) fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        let base = commit_file(&repo, "base.txt", "base\n", "base");
+        let mut task = create_test_task_with_status("Existing checkout", TaskStatus::Backlog);
+        task.project_id = Uuid::new_v4();
+        let branch = WorktreeManager::branch_for_task(task.id);
+        let checkout = dir.path().join("checkout");
+        git(&repo, &["worktree", "add", "-q", "-b", &branch, checkout.to_str().unwrap(), "main"]);
+        commit_file(&checkout, "prior.txt", "prior run\n", "prior run");
+        task.worktree_path = Some(checkout.to_string_lossy().into_owned());
+        task.branch_name = Some(branch);
+        task.base_commit = Some(base.clone());
+        Fixture { repo: repo.to_string_lossy().into_owned(), checkout, task, base, dir }
+    }
+
+    fn handoff(stage: WorkerHandoffStage) -> WorkerHandoff {
+        WorkerHandoff {
+            task_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            repository_id: None,
+            run: Some(1),
+            branch: None,
+            start_head: None,
+            stage,
+            acceptance: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_checkout_is_bound_to_its_head_and_keeps_the_task_base() {
+        let fx = fixture();
+        let head = git(&fx.checkout, &["rev-parse", "HEAD"]);
+        let evidence = inspect_existing_checkout(&fx.repo, &fx.task).await.unwrap();
+        assert_eq!(evidence.head, head, "the prior run's commit is the checkout's HEAD");
+        assert_eq!(evidence.base_commit, fx.base, "the Task's own base is kept, not reset to HEAD");
+        assert_eq!(evidence.branch_ref, format!("refs/heads/{}", WorktreeManager::branch_for_task(fx.task.id)));
+        assert_eq!(evidence.run, fx.task.next_run());
+        assert_eq!(evidence.task_id, fx.task.id);
+        assert_eq!(evidence.project_id, fx.task.project_id);
+        assert!(fx.dir.path().join("checkout/prior.txt").exists(), "earlier commits stay in the checkout");
+    }
+
+    #[tokio::test]
+    async fn uncommitted_work_of_every_kind_is_refused_and_left_in_place() {
+        let dirtiers: [fn(&Path); 3] = [
+            |c| std::fs::write(c.join("base.txt"), "changed\n").unwrap(),
+            |c| {
+                std::fs::write(c.join("staged.txt"), "staged\n").unwrap();
+                git(c, &["add", "staged.txt"]);
+            },
+            |c| std::fs::write(c.join("untracked.txt"), "untracked\n").unwrap(),
+        ];
+        for dirty in dirtiers {
+            let fx = fixture();
+            dirty(&fx.checkout);
+            let err = inspect_existing_checkout(&fx.repo, &fx.task).await.unwrap_err();
+            assert!(err.contains("uncommitted changes"), "{err}");
+            assert!(fx.checkout.join("prior.txt").exists(), "the checkout was not touched");
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_missing_and_foreign_checkouts_are_refused() {
+        let detached = fixture();
+        git(&detached.checkout, &["checkout", "-q", "--detach"]);
+        assert!(inspect_existing_checkout(&detached.repo, &detached.task).await.is_err());
+
+        let missing = fixture();
+        std::fs::remove_dir_all(&missing.checkout).unwrap();
+        assert!(inspect_existing_checkout(&missing.repo, &missing.task).await.is_err());
+
+        let foreign = fixture();
+        let mut task = foreign.task.clone();
+        task.branch_name = Some("main".into());
+        let err = inspect_existing_checkout(&foreign.repo, &task).await.unwrap_err();
+        assert!(err.contains("own branch"), "{err}");
+    }
+
+    /// The user's own checkout is never a Task Checkout, whatever the Task's
+    /// record says: here its branch is checked out in the primary checkout, and
+    /// the record names that checkout, directly or through a symlink.
+    #[tokio::test]
+    async fn the_primary_checkout_and_its_symlink_alias_are_refused_and_left_untouched() {
+        let fx = fixture();
+        let repo = Path::new(&fx.repo);
+        let branch = fx.task.branch_name.clone().unwrap();
+        git(repo, &["worktree", "remove", fx.checkout.to_str().unwrap()]);
+        git(repo, &["checkout", "-q", &branch]);
+        std::fs::write(repo.join("wip.txt"), "uncommitted\n").unwrap();
+        let head = git(repo, &["rev-parse", "HEAD"]);
+
+        for path in [repo.to_path_buf(), repo.join("..").join("repo")] {
+            let mut task = fx.task.clone();
+            task.worktree_path = Some(path.to_string_lossy().into_owned());
+            let err = inspect_existing_checkout(&fx.repo, &task).await.unwrap_err();
+            assert!(err.contains("repository's own checkout"), "{path:?}: {err}");
+        }
+        #[cfg(unix)]
+        {
+            let alias = fx.dir.path().join("alias");
+            std::os::unix::fs::symlink(repo, &alias).unwrap();
+            let mut task = fx.task.clone();
+            task.worktree_path = Some(alias.to_string_lossy().into_owned());
+            let err = inspect_existing_checkout(&fx.repo, &task).await.unwrap_err();
+            assert!(err.contains("repository's own checkout"), "{alias:?}: {err}");
+            // The same refusal when the Project itself is reached through the alias.
+            let err = inspect_existing_checkout(alias.to_str().unwrap(), &task).await.unwrap_err();
+            assert!(err.contains("repository's own checkout"), "{alias:?} via alias: {err}");
+        }
+        assert_eq!(git(repo, &["rev-parse", "HEAD"]), head, "the branch did not move");
+        assert_eq!(git(repo, &["symbolic-ref", "--short", "HEAD"]), branch);
+        assert_eq!(std::fs::read_to_string(repo.join("wip.txt")).unwrap(), "uncommitted\n");
+    }
+
+    /// A Project whose repository path is itself a linked worktree is
+    /// supported: the Task Checkout is a different linked worktree, and the
+    /// main checkout it was linked from is still not one.
+    #[tokio::test]
+    async fn a_linked_worktree_project_reuses_a_separate_task_checkout_only() {
+        let fx = fixture();
+        let main_repo = Path::new(&fx.repo);
+        let project_checkout = fx.dir.path().join("project-worktree");
+        git(main_repo, &["worktree", "add", "-q", "-b", "project-branch", project_checkout.to_str().unwrap(), "main"]);
+        let project = project_checkout.to_string_lossy().into_owned();
+
+        let evidence = inspect_existing_checkout(&project, &fx.task).await.unwrap();
+        assert_eq!(evidence.checkout_path, fx.task.worktree_path.clone().unwrap());
+
+        let mut as_project = fx.task.clone();
+        as_project.worktree_path = Some(project.clone());
+        assert!(inspect_existing_checkout(&project, &as_project).await.is_err(), "the Project's own path");
+        let mut as_main = fx.task.clone();
+        git(main_repo, &["worktree", "remove", fx.checkout.to_str().unwrap()]);
+        git(main_repo, &["checkout", "-q", as_main.branch_name.as_deref().unwrap()]);
+        as_main.worktree_path = Some(fx.repo.clone());
+        let err = inspect_existing_checkout(&project, &as_main).await.unwrap_err();
+        assert!(err.contains("repository's own checkout"), "{err}");
+    }
+
+    /// The Project's own linked worktree is never a Task Checkout, however the
+    /// Project path reaches it: its root, a subdirectory of the root, or an
+    /// alias of either. Git lists the main checkout first, so the Project's
+    /// own root is found only by asking the Project for its top level.
+    #[tokio::test]
+    async fn the_project_linked_worktree_root_is_refused_from_every_project_path() {
+        let fx = fixture();
+        let main_repo = Path::new(&fx.repo);
+        let branch = fx.task.branch_name.clone().unwrap();
+        let project_root = fx.dir.path().join("project-worktree");
+        git(main_repo, &["worktree", "add", "-q", "-b", "project-branch", project_root.to_str().unwrap(), "main"]);
+        let subdir = project_root.join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        // The Task's own branch moves into the Project's linked worktree.
+        git(main_repo, &["worktree", "remove", fx.checkout.to_str().unwrap()]);
+        git(&project_root, &["checkout", "-q", &branch]);
+
+        let mut task = fx.task.clone();
+        task.worktree_path = Some(project_root.to_string_lossy().into_owned());
+        let projects = [project_root.clone(), subdir.clone(), subdir.join("..")];
+        let subdir_alias = fx.dir.path().join("subdir-alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&subdir, &subdir_alias).unwrap();
+        for project in projects.iter().chain(cfg!(unix).then_some(&subdir_alias)) {
+            let err = inspect_existing_checkout(project.to_str().unwrap(), &task).await.unwrap_err();
+            assert!(err.contains("repository's own checkout"), "{}: {err}", project.display());
+        }
+
+        // Refusal leaves staged and untracked work, and the branch, exactly as they were.
+        std::fs::write(project_root.join("staged.txt"), "staged\n").unwrap();
+        git(&project_root, &["add", "staged.txt"]);
+        std::fs::write(project_root.join("untracked.txt"), "untracked\n").unwrap();
+        let head = git(&project_root, &["rev-parse", "HEAD"]);
+        for project in projects.iter().chain(cfg!(unix).then_some(&subdir_alias)) {
+            let err = inspect_existing_checkout(project.to_str().unwrap(), &task).await.unwrap_err();
+            assert!(err.contains("repository's own checkout"), "{}: {err}", project.display());
+        }
+
+        assert_eq!(git(&project_root, &["rev-parse", "HEAD"]), head, "HEAD did not move");
+        assert_eq!(git(&project_root, &["symbolic-ref", "--short", "HEAD"]), branch);
+        assert_eq!(std::fs::read_to_string(project_root.join("staged.txt")).unwrap(), "staged\n");
+        assert_eq!(std::fs::read_to_string(project_root.join("untracked.txt")).unwrap(), "untracked\n");
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_unrelated_base_commit_is_refused_and_never_inferred() {
+        let fx = fixture();
+        let mut no_base = fx.task.clone();
+        no_base.base_commit = None;
+        let err = inspect_existing_checkout(&fx.repo, &no_base).await.unwrap_err();
+        assert!(err.contains("base commit"), "{err}");
+
+        let orphan = {
+            let root = Path::new(&fx.repo);
+            git(root, &["checkout", "-q", "--orphan", "unrelated"]);
+            commit_file(root, "other.txt", "other\n", "unrelated root")
+        };
+        let mut unrelated = fx.task.clone();
+        unrelated.base_commit = Some(orphan);
+        let err = inspect_existing_checkout(&fx.repo, &unrelated).await.unwrap_err();
+        assert!(err.contains("does not descend"), "{err}");
+    }
+
+    #[test]
+    fn a_started_or_unsettled_handoff_blocks_reuse_and_none_does_not() {
+        let mut task = create_test_task_with_status("handoff", TaskStatus::Backlog);
+        task.worktree_path = Some("/x".into());
+        task.branch_name = Some("b".into());
+        for stage in [
+            WorkerHandoffStage::Started,
+            WorkerHandoffStage::CommittedAwaitingReview { commit: "c".into() },
+            WorkerHandoffStage::RecoveryRequired { reason: "r".into(), observed_commit: None },
+            WorkerHandoffStage::ResolvedToAiReview { commit: "c".into() },
+        ] {
+            task.worker_handoff = Some(handoff(stage.clone()));
+            assert!(task.existing_checkout_refusal().is_some(), "{stage:?} without supersession");
+        }
+        task.worker_handoff = None;
+        assert_eq!(task.existing_checkout_refusal(), None, "no handoff is pending");
+    }
+
+    #[tokio::test]
+    async fn only_a_task_with_a_checkout_needs_inspected_evidence() {
+        let fx = fixture();
+        let plain = create_test_task_with_status("plain", TaskStatus::Backlog);
+        let evidence = inspect_existing_checkout(&fx.repo, &fx.task).await.unwrap();
+        assert!(TaskMutation::execute_request(&fx.task, "extra", None).is_err(), "a checkout must be inspected");
+        assert!(TaskMutation::execute_request(&plain, "extra", Some(evidence.clone())).is_err());
+        assert!(TaskMutation::execute_request(&plain, "extra", None).is_ok(), "the no-checkout path is unchanged");
+        let accepted = TaskMutation::execute_request(&fx.task, "extra", Some(evidence.clone())).unwrap();
+        let TaskMutation::ExecuteRequest { checkout, .. } = &accepted else { unreachable!() };
+        assert_eq!(checkout.as_deref(), Some(&evidence));
+        assert!(accepted.summary().contains("reusing its Task Checkout on branch"));
+    }
+
+    #[test]
+    fn a_binding_saved_before_checkout_evidence_existed_reuses_nothing() {
+        let json = serde_json::json!({
+            "approval_id": Uuid::new_v4(),
+            "digest": "d",
+            "for_run": 1,
+            "request": "extra"
+        });
+        let old: crate::domain::task::ApprovedExecution = serde_json::from_value(json).unwrap();
+        assert_eq!(old.checkout, None, "absent evidence never authorizes reuse");
+    }
+
+    #[test]
+    fn a_proposal_saved_without_checkout_evidence_authorizes_nothing() {
+        let json = serde_json::json!({
+            "kind": "execute_request",
+            "target_task_id": Uuid::new_v4(),
+            "target_task_title": "old",
+            "from": "backlog",
+            "request": "extra",
+            "input": { "digest": "d", "description": null, "subtask_count": 0 }
+        });
+        let old: TaskMutation = serde_json::from_value(json).unwrap();
+        let TaskMutation::ExecuteRequest { checkout, .. } = old else { unreachable!() };
+        assert_eq!(checkout, None, "absent evidence never authorizes reuse");
+    }
+
+    #[tokio::test]
+    async fn the_recheck_refuses_a_moved_head_and_accepts_the_unchanged_checkout() {
+        let fx = fixture();
+        let shown = inspect_existing_checkout(&fx.repo, &fx.task).await.unwrap();
+        recheck_existing_checkout(&fx.task, &shown).await.expect("an unchanged checkout passes");
+        commit_file(&fx.checkout, "later.txt", "later\n", "moved after proposal");
+        let err = recheck_existing_checkout(&fx.task, &shown).await.unwrap_err();
+        assert!(err.contains("changed after this request was proposed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_proposal_records_its_evidence_and_a_checkout_task_without_it_is_refused() {
+        let fx = fixture();
+        let project_id = fx.task.project_id;
+        let tasks = HashMap::from([(fx.task.id, fx.task.clone())]);
+        let output = || CoordinatorOutput::ExecuteRequest {
+            text: "explain".into(),
+            target_task_id: fx.task.id,
+            request: "add a test".into(),
+        };
+        let mut conversation = Conversation::new(project_id);
+        assert!(record_proposal(&mut conversation, project_id, output(), &tasks, None).is_err());
+        assert!(conversation.project_actions.is_empty());
+        let evidence = inspect_existing_checkout(&fx.repo, &fx.task).await.unwrap();
+        record_proposal(&mut conversation, project_id, output(), &tasks, Some(evidence.clone())).unwrap();
+        let recorded = conversation.project_actions.last().unwrap();
+        let TaskMutation::ExecuteRequest { checkout, .. } = &recorded.mutation else { unreachable!() };
+        assert_eq!(checkout.as_deref(), Some(&evidence));
+    }
 }
 
 #[cfg(test)]
@@ -724,7 +1186,7 @@ mod tests {
         async fn propose(&self, conversation: &mut Conversation, json: &str) -> Result<Uuid, String> {
             let output = Conversation::parse_output(json)?;
             let tasks = self.tasks.read().await;
-            record_proposal(conversation, self.project_id, output, &tasks)?;
+            record_proposal(conversation, self.project_id, output, &tasks, None)?;
             Ok(conversation.project_actions.last().unwrap().id)
         }
 
@@ -774,6 +1236,38 @@ mod tests {
         ] {
             assert!(Conversation::parse_output(&bad).is_err(), "accepted: {bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_approved_request_queues_in_the_exact_checkout_the_human_was_shown() {
+        let fx = super::existing_checkout_tests::fixture();
+        let world = World::new();
+        let mut task = fx.task.clone();
+        task.project_id = world.project_id;
+        world.tasks.write().await.insert(task.id, task.clone());
+        let board: Vec<Task> = world.tasks.read().await.values().cloned().collect();
+        world.storage.save_project_tasks(world.project_id, &board).unwrap();
+
+        let evidence = super::inspect_existing_checkout(&fx.repo, &task).await.unwrap();
+        let output = CoordinatorOutput::ExecuteRequest {
+            text: "Run it again".into(),
+            target_task_id: task.id,
+            request: "add a test".into(),
+        };
+        let mut conversation = world.conversation();
+        {
+            let tasks = world.tasks.read().await;
+            record_proposal(&mut conversation, world.project_id, output, &tasks, Some(evidence.clone())).unwrap();
+        }
+        let id = conversation.project_actions.last().unwrap().id;
+        decide(&world.scope(), &mut conversation, id, Decision::Approve).await.unwrap();
+
+        let queued = world.tasks.read().await[&task.id].clone();
+        assert_eq!(queued.status, TaskStatus::Queue);
+        assert_eq!(queued.worktree_path.as_deref(), Some(evidence.checkout_path.as_str()));
+        assert_eq!(queued.base_commit.as_deref(), Some(fx.base.as_str()), "the Task base is not reset to HEAD");
+        assert_eq!(queued.approved_execution.and_then(|b| b.checkout), Some(evidence));
+        assert!(fx.checkout.join("prior.txt").exists(), "earlier commits stay in the checkout");
     }
 
     #[tokio::test]
@@ -1427,7 +1921,7 @@ mod tests {
         ));
         let mut conversation = Conversation::new(Uuid::new_v4());
         let reply = Conversation::parse_output(r#"{"type":"reply","text":"hi"}"#).unwrap();
-        assert!(record_proposal(&mut conversation, Uuid::new_v4(), reply, &HashMap::new()).is_err());
+        assert!(record_proposal(&mut conversation, Uuid::new_v4(), reply, &HashMap::new(), None).is_err());
         assert!(conversation.project_actions.is_empty());
     }
     fn enqueue_json(task_id: Uuid) -> String {
@@ -1872,7 +2366,7 @@ mod tests {
         assert_eq!(snapshot_of(&world, task.id).await.approved_execution, None);
 
         let mut t = snapshot_of(&world, task.id).await;
-        t.approved_execution = Some(crate::domain::task::ApprovedExecution { approval_id: id, digest: "d".into(), for_run: 1, request: None });
+        t.approved_execution = Some(crate::domain::task::ApprovedExecution { approval_id: id, digest: "d".into(), for_run: 1, request: None, checkout: None });
         let from = t.status.clone();
         t.status = TaskStatus::Backlog;
         t.record_move(&from);
@@ -2002,6 +2496,7 @@ mod tests {
                 approval_id: id,
                 run: 1,
                 digest: crate::queue::prompt::approved_input_digest(t, Some("more")),
+                checkout: None,
             });
         })
         .await;
@@ -2142,7 +2637,7 @@ mod tests {
 
         let mut explicit = crate::test_helpers::create_test_task("Model policy");
         explicit.model = "claude-opus-4-0-20250514".into();
-        let mutation = TaskMutation::execute_request(&explicit, "extra").unwrap();
+        let mutation = TaskMutation::execute_request(&explicit, "extra", None).unwrap();
         let TaskMutation::ExecuteRequest { input, .. } = &mutation else {
             panic!("expected an ExecuteRequest proposal");
         };
@@ -2151,7 +2646,7 @@ mod tests {
 
         let mut provider_default = explicit.clone();
         provider_default.model = "default".into();
-        let TaskMutation::ExecuteRequest { input, .. } = TaskMutation::execute_request(&provider_default, "extra").unwrap() else {
+        let TaskMutation::ExecuteRequest { input, .. } = TaskMutation::execute_request(&provider_default, "extra", None).unwrap() else {
             panic!("expected an ExecuteRequest proposal");
         };
         assert_eq!(model_policy_phrase(input.model.as_deref()), "provider default, selected at execution time");
@@ -2165,6 +2660,7 @@ mod tests {
             digest: crate::queue::prompt::approved_input_digest(&explicit, Some("extra")),
             for_run: explicit.next_run(),
             request: Some("extra".into()),
+            checkout: None,
         });
         assert_eq!(crate::queue::prompt::check_approved_input(&approved), crate::queue::prompt::ApprovedInputCheck::Matches);
         let mut switched = approved.clone();
@@ -2178,6 +2674,7 @@ mod tests {
             digest: crate::queue::prompt::approved_input_digest(&provider_default, Some("extra")),
             for_run: provider_default.next_run(),
             request: Some("extra".into()),
+            checkout: None,
         });
         let mut pinned = approved_default.clone();
         pinned.model = "claude-opus-4-0-20250514".into();

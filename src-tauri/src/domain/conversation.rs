@@ -186,7 +186,43 @@ pub enum TaskMutation {
         from: TaskStatus,
         request: String,
         input: ExecutionInput,
+        /// The Task Checkout this request reuses, as inspected when it was
+        /// proposed. Present only for a Task that already holds a checkout. A
+        /// proposal saved without it, including every one written before this
+        /// field existed, never authorizes reuse of a checkout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkout: Option<Box<ExistingCheckoutEvidence>>,
     },
+}
+
+/// The facts of an existing Task Checkout that a Human approved an additional
+/// request to run in, read from Git when the request was proposed.
+///
+/// Approval re-reads the checkout and refuses any difference, so the approved
+/// run starts only in the checkout the person was shown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExistingCheckoutEvidence {
+    pub project_id: Uuid,
+    pub task_id: Uuid,
+    /// The repository path the checkout is registered in, as SlashIt resolved it.
+    pub repository_path: String,
+    pub checkout_path: String,
+    /// The `.git` entry identity of the checkout (device and inode on Unix).
+    /// `None` when it could not be read; a difference refuses, and absence never
+    /// matches a present identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_entry_identity: Option<String>,
+    /// The Task's branch, by its short name.
+    pub branch: String,
+    /// The full reference of the branch, `refs/heads/<branch>`.
+    pub branch_ref: String,
+    /// The full commit the branch and HEAD named when the request was proposed.
+    pub head: String,
+    /// The Task's own `base_commit`, which the Task diff is taken from. Reuse
+    /// keeps this baseline; it is never reset to `head`.
+    pub base_commit: String,
+    /// The run number the approval would start, from `Task::next_run`.
+    pub run: u32,
 }
 
 /// What a queued Task would be told to do, as the Human saw it when approving.
@@ -332,11 +368,19 @@ impl TaskMutation {
         })
     }
 
-    /// Propose one additional coding request for a Backlog Task. Refused here
-    /// for any other state, for a Task that already holds a Task Checkout or a
-    /// Worker handoff, and while an earlier checkout operation is unfinished.
-    /// Approval re-checks all of it.
-    pub fn execute_request(target: &Task, request: &str) -> Result<Self, String> {
+    /// Propose one additional coding request for a Backlog Task.
+    ///
+    /// A Task with no Task Checkout is proposed without `checkout`, as before.
+    /// A Task that already holds one qualifies only with `checkout`, the
+    /// evidence the caller inspected for this exact Task, and only when the
+    /// Task's own refusals allow reuse ([`Task::existing_checkout_refusal`]).
+    /// Refused here for any other state, and while an earlier checkout
+    /// operation is unfinished. Approval re-checks all of it.
+    pub fn execute_request(
+        target: &Task,
+        request: &str,
+        checkout: Option<ExistingCheckoutEvidence>,
+    ) -> Result<Self, String> {
         let request = validate_request(request)?;
         if target.status != TaskStatus::Backlog {
             return Err(format!(
@@ -345,12 +389,28 @@ impl TaskMutation {
                 target.status
             ));
         }
-        if target.worktree_path.is_some() || target.branch_name.is_some() || target.worker_handoff.is_some() {
-            return Err(
-                "This Task already has a Task Checkout, so an additional request cannot be approved for it yet. \
-                 Propose a new Task for distinct work."
-                    .into(),
-            );
+        let holds_checkout =
+            target.worktree_path.is_some() || target.branch_name.is_some() || target.worker_handoff.is_some();
+        match (holds_checkout, &checkout) {
+            (false, Some(_)) => {
+                return Err("This Task has no Task Checkout to reuse, so the request cannot name one".into());
+            }
+            (true, None) => {
+                return Err(
+                    "This Task already has a Task Checkout, and its checkout was not inspected for this request. \
+                     Propose the request again."
+                        .into(),
+                );
+            }
+            (true, Some(evidence)) => {
+                if evidence.task_id != target.id || evidence.project_id != target.project_id {
+                    return Err("The inspected checkout belongs to another Task or Project".into());
+                }
+                if let Some(reason) = target.existing_checkout_refusal() {
+                    return Err(reason);
+                }
+            }
+            (false, None) => {}
         }
         if target.cleanup_in_flight || target.republish_pending_refusal().is_some() {
             return Err("This Task cannot run until an unfinished checkout operation is resolved".into());
@@ -362,6 +422,7 @@ impl TaskMutation {
             from: target.status.clone(),
             request,
             input: ExecutionInput::observe(target, digest),
+            checkout: checkout.map(Box::new),
         })
     }
 
@@ -391,12 +452,18 @@ impl TaskMutation {
                     ))
                 ))
             ),
-            Self::ExecuteRequest { target_task_id, target_task_title, from, request, input } => format!(
+            Self::ExecuteRequest { target_task_id, target_task_title, from, request, input, checkout } => format!(
                 "Queue Task {target_task_id} ({target_task_title:?}) from {from:?} for one run with an \
-                 additional request, on its current definition ({}; {}): {}; the Task description is not \
+                 additional request, on its current definition ({}; {}){}: {}; the Task description is not \
                  changed, and SlashIt's scheduler decides when it starts",
                 input.digest.chars().take(12).collect::<String>(),
                 model_policy_phrase(input.model.as_deref()),
+                checkout.as_ref().map_or(String::new(), |c| format!(
+                    ", reusing its Task Checkout on branch {} at {} (base {}), preserving its existing commits",
+                    c.branch,
+                    c.head.chars().take(12).collect::<String>(),
+                    c.base_commit.chars().take(12).collect::<String>(),
+                )),
                 request.chars().take(600).collect::<String>()
             ),
         };
@@ -587,8 +654,9 @@ pub enum CoordinatorOutput {
         target_task_id: Uuid,
     },
     /// Proposal to run a Backlog Task once more with one additional coding
-    /// request. Only a Task without a Task Checkout qualifies; distinct new
-    /// work is a new Task. The description is not changed.
+    /// request. A Backlog Task qualifies with no Task Checkout, or with its own
+    /// existing Task Checkout that SlashIt has inspected and found eligible.
+    /// Distinct new work is a new Task. The description is not changed.
     ExecuteRequest {
         text: String,
         target_task_id: Uuid,
