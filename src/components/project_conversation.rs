@@ -385,11 +385,13 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let id = execution_id.clone();
         spawn_local(async move {
             if let Ok(value) = conversation_service::get_project_conversation_executions(id).await {
+                // The view may have been disposed while the request was in flight, so the late
+                // response uses the non-panicking accessors and is dropped when nothing is left to update.
                 if value == current {
-                    stable_refreshes.update_value(|count| *count = count.saturating_add(1));
-                } else if executions.get_untracked() == current {
+                    stable_refreshes.try_update_value(|count| *count = count.saturating_add(1));
+                } else if executions.try_get_untracked().is_some_and(|now| now == current) {
                     // Apply the response only if nothing newer arrived while it was in flight. A newer snapshot is never overwritten by an older read; the next tick refreshes again when needed.
-                    set_executions.set(value);
+                    let _ = set_executions.try_set(value);
                 }
             }
         });
@@ -888,5 +890,18 @@ mod tests {
         assert!(!approval_effect_note(&enqueue).contains("does not start any work"));
         let edit = ConversationTaskMutation::EditTask { target_task_id: Uuid::from_u128(2), target_task_title: "T".into(), changes: vec![] };
         assert!(approval_effect_note(&edit).contains("does not start any work"));
+    }
+
+    #[test]
+    fn a_refresh_that_returns_after_disposal_finds_nothing_to_update() {
+        // The refresh response is applied through these accessors. After the view is disposed they report
+        // that nothing is left, instead of panicking as `get_untracked` and `set` do.
+        let owner = leptos::reactive::owner::Owner::new();
+        let (executions, set_executions) = owner.with(|| signal(Vec::<ConversationExecution>::new()));
+        let stable_refreshes = owner.with(|| StoredValue::new_local(0u32));
+        owner.cleanup();
+        assert!(executions.try_get_untracked().is_none());
+        assert!(set_executions.try_set(Vec::new()).is_some());
+        assert!(stable_refreshes.try_update_value(|count| *count += 1).is_none());
     }
 }
