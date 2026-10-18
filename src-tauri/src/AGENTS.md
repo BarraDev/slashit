@@ -5,6 +5,7 @@ Backend source for Tauri v2. This folder contains all Rust backend code organize
 ## Module Structure
 
 - **lib.rs** - App state definition, Tauri command registration, app entry point
+- **main_window.rs** - The main window, built in `setup()` with the navigation boundary: only the application origin may navigate it, and new-window requests are refused. External links leave through the frontend's opener
 - **main.rs** - Backend entry point (calls `slashit_ui_lib::run()`)
 - **commands/** - Tauri IPC command handlers organized by domain
 - **domain/** - Shared domain models (Agent, Project, Repository, Session, Task, Workspace)

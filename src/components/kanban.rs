@@ -14,6 +14,7 @@ use crate::components::attention::{attention_order, next_after, reveal_card, Boa
 use crate::components::task_live::{activity_from_event, changes_task_record, ActivityUpdate, LiveRuns};
 use crate::models::AgentEvent;
 use crate::services::task_run_service::{get_live_runs, listen_agent_events_with_ready};
+use crate::services::is_safe_link_destination;
 use crate::services::{reorder_task, queue_service, get_task_diff, get_task_diff_stat, analyze_pr_comments, address_pr_review, sync_pr_review_replies, discuss_pr_review_questions, find_pr_candidates, link_existing_pr, get_pr_push_recovery, recover_private_email_and_create_pr, refresh_task_pr_state, AddressPrReviewOptions, PrCandidate, PrPushRecoveryPlan};
 use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
@@ -1439,8 +1440,6 @@ fn PrReviewModal(
                                                 </summary>
                                                 <div
                                                     class="mt-2 max-h-72 overflow-y-auto rounded border border-white/10 bg-black/30 px-3 py-2 prose prose-sm prose-invert max-w-none leading-relaxed prose-pre:my-2 prose-pre:bg-black/50 prose-pre:text-xs prose-code:text-xs prose-code:before:hidden prose-code:after:hidden prose-p:my-1 prose-ul:my-1 prose-li:my-0"
-                                                    on:click=open_comment_link
-                                                    on:auxclick=open_comment_link
                                                     inner_html=html
                                                 ></div>
                                             </details>
@@ -1660,31 +1659,13 @@ fn PrReviewModal(
     }
 }
 
-/// Whether a Markdown link destination may be rendered as a clickable link.
-/// Only absolute `http`, `https` and `mailto` destinations pass. Anything else
-/// is refused, including `javascript:`/`data:`/`file:` schemes, relative and
-/// protocol-relative destinations (which would resolve against the app's own
-/// origin), and destinations with leading whitespace or embedded control
-/// characters that a browser would strip before reading the scheme.
-fn is_safe_link_destination(url: &str) -> bool {
-    let has_scheme = |scheme: &str| {
-        url.get(..scheme.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
-    };
-    ["http://", "https://", "mailto:"]
-        .into_iter()
-        .any(has_scheme)
-        && !url.chars().any(|c| c.is_control() || c.is_whitespace())
-}
-
 /// Render a PR-comment body (GitHub-flavored markdown from `gh api`) to HTML.
 /// The body is remote, untrusted text. Raw HTML is dropped, images are
 /// replaced by their alt text so nothing is fetched on render, and a link
 /// keeps its markup only when `is_safe_link_destination` accepts it; otherwise
 /// just its text remains. Output is consumed via Leptos `inner_html` and
-/// styled via the `prose prose-invert` Tailwind plugin. A container that shows
-/// it must route clicks through `open_comment_link`, because the webview would
-/// otherwise navigate the app window itself.
+/// styled via the `prose prose-invert` Tailwind plugin. Clicks on its links are
+/// routed to the opener by `route_external_links`, installed at startup.
 fn render_pr_comment_markdown(src: &str) -> String {
     use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
 
@@ -1711,32 +1692,6 @@ fn render_pr_comment_markdown(src: &str) -> String {
     let mut out = String::with_capacity(src.len() + src.len() / 4);
     html::push_html(&mut out, parser);
     out
-}
-
-/// Click handler for a container filled with `render_pr_comment_markdown`
-/// output: never lets the webview navigate, and opens an `http`, `https` or
-/// `mailto` link in the external browser instead.
-fn open_comment_link(ev: leptos::ev::MouseEvent) {
-    use wasm_bindgen::JsCast;
-
-    let Some(anchor) = ev
-        .target()
-        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-        .and_then(|el| el.closest("a").ok().flatten())
-    else {
-        return;
-    };
-    ev.prevent_default();
-    if let Some(href) = anchor
-        .get_attribute("href")
-        .filter(|h| is_safe_link_destination(h))
-    {
-        spawn_local(async move {
-            if let Err(e) = crate::services::open_url_external(href).await {
-                crate::components::toast::error(format!("Could not open the link: {e}"));
-            }
-        });
-    }
 }
 
 /// Whether a review item stays approved after its decision changes. Only a
@@ -1963,8 +1918,6 @@ fn render_review_item(
                         <summary class="cursor-pointer hover:text-white/80">"Original comment"</summary>
                         <div
                             class="mt-1 max-h-48 overflow-y-auto rounded border border-white/5 bg-black/20 px-3 py-2 prose prose-sm prose-invert max-w-none leading-relaxed prose-pre:my-2 prose-pre:bg-black/40 prose-pre:text-xs prose-code:text-xs prose-code:before:hidden prose-code:after:hidden prose-p:my-1 prose-ul:my-1 prose-li:my-0"
-                            on:click=open_comment_link
-                            on:auxclick=open_comment_link
                             inner_html=html
                         ></div>
                     </details>

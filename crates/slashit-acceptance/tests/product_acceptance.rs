@@ -60,6 +60,8 @@ mod human_review;
 mod local_first;
 #[path = "product_acceptance/local_integration.rs"]
 mod local_integration;
+#[path = "product_acceptance/main_window.rs"]
+mod main_window;
 #[path = "product_acceptance/needs_you.rs"]
 mod needs_you;
 #[path = "product_acceptance/orphans.rs"]

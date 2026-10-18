@@ -28,7 +28,7 @@ pub mod repository_setup_service;
 pub mod orphans_service;
 pub mod conversation_service;
 
-pub use opener_service::open_url_external;
+pub use opener_service::{is_safe_link_destination, open_url_external, route_external_links};
 pub use repository_service::{list_repositories, pick_folder, check_is_git_repo};
 pub use repository_setup_service::create_repository;
 pub use project_service::{create_project, list_projects, get_project, get_project_path, attach_project_to_workspace, detach_project_from_workspace};
