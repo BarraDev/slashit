@@ -1671,7 +1671,9 @@ fn is_safe_link_destination(url: &str) -> bool {
         url.get(..scheme.len())
             .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
     };
-    ["http://", "https://", "mailto:"].into_iter().any(has_scheme)
+    ["http://", "https://", "mailto:"]
+        .into_iter()
+        .any(has_scheme)
         && !url.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
@@ -1725,7 +1727,10 @@ fn open_comment_link(ev: leptos::ev::MouseEvent) {
         return;
     };
     ev.prevent_default();
-    if let Some(href) = anchor.get_attribute("href").filter(|h| is_safe_link_destination(h)) {
+    if let Some(href) = anchor
+        .get_attribute("href")
+        .filter(|h| is_safe_link_destination(h))
+    {
         spawn_local(async move {
             if let Err(e) = crate::services::open_url_external(href).await {
                 crate::components::toast::error(format!("Could not open the link: {e}"));
@@ -3019,7 +3024,11 @@ mod tests {
 
     #[test]
     fn only_absolute_web_and_mail_destinations_are_links() {
-        for ok in ["https://example.com/a?b=c", "HTTP://EXAMPLE.COM", "mailto:a@example.com"] {
+        for ok in [
+            "https://example.com/a?b=c",
+            "HTTP://EXAMPLE.COM",
+            "mailto:a@example.com",
+        ] {
             assert!(is_safe_link_destination(ok), "{ok}");
         }
         for bad in [
@@ -3072,11 +3081,20 @@ mod tests {
 
     #[test]
     fn safe_links_stay_clickable_and_escaped() {
-        let html = render_pr_comment_markdown("[a](https://example.com/x?a=1&b=\"2\") <mailto:a@example.com>");
-        assert!(html.contains("<a href=\"https://example.com/x?a=1&amp;b=%222%22\">a</a>"), "{html}");
+        let html = render_pr_comment_markdown(
+            "[a](https://example.com/x?a=1&b=\"2\") <mailto:a@example.com>",
+        );
+        assert!(
+            html.contains("<a href=\"https://example.com/x?a=1&amp;b=%222%22\">a</a>"),
+            "{html}"
+        );
         assert!(html.contains("<a href=\"mailto:a@example.com\">"), "{html}");
-        let nested = render_pr_comment_markdown("**[bold](https://example.com)** and [x](javascript:1) *y*");
-        assert!(nested.contains("<strong><a href=\"https://example.com\">bold</a></strong>"), "{nested}");
+        let nested =
+            render_pr_comment_markdown("**[bold](https://example.com)** and [x](javascript:1) *y*");
+        assert!(
+            nested.contains("<strong><a href=\"https://example.com\">bold</a></strong>"),
+            "{nested}"
+        );
         assert!(nested.contains("and x <em>y</em>"), "{nested}");
     }
 
@@ -3088,11 +3106,18 @@ mod tests {
             "![alt text](javascript:alert(1))",
         ] {
             let html = render_pr_comment_markdown(src);
-            assert!(!html.contains("<img") && !html.contains("src=") && !html.contains("tracker"), "{html}");
+            assert!(
+                !html.contains("<img") && !html.contains("src=") && !html.contains("tracker"),
+                "{html}"
+            );
             assert_eq!(html.trim(), "<p>alt text</p>");
         }
-        let linked = render_pr_comment_markdown("[![logo](https://t.example/p.png)](https://example.com)");
-        assert_eq!(linked.trim(), "<p><a href=\"https://example.com\">logo</a></p>");
+        let linked =
+            render_pr_comment_markdown("[![logo](https://t.example/p.png)](https://example.com)");
+        assert_eq!(
+            linked.trim(),
+            "<p><a href=\"https://example.com\">logo</a></p>"
+        );
     }
 
     #[test]
@@ -3100,24 +3125,51 @@ mod tests {
         let html = render_pr_comment_markdown(
             "<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n\ninline <b onclick=x>b</b> & \"q\" `<i>`",
         );
-        assert!(!html.contains("<script") && !html.contains("<img") && !html.contains("onerror") && !html.contains("<b "), "{html}");
-        assert!(html.contains("&amp;") && html.contains("<code>&lt;i&gt;</code>"), "{html}");
+        assert!(
+            !html.contains("<script")
+                && !html.contains("<img")
+                && !html.contains("onerror")
+                && !html.contains("<b "),
+            "{html}"
+        );
+        assert!(
+            html.contains("&amp;") && html.contains("<code>&lt;i&gt;</code>"),
+            "{html}"
+        );
     }
 
     #[test]
     fn legitimate_markdown_is_unchanged() {
         let html = render_pr_comment_markdown("# T\n\n- [x] done\n- item\n\n```rust\nlet a = 1 < 2;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n~~s~~");
-        for needle in ["<h1>T</h1>", "type=\"checkbox\"", "<li>item</li>", "&lt; 2", "<table>", "<del>s</del>"] {
+        for needle in [
+            "<h1>T</h1>",
+            "type=\"checkbox\"",
+            "<li>item</li>",
+            "&lt; 2",
+            "<table>",
+            "<del>s</del>",
+        ] {
             assert!(html.contains(needle), "{needle}: {html}");
         }
     }
 
     #[test]
     fn malformed_links_do_not_unbalance_the_output() {
-        for src in ["[a](", "[a](<", "[a]()", "[[a](javascript:1)](https://example.com)", "[a](https://e.com", "]( [a"] {
+        for src in [
+            "[a](",
+            "[a](<",
+            "[a]()",
+            "[[a](javascript:1)](https://example.com)",
+            "[a](https://e.com",
+            "]( [a",
+        ] {
             let html = render_pr_comment_markdown(src);
             assert!(!html.to_lowercase().contains("javascript"), "{src}: {html}");
-            assert_eq!(html.matches("<a ").count(), html.matches("</a>").count(), "{src}: {html}");
+            assert_eq!(
+                html.matches("<a ").count(),
+                html.matches("</a>").count(),
+                "{src}: {html}"
+            );
         }
     }
 
