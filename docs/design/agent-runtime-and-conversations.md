@@ -105,7 +105,9 @@ readable and keep their identities. A `Proposed` one can be rejected. An
 `Approved` one can be withdrawn with `HumanAction::Withdraw`, which records an
 `ActionWithdrawn` entry and never touches the Task. Approving or retrying a
 legacy action is refused before any decision is recorded, any editing owner or
-provider lease is taken, or any provider runs. For new coding work, the
+provider lease is taken, or any provider runs. The Conversation has no code
+path that starts a Task Worker. Historical `WorkerStarted`, `WorkerResult` and
+`RunFailed` entries are read-only evidence, not a running Worker. For new coding work, the
 Coordinator proposes `EnqueueTask` or `ExecuteRequest`, which needs a fresh
 Human approval. The card shows the exact fields to be created or
 changed. An edit shows each field as observed value to proposed value.
