@@ -39,43 +39,54 @@ selected recent conversational messages, and a bounded index of Tasks. It uses
 read-only tools. Durable history and the projection sent to a provider are
 separate; provider transcripts and arbitrary Project records are not included.
 
-The strict output contract is `Reply { text }`, `DelegateToTask { text,
-target_task_id, request }`, `CreateTask` or `EditTask` (see
+The strict output contract is `Reply { text }`, `CreateTask`, `EditTask`,
+`MoveTask`, `EnqueueTask` or `ExecuteRequest` (see
 [Coordinator Task capabilities](#coordinator-task-capabilities)). Unknown types
-and fields are refused. Prose cannot trigger an action. A proposal is persisted and displayed, but cannot start a Worker until
-a Human explicitly approves it. Approval can replace the request; the saved
-approved request is the execution authority.
+and fields are refused. Direct delegation to a Task Worker is retired. A
+`delegate_to_task` output still parses, but on both the ordinary and the
+follow-up path SlashIt records a bounded refusal, creates no proposal or
+`TaskAction`, and starts nothing. Prose cannot trigger an action. A Coordinator
+proposal is a `ProjectAction`: it is persisted and displayed, changes no Task,
+and cannot be edited before a decision. Approval authorizes exactly the
+persisted mutation the Human saw. Approval does not start a Worker.
 
-A Worker is admitted only for an existing Task in the Conversation's Project.
-The Task must already have a valid Git Task Checkout on its recorded branch,
-and the existing Task executor must grant exclusive Task ownership and agent
-capacity. Worker context contains the target Task, approved request, and
-selected bounded dependencies. It excludes the full Conversation, unrelated
-Tasks, and provider transcripts. The Coordinator is read-only, so it does not
-share mutation of the Task Checkout.
+Approving `EnqueueTask` queues an existing Backlog Task. Approving
+`ExecuteRequest` queues the Task with the approved request bound to that
+approval, and may name the Task's existing Git Task Checkout. Both go through
+the normal Task lifecycle, which decides when the Task runs. The Task executor
+grants exclusive Task ownership and agent capacity, obtains the Task's Task
+Checkout, records the run, and publishes its activity and result on the Task.
+The run prompt is built from the target Task and the approved request. It does
+not include the Conversation history, unrelated Tasks, or provider transcripts.
+The Coordinator is read-only and never edits the Task Checkout.
 
-After the Task's provider lease is taken and before the Worker is recorded as
-started, SlashIt reads the Task Checkout's Git status. Any uncommitted change,
-tracked, staged, deleted or untracked, refuses the start, as does a status that
-cannot be read. The approved action stays approved, the checkout is not
-touched, and the Human resolves it and retries. The Worker's result is
-committed as everything in the checkout, so edits that were already there would
-otherwise be recorded as the new request's work. This protects against
-pre-existing dirty content only. It does not establish who owns an edit made in
-the checkout while the Worker runs, and ignored files are not considered.
+An `ExecuteRequest` that names a checkout is checked under the Task's lifecycle
+lease before it is queued. The named checkout must be the Task's own checkout as
+the Human saw it, and a checkout with an unfinished recovery, cleanup, or
+integration operation refuses the approval. A refused approval is recorded as
+`Refused`. It is not retried in place: the Human resolves the cause, and the
+Coordinator proposes the request again. When a new attempt starts on a recovered
+checkout, the executor reads the uncommitted work again before the provider
+starts. A change is recorded as recovery of that run, and no provider is
+launched. Results are committed from the whole checkout, so edits that were
+already there would otherwise be recorded as the new request's work. This
+protects against pre-existing uncommitted content only. It does not establish
+who owns an edit made in the checkout while the Worker runs, and ignored files
+are not considered.
 
-The Worker result is saved as Conversation-owned evidence. SlashIt then starts
-a fresh read-only Coordinator Run with the selected context and that result
-marked as untrusted evidence. The Coordinator replies in the same Conversation,
-which remains open for ordinary Human messages or another separately approved
-action.
+Legacy `TaskAction` results saved as Conversation evidence stay readable. A
+`Returned` legacy result can still be mediated: SlashIt starts a fresh read-only
+Coordinator Run with the selected context and that result marked as untrusted
+evidence, and the Coordinator replies in the same Conversation. Mediation never
+replays the Worker. A repeated retry of an already mediated result is refused
+before any provider runs.
 
-After restart no Run is considered live. An interrupted Coordinator can be
-retried from saved Conversation state. A Worker that may have partially changed
-a checkout is marked interrupted and is not silently replayed. Once a Worker
-result is durable, recovery continues with a fresh Coordinator Run rather than
-rerunning the Worker. This prevents automatic replay; it does not promise
-exactly-once external or repository side effects across crashes.
+After restart no Run is considered live. A run that may have partially changed
+its checkout is recorded as needing recovery and is not replayed silently. A
+legacy Coordinator run interrupted by a restart can be retried from saved
+Conversation state. A legacy Worker result that is already durable is mediated,
+never rerun. This prevents automatic replay; it does not promise exactly-once
+external or repository side effects across crashes.
 
 ### Coordinator Task capabilities
 
@@ -87,9 +98,16 @@ to select a Task to talk to it.
 `CreateTask { title, description?, priority?, category? }` and `EditTask {
 target_task_id, title?, description?, priority?, category? }` are mutating,
 so each is a `ProjectAction` that waits for one explicit Human decision. This
-is separate from `TaskAction`, which models delegation to a Worker; both are
-stored in the Conversation, and Conversations saved before `ProjectAction`
-existed load unchanged. The card shows the exact fields to be created or
+is separate from `TaskAction`, the legacy record of direct delegation to a
+Worker; both are stored in the Conversation, and Conversations saved before
+`ProjectAction` existed load unchanged. Legacy `TaskAction` records stay
+readable and keep their identities. A `Proposed` one can be rejected. An
+`Approved` one can be withdrawn with `HumanAction::Withdraw`, which records an
+`ActionWithdrawn` entry and never touches the Task. Approving or retrying a
+legacy action is refused before any decision is recorded, any editing owner or
+provider lease is taken, or any provider runs. For new coding work, the
+Coordinator proposes `EnqueueTask` or `ExecuteRequest`, which needs a fresh
+Human approval. The card shows the exact fields to be created or
 changed. An edit shows each field as observed value to proposed value.
 Proposals are not editable before approval, so the executed mutation is the
 one on screen. Each decision applies to one action: a successful create or
@@ -221,12 +239,14 @@ recovery work. That is deliberately not tracked as one large issue now.
 ## Future scope
 
 The current implementation includes Project Conversations, ordinary replies,
-bounded Task visibility, Human-gated Task creation and editing, `DelegateToTask`,
-explicit Human approval, and a Task-scoped Worker. Moving or queueing Tasks,
-pull request and CI capabilities, tracker synchronization, Workspace
-Conversations, context compaction, multiple Workers, provider-session resume,
-and richer provider adapters remain future work. The Conversation direction
-is one continuous Conversation per Project with bounded, rebuilt provider
+bounded Task visibility, Human-gated Task creation, editing, moving and queueing,
+explicit Human approval, and Task-scoped Worker execution through the normal
+Task lifecycle. Direct delegation to a Worker is retired (its historical
+records stay readable). Pull request and CI capabilities, tracker
+synchronization, Workspace Conversations, context compaction, multiple Workers,
+provider-session resume, and richer provider adapters remain future work. The
+Conversation direction is one continuous Conversation per Project with bounded,
+rebuilt provider
 context, not several concurrent Conversations; see
 [project-conversation-history.md](project-conversation-history.md). ACP remains
 an adapter boundary and is not part of the Project Conversation execution path.

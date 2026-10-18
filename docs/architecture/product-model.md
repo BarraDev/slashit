@@ -64,10 +64,10 @@ Task       1    ── 0..1  Task Checkout  (according to lifecycle state)
   require a Task Checkout. A Workspace member Project keeps its own
   Conversation; Workspaces do not own Conversations.
 - **Tasks are Project resources, not Conversation owners.** The Project
-  Coordinator can discuss bounded Task metadata and propose a structured
-  delegation to one existing Task. A human must approve the exact request
-  before a Task Worker runs in that Task's existing Checkout. The Worker
-  result is recorded back into the Project Conversation.
+  Coordinator can discuss bounded Task metadata and propose normal Task work:
+  queueing a Backlog Task, or one additional request on a Backlog Task. A human
+  must approve the exact input before the normal Task executor runs it in that
+  Task's Checkout. Direct delegation to a Worker is retired.
 - **The Coordinator operates SlashIt through explicit capabilities.** It
   does not edit repository files, own a Task Checkout or run Task
   implementation. Creating a Task and editing a Task's title, description,

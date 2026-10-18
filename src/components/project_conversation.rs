@@ -23,16 +23,31 @@ fn has_unmediated_worker_result(snapshot: &ConversationSnapshot) -> bool {
     snapshot.conversation.actions.iter().any(|action| action.status == ConversationActionStatus::Returned && !action.coordinator_replied)
 }
 
-/// The request the Human sees: an approved action always shows the persisted
-/// `approved_request`, never a leftover local edit.
-fn shown_request(approved: bool, edit: Option<String>, current: String) -> String {
-    if approved { current } else { edit.unwrap_or(current) }
+/// What a card for a retired direct delegation may offer. Direct delegation is
+/// retired, so no card approves or starts a Worker. A proposal can be rejected;
+/// an earlier approval can only be withdrawn, which changes nothing in the Task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetiredDelegationControls {
+    note: &'static str,
+    can_reject: bool,
+    can_withdraw: bool,
 }
 
-/// The request plain Approve must send so the approved text is the visible text.
-/// An already approved action carries its request, so nothing is resent.
-fn plain_approval_request(approved: bool, edit: Option<String>) -> Option<String> {
-    if approved { None } else { edit }
+/// `None` for every status that has no decision left to make on this card.
+fn retired_delegation_controls(status: ConversationActionStatus) -> Option<RetiredDelegationControls> {
+    match status {
+        ConversationActionStatus::Proposed => Some(RetiredDelegationControls {
+            note: "Direct delegation to a Task Worker is retired. Nothing will start from this proposal. Reject it to clear it.",
+            can_reject: true,
+            can_withdraw: false,
+        }),
+        ConversationActionStatus::Approved => Some(RetiredDelegationControls {
+            note: "You approved this before direct delegation was retired. SlashIt will not start it. Withdraw the approval to clear it; the Task is not changed.",
+            can_reject: false,
+            can_withdraw: true,
+        }),
+        _ => None,
+    }
 }
 
 /// What a Project action card shows the Human: exactly the fields that will be
@@ -297,7 +312,6 @@ fn execution_card(execution: ConversationExecution, approval: &'static str) -> i
 pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let (snapshot, set_snapshot) = signal(None::<ConversationSnapshot>);
     let (draft, set_draft) = signal(String::new());
-    let (edits, set_edits) = signal(HashMap::<String, String>::new());
     let (busy, set_busy) = signal(false);
     let (error, set_error) = signal(None::<String>);
     let (executions, set_executions) = signal(Vec::<ConversationExecution>::new());
@@ -322,13 +336,6 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         }
     });
 
-    let edits_snapshot = snapshot;
-    Effect::new(move |_| {
-        let active_ids = edits_snapshot.get().map(|value| value.conversation.actions.into_iter()
-            .filter(|action| matches!(action.status, ConversationActionStatus::Proposed | ConversationActionStatus::Approved))
-            .map(|action| action.id.to_string()).collect::<Vec<_>>()).unwrap_or_default();
-        set_edits.update(|edits| edits.retain(|id, _| active_ids.contains(id)));
-    });
 
     let initial_id = project_id.clone();
     let initial_begin_request = begin_snapshot_request.clone();
@@ -455,6 +462,25 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
             set_busy.set(false);
         });
     });
+    let withdraw_project_id = project_id.clone();
+    let withdraw_begin_request = begin_snapshot_request.clone();
+    let withdraw_publish = publish_snapshot.clone();
+    let withdraw_action = Callback::new(move |action_id: String| {
+        let Some(current) = snapshot.get_untracked() else { return; };
+        set_busy.set(true);
+        let id = withdraw_project_id.clone();
+        let refresh_id = withdraw_project_id.clone();
+        let request_id = withdraw_begin_request.run(());
+        let publish = withdraw_publish.clone();
+        let refresh_begin_request = withdraw_begin_request.clone();
+        let refresh_publish = withdraw_publish.clone();
+        spawn_local(async move {
+            match conversation_service::act_on_project_conversation(id, current.conversation.id.to_string(), current.conversation.revision, action_id, ConversationHumanAction::Withdraw).await {
+                Ok(value) => publish.run((request_id, value)), Err(error) => { set_error.set(Some(error)); let refresh_request = refresh_begin_request.run(()); if let Ok(value) = conversation_service::get_project_conversation(refresh_id).await { refresh_publish.run((refresh_request, value)); } },
+            }
+            set_busy.set(false);
+        });
+    });
     let retry_project_id = project_id.clone();
     let retry_begin_request = begin_snapshot_request.clone();
     let retry_publish = publish_snapshot.clone();
@@ -500,6 +526,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                 ConversationEntryKind::ActionDecision { approved, request, .. } => ("conversation-action-event", Some(if approved { format!("You approved the Worker request: {}", request.unwrap_or_default()) } else { "You rejected the proposed Task work.".to_string() })),
                                 ConversationEntryKind::WorkerStarted { action_id } => ("conversation-action-event", actions.iter().find(|action| action.id == action_id).map(|action| format!("Worker started in Task Checkout: {}", action.target_task_title))),
                                 ConversationEntryKind::WorkerResult { result, .. } => ("conversation-worker-result", Some(result)),
+                                ConversationEntryKind::ActionWithdrawn { .. } => ("conversation-action-event", Some("You withdrew an earlier approval of a retired direct delegation. Nothing was started.".to_string())),
                                 ConversationEntryKind::RunFailed { message, .. } => ("conversation-run-failed", Some(message)),
                                 ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", project_action_event_text(kind, &project_actions)),
                             };
@@ -516,26 +543,33 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                 </div>
                 <div class="mb-3 max-h-[40%] shrink-0 space-y-2 overflow-y-auto">
                     <For
-                        each=move || snapshot.get().map(|value| value.conversation.actions.into_iter().filter(|action| matches!(action.status, ConversationActionStatus::Proposed | ConversationActionStatus::Approved)).collect::<Vec<_>>()).unwrap_or_default()
+                        each=move || snapshot.get().map(|value| value.conversation.actions.into_iter().filter(|action| retired_delegation_controls(action.status).is_some()).collect::<Vec<_>>()).unwrap_or_default()
                         key=|action| action.id
                         children=move |action| {
                         let action_uuid = action.id;
-                        let id = action_uuid.to_string(); let input_id = id.clone(); let approve_id = id.clone(); let edit_approve_id = id.clone(); let reject_id = id.clone();
-                        let original = action.approved_request.clone().unwrap_or_else(|| action.request.clone()); let value_fallback = original.clone(); let value_id = id.clone();
-                        let current_request = Signal::derive(move || snapshot.get().and_then(|value| value.conversation.actions.into_iter().find(|item| item.id == action_uuid)).map(|item| item.approved_request.unwrap_or(item.request)).unwrap_or_else(|| value_fallback.clone()));
-                        let is_approved = Signal::derive(move || snapshot.get().and_then(|value| value.conversation.actions.into_iter().find(|item| item.id == action_uuid)).is_some_and(|item| item.status == ConversationActionStatus::Approved));
-                        let approve_action = approve_action.clone(); let edit_approve_action = approve_action.clone(); let reject_action = reject_action.clone();
+                        let id = action_uuid.to_string(); let reject_id = id.clone(); let withdraw_id = id;
+                        let recorded = action.approved_request.clone().unwrap_or_else(|| action.request.clone());
+                        let recorded_request = Signal::derive(move || snapshot.get().and_then(|value| value.conversation.actions.into_iter().find(|item| item.id == action_uuid)).map(|item| item.approved_request.unwrap_or(item.request)).unwrap_or_else(|| recorded.clone()));
+                        let status = Signal::derive(move || snapshot.get().and_then(|value| value.conversation.actions.into_iter().find(|item| item.id == action_uuid)).map(|item| item.status));
+                        let controls = Signal::derive(move || status.get().and_then(retired_delegation_controls));
+                        let reject_action = reject_action.clone(); let withdraw_action = withdraw_action.clone();
                         view! {
                             <article data-testid="conversation-action-proposal" class="rounded-lg border border-amber-300/30 bg-amber-400/5 p-3">
-                                <div class="text-xs uppercase tracking-wide text-amber-200">"Coordinator proposes Task work"</div>
+                                <div class="text-xs uppercase tracking-wide text-amber-200">"Retired direct delegation"</div>
                                 <div class="mt-1 font-medium text-white">{action.target_task_title}</div>
                                 <div class="mt-1 break-all font-mono text-xs text-white/55">{format!("Task ID: {}", action.target_task_id)}</div>
                                 <p class="mt-2 whitespace-pre-wrap text-sm text-white/75">{action.explanation}</p>
-                                <label class="mt-2 block text-xs text-white/50">"Worker request"<textarea data-testid="conversation-action-request" class="mt-1 min-h-20 w-full rounded bg-black/30 p-2 text-sm text-white" readonly=move || is_approved.get() prop:value=move || shown_request(is_approved.get(), edits.with(|edits| edits.get(&value_id).cloned()), current_request.get()) on:input=move |event| set_edits.update(|edits| { edits.insert(input_id.clone(), event_target_value(&event)); })></textarea></label>
+                                <p data-testid="conversation-retired-note" class="mt-2 text-sm text-amber-100/80">{move || controls.get().map(|c| c.note).unwrap_or_default()}</p>
+                                <label class="mt-2 block text-xs text-white/50">"Recorded request"<textarea data-testid="conversation-action-request" class="mt-1 min-h-20 w-full rounded bg-black/30 p-2 text-sm text-white" readonly=true prop:value=move || recorded_request.get()></textarea></label>
                                 <div class="mt-2 flex gap-2">
-                                    <button data-testid="conversation-action-approve" class="rounded bg-emerald-700 px-3 py-1 text-sm" disabled=move || busy.get() on:click=move |_| { let request = plain_approval_request(is_approved.get_untracked(), edits.get_untracked().get(&approve_id).cloned()); approve_action.run((approve_id.clone(), request)); }>{move || if is_approved.get() { "Start approved Worker" } else { "Approve exact request" }}</button>
-                                    <button data-testid="conversation-action-edit-approve" class="rounded bg-emerald-700/70 px-3 py-1 text-sm" disabled=move || busy.get() || is_approved.get() on:click=move |_| { let edited = edits.get_untracked().get(&id).cloned().unwrap_or(original.clone()); edit_approve_action.run((edit_approve_id.clone(), Some(edited))); } >"Edit + approve"</button>
-                                    <button data-testid="conversation-action-reject" class="rounded border border-white/20 px-3 py-1 text-sm" disabled=move || busy.get() || is_approved.get() on:click=move |_| reject_action.run(reject_id.clone())>"Reject"</button>
+                                    {move || controls.get().is_some_and(|c| c.can_reject).then(|| {
+                                        let reject_action = reject_action.clone(); let reject_id = reject_id.clone();
+                                        view! { <button data-testid="conversation-action-reject" class="rounded border border-white/20 px-3 py-1 text-sm" disabled=move || busy.get() on:click=move |_| reject_action.run(reject_id.clone())>"Reject"</button> }
+                                    })}
+                                    {move || controls.get().is_some_and(|c| c.can_withdraw).then(|| {
+                                        let withdraw_action = withdraw_action.clone(); let withdraw_id = withdraw_id.clone();
+                                        view! { <button data-testid="conversation-action-withdraw" class="rounded border border-amber-200/40 px-3 py-1 text-sm text-amber-100" disabled=move || busy.get() on:click=move |_| withdraw_action.run(withdraw_id.clone())>"Withdraw approval"</button> }
+                                    })}
                                 </div>
                             </article>
                         }
@@ -646,17 +680,24 @@ mod tests {
     }
 
     #[test]
-    fn plain_approval_sends_the_edited_request_the_textarea_shows() {
-        let shown = shown_request(false, Some("B".into()), "A".into());
-        assert_eq!(shown, "B");
-        assert_eq!(plain_approval_request(false, Some("B".into())), Some(shown));
-        assert_eq!(plain_approval_request(false, None), None);
+    fn a_retired_proposal_can_only_be_rejected() {
+        use ConversationActionStatus::*;
+        let controls = retired_delegation_controls(Proposed).expect("a proposal still has a decision");
+        assert!(controls.can_reject);
+        assert!(!controls.can_withdraw);
+        assert!(controls.note.contains("retired"));
     }
 
     #[test]
-    fn an_approved_action_shows_its_persisted_request_not_a_stale_edit() {
-        assert_eq!(shown_request(true, Some("B".into()), "A".into()), "A");
-        assert_eq!(plain_approval_request(true, Some("B".into())), None);
+    fn a_retired_approval_can_only_be_withdrawn_and_no_card_starts_a_worker() {
+        use ConversationActionStatus::*;
+        let controls = retired_delegation_controls(Approved).expect("an approval can be withdrawn");
+        assert!(controls.can_withdraw);
+        assert!(!controls.can_reject);
+        assert!(controls.note.contains("will not start it"));
+        for finished in [Running, Returned, Rejected, Interrupted, Failed, Withdrawn] {
+            assert_eq!(retired_delegation_controls(finished), None, "{finished:?}");
+        }
     }
 
     #[test]
@@ -704,6 +745,7 @@ mod tests {
         // editable, so the Human approves exactly the proposal on screen.
         assert_eq!(serde_json::to_value(ConversationHumanAction::Approve { request: None }).unwrap(), serde_json::json!({"action":"approve","request":null}));
         assert_eq!(serde_json::to_value(ConversationHumanAction::Reject).unwrap(), serde_json::json!({"action":"reject"}));
+        assert_eq!(serde_json::to_value(ConversationHumanAction::Withdraw).unwrap(), serde_json::json!({"action":"withdraw"}));
     }
 
     #[test]

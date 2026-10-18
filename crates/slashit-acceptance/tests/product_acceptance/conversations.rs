@@ -1,5 +1,5 @@
 //! Desktop journeys for Project-owned conversation, including the zero-Task
-//! path and a separately approved Task Worker delegation.
+//! path, the refusal of retired direct delegation, and approved Task execution.
 
 use super::*;
 use super::task_runs::{create_task, register_project};
@@ -87,8 +87,8 @@ async fn zero_task_project_conversation_replies_and_survives_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
-    let context = TestContext::new("project_conversation_delegation").expect("harness setup");
+async fn project_conversation_refuses_retired_direct_delegation_and_stays_usable() {
+    let context = TestContext::new("project_conversation_retired_delegation").expect("harness setup");
     let root = context.state().path().to_path_buf();
     let agent = FakeAgent::install(&root).expect("install fake Claude");
     context.set_child_env("PATH", agent.path_value().to_os_string());
@@ -96,161 +96,57 @@ async fn project_conversation_human_gates_a_worker_and_mediates_its_result() {
         fake_agent::MARKER_DIR_VAR,
         agent.marker_dir().as_os_str().to_os_string(),
     );
-    context.set_child_env(fake_agent::COORDINATOR_OUTPUT_VAR, "delegate_to_task");
-    context.set_child_env(fake_agent::COORDINATOR_DELEGATE_POSITION_VAR, "3");
-    let blocked_runs = agent
-        .block_agent_runs()
-        .expect("create deterministic run gates");
-    context.set_child_env(fake_agent::BLOCK_DIR_VAR, blocked_runs.into_os_string());
-    // Fail the first Coordinator run after the Worker result. The saved result
-    // must remain visible and an explicit fresh retry must not rerun the Worker.
-    context.set_child_env(fake_agent::COORDINATOR_FAIL_AFTER_WORKER_VAR, "1");
+    context.set_child_env(
+        fake_agent::COORDINATOR_OUTPUT_VAR,
+        r#"{"type":"reply","text":"Fake Coordinator reply."}"#,
+    );
 
     let outcome = async {
         let repository = GitFixture::create(&root.join("fixture-repo"))?;
-        let session = context.start_session("delegation").await?;
+        let session = context.start_session("retired-delegation").await?;
         let repository_id = created_id(ui::invoke(session.driver(), "create_repository", json!({"localPath":repository.path(),"remoteUrl":Value::Null,"initialize":Value::Null})).await?, "create_repository")?;
-        let project_id = created_id(ui::invoke(session.driver(), "create_project", json!({"name":"Delegated Project","repositoryId":repository_id,"agentType":"claude_code"})).await?, "create_project")?;
-        let task = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Existing Task","description":"A bounded implementation task","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
-        let task_id = created_id(task.clone(), "create_task")?;
+        let project_id = created_id(ui::invoke(session.driver(), "create_project", json!({"name":"Retired Delegation Project","repositoryId":repository_id,"agentType":"claude_code"})).await?, "create_project")?;
+        let task_id = created_id(ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Existing Task","description":"A bounded implementation task","model":"sonnet","planningMode":false,"dependencies":[]}})).await?, "create_task")?;
         ui::invoke(session.driver(), "create_worktree", json!({"taskId":task_id})).await?;
+        // The first Coordinator turn still emits the retired delegation. The
+        // fixture substitutes the Task id that the delegation names.
+        let scripted = agent.marker_dir().join(".coordinator-output");
+        std::fs::create_dir_all(&scripted)?;
+        std::fs::write(scripted.join("1"), "delegate_to_task")?;
         let target_config = agent.marker_dir().join(".coordinator-target");
         std::fs::create_dir_all(&target_config)?;
-        let stale_target = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Task to remove before rejection","description":"A stale proposal target","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
-        let stale_target_id = created_id(stale_target, "create stale proposal target")?;
         std::fs::write(target_config.join("id"), &task_id)?;
-        let unrelated = ui::invoke(session.driver(), "create_task", json!({"params":{"projectId":project_id,"title":"Unrelated private Task sentinel","description":"Must not enter the Worker projection","model":"sonnet","planningMode":false,"dependencies":[]}})).await?;
-        let unrelated_task_id = created_id(unrelated, "create_task")?;
         open_conversations(session.driver(), &project_id).await?;
 
-        // No proposal may start the Worker. The fixture's invocation count
-        // stays at the Coordinator until the exact payload is approved.
         submit_message(session.driver(), "Please make a small change in Existing Task.").await?;
-        await_blocked_provider_run(&agent).await?;
-        // Leaving the page must neither stop the live run nor lose its state.
-        open_nav(session.driver(), "dashboard", KANBAN_BOARD).await?;
-        open_nav(session.driver(), "conversations", PANEL).await?;
-        ui::visible(session.driver(), "[data-testid=\"conversation-stop\"]").await?;
-        await_and_release_provider_run(&agent).await?;
-        await_text(session.driver(), PANEL, "Coordinator proposes Task work").await?;
-        let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
-        let proposal_text = proposal.text().await?;
-        if !proposal_text.contains("Existing Task") || !proposal_text.contains(&task_id) || !proposal_text.contains("right execution boundary") { bail!("the exact target and explanation are not visible: {proposal_text}"); }
-        ui::visible(session.driver(), "[data-testid=\"conversation-action-request\"]").await?;
-        if field_value(session.driver(), "[data-testid=\"conversation-action-request\"]").await? != "Add the approved marker." { bail!("the exact proposed request is not visible in its editable field"); }
-        if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 1 { bail!("Worker ran before approval"); }
-
-        // A normal rejection is durable and must never start a Worker.
-        ui::visible(session.driver(), "[data-testid=\"conversation-action-reject\"]").await?.click().await?;
-        let rejected = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
-        if rejected["conversation"]["actions"].as_array().and_then(|actions| actions.first()).is_none_or(|action| action["status"] != "rejected") { bail!("rejection was not persisted"); }
-        if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 1 { bail!("reject started a Worker"); }
-
-        // A stale proposal remains rejectable after its target disappears.
-        std::fs::write(target_config.join("id"), &stale_target_id)?;
-        submit_message(session.driver(), "Please propose the Task work again.").await?;
-        await_and_release_provider_run(&agent).await?;
-        await_text(session.driver(), PANEL, "Coordinator proposes Task work").await?;
-        let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
-        let proposal_text = proposal.text().await?;
-        if !proposal_text.contains("Task to remove before rejection") || !proposal_text.contains(&stale_target_id) { bail!("the stale proposal target is not visible: {proposal_text}"); }
-        ui::invoke(session.driver(), "delete_task", json!({"taskId":stale_target_id})).await?;
-        ui::visible(session.driver(), "[data-testid=\"conversation-action-reject\"]").await?.click().await?;
-        let stale_rejected = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
-        if stale_rejected["conversation"]["actions"].as_array().is_none_or(|actions| !actions.iter().any(|action| action["target_task_id"] == stale_target_id && action["status"] == "rejected")) { bail!("deleted proposal target could not be rejected: {stale_rejected}"); }
-        if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 2 { bail!("stale-target rejection started a Worker"); }
-
-        std::fs::write(target_config.join("id"), &task_id)?;
-        submit_message(session.driver(), "Please propose the Task work a third time.").await?;
-        await_and_release_provider_run(&agent).await?;
-        await_text(session.driver(), PANEL, "Coordinator proposes Task work").await?;
-        let proposal = ui::visible(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?;
-        let proposal_text = proposal.text().await?;
-        if !proposal_text.contains("Existing Task") || !proposal_text.contains(&task_id) { bail!("the third exact proposal target is not visible: {proposal_text}"); }
-        ui::visible(session.driver(), "[data-testid=\"conversation-action-request\"]").await?;
-        if field_value(session.driver(), "[data-testid=\"conversation-action-request\"]").await? != "Add the approved marker." { bail!("the third exact proposed request is not visible in its editable field"); }
-        if agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count() != 3 { bail!("third proposal started a Worker before approval"); }
-
-        let request = ui::visible(session.driver(), "[data-testid=\"conversation-action-request\"]").await?;
-        request.clear().await?;
-        request.send_keys("Edited authoritative request").await?;
-        ui::visible(session.driver(), "[data-testid=\"conversation-action-edit-approve\"]").await?.click().await?;
-        await_and_release_provider_run(&agent).await?; // Worker run
-        await_returned_worker_result(session.driver(), &project_id).await?;
-        await_blocked_provider_run(&agent).await?; // Coordinator after durable Worker result
-        let result_while_mediating = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
-        if result_while_mediating["conversation"]["actions"].as_array().is_none_or(|actions| !actions.iter().any(|action| action["status"] == "returned" && action["worker_result"].as_str().is_some())) { bail!("Worker result was not durably visible while Coordinator mediation was blocked: {result_while_mediating}"); }
-        agent.release_blocked_runs()?; // First follow-up fails by fixture instruction.
-        await_text(session.driver(), "[data-testid=\"conversation-worker-result\"]", "fake Worker completed approved work").await?;
-        ui::visible(session.driver(), "[data-testid=\"conversation-continuation-error\"]").await?;
-        if ui::visible(session.driver(), SEND).await?.is_enabled().await? { bail!("Human send remained enabled while a saved Worker result awaited Coordinator mediation"); }
-        if !super::text_of(session.driver(), "[data-testid=\"conversation-history\"]").await?.unwrap_or_default().contains("fake Worker completed approved work") {
-            bail!("a failed Coordinator follow-up hid the durable Worker result");
+        await_text(session.driver(), "[data-testid=\"conversation-run-failed\"]", "Direct delegation to a Task Worker is retired").await?;
+        if text_of(session.driver(), "[data-testid=\"conversation-action-proposal\"]").await?.is_some() {
+            bail!("the refused delegation still offered a proposal card");
         }
-        let before_explicit_retry = agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count();
-        for _ in 0..3 {
-            let pending = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
-            if pending["conversation"]["actions"].as_array().is_none_or(|actions| !actions.iter().any(|action| action["status"] == "returned" && action["coordinator_replied"] == false)) { bail!("GET did not preserve the visible unmediated result: {pending}"); }
-        }
-        let after_reads = agent.invocations()?.iter().filter(|invocation| invocation.prompt.is_some()).count();
-        if after_reads != before_explicit_retry { bail!("GET unexpectedly launched provider work ({before_explicit_retry} -> {after_reads})"); }
-        ui::visible(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?.click().await?;
-        await_blocked_provider_run(&agent).await?;
-        ui::visible(session.driver(), "[data-testid=\"conversation-stop\"]").await?.click().await?;
-        let stopped = await_conversation_idle(session.driver(), &project_id, 1).await?;
-        if stopped["conversation"]["actions"].as_array().is_none_or(|actions| !actions.iter().any(|action| action["status"] == "returned" && action["coordinator_replied"] == false)) {
-            bail!("stopping Coordinator mediation did not preserve the returned Worker result: {stopped}");
-        }
-        await_enabled(session.driver(), "[data-testid=\"conversation-retry-coordinator\"]").await?.click().await?;
-        await_and_release_provider_run(&agent).await?;
-        await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Coordinator reviewed the Worker result.").await?;
-        let worker_runs = agent.invocations()?.iter().filter(|run| run.prompt.as_deref().is_some_and(|prompt| prompt.contains("Execute only approved_request in this Task Checkout"))).count();
-        if worker_runs != 1 { bail!("Coordinator retry started the Worker {worker_runs} times"); }
+        let refused = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
+        if refused["conversation"]["actions"].as_array().is_some_and(|actions| !actions.is_empty()) { bail!("a refused delegation recorded an action: {refused}"); }
+        if refused["coordinator_live"] != false || refused["worker_live"] != false { bail!("the refusal left a Run live"); }
 
+        // The Conversation stays usable after the refusal.
+        send_message(session.driver(), "What can we do instead?", "Fake Coordinator reply.").await?;
+        context.close_session(session, "retired-delegation", &Ok(())).await?;
 
-        let conversation = ui::invoke(session.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
-        let conversation_id = conversation["conversation"]["id"].as_str().context("Conversation id missing")?.to_string();
-        let actions = conversation["conversation"]["actions"].as_array().context("Delegation actions missing")?;
-        if actions.iter().any(|action| action["target_task_id"] == unrelated_task_id) { bail!("the unrelated Task was targeted"); }
-        let action = actions.iter().find(|action| action["status"] == "returned").context("Returned delegation action missing")?;
-        if action["approved_request"] != "Edited authoritative request" || action["status"] != "returned" || action["coordinator_replied"] != true { bail!("approved payload/result state was not durably mediated: {action}"); }
-        if conversation["coordinator_live"] != false || conversation["worker_live"] != false { bail!("completed delegation is still live"); }
+        let restarted = context.start_session("retired-delegation-restart").await?;
+        open_conversations(restarted.driver(), &project_id).await?;
+        let restored = ui::invoke(restarted.driver(), "get_project_conversation", json!({"projectId":project_id})).await?;
+        if restored["conversation"]["actions"].as_array().is_some_and(|actions| !actions.is_empty()) { bail!("restart created a legacy action: {restored}"); }
+        let history = text_of(restarted.driver(), "[data-testid=\"conversation-history\"]").await?.unwrap_or_default();
+        if !history.contains("Direct delegation to a Task Worker is retired") || !history.contains("What can we do instead?") { bail!("the refusal did not survive restart: {history}"); }
 
-        let tasks: Vec<Value> = serde_json::from_value(ui::invoke(session.driver(), "list_tasks", json!({"projectId":project_id})).await?)?;
-        let persisted_task = tasks.iter().find(|task| task["id"] == task_id).context("Task disappeared")?;
-        if persisted_task["status"] != "backlog" { bail!("TaskStatus was changed to represent Worker liveness: {}", persisted_task["status"]); }
-        let invocations = agent.invocations()?;
-        let runs = invocations.iter().filter(|invocation| invocation.prompt.is_some()).collect::<Vec<_>>();
-        if runs.len() != 7 { bail!("expected three proposal Coordinators, Worker, failed Coordinator, stopped Coordinator and successful retry; observed {}", runs.len()); }
-        let worker = runs[3];
-        if !worker.working_dir.ends_with(persisted_task["worktree_path"].as_str().unwrap_or_default()) && worker.working_dir != Path::new(persisted_task["worktree_path"].as_str().unwrap_or_default()) { bail!("Worker did not run in target Task Checkout: {}", worker.working_dir.display()); }
-        let worker_prompt = worker.prompt.as_deref().unwrap_or_default();
-        if !worker_prompt.contains("Edited authoritative request") || worker_prompt.contains("Please make a small change") || worker_prompt.contains("right execution boundary") || worker_prompt.contains("Unrelated private Task sentinel") || worker_prompt.contains("Must not enter the Worker projection") { bail!("Worker context contains the wrong payload, hidden Coordinator history, or unrelated Task data: {worker_prompt}"); }
-        if runs.iter().any(|run| run.args.iter().any(|arg| arg == "--resume" || arg == "--session-id")) { bail!("a fresh Run depended on provider continuity"); }
-        if !runs[6].prompt.as_deref().unwrap_or_default().contains("fake Worker completed approved work") { bail!("fresh Coordinator retry did not receive the persisted Worker result"); }
-
-        submit_message(session.driver(), "What should we do next?").await?;
-        await_and_release_provider_run(&agent).await?;
-        await_provider_invocation_count(&agent, 8).await?;
-        let continued = await_conversation_idle(session.driver(), &project_id, 8).await?;
-        let final_run_count = agent
-            .invocations()?
-            .iter()
-            .filter(|invocation| invocation.prompt.is_some())
+        // No run ever executed the Task Worker prompt, in any Task Checkout.
+        let worker_runs = agent.invocations()?.iter()
+            .filter(|run| run.prompt.as_deref().is_some_and(|prompt| prompt.contains("Execute only approved_request in this Task Checkout")))
             .count();
-        if final_run_count != 8 {
-            bail!("the continued Human turn started an unexpected number of provider Runs: {final_run_count}");
-        }
-        let entries = continued["conversation"]["entries"].as_array().context("continued Conversation entries missing")?;
-        let mediator_replies = entries.iter().filter(|entry| entry["kind"]["text"] == "Coordinator reviewed the Worker result.").count();
-        let ordinary_replies = entries.iter().filter(|entry| entry["kind"]["text"] == "Fake Coordinator reply.").count();
-        if mediator_replies != 1 || ordinary_replies != 1 {
-            bail!("Conversation did not persist both the mediated reply and the later ordinary reply: {continued}");
-        }
-        await_text(session.driver(), "[data-testid=\"conversation-history\"]", "Fake Coordinator reply.").await?;
-        if continued["conversation"]["id"] != conversation_id { bail!("continued chat changed Conversation identity"); }
-        if entries.len() < 8 { bail!("Conversation did not remain open after Worker mediation"); }
-        context.close_session(session, "delegation", &Ok(())).await?;
+        if worker_runs != 0 { bail!("a retired delegation started {worker_runs} Task Worker runs"); }
+        let tasks: Vec<Value> = serde_json::from_value(ui::invoke(restarted.driver(), "list_tasks", json!({"projectId":project_id})).await?)?;
+        let persisted_task = tasks.iter().find(|task| task["id"] == task_id).context("Task disappeared")?;
+        if persisted_task["status"] != "backlog" { bail!("the refused delegation changed the Task status: {}", persisted_task["status"]); }
+        context.close_session(restarted, "retired-delegation-restart", &Ok(())).await?;
         Ok::<_, anyhow::Error>(())
     }.await;
     context.finish(outcome);
@@ -583,91 +479,6 @@ async fn submit_message(driver: &WebDriver, message: &str) -> Result<()> {
     Ok(())
 }
 
-async fn await_blocked_provider_run(agent: &FakeAgent) -> Result<()> {
-    let started = Instant::now();
-    loop {
-        if agent
-            .blocked_pids()?
-            .into_iter()
-            .any(|pid| agent.is_running(pid))
-        {
-            return Ok(());
-        }
-        if started.elapsed() > EXECUTION_DEADLINE {
-            bail!("fake provider did not reach its deterministic blocking gate");
-        }
-        tokio::time::sleep(POLL).await;
-    }
-}
-
-async fn await_provider_invocation_count(agent: &FakeAgent, expected: usize) -> Result<()> {
-    let started = Instant::now();
-    loop {
-        let count = agent
-            .invocations()?
-            .iter()
-            .filter(|invocation| invocation.prompt.is_some())
-            .count();
-        if count >= expected {
-            return Ok(());
-        }
-        if started.elapsed() > EXECUTION_DEADLINE {
-            bail!("expected {expected} provider invocations, observed {count}");
-        }
-        tokio::time::sleep(POLL).await;
-    }
-}
-
-async fn await_enabled(driver: &WebDriver, selector: &str) -> Result<WebElement> {
-    let started = Instant::now();
-    loop {
-        let element = ui::visible(driver, selector).await?;
-        if element.is_enabled().await? {
-            return Ok(element);
-        }
-        if started.elapsed() > EXECUTION_DEADLINE {
-            bail!("{selector} stayed disabled past the acceptance deadline");
-        }
-        tokio::time::sleep(POLL).await;
-    }
-}
-
-async fn await_returned_worker_result(driver: &WebDriver, project_id: &str) -> Result<()> {
-    let started = Instant::now();
-    loop {
-        let snapshot = ui::invoke(
-            driver,
-            "get_project_conversation",
-            json!({"projectId":project_id}),
-        )
-        .await?;
-        let returned = snapshot["conversation"]["actions"]
-            .as_array()
-            .is_some_and(|actions| {
-                actions.iter().any(|action| {
-                    action["status"] == "returned"
-                        && action["worker_result"].as_str().is_some()
-                })
-            });
-        if returned {
-            return Ok(());
-        }
-        if started.elapsed() > EXECUTION_DEADLINE {
-            bail!("Worker did not durably return a result before Coordinator mediation");
-        }
-        tokio::time::sleep(POLL).await;
-    }
-}
-
-async fn await_and_release_provider_run(agent: &FakeAgent) -> Result<()> {
-    await_blocked_provider_run(agent).await?;
-    let released = agent.release_blocked_runs()?;
-    if released != 1 {
-        bail!("expected one serial provider run at its gate, released {released}");
-    }
-    Ok(())
-}
-
 async fn await_conversation_idle(
     driver: &WebDriver,
     project_id: &str,
@@ -695,19 +506,6 @@ async fn await_conversation_idle(
         }
         tokio::time::sleep(POLL).await;
     }
-}
-
-async fn field_value(driver: &WebDriver, selector: &str) -> Result<String> {
-    Ok(driver
-        .execute(
-            "return document.querySelector(arguments[0]).value;",
-            vec![Value::String(selector.to_owned())],
-        )
-        .await?
-        .json()
-        .as_str()
-        .context("editable field value missing")?
-        .to_owned())
 }
 
 async fn await_text(driver: &WebDriver, selector: &str, text: &str) -> Result<()> {
