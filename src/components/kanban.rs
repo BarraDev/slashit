@@ -1439,6 +1439,8 @@ fn PrReviewModal(
                                                 </summary>
                                                 <div
                                                     class="mt-2 max-h-72 overflow-y-auto rounded border border-white/10 bg-black/30 px-3 py-2 prose prose-sm prose-invert max-w-none leading-relaxed prose-pre:my-2 prose-pre:bg-black/50 prose-pre:text-xs prose-code:text-xs prose-code:before:hidden prose-code:after:hidden prose-p:my-1 prose-ul:my-1 prose-li:my-0"
+                                                    on:click=open_comment_link
+                                                    on:auxclick=open_comment_link
                                                     inner_html=html
                                                 ></div>
                                             </details>
@@ -1658,13 +1660,33 @@ fn PrReviewModal(
     }
 }
 
+/// Whether a Markdown link destination may be rendered as a clickable link.
+/// Only absolute `http`, `https` and `mailto` destinations pass. Anything else
+/// is refused, including `javascript:`/`data:`/`file:` schemes, relative and
+/// protocol-relative destinations (which would resolve against the app's own
+/// origin), and destinations with leading whitespace or embedded control
+/// characters that a browser would strip before reading the scheme.
+fn is_safe_link_destination(url: &str) -> bool {
+    let has_scheme = |scheme: &str| {
+        url.get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    };
+    ["http://", "https://", "mailto:"]
+        .into_iter()
+        .any(has_scheme)
+        && !url.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 /// Render a PR-comment body (GitHub-flavored markdown from `gh api`) to HTML.
-/// Raw HTML in the input is dropped to keep the modal safe from injected
-/// `<script>`/`<img onerror>` payloads that could ride along in a reviewer
-/// comment. Output is consumed via Leptos `inner_html` and styled via the
-/// `prose prose-invert` Tailwind plugin.
+/// The body is remote, untrusted text. Raw HTML is dropped, images are
+/// replaced by their alt text so nothing is fetched on render, and a link
+/// keeps its markup only when `is_safe_link_destination` accepts it; otherwise
+/// just its text remains. Output is consumed via Leptos `inner_html` and
+/// styled via the `prose prose-invert` Tailwind plugin. A container that shows
+/// it must route clicks through `open_comment_link`, because the webview would
+/// otherwise navigate the app window itself.
 fn render_pr_comment_markdown(src: &str) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser};
+    use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
 
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -1672,13 +1694,49 @@ fn render_pr_comment_markdown(src: &str) -> String {
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_GFM);
 
-    let parser = Parser::new_ext(src, opts).filter(|ev| {
-        !matches!(ev, Event::Html(_) | Event::InlineHtml(_))
+    // One entry per open link: whether its markup was kept.
+    let mut open_links: Vec<bool> = Vec::new();
+    let parser = Parser::new_ext(src, opts).filter_map(|ev| match ev {
+        Event::Html(_) | Event::InlineHtml(_) => None,
+        Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image) => None,
+        Event::Start(Tag::Link { ref dest_url, .. }) => {
+            let keep = is_safe_link_destination(dest_url);
+            open_links.push(keep);
+            keep.then_some(ev)
+        }
+        Event::End(TagEnd::Link) => open_links.pop().unwrap_or(false).then_some(ev),
+        ev => Some(ev),
     });
 
     let mut out = String::with_capacity(src.len() + src.len() / 4);
     html::push_html(&mut out, parser);
     out
+}
+
+/// Click handler for a container filled with `render_pr_comment_markdown`
+/// output: never lets the webview navigate, and opens an `http`, `https` or
+/// `mailto` link in the external browser instead.
+fn open_comment_link(ev: leptos::ev::MouseEvent) {
+    use wasm_bindgen::JsCast;
+
+    let Some(anchor) = ev
+        .target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .and_then(|el| el.closest("a").ok().flatten())
+    else {
+        return;
+    };
+    ev.prevent_default();
+    if let Some(href) = anchor
+        .get_attribute("href")
+        .filter(|h| is_safe_link_destination(h))
+    {
+        spawn_local(async move {
+            if let Err(e) = crate::services::open_url_external(href).await {
+                crate::components::toast::error(format!("Could not open the link: {e}"));
+            }
+        });
+    }
 }
 
 /// Whether a review item stays approved after its decision changes. Only a
@@ -1905,6 +1963,8 @@ fn render_review_item(
                         <summary class="cursor-pointer hover:text-white/80">"Original comment"</summary>
                         <div
                             class="mt-1 max-h-48 overflow-y-auto rounded border border-white/5 bg-black/20 px-3 py-2 prose prose-sm prose-invert max-w-none leading-relaxed prose-pre:my-2 prose-pre:bg-black/40 prose-pre:text-xs prose-code:text-xs prose-code:before:hidden prose-code:after:hidden prose-p:my-1 prose-ul:my-1 prose-li:my-0"
+                            on:click=open_comment_link
+                            on:auxclick=open_comment_link
                             inner_html=html
                         ></div>
                     </details>
@@ -2941,6 +3001,7 @@ mod tests {
     use super::approved_after_decision_change;
     use super::next_card_id;
     use super::{awaiting_delivery, offers_pr_sync};
+    use super::{is_safe_link_destination, render_pr_comment_markdown};
     use crate::models::{HumanReviewDecision, HumanReviewEntry, Task, TaskStatus};
     use uuid::Uuid;
 
@@ -2959,6 +3020,157 @@ mod tests {
             "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn only_absolute_web_and_mail_destinations_are_links() {
+        for ok in [
+            "https://example.com/a?b=c",
+            "HTTP://EXAMPLE.COM",
+            "mailto:a@example.com",
+        ] {
+            assert!(is_safe_link_destination(ok), "{ok}");
+        }
+        for bad in [
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            " javascript:alert(1)",
+            "java\tscript:alert(1)",
+            "java\nscript:alert(1)",
+            "\u{1}javascript:alert(1)",
+            "data:text/html,x",
+            "vbscript:x",
+            "file:///etc/passwd",
+            "tauri://localhost/",
+            "//example.com/x",
+            "/relative/path",
+            "relative",
+            "#fragment",
+            "https:",
+            "httpx://example.com",
+            "https://exa mple.com",
+            "",
+        ] {
+            assert!(!is_safe_link_destination(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn unsafe_links_keep_their_text_but_not_their_destination() {
+        for src in [
+            "[click](javascript:alert(1))",
+            "[click](JAVASCRIPT:alert(1))",
+            "[click](&#106;avascript:alert(1))",
+            "[click](java&#9;script:alert(1))",
+            "[click](%6Aavascript:alert(1))",
+            "[click](data:text/html;base64,AAAA)",
+            "[click](//evil.example/x)",
+            "[click](/relative)",
+            "[click][r]\n\n[r]: javascript:alert(1)",
+            "<javascript:alert(1)>",
+        ] {
+            let html = render_pr_comment_markdown(src);
+            assert!(!html.contains("href"), "{src}: {html}");
+            assert!(!html.contains("<a"), "{src}: {html}");
+        }
+        assert_eq!(
+            render_pr_comment_markdown("[click](javascript:alert(1))").trim(),
+            "<p>click</p>"
+        );
+    }
+
+    #[test]
+    fn safe_links_stay_clickable_and_escaped() {
+        let html = render_pr_comment_markdown(
+            "[a](https://example.com/x?a=1&b=\"2\") <mailto:a@example.com>",
+        );
+        assert!(
+            html.contains("<a href=\"https://example.com/x?a=1&amp;b=%222%22\">a</a>"),
+            "{html}"
+        );
+        assert!(html.contains("<a href=\"mailto:a@example.com\">"), "{html}");
+        let nested =
+            render_pr_comment_markdown("**[bold](https://example.com)** and [x](javascript:1) *y*");
+        assert!(
+            nested.contains("<strong><a href=\"https://example.com\">bold</a></strong>"),
+            "{nested}"
+        );
+        assert!(nested.contains("and x <em>y</em>"), "{nested}");
+    }
+
+    #[test]
+    fn images_are_replaced_by_their_alt_text_and_never_fetched() {
+        for src in [
+            "![alt text](https://tracker.example/p.png)",
+            "![alt text][r]\n\n[r]: https://tracker.example/p.png",
+            "![alt text](javascript:alert(1))",
+        ] {
+            let html = render_pr_comment_markdown(src);
+            assert!(
+                !html.contains("<img") && !html.contains("src=") && !html.contains("tracker"),
+                "{html}"
+            );
+            assert_eq!(html.trim(), "<p>alt text</p>");
+        }
+        let linked =
+            render_pr_comment_markdown("[![logo](https://t.example/p.png)](https://example.com)");
+        assert_eq!(
+            linked.trim(),
+            "<p><a href=\"https://example.com\">logo</a></p>"
+        );
+    }
+
+    #[test]
+    fn raw_html_is_dropped_and_text_stays_escaped() {
+        let html = render_pr_comment_markdown(
+            "<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n\ninline <b onclick=x>b</b> & \"q\" `<i>`",
+        );
+        assert!(
+            !html.contains("<script")
+                && !html.contains("<img")
+                && !html.contains("onerror")
+                && !html.contains("<b "),
+            "{html}"
+        );
+        assert!(
+            html.contains("&amp;") && html.contains("<code>&lt;i&gt;</code>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn legitimate_markdown_is_unchanged() {
+        let html = render_pr_comment_markdown("# T\n\n- [x] done\n- item\n\n```rust\nlet a = 1 < 2;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n~~s~~");
+        for needle in [
+            "<h1>T</h1>",
+            "type=\"checkbox\"",
+            "<li>item</li>",
+            "&lt; 2",
+            "<table>",
+            "<del>s</del>",
+        ] {
+            assert!(html.contains(needle), "{needle}: {html}");
+        }
+    }
+
+    #[test]
+    fn malformed_links_do_not_unbalance_the_output() {
+        for src in [
+            "[a](",
+            "[a](<",
+            "[a]()",
+            "[[a](javascript:1)](https://example.com)",
+            "[a](https://e.com",
+            "]( [a",
+        ] {
+            let html = render_pr_comment_markdown(src);
+            assert!(!html.to_lowercase().contains("javascript"), "{src}: {html}");
+            assert_eq!(
+                html.matches("<a ").count(),
+                html.matches("</a>").count(),
+                "{src}: {html}"
+            );
+        }
     }
 
     #[test]
