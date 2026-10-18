@@ -159,7 +159,7 @@ async fn task_executions(state: &AppState, conversation: &Conversation) -> Vec<E
     conversation_executions::project(&conversation_executions::Inputs {
         project_id: conversation.project_id,
         actions: &conversation.project_actions,
-        tasks: &*tasks,
+        tasks: &tasks,
         live: live.as_ref(),
         delivery_in_flight: &|task_id| state.task.deliveries.contains(task_id),
     })

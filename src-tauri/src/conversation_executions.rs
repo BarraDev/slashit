@@ -29,7 +29,9 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::domain::conversation::{ProjectAction, ProjectActionStatus, TaskMutation};
-use crate::domain::task::{ActivityKind, AttentionReason, ExecutedApproval, Task, TaskStatus};
+use crate::domain::task::{
+    ActivityColumn, ActivityKind, AttentionReason, ExecutedApproval, Task, TaskStatus,
+};
 
 /// The most recent execution-capable actions one Conversation shows.
 pub const MAX_EXECUTIONS: usize = 10;
@@ -227,6 +229,10 @@ fn view(
         .is_some_and(|binding| binding.approval_id == action.id);
     let (state, run) = match executed.as_slice() {
         [] if bound && task.status == TaskStatus::Queue => (ExecutionState::Queued, None),
+        // A start consumes the binding in the same write that records the run.
+        // A binding that survives into Error means the queued start failed before
+        // any run began, so it is a failure with no run number.
+        [] if bound && task.status == TaskStatus::Error => (ExecutionState::Failed, None),
         [] if bound => (ExecutionState::Ambiguous, None),
         [] if action.status == ProjectActionStatus::Approved => {
             (ExecutionState::PendingApproval, None)
@@ -251,8 +257,13 @@ fn view(
         Some(run) if terminal => result_for(task, run).unwrap_or(ResultView::NotRecorded),
         _ => ResultView::NotApplicable,
     };
-    let attention = match run {
-        Some(run) if run == latest => task.needs_you((inputs.delivery_in_flight)(task.id)),
+    let delivering = (inputs.delivery_in_flight)(task.id);
+    let attention = match (state, run) {
+        // A binding left by a failed start: the Task's Error is this approval's.
+        (ExecutionState::Failed, None) => task.needs_you(delivering),
+        (_, Some(run)) if run == latest && attention_belongs_to(task, run) => {
+            task.needs_you(delivering)
+        }
         _ => None,
     };
     ExecutionView {
@@ -318,6 +329,40 @@ fn result_for(task: &Task, run: u32) -> Option<ResultView> {
             },
         }),
         _ => None,
+    })
+}
+
+/// Whether the Task's current attention belongs to run `run`. Attention describes
+/// the Task as it is now, so it belongs to the run only while nothing after the
+/// run's last own milestone took the Task back to Backlog or Queue, failed it
+/// before a run began, stopped it or interrupted it. Those later records mean
+/// the current attention is about a different approval, or about none.
+fn attention_belongs_to(task: &Task, run: u32) -> bool {
+    let own = |kind: &ActivityKind| {
+        matches!(
+            kind,
+            ActivityKind::RunStarted { run: r, .. }
+                | ActivityKind::RunCompleted { run: r }
+                | ActivityKind::RunResult { run: r, .. }
+                | ActivityKind::RunFailed { run: Some(r), .. }
+                | ActivityKind::RecoveryRequired { run: Some(r), .. }
+                if *r == run
+        )
+    };
+    let Some(last_own) = task.activity.iter().rposition(|entry| own(&entry.kind)) else {
+        return false;
+    };
+    task.activity[last_own..].iter().all(|entry| {
+        !matches!(
+            entry.kind,
+            ActivityKind::Moved {
+                to: ActivityColumn::Backlog | ActivityColumn::Queue,
+                ..
+            } | ActivityKind::RunFailed { run: None, .. }
+                | ActivityKind::RecoveryRequired { run: None, .. }
+                | ActivityKind::Stopped { .. }
+                | ActivityKind::Interrupted { .. }
+        )
     })
 }
 
@@ -871,6 +916,68 @@ mod tests {
             newest.explanation.original_chars as usize,
             MAX_EXPLANATION_CHARS + 20
         );
+    }
+
+    #[test]
+    fn a_start_that_failed_before_any_run_is_a_failure_with_no_run_number() {
+        let mut task = task_in(project_id(), "Pre-start", TaskStatus::Backlog);
+        let b = enqueue(&task, ProjectActionStatus::Applied, applied(&task));
+        bind(&mut task, b.id, 1);
+        // Promotion failed after the binding was written. The binding was not cleared.
+        task.status = TaskStatus::Error;
+        task.record_activity(ActivityKind::RunFailed {
+            run: None,
+            reason: "no worktree".into(),
+        });
+        let tasks = store(vec![task]);
+        let view = only(&run_views(std::slice::from_ref(&b), &tasks, None), &b);
+
+        assert_eq!(view.state, ExecutionState::Failed);
+        assert_eq!(view.run, None);
+        assert_eq!(view.attention, Some(AttentionReason::Failed));
+        assert!(view.needs_human);
+    }
+
+    #[test]
+    fn later_board_state_is_not_attributed_to_an_earlier_completed_run() {
+        let mut task = task_in(project_id(), "Moved back", TaskStatus::Backlog);
+        let a = enqueue(&task, ProjectActionStatus::Applied, applied(&task));
+        start(&mut task, a.id, 1);
+        finish(&mut task, 1);
+        task.status = TaskStatus::HumanReview;
+        // A person moved the Task back to Backlog, then a later approval's start was refused.
+        task.record_activity(ActivityKind::Moved {
+            from: ActivityColumn::HumanReview,
+            to: ActivityColumn::Backlog,
+        });
+        task.status = TaskStatus::Error;
+        task.record_activity(ActivityKind::RunFailed {
+            run: None,
+            reason: "stale".into(),
+        });
+        let tasks = store(vec![task]);
+        let view = only(&run_views(std::slice::from_ref(&a), &tasks, None), &a);
+
+        assert_eq!(view.state, ExecutionState::Completed);
+        assert_eq!(view.attention, None);
+        assert!(!view.needs_human);
+    }
+
+    #[test]
+    fn a_completed_run_keeps_the_review_attention_it_produced() {
+        let mut task = task_in(project_id(), "Reviewed", TaskStatus::HumanReview);
+        let a = enqueue(&task, ProjectActionStatus::Applied, applied(&task));
+        start(&mut task, a.id, 1);
+        finish(&mut task, 1);
+        // The run's changes carried the Task into Human Review.
+        task.status = TaskStatus::HumanReview;
+        task.record_activity(ActivityKind::ReadyForReview { arrival: 1 });
+        let tasks = store(vec![task]);
+        let view = only(&run_views(std::slice::from_ref(&a), &tasks, None), &a);
+
+        assert_eq!(view.state, ExecutionState::Completed);
+        assert_eq!(view.attention, Some(AttentionReason::Review));
+        assert!(view.needs_human);
     }
 
     #[test]
