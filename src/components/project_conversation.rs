@@ -1,9 +1,19 @@
-use crate::models::{ConversationActionStatus, ConversationEntryKind, ConversationFieldChange, ConversationHumanAction, ConversationProjectAction, ConversationProjectActionOutcome, ConversationProjectActionStatus, ConversationRole, ConversationSnapshot, ConversationTaskMutation};
+use crate::components::attention::AttentionChip;
+use crate::models::{ConversationActionStatus, ConversationEntryKind, ConversationExecution, ConversationExecutionResult, ConversationExecutionState, ConversationFieldChange, ConversationHumanAction, ConversationProjectAction, ConversationProjectActionOutcome, ConversationProjectActionStatus, ConversationRole, ConversationSnapshot, ConversationTaskMutation};
 use crate::services::conversation_service;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Execution views refresh more slowly than the Coordinator and Worker
+/// liveness poll, and only while a run can still change.
+const EXECUTION_REFRESH_MS: u32 = 3_000;
+
+/// Refreshes of an unchanged `Unconfirmed` run before the refresh stops, about
+/// five minutes. Nothing settles such a run on its own, so polling it forever
+/// would only repeat the same answer.
+const UNCONFIRMED_STABLE_REFRESHES: u32 = 100;
 
 fn should_poll_snapshot(busy: bool, coordinator_live: bool, worker_live: bool) -> bool {
     busy || coordinator_live || worker_live
@@ -176,6 +186,104 @@ fn should_publish_snapshot(current: Option<(Uuid, u64)>, incoming: (Uuid, u64), 
     }
 }
 
+/// Whether the execution list still holds a run that can change without a
+/// Human decision. Queued and running runs keep refreshing; an unconfirmed run
+/// stops once it has been unchanged for a long time.
+fn should_refresh_executions(executions: &[ConversationExecution], stable_refreshes: u32) -> bool {
+    executions.iter().any(|execution| match execution.state {
+        ConversationExecutionState::Unconfirmed => stable_refreshes < UNCONFIRMED_STABLE_REFRESHES,
+        _ => execution.transitional,
+    })
+}
+
+/// What a Human reads for each execution state. The wording never calls a
+/// completed coding run delivered, and never says a run is alive from a
+/// persisted status alone.
+fn execution_state_text(state: ConversationExecutionState) -> &'static str {
+    match state {
+        ConversationExecutionState::PendingApproval => "Approved. No record shows the approval taking effect yet.",
+        ConversationExecutionState::Queued => "Queued by this approval. SlashIt's scheduler decides when the run starts.",
+        ConversationExecutionState::Running => "Running now in the Task Checkout.",
+        ConversationExecutionState::Unconfirmed => "Started, but its outcome is not confirmed yet. It is not counted as completed or failed.",
+        ConversationExecutionState::Completed => "The coding run completed. The Task may still be in review or delivery.",
+        ConversationExecutionState::Failed => "The run failed.",
+        ConversationExecutionState::RecoveryRequired => "The run's outcome needs your inspection before anything else runs.",
+        ConversationExecutionState::Ambiguous => "SlashIt's records do not identify one run for this approval, so none is linked.",
+        ConversationExecutionState::NoExecutionEvidence => "No run is recorded for this approval.",
+        ConversationExecutionState::TaskUnavailable => "The Task is missing or no longer belongs to this Project.",
+    }
+}
+
+/// The stable `data-state` value for an execution card, for tests and acceptance.
+fn execution_state_key(state: ConversationExecutionState) -> &'static str {
+    match state {
+        ConversationExecutionState::PendingApproval => "pending_approval",
+        ConversationExecutionState::Queued => "queued",
+        ConversationExecutionState::Running => "running",
+        ConversationExecutionState::Unconfirmed => "unconfirmed",
+        ConversationExecutionState::Completed => "completed",
+        ConversationExecutionState::Failed => "failed",
+        ConversationExecutionState::RecoveryRequired => "recovery_required",
+        ConversationExecutionState::Ambiguous => "ambiguous",
+        ConversationExecutionState::NoExecutionEvidence => "no_execution_evidence",
+        ConversationExecutionState::TaskUnavailable => "task_unavailable",
+    }
+}
+
+fn execution_run_text(run: Option<u32>) -> String {
+    match run {
+        Some(run) => format!("Run {run}"),
+        None => "Run not established yet".to_string(),
+    }
+}
+
+/// The approval that started the run, named as the Human approved it.
+fn approval_text(action: Option<&ConversationProjectAction>) -> &'static str {
+    match action.map(|action| &action.mutation) {
+        Some(ConversationTaskMutation::ExecuteRequest { .. }) => "Approved additional request",
+        _ => "Approved queue request",
+    }
+}
+
+/// One Task run started by an approved action, shown beside that action's
+/// event in the history. Its text is rendered as plain text only.
+fn execution_card(execution: ConversationExecution, approval: &'static str) -> impl IntoView {
+    let state = execution_state_key(execution.state);
+    let result = match execution.result {
+        ConversationExecutionResult::Available { text } | ConversationExecutionResult::Truncated { text } => {
+            let note = text.truncated.then(|| format!("Showing the first {} of {} characters.", text.text.chars().count(), text.original_chars));
+            view! {
+                <div data-testid="conversation-execution-result" class="whitespace-pre-wrap text-sm text-white/90">{text.text}</div>
+                {note.map(|note| view! { <p data-testid="conversation-execution-result-truncated" class="text-xs text-white/50">{note}</p> })}
+            }.into_any()
+        }
+        ConversationExecutionResult::Unavailable { reason } => view! {
+            <p data-testid="conversation-execution-result-unavailable" class="text-sm text-amber-100/80">{format!("The provider gave no final answer: {}", reason.text)}</p>
+        }.into_any(),
+        ConversationExecutionResult::NotRecorded => view! {
+            <p data-testid="conversation-execution-result-missing" class="text-sm text-white/50">"No result was recorded for this run."</p>
+        }.into_any(),
+        ConversationExecutionResult::NotApplicable => ().into_any(),
+    };
+    let attention = execution.needs_human.then(|| match execution.attention {
+        Some(reason) => view! { <div data-testid="conversation-execution-attention" class="flex items-center gap-2"><AttentionChip reason=reason /></div> }.into_any(),
+        None => view! { <div data-testid="conversation-execution-attention" class="text-xs text-amber-100/90">"Needs you: inspect this run before another attempt."</div> }.into_any(),
+    });
+    let explanation = (!execution.explanation.text.is_empty()).then(|| execution.explanation.text.clone());
+    view! {
+        <article data-testid="conversation-execution" data-state=state class="ml-4 rounded-lg border border-sky-300/20 bg-sky-400/5 px-3 py-2">
+            <div class="mb-1 text-xs font-medium text-white/50">"Task run"</div>
+            <div data-testid="conversation-execution-task" class="text-sm font-medium text-white">{execution.task_title}</div>
+            <div data-testid="conversation-execution-approval" class="text-xs text-white/50">{format!("{approval} · Task {}", execution.task_id.as_simple().to_string().chars().take(8).collect::<String>())}</div>
+            <div data-testid="conversation-execution-run" class="mt-1 text-xs text-white/70">{execution_run_text(execution.run)}</div>
+            <div data-testid="conversation-execution-state" class="mt-1 text-sm text-white/90">{execution_state_text(execution.state)}</div>
+            <div class="mt-2 space-y-1">{result}</div>
+            {attention}
+            {explanation.map(|text| view! { <p data-testid="conversation-execution-explanation" class="mt-2 text-xs text-white/50">{text}</p> })}
+        </article>
+    }
+}
+
 #[component]
 pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let (snapshot, set_snapshot) = signal(None::<ConversationSnapshot>);
@@ -183,6 +291,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     let (edits, set_edits) = signal(HashMap::<String, String>::new());
     let (busy, set_busy) = signal(false);
     let (error, set_error) = signal(None::<String>);
+    let (executions, set_executions) = signal(Vec::<ConversationExecution>::new());
     let (next_snapshot_request, set_next_snapshot_request) = signal(0u64);
     let (applied_snapshot_request, set_applied_snapshot_request) = signal(0u64);
     let begin_snapshot_request = Callback::new(move |()| {
@@ -198,6 +307,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         let current_version = current.as_ref().map(|current| (current.conversation.id, current.conversation.revision));
         let incoming_version = (value.conversation.id, value.conversation.revision);
         if should_publish_snapshot(current_version, incoming_version, request, applied_snapshot_request.get_untracked()) {
+            set_executions.set(value.executions.clone());
             set_snapshot.set(Some(value));
             set_applied_snapshot_request.set(request);
         }
@@ -247,6 +357,29 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
         spawn_local(async move { if let Ok(value) = conversation_service::get_project_conversation(id).await { publish.run((request, value)); } });
     })));
     on_cleanup(move || { timer.update_value(|value| { value.take(); }); });
+
+    // Execution views refresh on their own, slower clock. The liveness poll
+    // above stays scoped to the Coordinator and the legacy Conversation Worker.
+    // This read writes nothing, and it runs only while a shown run can still change.
+    let execution_id = project_id.clone();
+    let stable_refreshes = StoredValue::new_local(0u32);
+    let execution_timer = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(EXECUTION_REFRESH_MS, move || {
+        if snapshot.get_untracked().is_none() { return; }
+        let current = executions.get_untracked();
+        if !should_refresh_executions(&current, stable_refreshes.get_value()) { return; }
+        let id = execution_id.clone();
+        spawn_local(async move {
+            if let Ok(value) = conversation_service::get_project_conversation_executions(id).await {
+                if value == current {
+                    stable_refreshes.update_value(|count| *count = count.saturating_add(1));
+                } else {
+                    stable_refreshes.set_value(0);
+                    set_executions.set(value);
+                }
+            }
+        });
+    })));
+    on_cleanup(move || { execution_timer.update_value(|value| { value.take(); }); });
 
     let send_id = project_id.clone();
     let send_begin_request = begin_snapshot_request.clone();
@@ -341,7 +474,9 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                     {move || snapshot.get().map(|value| {
                         let actions = value.conversation.actions;
                         let project_actions = value.conversation.project_actions;
-                        value.conversation.entries.into_iter().filter_map(|entry| {
+                        let executions = executions.get();
+                        value.conversation.entries.into_iter().flat_map(|entry| {
+                            let applied = match &entry.kind { ConversationEntryKind::ProjectActionApplied { action_id, .. } => Some(*action_id), _ => None };
                             let (testid, text) = match entry.kind {
                                 ConversationEntryKind::HumanMessage { text } | ConversationEntryKind::CoordinatorReply { text } => ("conversation-message", Some(text)),
                                 ConversationEntryKind::ActionProposed { action_id } => ("conversation-action-event", actions.iter().find(|action| action.id == action_id).map(|action| format!("Proposed work for {} (Task {}): {}", action.target_task_title, action.target_task_id, action.request))),
@@ -352,7 +487,13 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                 ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", project_action_event_text(kind, &project_actions)),
                             };
                             let role = match entry.role { ConversationRole::Human => "You", ConversationRole::Coordinator => "Coordinator", ConversationRole::Worker => "Worker" };
-                            text.map(|text| view! { <article data-testid=testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 text-xs font-medium text-white/50">{role}</div><div class="whitespace-pre-wrap text-sm text-white/90">{text}</div></article> })
+                            let event = text.map(|text| view! { <article data-testid=testid class="rounded-lg bg-black/25 px-3 py-2"><div class="mb-1 text-xs font-medium text-white/50">{role}</div><div class="whitespace-pre-wrap text-sm text-white/90">{text}</div></article> }.into_any());
+                            // The run an approval started appears beside the event that applied it, so the history keeps it after the proposal card is gone.
+                            let card = applied.and_then(|action_id| executions.iter().find(|execution| execution.action_id == action_id).cloned()).map(|execution| {
+                                let approval = approval_text(project_actions.iter().find(|action| action.id == execution.action_id));
+                                execution_card(execution, approval).into_any()
+                            });
+                            event.into_iter().chain(card).collect::<Vec<_>>()
                         }).collect_view()
                     })}
                 </div>
@@ -661,5 +802,62 @@ mod tests {
         assert_eq!(pending_project_actions(&snapshot).len(), 1);
         let legacy = serde_json::json!({"conversation":{"id":Uuid::new_v4(),"project_id":Uuid::new_v4(),"revision":0,"created_at":"","updated_at":"","entries":[],"actions":[]},"coordinator_live":false,"worker_live":false,"run_status":null});
         assert!(pending_project_actions(&serde_json::from_value(legacy).unwrap()).is_empty());
+    }
+
+    fn execution(state: ConversationExecutionState, transitional: bool) -> ConversationExecution {
+        ConversationExecution {
+            action_id: Uuid::from_u128(1),
+            task_id: Uuid::from_u128(2),
+            task_title: "Task".into(),
+            state,
+            transitional,
+            run: Some(1),
+            result: ConversationExecutionResult::NotApplicable,
+            needs_human: false,
+            attention: None,
+            explanation: crate::models::ConversationBoundedText { text: String::new(), truncated: false, original_chars: 0 },
+        }
+    }
+
+    #[test]
+    fn execution_refresh_follows_only_runs_that_can_still_change() {
+        use ConversationExecutionState as S;
+        assert!(should_refresh_executions(&[execution(S::Queued, true)], 0));
+        assert!(should_refresh_executions(&[execution(S::Running, true)], 10_000));
+        assert!(!should_refresh_executions(&[execution(S::Completed, false)], 0));
+        assert!(!should_refresh_executions(&[execution(S::Failed, false), execution(S::NoExecutionEvidence, false)], 0));
+        assert!(!should_refresh_executions(&[], 0));
+        // An unconfirmed run keeps refreshing until it has been unchanged for the budget.
+        assert!(should_refresh_executions(&[execution(S::Unconfirmed, true)], UNCONFIRMED_STABLE_REFRESHES - 1));
+        assert!(!should_refresh_executions(&[execution(S::Unconfirmed, true)], UNCONFIRMED_STABLE_REFRESHES));
+    }
+
+    #[test]
+    fn each_execution_state_has_its_own_key_and_wording() {
+        use ConversationExecutionState as S;
+        let states = [S::PendingApproval, S::Queued, S::Running, S::Unconfirmed, S::Completed, S::Failed, S::RecoveryRequired, S::Ambiguous, S::NoExecutionEvidence, S::TaskUnavailable];
+        let keys: std::collections::HashSet<_> = states.iter().map(|state| execution_state_key(*state)).collect();
+        let texts: std::collections::HashSet<_> = states.iter().map(|state| execution_state_text(*state)).collect();
+        assert_eq!(keys.len(), states.len());
+        assert_eq!(texts.len(), states.len());
+        // A completed coding run is never presented as a delivered Task.
+        assert!(execution_state_text(S::Completed).contains("may still be in review"));
+        assert!(execution_state_text(S::Unconfirmed).contains("not counted as completed or failed"));
+    }
+
+    #[test]
+    fn an_execution_names_the_approval_that_started_it() {
+        let queue = ConversationProjectAction {
+            id: Uuid::from_u128(1),
+            explanation: String::new(),
+            mutation: ConversationTaskMutation::EnqueueTask { target_task_id: Uuid::from_u128(2), target_task_title: "T".into(), from: "backlog".into(), input: None },
+            status: ConversationProjectActionStatus::Applied,
+            outcome: None,
+            created_at: String::new(),
+        };
+        assert_eq!(approval_text(Some(&queue)), "Approved queue request");
+        assert_eq!(approval_text(None), "Approved queue request");
+        assert_eq!(execution_run_text(None), "Run not established yet");
+        assert_eq!(execution_run_text(Some(3)), "Run 3");
     }
 }
