@@ -161,25 +161,7 @@ private state.
   revision's run, an unpushed fix, a stale review, or pending CI.
 - Cleanup outside your own workspace (toolchains, `~/.cargo`, other
   workspaces) needs explicit authorization.
-
-### Change size and review
-
-- Before changing a shared function or interface, grep its callers, including
-  Tauri `invoke` names, `generate_handler!` in `src-tauri/src/lib.rs`, tests, and scripts.
-- Prefer existing project mechanisms and plain code to new abstractions,
-  wrappers, options, or dependencies. Delete redundancy only when it is safe.
-- Keep code that enforces an invariant or authorization boundary, such as
-  `GuiMutation` admission, durable write ordering, Task lifecycle ownership,
-  provider and checkout leases, recovery evidence, and human authorization, even
-  when it looks unused.
-- A review finding needs evidence: a reproducing input, a wrong state transition,
-  a reachable failure, or a violated invariant.
-- Test depth follows risk: significant new logic needs regression evidence,
-  including negative paths. Comment and documentation edits need no full-suite run.
-- Record a deliberate limitation, its reason, and its revisit trigger where a
-  future maintainer needs them.
-- A clean review does not replace hosted CI, exact-commit validation, or the
-  gates in `docs/development-workflow.md`.
+- Follow the change size and review standards in `docs/development-workflow.md`.
 
 ### Tooling
 
@@ -202,39 +184,57 @@ private state.
 ### Reports and sessions
 
 - Each substantial unit of work produces one authoritative report in
-  `../slashit-private/reports/` (local, untracked), plus at most a bounded
-  worklog. Do not store full chat transcripts.
+  `../slashit-private/reports/`, plus at most a bounded worklog.
+  `slashit-private` is local, untracked maintainer state, not part of the
+  repository. Do not store full chat transcripts.
 - Start a fresh session at substantial unit boundaries. Lessons that must
   outlive a report are rewritten into project docs.
 
 ### Pull requests and published text
 
-- A PR is one semantic delivery unit, not one per review finding. Stack PRs only
-  for real dependencies; keep each independently truthful.
-- PR titles and bodies, commit messages, and source comments must stay useful to
-  a future reader: no work-tracking labels, session narration, temporary SHAs,
-  private report paths, or AI attribution (see below).
+- A PR is a semantic delivery unit, not one PR per review finding. Stack PRs
+  only for real dependencies, and keep every PR in a stack independently
+  truthful.
+- PR titles and bodies, commit messages, and source comments must stay useful
+  to a future reader. They must not contain internal work-tracking labels,
+  session narration, temporary verification SHAs, private report paths, or AI
+  attribution (see below).
 - Do not post transient agent-status comments on PRs.
 
 ### Authorization
 
 - Local work inside your own workspace (edits, `jj` changes, builds, tests)
   is normal and needs no gate.
-- Public or destructive operations (push, PRs and issues, publication
-  bookmarks, abandoning work you do not own) need explicit authorization
-  proportionate to their blast radius.
-- Merging, GitHub settings changes, force-pushes, and deleting remote branches
-  or tags require the repository owner's explicit approval every time.
+- Public or destructive operations (push, creating or editing PRs and issues,
+  publication bookmarks, abandoning or deleting work or workspaces you do not
+  own) require an explicit authorization appropriate to their blast
+  radius.
+- Merging, repository or GitHub settings changes, force-pushes or other
+  rewrites of published checkpoints, and deleting remote branches or tags
+  require the repository owner's explicit approval every time.
 
 ### No AI Attribution in Public Repository Artifacts
 
-Published artifacts (commits, PRs, comments, issues, release notes, tags) must
-contain **no AI session URLs, session identifiers, or AI attribution**, unless
-the user asks for one in that artifact. Never add a `Claude-Session:` or other
-session trailer, a session link, `Co-Authored-By:` for any AI assistant, or
-"Generated with/by Claude" or "Made with <AI tool>" text. Before every commit,
-push, or PR or issue write, check what becomes public, and remove any such text
-now rather than leaving it for a follow-up. Keep provenance in private notes.
+Commits, PR titles and bodies, PR and issue comments, issues, release notes,
+tags and any other published repository artifact must contain **no AI session
+URLs, session identifiers, or AI attribution**, unless the user explicitly
+asks for one in that specific artifact.
+
+Never add, among others:
+
+- `Claude-Session:` or any other session trailer
+- `claude.ai/code/session/...` or an equivalent link for any AI tool
+- `Co-Authored-By: Claude` (or another AI assistant)
+- "Generated with/by Claude", "Made with <AI tool>" and similar
+
+Before every commit, push, or PR/issue write, inspect what is about to become
+public -- commit messages, the PR body, comment text, generated metadata --
+and confirm none of the above is present. If attribution slipped into work
+that is still unpublished or still amendable, remove it before finishing
+rather than leaving it for a follow-up.
+
+Tool and session provenance belongs in private working notes, not in the
+repository's public history.
 
 ## Nested AGENTS.md
 
