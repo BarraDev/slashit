@@ -1230,6 +1230,8 @@ pub(crate) mod tests {
         tcp: Option<Endpoint>,
         local_fault: Option<Arc<AcceptFault>>,
         tcp_fault: Option<Arc<AcceptFault>>,
+        /// The TCP listener's slot, emptied when its accept loop gives up.
+        tcp_listener: Option<Arc<tokio::sync::Mutex<Option<IpcListener>>>>,
         stop: tokio::sync::watch::Sender<bool>,
         ownership: Option<IpcOwnership>,
         server: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
@@ -1302,6 +1304,11 @@ pub(crate) mod tests {
             };
             let local_fault = fault_of(true);
             let tcp_fault = fault_of(false);
+            let tcp_listener = bound
+                .listeners
+                .iter()
+                .find(|owner| !owner.endpoint.is_os_authenticated())
+                .map(|owner| owner.listener.clone());
             let ownership = bound.ownership();
 
             let (stop, shutdown) = tokio::sync::watch::channel(false);
@@ -1325,6 +1332,7 @@ pub(crate) mod tests {
                 tcp,
                 local_fault,
                 tcp_fault,
+                tcp_listener,
                 stop,
                 ownership: Some(ownership),
                 server: Some(server),
@@ -1381,6 +1389,21 @@ pub(crate) mod tests {
                 Err(error) => panic!("connecting failed for a reason other than refusal: {error}"),
             }
         }
+    }
+
+    /// Waits until the accept loop has given up on `slot` and dropped its
+    /// listener. Probing before that connects into a backlog nobody accepts
+    /// from, and when the listener closes, the kernel resets those queued
+    /// connections: a probe still waiting on its connect then sees
+    /// `ECONNRESET`, which says nothing about whether the listener serves.
+    async fn until_listener_retired(slot: &tokio::sync::Mutex<Option<IpcListener>>) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while slot.lock().await.is_some() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the failed optional listener is retired");
     }
 
     /// Acquire the endpoint after a release, tolerating the instant in which a
@@ -1562,10 +1585,11 @@ pub(crate) mod tests {
         let tcp = rig.tcp.clone().expect("tcp bound");
 
         rig.tcp_fault.as_ref().unwrap().fail();
+        until_listener_retired(rig.tcp_listener.as_ref().unwrap()).await;
 
         tokio::time::timeout(Duration::from_secs(10), until_connection_refused(&tcp))
-        .await
-        .expect("the failed optional listener is closed, so its clients are refused");
+            .await
+            .expect("the failed optional listener is closed, so its clients are refused");
         assert!(!rig.server_finished(), "TCP is optional: the server carries on");
         assert!(rig.executor.is_accepting_work());
         assert!(rig.ping(&rig.local).await.unwrap().ok, "the local owner still answers");
