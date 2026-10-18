@@ -273,7 +273,7 @@ pub async fn get_project_conversation(
             if interrupted_worker {
                 conversation.push(Role::Worker, EntryKind::RunFailed {
                     role: Role::Worker,
-                    message: "The application restarted while this Worker may have been changing its Task Checkout. The Worker was not replayed; inspect the checkout before approving another attempt.".into(),
+                    message: "The application restarted while this Worker may have been changing its Task Checkout. The Worker was not replayed, and direct delegation is retired, so no new attempt starts from this record. Inspect the checkout if it may have changed.".into(),
                 });
             }
             if conversation
@@ -633,6 +633,14 @@ pub async fn act_on_project_conversation(
         if conversation.id != conversation_id || conversation.project_id != project_id {
             return Err("Conversation does not belong to this Project".into());
         }
+        // A repeated withdrawal of an already withdrawn approval is answered even
+        // with a stale revision: the withdrawal already happened, and this one
+        // records nothing. A lost response therefore cannot turn into an error.
+        if matches!(action, HumanAction::Withdraw)
+            && conversation.actions.iter().any(|item| item.id == action_id && item.status == ActionStatus::Withdrawn)
+        {
+            return Ok(snapshot(&state, conversation, None).await);
+        }
         if conversation.revision != revision {
             return Err("Conversation changed; reload before acting".into());
         }
@@ -658,20 +666,11 @@ pub async fn act_on_project_conversation(
             conversation_actions::decide(&scope, &mut conversation, action_id, decision).await?;
             return Ok(snapshot(&state, conversation, None).await);
         }
-        // Retirement gate for direct delegation. Withdrawal only records the
-        // Human's decision. Approval, including a retry of an earlier approval,
-        // is refused here, before any decision is recorded, any editing owner
-        // or provider lease is taken, the checkout is read, or a provider runs.
         if matches!(action, HumanAction::Withdraw) {
             withdraw_legacy_approval(&mut conversation, action_id, |candidate| {
                 state.storage.save_conversation(candidate).map_err(|error| error.to_string())
             })?;
             return Ok(snapshot(&state, conversation, None).await);
-        }
-        if matches!(action, HumanAction::Approve { .. })
-            && conversation.actions.iter().any(|item| item.id == action_id)
-        {
-            return Err(RETIRED_APPROVAL_REFUSAL.into());
         }
         let action_record = conversation
             .actions
@@ -683,6 +682,14 @@ pub async fn act_on_project_conversation(
             ActionStatus::Proposed | ActionStatus::Approved
         ) {
             return Err("Action is no longer awaiting approval or safe to start".into());
+        }
+        // Retirement gate for direct delegation. Only a Proposed or Approved
+        // legacy action reaches this point. Approval, including a retry of an
+        // earlier approval, is refused before any decision is recorded, any
+        // editing owner or provider lease is taken, the checkout is read, or a
+        // provider runs.
+        if matches!(action, HumanAction::Approve { .. }) {
+            return Err(RETIRED_APPROVAL_REFUSAL.into());
         }
         if matches!(&action, HumanAction::Reject) && !can_reject(action_record.status) {
             return Err("An approved delegation can only be withdrawn, not rejected".into());
@@ -1026,7 +1033,7 @@ async fn proposal_checkout(
 /// What the Human sees when an approval would start a retired direct
 /// delegation. It is refused before any decision is recorded, any editing
 /// owner or provider lease is taken, the checkout is read, or a provider runs.
-const RETIRED_APPROVAL_REFUSAL: &str = "Direct delegation to a Task Worker is retired, so this action cannot start a Worker. Nothing was started or changed. Reject it, or withdraw an earlier approval. For new work, ask the Coordinator for a Task action you can approve.";
+const RETIRED_APPROVAL_REFUSAL: &str = "Direct delegation to a Task Worker is retired, so this action cannot start a Worker. Nothing was started or changed. Reject a proposal, or withdraw an earlier approval. For new work, ask the Coordinator for a Task action you can approve.";
 
 /// Withdraws the Human's approval of a retired direct delegation.
 ///
@@ -2433,14 +2440,18 @@ mod tests {
             assert_eq!(repeated.revision, after.revision);
             assert_eq!(repeated.entries.len(), after.entries.len());
 
-            // A stale client request is refused by the revision check and changes nothing.
-            let stale = fx.act(action, before.revision, super::super::HumanAction::Withdraw).await.expect_err("stale");
-            assert!(stale.contains("Conversation changed"), "{stale}");
+            // A repeat sent with a stale revision (a lost response) is answered too, and changes nothing.
+            fx.act(action, before.revision, super::super::HumanAction::Withdraw)
+                .await
+                .expect("a repeated withdrawal is idempotent even with a stale revision");
+            assert_eq!(fx.conversation().revision, after.revision);
             assert_eq!(fx.conversation().entries.len(), after.entries.len());
 
             // The withdrawn approval can never be approved again.
             let refusal = fx.approve(action).await.expect_err("a withdrawn approval is not retried");
-            fx.assert_retired_refusal(&refusal);
+            assert!(refusal.contains("no longer awaiting"), "{refusal}");
+            assert!(!refusal.contains("retired"), "a withdrawn action is not a retirement case: {refusal}");
+            assert_eq!(fx.status_of(action), ActionStatus::Withdrawn);
 
             // The Task, its checkout and the provider are untouched.
             let task_after = fx.state().task.tasks.read().await[&fx.task_id].clone();
