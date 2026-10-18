@@ -1598,9 +1598,11 @@ mod tests {
         assert!(conversation.entries.is_empty());
     }
 
-    /// A Conversation Worker delegation must not reach a Task Checkout whose
-    /// Worker recovery evidence is unresolved, whether or not the Human had
-    /// already approved the action.
+    /// A retired direct delegation is refused by the retirement gate, which runs
+    /// before the Task's Worker recovery evidence is consulted. The refusal does
+    /// not depend on that evidence, so these cases do not prove the
+    /// recovery-evidence refusal itself; that branch is kept only behind the
+    /// gate until D5 removes the launch code.
     #[cfg(unix)]
     mod recovery_refusal {
         use super::*;

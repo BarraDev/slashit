@@ -45,9 +45,10 @@ The strict output contract is `Reply { text }`, `CreateTask`, `EditTask`,
 and fields are refused. Direct delegation to a Task Worker is retired: a
 `delegate_to_task` output still parses, but on both the ordinary and the
 follow-up path SlashIt records a bounded refusal, creates no `TaskAction` and
-starts nothing. Prose cannot trigger an action. A proposal is persisted and displayed, but cannot start a Worker until
-a Human explicitly approves it. Approval can replace the request; the saved
-approved request is the execution authority.
+starts nothing. Prose cannot trigger an action. A proposal is persisted and
+displayed, but cannot start a Worker until a Human explicitly approves it.
+Approval can replace the request; the saved approved request is the execution
+authority.
 
 A Worker is admitted only for an existing Task in the Conversation's Project.
 The Task must already have a valid Git Task Checkout on its recorded branch,
@@ -231,14 +232,14 @@ recovery work. That is deliberately not tracked as one large issue now.
 ## Future scope
 
 The current implementation includes Project Conversations, ordinary replies,
-bounded Task visibility, Human-gated Task creation and editing, explicit Human
-approval, and Task-scoped Worker execution through the normal Task lifecycle.
-Direct delegation to a Worker is retired (its historical records stay
-readable). Moving or queueing Tasks,
-pull request and CI capabilities, tracker synchronization, Workspace
-Conversations, context compaction, multiple Workers, provider-session resume,
-and richer provider adapters remain future work. The Conversation direction
-is one continuous Conversation per Project with bounded, rebuilt provider
+bounded Task visibility, Human-gated Task creation, editing, moving and queueing,
+explicit Human approval, and Task-scoped Worker execution through the normal
+Task lifecycle. Direct delegation to a Worker is retired (its historical
+records stay readable). Pull request and CI capabilities, tracker
+synchronization, Workspace Conversations, context compaction, multiple Workers,
+provider-session resume, and richer provider adapters remain future work. The
+Conversation direction is one continuous Conversation per Project with bounded,
+rebuilt provider
 context, not several concurrent Conversations; see
 [project-conversation-history.md](project-conversation-history.md). ACP remains
 an adapter boundary and is not part of the Project Conversation execution path.
