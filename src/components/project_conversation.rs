@@ -245,6 +245,15 @@ fn approval_text(action: Option<&ConversationProjectAction>) -> &'static str {
     }
 }
 
+/// What approving does, as the proposal card states it. A queue request queues a
+/// run that SlashIt's scheduler starts, so it must not say that no work starts.
+fn approval_effect_note(mutation: &ConversationTaskMutation) -> &'static str {
+    match mutation {
+        ConversationTaskMutation::EnqueueTask { .. } | ConversationTaskMutation::ExecuteRequest { .. } => "Approving queues this Task. SlashIt's scheduler decides when its run starts.",
+        _ => "Approving only changes this Task's record. It does not start any work.",
+    }
+}
+
 /// One Task run started by an approved action, shown beside that action's
 /// event in the history. Its text is rendered as plain text only.
 fn execution_card(execution: ConversationExecution, approval: &'static str) -> impl IntoView {
@@ -363,17 +372,23 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
     // This read writes nothing, and it runs only while a shown run can still change.
     let execution_id = project_id.clone();
     let stable_refreshes = StoredValue::new_local(0u32);
+    let seen_executions = StoredValue::new_local(Vec::<ConversationExecution>::new());
     let execution_timer = StoredValue::new_local(Some(gloo_timers::callback::Interval::new(EXECUTION_REFRESH_MS, move || {
         if snapshot.get_untracked().is_none() { return; }
         let current = executions.get_untracked();
+        // Any change to the list, from a refresh or from a published snapshot, restarts the unconfirmed budget.
+        if seen_executions.with_value(|seen| *seen != current) {
+            seen_executions.set_value(current.clone());
+            stable_refreshes.set_value(0);
+        }
         if !should_refresh_executions(&current, stable_refreshes.get_value()) { return; }
         let id = execution_id.clone();
         spawn_local(async move {
             if let Ok(value) = conversation_service::get_project_conversation_executions(id).await {
                 if value == current {
                     stable_refreshes.update_value(|count| *count = count.saturating_add(1));
-                } else {
-                    stable_refreshes.set_value(0);
+                } else if executions.get_untracked() == current {
+                    // Apply the response only if nothing newer arrived while it was in flight. A newer snapshot is never overwritten by an older read; the next tick refreshes again when needed.
                     set_executions.set(value);
                 }
             }
@@ -535,6 +550,9 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                             let approve_id = action.id.to_string(); let reject_id = approve_id.clone();
                             let approve_action = approve_action.clone(); let reject_action = reject_action.clone();
                             let status = format!("{:?}", action.status).to_lowercase();
+                            let action_id = action.id;
+                            let note = approval_effect_note(&action.mutation);
+                            let approval = approval_text(Some(&action));
                             view! {
                                 <article data-testid="project-action-proposal" data-status=status class="rounded-lg border border-amber-300/30 bg-amber-400/5 p-3">
                                     <div class="text-xs uppercase tracking-wide text-amber-200">{format!("Coordinator proposes: {}", view.heading)}</div>
@@ -543,7 +561,9 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                     <dl class="mt-2 space-y-1 text-sm" data-testid="project-action-details">
                                         {view.rows.into_iter().map(|(label, value)| view! { <div class="flex gap-2"><dt class="w-24 shrink-0 text-xs text-white/50">{label}</dt><dd class="whitespace-pre-wrap break-words text-white/90">{value}</dd></div> }).collect_view()}
                                     </dl>
-                                    <p class="mt-2 text-xs text-white/50">"Approving only changes this Task's record. It does not start any work."</p>
+                                    <p class="mt-2 text-xs text-white/50">{note}</p>
+                                    // An approved action whose apply has not finished may already have started a run: show what the records say, under the proposal.
+                                    {move || executions.get().into_iter().find(|execution| execution.action_id == action_id).map(|execution| execution_card(execution, approval))}
                                     <div class="mt-2 flex gap-2">
                                         {controls.approve_label.map(|label| view! { <button data-testid="project-action-approve" class="rounded bg-emerald-700 px-3 py-1 text-sm" disabled=move || busy.get() on:click=move |_| approve_action.run((approve_id.clone(), None))>{label}</button> })}
                                         {controls.can_reject.then(|| view! { <button data-testid="project-action-reject" class="rounded border border-white/20 px-3 py-1 text-sm" disabled=move || busy.get() on:click=move |_| reject_action.run(reject_id.clone())>"Reject"</button> })}
@@ -859,5 +879,14 @@ mod tests {
         assert_eq!(approval_text(None), "Approved queue request");
         assert_eq!(execution_run_text(None), "Run not established yet");
         assert_eq!(execution_run_text(Some(3)), "Run 3");
+    }
+
+    #[test]
+    fn approval_wording_matches_what_approval_does() {
+        let enqueue = ConversationTaskMutation::EnqueueTask { target_task_id: Uuid::from_u128(2), target_task_title: "T".into(), from: "backlog".into(), input: None };
+        assert!(approval_effect_note(&enqueue).contains("queues this Task"));
+        assert!(!approval_effect_note(&enqueue).contains("does not start any work"));
+        let edit = ConversationTaskMutation::EditTask { target_task_id: Uuid::from_u128(2), target_task_title: "T".into(), changes: vec![] };
+        assert!(approval_effect_note(&edit).contains("does not start any work"));
     }
 }
