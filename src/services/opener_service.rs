@@ -1,5 +1,6 @@
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 
 #[wasm_bindgen]
 extern "C" {
@@ -17,8 +18,8 @@ fn js_error_to_string(value: JsValue) -> String {
 }
 
 /// Opens `url` in the user's default external browser via the
-/// `tauri-plugin-opener` plugin. Webview `<a target="_blank">` does not open
-/// an external browser by itself, so call this from click handlers.
+/// `tauri-plugin-opener` plugin. Webview navigation to an external page is
+/// refused by the backend, so an external link can only leave through here.
 ///
 /// Uses the fallible `raw_invoke` binding rather than the `-> JsValue` one
 /// most services use: a rejected `open_url` call (no default browser
@@ -32,4 +33,78 @@ pub async fn open_url_external(url: String) -> Result<(), String> {
         .await
         .map_err(js_error_to_string)?;
     Ok(())
+}
+
+/// Whether a link destination is an absolute `http`, `https` or `mailto` URL
+/// that may be opened externally. Case-insensitive; a destination with
+/// whitespace or control characters is refused, because a browser strips
+/// those before it reads the scheme.
+pub fn is_safe_link_destination(url: &str) -> bool {
+    let has_scheme = |scheme: &str| {
+        url.get(..scheme.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+    };
+    ["http://", "https://", "mailto:"]
+        .into_iter()
+        .any(has_scheme)
+        && !url.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// Whether a mouse button opens a link: the primary button (`click`) and the
+/// auxiliary middle button. Any other button keeps its default behavior, so a
+/// right-click still reaches the context menu instead of opening a browser.
+fn opens_link_on_button(button: i16) -> bool {
+    matches!(button, 0 | 1)
+}
+
+/// Routes clicks on external links, anywhere in the document, through
+/// `open_url_external`. Installed once at startup. The listener runs in the
+/// capture phase, so no component can stop it, and each click is handled once.
+pub fn route_external_links() {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let on_mouse = Closure::<dyn Fn(web_sys::MouseEvent)>::new(|ev: web_sys::MouseEvent| {
+        if !opens_link_on_button(ev.button()) {
+            return;
+        }
+        let Some(anchor) = ev
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            .and_then(|el| el.closest("a").ok().flatten())
+        else {
+            return;
+        };
+        let Some(href) = anchor.get_attribute("href") else {
+            return;
+        };
+        if !is_safe_link_destination(&href) {
+            return;
+        }
+        ev.prevent_default();
+        spawn_local(async move {
+            if let Err(e) = open_url_external(href).await {
+                crate::components::toast::error(format!("Could not open the link: {e}"));
+            }
+        });
+    });
+    let listener: &js_sys::Function = on_mouse.as_ref().unchecked_ref();
+    for event in ["click", "auxclick"] {
+        let _ = document.add_event_listener_with_callback_and_bool(event, listener, true);
+    }
+    // The listener lives for the whole session, so the closure is leaked on purpose.
+    on_mouse.forget();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::opens_link_on_button;
+
+    #[test]
+    fn primary_and_middle_buttons_open_links_and_the_others_do_not() {
+        assert!(opens_link_on_button(0));
+        assert!(opens_link_on_button(1));
+        assert!(!opens_link_on_button(2));
+        assert!(!opens_link_on_button(3));
+    }
 }

@@ -19,5 +19,6 @@ use leptos::prelude::*;
 
 fn main() {
     console_error_panic_hook::set_once();
+    services::route_external_links();
     mount_to_body(App);
 }

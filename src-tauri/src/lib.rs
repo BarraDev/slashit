@@ -9,6 +9,7 @@ mod session;
 mod queue;
 mod pty;
 mod worktree;
+mod main_window;
 mod storage_accounting;
 /// What GitHub last said about the pull requests linked to tasks.
 pub mod pr_status;
@@ -233,6 +234,8 @@ pub fn run() {
             let restart_requested = restart_requested.clone();
             let ownership_slot = ownership_slot.clone();
             move |app| {
+            // The main window first, so nothing below runs before its boundary exists.
+            main_window::create(app)?;
             let state: tauri::State<AppState> = app.state();
 
             // The webview exists now, so the sink the rest of the backend
