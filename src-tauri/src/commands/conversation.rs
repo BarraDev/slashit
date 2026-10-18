@@ -4,10 +4,11 @@ use crate::domain::conversation::{
     ActionStatus, Conversation, CoordinatorOutput, EntryKind, Role, TaskAction,
 };
 use crate::conversation_actions::{self, Decision};
+use crate::conversation_executions::{self, ExecutionView};
 use crate::domain::AgentStatus;
 use crate::AppState;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -74,6 +75,9 @@ pub struct Snapshot {
     pub worker_live: bool,
     pub run_status: Option<AgentStatus>,
     pub continuation_error: Option<String>,
+    /// What each recent approved action's Task run has become. Built from the
+    /// Task records at read time and never stored in the Conversation.
+    pub executions: Vec<ExecutionView>,
 }
 
 #[derive(Debug)]
@@ -130,13 +134,35 @@ async fn snapshot(
         .iter()
         .any(|action| action.status == ActionStatus::Running)
         && live;
+    let executions = task_executions(state, &conversation).await;
     Snapshot {
         conversation,
         coordinator_live: live && !worker_live,
         worker_live,
         run_status: live.then_some(AgentStatus::Running),
         continuation_error,
+        executions,
     }
+}
+
+/// The execution views for one Conversation's approved actions, from the
+/// Task records as they are now. The executor is asked before the Task store
+/// is locked, and the lock is held only for the synchronous projection.
+async fn task_executions(state: &AppState, conversation: &Conversation) -> Vec<ExecutionView> {
+    // `None` when the executor is not installed yet: liveness is then unknown,
+    // and no run is reported as running.
+    let live: Option<HashSet<Uuid>> = match state.executor.get() {
+        Some(executor) => Some(executor.live_runs().await.into_iter().map(|run| run.task_id).collect()),
+        None => None,
+    };
+    let tasks = state.task.tasks.read().await;
+    conversation_executions::project(&conversation_executions::Inputs {
+        project_id: conversation.project_id,
+        actions: &conversation.project_actions,
+        tasks: &*tasks,
+        live: live.as_ref(),
+        delivery_in_flight: &|task_id| state.task.deliveries.contains(task_id),
+    })
 }
 
 async fn load_or_create(state: &AppState, project_id: Uuid) -> Result<Conversation, String> {
@@ -268,6 +294,35 @@ pub async fn get_project_conversation(
         conversation
     };
     Ok(snapshot(&state, conversation, None).await)
+}
+
+/// The execution views alone, for the Conversation's bounded refresh. It reads
+/// the saved Conversation and the Task records and writes nothing, so it does
+/// not run the restart reconciliation that `get_project_conversation` owns.
+#[tauri::command]
+pub async fn get_project_conversation_executions(
+    _gui: GuiMutation,
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<ExecutionView>, String> {
+    let project_id = parse_id(&project_id, "Project id")?;
+    if !state
+        .project
+        .projects
+        .read()
+        .await
+        .contains_key(&project_id)
+    {
+        return Err("Project not found".into());
+    }
+    let Some(conversation) = state
+        .storage
+        .load_primary_conversation(project_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(task_executions(&state, &conversation).await)
 }
 
 #[tauri::command]
