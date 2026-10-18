@@ -35,6 +35,10 @@ pub enum ActionStatus {
     Rejected,
     Interrupted,
     Failed,
+    /// A Human withdrew the approval of a retired direct delegation before it
+    /// started. Terminal: the historical approval event is kept, and the Task
+    /// is never touched.
+    Withdrawn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -591,6 +595,12 @@ pub enum EntryKind {
         action_id: Uuid,
         reason: String,
     },
+    /// The Human withdrew an approval of a retired direct delegation. `revision`
+    /// is the Conversation revision the Human acted on.
+    ActionWithdrawn {
+        action_id: Uuid,
+        revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -816,6 +826,7 @@ impl Conversation {
                     _ => serde_json::json!({"kind":"project_action_applied","action_id":action_id,"task_id":task_id}),
                 }),
                 EntryKind::ProjectActionRefused { action_id, reason } => Some(serde_json::json!({"kind":"project_action_refused","action_id":action_id,"reason":reason.chars().take(1000).collect::<String>()})),
+                EntryKind::ActionWithdrawn { action_id, .. } => Some(serde_json::json!({"kind":"action_withdrawn","action_id":action_id,"scope":DECISION_SCOPE,"note":"The Human withdrew an earlier approval of a retired direct delegation. Nothing was started."})),
             }).take(PROJECTION_MESSAGE_COUNT).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>();
         serde_json::json!({
             "project": {"name": project_name, "root": project_root},

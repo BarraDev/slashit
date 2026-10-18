@@ -114,6 +114,9 @@ fn preserve_saved_conversation(
 pub enum HumanAction {
     Approve { request: Option<String> },
     Reject,
+    /// Withdraws the Human's approval of a retired direct delegation that has
+    /// not started. Nothing is executed and the Task is not changed.
+    Withdraw,
 }
 
 fn parse_id(value: &str, what: &str) -> Result<Uuid, String> {
@@ -640,6 +643,9 @@ pub async fn act_on_project_conversation(
                     return Err("This action cannot be edited before approval".into());
                 }
                 HumanAction::Reject => Decision::Reject,
+                HumanAction::Withdraw => {
+                    return Err("Only an approval of a retired direct delegation can be withdrawn".into());
+                }
             };
             let scope = conversation_actions::Scope {
                 project_id,
@@ -651,6 +657,21 @@ pub async fn act_on_project_conversation(
             };
             conversation_actions::decide(&scope, &mut conversation, action_id, decision).await?;
             return Ok(snapshot(&state, conversation, None).await);
+        }
+        // Retirement gate for direct delegation. Withdrawal only records the
+        // Human's decision. Approval, including a retry of an earlier approval,
+        // is refused here, before any decision is recorded, any editing owner
+        // or provider lease is taken, the checkout is read, or a provider runs.
+        if matches!(action, HumanAction::Withdraw) {
+            withdraw_legacy_approval(&mut conversation, action_id, |candidate| {
+                state.storage.save_conversation(candidate).map_err(|error| error.to_string())
+            })?;
+            return Ok(snapshot(&state, conversation, None).await);
+        }
+        if matches!(action, HumanAction::Approve { .. })
+            && conversation.actions.iter().any(|item| item.id == action_id)
+        {
+            return Err(RETIRED_APPROVAL_REFUSAL.into());
         }
         let action_record = conversation
             .actions
@@ -664,9 +685,12 @@ pub async fn act_on_project_conversation(
             return Err("Action is no longer awaiting approval or safe to start".into());
         }
         if matches!(&action, HumanAction::Reject) && !can_reject(action_record.status) {
-            return Err("An approved delegation cannot be rejected".into());
+            return Err("An approved delegation can only be withdrawn, not rejected".into());
         }
         match action {
+            HumanAction::Withdraw => {
+                return Err("Withdrawal is handled before the action is looked up".into());
+            }
             HumanAction::Reject => {
                 action_record.status = ActionStatus::Rejected;
                 conversation.push(
@@ -997,6 +1021,58 @@ async fn proposal_checkout(
         .remove(&project_id)
         .ok_or("This Project has no repository to inspect its Task Checkout in")?;
     conversation_actions::inspect_existing_checkout(&repo_path, &task).await.map(Some)
+}
+
+/// What the Human sees when an approval would start a retired direct
+/// delegation. It is refused before any decision is recorded, any editing
+/// owner or provider lease is taken, the checkout is read, or a provider runs.
+const RETIRED_APPROVAL_REFUSAL: &str = "Direct delegation to a Task Worker is retired, so this action cannot start a Worker. Nothing was started or changed. Reject it, or withdraw an earlier approval. For new work, ask the Coordinator for a Task action you can approve.";
+
+/// Withdraws the Human's approval of a retired direct delegation.
+///
+/// Only an `Approved` action that has not started can be withdrawn. Repeating
+/// the withdrawal of an already withdrawn action changes nothing and records
+/// nothing. The withdrawn candidate is saved before `conversation` changes, so
+/// a failed save leaves the in-memory Conversation as it was and reports no
+/// success. The historical approval event is kept, and the Task is never read
+/// or written here.
+fn withdraw_legacy_approval<F>(
+    conversation: &mut Conversation,
+    action_id: Uuid,
+    save: F,
+) -> Result<bool, String>
+where
+    F: FnOnce(&Conversation) -> Result<(), String>,
+{
+    let status = conversation
+        .actions
+        .iter()
+        .find(|action| action.id == action_id)
+        .ok_or("Action not found")?
+        .status;
+    match status {
+        ActionStatus::Approved => {}
+        ActionStatus::Withdrawn => return Ok(false),
+        ActionStatus::Proposed => {
+            return Err("A proposal that was never approved is rejected, not withdrawn".into());
+        }
+        ActionStatus::Running => {
+            return Err("This Worker is running, so its approval cannot be withdrawn. Nothing was changed.".into());
+        }
+        ActionStatus::Returned | ActionStatus::Rejected | ActionStatus::Interrupted | ActionStatus::Failed => {
+            return Err("This action has no approval to withdraw in its current state".into());
+        }
+    }
+    let mut candidate = conversation.clone();
+    let revision = candidate.revision;
+    let Some(action) = candidate.actions.iter_mut().find(|action| action.id == action_id) else {
+        return Err("Action not found".into());
+    };
+    action.status = ActionStatus::Withdrawn;
+    candidate.push(Role::Human, EntryKind::ActionWithdrawn { action_id, revision });
+    save(&candidate)?;
+    *conversation = candidate;
+    Ok(true)
 }
 
 /// What the Human sees when the Coordinator still emits the retired direct
@@ -1431,6 +1507,86 @@ mod tests {
         assert_eq!(retry.project_actions.len(), 1, "exactly one proposal after the retry");
     }
 
+    fn legacy_action(status: ActionStatus) -> TaskAction {
+        TaskAction {
+            id: Uuid::new_v4(),
+            target_task_id: Uuid::new_v4(),
+            target_task_title: "Task".into(),
+            request: "change a.txt".into(),
+            explanation: "why".into(),
+            approved_request: Some("change a.txt".into()),
+            status,
+            worker_result: None,
+            coordinator_replied: false,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn only_an_unstarted_approval_of_a_retired_delegation_can_be_withdrawn() {
+        let mut saved = 0;
+        let mut withdraw = |status: ActionStatus| {
+            let mut conversation = Conversation::new(Uuid::new_v4());
+            let action = legacy_action(status);
+            let action_id = action.id;
+            conversation.actions.push(action);
+            let result = super::withdraw_legacy_approval(&mut conversation, action_id, |_| {
+                saved += 1;
+                Ok(())
+            });
+            (result, conversation)
+        };
+
+        let (result, conversation) = withdraw(ActionStatus::Approved);
+        assert_eq!(result, Ok(true));
+        assert_eq!(conversation.actions[0].status, ActionStatus::Withdrawn);
+        assert!(matches!(
+            conversation.entries.last().unwrap().kind,
+            EntryKind::ActionWithdrawn { revision: 0, .. }
+        ));
+        assert_eq!(conversation.revision, 1);
+
+        let (result, conversation) = withdraw(ActionStatus::Withdrawn);
+        assert_eq!(result, Ok(false), "a withdrawn action is already final");
+        assert!(conversation.entries.is_empty(), "a repeated withdrawal records nothing");
+        let (result, _) = withdraw(ActionStatus::Proposed);
+        assert!(result.unwrap_err().contains("rejected, not withdrawn"));
+        let (result, _) = withdraw(ActionStatus::Running);
+        assert!(result.unwrap_err().contains("running"));
+        for status in [ActionStatus::Returned, ActionStatus::Rejected, ActionStatus::Interrupted, ActionStatus::Failed] {
+            let (result, conversation) = withdraw(status);
+            assert!(result.unwrap_err().contains("no approval to withdraw"), "{status:?}");
+            assert!(conversation.entries.is_empty(), "{status:?} changes nothing");
+        }
+        assert_eq!(saved, 1, "only the one real withdrawal was saved");
+    }
+
+    #[test]
+    fn a_withdrawal_that_fails_to_persist_reports_no_success_and_changes_nothing() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        let action = legacy_action(ActionStatus::Approved);
+        let action_id = action.id;
+        conversation.actions.push(action);
+        let revision = conversation.revision;
+
+        let result = super::withdraw_legacy_approval(&mut conversation, action_id, |_| {
+            Err("disk write failed".into())
+        });
+
+        assert_eq!(result, Err("disk write failed".into()));
+        assert_eq!(conversation.actions[0].status, ActionStatus::Approved, "still the approval");
+        assert_eq!(conversation.revision, revision);
+        assert!(conversation.entries.is_empty(), "no withdrawal entry was committed");
+    }
+
+    #[test]
+    fn a_withdrawal_for_an_unknown_action_changes_nothing() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        let result = super::withdraw_legacy_approval(&mut conversation, Uuid::new_v4(), |_| Ok(()));
+        assert_eq!(result, Err("Action not found".into()));
+        assert!(conversation.entries.is_empty());
+    }
+
     /// A Conversation Worker delegation must not reach a Task Checkout whose
     /// Worker recovery evidence is unresolved, whether or not the Human had
     /// already approved the action.
@@ -1457,7 +1613,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_recovery_required_task_launches_no_provider_and_keeps_the_action_unstarted() {
+        async fn a_retired_delegation_is_refused_before_recovery_evidence_is_read() {
             let fake = crate::test_helpers::FakeProgram::install("claude", "exit 0\n").await;
             let tmp = tempfile::tempdir().unwrap();
             let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
@@ -1574,8 +1730,8 @@ mod tests {
                     super::super::HumanAction::Approve { request: None },
                 )
                 .await
-                .expect_err("recovery evidence refuses the delegation");
-                assert!(refusal.contains("unresolved Worker recovery"), "{refusal}");
+                .expect_err("the retirement gate refuses the delegation");
+                assert!(refusal.contains("retired"), "{refusal}");
             }
 
             assert!(fake.invocations().is_empty(), "no provider was launched: {}", fake.invocations());
@@ -1769,6 +1925,44 @@ mod tests {
                 .map_err(|e| e.to_string())
             }
 
+            /// Sends any Human action at an explicit revision, as a direct command would.
+            async fn act(&self, id: Uuid, revision: u64, action: super::super::HumanAction) -> Result<(), String> {
+                let current = self.conversation();
+                super::super::act_on_project_conversation(
+                    GuiMutation::untracked(),
+                    self.app.state(),
+                    self.project_id.to_string(),
+                    current.id.to_string(),
+                    revision,
+                    id.to_string(),
+                    action,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            }
+
+            async fn withdraw(&self, id: Uuid) -> Result<(), String> {
+                let revision = self.conversation().revision;
+                self.act(id, revision, super::super::HumanAction::Withdraw).await
+            }
+
+            fn assert_retired_refusal(&self, refusal: &str) {
+                assert!(refusal.contains("retired"), "{refusal}");
+                assert!(refusal.contains("Nothing was started or changed"), "{refusal}");
+                assert!(refusal.len() < 800, "bounded: {refusal}");
+                assert!(!refusal.contains("uncommitted changes"), "the gate precedes the checkout read: {refusal}");
+            }
+
+            /// Model a historical record by setting a stored action's status.
+            fn set_status(&self, id: Uuid, status: ActionStatus, approved_request: Option<&str>) {
+                let mut conversation = self.conversation();
+                let action = conversation.actions.iter_mut().find(|a| a.id == id).unwrap();
+                action.status = status;
+                action.approved_request = approved_request.map(str::to_string);
+                self.state().storage.save_conversation(&conversation).unwrap();
+            }
+
             fn worker_started(&self) -> usize {
                 self.conversation().entries.iter().filter(|e| matches!(e.kind, EntryKind::WorkerStarted { .. })).count()
             }
@@ -1810,8 +2004,10 @@ mod tests {
             std::fs::remove_file(c.join("gone.txt")).unwrap();
         }
 
-        /// Refuse, preserve everything, then launch after the Human resolves it.
-        async fn refuses_then_runs_after_resolution(make_dirty: fn(&std::path::Path)) {
+        /// A retired delegation is refused whatever the checkout holds, and the
+        /// refusal leaves the checkout, the Proposed action and the history as
+        /// they were, even after the Human resolves the checkout by hand.
+        async fn retired_approval_leaves_a_dirty_checkout_untouched(make_dirty: fn(&std::path::Path)) {
             let tmp = tempfile::tempdir().unwrap();
             let fake = crate::test_helpers::FakeProgram::install(
                 "claude",
@@ -1830,70 +2026,56 @@ mod tests {
             );
             let action = fx.propose("change a.txt");
 
-            let refusal = fx.approve(action).await.expect_err("a dirty checkout refuses the Worker");
-            assert!(refusal.contains("The Worker was not started"), "{refusal}");
-            assert!(refusal.contains("uncommitted changes"), "{refusal}");
-            assert!(refusal.contains("left them untouched"), "{refusal}");
-            assert!(refusal.contains("still approved"), "{refusal}");
-            assert!(refusal.contains(fx.checkout.to_str().unwrap()), "names the checkout: {refusal}");
-            assert!(refusal.len() < 800, "bounded");
-            assert!(!refusal.contains("safe to discard"), "{refusal}");
-
+            let refusal = fx.approve(action).await.expect_err("a retired delegation is refused");
+            fx.assert_retired_refusal(&refusal);
             assert!(fake.invocations().is_empty(), "no provider launched: {}", fake.invocations());
             assert_eq!(fx.worker_started(), 0, "no WorkerStarted");
-            assert_eq!(fx.status_of(action), ActionStatus::Approved, "approval is durable, not Running");
-            assert_eq!(fx.human_approvals(), 1, "one Human decision");
+            assert_eq!(fx.status_of(action), ActionStatus::Proposed, "no approval was recorded");
+            assert_eq!(fx.human_approvals(), 0, "no Human approval");
             assert!(!fx.state().executor.get().unwrap().is_task_running(fx.task_id).await);
             assert_eq!(git(&fx.checkout, &["status", "--porcelain=v1", "--untracked-files=all"]), status_before);
             assert_eq!(git(&fx.checkout, &["diff", "--cached"]), index_before);
             assert_eq!(git(&fx.checkout, &["rev-parse", "HEAD"]), head);
-            assert_eq!(
-                (
-                    std::fs::read(fx.checkout.join("a.txt")).ok(),
-                    std::fs::read(fx.checkout.join("gone.txt")).ok(),
-                    std::fs::read(fx.checkout.join("leftover.txt")).ok(),
-                ),
-                files_before,
-                "no file changed"
+            let files_after_refusal = (
+                std::fs::read(fx.checkout.join("a.txt")).ok(),
+                std::fs::read(fx.checkout.join("gone.txt")).ok(),
+                std::fs::read(fx.checkout.join("leftover.txt")).ok(),
             );
+            assert_eq!(files_after_refusal, files_before, "no file changed");
 
-            // The Human resolves the checkout and retries the same approval.
+            // Resolving the checkout by hand does not revive the retired path.
             fx.resolve_by_hand();
-            fx.approve(action).await.expect("the retry starts the Worker");
-            assert_eq!(fx.worker_invocations(&fake), 1);
-            assert_eq!(fx.worker_started(), 1);
-            assert_eq!(fx.human_approvals(), 1, "retry adds no second decision");
-            assert_eq!(fx.status_of(action), ActionStatus::Returned);
-            assert_eq!(
-                git(&fx.checkout, &["show", "--name-only", "--format=", "HEAD"]),
-                "worker-output.txt",
-                "the commit holds only the Worker's change"
-            );
+            let refusal = fx.approve(action).await.expect_err("still retired after resolution");
+            fx.assert_retired_refusal(&refusal);
+            assert!(fake.invocations().is_empty(), "still no provider launched after resolution");
+            assert_eq!(fx.worker_invocations(&fake), 0, "no Worker ran in the checkout");
+            assert_eq!(fx.status_of(action), ActionStatus::Proposed);
+            assert_eq!(fx.human_approvals(), 0, "no approval after resolution either");
             drop(fx.repo);
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_tracked_modification_refuses_the_worker() {
-            refuses_then_runs_after_resolution(dirty_tracked).await;
+        async fn a_tracked_modification_is_refused_as_retired() {
+            retired_approval_leaves_a_dirty_checkout_untouched(dirty_tracked).await;
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn an_untracked_file_refuses_the_worker() {
-            refuses_then_runs_after_resolution(dirty_untracked).await;
+        async fn an_untracked_file_is_refused_as_retired() {
+            retired_approval_leaves_a_dirty_checkout_untouched(dirty_untracked).await;
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_staged_only_change_refuses_the_worker() {
-            refuses_then_runs_after_resolution(dirty_staged).await;
+        async fn a_staged_only_change_is_refused_as_retired() {
+            retired_approval_leaves_a_dirty_checkout_untouched(dirty_staged).await;
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_deleted_tracked_file_refuses_the_worker() {
-            refuses_then_runs_after_resolution(dirty_deleted).await;
+        async fn a_deleted_tracked_file_is_refused_as_retired() {
+            retired_approval_leaves_a_dirty_checkout_untouched(dirty_deleted).await;
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_clean_checkout_starts_the_worker_and_commits_only_its_change() {
+        async fn a_clean_checkout_gets_no_retired_worker_and_keeps_its_commits() {
             let tmp = tempfile::tempdir().unwrap();
             let fake = crate::test_helpers::FakeProgram::install(
                 "claude",
@@ -1903,22 +2085,18 @@ mod tests {
             let fx = fixture(tmp).await;
             let head = git(&fx.checkout, &["rev-parse", "HEAD"]);
             let action = fx.propose("change a.txt");
-            fx.approve(action).await.expect("clean checkout runs the Worker");
-            assert_eq!(fx.worker_invocations(&fake), 1);
-            assert_eq!(fx.worker_started(), 1);
-            assert_eq!(fx.status_of(action), ActionStatus::Returned);
-            assert_ne!(git(&fx.checkout, &["rev-parse", "HEAD"]), head);
+            let refusal = fx.approve(action).await.expect_err("a clean checkout is not enough to start a retired delegation");
+            fx.assert_retired_refusal(&refusal);
+            assert!(fake.invocations().is_empty(), "no provider launched");
+            assert_eq!(fx.worker_invocations(&fake), 0);
+            assert_eq!(fx.worker_started(), 0);
+            assert_eq!(fx.status_of(action), ActionStatus::Proposed);
+            assert_eq!(git(&fx.checkout, &["rev-parse", "HEAD"]), head, "no commit was made");
             assert_eq!(git(&fx.checkout, &["status", "--porcelain"]), "");
-            assert_eq!(git(&fx.checkout, &["show", "--name-only", "--format=", "HEAD"]), "worker-output.txt");
-            assert_eq!(
-                git(&fx.checkout, &["log", "-1", "--format=%an <%ae>|%cn <%ce>", "HEAD"]),
-                "t <t@example.com>|t <t@example.com>",
-                "the Worker's commit uses the fixture's identity"
-            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn edits_left_by_a_failed_worker_refuse_the_next_approved_request() {
+        async fn a_historical_failed_delegations_leftovers_do_not_matter_to_the_retired_gate() {
             let tmp = tempfile::tempdir().unwrap();
             let fake = crate::test_helpers::FakeProgram::install(
                 "claude",
@@ -1926,22 +2104,19 @@ mod tests {
             )
             .await;
             let fx = fixture(tmp).await;
-            let first = fx.propose("first request");
-            fx.approve(first).await.expect("the failure is recorded, not returned as an error");
-            assert_eq!(fx.status_of(first), ActionStatus::Failed);
-            assert_eq!(fx.worker_invocations(&fake), 1);
-            assert_eq!(
-                std::fs::read_to_string(fx.checkout.join("worker-output.txt")).unwrap(),
-                "worker\n",
-                "the failed Worker left its edit"
-            );
+            // A Failed record from before retirement, with the edit its Worker left.
+            let historical = fx.propose("first request");
+            fx.set_status(historical, ActionStatus::Failed, Some("first request"));
+            std::fs::write(fx.checkout.join("worker-output.txt"), "worker\n").unwrap();
 
             let second = fx.propose("second request");
-            let refusal = fx.approve(second).await.expect_err("leftovers refuse the second request");
-            assert!(refusal.contains("The Worker was not started"), "{refusal}");
-            assert_eq!(fx.worker_invocations(&fake), 1, "no second provider launch");
-            assert_eq!(fx.status_of(second), ActionStatus::Approved);
-            assert_eq!(fx.worker_started(), 1, "only the first Worker started");
+            let refusal = fx.approve(second).await.expect_err("retired, whatever the leftovers");
+            fx.assert_retired_refusal(&refusal);
+            assert!(fake.invocations().is_empty(), "no provider launched");
+            assert_eq!(fx.worker_invocations(&fake), 0, "no second Worker");
+            assert_eq!(fx.status_of(second), ActionStatus::Proposed);
+            assert_eq!(fx.status_of(historical), ActionStatus::Failed, "the historical record stays Failed");
+            assert_eq!(fx.worker_started(), 0);
             assert_eq!(
                 std::fs::read_to_string(fx.checkout.join("worker-output.txt")).unwrap(),
                 "worker\n",
@@ -1951,7 +2126,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_held_provider_lease_still_refuses_before_any_state_changes() {
+        async fn the_retired_gate_precedes_the_provider_lease() {
             let tmp = tempfile::tempdir().unwrap();
             let fake = crate::test_helpers::FakeProgram::install(
                 "claude",
@@ -1962,27 +2137,22 @@ mod tests {
             let lease_path = crate::queue::task_provider_lease_path(&fx.state().storage, fx.task_id);
             let held = crate::agents::provider_lease::acquire(&lease_path).unwrap();
             let action = fx.propose("change a.txt");
-            let refusal = fx.approve(action).await.expect_err("an earlier provider holds the checkout");
-            assert!(refusal.contains("provider lease"), "{refusal}");
+            let refusal = fx.approve(action).await.expect_err("retired, though a provider holds the checkout");
+            fx.assert_retired_refusal(&refusal);
+            assert!(!refusal.contains("provider lease"), "the lease is never reached: {refusal}");
             assert!(fake.invocations().is_empty());
             assert_eq!(fx.worker_started(), 0);
-            assert_eq!(fx.status_of(action), ActionStatus::Approved);
+            assert_eq!(fx.status_of(action), ActionStatus::Proposed);
 
-            // The lease is checked first: a dirty checkout does not change the answer.
-            dirty_untracked(&fx.checkout);
-            let refusal = fx.approve(action).await.expect_err("still held");
-            assert!(refusal.contains("provider lease"), "{refusal}");
             drop(held);
-            fx.resolve_by_hand();
-            fx.approve(action).await.expect("released lease and clean checkout run the Worker");
-            assert_eq!(fx.worker_invocations(&fake), 1);
+            dirty_untracked(&fx.checkout);
+            fx.approve(action).await.expect_err("still retired once the lease is released");
+            assert_eq!(fx.worker_invocations(&fake), 0);
+            assert_eq!(fx.status_of(action), ActionStatus::Proposed);
         }
 
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_corrupt_checkout_index_launches_nothing() {
-            // Checkout validation reads the status first and refuses here, so this
-            // proves the end-to-end outcome. The guard's own Git-failure branch is
-            // proved by the_guard_itself_reports_a_failed_status_read_as_not_started.
+        async fn a_corrupt_checkout_index_is_never_read_for_a_retired_delegation() {
             let tmp = tempfile::tempdir().unwrap();
             let fake = crate::test_helpers::FakeProgram::install(
                 "claude",
@@ -1993,10 +2163,72 @@ mod tests {
             let git_dir = git(&fx.checkout, &["rev-parse", "--absolute-git-dir"]);
             std::fs::write(std::path::Path::new(&git_dir).join("index"), b"not an index").unwrap();
             let action = fx.propose("change a.txt");
-            fx.approve(action).await.expect_err("an unreadable checkout is never treated as clean");
+            let refusal = fx.approve(action).await.expect_err("retired before the checkout is read");
+            fx.assert_retired_refusal(&refusal);
             assert!(fake.invocations().is_empty());
             assert_eq!(fx.worker_started(), 0);
-            assert_eq!(fx.status_of(action), ActionStatus::Approved);
+            assert_eq!(fx.status_of(action), ActionStatus::Proposed);
+            drop(fx.repo);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_withdrawn_approval_is_durable_idempotent_and_starts_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let fake = crate::test_helpers::FakeProgram::install(
+                "claude",
+                &worker_body(&checkout_path_of(&tmp), RESULT_EVENT),
+            )
+            .await;
+            let fx = fixture(tmp).await;
+            let head = git(&fx.checkout, &["rev-parse", "HEAD"]);
+            let action = fx.propose("change a.txt");
+            // A historical approval: the decision entry an earlier build recorded.
+            let mut seeded = fx.conversation();
+            let record = seeded.actions.iter_mut().find(|a| a.id == action).unwrap();
+            record.status = ActionStatus::Approved;
+            record.approved_request = Some("change a.txt".into());
+            seeded.push(Role::Human, EntryKind::ActionDecision {
+                action_id: action,
+                approved: true,
+                request: Some("change a.txt".into()),
+            });
+            fx.state().storage.save_conversation(&seeded).unwrap();
+            let before = fx.conversation();
+            let task_before = fx.state().task.tasks.read().await[&fx.task_id].clone();
+
+            fx.withdraw(action).await.expect("the approval is withdrawn");
+            let after = fx.conversation();
+            assert_eq!(fx.status_of(action), ActionStatus::Withdrawn);
+            assert_eq!(after.revision, before.revision + 1, "one durable decision");
+            assert!(matches!(
+                after.entries.last().unwrap().kind,
+                EntryKind::ActionWithdrawn { action_id, revision } if action_id == action && revision == before.revision
+            ));
+            assert_eq!(fx.human_approvals(), 1, "the historical approval event is kept");
+
+            // Repeating the withdrawal at the current revision has no effect and no new entry.
+            fx.withdraw(action).await.expect("a repeated withdrawal is accepted");
+            let repeated = fx.conversation();
+            assert_eq!(repeated.revision, after.revision);
+            assert_eq!(repeated.entries.len(), after.entries.len());
+
+            // A stale client request is refused by the revision check and changes nothing.
+            let stale = fx.act(action, before.revision, super::super::HumanAction::Withdraw).await.expect_err("stale");
+            assert!(stale.contains("Conversation changed"), "{stale}");
+            assert_eq!(fx.conversation().entries.len(), after.entries.len());
+
+            // The withdrawn approval can never be approved again.
+            let refusal = fx.approve(action).await.expect_err("a withdrawn approval is not retried");
+            fx.assert_retired_refusal(&refusal);
+
+            // The Task, its checkout and the provider are untouched.
+            let task_after = fx.state().task.tasks.read().await[&fx.task_id].clone();
+            assert_eq!(task_after.status, task_before.status);
+            assert_eq!(task_after.worktree_path, task_before.worktree_path);
+            assert_eq!(task_after.branch_name, task_before.branch_name);
+            assert_eq!(git(&fx.checkout, &["rev-parse", "HEAD"]), head);
+            assert!(fake.invocations().is_empty(), "no provider launched");
+            assert_eq!(fx.worker_started(), 0);
             drop(fx.repo);
         }
 

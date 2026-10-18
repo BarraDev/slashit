@@ -500,6 +500,7 @@ pub fn ProjectConversation(project_id: String) -> impl IntoView {
                                 ConversationEntryKind::ActionDecision { approved, request, .. } => ("conversation-action-event", Some(if approved { format!("You approved the Worker request: {}", request.unwrap_or_default()) } else { "You rejected the proposed Task work.".to_string() })),
                                 ConversationEntryKind::WorkerStarted { action_id } => ("conversation-action-event", actions.iter().find(|action| action.id == action_id).map(|action| format!("Worker started in Task Checkout: {}", action.target_task_title))),
                                 ConversationEntryKind::WorkerResult { result, .. } => ("conversation-worker-result", Some(result)),
+                                ConversationEntryKind::ActionWithdrawn { .. } => ("conversation-action-event", Some("You withdrew an earlier approval of a retired direct delegation. Nothing was started.".to_string())),
                                 ConversationEntryKind::RunFailed { message, .. } => ("conversation-run-failed", Some(message)),
                                 ref kind @ (ConversationEntryKind::ProjectActionProposed { .. } | ConversationEntryKind::ProjectActionDecision { .. } | ConversationEntryKind::ProjectActionApplied { .. } | ConversationEntryKind::ProjectActionRefused { .. }) => ("conversation-action-event", project_action_event_text(kind, &project_actions)),
                             };
