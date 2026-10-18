@@ -75,6 +75,7 @@
 # Local integration journeys (checked-out target and dependent task; GitHub remote and local base
 # choice; conflict and unfinished integrations). Each is heavy, so one went to each shard.
 1	local_integration::local_work_is_integrated_into_the_checked_out_main_and_a_dependent_task_receives_it
+1	main_window::main_window_refuses_external_navigation_and_new_windows
 2	local_integration::a_project_with_a_github_remote_delivers_locally_by_choice_and_starts_new_tasks_from_its_local_branch
 3	local_integration::a_conflict_is_refused_and_an_unfinished_integration_is_resumed_or_discarded
 
