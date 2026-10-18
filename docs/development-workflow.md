@@ -787,3 +787,34 @@ Local tests show how the code behaves in the tests. They do not demonstrate
 power-loss durability, behavior on an operating system other than the one they
 ran on, or anything the hosted `ignore`d tests cover. State those limits in
 the report instead of implying them.
+
+## 17. Change size and review standards
+
+These standards apply to backend, frontend, Tauri IPC, integration, and
+architecture work alike. They refine the rules above; they do not replace them.
+
+- **Callers first.** Before changing a shared function, type, or interface, find
+  every caller and indirect reference: Tauri command names used by `invoke`,
+  entries in the `generate_handler!` list, tests, and scripts. Fix the root
+  cause once, in the shared code.
+- **Simple before general.** Prefer an existing project mechanism, then plain
+  code, over a new abstraction, wrapper, option, or dependency. Remove redundant
+  code only after confirming it has no caller and protects no invariant.
+- **Keep safeguards.** Code that looks redundant or unused can still enforce
+  authorization (for example `GuiMutation` admission), durable persistence and
+  write ordering, checkout ownership, provider leases, or recovery evidence.
+  Establish its purpose before removing it, and never remove such code to
+  shorten a diff.
+- **Evidence for findings.** A review finding states a reproduction, a reachable
+  failure path, or a violated invariant, and it is checked against the current
+  code before it is reported.
+- **Coverage by risk.** Choose regression tests by the correctness and safety
+  risk of the change, not by a fixed count. Behavior that protects data,
+  authorization, or ownership needs tests for its failure and negative paths.
+  Comment-only and documentation-only changes need no test run beyond the
+  documentation check.
+- **Limitations.** Record a significant intentional limitation where the code or
+  its nearest `AGENTS.md` describes it, with the condition that would justify
+  revisiting it.
+- **Gates stay authoritative.** A clean review verdict does not replace hosted
+  CI, exact-commit validation, or the publication gates in sections 13 and 14.

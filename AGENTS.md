@@ -161,6 +161,7 @@ private state.
   revision's run, an unpushed fix, a stale review, or pending CI.
 - Cleanup outside your own workspace (toolchains, `~/.cargo`, other
   workspaces) needs explicit authorization.
+- Follow the change size and review standards in `docs/development-workflow.md`.
 
 ### Tooling
 
