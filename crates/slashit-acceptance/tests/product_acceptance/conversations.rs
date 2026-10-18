@@ -449,6 +449,70 @@ async fn coordinator_queues_a_backlog_task_only_after_human_approval() {
     context.finish(outcome);
 }
 
+/// A Human-approved queue shows its Task run in the Conversation: queued under
+/// the approval first, then completed with the coding result. The association
+/// survives a restart because it is rebuilt from the Task record, and the
+/// Conversation starts no provider run of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn project_conversation_shows_the_run_an_approval_started() {
+    let context = TestContext::new("project_conversation_execution").expect("harness setup");
+    let root = context.state().path().to_path_buf();
+    let agent = FakeAgent::install(&root).expect("install fake Claude");
+    context.set_child_env("PATH", agent.path_value().to_os_string());
+    context.set_child_env(fake_agent::MARKER_DIR_VAR, agent.marker_dir().as_os_str().to_os_string());
+    let scripted = agent.marker_dir().join(".coordinator-output");
+    std::fs::create_dir_all(&scripted).expect("script directory");
+
+    let outcome = async {
+        super::start_on_the_legacy_auto_placement(&context.state().config_file())?;
+        let repository = GitFixture::create(&root.join("fixture-repo"))?;
+        let session = context.start_session("execution").await?;
+        let driver = session.driver();
+        let project_id = register_project(driver, &repository).await?;
+        let (task_id, title) = create_task(driver, &project_id, "Show my run", &[]).await?;
+        // Held in Queue until the journey lets the scheduler promote it.
+        ui::invoke(driver, "update_queue_config", json!({ "autoPromote": false })).await?;
+        let worker_runs = || anyhow::Ok(agent.invocations()?.iter().filter(|run| {
+            run.prompt.as_deref().is_some_and(|prompt| !prompt.contains("\"current_message\""))
+        }).count());
+        let enqueue = format!(r#"{{"type":"enqueue_task","text":"This is ready to build.","target_task_id":"{task_id}"}}"#);
+        std::fs::write(scripted.join("1"), &enqueue)?;
+        open_conversations(driver, &project_id).await?;
+        let history = "[data-testid=\"conversation-history\"]";
+        let card = "[data-testid=\"conversation-execution\"]";
+
+        // 1. Approval queues the Task, and the card names the approval's queued run.
+        submit_message(driver, "Please get this started.").await?;
+        await_text(driver, "[data-testid=\"project-action-proposal\"]", &title).await?;
+        ui::visible(driver, "[data-testid=\"project-action-approve\"]").await?.click().await?;
+        await_text(driver, history, &format!("Task queued: {title}")).await?;
+        await_text(driver, &format!("{card}[data-state=\"queued\"] [data-testid=\"conversation-execution-task\"]"), &title).await?;
+        await_text(driver, &format!("{card}[data-state=\"queued\"] [data-testid=\"conversation-execution-run\"]"), "Run not established yet").await?;
+        if worker_runs()? != 0 { bail!("approving started a run before the scheduler promoted the Task"); }
+
+        // 2. The executor runs it. The card settles to the coding result, and the Conversation starts nothing.
+        ui::invoke(driver, "update_queue_config", json!({ "autoPromote": true })).await?;
+        let settled = super::await_status(driver, &project_id, &task_id, &["human_review", "error"]).await?;
+        if settled["status"] != "human_review" || settled["worktree_path"].is_null() {
+            bail!("the queued Task did not run through the executor to Human Review: {settled}");
+        }
+        await_text(driver, &format!("{card}[data-state=\"completed\"] [data-testid=\"conversation-execution-run\"]"), "Run 1").await?;
+        await_text(driver, &format!("{card}[data-state=\"completed\"] [data-testid=\"conversation-execution-result\"]"), fake_agent::REPORTED_RESULT).await?;
+        if worker_runs()? != 1 { bail!("expected exactly one Task run, found {}", worker_runs()?); }
+        context.close_session(session, "execution", &Ok(())).await?;
+
+        // 3. After a restart the card is rebuilt from the Task record, and no run is replayed.
+        let restarted = context.start_session("execution-restart").await?;
+        open_conversations(restarted.driver(), &project_id).await?;
+        await_text(restarted.driver(), &format!("{card}[data-state=\"completed\"] [data-testid=\"conversation-execution-result\"]"), fake_agent::REPORTED_RESULT).await?;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        if worker_runs()? != 1 { bail!("a restart or the Conversation ran the Task again: {} runs", worker_runs()?); }
+        context.close_session(restarted, "execution-restart", &Ok(())).await?;
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    context.finish(outcome);
+}
+
 /// Open the Conversations page from the Project navigation.
 ///
 /// The last page is restored on reload, so a restarted session may already be
