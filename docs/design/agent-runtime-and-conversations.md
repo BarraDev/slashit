@@ -39,10 +39,13 @@ selected recent conversational messages, and a bounded index of Tasks. It uses
 read-only tools. Durable history and the projection sent to a provider are
 separate; provider transcripts and arbitrary Project records are not included.
 
-The strict output contract is `Reply { text }`, `DelegateToTask { text,
-target_task_id, request }`, `CreateTask` or `EditTask` (see
+The strict output contract is `Reply { text }`, `CreateTask`, `EditTask`,
+`MoveTask`, `EnqueueTask` or `ExecuteRequest` (see
 [Coordinator Task capabilities](#coordinator-task-capabilities)). Unknown types
-and fields are refused. Prose cannot trigger an action. A proposal is persisted and displayed, but cannot start a Worker until
+and fields are refused. Direct delegation to a Task Worker is retired: a
+`delegate_to_task` output still parses, but on both the ordinary and the
+follow-up path SlashIt records a bounded refusal, creates no `TaskAction` and
+starts nothing. Prose cannot trigger an action. A proposal is persisted and displayed, but cannot start a Worker until
 a Human explicitly approves it. Approval can replace the request; the saved
 approved request is the execution authority.
 
@@ -87,9 +90,16 @@ to select a Task to talk to it.
 `CreateTask { title, description?, priority?, category? }` and `EditTask {
 target_task_id, title?, description?, priority?, category? }` are mutating,
 so each is a `ProjectAction` that waits for one explicit Human decision. This
-is separate from `TaskAction`, which models delegation to a Worker; both are
-stored in the Conversation, and Conversations saved before `ProjectAction`
-existed load unchanged. The card shows the exact fields to be created or
+is separate from `TaskAction`, the legacy record of direct delegation to a
+Worker; both are stored in the Conversation, and Conversations saved before
+`ProjectAction` existed load unchanged. Legacy `TaskAction` records stay
+readable and keep their identities. A `Proposed` one can be rejected. An
+`Approved` one can be withdrawn with `HumanAction::Withdraw`, which records an
+`ActionWithdrawn` entry and never touches the Task. Approving or retrying a
+legacy action is refused before any decision is recorded, any editing owner or
+provider lease is taken, or any provider runs. For new coding work, the
+Coordinator proposes `EnqueueTask` or `ExecuteRequest`, which needs a fresh
+Human approval. The card shows the exact fields to be created or
 changed. An edit shows each field as observed value to proposed value.
 Proposals are not editable before approval, so the executed mutation is the
 one on screen. Each decision applies to one action: a successful create or
@@ -221,8 +231,10 @@ recovery work. That is deliberately not tracked as one large issue now.
 ## Future scope
 
 The current implementation includes Project Conversations, ordinary replies,
-bounded Task visibility, Human-gated Task creation and editing, `DelegateToTask`,
-explicit Human approval, and a Task-scoped Worker. Moving or queueing Tasks,
+bounded Task visibility, Human-gated Task creation and editing, explicit Human
+approval, and Task-scoped Worker execution through the normal Task lifecycle.
+Direct delegation to a Worker is retired (its historical records stay
+readable). Moving or queueing Tasks,
 pull request and CI capabilities, tracker synchronization, Workspace
 Conversations, context compaction, multiple Workers, provider-session resume,
 and richer provider adapters remain future work. The Conversation direction

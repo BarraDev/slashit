@@ -959,4 +959,102 @@ mod tests {
         conversation.actions[0].coordinator_replied = true;
         assert!(!conversation.has_unmediated_worker_result());
     }
+
+    /// A Conversation written before direct delegation was retired still loads
+    /// with every legacy status and entry, keeps their identities, and projects
+    /// its history to the Coordinator.
+    #[test]
+    fn historical_legacy_conversation_json_loads_keeps_identities_and_projects() {
+        let timestamp = "2026-01-01T00:00:00Z";
+        let task = Uuid::new_v4();
+        let ids: Vec<Uuid> = (0..7).map(|_| Uuid::new_v4()).collect();
+        let statuses = ["proposed", "approved", "running", "returned", "rejected", "interrupted", "failed"];
+        let actions: Vec<serde_json::Value> = statuses
+            .iter()
+            .zip(&ids)
+            .map(|(status, id)| {
+                serde_json::json!({
+                    "id": id,
+                    "target_task_id": task,
+                    "target_task_title": "Task",
+                    "request": "change a.txt",
+                    "explanation": "why",
+                    "approved_request": if *status == "proposed" { serde_json::Value::Null } else { serde_json::json!("change a.txt") },
+                    "status": status,
+                    "worker_result": if *status == "returned" { serde_json::json!("result") } else { serde_json::Value::Null },
+                    "coordinator_replied": false,
+                    "created_at": timestamp,
+                })
+            })
+            .collect();
+        let entry = |kind: serde_json::Value| serde_json::json!({"id": Uuid::new_v4(), "role": "human", "kind": kind, "created_at": timestamp});
+        let raw = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "project_id": Uuid::new_v4(),
+            "revision": 12,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "entries": [
+                entry(serde_json::json!({"kind": "action_proposed", "action_id": ids[0]})),
+                entry(serde_json::json!({"kind": "action_decision", "action_id": ids[1], "approved": true, "request": "change a.txt"})),
+                entry(serde_json::json!({"kind": "worker_started", "action_id": ids[2]})),
+                entry(serde_json::json!({"kind": "worker_result", "action_id": ids[3], "result": "result"})),
+                entry(serde_json::json!({"kind": "run_failed", "role": "worker", "message": "stopped"})),
+            ],
+            "actions": actions,
+        });
+
+        let conversation: Conversation = serde_json::from_value(raw).expect("historical JSON loads");
+        assert_eq!(conversation.actions.len(), 7);
+        assert!(conversation.project_actions.is_empty(), "absent project_actions default to empty");
+        assert_eq!(conversation.actions[1].status, ActionStatus::Approved);
+        assert_eq!(conversation.actions[1].id, ids[1]);
+        assert!(conversation.has_unmediated_worker_result(), "a saved Returned result still awaits mediation");
+
+        let stored = serde_json::to_value(&conversation).unwrap();
+        assert_eq!(stored["actions"][1]["id"], serde_json::json!(ids[1]));
+        assert_eq!(stored["actions"][1]["status"], "approved");
+        assert_eq!(stored["actions"][3]["status"], "returned");
+        assert_eq!(stored["actions"][6]["status"], "failed");
+        assert_eq!(stored["revision"], 12);
+
+        let projection = conversation.coordinator_projection("next", "Project", None, &[]).to_string();
+        for kind in ["action_proposed", "action_decision", "worker_started", "worker_result", "run_failed"] {
+            assert!(projection.contains(kind), "{kind} is still projected");
+        }
+    }
+
+    #[test]
+    fn a_withdrawn_legacy_approval_round_trips_and_projects_without_starting_work() {
+        let action_id = Uuid::new_v4();
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.actions.push(TaskAction {
+            id: action_id,
+            target_task_id: Uuid::new_v4(),
+            target_task_title: "Task".into(),
+            request: "change a.txt".into(),
+            explanation: "why".into(),
+            approved_request: Some("change a.txt".into()),
+            status: ActionStatus::Withdrawn,
+            worker_result: None,
+            coordinator_replied: false,
+            created_at: Utc::now(),
+        });
+        conversation.push(Role::Human, EntryKind::ActionWithdrawn { action_id, revision: 3 });
+
+        let stored = serde_json::to_string(&conversation).unwrap();
+        let reloaded: Conversation = serde_json::from_str(&stored).unwrap();
+        assert_eq!(reloaded.actions[0].status, ActionStatus::Withdrawn);
+        assert!(!reloaded.has_unmediated_worker_result());
+
+        let projection = reloaded.coordinator_projection("why", "Project", None, &[]);
+        let withdrawal = projection["recent_history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == "action_withdrawn")
+            .expect("the withdrawal is projected");
+        assert_eq!(withdrawal["scope"], "this_proposal_only");
+        assert!(withdrawal["note"].as_str().unwrap().contains("Nothing was started"));
+    }
 }

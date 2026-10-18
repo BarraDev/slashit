@@ -1269,6 +1269,10 @@ mod tests {
             serde_json::from_value::<HumanAction>(serde_json::json!({"action":"reject"})),
             Ok(HumanAction::Reject)
         ));
+        assert!(matches!(
+            serde_json::from_value::<HumanAction>(serde_json::json!({"action":"withdraw"})),
+            Ok(HumanAction::Withdraw)
+        ));
     }
 
     #[test]
@@ -1754,10 +1758,227 @@ mod tests {
         }
     }
 
-    /// A Worker is launched into a Task Checkout only when it has no
-    /// uncommitted changes, because the Worker's result is committed as
-    /// everything in the checkout. A refusal leaves the checkout, the
-    /// approval and the history as they were.
+    /// Coordinator output on both Conversation paths, through the real commands
+    /// against a fake provider. A retired delegation is refused on an ordinary
+    /// turn and on a follow-up. Mediating a saved Worker result never replays
+    /// the Worker.
+    #[cfg(unix)]
+    mod retired_coordinator_output {
+        use super::*;
+        use crate::commands::gui_admission::GuiMutation;
+        use crate::domain::TaskStatus;
+        use tauri::Manager;
+
+        /// A fake `claude` that logs each run's working directory, consumes its
+        /// prompt and prints `result` as the provider's final result.
+        fn coordinator_body(log: &std::path::Path, result: &str) -> String {
+            let escaped = result.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(
+                "cat >/dev/null\necho \"$PWD\" >> \"{}\"\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{}\"}}'\n",
+                log.display(),
+                escaped
+            )
+        }
+
+        struct Fx {
+            _tmp: tempfile::TempDir,
+            _fake: crate::test_helpers::FakeProgram,
+            app: tauri::App<tauri::test::MockRuntime>,
+            log: std::path::PathBuf,
+            project_id: Uuid,
+            returned: Uuid,
+        }
+
+        /// A Project whose Conversation holds one saved Worker result. It is
+        /// unmediated unless `mediated` says the Coordinator already replied.
+        async fn fixture(tmp: tempfile::TempDir, result: &str, mediated: bool) -> Fx {
+            let log = tmp.path().join("provider-runs.log");
+            let fake = crate::test_helpers::FakeProgram::install("claude", &coordinator_body(&log, result)).await;
+            let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+                tmp.path().join("config"),
+                tmp.path().join("data"),
+                tmp.path().join("cache"),
+                tmp.path().join("runtime"),
+            ));
+            let (state, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
+            crate::test_helpers::attach_test_executor(&state);
+            let project_id = Uuid::new_v4();
+            state.project.projects.write().await.insert(
+                project_id,
+                crate::domain::Project {
+                    id: project_id,
+                    name: "p".into(),
+                    repository_id: None,
+                    scope: Default::default(),
+                    state_location: crate::config::paths::StateLocation::External,
+                    base: None,
+                    agent_type: crate::domain::project::AgentType::ClaudeCode,
+                    agent_config: crate::domain::project::AgentConfig {
+                        agent_type: crate::domain::project::AgentType::ClaudeCode,
+                        command: "claude".into(),
+                        args: Vec::new(),
+                        env: std::collections::HashMap::new(),
+                        model: None,
+                        api_key: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                },
+            );
+            let task = board_task(project_id, TaskStatus::Backlog);
+            let target_task_id = task.id;
+            state.task.tasks.write().await.insert(task.id, task);
+            let returned = Uuid::new_v4();
+            let mut conversation = state.storage.create_primary_conversation(project_id).unwrap();
+            conversation.actions.push(TaskAction {
+                id: returned,
+                target_task_id,
+                target_task_title: "Task".into(),
+                request: "change a.txt".into(),
+                explanation: "why".into(),
+                approved_request: Some("change a.txt".into()),
+                status: ActionStatus::Returned,
+                worker_result: Some("fake Worker completed approved work".into()),
+                coordinator_replied: mediated,
+                created_at: chrono::Utc::now(),
+            });
+            state.storage.save_conversation(&conversation).unwrap();
+            let app = tauri::test::mock_app();
+            app.manage(state);
+            Fx { _tmp: tmp, _fake: fake, app, log, project_id, returned }
+        }
+
+        impl Fx {
+            fn state(&self) -> &crate::AppState {
+                self.app.state::<crate::AppState>().inner()
+            }
+
+            fn conversation(&self) -> Conversation {
+                self.state().storage.load_primary_conversation(self.project_id).unwrap().unwrap()
+            }
+
+            /// Provider runs so far. Each line is one run's working directory.
+            fn runs(&self) -> Vec<String> {
+                std::fs::read_to_string(&self.log)
+                    .map(|log| log.lines().map(str::to_owned).collect())
+                    .unwrap_or_default()
+            }
+
+            fn refusals(conversation: &Conversation) -> usize {
+                conversation
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(
+                        &entry.kind,
+                        EntryKind::RunFailed { role: Role::Coordinator, message } if message.contains("retired")
+                    ))
+                    .count()
+            }
+        }
+
+        fn delegation(target: Uuid) -> String {
+            format!(
+                r#"{{"type":"delegate_to_task","text":"do it","target_task_id":"{target}","request":"change a.txt"}}"#
+            )
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_ordinary_turn_refuses_a_retired_delegation_and_stays_usable() {
+            let tmp = tempfile::tempdir().unwrap();
+            let fx = fixture(tmp, &delegation(Uuid::new_v4()), true).await;
+            let before = fx.conversation();
+            let actions_before = before.actions.len();
+
+            let snapshot = super::super::send_project_message(
+                GuiMutation::untracked(),
+                fx.app.state(),
+                fx.project_id.to_string(),
+                "Please change a.txt".into(),
+            )
+            .await
+            .expect("the refusal is recorded, not returned as a failed send");
+
+            assert_eq!(snapshot.conversation.actions.len(), actions_before, "no TaskAction was created");
+            assert!(snapshot.conversation.project_actions.is_empty(), "no proposal was recorded");
+            assert_eq!(Fx::refusals(&snapshot.conversation), 1);
+            assert_eq!(fx.runs().len(), 1, "only the Coordinator ran");
+            assert!(!snapshot.worker_live && !snapshot.coordinator_live);
+            // Usable: a refused delegation leaves no unmediated result behind.
+            assert!(!snapshot.conversation.has_unmediated_worker_result());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_followup_refuses_a_retired_delegation_and_mediates_the_result_once() {
+            let tmp = tempfile::tempdir().unwrap();
+            let fx = fixture(tmp, &delegation(Uuid::new_v4()), false).await;
+            let before = fx.conversation();
+            let actions_before = before.actions.len();
+
+            let snapshot = super::super::retry_project_conversation_continuation(
+                GuiMutation::untracked(),
+                fx.app.state(),
+                fx.project_id.to_string(),
+                before.id.to_string(),
+                before.revision,
+                fx.returned.to_string(),
+            )
+            .await
+            .expect("the mediation completes");
+
+            let returned = snapshot.conversation.actions.iter().find(|a| a.id == fx.returned).unwrap();
+            assert!(returned.coordinator_replied, "the saved result is mediated");
+            assert_eq!(returned.status, ActionStatus::Returned);
+            assert_eq!(returned.worker_result.as_deref(), Some("fake Worker completed approved work"), "the result is kept");
+            assert_eq!(snapshot.conversation.actions.len(), actions_before, "no new TaskAction was created");
+            assert!(snapshot.conversation.project_actions.is_empty());
+            assert_eq!(Fx::refusals(&snapshot.conversation), 1);
+            assert_eq!(fx.runs().len(), 1, "one Coordinator follow-up, and no Worker");
+            assert!(!fx.conversation().has_unmediated_worker_result());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_saved_result_is_mediated_without_replaying_the_worker() {
+            let tmp = tempfile::tempdir().unwrap();
+            let reply = r#"{"type":"reply","text":"Coordinator reviewed the Worker result."}"#;
+            let fx = fixture(tmp, reply, false).await;
+            let before = fx.conversation();
+
+            let snapshot = super::super::retry_project_conversation_continuation(
+                GuiMutation::untracked(),
+                fx.app.state(),
+                fx.project_id.to_string(),
+                before.id.to_string(),
+                before.revision,
+                fx.returned.to_string(),
+            )
+            .await
+            .expect("the mediation completes");
+
+            assert!(snapshot.conversation.actions.iter().any(|a| a.id == fx.returned && a.coordinator_replied));
+            assert!(snapshot.conversation.entries.iter().any(|e| matches!(
+                &e.kind,
+                EntryKind::CoordinatorReply { text } if text == "Coordinator reviewed the Worker result."
+            )));
+            assert_eq!(fx.runs().len(), 1, "the Coordinator ran once and the Worker never did");
+            // A second retry of an already mediated result is refused before any provider run.
+            let repeat = super::super::retry_project_conversation_continuation(
+                GuiMutation::untracked(),
+                fx.app.state(),
+                fx.project_id.to_string(),
+                before.id.to_string(),
+                snapshot.conversation.revision,
+                fx.returned.to_string(),
+            )
+            .await;
+            assert!(repeat.is_err(), "a mediated result is not mediated twice");
+            assert_eq!(fx.runs().len(), 1);
+        }
+    }
+
+    /// Retired direct delegation must leave every Task Checkout as it found it,
+    /// whatever state the checkout holds. These cases run the real command
+    /// against a fake provider. They also prove that withdrawing an earlier
+    /// approval changes neither the checkout nor the Task.
     #[cfg(unix)]
     mod dirty_checkout {
         use super::*;
@@ -2229,6 +2450,23 @@ mod tests {
             assert_eq!(git(&fx.checkout, &["rev-parse", "HEAD"]), head);
             assert!(fake.invocations().is_empty(), "no provider launched");
             assert_eq!(fx.worker_started(), 0);
+
+            // Durable across restart: a freshly opened state reads the same record.
+            let root = fx._tmp.path();
+            let paths = std::sync::Arc::new(crate::config::paths::AppPaths::with_roots(
+                root.join("config"),
+                root.join("data"),
+                root.join("cache"),
+                root.join("runtime"),
+            ));
+            let (reopened, _) = crate::app_core::build_state_with_paths(paths).await.unwrap();
+            let persisted = reopened.storage.load_primary_conversation(fx.project_id).unwrap().unwrap();
+            assert_eq!(persisted.actions.iter().find(|a| a.id == action).unwrap().status, ActionStatus::Withdrawn);
+            assert_eq!(
+                persisted.entries.iter().filter(|e| matches!(e.kind, EntryKind::ActionWithdrawn { .. })).count(),
+                1,
+                "one durable withdrawal after restart"
+            );
             drop(fx.repo);
         }
 
