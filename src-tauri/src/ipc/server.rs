@@ -892,7 +892,8 @@ async fn accept_loop(
                          failures"
                     );
                     // An optional listener that is given up on is closed, so
-                    // its clients are refused rather than left queued. The
+                    // new clients are refused. Connections already queued in
+                    // its backlog are reset by the kernel, not refused. The
                     // OS-verified one is kept: it is the ownership.
                     if !endpoint.is_os_authenticated() {
                         owner.listener.lock().await.take();
