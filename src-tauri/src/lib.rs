@@ -15,6 +15,7 @@ pub mod pr_status;
 /// Building `AppState` once, for whichever front end wants it.
 pub mod lifecycle;
 pub mod conversation_actions;
+pub mod conversation_executions;
 pub mod coordinator_reads;
 pub mod app_core;
 /// Headless execution, sharing the whole stack with the GUI.
@@ -428,6 +429,7 @@ pub fn run() {
             create_project,
             list_projects,
             get_project_conversation,
+            get_project_conversation_executions,
             open_project_conversation,
             send_project_message,
             retry_project_conversation_continuation,

@@ -39,7 +39,8 @@ pub use repository::*;
 pub use repository_setup::*;
 pub use project::*;
 pub use conversation::{
-    act_on_project_conversation, get_project_conversation, open_project_conversation,
+    act_on_project_conversation, get_project_conversation, get_project_conversation_executions,
+    open_project_conversation,
     retry_project_conversation_continuation, send_project_message, stop_project_conversation,
 };
 pub use workspace::*;

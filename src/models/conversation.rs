@@ -39,8 +39,30 @@ pub struct ProjectAction { pub id: Uuid, pub explanation: String, pub mutation: 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationRunStatus { Running }
+/// What a Task run started by an approved Project action has become. Mirrors the backend projection (`conversation_executions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationExecutionState { PendingApproval, Queued, Running, Unconfirmed, Completed, Failed, RecoveryRequired, Ambiguous, NoExecutionEvidence, TaskUnavailable }
+/// Text from a run or a proposal. Untrusted: it is shown as plain text only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationBoundedText { pub text: String, pub truncated: bool, pub original_chars: u32 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ConversationExecutionResult { Available { text: ConversationBoundedText }, Truncated { text: ConversationBoundedText }, Unavailable { reason: ConversationBoundedText }, NotRecorded, NotApplicable }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationExecution { pub action_id: Uuid, pub task_id: Uuid, pub task_title: String, pub state: ConversationExecutionState, pub transitional: bool, pub run: Option<u32>, pub result: ConversationExecutionResult, pub needs_human: bool, pub attention: Option<crate::models::AttentionReason>, pub explanation: ConversationBoundedText }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Snapshot { pub conversation: Conversation, pub coordinator_live: bool, pub worker_live: bool, pub run_status: Option<ConversationRunStatus>, #[serde(default)] pub continuation_error: Option<String> }
+pub struct Snapshot {
+    pub conversation: Conversation,
+    pub coordinator_live: bool,
+    pub worker_live: bool,
+    pub run_status: Option<ConversationRunStatus>,
+    #[serde(default)]
+    pub continuation_error: Option<String>,
+    /// Absent in snapshots written before execution visibility existed.
+    #[serde(default)]
+    pub executions: Vec<ConversationExecution>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum HumanAction { Approve { request: Option<String> }, Reject }
@@ -65,6 +87,7 @@ mod tests {
     fn continuation_error_is_typed_and_optional_for_existing_snapshots() {
         let legacy: Snapshot = serde_json::from_value(snapshot_json()).expect("legacy snapshot should decode");
         assert!(legacy.continuation_error.is_none());
+        assert!(legacy.executions.is_empty(), "a snapshot from before execution visibility has none");
 
         let mut failed = snapshot_json();
         failed["continuation_error"] = json!("Coordinator unavailable; retry from saved result");

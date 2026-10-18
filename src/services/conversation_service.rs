@@ -1,4 +1,4 @@
-use crate::models::{ConversationHumanAction, ConversationSnapshot};
+use crate::models::{ConversationExecution, ConversationHumanAction, ConversationSnapshot};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -30,6 +30,12 @@ async fn snapshot(promise: js_sys::Promise) -> Result<ConversationSnapshot, Stri
 pub async fn get_project_conversation(project_id: String) -> Result<ConversationSnapshot, String> {
     let args = serde_wasm_bindgen::to_value(&ProjectArgs { project_id }).map_err(|error| error.to_string())?;
     snapshot(raw_invoke("get_project_conversation", args)).await
+}
+/// The execution views alone. Read-only on the backend, so the Conversation can refresh them without the restart reconciliation of `get_project_conversation`.
+pub async fn get_project_conversation_executions(project_id: String) -> Result<Vec<ConversationExecution>, String> {
+    let args = serde_wasm_bindgen::to_value(&ProjectArgs { project_id }).map_err(|error| error.to_string())?;
+    let value = JsFuture::from(raw_invoke("get_project_conversation_executions", args)).await.map_err(|error| error.as_string().unwrap_or_else(|| format!("{error:?}")))?;
+    serde_wasm_bindgen::from_value(value).map_err(|error| format!("Invalid execution response: {error}"))
 }
 pub async fn open_project_conversation(project_id: String) -> Result<ConversationSnapshot, String> {
     let args = serde_wasm_bindgen::to_value(&ProjectArgs { project_id }).map_err(|error| error.to_string())?;
