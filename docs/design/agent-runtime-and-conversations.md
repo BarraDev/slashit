@@ -42,44 +42,51 @@ separate; provider transcripts and arbitrary Project records are not included.
 The strict output contract is `Reply { text }`, `CreateTask`, `EditTask`,
 `MoveTask`, `EnqueueTask` or `ExecuteRequest` (see
 [Coordinator Task capabilities](#coordinator-task-capabilities)). Unknown types
-and fields are refused. Direct delegation to a Task Worker is retired: a
+and fields are refused. Direct delegation to a Task Worker is retired. A
 `delegate_to_task` output still parses, but on both the ordinary and the
-follow-up path SlashIt records a bounded refusal, creates no `TaskAction` and
-starts nothing. Prose cannot trigger an action. A proposal is persisted and
-displayed, but cannot start a Worker until a Human explicitly approves it.
-Approval can replace the request; the saved approved request is the execution
-authority.
+follow-up path SlashIt records a bounded refusal, creates no proposal or
+`TaskAction`, and starts nothing. Prose cannot trigger an action. A Coordinator
+proposal is a `ProjectAction`: it is persisted and displayed, changes no Task,
+and cannot be edited before a decision. Approval authorizes exactly the
+persisted mutation the Human saw. Approval does not start a Worker.
 
-A Worker is admitted only for an existing Task in the Conversation's Project.
-The Task must already have a valid Git Task Checkout on its recorded branch,
-and the existing Task executor must grant exclusive Task ownership and agent
-capacity. Worker context contains the target Task, approved request, and
-selected bounded dependencies. It excludes the full Conversation, unrelated
-Tasks, and provider transcripts. The Coordinator is read-only, so it does not
-share mutation of the Task Checkout.
+Approving `EnqueueTask` queues an existing Backlog Task. Approving
+`ExecuteRequest` queues the Task with the approved request bound to that
+approval, and may name the Task's existing Git Task Checkout. Both go through
+the normal Task lifecycle, which decides when the Task runs. The Task executor
+grants exclusive Task ownership and agent capacity, obtains the Task's Task
+Checkout, records the run, and publishes its activity and result on the Task.
+The run prompt is built from the target Task and the approved request. It does
+not include the Conversation history, unrelated Tasks, or provider transcripts.
+The Coordinator is read-only and never edits the Task Checkout.
 
-After the Task's provider lease is taken and before the Worker is recorded as
-started, SlashIt reads the Task Checkout's Git status. Any uncommitted change,
-tracked, staged, deleted or untracked, refuses the start, as does a status that
-cannot be read. The approved action stays approved, the checkout is not
-touched, and the Human resolves it and retries. The Worker's result is
-committed as everything in the checkout, so edits that were already there would
-otherwise be recorded as the new request's work. This protects against
-pre-existing dirty content only. It does not establish who owns an edit made in
-the checkout while the Worker runs, and ignored files are not considered.
+An `ExecuteRequest` that names a checkout is checked under the Task's lifecycle
+lease before it is queued. The named checkout must be the Task's own checkout as
+the Human saw it, and a checkout with an unfinished recovery, cleanup, or
+integration operation refuses the approval. A refused approval is recorded as
+`Refused`. It is not retried in place: the Human resolves the cause, and the
+Coordinator proposes the request again. When a new attempt starts on a recovered
+checkout, the executor reads the uncommitted work again before the provider
+starts. A change is recorded as recovery of that run, and no provider is
+launched. Results are committed from the whole checkout, so edits that were
+already there would otherwise be recorded as the new request's work. This
+protects against pre-existing uncommitted content only. It does not establish
+who owns an edit made in the checkout while the Worker runs, and ignored files
+are not considered.
 
-The Worker result is saved as Conversation-owned evidence. SlashIt then starts
-a fresh read-only Coordinator Run with the selected context and that result
-marked as untrusted evidence. The Coordinator replies in the same Conversation,
-which remains open for ordinary Human messages or another separately approved
-action.
+Legacy `TaskAction` results saved as Conversation evidence stay readable. A
+`Returned` legacy result can still be mediated: SlashIt starts a fresh read-only
+Coordinator Run with the selected context and that result marked as untrusted
+evidence, and the Coordinator replies in the same Conversation. Mediation never
+replays the Worker. A repeated retry of an already mediated result is refused
+before any provider runs.
 
-After restart no Run is considered live. An interrupted Coordinator can be
-retried from saved Conversation state. A Worker that may have partially changed
-a checkout is marked interrupted and is not silently replayed. Once a Worker
-result is durable, recovery continues with a fresh Coordinator Run rather than
-rerunning the Worker. This prevents automatic replay; it does not promise
-exactly-once external or repository side effects across crashes.
+After restart no Run is considered live. A run that may have partially changed
+its checkout is recorded as needing recovery and is not replayed silently. A
+legacy Coordinator run interrupted by a restart can be retried from saved
+Conversation state. A legacy Worker result that is already durable is mediated,
+never rerun. This prevents automatic replay; it does not promise exactly-once
+external or repository side effects across crashes.
 
 ### Coordinator Task capabilities
 
