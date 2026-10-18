@@ -24,9 +24,16 @@ const WINDOW_CONFIG: &str = r#"{
 /// Builds the main window with the navigation boundary attached.
 ///
 /// Top-level navigation is allowed only to the application origin. Every
-/// other destination is refused, and nothing is opened on its behalf. External
-/// web links leave the window only through the opener, which the frontend
-/// calls after a click. A request for a new window is refused outright.
+/// other destination that parses as a URL is refused, and nothing is opened on
+/// its behalf. External web links leave the window only through the opener,
+/// which the frontend calls after a click. A request for a new window is refused
+/// outright, and so is a download, which is not a navigation and so would
+/// otherwise bypass the check.
+///
+/// Known gap: tauri-runtime-wry allows a destination that it cannot parse as a
+/// URL before this check runs, and on WebKitGTK a navigation without a URI falls
+/// back to WebKit's default, which allows it. Application content does not
+/// produce such destinations, but the boundary cannot close that gap itself.
 pub fn create(app: &App) -> tauri::Result<WebviewWindow> {
     let config: WindowConfig =
         serde_json::from_str(WINDOW_CONFIG).expect("main window configuration is valid");
@@ -34,6 +41,7 @@ pub fn create(app: &App) -> tauri::Result<WebviewWindow> {
     WebviewWindowBuilder::from_config(app, &config)?
         .on_navigation(move |target| is_app_navigation(target, &origin))
         .on_new_window(|_url, _features| NewWindowResponse::Deny)
+        .on_download(|_webview, _event| false)
         .build()
 }
 

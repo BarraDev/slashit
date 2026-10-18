@@ -50,11 +50,12 @@ pub fn is_safe_link_destination(url: &str) -> bool {
         && !url.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
-/// Whether a mouse button opens a link: the primary button (`click`) and the
-/// auxiliary middle button. Any other button keeps its default behavior, so a
-/// right-click still reaches the context menu instead of opening a browser.
-fn opens_link_on_button(button: i16) -> bool {
-    matches!(button, 0 | 1)
+/// Whether a mouse event opens a link. The primary button opens it through
+/// `click` and the middle button through `auxclick`; each button is accepted on
+/// its own event only, so one press cannot open a link twice. Any other button
+/// keeps its default behavior, so a right-click still reaches the context menu.
+fn opens_link(event_type: &str, button: i16) -> bool {
+    matches!((event_type, button), ("click", 0) | ("auxclick", 1))
 }
 
 /// Routes clicks on external links, anywhere in the document, through
@@ -65,7 +66,7 @@ pub fn route_external_links() {
         return;
     };
     let on_mouse = Closure::<dyn Fn(web_sys::MouseEvent)>::new(|ev: web_sys::MouseEvent| {
-        if !opens_link_on_button(ev.button()) {
+        if !opens_link(&ev.type_(), ev.button()) {
             return;
         }
         let Some(anchor) = ev
@@ -98,13 +99,20 @@ pub fn route_external_links() {
 
 #[cfg(test)]
 mod tests {
-    use super::opens_link_on_button;
+    use super::opens_link;
 
     #[test]
-    fn primary_and_middle_buttons_open_links_and_the_others_do_not() {
-        assert!(opens_link_on_button(0));
-        assert!(opens_link_on_button(1));
-        assert!(!opens_link_on_button(2));
-        assert!(!opens_link_on_button(3));
+    fn each_button_opens_a_link_only_on_its_own_event() {
+        assert!(opens_link("click", 0));
+        assert!(opens_link("auxclick", 1));
+        assert!(!opens_link("click", 1));
+        assert!(!opens_link("auxclick", 0));
+    }
+
+    #[test]
+    fn the_context_menu_button_never_opens_a_link() {
+        assert!(!opens_link("click", 2));
+        assert!(!opens_link("auxclick", 2));
+        assert!(!opens_link("auxclick", 3));
     }
 }
