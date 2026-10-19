@@ -1,7 +1,5 @@
 use crate::commands::gui_admission::GuiMutation;
 use uuid::Uuid;
-use crate::domain::{BranchOrigin, ProjectBase};
-use crate::worktree::{WorktreeInfo, WorktreeManager};
 
 #[tauri::command]
 pub async fn create_worktree(
@@ -14,7 +12,7 @@ pub async fn create_worktree(
 }
 
 /// [`create_worktree`], on an already parsed task id.
-async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result<String, String> {
+pub(crate) async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result<String, String> {
 
     // Acquiring a worktree for a task is a lifecycle ownership change, so it
     // waits behind any cleanup, terminalization or delete already running for
@@ -41,8 +39,8 @@ async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result
         }
     }
 
-    // Resolve repo path, and the project's local base
-    let (repo_path, project_base) = {
+    // Resolve the repository path.
+    let repo_path = {
         let tasks = state.task.tasks.read().await;
         let task = tasks.get(&task_id).ok_or("Task not found")?;
         let project_id = task.project_id;
@@ -51,41 +49,23 @@ async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result
         let projects = state.project.projects.read().await;
         let project = projects.get(&project_id).ok_or("Project not found")?;
         let repo_id = project.repository_id.ok_or("No repository linked")?;
-        let project_base = project.base.clone();
         drop(projects);
 
         let repos = state.repository.repositories.read().await;
         let repo = repos.get(&repo_id).ok_or("Repository not found")?;
-        (repo.local_path.clone(), project_base)
+        repo.local_path.clone()
     };
 
-    // Check if task already has a branch (reattach) or needs a new one
-    let existing_branch = {
-        let tasks = state.task.tasks.read().await;
-        tasks.get(&task_id).and_then(|t| t.branch_name.clone())
-    };
-
-    // A branch another task in the repository can claim is not this task's
-    // to reattach, adopt or create. See `worktree::refuse_shared_task_branch`.
-    let branch = existing_branch.clone().unwrap_or_else(|| WorktreeManager::branch_for_task(task_id));
-    crate::worktree::refuse_shared_task_branch(
-        &state.task.tasks,
-        &state.project.projects,
-        &state.repository.repositories,
-        task_id,
-        &branch,
-        &repo_path,
-    )
-    .await?;
-
-    let acquired = acquire_checkout(
-        &state.worktree_manager,
-        &repo_path,
-        existing_branch.as_deref(),
-        project_base.as_ref(),
-        task_id,
-    )
-    .await?;
+    // The checkout is acquired exactly as an execution acquires it: the
+    // executor reads the Task's dependencies, refuses what it cannot prove,
+    // and reattaches, adopts or creates the branch. Doing it here by a second
+    // route would let an explicit checkout omit work that an execution holds
+    // to, so there is only the one. See `TaskExecutor::acquire_task_worktree`.
+    let executor = state.executor.get().ok_or(
+        "The task executor is not running yet, so no checkout was created; try again in a moment",
+    )?;
+    let (_, acquired) = executor.acquire_task_worktree(task_id, &repo_path).await;
+    let acquired = acquired?;
 
     // Recorded before it is reported, and taken back if it cannot be: see
     // `WorktreeManager::undo_created_checkout` for why a checkout left
@@ -129,59 +109,6 @@ async fn create_worktree_inner(state: &crate::AppState, task_id: Uuid) -> Result
     }
 
     Ok(acquired.info.path)
-}
-
-/// The checkout [`create_worktree`] acquired, and what it establishes about
-/// the task's branch.
-struct AcquiredCheckout {
-    info: WorktreeInfo,
-    /// The commit the branch started from, when this call created it.
-    /// `None` on reattach and adoption, which keep whatever was recorded.
-    base_commit: Option<String>,
-    /// What the branch was created from, when that is known. `None` leaves
-    /// whatever the task already records.
-    origin: Option<BranchOrigin>,
-    /// The commit this call created the branch at, together with its
-    /// worktree. `None` when the branch already existed, whether its
-    /// worktree was adopted or added: nothing of that is this call's to take
-    /// back.
-    created_at: Option<String>,
-}
-
-/// Attach `existing_branch` again, or create (or adopt) the task's own
-/// branch when it has none yet.
-async fn acquire_checkout(
-    manager: &WorktreeManager,
-    repo_path: &str,
-    existing_branch: Option<&str>,
-    project_base: Option<&ProjectBase>,
-    task_id: Uuid,
-) -> Result<AcquiredCheckout, String> {
-    // A reattach keeps the starting commit and origin recorded when the
-    // branch was created.
-    if let Some(branch) = existing_branch {
-        let info = manager.reattach(repo_path, branch).await?;
-        return Ok(AcquiredCheckout { info, base_commit: None, origin: None, created_at: None });
-    }
-    // This path never stacks: a branch it creates starts at the resolved
-    // default base, exactly as the executor's ordinary branches do (see
-    // `WorktreeManager::create_or_adopt`), whatever the task depends on.
-    match manager
-        .create_or_adopt(repo_path, &WorktreeManager::branch_for_task(task_id), project_base)
-        .await?
-    {
-        (info, Some(base)) => Ok(AcquiredCheckout {
-            info,
-            created_at: Some(base.commit.clone()),
-            origin: Some(base.branch_origin()),
-            base_commit: Some(base.commit),
-        }),
-        // An adopted worktree claims no start: its `HEAD` is not where the
-        // branch started, and whatever the task already recorded is kept.
-        (info, None) => {
-            Ok(AcquiredCheckout { info, base_commit: None, origin: None, created_at: None })
-        }
-    }
 }
 
 /// Remove a task's worktree at the user's explicit request, without saying
@@ -246,6 +173,8 @@ pub async fn check_worktree_exists(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::BranchOrigin;
+    use crate::worktree::WorktreeManager;
     use std::path::Path;
 
     /// Run git in `dir` with a fixed identity, asserting it succeeds.
@@ -284,89 +213,6 @@ mod tests {
         (repo, manager)
     }
 
-    /// A worktree created from the Worktree panel while the primary checkout
-    /// is on a feature branch starts at `origin/main`, not at that branch's
-    /// tip, and records `main` as its default base.
-    #[tokio::test]
-    async fn a_worktree_created_from_a_feature_checkout_starts_at_the_default_base() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (repo, manager) = fixture(&temp);
-        let main_tip = git(&repo, &["rev-parse", "refs/remotes/origin/main"]);
-        git(&repo, &["checkout", "-q", "-b", "feature-f"]);
-        git(&repo, &["commit", "-q", "--allow-empty", "-m", "feature work"]);
-
-        let acquired = acquire_checkout(&manager, repo.to_str().unwrap(), None, None, Uuid::new_v4())
-            .await
-            .expect("a worktree");
-
-        assert_eq!(git(Path::new(&acquired.info.path), &["rev-parse", "HEAD"]), main_tip);
-        assert_eq!(acquired.base_commit.as_deref(), Some(main_tip.as_str()));
-        assert_eq!(
-            acquired.origin,
-            Some(BranchOrigin::DefaultBase { branch: Some("main".to_string()) })
-        );
-    }
-
-    /// A repository with no default base is refused, and nothing is created
-    /// in it.
-    #[tokio::test]
-    async fn a_repository_without_a_default_base_is_refused() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (repo, manager) = fixture(&temp);
-        git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]);
-        let refs_before = git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
-
-        let refused = acquire_checkout(&manager, repo.to_str().unwrap(), None, None, Uuid::new_v4())
-            .await
-            .err()
-            .expect("refused");
-
-        assert!(refused.contains("git remote set-head origin"), "{refused}");
-        assert_eq!(git(&repo, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs_before);
-        assert_eq!(git(&repo, &["worktree", "list", "--porcelain"]).matches("worktree ").count(), 1);
-    }
-
-    /// A worktree of the task's branch that git has registered at a path of
-    /// another tool's choosing is adopted there, with no origin claimed.
-    #[tokio::test]
-    async fn a_registered_worktree_at_a_custom_path_is_adopted_without_an_origin() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (repo, manager) = fixture(&temp);
-        let task_id = Uuid::new_v4();
-        let branch = WorktreeManager::branch_for_task(task_id);
-        let custom = temp.path().join("elsewhere").join(&branch);
-        git(&repo, &["worktree", "add", "-q", "-b", &branch, "--", custom.to_str().unwrap()]);
-
-        let acquired = acquire_checkout(&manager, repo.to_str().unwrap(), None, None, task_id)
-            .await
-            .expect("adopted");
-
-        assert_eq!(
-            std::fs::canonicalize(&acquired.info.path).unwrap(),
-            std::fs::canonicalize(&custom).unwrap()
-        );
-        assert_eq!(acquired.base_commit, None, "an adopted worktree's HEAD is not its start");
-        assert_eq!(acquired.origin, None);
-    }
-
-    /// A reattach records neither a starting commit nor an origin, so the
-    /// ones recorded when the branch was created are kept.
-    #[tokio::test]
-    async fn reattaching_records_no_base_and_no_origin() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let (repo, manager) = fixture(&temp);
-        git(&repo, &["branch", "task-legacy"]);
-
-        let acquired =
-            acquire_checkout(&manager, repo.to_str().unwrap(), Some("task-legacy"), None, Uuid::new_v4())
-                .await
-                .expect("a worktree");
-
-        assert_eq!(acquired.info.branch, "task-legacy");
-        assert_eq!(acquired.base_commit, None);
-        assert_eq!(acquired.origin, None);
-    }
-
     /// Two tasks whose ids share their first 8 hex digits, which was the
     /// whole of the branch name `task-12345678` earlier versions gave both,
     /// given checkouts from the Worktree panel.
@@ -390,6 +236,7 @@ mod tests {
             let (repo, _) = fixture(temp);
             let (state, _) =
                 crate::app_core::build_state_with_paths(paths(temp)).await.expect("state");
+            crate::test_helpers::attach_test_executor(&state);
             let repository = crate::domain::Repository {
                 id: Uuid::new_v4(),
                 local_path: repo.to_string_lossy().to_string(),
@@ -711,6 +558,7 @@ mod tests {
 
             let (state, _) =
                 crate::app_core::build_state_with_paths(paths(&temp)).await.expect("restart");
+            crate::test_helpers::attach_test_executor(&state);
             let reloaded = state.task.tasks.read().await[&B].clone();
             assert_eq!(reloaded.branch_name.as_deref(), Some(full.as_str()));
             assert_eq!(reloaded.worktree_path, None, "startup clears a checkout git confirms gone");
@@ -784,6 +632,7 @@ mod tests {
                 temp.path().join("runtime"),
             ));
             let (state, _) = crate::app_core::build_state_with_paths(paths).await.expect("state");
+            crate::test_helpers::attach_test_executor(&state);
             let repository = crate::domain::Repository {
                 id: Uuid::new_v4(),
                 local_path: repo.to_string_lossy().to_string(),

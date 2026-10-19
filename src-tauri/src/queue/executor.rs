@@ -475,24 +475,24 @@ type AcquiredWorktree = Result<Acquired, String>;
 
 /// The worktree a starting task was given and what is known about where its
 /// branch came from.
-struct Acquired {
-    info: WorktreeInfo,
+pub(crate) struct Acquired {
+    pub(crate) info: WorktreeInfo,
     /// What was done to get the worktree, for the log.
     what_happened: &'static str,
     /// The commit the task's branch started from, when it was created or
     /// resumed here. `None` on reattach, which keeps the recorded one.
-    base_commit: Option<String>,
+    pub(crate) base_commit: Option<String>,
     /// What the task's branch was created from, when it was created or
     /// resumed here and that is known. `None` on reattach, which keeps the
     /// recorded one, and for a branch whose origin is unknown: one adopted
     /// from an unrecorded start, or an ordinary branch that did not start on
     /// the proven default base.
-    origin: Option<BranchOrigin>,
+    pub(crate) origin: Option<BranchOrigin>,
     /// The commit this start created the task's branch at, together with its
     /// worktree. `None` when the branch already existed -- reattached,
     /// adopted, or a stacked branch resumed -- which is never this start's to
     /// take back if the task cannot record it.
-    created_at: Option<String>,
+    pub(crate) created_at: Option<String>,
 }
 
 /// Whether `task` sits where a delivered pull request lives, so that the
@@ -3200,9 +3200,10 @@ impl TaskExecutor {
     /// Returns the branch the task already had, if any, alongside the
     /// outcome: the worktree, what was done to get it, and the commit it
     /// started from when that is known. Nothing here starts an agent.
-    /// [`Self::spawn_task_execution`] calls it under the task's lifecycle
-    /// lease.
-    async fn acquire_task_worktree(
+    /// [`Self::spawn_task_execution`] and the explicit checkout command
+    /// (`commands::worktree::create_worktree_inner`) both call it under the
+    /// task's lifecycle lease.
+    pub(crate) async fn acquire_task_worktree(
         &self,
         task_id: Uuid,
         repo_path: &str,
@@ -3497,10 +3498,31 @@ impl TaskExecutor {
             // never recorded it may have stacked it. A task with no starting
             // commit has no known diff boundary, as for one recorded before
             // starting commits were kept.
+            // What an adopted checkout must hold before it may be used: the
+            // commits the dependencies' work is known to be in. Git confirming
+            // the checkout belongs to the branch is not enough. Empty for a
+            // Task without dependencies, and for one whose dependencies have no
+            // work SlashIt made.
+            let held = if dependency_ids.is_empty() {
+                Vec::new()
+            } else {
+                self.held_evidence(&dependency_ids).await
+            };
             let created = match delivered_base {
                 Some(base) => {
                     self.worktree_manager
-                        .create_or_adopt_from(repo_path, &branch_name, base)
+                        .create_or_adopt_from(repo_path, &branch_name, base, &held)
+                        .await
+                }
+                None if !dependency_ids.is_empty() => {
+                    let project_base = self.project_base_of(task_id).await;
+                    self.worktree_manager
+                        .create_or_adopt_holding(
+                            repo_path,
+                            &branch_name,
+                            project_base.as_ref(),
+                            &held,
+                        )
                         .await
                 }
                 None => {
@@ -3659,6 +3681,39 @@ impl TaskExecutor {
             }
         }
         Ok(merge_base)
+    }
+
+    /// The commits a checkout of a Task with `dependency_ids` must hold before
+    /// it may be adopted: the approved tip of each dependency integrated
+    /// locally, and the merge commit of each pull request recorded as merged.
+    /// A dependency with neither has no work SlashIt made, so it requires
+    /// nothing. Read from the record only; nothing is fetched or resolved.
+    async fn held_evidence(&self, dependency_ids: &[Uuid]) -> Vec<String> {
+        let tasks = self.tasks.read().await;
+        let mut held = Vec::new();
+        for dependency_id in dependency_ids {
+            let Some(dependency) = tasks.get(dependency_id) else {
+                continue;
+            };
+            if let Some(integration) = dependency.local_integration.as_ref() {
+                if matches!(integration.state, crate::domain::IntegrationState::Integrated) {
+                    held.push(integration.approved_tip.clone());
+                }
+            }
+            for external in &dependency.external_refs {
+                if let crate::domain::task::ExternalRef::GithubPr {
+                    state,
+                    merge_commit: Some(commit),
+                    ..
+                } = external
+                {
+                    if state.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("MERGED")) {
+                        held.push(commit.clone());
+                    }
+                }
+            }
+        }
+        held
     }
 
     /// The base a start checks its merged dependencies against, and creates
@@ -12908,6 +12963,124 @@ mod tests {
         assert_eq!(what_happened, "Created stacked worktree");
         let worktree = std::path::Path::new(&info.path);
         assert!(worktree.join("dependency.txt").exists());
+    }
+
+    /// The app's state, wired as `lib.rs` wires it at startup: the executor
+    /// shares the state's stores, so a command and the executor see the same
+    /// Tasks, projects and repositories.
+    async fn command_state_with_executor() -> (crate::AppState, Arc<TaskExecutor>, tempfile::TempDir) {
+        let paths_temp = tempfile::TempDir::new().expect("paths temp dir");
+        let paths = Arc::new(crate::config::paths::AppPaths::with_roots(
+            paths_temp.path().join("config"),
+            paths_temp.path().join("data"),
+            paths_temp.path().join("cache"),
+            paths_temp.path().join("runtime"),
+        ));
+        let (state, _report) = crate::app_core::build_state_with_paths(paths)
+            .await
+            .expect("state should build under a fresh tempdir");
+        let executor = crate::test_helpers::attach_test_executor(&state);
+        (state, executor, paths_temp)
+    }
+
+    /// The explicit checkout command takes the same start as an execution: a
+    /// Task that depends on unmerged work gets a checkout that holds that
+    /// work, not one from the default base without it.
+    #[tokio::test]
+    async fn an_explicit_checkout_of_a_dependent_task_holds_its_dependency_work() {
+        let (state, executor, _paths) = command_state_with_executor().await;
+        let temps = vec![tempfile::TempDir::new().expect("temp dir")];
+        let (repo, task_id, _) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-explicit01").await;
+        commit_unmerged_work(&repo, "task-explicit01", "dependency.txt");
+        publish_default_base(&repo);
+
+        let path = crate::commands::worktree::create_worktree_inner(&state, task_id)
+            .await
+            .expect("a checkout");
+
+        assert!(
+            std::path::Path::new(&path).join("dependency.txt").exists(),
+            "the explicit checkout omits the dependency's work"
+        );
+    }
+
+    /// A leftover checkout of the task's own branch, from before the
+    /// dependency's approved work reached the base, is not adopted for a
+    /// start that must hold that work. The branch lacks it, so the start is
+    /// refused, and the branch and the checkout are left as they were.
+    #[tokio::test]
+    async fn a_leftover_checkout_lacking_an_integrated_dependency_is_not_adopted() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-leftover01").await;
+        publish_default_base(&repo);
+        let branch = WorktreeManager::branch_for_task(task_id);
+        let (leftover, _) = executor
+            .worktree_manager
+            .create_or_adopt(repo.to_str().unwrap(), &branch, None)
+            .await
+            .expect("a leftover checkout of the task's branch");
+        commit_unmerged_work(&repo, "task-leftover01", "dependency.txt");
+        git_in(&repo, &["merge", "-q", "--no-edit", "task-leftover01"]);
+        git_in(&repo, &["push", "-q", "origin", "main"]);
+        integrate_dependency_locally(&executor, &repo, dependency_id, "task-leftover01").await;
+        let branch_before = git_in(&repo, &["rev-parse", &format!("refs/heads/{branch}")]);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+
+        let Err(refusal) = acquired else {
+            panic!("a checkout lacking the integrated work was adopted");
+        };
+        assert!(refusal.contains("was not adopted"), "{refusal}");
+        assert_eq!(git_in(&repo, &["rev-parse", &format!("refs/heads/{branch}")]), branch_before);
+        assert!(std::path::Path::new(&leftover.path).exists());
+    }
+
+    /// A checkout left by an interrupted start, after the dependency's approved
+    /// work reached the base, is adopted even though the base has since moved
+    /// on: it holds the work the start needs, and recovery must not refuse it
+    /// for lacking the newer base.
+    #[tokio::test]
+    async fn an_interrupted_checkout_holding_the_integrated_work_is_adopted_after_the_base_moves() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) =
+            stacked_task_fixture(&executor, &temps, TaskStatus::Done, None, "task-recover02").await;
+        publish_default_base(&repo);
+        commit_unmerged_work(&repo, "task-recover02", "dependency.txt");
+        git_in(&repo, &["merge", "-q", "--no-edit", "task-recover02"]);
+        git_in(&repo, &["push", "-q", "origin", "main"]);
+        integrate_dependency_locally(&executor, &repo, dependency_id, "task-recover02").await;
+        let branch = WorktreeManager::branch_for_task(task_id);
+        let (leftover, _) = executor
+            .worktree_manager
+            .create_or_adopt(repo.to_str().unwrap(), &branch, None)
+            .await
+            .expect("a leftover checkout of the task's branch");
+        std::fs::write(repo.join("later.txt"), "later\n").unwrap();
+        git_in(&repo, &["add", "later.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "later"]);
+        git_in(&repo, &["push", "-q", "origin", "main"]);
+        let branch_before = git_in(&repo, &["rev-parse", &format!("refs/heads/{branch}")]);
+
+        let (_, acquired) = executor
+            .acquire_task_worktree(task_id, repo.to_str().unwrap())
+            .await;
+
+        let Acquired {
+            info,
+            what_happened,
+            ..
+        } = acquired.expect("the interrupted checkout is adopted");
+        assert_eq!(what_happened, "Adopted worktree");
+        assert_eq!(
+            std::fs::canonicalize(&info.path).unwrap(),
+            std::fs::canonicalize(&leftover.path).unwrap()
+        );
+        assert!(std::path::Path::new(&info.path).join("dependency.txt").exists());
+        assert_eq!(git_in(&repo, &["rev-parse", &format!("refs/heads/{branch}")]), branch_before);
     }
 
     /// Replace the dependencies `task_id` records, as a legacy record holds
