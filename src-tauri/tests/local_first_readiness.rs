@@ -145,6 +145,9 @@ impl World {
             .expect("state");
         // Not about disk pressure: independent of the host's free space.
         state.start_guard = slashit_ui_lib::test_helpers::plenty_of_disk();
+        // The explicit checkout command starts a checkout through the executor,
+        // as the app's setup installs it.
+        slashit_ui_lib::test_helpers::attach_test_executor(&state);
         let app = tauri::test::mock_app();
         app.manage(state);
         World { tmp, app }

@@ -78,7 +78,11 @@ record stores its parent and fork point (below).
   left alone.
 - **Which base a new branch starts from.** The executor reads the Task's
   dependencies when it creates the branch; a Task with an existing branch is
-  reattached and reads none. The first matching rule decides:
+  reattached and reads none. An explicit checkout (`create_worktree`) takes the
+  same start, through the same executor path, so it can never give a Task a
+  branch that an execution would not have given it. A Task holding an approved
+  additional request gets its approved checkout instead, and that checkout is
+  refused if it has changed since approval. The first matching rule decides:
   - One dependency with no branch recorded has no work SlashIt made, and the
     branch starts from the default base.
   - One dependency whose approved work was integrated locally, and whose
@@ -116,6 +120,23 @@ record stores its parent and fork point (below).
   commit. A refresh writes only that commit; it does not finish the Task again.
   A base that does not contain the commit is refused, and the recovery is to
   fetch the repository (or update the project's base branch) and start again.
+
+  A Task whose start adopts an existing checkout of its own branch (one created
+  outside a start, or left by an unfinished one) adopts it only when that
+  branch contains the commits its dependencies' work is known to be in: the
+  approved tip of a dependency integrated locally, and the merge commit of a
+  dependency whose pull request is recorded as merged. A dependency with no
+  branch requires nothing, and the base the start resolves now is not
+  required, so a checkout left before the base moved is still adopted. Git
+  confirming that the checkout belongs to the branch is not enough. A branch
+  that lacks one of those commits is refused and left as it is; bringing it up
+  to date is a decision for the person.
+
+  Limit: a Task whose branch is already recorded is reattached without
+  re-reading its dependencies. Dependencies cannot change once a checkout
+  exists, so a branch created by a start is always one that holds the work it
+  needed. A branch recorded before this rule existed is not re-checked, because
+  an interrupted run and an approved continuation look the same on the record.
 
   A refusal creates no branch or worktree, and changes no dependency, branch,
   worktree or user branch. The executor then records the refusal as the Task's

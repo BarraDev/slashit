@@ -1019,17 +1019,119 @@ impl WorktreeManager {
     /// the new Task depends on. The branch is created at exactly that commit,
     /// not at whatever the default base resolves to now, so the check and
     /// the branch cannot disagree about the base.
+    ///
+    /// An existing checkout of the branch is adopted only if its branch
+    /// contains every commit in `held`, the commits the Task's dependencies'
+    /// work is known to be in. Git confirming that the checkout belongs to the
+    /// branch says nothing about the work it holds.
     pub async fn create_or_adopt_from(
         &self,
         repo_path: &str,
         branch: &str,
         base: ResolvedBase,
+        held: &[String],
     ) -> Result<(WorktreeInfo, Option<ResolvedBase>), String> {
         let branch = checked_task_branch(branch)?;
         if let Some(info) = self.adoptable_task_checkout(repo_path, branch).await? {
+            Self::require_branch_holds(repo_path, branch, held).await?;
             return Ok((info, None));
         }
+        Self::require_base_holds(repo_path, &base, held).await?;
         self.create_at_base(repo_path, branch, base).await
+    }
+
+    /// [`Self::create_or_adopt_from`] for a Task with dependencies whose
+    /// start has no resolved base of its own: the base is resolved only when a
+    /// new branch has to be created, so adopting an existing checkout does not
+    /// depend on it.
+    pub async fn create_or_adopt_holding(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        project_base: Option<&ProjectBase>,
+        held: &[String],
+    ) -> Result<(WorktreeInfo, Option<ResolvedBase>), String> {
+        let branch = checked_task_branch(branch)?;
+        if let Some(info) = self.adoptable_task_checkout(repo_path, branch).await? {
+            Self::require_branch_holds(repo_path, branch, held).await?;
+            return Ok((info, None));
+        }
+        let base = resolve_default_base(repo_path, project_base).await?;
+        Self::require_base_holds(repo_path, &base, held).await?;
+        self.create_at_base(repo_path, branch, base).await
+    }
+
+    /// Refuse to adopt a checkout whose branch lacks any of `held`. The branch
+    /// and the checkout are left exactly as they are: bringing the branch up to
+    /// date is the person's decision.
+    async fn require_branch_holds(repo_path: &str, branch: &str, held: &[String]) -> Result<(), String> {
+        if held.is_empty() {
+            return Ok(());
+        }
+        let tip = tokio::process::Command::new(git_program())
+            .args(["rev-parse", "--verify", &format!("refs/heads/{branch}^{{commit}}")])
+            .current_dir(repo_path)
+            .output()
+            .await
+            .map_err(|e| format!("Failed to run git rev-parse: {e}"))?;
+        if !tip.status.success() {
+            return Err(format!(
+                "the checkout of branch {branch} was not adopted, because the branch could not \
+                 be read: {}. Nothing was changed.",
+                String::from_utf8_lossy(&tip.stderr).trim()
+            ));
+        }
+        let tip = String::from_utf8_lossy(&tip.stdout).trim().to_string();
+        for commit in held {
+            match super::restack::is_ancestor(Path::new(repo_path), commit, &tip).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "the checkout of branch {branch} was not adopted, because the branch does \
+                         not contain {commit}, work the Task's dependencies hold. Nothing was \
+                         changed. Bring the branch up to date with that work yourself, or move \
+                         the checkout aside, and start the Task again."
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "the checkout of branch {branch} was not adopted, because it could not be \
+                         shown to contain {commit}: {e}. Nothing was changed."
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse to create a branch at `base` unless `base` holds every commit in
+    /// `held`. The check is against the base the branch is actually created at,
+    /// so the new branch holds the work its Task's dependencies hold. Nothing is
+    /// created when it refuses.
+    async fn require_base_holds(repo_path: &str, base: &ResolvedBase, held: &[String]) -> Result<(), String> {
+        for commit in held {
+            match super::restack::is_ancestor(Path::new(repo_path), commit, &base.commit).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "the base {} ({}) does not contain {commit}, work the Task's dependencies \
+                         hold, so no branch was created. Nothing was changed. Fetch the \
+                         repository, or update the project's base branch, and start the Task \
+                         again.",
+                        base.commit,
+                        base.describe(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "the base {} could not be shown to contain {commit}, so no branch was \
+                         created: {e}. Nothing was changed.",
+                        base.commit
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The worktree already holding `branch`, when there is one to adopt. A
@@ -7305,13 +7407,102 @@ branch refs/heads/some-other-branch
 
         let mgr = test_manager();
         let (info, base) = mgr
-            .create_or_adopt_from(repo_path, "task-0a1b2c3d", validated.clone())
+            .create_or_adopt_from(repo_path, "task-0a1b2c3d", validated.clone(), &[])
             .await
             .expect("create");
 
         assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), validated.commit);
         assert_eq!(run_git(&info.path, &["rev-parse", "HEAD"]), validated.commit);
         assert_eq!(base, Some(validated));
+    }
+
+    /// A worktree already holding the task's branch is adopted only when that
+    /// branch contains the base the caller validated. Git confirming that the
+    /// checkout belongs to the branch says nothing about the work the branch
+    /// holds, so a checkout that predates the base is refused and left alone.
+    #[tokio::test]
+    async fn an_adopted_checkout_must_contain_the_validated_base() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+        let (leftover, _) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let branch_before = run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]);
+
+        std::fs::write(tmp.path().join("later.txt"), "later\n").unwrap();
+        run_git(repo_path, &["add", "later.txt"]);
+        run_git(repo_path, &["commit", "-q", "-m", "later"]);
+        run_git(repo_path, &["push", "-q", "origin", "main"]);
+        let validated = resolve_default_base(repo_path, None).await.expect("a base");
+        assert_ne!(validated.commit, branch_before);
+
+        let held = [validated.commit.clone()];
+        let refused = match mgr.create_or_adopt_from(repo_path, "task-0a1b2c3d", validated, &held).await {
+            Err(refused) => refused,
+            Ok(_) => panic!("a checkout that lacks the validated base was adopted"),
+        };
+
+        assert!(refused.contains("task-0a1b2c3d"), "{refused}");
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), branch_before);
+        assert!(Path::new(&leftover.path).exists(), "the existing checkout is left as it is");
+    }
+
+    /// A checkout is adopted when its branch holds the commits the start needs,
+    /// even though the base has moved on since the checkout was created. The
+    /// start needs the work it is held to, not the newest base; this is an
+    /// interrupted start whose branch already holds what it needed.
+    #[tokio::test]
+    async fn an_adopted_checkout_needs_only_the_commits_it_is_held_to() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        let mgr = test_manager();
+        let (leftover, _) = mgr.create_or_adopt(repo_path, "task-0a1b2c3d", None).await.expect("create");
+        let held_commit = run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]);
+
+        std::fs::write(tmp.path().join("later.txt"), "later\n").unwrap();
+        run_git(repo_path, &["add", "later.txt"]);
+        run_git(repo_path, &["commit", "-q", "-m", "later"]);
+        run_git(repo_path, &["push", "-q", "origin", "main"]);
+        let moved = resolve_default_base(repo_path, None).await.expect("a base");
+        assert_ne!(moved.commit, held_commit);
+
+        let (adopted, base) = mgr
+            .create_or_adopt_from(repo_path, "task-0a1b2c3d", moved, std::slice::from_ref(&held_commit))
+            .await
+            .expect("adopted");
+
+        assert_eq!(
+            std::fs::canonicalize(&adopted.path).unwrap(),
+            std::fs::canonicalize(&leftover.path).unwrap()
+        );
+        assert_eq!(base, None, "an adopted checkout claims no start");
+        assert_eq!(run_git(repo_path, &["rev-parse", "refs/heads/task-0a1b2c3d"]), held_commit);
+    }
+
+    /// A new branch for a Task whose dependency work is not in the base it would
+    /// be created at is refused, and no ref or checkout is created.
+    #[tokio::test]
+    async fn a_new_branch_is_not_created_on_a_base_lacking_the_held_work() {
+        let tmp = create_temp_git_repo();
+        let repo_path = tmp.path().to_str().unwrap();
+        run_git(repo_path, &["checkout", "-q", "-b", "other"]);
+        std::fs::write(tmp.path().join("other.txt"), "other\n").unwrap();
+        run_git(repo_path, &["add", "other.txt"]);
+        run_git(repo_path, &["commit", "-q", "-m", "other"]);
+        let held_commit = run_git(repo_path, &["rev-parse", "HEAD"]);
+        run_git(repo_path, &["checkout", "-q", "main"]);
+        let refs_before = all_refs(repo_path);
+
+        let mgr = test_manager();
+        let refused = match mgr
+            .create_or_adopt_holding(repo_path, "task-0a1b2c3d", None, std::slice::from_ref(&held_commit))
+            .await
+        {
+            Err(refused) => refused,
+            Ok(_) => panic!("a branch was created on a base lacking the held work"),
+        };
+
+        assert!(refused.contains(&held_commit), "{refused}");
+        assert_eq!(all_refs(repo_path), refs_before);
     }
 
     /// A checkout exactly as its creation left it is taken back whole: the
