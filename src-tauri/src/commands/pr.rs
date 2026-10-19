@@ -4187,6 +4187,57 @@ async fn restack_onto_landed_parent(
         );
     }
 
+    // A supported admission record is part of this checkout's identity. A
+    // restack may carry it forward only when every exact required commit is
+    // present on the new base. Unknown/legacy evidence stays unknown.
+    let admission_rebound = {
+        let project_id = state.task.tasks.read().await.get(&task_uuid).map(|task| task.project_id);
+        let repository_id = if let Some(project_id) = project_id {
+            state.project.projects.read().await.get(&project_id).and_then(|project| project.repository_id)
+        } else {
+            None
+        };
+        let tasks = state.task.tasks.read().await;
+        tasks.get(&task_uuid).and_then(|task| task.checkout_admission.as_ref().and_then(|evidence| {
+            use crate::domain::task::CheckoutAdmission;
+            let mut ids: Vec<_> = evidence.dependencies.iter().map(|d| d.task_id).collect();
+            let mut task_ids = task.dependencies.clone();
+            ids.sort();
+            task_ids.sort();
+            let supported = evidence.format_version == CheckoutAdmission::FORMAT_VERSION
+                && evidence.policy_version == CheckoutAdmission::POLICY_VERSION
+                && evidence.task_id == task_uuid
+                && Some(evidence.repository_id) == repository_id
+                && evidence.branch == branch
+                && ids == task_ids;
+            supported.then(|| evidence.clone())
+        }))
+    };
+    if let Some(evidence) = admission_rebound.as_ref() {
+        if !restack::has_commit(repo, &evidence.admitted_commit).await?
+            || !restack::is_ancestor(repo, &evidence.admitted_commit, &tip).await? {
+            return Err("The Task's recorded checkout admission no longer matches its branch; SlashIt preserved the branch and checkout.".into());
+        }
+    }
+    let admission_rebound = admission_rebound.map(|mut evidence| {
+        evidence.admitted_commit = onto.clone();
+        evidence
+    });
+    if let Some(evidence) = admission_rebound.as_ref() {
+        for dependency in &evidence.dependencies {
+            if let crate::domain::task::DependencyRequirement::Commits(commits) = &dependency.requirement {
+                for commit in commits {
+                    if !restack::has_commit(repo, commit).await?
+                        || !restack::is_ancestor(repo, commit, &onto).await? {
+                        return Err(format!(
+                            "The Task's admitted dependency commit {commit} is not present on the landed base {onto}; SlashIt preserved the branch and checkout because it cannot safely carry the admission evidence through this restack."
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     let unchanged_note = "Nothing was changed or pushed.";
     if pushed.is_some() {
         return Err(format!(
@@ -4314,6 +4365,9 @@ async fn restack_onto_landed_parent(
                 task.base_commit = Some(onto.clone());
                 task.branch_origin =
                     Some(BranchOrigin::DefaultBase { branch: Some(default.to_string()) });
+                if let Some(admission) = admission_rebound.as_ref() {
+                    task.checkout_admission = Some(admission.clone());
+                }
                 recorded.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -10147,6 +10201,24 @@ mod tests {
                     );
                     let (state, _tmp) = build_test_state().await;
                     let task_id = seed_stacked_task(&state, &landed, Some(&landed.base_commit)).await;
+                    let repository_id = {
+                        let tasks = state.task.tasks.read().await;
+                        state.project.projects.read().await[&tasks[&task_id].project_id].repository_id.unwrap()
+                    };
+                    {
+                        let mut tasks = state.task.tasks.write().await;
+                        let task = tasks.get_mut(&task_id).unwrap();
+                        task.dependencies.clear();
+                        task.checkout_admission = Some(crate::domain::task::CheckoutAdmission {
+                            format_version: crate::domain::task::CheckoutAdmission::FORMAT_VERSION,
+                            policy_version: crate::domain::task::CheckoutAdmission::POLICY_VERSION,
+                            task_id,
+                            repository_id,
+                            branch: "task-branch".to_string(),
+                            admitted_commit: landed.base_commit.clone(),
+                            dependencies: Vec::new(),
+                        });
+                    }
                     assert_eq!(landed.repo.remote_has_branch("task-branch"), None, "{name}");
 
                     let result = create_pr_inner(&state, &task_id.to_string()).await;
@@ -10187,6 +10259,7 @@ mod tests {
                     let task = &tasks[&task_id];
                     assert_eq!(task.base_commit.as_deref(), Some(onto.as_str()), "{name}");
                     assert_eq!(task.branch_origin, Some(crate::domain::BranchOrigin::DefaultBase { branch: Some("main".to_string()) }), "{name}");
+                    assert_eq!(task.checkout_admission.as_ref().map(|a| a.admitted_commit.as_str()), Some(onto.as_str()), "{name}: admission follows the restacked checkout");
                     assert_eq!(task.pr_url.as_deref(), Some(CHILD_PR_URL), "{name}");
                 }
             }

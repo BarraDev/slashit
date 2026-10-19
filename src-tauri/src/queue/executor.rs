@@ -473,6 +473,26 @@ fn fix_outcome(outcome: Result<Option<AgentRun>, String>) -> FixOutcome {
 /// A task's worktree, or why none could be attached.
 type AcquiredWorktree = Result<Acquired, String>;
 
+fn stable_dependency_requirement(
+    task: &crate::domain::task::Task,
+) -> Result<crate::domain::task::DependencyRequirement, String> {
+    use crate::domain::task::DependencyRequirement;
+    if let Some(integration) = task.local_integration.as_ref() {
+        if integration.state == crate::domain::IntegrationState::Integrated
+            && crate::worktree::restack::is_full_object_id(&integration.approved_tip) {
+            return Ok(DependencyRequirement::Commits(vec![integration.approved_tip.clone()]));
+        }
+    }
+    for reference in &task.external_refs {
+        if let crate::domain::task::ExternalRef::GithubPr { state: Some(state), merge_commit: Some(commit), .. } = reference {
+            if state.eq_ignore_ascii_case("merged") && crate::worktree::restack::is_full_object_id(commit) {
+                return Ok(DependencyRequirement::Commits(vec![commit.clone()]));
+            }
+        }
+    }
+    Err(format!("Dependency Task {} has a branch but no stable recorded commit proving its required work. Preserve this checkout; refresh its merged pull request if applicable, or clear the dependency after reviewing the checkout before an ordinary start.", task.id))
+}
+
 /// The worktree a starting task was given and what is known about where its
 /// branch came from.
 pub(crate) struct Acquired {
@@ -493,6 +513,8 @@ pub(crate) struct Acquired {
     /// adopted, or a stacked branch resumed -- which is never this start's to
     /// take back if the task cannot record it.
     pub(crate) created_at: Option<String>,
+    /// Dependency admission evidence to persist with the checkout identity.
+    pub(crate) checkout_admission: Option<crate::domain::task::CheckoutAdmission>,
 }
 
 /// Whether `task` sits where a delivered pull request lives, so that the
@@ -3213,6 +3235,124 @@ impl TaskExecutor {
     /// [`Self::spawn_task_execution`] and the explicit checkout command
     /// (`commands::worktree::create_worktree_inner`) both call it under the
     /// task's lifecycle lease.
+    /// Reuses a valid admission record, or non-destructively requalifies a
+    /// legacy checkout only from stable prerequisite evidence and Git ancestry.
+    async fn verify_or_requalify_checkout_admission(
+        &self,
+        task_id: Uuid,
+        repo_path: &str,
+        branch: &str,
+        boundary: Option<&str>,
+        acquired_origin: Option<&BranchOrigin>,
+        acquired_base: Option<&str>,
+    ) -> Result<crate::domain::task::CheckoutAdmission, String> {
+        use crate::domain::task::{CheckoutAdmission, DependencyAdmission, DependencyRequirement};
+        let task = self.tasks.read().await.get(&task_id).cloned()
+            .ok_or_else(|| "The Task disappeared before its dependency admission could be checked".to_string())?;
+        let project = self.projects.read().await.get(&task.project_id).cloned()
+            .ok_or_else(|| "The Task Project disappeared before its dependency admission could be checked".to_string())?;
+        let repository_id = project.repository_id
+            .ok_or_else(|| "The Task Project has no registered repository; dependency admission cannot be verified".to_string())?;
+        let registered_path = self.repositories.read().await.get(&repository_id)
+            .map(|r| r.local_path.clone())
+            .ok_or_else(|| "The Task repository is no longer registered; dependency admission cannot be verified".to_string())?;
+        if std::fs::canonicalize(repo_path).ok() != std::fs::canonicalize(&registered_path).ok() {
+            return Err("The Task Checkout repository does not match its registered repository; dependency admission cannot be verified".into());
+        }
+        let dir = std::path::Path::new(repo_path);
+        let tip = crate::worktree::restack::exact_ref(dir, &format!("refs/heads/{branch}"))
+            .await.map_err(|e| format!("The Task branch could not be verified: {e}"))?
+            .ok_or_else(|| format!("The recorded Task branch {branch:?} is missing; it was preserved"))?;
+
+        let admitted_commit = boundary.unwrap_or(&tip).to_string();
+        if !crate::worktree::restack::has_commit(dir, &admitted_commit).await.unwrap_or(false)
+            || !crate::worktree::restack::is_ancestor(dir, &admitted_commit, &tip).await.unwrap_or(false) {
+            return Err("The checkout's recorded starting commit is not an ancestor of its current branch; preserve the checkout for review.".into());
+        }
+        let sorted_ids = |mut ids: Vec<Uuid>| { ids.sort(); ids };
+        if let Some(evidence) = task.checkout_admission.as_ref() {
+            let identity_matches = evidence.format_version == CheckoutAdmission::FORMAT_VERSION
+                && evidence.policy_version == CheckoutAdmission::POLICY_VERSION
+                && evidence.task_id == task_id
+                && evidence.repository_id == repository_id
+                && evidence.branch == branch
+                && sorted_ids(evidence.dependencies.iter().map(|d| d.task_id).collect())
+                    == sorted_ids(task.dependencies.clone());
+            if identity_matches
+                && crate::worktree::restack::has_commit(dir, &evidence.admitted_commit).await.unwrap_or(false)
+                && crate::worktree::restack::is_ancestor(dir, &evidence.admitted_commit, &tip).await.unwrap_or(false)
+            {
+                let mut valid = true;
+                for dep in &evidence.dependencies {
+                    if !self.tasks.read().await.contains_key(&dep.task_id) { valid = false; break; }
+                    match &dep.requirement {
+                        // Branchless records what was verified at admission.
+                        // A later branch assignment does not change that history.
+                        DependencyRequirement::Branchless => {}
+                        DependencyRequirement::Commits(commits) if !commits.is_empty() => {
+                            for commit in commits {
+                                if !crate::worktree::restack::has_commit(dir, commit).await.unwrap_or(false)
+                                    || !crate::worktree::restack::is_ancestor(dir, commit, &evidence.admitted_commit).await.unwrap_or(false) {
+                                    valid = false; break;
+                                }
+                            }
+                            if !valid { break; }
+                        }
+                        DependencyRequirement::Commits(_) => { valid = false; break; }
+                    }
+                }
+                if valid { return Ok(evidence.clone()); }
+            }
+        }
+
+        // Legacy/unknown evidence may be requalified only from a stable
+        // integrated commit, a recorded merged commit, or the recorded exact
+        // stacked fork. A dependency's moving branch tip is never proof.
+        let mut admitted = Vec::with_capacity(task.dependencies.len());
+        for dependency_id in &task.dependencies {
+            let dep = self.tasks.read().await.get(dependency_id).cloned()
+                .ok_or_else(|| format!("Dependency Task {dependency_id} is missing; its required work cannot be established. Preserve this checkout and restore that Task or resolve the dependency."))?;
+            let requirement = if dep.branch_name.is_none() {
+                DependencyRequirement::Branchless
+            } else if let (Some(base), Some(crate::domain::task::BranchOrigin::Stacked { parent_branch }))
+                = (acquired_base.or(task.base_commit.as_deref()), acquired_origin.or(task.branch_origin.as_ref())) {
+                if dep.branch_name.as_deref() == Some(parent_branch.as_str()) {
+                    let dependency_tip = crate::worktree::restack::exact_ref(
+                        dir,
+                        &format!("refs/heads/{parent_branch}"),
+                    )
+                    .await
+                    .map_err(|e| format!("The stacked dependency branch could not be verified: {e}"))?
+                    .ok_or_else(|| format!("The stacked dependency branch {parent_branch:?} is missing; its required work cannot be established. Preserve this checkout."))?;
+                    if !crate::worktree::restack::is_ancestor(dir, base, &dependency_tip).await.unwrap_or(false) {
+                        return Err(format!("The recorded checkout fork {base} is not part of dependency Task {dependency_id}'s branch {parent_branch:?}; preserve this checkout for review."));
+                    }
+                    DependencyRequirement::Commits(vec![base.to_string()])
+                } else { stable_dependency_requirement(&dep)? }
+            } else {
+                stable_dependency_requirement(&dep)?
+            };
+            if let DependencyRequirement::Commits(commits) = &requirement {
+                for commit in commits {
+                    if !crate::worktree::restack::has_commit(dir, commit).await.unwrap_or(false)
+                        || !crate::worktree::restack::is_ancestor(dir, commit, &admitted_commit).await.unwrap_or(false) {
+                        return Err(format!("The existing Task branch does not contain the stable required commit {commit} for dependency Task {dependency_id}. The checkout was preserved; restore the required work or clear the dependency before an ordinary start."));
+                    }
+                }
+            }
+            admitted.push(DependencyAdmission { task_id: *dependency_id, requirement });
+        }
+        Ok(CheckoutAdmission {
+            format_version: CheckoutAdmission::FORMAT_VERSION,
+            policy_version: CheckoutAdmission::POLICY_VERSION,
+            task_id,
+            repository_id,
+            branch: branch.to_string(),
+            admitted_commit,
+            dependencies: admitted,
+        })
+    }
+
     pub(crate) async fn acquire_task_worktree(
         &self,
         task_id: Uuid,
@@ -3437,6 +3577,15 @@ impl TaskExecutor {
         // reattach: retry must keep comparing against the original starting
         // point, not wherever the branch has moved to since.
         let acquired = if existing_branch.is_some() {
+            let approved_recovery = self.tasks.read().await.get(&task_id).is_some_and(|task| task.new_attempt_admits());
+            let admission = if approved_recovery {
+                self.tasks.read().await.get(&task_id).and_then(|task| task.checkout_admission.clone())
+            } else {
+                match self.verify_or_requalify_checkout_admission(task_id, repo_path, &branch_name, None, None, None).await {
+                    Ok(evidence) => Some(evidence),
+                    Err(refused) => return (existing_branch, Err(refused)),
+                }
+            };
             self.worktree_manager
                 .reattach(repo_path, &branch_name)
                 .await
@@ -3446,6 +3595,7 @@ impl TaskExecutor {
                     base_commit: None,
                     origin: None,
                     created_at: None,
+                    checkout_admission: admission,
                 })
         } else if let Some(parent_branch) = base_branch.as_deref() {
             // A task stacked on a dependency is not started from anywhere
@@ -3482,6 +3632,7 @@ impl TaskExecutor {
                         info: stacked.info,
                         what_happened,
                         created_at: (!stacked.resumed).then(|| stacked.dependency_tip.clone()),
+                    checkout_admission: None,
                         base_commit: Some(stacked.dependency_tip),
                         origin: Some(BranchOrigin::Stacked {
                             parent_branch: parent_branch.to_string(),
@@ -3547,6 +3698,7 @@ impl TaskExecutor {
                     info,
                     what_happened: "Created worktree",
                     created_at: Some(base.commit.clone()),
+                    checkout_admission: None,
                     origin: Some(base.branch_origin()),
                     base_commit: Some(base.commit),
                 }),
@@ -3556,9 +3708,29 @@ impl TaskExecutor {
                     base_commit: None,
                     origin: None,
                     created_at: None,
+                    checkout_admission: None,
                 }),
                 Err(e) => Err(e),
             }
+        };
+        let acquired = match acquired {
+            Ok(mut acquired) if acquired.checkout_admission.is_none() => {
+                let approved_recovery = self.tasks.read().await.get(&task_id).is_some_and(|task| task.new_attempt_admits());
+                if !approved_recovery {
+                    match self.verify_or_requalify_checkout_admission(
+                        task_id, repo_path, &branch_name,
+                        acquired.base_commit.as_deref(), acquired.origin.as_ref(), acquired.base_commit.as_deref(),
+                    ).await {
+                        Ok(evidence) => acquired.checkout_admission = Some(evidence),
+                        Err(refused) => {
+                            self.worktree_manager.release_unrecorded(repo_path, &acquired.info, acquired.created_at.as_deref()).await;
+                            return (existing_branch, Err(refused));
+                        }
+                    }
+                }
+                Ok(acquired)
+            }
+            other => other,
         };
         (existing_branch, acquired)
     }
@@ -3611,6 +3783,7 @@ impl TaskExecutor {
             base_commit: None,
             origin: None,
             created_at: None,
+            checkout_admission: None,
         })
     }
 
@@ -4112,6 +4285,7 @@ impl TaskExecutor {
                 t.approved_execution = None;
                 t.worktree_path = Some(acquired.info.path.clone());
                 t.branch_name = Some(acquired.info.branch.clone());
+                if let Some(evidence) = &acquired.checkout_admission { t.checkout_admission = Some(evidence.clone()); }
                 if let Some(base_commit) = &acquired.base_commit {
                     t.base_commit = Some(base_commit.clone());
                 }
@@ -14356,46 +14530,30 @@ mod tests {
         assert_eq!(retry.origin, None);
     }
 
-    /// Reattaching to a branch recorded before origins were kept does not
-    /// invent one: where that branch started is not known.
+    /// A dependency-bearing legacy checkout without stable admission evidence
+    /// remains unknown and is preserved for explicit resolution.
     #[tokio::test]
-    async fn reattaching_a_legacy_branch_records_no_origin() {
+    async fn reattaching_a_legacy_branch_without_stable_evidence_is_refused_unchanged() {
         let (executor, temps) = test_executor();
         let (repo, task_id, _) = stacked_task_fixture(
-            &executor,
-            &temps,
-            TaskStatus::InProgress,
-            None,
-            "task-deadbeef",
-        )
-        .await;
+            &executor, &temps, TaskStatus::InProgress, None, "task-deadbeef",
+        ).await;
         git_in(&repo, &["branch", "task-deadbeef"]);
         git_in(&repo, &["branch", "task-legacy"]);
-        executor
-            .tasks
-            .write()
-            .await
-            .get_mut(&task_id)
-            .unwrap()
-            .branch_name = Some("task-legacy".to_string());
+        executor.tasks.write().await.get_mut(&task_id).unwrap().branch_name = Some("task-legacy".into());
+        let refs_before = refs_of(&repo);
+        let worktrees_before = worktree_count(&repo);
 
-        let (existing, acquired) = executor
-            .acquire_task_worktree(task_id, repo.to_str().unwrap())
-            .await;
+        let (existing, acquired) = executor.acquire_task_worktree(task_id, repo.to_str().unwrap()).await;
         assert_eq!(existing.as_deref(), Some("task-legacy"));
-        let acquired = acquired.expect("the recorded branch is reattached");
-        assert_eq!(acquired.what_happened, "Reattached worktree");
-        assert_eq!(acquired.origin, None);
-        executor
-            .record_run_start(task_id, repo.to_str().unwrap(), acquired)
-            .await
-            .expect("recorded");
-
-        let project_id = executor.tasks.read().await[&task_id].project_id;
-        assert_eq!(
-            persisted_task(&executor, project_id, task_id).branch_origin,
-            None
-        );
+        let refusal = match acquired { Err(refusal) => refusal, Ok(_) => panic!("unknown legacy evidence must refuse") };
+        assert!(refusal.contains("stable recorded commit"), "{refusal}");
+        assert_eq!(refs_of(&repo), refs_before);
+        assert_eq!(worktree_count(&repo), worktrees_before);
+        let task = executor.tasks.read().await.get(&task_id).cloned().unwrap();
+        assert_eq!(task.branch_name.as_deref(), Some("task-legacy"));
+        assert!(task.worktree_path.is_none());
+        assert!(task.checkout_admission.is_none());
     }
 
     /// A stacked task started again after a restart, with its worktree gone
@@ -14755,6 +14913,156 @@ mod tests {
             std::path::Path::new(&path).is_dir(),
             "a reattached checkout is not removed"
         );
+        assert_eq!(worktree_count(&repo), 2);
+    }
+
+    /// A legacy recorded branch does not prove that dependency work was
+    /// admitted. Stable merged-commit evidence is checked against that exact
+    /// branch before any worktree is attached.
+    #[tokio::test]
+    async fn legacy_recorded_branch_missing_dependency_commit_is_refused_unchanged() {
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::Done, Some("MERGED"), "dependency-branch",
+        ).await;
+        publish_default_base(&repo);
+        git_in(&repo, &["switch", "-q", "-c", "dependency-branch", "main"]);
+        std::fs::write(repo.join("dependency.txt"), "required work\n").unwrap();
+        git_in(&repo, &["add", "dependency.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "dependency work"]);
+        let required = git_in(&repo, &["rev-parse", "HEAD"]);
+        git_in(&repo, &["switch", "-q", "main"]);
+        let task_branch = WorktreeManager::branch_for_task(task_id);
+        git_in(&repo, &["branch", &task_branch, "main"]);
+        {
+            let mut tasks = executor.tasks.write().await;
+            let dep = tasks.get_mut(&dependency_id).unwrap();
+            dep.external_refs = vec![crate::domain::task::ExternalRef::GithubPr {
+                url: "https://github.com/test-org/test-repo/pull/7".into(),
+                number: 7,
+                repo: "test-org/test-repo".into(),
+                state: Some("MERGED".into()),
+                merge_commit: Some(required.clone()),
+            }];
+        }
+        seed_recorded_branch_without_checkout(&executor, task_id, &task_branch).await;
+        let refs_before = refs_of(&repo);
+        let worktrees_before = worktree_count(&repo);
+        let (existing, acquired) = executor.acquire_task_worktree(task_id, repo.to_str().unwrap()).await;
+        assert_eq!(existing.as_deref(), Some(task_branch.as_str()));
+        let refused = match acquired { Err(refused) => refused, Ok(_) => panic!("legacy branch lacks its dependency commit") };
+        assert!(refused.contains(&required), "{refused}");
+        assert!(refused.contains("checkout was preserved"), "{refused}");
+        assert_eq!(refs_of(&repo), refs_before, "refusal must not move refs");
+        assert_eq!(worktree_count(&repo), worktrees_before, "refusal must not attach a checkout");
+        assert!(!repo.join("dependency.txt").exists());
+        assert!(executor.running_handles.read().await.is_empty());
+        let task = executor.tasks.read().await.get(&task_id).cloned().unwrap();
+        assert_eq!(task.branch_name.as_deref(), Some(task_branch.as_str()));
+        assert!(task.worktree_path.is_none());
+        assert!(task.checkout_admission.is_none(), "unknown history stays unknown");
+    }
+
+    /// A persisted admission remains valid after the dependency branch moves:
+    /// verification checks the historical commit and checkout boundary, never
+    /// today's dependency tip.
+    #[tokio::test]
+    async fn recorded_admission_survives_dependency_branch_advancing() {
+        use crate::domain::task::{CheckoutAdmission, DependencyAdmission, DependencyRequirement};
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::Done, Some("MERGED"), "dependency-branch",
+        ).await;
+        publish_default_base(&repo);
+        git_in(&repo, &["switch", "-q", "-c", "dependency-branch", "main"]);
+        std::fs::write(repo.join("dependency.txt"), "admitted work\n").unwrap();
+        git_in(&repo, &["add", "dependency.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "admitted dependency work"]);
+        let admitted = git_in(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("later.txt"), "later work\n").unwrap();
+        git_in(&repo, &["add", "later.txt"]);
+        git_in(&repo, &["commit", "-q", "-m", "later dependency work"]);
+        let advanced = git_in(&repo, &["rev-parse", "HEAD"]);
+        git_in(&repo, &["switch", "-q", "main"]);
+        let task_branch = WorktreeManager::branch_for_task(task_id);
+        git_in(&repo, &["branch", &task_branch, &admitted]);
+        let repository_id = executor.projects.read().await[&executor.tasks.read().await[&task_id].project_id]
+            .repository_id.unwrap();
+        {
+            let mut tasks = executor.tasks.write().await;
+            tasks.get_mut(&dependency_id).unwrap().external_refs = vec![
+                crate::domain::task::ExternalRef::GithubPr {
+                    url: "https://github.com/test-org/test-repo/pull/7".into(),
+                    number: 7,
+                    repo: "test-org/test-repo".into(),
+                    state: Some("MERGED".into()),
+                    merge_commit: Some(advanced),
+                }
+            ];
+            let task = tasks.get_mut(&task_id).unwrap();
+            task.branch_name = Some(task_branch.clone());
+            task.base_commit = Some(admitted.clone());
+            task.branch_origin = Some(BranchOrigin::Stacked { parent_branch: "dependency-branch".into() });
+            task.checkout_admission = Some(CheckoutAdmission {
+                format_version: CheckoutAdmission::FORMAT_VERSION,
+                policy_version: CheckoutAdmission::POLICY_VERSION,
+                task_id,
+                repository_id,
+                branch: task_branch.clone(),
+                admitted_commit: admitted.clone(),
+                dependencies: vec![DependencyAdmission {
+                    task_id: dependency_id,
+                    requirement: DependencyRequirement::Commits(vec![admitted.clone()]),
+                }],
+            });
+        }
+        seed_stacked_fixture_board(&executor).await;
+        let (_, acquired) = executor.acquire_task_worktree(task_id, repo.to_str().unwrap()).await;
+        let acquired = acquired.unwrap_or_else(|e| panic!("historical admission should remain valid: {e}"));
+        assert_eq!(acquired.checkout_admission.unwrap().admitted_commit, admitted);
+        assert_eq!(worktree_count(&repo), 2);
+    }
+
+    #[tokio::test]
+    async fn recorded_branchless_admission_survives_later_dependency_branch_assignment() {
+        use crate::domain::task::{CheckoutAdmission, DependencyAdmission, DependencyRequirement};
+        let (executor, temps) = test_executor();
+        let (repo, task_id, dependency_id) = stacked_task_fixture(
+            &executor, &temps, TaskStatus::Done, None, "dependency-branch",
+        ).await;
+        publish_default_base(&repo);
+        let start = git_in(&repo, &["rev-parse", "main"]);
+        let task_branch = WorktreeManager::branch_for_task(task_id);
+        git_in(&repo, &["branch", &task_branch, &start]);
+        let repository_id = executor.projects.read().await[&executor.tasks.read().await[&task_id].project_id]
+            .repository_id.unwrap();
+        {
+            let mut tasks = executor.tasks.write().await;
+            tasks.get_mut(&dependency_id).unwrap().branch_name = None;
+            let task = tasks.get_mut(&task_id).unwrap();
+            task.branch_name = Some(task_branch.clone());
+            task.checkout_admission = Some(CheckoutAdmission {
+                format_version: CheckoutAdmission::FORMAT_VERSION,
+                policy_version: CheckoutAdmission::POLICY_VERSION,
+                task_id,
+                repository_id,
+                branch: task_branch,
+                admitted_commit: start,
+                dependencies: vec![DependencyAdmission {
+                    task_id: dependency_id,
+                    requirement: DependencyRequirement::Branchless,
+                }],
+            });
+        }
+        executor.tasks.write().await.get_mut(&dependency_id).unwrap().branch_name = Some("later-created-branch".into());
+        seed_stacked_fixture_board(&executor).await;
+
+        let (_, acquired) = executor.acquire_task_worktree(task_id, repo.to_str().unwrap()).await;
+        let acquired = acquired.unwrap_or_else(|e| panic!("historical branchless admission should remain valid: {e}"));
+        assert!(matches!(
+            acquired.checkout_admission.unwrap().dependencies[0].requirement,
+            DependencyRequirement::Branchless
+        ));
         assert_eq!(worktree_count(&repo), 2);
     }
 

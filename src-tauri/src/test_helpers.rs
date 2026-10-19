@@ -620,6 +620,7 @@ pub fn create_test_task(title: &str) -> Task {
         error_message: None,
         worktree_path: None,
         branch_name: None,
+        checkout_admission: None,
         base_commit: None,
         branch_origin: None,
         pending_republish: None,

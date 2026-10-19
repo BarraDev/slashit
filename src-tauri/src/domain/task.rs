@@ -41,6 +41,62 @@ pub enum ExternalRef {
     LinearTicket { id: String },
 }
 
+/// Durable evidence of the dependency requirements a Task Checkout held when
+/// SlashIt admitted it. This is deliberately separate from Worker run and
+/// recovery records: neither proves dependency admission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckoutAdmission {
+    /// Version of this serialized record shape.
+    pub format_version: u16,
+    /// Version of the dependency admission rules that produced the evidence.
+    pub policy_version: u16,
+    pub task_id: Uuid,
+    pub repository_id: Uuid,
+    pub branch: String,
+    /// A stable commit boundary on the admitted branch. For a newly created
+    /// branch this is its starting commit; for a safely requalified adopted
+    /// checkout it may be the branch tip observed at requalification. It is
+    /// not the Task diff boundary (`Task::base_commit`).
+    pub admitted_commit: String,
+    /// Exact dependency set observed at admission. An empty vector means the
+    /// Task had no dependencies.
+    pub dependencies: Vec<DependencyAdmission>,
+}
+
+impl CheckoutAdmission {
+    pub const FORMAT_VERSION: u16 = 1;
+    pub const POLICY_VERSION: u16 = 1;
+}
+
+/// The work one dependency required the admitted checkout to contain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyAdmission {
+    pub task_id: Uuid,
+    pub requirement: DependencyRequirement,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "commits", rename_all = "snake_case")]
+pub enum DependencyRequirement {
+    /// The dependency had no recorded branch and therefore required no work.
+    Branchless,
+    /// These exact commits were required and verified at admission.
+    Commits(Vec<String>),
+}
+
+fn deserialize_checkout_admission<'de, D>(
+    deserializer: D,
+) -> Result<Option<CheckoutAdmission>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // A bad optional attestation must not make the containing Task board
+    // unreadable. Treat malformed shapes as unknown; a later write may drop
+    // the malformed value, which remains unknown rather than positive proof.
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
 impl ExternalRef {
     pub fn label(&self) -> String {
         match self {
@@ -146,6 +202,16 @@ pub struct Task {
     /// Git branch name for this task's worktree
     #[serde(default)]
     pub branch_name: Option<String>,
+
+    /// Versioned evidence of the dependency work this checkout held when it
+    /// was admitted. Missing or malformed evidence is unknown, never inferred
+    /// from the branch, `base_commit`, or Worker activity.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_checkout_admission",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub checkout_admission: Option<CheckoutAdmission>,
 
     /// The commit the task's worktree started from: the exact commit of the
     /// default branch on `origin`, of the project's local base branch when
@@ -856,6 +922,7 @@ impl Task {
             error_message: None,
             worktree_path: None,
             branch_name: None,
+            checkout_admission: None,
             base_commit: None,
             branch_origin: None,
             pending_republish: None,
@@ -1954,6 +2021,43 @@ impl HumanReviewRecord {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checkout_admission_survives_restart_and_bad_optional_evidence_becomes_unknown() {
+        use super::{CheckoutAdmission, DependencyAdmission, DependencyRequirement, Task};
+        let mut task = super::tests::startable_task();
+        let dependency = uuid::Uuid::new_v4();
+        task.dependencies = vec![dependency];
+        task.checkout_admission = Some(CheckoutAdmission {
+            format_version: CheckoutAdmission::FORMAT_VERSION,
+            policy_version: CheckoutAdmission::POLICY_VERSION,
+            task_id: task.id,
+            repository_id: uuid::Uuid::new_v4(),
+            branch: "task-branch".into(),
+            admitted_commit: "a".repeat(40),
+            dependencies: vec![DependencyAdmission {
+                task_id: dependency,
+                requirement: DependencyRequirement::Commits(vec!["b".repeat(40)]),
+            }],
+        });
+        let encoded = serde_json::to_vec(&task).unwrap();
+        let restarted: Task = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restarted.checkout_admission, task.checkout_admission);
+
+        let mut missing: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        missing.as_object_mut().unwrap().remove("checkout_admission");
+        let missing: Task = serde_json::from_value(missing).unwrap();
+        assert!(missing.checkout_admission.is_none());
+
+        let mut malformed: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        malformed["checkout_admission"] = serde_json::Value::String("unknown shape".into());
+        let malformed: Task = serde_json::from_value(malformed).unwrap();
+        assert!(malformed.checkout_admission.is_none());
+
+        let mut unsupported: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        unsupported["checkout_admission"]["format_version"] = serde_json::json!(99);
+        let unsupported: Task = serde_json::from_value(unsupported).unwrap();
+        assert_eq!(unsupported.checkout_admission.unwrap().format_version, 99);
+    }
     use super::*;
 
     /// A pre-rename persisted task record: `workspace_id` (the old field
